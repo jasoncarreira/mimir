@@ -1067,6 +1067,53 @@ def test_claim_issue_accepts_worklink_in_progress_label() -> None:
     assert result.record is not None
 
 
+@pytest.mark.parametrize("content", ['{"issue": 200, "attempt": 1}', "", "corrupt", None])
+@pytest.mark.parametrize("override", [False, True])
+def test_retained_publication_refuses_without_mutation_and_allows_retry_after_clear(
+    tmp_path: Path, content: str | None, override: bool,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    path = tmp_path / "state" / "worklink" / "publications" / "200.json"
+    path.parent.mkdir(parents=True)
+    if content is None:
+        path.symlink_to(path.parent / "missing-intent")
+        assert not path.exists()
+    else:
+        path.write_text(content)
+    claims = ChainlinkClaims(
+        agent_id="mimir-a", runner=runner,
+        home_path=tmp_path / "other" if override else tmp_path,
+    )
+    before_claim_calls: list[bool] = []
+    kwargs = {"home_path": tmp_path} if override else {}
+    result = claims.claim_issue(
+        200, labels=["worklink:ready"],
+        before_claim=lambda: before_claim_calls.append(True), **kwargs,
+    )
+    assert not result.claimed
+    assert result.reason == "publication_intent_exists"
+    assert not result.attempts_exhausted
+    assert result.record is None
+    assert calls == [["chainlink", "issue", "show", "200", "--json"]]
+    assert before_claim_calls == []
+    if content is None:
+        assert path.is_symlink()
+        assert not path.exists()
+    else:
+        assert path.read_text() == content
+
+    path.unlink()
+    result = claims.claim_issue(200, labels=["worklink:ready"], **kwargs)
+    assert result.claimed
+    assert result.record is not None
+    assert result.record.attempt == 1
+
+
 def test_claim_issue_refuses_when_review_ready_evidence_exists(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     calls: list[list[str]] = []
 

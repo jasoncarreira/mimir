@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 from typing import Any, Callable, Iterator, Sequence
 
@@ -174,6 +175,12 @@ def worklink_status(
 ) -> list[WorklinkStatus]:
     """Classify Worklink leaves from run state and current Chainlink labels."""
     states = {state.issue_id: state for state in list_run_states(home)}
+    intents = {
+        int(path.stem): path
+        for path in (home / "state" / "worklink" / "publications").glob("*.json")
+        if path.stem.isascii() and path.stem.isdecimal()
+        and path.stem == str(int(path.stem))
+    }
     run = runner or _runner(home, chainlink_bin)
     explicit = set(issue_ids)
     if explicit:
@@ -182,7 +189,7 @@ def worklink_status(
         open_issue_ids, discovery_error = _open_issue_ids(run, chainlink_bin)
         if discovery_error is not None:
             raise RuntimeError(discovery_error)
-        candidates = set(states) | open_issue_ids
+        candidates = set(states) | set(intents) | open_issue_ids
     labels_by_issue, label_errors = _worklink_issue_labels(
         run, chainlink_bin, candidates
     )
@@ -191,6 +198,7 @@ def worklink_status(
         if explicit
         else (
             set(states)
+            | set(intents)
             | set(label_errors)
             | {
                 issue_id
@@ -223,6 +231,16 @@ def worklink_status(
         else:
             classification = "clean"
             elapsed = None
+        if issue_id in intents:
+            if state is None:
+                classification = "publication-pending"
+            detail = (
+                f"retained publication intent: {intents[issue_id]}; "
+                "verify no publisher is running and reconcile the remote PR/evidence "
+                "before clearing; clear command: "
+                f"rm -- {shlex.quote(str(intents[issue_id].absolute()))}"
+            )
+            disagreement = f"{disagreement}; {detail}" if disagreement else detail
         rows.append(
             WorklinkStatus(
                 issue_id=issue_id,
