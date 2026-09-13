@@ -705,7 +705,7 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
 
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
@@ -722,6 +722,7 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     with pytest.raises(ValueError, match="unknown Worklink backend config"):
         run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
 
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_run_failed")
     assert failure["issue_id"] == 441
@@ -770,7 +771,7 @@ def test_postclaim_failure_emits_same_failure_event(
     events = tmp_path / "logs" / "events.jsonl"
     state_dir = tmp_path / "state" / "pollers" / "worklink-ready-queue"
     ambient_state_dir = tmp_path / "ambient-state"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
 
     async def failed_after_claim(self: WorklinkRunner, issue_id: int, **_: object):
         return orchestrator.WorklinkRunResult(
@@ -786,6 +787,7 @@ def test_postclaim_failure_emits_same_failure_event(
     result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
 
     assert result.status == "failed"
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_run_failed")
     assert failure["attempt"] == 2
@@ -872,6 +874,107 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert result.status == "completed"
     assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
     assert not (tmp_path / "ambient-state").exists()
+
+
+@pytest.mark.parametrize("epic", [False, True], ids=["leaf", "factory"])
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [
+        ("duplicate_run_live", "refused"),
+        ("claim_contention_exhausted", "refused"),
+        ("lifecycle_state_incompatible", "refused"),
+        ("review_ready_evidence_exists", "refused"),
+        ("publication_intent_exists", "refused"),
+        ("concurrency cap reached (1/1 active claims)", "refused"),
+        ("concurrency cap reached (4/3 active claims)", "refused"),
+        ("lock service unavailable", "failed"),
+        ("claim guard failed", "failed"),
+        (None, "failed"),
+    ],
+)
+def test_claim_refusal_dispatch_failure_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    epic: bool,
+    reason: str | None,
+    status: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        pending_failure_alerts,
+    )
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    issue = json.loads(ISSUE_JSON)
+    if epic:
+        issue["labels"].append("worklink:epic")
+    calls, runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+    )
+    registry = BackendRegistry(config)
+    backend = FakeBackend()
+    registry.register(backend)
+    claim_calls: list[int] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def refuse_claim(self: ChainlinkClaims, issue_id: int, *args: object, **kwargs: object):
+        claim_calls.append(issue_id)
+        return ClaimResult(False, reason=reason)
+
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
+    monkeypatch.setattr(ChainlinkClaims, "claim_issue", refuse_claim)
+    monkeypatch.setattr(
+        orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    for consecutive in (1, 2, 3):
+        if epic:
+            result = run_worklink_epic(home=tmp_path, repo=repo, issue_id=441, autonomous=True)
+        else:
+            result = run_worklink(
+                home=tmp_path, repo=repo, issue_id=441, backend="fake", autonomous=True
+            )
+        assert result.status == status
+        assert result.reason == (reason or "claim_failed")
+        assert result.attempt is None
+        assert claim_calls == [441] * consecutive
+        issues = load_failure_state(state_dir)["issues"]
+        if status == "refused":
+            assert issues == {}
+            assert pending_failure_alerts(state_dir) == (set(), [])
+            assert not any(name == "worklink_run_failed" for name, _ in events)
+        else:
+            entry = issues["441"]
+            assert entry["active"] is True
+            assert entry["consecutive"] == consecutive
+            assert entry["attempt"] is None
+            assert entry["attempt_consumed"] is False
+            assert entry["terminal_error"] == (reason or "claim_failed")
+            backed_off, alerts = pending_failure_alerts(
+                state_dir, now=datetime.fromisoformat(entry["failed_at"])
+            )
+            assert backed_off == {441}
+            assert len(alerts) == 1
+            assert alerts[0]["issue_id"] == 441
+            assert alerts[0]["signal"] == "worklink_run_failure_escalated"
+            assert alerts[0]["terminal_error"] == entry["terminal_error"]
+            assert sum(name == "worklink_run_failed" for name, _ in events) == consecutive
+
+    assert backend.orders == []
+    assert not worktree.exists()
+    assert load_run_state(tmp_path, 441) is None
+    assert not (tmp_path / "state" / "worklink" / "factory-runs").exists()
+    assert not any(
+        isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
+        for call in calls
+    )
 
 
 def test_leaf_dispatch_failure_clears_ledger_only_after_success(
@@ -1062,6 +1165,7 @@ def _orchestrator_runner(
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         nonlocal commit_seen
         calls.append(args)
@@ -1596,7 +1700,7 @@ def test_worklink_rereads_issue_comments_before_claiming(tmp_path: Path) -> None
 def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree)
@@ -1638,6 +1742,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     assert ["git", "-C", str(worktree), "checkout", "-B", "issue/441-a1", "abc123"] in calls
     pr_calls = [c for c in calls if isinstance(c, list) and c[:3] == ["gh", "pr", "create"]]
     assert pr_calls and pr_calls[0][pr_calls[0].index("--base") + 1] == "main"
+    logger.flush_sync()
     body = events.read_text(encoding="utf-8")
     assert "worklink_claimed" in body
     assert "worklink_evidence" in body
@@ -1648,7 +1753,7 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
 def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-push-failure")
+    logger = init_logger(events, session_id="test-worklink-push-failure")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -1658,6 +1763,7 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         if (
             isinstance(args, list)
@@ -1665,7 +1771,7 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
         ):
             calls.append(args)
             return cp(args, returncode=128, stderr="remote rejected publication\n")
-        return base_runner(args, cwd=cwd, text=text)
+        return base_runner(args, cwd=cwd, text=text, timeout=timeout)
 
     registry = BackendRegistry(WorklinkConfig())
     registry.register(FakeBackend())
@@ -1690,6 +1796,7 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
     assert evidence["head_sha"] is None
     assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] not in calls
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(record for record in records if record["type"] == "worklink_publication_failed")
     assert failure["step"] == "push"
@@ -1700,7 +1807,7 @@ def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) 
 @pytest.mark.parametrize("fenced", [True, False], ids=["fenced", "negative-control"])
 @pytest.mark.parametrize("crash", [False, True], ids=["live", "process-death"])
 def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fenced, crash) -> None:
-    """A distinct controller is admitted after remote creation, before evidence.
+    """A distinct controller tries admission after remote creation, before evidence.
 
     The fake tracker models the reaper's stolen/released lock and ready label;
     neither heartbeat nor claim ownership is used as the publication guarantee.
@@ -1743,8 +1850,28 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
         result = asyncio.run(WorklinkRunner(
             home=tmp_path, repo=repo, runner=runner, registry=registry,
         ).run(441, backend_name="fake", test_command="echo ok"))
-        assert ["chainlink", "locks", "claim", "441"] in calls
-        assert result.attempt == attempt
+        if attempt == 2 and fenced:
+            assert result.status == "refused"
+            assert result.reason == "publication_intent_exists"
+            assert result.attempt is None
+            assert result.checkout is None
+            assert not worktree.exists()
+            assert "worklink:ready" in issue["labels"]
+            assert not any(
+                isinstance(call, list) and (
+                    call[:2] == ["chainlink", "locks"]
+                    or call[:3] in [
+                        ["chainlink", "issue", "label"],
+                        ["chainlink", "issue", "unlabel"],
+                        ["chainlink", "issue", "comment"],
+                        ["git", "clone", "--local"],
+                    ]
+                ) for call in calls
+            )
+            assert not (tmp_path / "state/worklink/evidence/441-2.json").exists()
+        else:
+            assert ["chainlink", "locks", "claim", "441"] in calls
+            assert result.attempt == attempt
         return result
 
     def original():
@@ -1757,17 +1884,17 @@ def test_publication_replacement_interleaving(tmp_path: Path, monkeypatch, fence
         evidence = tmp_path / "state/worklink/evidence/441-1.json"
         assert not json.loads(evidence.read_text())["pr_url"]
         # Model loss of disposable run metadata as well as the stolen claim.
-        # The acceptance case is an admitted replacement, not reliable liveness.
+        # Admission must refuse independently of reliable liveness.
         module.clear_run_state(tmp_path, 441)
         if crash:
             process.terminate()
             process.join(10)
             assert not process.is_alive()
         replacement = run_attempt(2)
-        assert replacement.status == ("blocked" if fenced else "completed")
+        assert replacement.status == ("refused" if fenced else "completed")
         assert publications.value == (1 if fenced else 2)
         if fenced:
-            assert "publication fence failed" in replacement.reason
+            assert replacement.reason == "publication_intent_exists"
         if not crash:
             finish.set()
             process.join(10)
@@ -1858,36 +1985,74 @@ def test_publication_fence_failures_and_retry(tmp_path: Path, monkeypatch, failu
     registry.register(FakeBackend())
     orchestrator = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry)
     result = asyncio.run(orchestrator.run(441, backend_name="fake", test_command="echo ok"))
-    assert result.status in {"blocked", "failed"}
+    if failure == "existing-intent":
+        assert result.status == "refused"
+        assert result.reason == "publication_intent_exists"
+        assert result.attempt is None
+        assert result.checkout is None
+        assert not worktree.exists()
+        assert not (evidence_dir / "441-1.json").exists()
+        assert not any(
+            isinstance(call, list) and (
+                call[:2] == ["chainlink", "locks"]
+                or call[:3] in [
+                    ["chainlink", "issue", "label"],
+                    ["chainlink", "issue", "unlabel"],
+                    ["chainlink", "issue", "comment"],
+                    ["git", "clone", "--local"],
+                ]
+            ) for call in calls
+        )
+    else:
+        assert result.status in {"blocked", "failed"}
     assert len(publications) == (1 if failure in {"pr", "completed-evidence"} else 0)
     retained = failure in {"pr", "completed-evidence", "intent-sync", "existing-intent"}
     assert intent.exists() == retained
     fail = False
     issue = json.loads(ISSUE_JSON)
-    issue["comments"] = [ClaimRecord(
+    issue["comments"] = [] if failure == "existing-intent" else [ClaimRecord(
         441, 1, "original", datetime(2020, 1, 1, tzinfo=UTC),
     ).to_comment()]
-    worktree = worktree.with_name("441-2")
+    next_attempt = 1 if failure == "existing-intent" else 2
+    worktree = worktree.with_name(f"441-{next_attempt}")
     calls, base_runner = _orchestrator_runner(repo, worktree, issue_json=json.dumps(issue))
     retried = asyncio.run(orchestrator.run(441, backend_name="fake", test_command="echo ok"))
-    assert retried.status == ("blocked" if retained else "completed"), retried.reason
+    assert retried.status == ("refused" if retained else "completed"), retried.reason
+    if retained:
+        assert retried.reason == "publication_intent_exists"
+        assert retried.attempt is None
+        assert retried.checkout is None
+        assert not worktree.exists()
+        assert "worklink:ready" in issue["labels"]
+        assert not (evidence_dir / f"441-{next_attempt}.json").exists()
+        assert not any(
+            isinstance(call, list) and (
+                call[:2] == ["chainlink", "locks"]
+                or call[:3] in [
+                    ["chainlink", "issue", "label"],
+                    ["chainlink", "issue", "unlabel"],
+                    ["chainlink", "issue", "comment"],
+                    ["git", "clone", "--local"],
+                ]
+            ) for call in calls
+        )
     assert len(publications) == (0 if failure in {"intent-sync", "existing-intent"} else 1)
-    if failure == "pr":
+    if failure in {"pr", "existing-intent"}:
         # Operator reconciliation: the creator and its children have stopped,
         # and GitHub confirms this deliberately rejected request created no PR.
         # A nonzero CLI exit alone was NOT enough to authorize this retry.
         intent.unlink()
-        issue["comments"].append(ClaimRecord(
-            441, 2, "replacement", datetime(2020, 1, 2, tzinfo=UTC),
-        ).to_comment())
         calls, base_runner = _orchestrator_runner(
-            repo, worktree.with_name("441-3"), issue_json=json.dumps(issue),
+            repo, worktree, issue_json=json.dumps(issue),
         )
         reconciled = asyncio.run(orchestrator.run(
             441, backend_name="fake", test_command="echo ok",
         ))
         assert reconciled.status == "completed", reconciled.reason
-        assert len(publications) == 2  # one rejected request, one successful PR
+        assert reconciled.attempt == next_attempt
+        assert ["chainlink", "locks", "claim", "441"] in calls
+        assert ["git", "clone", "--local", "--quiet", str(repo), str(worktree)] in calls
+        assert len(publications) == (2 if failure == "pr" else 1)
 
 
 def test_publication_fence_accepts_missing_evidence_directory(tmp_path: Path) -> None:
@@ -1977,6 +2142,7 @@ def test_post_pr_comment_failure_does_not_demote_completed_run(tmp_path: Path) -
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         nonlocal pr_opened
         if isinstance(args, list) and args[:3] == ["gh", "pr", "create"]:
@@ -1989,7 +2155,7 @@ def test_post_pr_comment_failure_does_not_demote_completed_run(tmp_path: Path) -
         ):
             calls.append(args)
             return cp(args, returncode=1, stderr="temporary Chainlink failure")
-        return base_runner(args, cwd=cwd, text=text)
+        return base_runner(args, cwd=cwd, text=text, timeout=timeout)
 
     registry = BackendRegistry(WorklinkConfig())
     registry.register(FakeBackend())
@@ -2235,8 +2401,21 @@ def test_published_transition_failure_is_reaped_to_review(
         agent_id="reaper", home_path=tmp_path, runner=runner, max_attempts=1,
         clock=lambda: datetime.now(UTC) + timedelta(days=1),
     )
-    records = claim_records_from_comments(comments)
-    assert len(records) == 1
+    history = claim_records_from_comments(comments)
+    # The controller gate now yields to the finalization heartbeat. Its comment
+    # refreshes the SAME claim; it is not a second admission or a reaper record.
+    # Keep the exact single-admission guard and validate every refresh rather
+    # than weakening the history length assertion to allow arbitrary records.
+    admissions = [record for record in history if record.heartbeat_at is None]
+    assert len(admissions) == 1
+    admission = admissions[0]
+    heartbeats = [record for record in history if record.heartbeat_at is not None]
+    assert heartbeats
+    assert all(replace(record, heartbeat_at=None) == admission for record in heartbeats)
+    assert all(record.heartbeat_at >= admission.claimed_at for record in heartbeats)
+    assert claims.attempts_used(comments) == 1
+    # reap_home selects the latest liveness anchor, not every historical comment.
+    records = [max(heartbeats, key=lambda record: record.heartbeat_at)]
     if release_first:
         fail_transition = False
         assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == []
@@ -2338,7 +2517,7 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
 def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink")
+    logger = init_logger(events, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
@@ -2355,6 +2534,7 @@ def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_pa
     assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
     assert load_run_state(tmp_path, 441) is None
     assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     failure = next(
         record
@@ -2781,6 +2961,7 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, str) and args.endswith("pytest -q"):
             assignment = shlex.split(args)[0]
@@ -2802,7 +2983,7 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
             write_report(junit.parent, total=9908, failed=failed_nodes)
             assert cache_dir == junit.parent / "cache"
             return cp(args, returncode=1, stdout="gate failed without prose identifiers\n")
-        return base_runner(args, cwd=cwd, text=text)
+        return base_runner(args, cwd=cwd, text=text, timeout=timeout)
 
     registry = BackendRegistry(WorklinkConfig())
     registry.register(PassingExecutorBackend())
@@ -2837,7 +3018,7 @@ def test_zero_exit_executor_and_failed_gate_record_structured_reason_and_diverge
 def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-crash")
+    logger = init_logger(events, session_id="test-worklink-crash")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree, files_stdout="")
@@ -2879,6 +3060,7 @@ def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path:
     assert evidence["model"] == "openai/gpt-5.6-sol"
     assert evidence["failure_reason"] == result.reason
     assert evidence["tests"]["skipped_reason"] == "executor exited nonzero before the test gate"
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     evidence_event = next(record for record in records if record["type"] == "worklink_evidence")
     assert evidence_event["model"] == "openai/gpt-5.6-sol"
@@ -2899,7 +3081,7 @@ def test_executor_crash_publishes_only_scrubbed_bounded_failure_reason(tmp_path:
 def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
-    init_logger(events, session_id="test-worklink-contention")
+    logger = init_logger(events, session_id="test-worklink-contention")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     _, base_runner = _orchestrator_runner(repo, worktree)
@@ -2910,6 +3092,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         nonlocal claim_calls
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
@@ -2923,7 +3106,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
                         "-locks-cache/index.lock': File exists."
                     ),
                 )
-        return base_runner(args, cwd=cwd, text=text)
+        return base_runner(args, cwd=cwd, text=text, timeout=timeout)
 
     backend = FakeBackend()
     registry = BackendRegistry(WorklinkConfig())
@@ -2938,6 +3121,7 @@ def test_worklink_runner_retries_transient_claim_contention(tmp_path: Path) -> N
     assert result.status == "completed"
     assert result.attempt == 1
     assert claim_calls == 2
+    logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
     contention = [record for record in records if record["type"] == "worklink_claim_contention"]
     assert [record["outcome"] for record in contention] == ["retrying", "succeeded"]
@@ -3234,7 +3418,7 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
 def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3266,6 +3450,7 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
     )
 
     assert result.status == "failed"
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transition = [record for record in records if record["type"] == "worklink_transition"][-1]
     assert transition["status"] == "failed"
@@ -3280,7 +3465,7 @@ def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path
 def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3326,6 +3511,7 @@ def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Pa
     assert not any(
         isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls
     )
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transitions = [record for record in records if record["type"] == "worklink_transition"]
     assert len(transitions) == 2
@@ -3344,7 +3530,7 @@ def test_no_pr_blocked_failed_transition_still_emits_and_propagates(tmp_path: Pa
 def test_published_completion_failed_transition_still_emits_not_applied(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
-    init_logger(events_path, session_id="test-worklink")
+    logger = init_logger(events_path, session_id="test-worklink")
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, base_runner = _orchestrator_runner(repo, worktree)
@@ -3354,13 +3540,14 @@ def test_published_completion_failed_transition_still_emits_not_applied(tmp_path
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, list) and args == [
             "chainlink", "issue", "label", "441", "worklink:review"
         ]:
             calls.append(args)
             return cp(args, returncode=1, stderr="label add failed")
-        return base_runner(args, cwd=cwd, text=text)
+        return base_runner(args, cwd=cwd, text=text, timeout=timeout)
 
     registry = BackendRegistry(WorklinkConfig())
     registry.register(FakeBackend())
@@ -3373,6 +3560,7 @@ def test_published_completion_failed_transition_still_emits_not_applied(tmp_path
 
     assert result.status == "completed"
     assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/999"
+    logger.flush_sync()
     records = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     transitions = [record for record in records if record["type"] == "worklink_transition"]
     assert len(transitions) == 1
@@ -3405,6 +3593,45 @@ def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -
         for call in calls
     )
     assert ["chainlink", "issue", "label", "441", "worklink:ready"] in calls
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, base_runner = _orchestrator_runner(repo, worktree)
+
+    def runner(args, **kwargs):
+        if isinstance(args, str):
+            calls.append(args)
+            if timed_out:
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"gate stalled")
+            return cp(args, returncode=1, stdout="assertion failed\n")
+        return base_runner(args, **kwargs)
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok",
+        )
+    )
+
+    assert result.attempt == 1
+    assert result.status == ("blocked" if timed_out else "failed")
+    assert not result.review_ready
+    assert result.pr_url is None
+    assert (["chainlink", "issue", "label", "441", "worklink:blocked"] in calls) is timed_out
+    assert (["chainlink", "issue", "label", "441", "worklink:ready"] in calls) is (not timed_out)
+    assert ["chainlink", "locks", "release", "441"] in calls
+    assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    evidence = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+    assert evidence["tests"]["timed_out"] is timed_out
+    reason = "gate_timed_out" if timed_out else "tests_failed"
+    assert any(
+        isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
+        and reason in call[-1] for call in calls
+    )
 
 
 def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) -> None:
@@ -3959,6 +4186,65 @@ def test_outside_checkout_detection_marks_root_leak_failed(tmp_path: Path) -> No
     assert any(reason.startswith("backend_wrote_outside_checkout:") for reason in result.reasons)
 
 
+@pytest.mark.parametrize("files_changed", [[], ["legitimate.py"]], ids=["empty-diff", "legitimate-diff"])
+@pytest.mark.parametrize("root_state", ["escaped", "clean", "inside", "preexisting"])
+def test_outside_checkout_detection_is_independent_of_attempt_diff(
+    tmp_path: Path, files_changed: list[str], root_state: str,
+) -> None:
+    from mimir.worklink.orchestrator import _with_outside_checkout_detection
+
+    checkout = tmp_path / "attempt"
+    status = "completed" if files_changed else "failed"
+    reasons = () if files_changed else ("completed_empty_diff",)
+    validation = EvidenceValidation(
+        status=status,
+        review_ready=bool(files_changed),
+        reasons=reasons,
+        evidence=WorklinkEvidence(
+            issue=517, attempt=1, backend="codex", branch="issue/517-a1",
+            checkout=str(checkout), started_at="2026-06-16T20:00:00+00:00",
+            finished_at="2026-06-16T20:05:00+00:00", files_changed=files_changed,
+            diff_stat="", commands=[], tests=None, pr_url=None, status=status,
+        ),
+    )
+    output = {
+        "escaped": " M leaked.py\n",
+        "clean": "",
+        "inside": " M attempt/legitimate.py\n",
+        "preexisting": " M operator.py\n",
+    }[root_state]
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout=output if args[3] == "status" else "", stderr="")
+
+    result = _with_outside_checkout_detection(
+        validation, issue=517, attempt=1, root=tmp_path, checkout=checkout,
+        runner=runner, root_dirty_before=("operator.py",),
+    )
+
+    assert calls[0] == [
+        "git", "-C", str(tmp_path), "status", "--porcelain=v1", "--untracked-files=all",
+    ]
+    if root_state == "escaped":
+        assert result.status == "failed"
+        assert result.review_ready is False
+        assert result.evidence.status == "failed"
+        assert result.evidence.files_changed == files_changed
+        assert result.reasons == (*reasons, (
+            "backend_wrote_outside_checkout: leaked.py "
+            "(quarantined to git stash 'worklink-leak-517-a1' in the repo root)"
+        ))
+        assert calls[1:] == [[
+            "git", "-C", str(tmp_path), "stash", "push", "--include-untracked",
+            "-m", "worklink-leak-517-a1", "--", "leaked.py",
+        ]]
+    else:
+        assert result is validation
+        assert len(calls) == 1
+
+
 def test_outside_checkout_leak_is_quarantined_recoverably(tmp_path: Path) -> None:
     from mimir.worklink.orchestrator import _dirty_paths, _with_outside_checkout_detection
 
@@ -4334,7 +4620,7 @@ def test_run_epic_refuses_review_state_before_claim_or_factory_launch(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run_epic(701)
     )
 
-    assert result.status == "failed"
+    assert result.status == "refused"
     assert result.reason == "lifecycle_state_incompatible"
     assert not any(call[1:3] == ["locks", "claim"] for call in calls)
     assert not (repo / ".worklink").exists()
@@ -5856,6 +6142,7 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
         )
     )
 
+    assert result.status == "refused"
     assert result.reason == "concurrency cap reached (1/1 active claims)"
     before_claim = observed[0].pop("before_claim")
     assert callable(before_claim)
@@ -6953,7 +7240,7 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(tmp_path: Path
     completion_runner = _completion_runner(sandbox, case="success")
     gate_calls = []
 
-    def controller(args, cwd=None, *, text=True):
+    def controller(args, cwd=None, *, text=True, timeout=1800):
         if isinstance(args, str):
             gate_calls.append((args, cwd, text))
             return cp(args, stdout="all tests passed\n")
@@ -6987,18 +7274,19 @@ def test_factory_completion_with_real_evidence_and_wrapped_runner(tmp_path: Path
 
 @pytest.mark.parametrize("args", ["make test", ["git", "status"]])
 @pytest.mark.parametrize("text", [True, False])
-def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, text: bool) -> None:
+@pytest.mark.parametrize("options", [{}, {"timeout": 7}])
+def test_factory_git_runner_forwards_controller_options(tmp_path: Path, args, text: bool, options) -> None:
     from mimir.worklink.orchestrator import _factory_git_runner
 
     calls = []
     result = subprocess.CompletedProcess(args, 0, "ok" if text else b"ok", "" if text else b"")
 
-    def controller(args, cwd=None, *, text=True):
-        calls.append((args, cwd, text))
+    def controller(args, cwd=None, *, text=True, **kwargs):
+        calls.append((args, cwd, text, kwargs))
         return result
 
-    assert _factory_git_runner(controller)(args, tmp_path, text=text) is result
-    assert calls == [(args, tmp_path, text)]
+    assert _factory_git_runner(controller)(args, tmp_path, text=text, **options) is result
+    assert calls == [(args, tmp_path, text, options)]
 
 
 def test_factory_completion_requires_entire_success_conjunction(

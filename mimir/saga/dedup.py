@@ -578,6 +578,10 @@ def distinct_dedup_scopes(
     ).fetchall()
 
 
+# Independent of the thematic candidate cap; bound quadratic dedup work.
+MAX_DEDUP_CANDIDATES = 1000
+
+
 def _candidate_raws_for_dedup(
     conn: sqlite3.Connection,
     *,
@@ -653,8 +657,8 @@ def _candidate_raws_for_dedup(
         f"  a.origin_domain, a.visibility, a.integrity "
         f"FROM atoms a "
         f"WHERE {' AND '.join(where)} "
-        f"ORDER BY a.created_at",
-        params,
+        f"ORDER BY a.created_at LIMIT ?",
+        [*params, MAX_DEDUP_CANDIDATES],
     ).fetchall()
     cols = ("id", "content", "stream", "memory_type", "source_type",
             "created_at", "topics", "metadata", "is_pinned",

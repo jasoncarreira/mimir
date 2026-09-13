@@ -170,6 +170,7 @@ def _remote_runner(repo: Path, calls: list, *, issue_id: int, labels: list[str])
         *,
         cwd: Path | None = None,
         text: bool = True,
+        timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
         calls.append(args)
         if isinstance(args, str):
@@ -659,7 +660,7 @@ def test_run_persists_state_for_local_compute_then_clears(tmp_path: Path) -> Non
             (order.checkout / "changed.txt").write_text("hi\n", encoding="utf-8")
             return RawResult(0, order.transcript_root / "fake.json", "success", None)
 
-    def local_runner(args, *, cwd=None, text=True):
+    def local_runner(args, *, cwd=None, text=True, timeout=1800):
         calls.append(args)
         if isinstance(args, str):
             return cp(args, stdout="ok\n")

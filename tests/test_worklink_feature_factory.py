@@ -769,17 +769,12 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
     assert all("cwd" not in kwargs for _, kwargs in calls)
 
 
+@pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
 def test_recovery_launch_binds_opencode_to_factory_session(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
 ) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_text(
-        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", ambient_model)
+    _own_opencode_resolution(tmp_path, monkeypatch)
     order = WorkOrder(
         issue_id=1551,
         checkout=tmp_path,
@@ -803,17 +798,12 @@ def test_recovery_launch_binds_opencode_to_factory_session(
     assert argv[argv.index("--session") + 1] == "session-1"
 
 
+@pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
 def test_recovery_launch_uses_retained_legacy_run_id(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
 ) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
-    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
-    auth.parent.mkdir(parents=True)
-    auth.write_text(
-        json.dumps({"openai": {"type": "oauth", "refresh": "subscription"}}),
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", ambient_model)
+    _own_opencode_resolution(tmp_path, monkeypatch)
     order = WorkOrder(1551, tmp_path, "resume", None, 43200, env={})
 
     spec = FeatureFactoryBackend(entrypoint="/absolute/factory.js").work_spec(

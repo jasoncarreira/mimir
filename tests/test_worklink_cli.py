@@ -461,6 +461,53 @@ def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("content", ['{"issue": 4, "attempt": 1}', "", "corrupt"])
+def test_status_discovers_retained_publication_and_gives_clear_command(
+    tmp_path: Path, content: str,
+) -> None:
+    import shlex
+
+    home = tmp_path / "operator's home"
+    path = home / "state" / "worklink" / "publications" / "4.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(content)
+    (path.parent / "4.json.archived").write_text(content)
+    (path.parent / "invalid.json").write_text(content)
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        payload = [] if args[2] == "list" else {"labels": []}
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(payload), stderr="")
+
+    rows = worklink_status(home, runner=runner)
+    assert len(rows) == 1
+    assert rows[0].issue_id == 4
+    assert rows[0].classification == "publication-pending"
+    assert rows[0].disagreement is not None
+    assert "reconcile the remote PR/evidence" in rows[0].disagreement
+    command = rows[0].disagreement.split("clear command: ")[1]
+    assert shlex.split(command) == ["rm", "--", str(path)]
+    assert path.read_text() == content
+    path.unlink()
+    assert worklink_status(home, runner=runner) == []
+
+
+def test_status_retained_publication_preserves_live_state_and_label_errors(tmp_path: Path) -> None:
+    _state(tmp_path, 4, os.getpid(), ticks=process_start_ticks(os.getpid()),
+           started_at=datetime.now(UTC))
+    path = tmp_path / "state" / "worklink" / "publications" / "4.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("")
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="offline")
+
+    row = worklink_status(tmp_path, issue_ids=[4], runner=runner)[0]
+    assert row.classification == "running"
+    assert row.disagreement is not None
+    assert "labels unavailable: offline" in row.disagreement
+    assert "retained publication intent" in row.disagreement
+
+
 def test_status_explicit_ids_skip_open_issue_discovery(tmp_path: Path) -> None:
     calls: list[list[str]] = []
     _state(

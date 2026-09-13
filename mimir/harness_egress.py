@@ -44,7 +44,12 @@ def harness_sink_allowed(
     *,
     on_refusal: Callable[[str], None] | None = None,
 ) -> bool:
-    """Check one harness sink and record enforced or shadow denials."""
+    """Check one harness sink and record enforced or shadow denials.
+
+    Keep the per-decision census, including per-subscriber SSE checks: the
+    logger enqueues on the loop, never appending inline. Queue overflow is
+    counted by EventLogger rather than silently sampling these decisions.
+    """
     if auth_context is not None:
         ifc_labels = auth_context.ifc_state.current(ifc_labels)
     carrier_enforcement = getattr(auth_context, "enforcement_enabled", None)

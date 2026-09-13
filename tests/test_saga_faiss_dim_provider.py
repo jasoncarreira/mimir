@@ -111,8 +111,8 @@ def test_ensure_index_returns_none_when_provider_unavailable(
 
     index = store._ensure_index(conn)
     assert index is None
-    # And the miss is cached so we don't keep retrying the provider.
-    assert store._index_built is True
+    # A transient miss must remain retryable without restarting the store.
+    assert store._index_built is False
 
 
 # ─── populated DB never overrides the configured embedder ───────────

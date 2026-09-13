@@ -26,6 +26,84 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _event_log_read_barrier(monkeypatch, request):
+    """Drain accepted sync telemetry before test-side reads of owned logs.
+
+    A teardown-only flush is too late for assertions inside async tests. Keep
+    production writers asynchronous; intercept reads instead, including the
+    stat/exists check that often precedes a read. Track actual EventLogger
+    paths, not a filename convention (several tests use custom names).
+
+    The logger's own contract tests deliberately inspect an undrained queue
+    and retain explicit off-loop barriers. No production reader gets this
+    guarantee: see docs/event-log-consistency.md. Worker-thread IO must bypass
+    this hook, or the dedicated writer would wait for itself.
+    """
+    import builtins
+    import threading
+    from mimir import event_logger
+
+    if request.node.path.name == "test_event_logger.py":
+        yield
+        return
+
+    paths: set[str] = set()
+    owner_thread = threading.get_ident()
+    original_init = event_logger.EventLogger.__init__
+    original_open = Path.open
+    original_stat = Path.stat
+    original_builtin_open = builtins.open
+    flushing = False
+
+    def key(path):
+        return os.path.abspath(os.fspath(path))
+
+    def init(logger, path, *args, **kwargs):
+        original_init(logger, path, *args, **kwargs)
+        paths.add(key(path))
+
+    def barrier(path):
+        nonlocal flushing
+        if threading.get_ident() != owner_thread or flushing:
+            return
+        try:
+            owned = key(path) in paths
+        except TypeError:  # open() also accepts integer file descriptors
+            return
+        if owned:
+            flushing = True
+            try:
+                event_logger._SYNC_EXECUTOR.submit(lambda: None).result(timeout=10)
+            finally:
+                flushing = False
+
+    def path_open(path, mode="r", *args, **kwargs):
+        if "r" in mode or "+" in mode:
+            barrier(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    def path_stat(path, *args, **kwargs):
+        barrier(path)
+        return original_stat(path, *args, **kwargs)
+
+    def builtin_open(path, mode="r", *args, **kwargs):
+        if "r" in mode or "+" in mode:
+            barrier(path)
+        return original_builtin_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(event_logger.EventLogger, "__init__", init)
+    monkeypatch.setattr(Path, "open", path_open)
+    monkeypatch.setattr(Path, "stat", path_stat)
+    monkeypatch.setattr(builtins, "open", builtin_open)
+    try:
+        yield
+    finally:
+        # Finish this test's writes before its patches/temporary paths expire.
+        if paths:
+            event_logger._SYNC_EXECUTOR.submit(lambda: None).result(timeout=10)
+
+
 SYNTHETIC_MIMIR_UID = 42001
 SYNTHETIC_WORKLINK_UID = 42002
 SYNTHETIC_WORKLINK_GID = 42003

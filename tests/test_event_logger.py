@@ -393,6 +393,7 @@ async def test_feedback_v1_metadata_survives_redaction_and_jsonl_round_trip(
         owner_principal=None,
         detail=f"token={secret}",
     )
+    await asyncio.to_thread(logger.flush_sync)
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [record["event_version"] for record in records] == ["v1", "v1"]
@@ -618,3 +619,116 @@ def test_durable_process_lock_timeout_fails_instead_of_claiming_success(
     assert not path.exists()
     assert "process lock timed out" in caplog.text
     assert "failing durable append" in caplog.text
+
+
+def _hold_process_lock(path, ready, release):
+    with path.open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        ready.set()
+        release.wait(5)
+
+
+@pytest.mark.parametrize("contention", ["flock", "io_lock", "file_io"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["queued", "negative-control"])
+async def test_sync_logging_timer_latency(tmp_path, monkeypatch, contention, legacy):
+    """The negative control executes the old inline append, not a fake sleep caller."""
+    import time
+    import mimir.event_logger as event_logger
+
+    logger = EventLogger(tmp_path / "events.jsonl", "latency")
+    monkeypatch.setattr(event_logger, "_logger", logger)
+    process = None
+    release_timer = None
+    if contention == "flock":
+        ctx = multiprocessing.get_context("spawn")
+        ready, release = ctx.Event(), ctx.Event()
+        process = ctx.Process(
+            target=_hold_process_lock,
+            args=(logger._process_lock_path, ready, release),
+        )
+        process.start()
+        assert await asyncio.to_thread(ready.wait, 5)
+        unlock = release.set
+    elif contention == "io_lock":
+        logger._io_lock.acquire()
+        unlock = logger._io_lock.release
+    else:
+        original = logger._append_record_sync
+
+        def slow_append(record):
+            time.sleep(0.35)
+            original(record)
+
+        monkeypatch.setattr(logger, "_append_record_sync", slow_append)
+        unlock = None
+
+    async def timer():
+        start = asyncio.get_running_loop().time()
+        await asyncio.sleep(0.01)
+        return asyncio.get_running_loop().time() - start - 0.01
+
+    try:
+        timer_task = asyncio.create_task(timer())
+        await asyncio.sleep(0)  # Arm the timer before invoking the sync API.
+        if unlock is not None:
+            release_timer = threading.Timer(0.35, unlock)
+            release_timer.start()
+        if legacy:
+            # Exact pre-fix log_sync work: build record, then append inline.
+            logger._append_record_sync(logger._record("probe", {}))
+        else:
+            event_logger.log_event_sync("probe")
+        overshoot = await timer_task
+        if legacy:
+            assert overshoot >= 0.25, overshoot
+        else:
+            assert overshoot < 0.1, overshoot
+    finally:
+        if release_timer is not None:
+            await asyncio.to_thread(release_timer.join)
+        await asyncio.to_thread(logger.flush_sync)
+        if process is not None:
+            await asyncio.to_thread(process.join, 5)
+            assert process.exitcode == 0
+    assert json.loads(logger._path.read_text())["type"] == "probe"
+
+
+async def test_sync_queue_bounds_drops_and_fifo(tmp_path, monkeypatch, caplog):
+    import mimir.event_logger as event_logger
+
+    logger = EventLogger(tmp_path / "events.jsonl", "fifo")
+    await asyncio.to_thread(logger.flush_sync)
+    monkeypatch.setattr(event_logger, "_SYNC_SLOTS", threading.BoundedSemaphore(3))
+    logger._io_lock.acquire()
+    try:
+        for i in range(5):
+            logger.log_sync("queued", i=i)
+        assert logger.dropped_sync_records == 2
+        assert not logger._path.exists()
+    finally:
+        logger._io_lock.release()
+        await asyncio.to_thread(logger.flush_sync)
+    logger.log_sync("uncontended", i=5)
+    await asyncio.to_thread(logger.flush_sync)
+    # Non-loop completion still observes the same FIFO.
+    await asyncio.to_thread(logger.log_sync, "thread", i=6)
+    records = [json.loads(line) for line in logger._path.read_text().splitlines()]
+    assert [record["i"] for record in records] == [0, 1, 2, 5, 6]
+    assert "2 records dropped total" in caplog.text
+
+
+async def test_sync_queue_recovers_after_write_failure(tmp_path, monkeypatch, caplog):
+    logger = EventLogger(tmp_path / "events.jsonl", "failure")
+    original = logger._append_record_sync
+
+    def fail(record):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(logger, "_append_record_sync", fail)
+    logger.log_sync("failed")
+    await asyncio.to_thread(logger.flush_sync)
+    assert "disk unavailable" in caplog.text
+    monkeypatch.setattr(logger, "_append_record_sync", original)
+    logger.log_sync("recovered")
+    await asyncio.to_thread(logger.flush_sync)
+    assert json.loads(logger._path.read_text())["type"] == "recovered"

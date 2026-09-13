@@ -193,6 +193,9 @@ class MessageBuffer:
         return loaded
 
     def _append_in_memory(self, msg: Message) -> None:
+        # Normalize client IDs at live/replay ingress, not only during rendering.
+        if msg.msg_id is not None:
+            msg.msg_id = sanitize_prompt_field(msg.msg_id)
         ch = self._by_channel.get(msg.channel_id)
         if ch is None:
             ch = deque(maxlen=self.per_channel_max)

@@ -42,6 +42,54 @@ def reset_event_logger():
     _reset_logger_for_tests()
 
 
+@pytest.mark.parametrize("reader", ["text", "bytes", "open", "builtin", "exists", "tail"])
+async def test_shared_event_log_read_barrier(tmp_path, monkeypatch, reader):
+    """A held writer deterministically races every supported observation form."""
+    import json
+    import threading
+    from mimir._jsonl_tail import tail_jsonl_records
+
+    path = tmp_path / "custom-telemetry.jsonl"
+    logger = init_logger(path, session_id="read-barrier")
+    entered = threading.Event()
+    release = threading.Event()
+    original = logger._append_record_sync
+
+    def held_append(record):
+        entered.set()
+        assert release.wait(5)
+        original(record)
+
+    monkeypatch.setattr(logger, "_append_record_sync", held_append)
+    logger.log_sync("queued-read")
+    assert await asyncio.to_thread(entered.wait, 2)
+    # Release from a real thread: the test-only read barrier may block the
+    # loop, whereas production consumers must await an off-loop flush.
+    timer = threading.Timer(0.1, release.set)
+    timer.start()
+    try:
+        if reader == "exists":
+            assert path.exists()
+        elif reader == "tail":
+            assert [r["type"] for r in tail_jsonl_records(path)] == ["queued-read"]
+        else:
+            if reader == "text":
+                raw = path.read_text()
+            elif reader == "bytes":
+                raw = path.read_bytes()
+            elif reader == "open":
+                with path.open() as handle:
+                    raw = handle.read()
+            else:
+                with open(path) as handle:
+                    raw = handle.read()
+            assert json.loads(raw)["type"] == "queued-read"
+    finally:
+        release.set()
+        await asyncio.to_thread(timer.join)
+        await asyncio.to_thread(logger.flush_sync)
+
+
 async def _drain_task_callback() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -50,7 +98,7 @@ async def _drain_task_callback() -> None:
 @pytest.mark.asyncio
 async def test_spawn_background_logs_task_failure(tmp_path):
     events = tmp_path / "events.jsonl"
-    init_logger(events, session_id="test-session")
+    logger = init_logger(events, session_id="test-session")
     tasks: set[asyncio.Task[Any]] = set()
 
     async def fail() -> None:
@@ -63,6 +111,7 @@ async def test_spawn_background_logs_task_failure(tmp_path):
     await _drain_task_callback()
 
     assert task not in tasks
+    await asyncio.to_thread(logger.flush_sync)
     text = events.read_text()
     assert '"type": "background_task_failed"' in text
     assert '"name": "boom-task"' in text
@@ -73,7 +122,7 @@ async def test_spawn_background_logs_task_failure(tmp_path):
 @pytest.mark.asyncio
 async def test_spawn_background_cancel_is_not_failure(tmp_path):
     events = tmp_path / "events.jsonl"
-    init_logger(events, session_id="test-session")
+    logger = init_logger(events, session_id="test-session")
     tasks: set[asyncio.Task[Any]] = set()
     started = asyncio.Event()
 
@@ -90,6 +139,7 @@ async def test_spawn_background_cancel_is_not_failure(tmp_path):
     await _drain_task_callback()
 
     assert task not in tasks
+    await asyncio.to_thread(logger.flush_sync)
     assert not events.exists() or "background_task_failed" not in events.read_text()
 
 

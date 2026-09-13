@@ -98,7 +98,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_WORKER_IDLE_TIMEOUT_S` | int | `60` | Idle seconds before a channel worker is torn down. |
 | `MIMIR_MAX_CONCURRENT_POLLERS` | int | `8` | Semaphore cap on concurrent poller subprocesses (floor 1). |
 | `MIMIR_TURN_TIMEOUT_SECONDS` | int | `3600` | Per-turn wall-clock timeout on the model stream. `0` = no timeout. |
-| `MIMIR_POST_TURN_TIMEOUT_SECONDS` | int | `180` | Ceiling for post-model-loop awaits (finalize hooks, end-of-turn send). |
+| `MIMIR_POST_TURN_TIMEOUT_SECONDS` | int | `180` | Ceiling for finalize hooks after the model loop. Zero or negative values use the 180-second default, not an immediate timeout or an unlimited wait. Worklink continuation recovery uses a separate ceiling of 30 seconds, reduced to this value when positive and smaller. |
 | `MIMIR_DRAIN_TIMEOUT_SECONDS` | int | `30` | Graceful-drain bound on SIGTERM for in-flight turns. `0` = unbounded. Keep your supervisor's stop timeout ≥ this. |
 | `MIMIR_TOOL_CALL_BUDGET` | int | `200` | Per-turn tool-call budget; caps panic-search loops. `0` disables. |
 | `MIMIR_MAX_TURN_ITERATIONS` | int | `200` | Per-turn model-iteration ceiling; nudges at 75%/90%, hard-stops at 100%. `0` disables. |
