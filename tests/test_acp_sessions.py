@@ -1746,6 +1746,133 @@ async def test_detach_waits_for_prompt_before_reloading(
         await asyncio.gather(first, loading, cancellation_started, return_exceptions=True)
 
 
+@pytest.mark.parametrize(("route", "already_cancelling"), [
+    ("load", False), ("load", True), ("revalidate", False),
+])
+async def test_stalled_turn_detach_refuses_within_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    already_cancelling: bool, route: str,
+) -> None:
+    bundle, core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    client = McpClient()
+    agent.on_connect(client)
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session("/one", mcp_servers=_hands("server"))).session_id
+    state = agent._sessions[session_id]
+    provider = state.provider
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(agent_module, "ACP_SESSION_DETACH_GRACE_SECONDS", 0.01)
+
+    async def turn(event: Any, **kwargs: Any) -> None:
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+            raise
+
+    core.run_turn = turn
+    prompting = asyncio.create_task(agent.prompt(
+        session_id, [sdk.TextContentBlock(type="text", text="stalled")],
+    ))
+
+    class Transport:
+        def __init__(self) -> None:
+            self.incoming: asyncio.Queue[Any] = asyncio.Queue()
+            self.outgoing: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def receive(self) -> Any:
+            return await self.incoming.get()
+
+        async def send(self, message: Any) -> None:
+            await self.outgoing.put(message)
+
+        async def close(self) -> None:
+            pass
+
+    dispatchers = []
+
+    def make_dispatcher(*args: Any, **kwargs: Any) -> Any:
+        dispatcher = sdk.BoundedMessageDispatcher(*args, **kwargs)
+        dispatchers.append(dispatcher)
+        return dispatcher
+
+    async def handle(method: str, params: Any, notification: bool) -> Any:
+        assert method == "session/load"
+        response = await agent.load_session("/two", session_id)
+        return response.model_dump(mode="json", by_alias=True)
+
+    transport = Transport()
+    connection = sdk.Connection(
+        handle, transport, listening=False,
+        state_store=sdk.StrictMessageStateStore(), dispatcher_factory=make_dispatcher,
+    )
+    runner = asyncio.create_task(connection.main_loop())
+    revalidating = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        active = state.active_prompt
+        assert active is not None
+        if already_cancelling:
+            await agent.cancel(session_id)
+        if route == "revalidate":
+            async def invalid_tools(candidate: SessionState) -> None:
+                raise agent_module.ProviderSchemaError("missing")
+
+            monkeypatch.setattr(agent, "_validate_tools", invalid_tools)
+            await agent.on_mcp_notification(
+                state.generation, provider.connection_id, "notifications/tools/list_changed", {},
+            )
+            revalidating = next(
+                task for task in agent._connection.tasks
+                if task.get_coro().__name__ == "_revalidate_provider"
+            )
+            with pytest.raises(sdk.RequestError, match="retry session/load"):
+                await asyncio.wait_for(asyncio.shield(revalidating), 1)
+
+        # Repeated wire requests must receive the specific refusal and return
+        # their dispatcher slots, even though the model remains stalled.
+        dispatcher = dispatchers[0]
+        capacity = dispatcher._runner_slots._value
+        for request_id in range(3):
+            await transport.incoming.put({
+                "jsonrpc": "2.0", "id": request_id, "method": "session/load",
+                "params": {"sessionId": session_id, "cwd": "/two"},
+            })
+            response = await asyncio.wait_for(transport.outgoing.get(), 1)
+            assert response["id"] == request_id
+            assert response["error"]["code"] == -32003
+            assert "retry session/load" in response["error"]["message"]
+            async with asyncio.timeout(1):
+                while dispatcher._runner_tasks:
+                    await asyncio.sleep(0)
+            assert dispatcher._runner_slots._value == capacity
+            assert agent._sessions[session_id] is state
+            assert state.active_prompt is active
+            assert state.dirty
+            assert not active.completed.is_set()
+            assert not release.is_set()
+            with pytest.raises(sdk.RequestError):
+                await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="blocked")])
+
+        release.set()
+        assert (await asyncio.wait_for(prompting, 1)).stop_reason == "cancelled"
+        monkeypatch.undo()
+        await agent.load_session("/retry", session_id)
+        assert agent._sessions[session_id] is not state
+    finally:
+        release.set()
+        await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), 2)
+        if revalidating is not None:
+            await asyncio.wait_for(asyncio.gather(revalidating, return_exceptions=True), 2)
+        await transport.incoming.put(None)
+        await asyncio.wait_for(runner, 2)
+        await connection.close()
+
+
 @pytest.mark.parametrize("route", ["drain", "ordered", "failure"])
 async def test_stalled_read_peer_prompt_then_load_is_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
