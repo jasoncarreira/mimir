@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -8,7 +9,7 @@ import pytest
 
 from mimir.agent import Agent, _DEFAULT_SYSTEM_PROMPT
 from mimir.config import Config
-from mimir.event_logger import init_logger
+from mimir.event_logger import get_logger, init_logger
 from mimir.history import MessageBuffer
 from mimir.index import IndexGenerator
 from mimir.turn_logger import TurnLogger
@@ -320,6 +321,7 @@ async def test_core_prompt_degraded_event_emits_only_on_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = _make_agent(tmp_path, monkeypatch)
+    logger = get_logger()
     capture = _stub_deepagent_build(monkeypatch)
 
     await agent._build_agent_if_needed()
@@ -328,6 +330,7 @@ async def test_core_prompt_degraded_event_emits_only_on_rebuild(
     await agent._build_agent_if_needed()
 
     assert len(capture.prompts) == 2
+    await asyncio.to_thread(logger.flush_sync)
     events = agent._config.events_log.read_text(encoding="utf-8")
     assert events.count('"type": "core_prompt_degraded"') == 2
 

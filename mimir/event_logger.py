@@ -13,6 +13,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, TextIO
@@ -25,6 +26,12 @@ log = logging.getLogger(__name__)
 FEEDBACK_EVENT_VERSION: Final[str] = "v1"
 PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
 PROCESS_LOCK_POLL_SECONDS = 0.01
+
+# One FIFO writer, separate from asyncio's pool: a contended flock must not
+# starve unrelated to_thread work. Admission includes the in-flight record.
+SYNC_QUEUE_CAPACITY = 1024
+_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="event-logger")
+_SYNC_SLOTS = threading.BoundedSemaphore(SYNC_QUEUE_CAPACITY)
 
 
 def _utc_now_iso() -> str:
@@ -64,6 +71,8 @@ class EventLogger:
         self._io_lock = threading.Lock()
         self._line_count = 0
         self._dir_ready = False
+        self.dropped_sync_records = 0
+        self._reported_sync_drops = 0
 
         self._ensure_dir(force=True)
         # CR2-#6: pre-2026-05-10 this read the entire file via
@@ -134,7 +143,7 @@ class EventLogger:
     ) -> None:
         """Append a pre-built record using synchronous file IO.
 
-        Called from ``log_sync`` directly and from ``log`` via
+        Called from ``log_sync`` on its dedicated worker and from ``log`` via
         ``asyncio.to_thread`` so ordinary awaited event logging does not do
         mkdir/open/write work on the event loop.
         """
@@ -211,20 +220,53 @@ class EventLogger:
             log.warning("events.jsonl write failed: %s", exc)
 
     def log_sync(self, event_type: str, **payload: Any) -> None:
-        """Synchronous append — see ``log_event_sync`` for callsite
-        rationale. No async lock acquisition; relies on POSIX
-        ``O_APPEND`` atomicity. Errors are swallowed at WARN (same as
-        the async path) so a misbehaving log sink never crashes the
-        primary work path."""
+        """Enqueue best-effort telemetry without doing file IO on the loop.
+
+        The capacity try-lock never waits for a writer. Full queues drop the
+        newest record, counted in ``dropped_sync_records`` and reported by the
+        worker on its next write (not through a blocking loop-thread handler).
+        Non-loop callers retain synchronous completion. All accepted calls use
+        the same FIFO, so a later uncontended call cannot overtake queued work.
+        This is not the fsync/security contract of ``log_durable_sync``.
+        """
+        if not _SYNC_SLOTS.acquire(blocking=False):
+            self.dropped_sync_records += 1
+            return
         try:
             record = self._record(event_type, payload)
-            # chainlink #393: _append_record_sync holds _io_lock so this append
-            # can't interleave with _trim_sync's tail-read + rename on the worker
-            # thread.
-            self._append_record_sync(record)
-            # Trim deferred to the async path — see comment in log().
+
+            def append() -> None:
+                try:
+                    self._append_record_sync(record)
+                    dropped = self.dropped_sync_records
+                    if dropped != self._reported_sync_drops:
+                        log.warning(
+                            "events.jsonl sync queue overflow: %d records dropped total",
+                            dropped,
+                        )
+                        self._reported_sync_drops = dropped
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("events.jsonl sync write failed: %s", exc)
+                finally:
+                    _SYNC_SLOTS.release()
+
+            future = _SYNC_EXECUTOR.submit(append)
         except Exception as exc:  # noqa: BLE001
+            _SYNC_SLOTS.release()
             log.warning("events.jsonl sync write failed: %s", exc)
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            future.result()
+
+    def flush_sync(self) -> None:
+        """Wait for previously submitted sync writes; call only off-loop.
+
+        The shared executor is also joined at normal interpreter shutdown.
+        Abrupt termination can lose queued best-effort telemetry.
+        """
+        _SYNC_EXECUTOR.submit(lambda: None).result()
 
     def log_durable_sync(self, event_type: str, **payload: Any) -> None:
         """Append and fsync a security-sensitive event.
@@ -332,13 +374,14 @@ async def log_event(event_type: str, **payload: Any) -> None:
 
 
 def log_event_sync(event_type: str, **payload: Any) -> None:
-    """Sync variant for callsites that can't await — e.g. langchain
-    ``rate_limit_callback`` invoked inline on the chat model's response
-    path. POSIX ``O_APPEND`` keeps writes atomic at the OS level for
-    records well under ``PIPE_BUF`` (4 KB on Linux), so the sync path
-    doesn't interleave with the async writer even when both fire at the
-    same time. Trimming is intentionally deferred — the next async
-    ``log_event`` will catch up on the line-count check."""
+    """Best-effort sync API; loop callers enqueue rather than wait for file IO.
+
+    A bounded FIFO preserves accepted sync-call order. Overflow drops newest
+    and increments the logger's ``dropped_sync_records`` counter. The worker
+    retains both the thread lock and sibling flock discipline. Trimming remains
+    deferred to ``log_event``. Use ``log_durable_event_sync`` for fsync with
+    propagated failures, not this telemetry API.
+    """
     get_logger().log_sync(event_type, **payload)
 
 

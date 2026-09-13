@@ -79,6 +79,17 @@ asserting shared state.** Fix the assertion, not the ordering. Do not reach for
 ordering plugins, `importlib.reload`, or fixtures that reset globals — those hide
 the coupling instead of removing it.
 
+### Observing queued telemetry in tests
+
+`log_event_sync` queues best-effort writes when called on an event loop.
+The shared `tests/conftest.py` read barrier drains accepted writes before
+main-test-thread reads of paths owned by an EventLogger; do not patch the
+production logger back to inline IO to make assertions pass. Queue contract
+tests in `test_event_logger.py` deliberately opt out. Worker-thread reads,
+raw descriptors, and subprocess consumers need explicit synchronization.
+See [Event-log read consistency](docs/event-log-consistency.md) for the
+reader audit, exact coverage, and production consistency requirements.
+
 ### Don't assert on ambient state you don't own
 
 Asserting on mutable process state is fine when that state is the *subject* of the

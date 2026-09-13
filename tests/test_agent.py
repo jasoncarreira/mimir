@@ -6263,6 +6263,11 @@ async def test_acp_refused_final_text_surfaces_turn_level_outcome(
     assert "super-secret" not in serialized
     assert "/absolute/controller" not in serialized
     assert "api.provider.example" not in serialized
+    # Sink-denial telemetry is queued on the event loop. Drain the dedicated
+    # writer before inspecting the JSONL rather than racing its worker thread.
+    from mimir.event_logger import get_logger
+
+    await asyncio.to_thread(get_logger().flush_sync)
     events = [
         json.loads(line)
         for line in (tmp_path / "home" / "logs" / "events.jsonl").read_text().splitlines()
