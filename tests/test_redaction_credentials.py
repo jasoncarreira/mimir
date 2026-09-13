@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import re
+import statistics
 import time
 
 import pytest
@@ -121,12 +122,36 @@ def test_benign_structured_keys() -> None:
     assert turn_event_redaction.scrub_value(value) == value
 
 
-@pytest.mark.parametrize("fragment", ["monkey", "key", "private_key", "credential"])
+@pytest.mark.parametrize("fragment", [
+    "monkey", "key", "private_key", "credential", "authorization",
+])
 def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
-    text = (fragment * (65536 // len(fragment) + 1))[:65536]
-    start = time.process_time()
-    assert redaction.redact_text(text) == text
-    assert time.process_time() - start < 0.150
+    texts = {
+        size: (fragment * (size // len(fragment) + 1))[:size]
+        for size in (65536, 131072)
+    }
+    # Warm both paths before measuring; neither input contains YAML block
+    # indicators, so doubling does not switch between parser and scanner paths.
+    for text in texts.values():
+        assert redaction.redact_text(text) == text
+
+    samples: dict[int, list[float]] = {size: [] for size in texts}
+    for trial in range(5):
+        # Alternate order and take medians to reduce sensitivity to transient
+        # runner noise. Time only redaction, not input construction or assertions.
+        sizes = list(texts) if trial % 2 == 0 else list(reversed(texts))
+        for size in sizes:
+            start = time.process_time()
+            result = redaction.redact_text(texts[size])
+            elapsed = time.process_time() - start
+            assert result == texts[size]
+            samples[size].append(elapsed)
+
+    t_1x = statistics.median(samples[65536])
+    t_2x = statistics.median(samples[131072])
+    # Linear work should grow ~2x; 3x allows noise while remaining below the
+    # ~4x growth of quadratic backtracking. No machine-specific time deadline.
+    assert t_2x < t_1x * 3, (fragment, t_1x, t_2x)
 
 
 def test_shared_pattern_registration() -> None:
