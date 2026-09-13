@@ -227,41 +227,64 @@ async def _git_once(
     return GitResult(stdout=stdout, stderr=stderr)
 
 
+CLEANUP_JOIN_TIMEOUT = 15.0
+
+
+class GitCleanupTimeout(RuntimeError):
+    """Owned Git cleanup did not finish; repository recovery is not safe."""
+
+
+def _consume_cleanup_result(task: asyncio.Future) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
 async def _finish_cleanup(awaitable: Any) -> Any:
-    """Join owned cleanup despite repeated cancellation, then propagate it."""
+    """Join cleanup against one deadline, even if the caller is cancelled again.
+
+    asyncio.wait bounds the join without waiting for the owned task to accept
+    cancellation (unlike wait_for(task)). Timeout is a hard failure, not proof
+    that cleanup completed: callers must not start recovery on that basis.
+    """
     task = asyncio.ensure_future(awaitable)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CLEANUP_JOIN_TIMEOUT
     cancelled = None
     while not task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            task.cancel()
+            task.add_done_callback(_consume_cleanup_result)
+            log.error("Git cleanup did not join within %ss", CLEANUP_JOIN_TIMEOUT)
+            raise GitCleanupTimeout("Git cleanup deadline exceeded")
         try:
-            await asyncio.shield(task)
+            await asyncio.wait([task], timeout=remaining)
         except asyncio.CancelledError as exc:
             cancelled = exc
-        except BaseException:
-            break
-    try:
-        return task.result()
-    finally:
-        if cancelled is not None:
-            raise cancelled
+    # Nested cleanup failure must not become an ordinary cancellation, which
+    # would let a caller attempt rebase recovery over an outstanding writer.
+    if not task.cancelled() and isinstance(task.exception(), GitCleanupTimeout):
+        raise task.exception()
+    if cancelled is not None:
+        _consume_cleanup_result(task)
+        raise cancelled
+    return task.result()
 
 
 async def _reap_git_process(proc: asyncio.subprocess.Process) -> None:
     try:
-        if os.name == "posix":
-            # The leader may already have exited while a hook/transport still
-            # holds its pipes or writes to the repository. Kill the whole session's
-            # initial process group before allowing recovery (notably rebase abort).
-            os.killpg(proc.pid, signal.SIGKILL)
-        elif proc.returncode is None:
-            proc.kill()
-    except ProcessLookupError:
+        if proc.returncode is None:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+    except (ProcessLookupError, PermissionError):
         pass
-    try:
-        # wait() alone can hang on paused pipe transports after communicate was
-        # cancelled. Restart the readers and drain both pipes through EOF first.
-        await proc.communicate()
-    finally:
-        await proc.wait()
+    # wait() alone can hang on paused pipe transports after communicate was
+    # cancelled. Restart readers first. Do not await again in a finally: when
+    # the join deadline cancels this drain, that would strand the cleanup task.
+    await proc.communicate()
+    await proc.wait()
 
 
 async def _git_bytes(
@@ -289,8 +312,11 @@ async def _git_bytes(
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
-    finally:
+    except BaseException:
         await _finish_cleanup(_reap_git_process(proc))
+        raise
+    # communicate() already drained the pipes and reaped the successful child.
+    # Its PID is no longer ours; neither signal it nor communicate a second time.
     return proc.returncode, stdout_b, stderr_b
 
 

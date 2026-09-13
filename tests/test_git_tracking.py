@@ -68,6 +68,7 @@ async def test_git_group_drained_before_rebase_abort(
     spawn = asyncio.create_subprocess_exec
     ready = asyncio.Event()
     processes, child_fds, aborted = [], [], []
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
     child_source = (
         "import fcntl, os, time; guard = open('writer.lock', 'w'); "
         "fcntl.flock(guard, fcntl.LOCK_EX); print(os.getpid(), flush=True); "
@@ -126,6 +127,15 @@ async def test_git_group_drained_before_rebase_abort(
         # use wait_for(task): cancellation-resistant cleanup could hang that too.
         done, _ = await asyncio.wait([task], timeout=5)
         assert task in done, "Git cleanup hung on inherited or paused pipes"
+        if parent_exited:
+            # The child deliberately outlives an already-reaped group leader.
+            # Its former numeric PID is not authority to signal a group. Bound
+            # the failed drain and refuse rebase recovery while the writer lives.
+            with pytest.raises(git_tracking.GitCleanupTimeout):
+                await task
+            assert aborted == []
+            assert not select.select([child_fds[0]], [], [], 0)[0]
+            return
         if cancel:
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -144,14 +154,27 @@ async def test_git_group_drained_before_rebase_abort(
         for fd in child_fds:
             if not select.select([fd], [], [], 0)[0]:
                 signal.pidfd_send_signal(fd, signal.SIGKILL)
-        for proc in processes:
-            if proc.returncode is None:
-                proc.kill()
-            await proc.communicate()
-            await proc.wait()
-        await asyncio.gather(task, return_exceptions=True)
-        for fd in child_fds:
-            os.close(fd)
+        async def bounded_join(awaitable):
+            owned = asyncio.ensure_future(awaitable)
+            done, _ = await asyncio.wait([owned], timeout=2)
+            if not done:
+                owned.cancel()
+                owned.add_done_callback(git_tracking._consume_cleanup_result)
+            elif not owned.cancelled():
+                # Cleanup must not replace the original assertion/exception.
+                owned.exception()
+
+        try:
+            for proc in processes:
+                if proc.returncode is None:
+                    proc.kill()
+                await bounded_join(proc.communicate())
+                await bounded_join(proc.wait())
+            task.cancel()
+            await bounded_join(task)
+        finally:
+            for fd in child_fds:
+                os.close(fd)
 
 
 @pytest.mark.asyncio
@@ -214,6 +237,102 @@ async def test_subprocess_failure_kills_and_reaps(tmp_path, fake_git_process, bl
         proc.kill_group.assert_called_once_with()
     assert proc.communicate.await_count == 2
     proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_git_never_signals_or_communicates_twice(
+    tmp_path, fake_git_process, returncode,
+):
+    proc = fake_git_process
+    proc.returncode = returncode
+    assert await git_tracking._git_bytes("status", cwd=tmp_path, timeout=1) == (
+        returncode, b"", b"",
+    )
+    proc.kill_group.assert_not_called()
+    proc.communicate.assert_awaited_once()
+    proc.wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaper_does_not_signal_reaped_pid(fake_git_process):
+    proc = fake_git_process
+    proc.returncode = 0
+    await git_tracking._reap_git_process(proc)
+    proc.kill_group.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_deadline_survives_repeated_cancellation(monkeypatch, caplog):
+    monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 0.05)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def resistant():
+        started.set()
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+
+    owned = asyncio.create_task(resistant())
+    joiner = asyncio.create_task(git_tracking._finish_cleanup(owned))
+    await started.wait()
+
+    async def cancel_repeatedly():
+        while not joiner.done():
+            joiner.cancel()
+            await asyncio.sleep(0.005)
+
+    canceller = asyncio.create_task(cancel_repeatedly())
+    try:
+        done, _ = await asyncio.wait([joiner], timeout=1)
+        assert joiner in done, "cancellation reset or escaped the cleanup deadline"
+        with pytest.raises(git_tracking.GitCleanupTimeout):
+            await joiner
+        assert "Git cleanup did not join" in caplog.text
+        assert not owned.done()  # Bounded join does not pretend the work stopped.
+    finally:
+        release.set()
+        canceller.cancel()
+        await asyncio.gather(owned, canceller, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_is_not_hidden_by_outer_cancellation():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        raise git_tracking.GitCleanupTimeout("nested failure")
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(git_tracking.GitCleanupTimeout, match="nested failure"):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_cleanup_propagates_cancellation_after_success(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def cleanup():
+        started.set()
+        await release.wait()
+        return 42
+
+    task = asyncio.create_task(git_tracking._finish_cleanup(cleanup()))
+    await started.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio
