@@ -4854,6 +4854,182 @@ async def test_missed_completion_trigger_recovers_on_timed_fire(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
+async def test_trigger_fifo_bounds_unterminated_record_and_recovers(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    valid = b'{"poller":"ready","reason":"completed"}\n'
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for chunk in [b"x" * 65536, b"x", b"x" * 65536, b"x" * 65536]:
+            with mock.patch("mimir.scheduler.os.read", return_value=chunk):
+                sched._read_poller_trigger_signals()
+            assert len(sched._poller_trigger_buffer) <= 65536
+        await asyncio.gather(*sched._background_tasks)
+        assert [e["type"] for e in _scheduler_events(tmp_path)] == [
+            "poller_fire_trigger_invalid",
+        ]
+        trigger.assert_not_called()
+        # A syntactically valid suffix still belongs to the rejected record.
+        with mock.patch("mimir.scheduler.os.read", return_value=valid + valid):
+            sched._read_poller_trigger_signals()
+        trigger.assert_called_once_with("ready", reason="completed")
+    await asyncio.gather(*sched._background_tasks)
+    assert len(_scheduler_events(tmp_path)) == 1
+    assert sched._poller_trigger_buffer == b""
+
+
+@pytest.mark.asyncio
+async def test_trigger_fifo_rejects_completed_oversize_record_only(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    valid = b'{"poller":"ready","reason":"completed"}\n'
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for chunk in [valid + b"x" * 60000, b"x" * 5537 + b"\n" + valid]:
+            with mock.patch("mimir.scheduler.os.read", return_value=chunk):
+                sched._read_poller_trigger_signals()
+        assert trigger.call_args_list == [mock.call("ready", reason="completed")] * 2
+    await asyncio.gather(*sched._background_tasks)
+    assert [e["type"] for e in _scheduler_events(tmp_path)] == ["poller_fire_trigger_invalid"]
+    assert sched._poller_trigger_buffer == b""
+
+
+@pytest.mark.asyncio
+async def test_trigger_fifo_large_readiness_batch_and_boundary_record(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    prefix = b'{"poller":"ready","reason":"'
+    suffix = b'"}'
+    reason = b"r" * (65536 - len(prefix) - len(suffix))
+    record = prefix + reason + suffix
+    small = b'{"poller":"ready","reason":"completed"}\n'
+    payload = record + b"\n" + small * 4000
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        for offset in range(0, len(payload), 65536):
+            with mock.patch("mimir.scheduler.os.read", return_value=payload[offset:offset + 65536]):
+                sched._read_poller_trigger_signals()
+        assert trigger.call_count == 4001
+        assert trigger.call_args_list[0] == mock.call("ready", reason=reason.decode())
+        assert trigger.call_args_list[1:] == [mock.call("ready", reason="completed")] * 4000
+    assert sched._poller_trigger_buffer == b""
+    assert not sched._background_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [BlockingIOError(), OSError("read failed")])
+async def test_trigger_fifo_read_errors_preserve_partial_record(tmp_path: Path, error):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    sched._poller_trigger_fd = 123
+    sched._poller_trigger_buffer = b'{"poller":"ready",'
+    with mock.patch("mimir.scheduler.os.read", side_effect=error):
+        sched._read_poller_trigger_signals()
+    with mock.patch.object(sched, "trigger_poller") as trigger:
+        with mock.patch("mimir.scheduler.os.read", return_value=b'"reason":"completed"}\n'):
+            sched._read_poller_trigger_signals()
+        trigger.assert_called_once_with("ready", reason="completed")
+
+
+@pytest.mark.asyncio
+async def test_reinstall_prunes_retired_poller_maps(tmp_path: Path):
+    from dataclasses import replace
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "kept", priority="normal")
+    sched.add_poller_jobs(skills)
+    kept = sched._pollers["kept"]
+    with mock.patch.object(sched, "_fire_poller_once", new_callable=mock.AsyncMock):
+        await sched._fire_poller(poller_name="kept")
+        kept_lock = sched._poller_fire_locks["kept"]
+        for i in range(20):
+            retired = replace(kept, name=f"retired-{i}")
+            sched._apply_reinstall([kept, retired], [], [])
+            await sched._fire_poller(poller_name=retired.name)
+            sched._poller_cadence_seconds(retired)
+        sched._poller_cadence_seconds(kept)
+        updated = replace(kept, cron="0 0 * * *")
+        sched._apply_reinstall([updated], [], [])
+    assert sched._poller_fire_locks == {"kept": kept_lock}
+    assert sched._poller_cadence_cache == {}
+    sched._poller_cadence_seconds(updated)
+    sched._apply_reinstall([updated], [], [])
+    assert set(sched._poller_cadence_cache) == {("kept", updated.cron)}
+
+
+@pytest.mark.asyncio
+async def test_reinstall_preserves_lock_during_pending_waiter_handoff(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    poller = sched._pollers["p1"]
+    lock = sched._poller_fire_locks.setdefault("p1", asyncio.Lock())
+    await lock.acquire()
+    waiting = asyncio.Event()
+
+    async def fire():
+        waiting.set()
+        await sched._fire_poller(poller_name="p1")
+
+    with mock.patch.object(sched, "_fire_poller_once", new_callable=mock.AsyncMock):
+        task = asyncio.create_task(fire())
+        try:
+            await asyncio.wait_for(waiting.wait(), 5)
+            assert not task.done()
+            lock.release()
+            # No await: the waiter is runnable but has not acquired the lock.
+            assert not lock.locked()
+            sched._apply_reinstall([], [], [])
+            assert sched._poller_fire_locks["p1"] is lock
+            sched._apply_reinstall([poller], [], [])
+            assert sched._poller_fire_locks["p1"] is lock
+            await asyncio.wait_for(task, 5)
+            sched._apply_reinstall([], [], [])
+            assert sched._poller_fire_locks == {}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_retired_poller_lock_reclaimed_after_waiter_cancellation(tmp_path: Path):
+    sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock())
+    skills = tmp_path / "skills"
+    _drop_priority_poller(skills, "p1", priority="normal")
+    sched.add_poller_jobs(skills)
+    entered = asyncio.Event()
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def once(**kwargs):
+        entered.set()
+        await release.wait()
+
+    async def waiter():
+        waiting.set()
+        await sched._fire_poller(poller_name="p1")
+
+    tasks = []
+    with mock.patch.object(sched, "_fire_poller_once", new=once):
+        try:
+            tasks.append(asyncio.create_task(sched._fire_poller(poller_name="p1")))
+            await asyncio.wait_for(entered.wait(), 5)
+            lock = sched._poller_fire_locks["p1"]
+            tasks.append(asyncio.create_task(waiter()))
+            await asyncio.wait_for(waiting.wait(), 5)
+            sched._apply_reinstall([], [], [])
+            tasks[1].cancel()
+            await asyncio.gather(tasks[1], return_exceptions=True)
+            assert sched._poller_fire_locks == {"p1": lock}
+            release.set()
+            await asyncio.wait_for(tasks[0], 5)
+            assert sched._poller_fire_locks == {}
+            assert sched._poller_fire_users == {}
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_completion_fifo_reaches_triggered_poller(tmp_path: Path, monkeypatch):
     from mimir.event_logger import init_logger
     from mimir.poller_triggers import notify_poller

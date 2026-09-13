@@ -73,9 +73,10 @@ class _Inflight:
     active: bool = True
 
 
-# channel_id -> in-flight state. Guarded by ``_LOCK`` because ``before_model``
-# may run in a worker thread while the dispatcher (event loop) calls
-# ``inject_message``.
+# channel_id -> in-flight state. The current LangChain/LangGraph async path
+# calls our sync ``before_model`` directly on the event loop, not in a worker.
+# Keep ``_LOCK`` as defensive protection for synchronous/threaded callers;
+# critical sections must stay short and must not perform blocking I/O.
 _REGISTRY: dict[str, _Inflight] = {}
 _LOCK = threading.Lock()
 
@@ -112,8 +113,8 @@ def deactivate(
     entry. ``leftovers`` are queued-but-not-folded events accepted after the
     final ``before_model`` boundary; ``folded`` and ``deferred`` are the durable
     visibility snapshots that ``run_turn`` records/re-enqueues. Taking all three
-    snapshots atomically prevents a worker-thread ``before_model`` drain from
-    moving events from ``queue`` to ``folded`` between separate
+    snapshots atomically also protects against a concurrent synchronous caller
+    draining events from ``queue`` to ``folded`` between separate
     ``folded_records()``/``deferred_records()`` reads and deactivation.
     """
     if not channel_id:
@@ -490,6 +491,8 @@ class MidTurnInjectionMiddleware(AgentMiddleware):
     which is every turn until the dispatcher feeds it (PR 2)."""
 
     def before_model(self, state, runtime):  # noqa: ANN001 — langchain hook shape
+        # Sync does not mean off-loop: the current framework calls this body
+        # directly on the event loop during async runs. Keep it nonblocking.
         pending = _drain(_current_channel_id())
         if not pending:
             return None  # common case: one dict lookup, no state change

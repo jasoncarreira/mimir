@@ -105,6 +105,59 @@ async def test_semaphore_enforces_concurrency(monkeypatch: pytest.MonkeyPatch) -
     assert order == ["first", "second"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_cap,new_cap", [(1, 3), (3, 1)])
+async def test_capacity_change_waits_for_holders_and_waiters(
+    monkeypatch: pytest.MonkeyPatch, old_cap: int, new_cap: int,
+) -> None:
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", str(old_cap))
+    guard = _spawn_guard_init()
+    sem = guard.sem
+    for _ in range(old_cap):
+        await sem.acquire()
+    waiter = asyncio.create_task(sem.acquire())
+    await asyncio.sleep(0)
+    try:
+        monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", str(new_cap))
+        assert _spawn_guard_init().sem is sem
+        assert guard.max_concurrent == old_cap
+        assert not waiter.done()
+        # A released permit is reserved for the queued waiter, not idle capacity.
+        sem.release()
+        assert _spawn_guard_init().sem is sem
+        await waiter
+        assert _spawn_guard_init().sem is sem
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+        for _ in range(old_cap):
+            sem.release()
+    assert _spawn_guard_init().max_concurrent == new_cap
+    assert guard.sem is not sem
+    for _ in range(new_cap):
+        await guard.sem.acquire()
+    assert guard.sem.locked()
+    for _ in range(new_cap):
+        guard.sem.release()
+
+
+@pytest.mark.asyncio
+async def test_capacity_change_preserves_partially_occupied_semaphore(monkeypatch):
+    monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "3")
+    guard = _spawn_guard_init()
+    sem = guard.sem
+    await sem.acquire()
+    try:
+        assert not sem.locked()
+        monkeypatch.setenv("MIMIR_SPAWN_MAX_CONCURRENT", "1")
+        assert _spawn_guard_init().sem is sem
+        assert guard.max_concurrent == 3
+    finally:
+        sem.release()
+    assert _spawn_guard_init().max_concurrent == 1
+
+
 def test_reset_clears_loop_bound_state() -> None:
     guard = _spawn_guard_init()
     guard.recent.extend((1.0, 2.0))

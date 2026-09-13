@@ -1253,13 +1253,13 @@ def register_routes(
             live_events_active[bucket] = live_events_active.get(bucket, 0) + 1
             return True
 
-    async def _release_live_event_slot(bucket: tuple[str, str]) -> None:
-        async with live_events_lock:
-            remaining = live_events_active[bucket] - 1
-            if remaining:
-                live_events_active[bucket] = remaining
-            else:
-                del live_events_active[bucket]
+    def _release_live_event_slot(bucket: tuple[str, str]) -> None:
+        # No await: loop-local accounting is atomic and survives repeated cancellation.
+        remaining = live_events_active[bucket] - 1
+        if remaining:
+            live_events_active[bucket] = remaining
+        else:
+            del live_events_active[bucket]
 
     async def _live_event_items(
         request: web.Request,
@@ -1355,7 +1355,7 @@ def register_routes(
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
-            await _release_live_event_slot(bucket)
+            _release_live_event_slot(bucket)
         return resp
 
     turn_events_active: dict[tuple[str, str], int] = {}
@@ -1368,13 +1368,13 @@ def register_routes(
             turn_events_active[bucket] = turn_events_active.get(bucket, 0) + 1
             return True
 
-    async def _release_turn_event_slot(bucket: tuple[str, str]) -> None:
-        async with turn_events_lock:
-            remaining = turn_events_active[bucket] - 1
-            if remaining:
-                turn_events_active[bucket] = remaining
-            else:
-                del turn_events_active[bucket]
+    def _release_turn_event_slot(bucket: tuple[str, str]) -> None:
+        # No await: loop-local accounting is atomic and survives repeated cancellation.
+        remaining = turn_events_active[bucket] - 1
+        if remaining:
+            turn_events_active[bucket] = remaining
+        else:
+            del turn_events_active[bucket]
 
     async def turn_events_stream(request: web.Request) -> web.StreamResponse:
         """Live SSE stream of in-turn events (chainlink #583 slice 1).
@@ -1439,7 +1439,7 @@ def register_routes(
         finally:
             if queue is not None:
                 turn_event_bus.unsubscribe(channel, queue)
-            await _release_turn_event_slot(bucket)
+            _release_turn_event_slot(bucket)
         return resp
 
     async def react_app(request: web.Request) -> web.StreamResponse:
