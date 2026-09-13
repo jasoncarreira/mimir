@@ -3833,6 +3833,8 @@ def _comment_evidence(
         f" test_env={json.dumps(evidence.test_env, sort_keys=True)}"
     )
     reasons = f"\nReasons: {', '.join(validation.reasons)}" if validation.reasons else ""
+    if tests is not None and tests.skipped_reason is not None:
+        summary += f" skipped_reason={json.dumps(redact_text(tests.skipped_reason)[:1000])}"
     # chainlink #815: the failed gate-test output otherwise dies with the worker
     # container; the issue comment is the per-leaf surface the planner (and the
     # next dispatch's groomer) actually reads.
