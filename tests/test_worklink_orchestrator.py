@@ -2397,8 +2397,21 @@ def test_published_transition_failure_is_reaped_to_review(
         agent_id="reaper", home_path=tmp_path, runner=runner, max_attempts=1,
         clock=lambda: datetime.now(UTC) + timedelta(days=1),
     )
-    records = claim_records_from_comments(comments)
-    assert len(records) == 1
+    history = claim_records_from_comments(comments)
+    # The controller gate now yields to the finalization heartbeat. Its comment
+    # refreshes the SAME claim; it is not a second admission or a reaper record.
+    # Keep the exact single-admission guard and validate every refresh rather
+    # than weakening the history length assertion to allow arbitrary records.
+    admissions = [record for record in history if record.heartbeat_at is None]
+    assert len(admissions) == 1
+    admission = admissions[0]
+    heartbeats = [record for record in history if record.heartbeat_at is not None]
+    assert heartbeats
+    assert all(replace(record, heartbeat_at=None) == admission for record in heartbeats)
+    assert all(record.heartbeat_at >= admission.claimed_at for record in heartbeats)
+    assert claims.attempts_used(comments) == 1
+    # reap_home selects the latest liveness anchor, not every historical comment.
+    records = [max(heartbeats, key=lambda record: record.heartbeat_at)]
     if release_first:
         fail_transition = False
         assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == []
