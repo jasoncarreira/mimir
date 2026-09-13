@@ -2769,7 +2769,12 @@ def _factory_git_runner(controller_runner: Runner) -> Runner:
     from .backends.feature_factory import _control_environment
     from .worker_client import factory_checkout_for_path, run_factory_control
 
-    def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    def run(
+        args: Sequence[str] | str,
+        cwd: Path | None = None,
+        *,
+        text: bool = True,
+    ) -> subprocess.CompletedProcess:
         if len(args) >= 3 and list(args[:2]) == ["git", "-C"]:
             binding = factory_checkout_for_path(Path(args[2]))
             if binding is not None:
@@ -2782,9 +2787,11 @@ def _factory_git_runner(controller_runner: Runner) -> Runner:
                 if stat.S_IMODE(boundary.st_mode) != 0o2700:
                     result = run_factory_control(root, args, env=_control_environment())
                     return subprocess.CompletedProcess(
-                        args, result.returncode, result.stdout.decode(), result.stderr.decode(),
+                        args, result.returncode,
+                        result.stdout.decode() if text else result.stdout,
+                        result.stderr.decode() if text else result.stderr,
                     )
-        return controller_runner(args)
+        return controller_runner(args, cwd=cwd, text=text)
 
     return run
 
