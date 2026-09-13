@@ -904,11 +904,11 @@ class Config:
     # allowing legitimate long heartbeat or reflection work.
     turn_timeout_seconds: int
 
-    # chainlink #389: ceiling for post-model-loop external awaits (finalize
-    # hooks, end-of-turn bridge.send). turn_timeout_seconds only bounds the
-    # model stream; without this a hung bridge send or operator finalize hook
+    # chainlink #389: ceiling for post-model-loop finalize hooks.
+    # turn_timeout_seconds only bounds the model stream; without this a hung hook
     # would hold the dispatcher worker forever and wedge the whole channel.
-    # Generous enough for a legitimate commitment-extraction LLM call.
+    # Nonpositive values use the 180-second default, matching continuation
+    # recovery's finite-default semantics (its separate default is 30 seconds).
     post_turn_timeout_seconds: int
 
     # chainlink #510: graceful-drain bound. On SIGTERM the dispatcher stops

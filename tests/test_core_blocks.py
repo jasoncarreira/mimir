@@ -69,6 +69,72 @@ def test_load_core_returns_empty_when_dir_missing(tmp_path: Path):
     assert load_core(tmp_path) == []
 
 
+def test_load_core_reports_each_unreadable_path_once(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from mimir import core_blocks as cb
+
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    healthy = core / "00-healthy.md"
+    healthy.write_text("Healthy core body.", encoding="utf-8")
+    unreadable = [core / "10-denied.md", core / "20-vanished.md"]
+    for path in unreadable:
+        path.touch()
+    original = cb.read_text_lossy
+
+    def read(path):
+        if path == unreadable[0]:
+            raise PermissionError("private error detail")
+        if path == unreadable[1]:
+            raise FileNotFoundError("private error detail")
+        return original(path)
+
+    monkeypatch.setattr(cb, "read_text_lossy", read)
+    monkeypatch.setattr(cb, "_UNREADABLE_CORE_REPORTED", set())
+    emit = Mock()
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", emit)
+    for _ in range(2):
+        blocks = load_core(tmp_path)
+        assert [b.path for b in blocks] == [healthy]
+        assert blocks[0].content == "Healthy core body."
+    assert emit.call_count == 2
+    for path, error in zip(unreadable, ["PermissionError", "FileNotFoundError"]):
+        emit.assert_any_call(
+            "core_prompt_degraded", reason="unreadable_core_file",
+            path=str(path), error_type=error,
+        )
+
+
+def test_load_core_read_reporting_failure_is_contained(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    from mimir import core_blocks as cb
+
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    (core / "00-denied.md").touch()
+    monkeypatch.setattr(cb, "_UNREADABLE_CORE_REPORTED", set())
+    monkeypatch.setattr(cb, "read_text_lossy", Mock(side_effect=OSError))
+    emit = Mock(side_effect=RuntimeError("logger unavailable"))
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", emit)
+    assert load_core(tmp_path) == []
+    assert load_core(tmp_path) == []
+    assert emit.call_count == 1
+
+
+def test_load_core_healthy_emits_no_event(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    core = tmp_path / "memory" / "core"
+    core.mkdir(parents=True)
+    (core / "00-healthy.md").write_text("Healthy body.", encoding="utf-8")
+    emit = Mock()
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", emit)
+    assert load_core(tmp_path)[0].content == "Healthy body."
+    emit.assert_not_called()
+
+
 def test_read_text_lossy_replaces_non_utf8_and_logs(tmp_path: Path, caplog):
     """A stray non-UTF-8 byte is replacement-decoded (not raised) and logged
     with the file + position — chainlink #470."""

@@ -353,6 +353,30 @@ def test_shell_registry_none_clears_registry_and_callback(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [True, False, "exception"])
+async def test_shell_completion_enqueue_feedback(monkeypatch, outcome):
+    from unittest.mock import AsyncMock
+    from mimir import agent as agent_module
+
+    enqueue = AsyncMock(return_value=outcome)
+    if outcome == "exception":
+        enqueue.side_effect = RuntimeError("dispatcher down")
+    telemetry = AsyncMock()
+    monkeypatch.setattr(agent_module, "log_event", telemetry)
+    agent = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(read_job_output=lambda *a, **kw: {}),
+        _dispatcher=SimpleNamespace(enqueue=enqueue),
+    )
+    await agent_module.Agent._on_shell_job_complete(agent, _FakeJob(channel_id="ch-1"))
+    kinds = [call.args[0] for call in telemetry.await_args_list]
+    assert kinds.count("shell_job_complete_enqueue_ok") == int(outcome is True)
+    assert kinds.count("shell_job_complete_enqueue_failed") == int(outcome is not True)
+    if outcome is False:
+        routed = next(call for call in telemetry.await_args_list if call.args[0] == "shell_job_complete_routed")
+        assert routed.kwargs["accepted"] is False
+
+
+@pytest.mark.asyncio
 async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2144,6 +2144,59 @@ class _RequeueCaptureDispatcher:
         return len(events)
 
 
+@pytest.mark.parametrize("shortfall", [False, True])
+@pytest.mark.parametrize("telemetry_fails", [False, True])
+async def test_injection_cleanup_restores_both_batches_before_telemetry(
+    tmp_path: Path, monkeypatch, shortfall, telemetry_fails,
+):
+    from mimir import agent as agent_module
+
+    deferred = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="deferred", source_id="d1",
+    )
+    leftover = AgentEvent(trigger="user_message", channel_id="ch-1", content="leftover")
+
+    class InjectingAgent(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            assert _mti.inject_message("ch-1", deferred) == "injected"
+            _mti._drain("ch-1")
+            assert _mti.defer_message("ch-1", "d1", "later") == "deferred"
+            assert _mti.inject_message("ch-1", leftover) == "injected"
+            async for chunk in super().astream(state, config=config, stream_mode=stream_mode):
+                yield chunk
+
+    cap = _RequeueCaptureDispatcher()
+    if shortfall:
+        def reject(events):
+            cap.requeued.extend(events)
+            return 0
+        cap.requeue_front = reject
+    observed = []
+    original_log_event = agent_module.log_event
+
+    async def telemetry(kind, **payload):
+        if kind in {"mid_turn_injection_leftover", "mid_turn_deferred", "mid_turn_message_loss"}:
+            assert [ev.content for ev in cap.requeued] == ["leftover", "deferred"]
+            observed.append((kind, payload))
+            if telemetry_fails:
+                raise OSError("telemetry unavailable")
+        else:
+            await original_log_event(kind, **payload)
+
+    monkeypatch.setattr(agent_module, "log_event", telemetry)
+    agent = _build_agent(tmp_path, fake_agent=InjectingAgent([AIMessage(content="ok")]), fake_saga=None)
+    agent._dispatcher = cap
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-1", content="first"))
+    assert record.output == "ok"
+    assert cap.requeued[1].extra["force_new_turn"] is True
+    assert [kind for kind, _ in observed if kind != "mid_turn_message_loss"] == [
+        "mid_turn_injection_leftover", "mid_turn_deferred",
+    ]
+    losses = [payload for kind, payload in observed if kind == "mid_turn_message_loss"]
+    assert len(losses) == (2 if shortfall else 0)
+    assert all(p["count"] == 1 and p["requeued"] == 0 and p["dropped"] == 1 for p in losses)
+
+
 async def test_run_turn_defers_folded_message(tmp_path: Path):
     """chainlink #384: a folded message the agent defers is (a) marked
     deferred=true in this turn's injected_inputs, and (b) re-enqueued as its own
@@ -4925,8 +4978,10 @@ async def test_run_turn_non_user_turn_does_not_arm_mid_turn_injection(
     assert _mti._drain("ch-1") == []
 
 
+@pytest.mark.parametrize("shortfall", [False, True])
+@pytest.mark.parametrize("telemetry_fails", [False, True])
 async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, shortfall, telemetry_fails,
 ):
     """chainlink #383 watch item: arming the injection registry before setup
     must still clean up if setup fails before the model-loop finally runs."""
@@ -4936,6 +4991,29 @@ async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
         fake_agent=_FakeAgent(response_messages=[AIMessage(content="unused")]),
         fake_saga=None,
     )
+
+    from mimir import agent as agent_module
+    cap = _RequeueCaptureDispatcher()
+    if shortfall:
+        def reject(events):
+            cap.requeued.extend(events)
+            return 0
+        cap.requeue_front = reject
+    agent._dispatcher = cap
+    losses = []
+    original_log_event = agent_module.log_event
+
+    async def telemetry(kind, **payload):
+        if kind in {"mid_turn_injection_leftover", "mid_turn_message_loss"}:
+            assert len(cap.requeued) == 1
+            if kind == "mid_turn_message_loss":
+                losses.append(payload)
+            if telemetry_fails:
+                raise OSError("telemetry unavailable")
+        else:
+            await original_log_event(kind, **payload)
+
+    monkeypatch.setattr(agent_module, "log_event", telemetry)
 
     async def failing_body(*_args: object, **_kwargs: object):
         assert _mti.inject_message(
@@ -4955,10 +5033,39 @@ async def test_run_turn_early_armed_injection_deactivates_on_setup_error(
             AgentEvent(trigger="user_message", channel_id="ch-1", content="first"),
         )
 
+    assert len(cap.requeued) == 1
+    assert len(losses) == int(shortfall)
+    if shortfall:
+        assert losses[0]["dropped"] == 1
     assert _mti.inject_message(
         "ch-1",
         AgentEvent(trigger="user_message", channel_id="ch-1", content="later"),
     ) == "no_active_turn"
+
+
+@pytest.mark.parametrize("configured", [0, -1, 7])
+async def test_finalize_timeout_normalizes_nonpositive_values(tmp_path: Path, monkeypatch, configured):
+    import asyncio
+    monkeypatch.setenv("MIMIR_POST_TURN_TIMEOUT_SECONDS", str(configured))
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="ok")]), fake_saga=None)
+    finalized = []
+    timeouts = []
+    original_wait_for = asyncio.wait_for
+
+    async def capture_wait_for(awaitable, timeout):
+        if getattr(awaitable, "cr_code", None) is not None and awaitable.cr_code.co_name == "fire_hooks":
+            timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    class FinalizeHook:
+        async def finalize(self, ctx, event, record):
+            finalized.append(record.turn_id)
+
+    monkeypatch.setattr(asyncio, "wait_for", capture_wait_for)
+    agent._hooks.append(FinalizeHook())
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-1", content="hi"))
+    assert finalized == [record.turn_id]
+    assert timeouts == [configured if configured > 0 else 180]
 
 
 async def test_run_turn_bounds_hung_finalize_hook(tmp_path: Path, monkeypatch):

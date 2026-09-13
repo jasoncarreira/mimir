@@ -14,6 +14,7 @@ LangChain message shapes mimir actually sees in production:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -992,9 +993,12 @@ def test_truncate_input_returns_string():
 
 
 def test_make_turn_id_unique_and_shaped():
+    from mimir.models import make_turn_id as model_make_turn_id
+
+    assert make_turn_id is model_make_turn_id
     ids = {make_turn_id() for _ in range(100)}
     assert len(ids) == 100  # collision-free
-    assert all(isinstance(t, str) and len(t) >= 8 for t in ids)
+    assert all(re.fullmatch(r"[0-9a-f]{16}", t) for t in ids)
 
 
 async def test_turn_logger_writes_appendable_jsonl(tmp_path: Path):

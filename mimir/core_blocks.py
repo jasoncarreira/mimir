@@ -173,6 +173,10 @@ def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
     return True
 
 
+# Core files are read every turn; report each unreadable path once per process.
+_UNREADABLE_CORE_REPORTED: set[str] = set()
+
+
 def load_core(home: Path) -> list[CoreBlock]:
     """Load trusted ``memory/core/*.md`` in lexicographic (= numeric prefix) order."""
     core_dir = home / "memory" / "core"
@@ -184,7 +188,23 @@ def load_core(home: Path) -> list[CoreBlock]:
             continue
         try:
             text = read_text_lossy(path)
-        except OSError:
+        except OSError as exc:
+            key = str(path)
+            if key not in _UNREADABLE_CORE_REPORTED:
+                _UNREADABLE_CORE_REPORTED.add(key)
+                log.warning("core_prompt_degraded: unreadable core file %s (%s)",
+                            path, type(exc).__name__)
+                try:
+                    from .event_logger import log_event_sync
+
+                    log_event_sync(
+                        "core_prompt_degraded",
+                        reason="unreadable_core_file",
+                        path=key,
+                        error_type=type(exc).__name__,
+                    )
+                except Exception:  # signalling must not break prompt loading
+                    pass
             continue
         desc, is_auto = describe_file(text)
         blocks.append(

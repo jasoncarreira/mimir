@@ -2252,7 +2252,12 @@ class Agent:
                     event.channel_id
                 )
                 if leftover_injections and self._dispatcher is not None:
-                    self._dispatcher.requeue_front(leftover_injections)
+                    requeued = self._dispatcher.requeue_front(leftover_injections)
+                    if requeued < len(leftover_injections):
+                        await self._log_injection_requeue(
+                            "mid_turn_injection_leftover", event.channel_id, turn_id,
+                            len(leftover_injections), requeued,
+                        )
             # Release the typing indicator at turn end (held from turn start
             # across any send_message calls). In the finally so it fires on
             # success, error, and cancellation alike.
@@ -3042,14 +3047,12 @@ class Agent:
                 folded_records,
                 deferred_records,
             ) = mid_turn_injection.deactivate(event.channel_id)
+            requeue_results = []
             if leftover_injections and self._dispatcher is not None:
-                await log_event(
-                    "mid_turn_injection_leftover",
-                    channel_id=event.channel_id,
-                    turn_id=turn_id,
-                    count=len(leftover_injections),
-                )
-                self._dispatcher.requeue_front(leftover_injections)
+                requeued = self._dispatcher.requeue_front(leftover_injections)
+                requeue_results.append((
+                    "mid_turn_injection_leftover", len(leftover_injections), requeued,
+                ))
             # chainlink #384: re-enqueue deferred messages as their own fresh
             # turns. force_new_turn=True makes Dispatcher.enqueue / startup-drain
             # refuse to re-fold them (loop guard); deferred_from_turn_id +
@@ -3067,13 +3070,13 @@ class Agent:
                     })
                     for ev, reason in deferred_records
                 ]
-                await log_event(
-                    "mid_turn_deferred",
-                    channel_id=event.channel_id,
-                    turn_id=turn_id,
-                    count=len(deferred_events),
+                requeued = self._dispatcher.requeue_front(deferred_events)
+                requeue_results.append(("mid_turn_deferred", len(deferred_events), requeued))
+            # Restore both batches before any telemetry await can fail or cancel.
+            for kind, count, requeued in requeue_results:
+                await self._log_injection_requeue(
+                    kind, event.channel_id, turn_id, count, requeued,
                 )
-                self._dispatcher.requeue_front(deferred_events)
 
         if error is not None:
             events, events_truncated = extract_partial_tool_events(messages)
@@ -3464,16 +3467,19 @@ class Agent:
         # the whole channel) forever — turn_timeout_seconds only covers the model
         # stream, not this post-loop work. The TurnRecord is already written
         # above, so a timeout here only drops best-effort finalize work.
+        finalize_timeout = self._config.post_turn_timeout_seconds
+        if finalize_timeout <= 0:
+            finalize_timeout = 180
         try:
             await asyncio.wait_for(
                 fire_hooks("finalize", self._hooks, ctx, event, record),
-                timeout=self._config.post_turn_timeout_seconds,
+                timeout=finalize_timeout,
             )
         except asyncio.TimeoutError:
             log.warning(
                 "finalize hooks exceeded post_turn_timeout (%ss) — skipped to "
                 "avoid wedging the channel",
-                self._config.post_turn_timeout_seconds,
+                finalize_timeout,
             )
 
         # Post-turn observability hooks (181-M). Order matters:
@@ -3833,7 +3839,14 @@ class Agent:
                 error=str(exc)[:500],
             )
             return
-        await log_event("shell_job_complete_enqueue_ok", job_id=job.job_id)
+        if accepted:
+            await log_event("shell_job_complete_enqueue_ok", job_id=job.job_id)
+        else:
+            await log_event(
+                "shell_job_complete_enqueue_failed",
+                job_id=job.job_id,
+                error="dispatcher rejected completion event",
+            )
         await log_event(
             "shell_job_complete_routed",
             job_id=job.job_id,
@@ -3841,6 +3854,30 @@ class Agent:
             exit_code=job.exit_code,
             accepted=accepted,
         )
+
+    async def _log_injection_requeue(
+        self, kind: str, channel_id: str, turn_id: str, count: int, requeued: int,
+    ) -> None:
+        """Best-effort telemetry after accepted messages have been restored."""
+        if requeued < count:
+            log.error(
+                "mid_turn_message_loss: %s on %s requeued %s/%s messages",
+                kind, channel_id, requeued, count,
+            )
+            try:
+                await log_event(
+                    "mid_turn_message_loss", channel_id=channel_id, turn_id=turn_id,
+                    requeue_kind=kind, count=count, requeued=requeued, dropped=count - requeued,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("message-loss telemetry failed")
+        try:
+            await log_event(
+                kind, channel_id=channel_id, turn_id=turn_id,
+                count=count,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("injection requeue telemetry failed")
 
     # ────────────────────────────────────────────────────────────
     # System prompt assembly
@@ -3900,11 +3937,24 @@ class Agent:
                 writable_dirs=self._config.writable_dirs,
                 access_control_enforced=self._config.access_control_enforced,
             )
-        except Exception:
+        except Exception as exc:
             log.exception("_build_system_prompt failed; using minimal default")
+            if emit_health_events:
+                try:
+                    log_event_sync(
+                        "core_prompt_degraded",
+                        reason="assembly_fallback",
+                        error_type=type(exc).__name__,
+                    )
+                except Exception:
+                    log.exception("core_prompt_degraded event emission failed")
+            # Keep conventions even when the full prompt builder itself fails.
+            from .prompts import _DEFAULT_CONVENTIONS
+
+            fallback = f"{_DEFAULT_SYSTEM_PROMPT}\n\n{_DEFAULT_CONVENTIONS}"
             if self._config.access_control_enforced:
-                return f"{_DEFAULT_SYSTEM_PROMPT}\n\n{ENFORCEMENT_GUIDANCE}"
-            return _DEFAULT_SYSTEM_PROMPT
+                return f"{fallback}\n\n{ENFORCEMENT_GUIDANCE}"
+            return fallback
 
     # NOTE: _assemble_skill_block was removed in the skills-middleware
     # restoration PR. The framework's SkillsMiddleware now renders the
