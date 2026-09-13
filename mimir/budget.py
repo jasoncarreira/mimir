@@ -465,8 +465,8 @@ class HomeostaticArbiter:
             )
         if (
             self.cost_spike_ratio
-            and snap.cost_rate_baseline_usd_per_hour
-            and snap.cost_rate_baseline_usd_per_hour > 0
+            and snap.cost_rate_baseline_usd_per_hour is not None
+            and snap.cost_rate_baseline_usd_per_hour >= 0.01
         ):
             spike_trip = (
                 self.cost_spike_ratio * snap.cost_rate_baseline_usd_per_hour

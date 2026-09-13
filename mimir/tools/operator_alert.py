@@ -70,8 +70,10 @@ async def operator_alert(text: str) -> str:
     try:
         result = await _channel_registry.send(destination, text.strip(), final=False)
     except Exception as exc:
+        turn.operator_alert_count -= 1
         raise ToolException(f"operator_alert failed: {exc}") from exc
     if not getattr(result, "sent", True):
+        turn.operator_alert_count -= 1
         error = getattr(result, "error", None)
         detail = f" ({error})" if error else ""
         raise ToolException(f"operator_alert failed: message was not delivered{detail}")

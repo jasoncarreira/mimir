@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,6 +160,25 @@ def test_should_fire_when_no_signal(tmp_path: Path):
     assert decision.fire is True
     assert decision.reason == "ok"
     assert decision.severity.name == "CLEAR"
+
+
+@pytest.mark.parametrize("baseline, expected", [
+    (None, False), (0.0, False), (0.0099, False), (0.01, True), (0.0101, True),
+])
+@pytest.mark.parametrize("floor", [0.0, 0.5])
+def test_payg_near_spike_requires_meaningful_baseline(tmp_path: Path, baseline, expected, floor):
+    arb = _arbiter(tmp_path, cost_spike_ratio=3.0, cost_spike_floor_usd=floor)
+    snap = replace(
+        arb.snapshot(now=NOW),
+        cost_rate_now_usd_per_hour=max(0.025, floor),
+        cost_rate_baseline_usd_per_hour=baseline,
+        cost_hourly_limit_usd=0.0,
+    )
+    reason = arb._payg_near_trip_reason(snap)
+    if expected:
+        assert reason is not None and reason.startswith("cost_rate_near_spike:")
+    else:
+        assert reason is None
 
 
 def test_plan_window_saturation_suppresses(tmp_path: Path):

@@ -365,8 +365,9 @@ async def saga_forget(
     run call clears that line until the next decay cycle.
 
     Destructive calls require min_retrievals, confidence_floor, or grace_days.
-    Contribution and contradiction thresholds alone do not narrow the
-    in-process engine's selection. Broad dry-run previews remain available.
+    Contribution and contradiction thresholds are unsupported by the in-process
+    backend and are rejected, including in previews and mixed criteria calls.
+    Broad dry-run previews remain available.
     """
     from ..access_control import can_write_saga, saga_mutation_taint_refusal
 
@@ -386,6 +387,18 @@ async def saga_forget(
         return (
             "saga_forget failed: write access denied. "
             "Forget operations require server-provided admin or trusted-service authority."
+        )
+
+    from ..saga.client import SagaStore
+
+    if isinstance(client, SagaStore) and (
+        contribution_threshold is not None or contradiction_threshold is not None
+    ):
+        return (
+            "saga_forget failed: contribution_threshold and contradiction_threshold "
+            "are unsupported by the in-process backend; remove them and supply "
+            "min_retrievals, confidence_floor, or grace_days. Preview with "
+            "dry_run=True before forgetting."
         )
 
     kwargs: dict[str, Any] = {"dry_run": bool(dry_run), "auth_context": auth_context}

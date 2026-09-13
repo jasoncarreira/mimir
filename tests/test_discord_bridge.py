@@ -239,6 +239,52 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_on_reaction_fetches_channel_on_cache_miss(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels.pop(1)
+    channel.fetch_message = AsyncMock(
+        return_value=SimpleNamespace(author=bridge._client.user)
+    )
+    bridge._client.fetch_channel = AsyncMock(return_value=channel)
+
+    await bridge._on_reaction(SimpleNamespace(
+        user_id=99, channel_id=1, message_id=123, emoji="👍",
+    ))
+
+    bridge._client.fetch_channel.assert_awaited_once_with(1)
+    channel.fetch_message.assert_awaited_once_with(123)
+    record = json.loads((tmp_path / "logs" / "events.jsonl").read_text())
+    assert record["type"] == "react_received"
+    assert record["channel_id"] == "discord-1"
+    assert record["target_message_id"] == "123"
+    assert record["author"] == "discord-99"
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_channel_fetch_failure_is_safe(
+    bridge_with_fake_client, tmp_path: Path,
+):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    channel = bridge._client._channels.pop(1)
+    channel.fetch_message = AsyncMock()
+    bridge._client.fetch_channel = AsyncMock(
+        side_effect=discord.DiscordException("missing permissions")
+    )
+
+    await bridge._on_reaction(SimpleNamespace(
+        user_id=99, channel_id=1, message_id=123, emoji="👍",
+    ))
+
+    bridge._client.fetch_channel.assert_awaited_once_with(1)
+    channel.fetch_message.assert_not_awaited()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_on_reaction_emits_v1_canonical_owner_from_strict_identity(
     bridge_with_fake_client,
     tmp_path: Path,
@@ -400,6 +446,39 @@ async def test_send_closes_attachment_files_when_discord_send_fails(
     assert "discord send error" in (result.error or "")
     assert len(opened_files) == 2
     assert all(file.fp.closed for file in opened_files)
+
+
+@pytest.mark.asyncio
+async def test_send_closes_opened_attachment_when_later_path_is_missing(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch,
+):
+    import discord
+
+    bridge, _, sent = bridge_with_fake_client
+    attachment = tmp_path / "a.txt"
+    attachment.write_text("alpha")
+    opened_files: list[discord.File] = []
+    real_file = discord.File
+
+    def track_file(path):
+        file = real_file(path)
+        opened_files.append(file)
+        return file
+
+    monkeypatch.setattr(discord, "File", track_file)
+    try:
+        with pytest.raises(FileNotFoundError):
+            await bridge.send(
+                "discord-1", "hello",
+                attachment_paths=[attachment, tmp_path / "missing.txt"],
+            )
+
+        assert sent == []
+        assert len(opened_files) == 1
+        assert opened_files[0].fp.closed
+    finally:
+        for file in opened_files:
+            file.close()
 
 
 @pytest.mark.asyncio

@@ -651,8 +651,13 @@ async def test_terminal_state_contract(
     )
     from mimir.opencode_config import OpenCodeAuthError, OpenCodeConfigError
     from mimir.opencode_proposal import OpenCodeProposal, ProposalBuildResult
+    from mimir.tools import registry
 
     home, seed = spawn_tree
+    # This test owns the guard; retain another caller's reservation on refund.
+    guard = registry._spawn_guard_init()
+    other_token, error = await registry._spawn_acquire_rate_slot(guard, "other")
+    assert error is None
     record = {}
     events = []
 
@@ -741,6 +746,13 @@ async def test_terminal_state_contract(
     assert payload["status"] == status
     assert payload["reason_code"] == reason
     assert payload["exit_code"] == exit_code
+    work_ran = case in {
+        "timeout", "overflow", "auth_worker", "failed", "no_changes",
+        "path_count", "path_bytes", "patch_bytes", "sensitive",
+        "proposal_unavailable", "proposal",
+    }
+    assert len(guard.recent) == 1 + int(work_ran)
+    assert guard.recent[0] == other_token
     assert (payload["proposal"] is not None) is proposal_file
     assert events == [(event_type, {
         "run_id": payload["run_id"],
@@ -789,6 +801,30 @@ async def test_seed_refusal_payload_reports_each_distinct_cause(
         reported[expected_reason] = payload["reason_code"]
 
     assert reported == {reason: reason for reason in refusal_errors}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("work_ran", [False, True])
+async def test_spawn_exception_refunds_only_before_execution(
+    spawn_tree, tmp_path, monkeypatch, work_ran,
+):
+    from mimir import opencode_proposal
+    from mimir.tools import registry
+
+    _home, seed = spawn_tree
+    record = {}
+
+    def fail(*args, **kwargs):
+        raise LookupError("fixture failure")
+
+    kwargs = {}
+    if work_ran:
+        monkeypatch.setattr(opencode_proposal, "build_opencode_proposal", fail)
+    else:
+        kwargs["factory"] = fail
+    with pytest.raises(LookupError, match="fixture failure"):
+        await invoke(seed, tmp_path, record, **kwargs)
+    assert len(registry._SPAWN_GUARD.recent) == int(work_ran)
 
 
 @pytest.mark.asyncio

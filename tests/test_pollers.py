@@ -2653,6 +2653,9 @@ print(json.dumps({
     invalid = [e for e in events if e["type"] == "poller_invalid_usage_signal"]
     assert [e["reason"] for e in invalid] == ["poller_mismatch", "invalid_api_calls"]
     assert not [e for e in events if e["type"] == "poller_usage"]
+    complete = [e for e in events if e["type"] == "poller_complete"][-1]
+    assert complete["signals_emitted"] == 0
+    assert complete["events_emitted"] == 0
 
 
 # ─── poller_recovery framework wiring (chainlink #314) ────────────────
@@ -2669,18 +2672,40 @@ def _make_recovery_event(source_id: str) -> AgentEvent:
     )
 
 
-def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path):
+@pytest.mark.parametrize("raw, expected", [
+    (True, True), (False, False), (1, True), (0, False),
+    ("true", True), ("yes", True), ("on", True), ("1", True),
+    ("false", False), ("no", False), ("off", False), ("0", False),
+    ("  FaLsE  ", False), ("  TRUE  ", True),
+])
+def test_discover_pollers_reads_recover_failed_turns_flag(tmp_path: Path, raw, expected):
     skills = tmp_path / "skills"
     _write_pollers_json(skills / "skill", [
         {
             "name": "recovering",
             "command": "x",
             "cron": "* * * * *",
-            "recover_failed_turns": True,
+            "recover_failed_turns": raw,
         },
     ])
     [p] = discover_pollers(skills)
-    assert p.recover_failed_turns is True
+    assert p.recover_failed_turns is expected
+
+
+@pytest.mark.parametrize("raw", ["maybe", "", 2, -1, 1.0, None, [], {"on": True}])
+def test_manifest_invalid_recover_failed_turns_defaults_off(tmp_path: Path, caplog, raw):
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [{
+        "name": "recovering", "command": "x", "cron": "* * * * *",
+        "recover_failed_turns": raw,
+    }])
+    invalid = []
+    [poller] = discover_pollers(skills, invalid_entries=invalid)
+    assert poller.recover_failed_turns is False
+    assert "poller_invalid_recover_failed_turns" in caplog.text
+    assert len(invalid) == 1
+    assert invalid[0][1] == "recovering"
+    assert "recover_failed_turns" in invalid[0][2]
 
 
 @pytest.mark.asyncio

@@ -3186,6 +3186,36 @@ def test_build_trigger_honors_standard_crontab_day_of_week_ranges_lists_and_step
     assert first == datetime(2026, 6, 21, 9, 0, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize("dow, explicit, weekdays", [
+    ("5/2", "5-7/2", {4, 6}),
+    ("1/3", "1-7/3", {0, 3, 6}),
+    ("0/2", "0-7/2", {6, 1, 3, 5}),
+    ("7/2", "7-7/2", {6}),
+    ("5/1", "5-7/1", {4, 5, 6}),
+])
+def test_build_trigger_standard_dow_value_steps(dow, explicit, weekdays):
+    from datetime import datetime, timedelta, timezone
+
+    # Vixie entry.c accepts the explicit ranges, not bare value/step.
+    # Our shorthand extends to the same inclusive endpoint, Sunday=7.
+    # https://github.com/vixie/cron/blob/master/entry.c (get_range, load_entry)
+    start = datetime(2026, 6, 22, tzinfo=timezone.utc)  # Monday
+    expected = [
+        start + timedelta(days=day, hours=9)
+        for day in range(14) if day % 7 in weekdays
+    ]
+    for field in (dow, explicit):
+        trigger = _build_trigger(SchedulerJob(
+            name="stepped", prompt="x", cron=f"0 9 * * {field}",
+        ))
+        previous = None
+        for target in expected:
+            actual = trigger.get_next_fire_time(previous, previous or start)
+            assert actual == target
+            previous = actual
+        assert trigger.get_next_fire_time(previous, previous) >= start + timedelta(days=14)
+
+
 def test_build_trigger_defaults_to_utc_when_tz_omitted():
     """Back-compat: bench/test call sites that haven't been updated
     to pass tz must still get a UTC-anchored trigger (matches pre-PR
