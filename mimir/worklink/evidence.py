@@ -753,15 +753,17 @@ def _gate_results_diverge(
 
 
 def _run(args: Sequence[str] | str, *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    from ..contained_execution import base_worker_environment
     from ..tools._shell_env import scrub_model_selection_env
 
     env = os.environ.copy()
     scrub_model_selection_env(env)
     if isinstance(args, str):
-        # Operator-configured test commands are trusted input, equivalent to
-        # poller.command; backend-generated text is never routed here.
+        # Shell syntax supports configured commands and the report env prefix.
+        # Configuration must be trusted; checkout code still gets a bounded env.
         return subprocess.run(
-            args, shell=True, cwd=cwd, env=env, capture_output=True, text=True, check=False
+            args, shell=True, cwd=cwd, env=base_worker_environment("evidence"),
+            capture_output=True, text=True, check=False
         )
     return subprocess.run(
         list(args), cwd=cwd, env=env, capture_output=True, text=True, check=False

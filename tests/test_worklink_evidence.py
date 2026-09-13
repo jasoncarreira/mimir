@@ -241,6 +241,46 @@ def _init_gate_repo(tmp_path: Path, test_source: str) -> Path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["opencode", "feature_factory"])
+@pytest.mark.parametrize("injected", [False, True])
+async def test_default_gate_bounds_checkout_environment(tmp_path, monkeypatch, backend, injected):
+    from mimir.worklink.checkout import coding_enabled
+    from mimir.worklink.orchestrator import _runner_for_home
+
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+    assert not coding_enabled()
+    credentials = (
+        "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "SLACK_BOT_TOKEN",
+        "DISCORD_TOKEN", "MIMIR_API_KEY", "MIMIR_MODEL_SPEC", "UNLISTED_GATE_SENTINEL",
+    )
+    for name in credentials:
+        monkeypatch.setenv(name, "gate-secret-sentinel")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-W error")
+    repo = _init_gate_repo(
+        tmp_path,
+        "from pathlib import Path\ndef test_checkout():\n    assert Path('seed.txt').read_text() == 'seed\\n'\n",
+    )
+    # conftest runs before collection, just as backend-authored code would.
+    (repo / "conftest.py").write_text(
+        "import os\n"
+        f"assert not set({credentials!r}) & os.environ.keys()\n"
+        "assert '-W error' in os.environ['PYTEST_ADDOPTS']\n"
+        "assert '--junitxml=' in os.environ['PYTEST_ADDOPTS']\n",
+        encoding="utf-8",
+    )
+    result = await observe_evidence(
+        issue=1684, attempt=1, backend=backend, branch="issue/1684-a1",
+        checkout=repo, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed",
+        test_command=f"{shlex.quote(sys.executable)} -m pytest -q test_gate_sample.py",
+        runner=_runner_for_home(tmp_path, "chainlink") if injected else None,
+    )
+    assert result.review_ready, result.evidence.tests
+    assert result.evidence.tests.counts.passed == 1
+    assert result.evidence.tests.report_error is None
+
+
+@pytest.mark.asyncio
 async def test_gate_records_counts_from_pytest_generated_junit(tmp_path: Path) -> None:
     repo = _init_gate_repo(
         tmp_path,
@@ -318,7 +358,7 @@ import pytest
 
 @pytest.mark.parametrize("value", [1], ids=["token=top-secret ; $literal"])
 def test_candidate(value):
-    assert os.environ["WORKLINK_GATE_TEST_ENV"] == "same"
+    assert "WORKLINK_GATE_TEST_ENV" not in os.environ
     path = Path("visits")
     visits = int(path.read_text()) if path.exists() else 0
     path.write_text(str(visits + 1))

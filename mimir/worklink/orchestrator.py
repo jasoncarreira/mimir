@@ -4404,8 +4404,11 @@ def _runner_for_home(home: Path, chainlink_bin: str) -> Runner:
         text: bool = True,
     ) -> subprocess.CompletedProcess:
         if isinstance(args, str):
+            from ..contained_execution import base_worker_environment
+
             return subprocess.run(
-                args, shell=True, cwd=cwd, capture_output=True, text=text, check=False
+                args, shell=True, cwd=cwd, env=base_worker_environment("evidence"),
+                capture_output=True, text=text, check=False
             )
         # Chainlink discovers its repository from cwd. Its configured home is
         # authoritative even when a caller also supplies a backend checkout.
