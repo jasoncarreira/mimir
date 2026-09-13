@@ -58,6 +58,7 @@ def test_effective_ssh_configuration_disables_forwarding_and_local_commands(tmp_
         check=True,
         capture_output=True,
         text=True,
+        env=child_environment({"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}),
     )
     effective = dict(line.split(maxsplit=1) for line in result.stdout.splitlines())
     assert effective["forwardagent"] == "no"
@@ -80,7 +81,14 @@ def test_ssh_file_allowlist_and_argument_bounds(tmp_path: Path) -> None:
 
 
 def test_child_environment_is_secret_and_profile_free() -> None:
-    assert child_environment({"PATH": "/bin", "SECRET": "public", "PYTHONPATH": "x", "PYTHONHOME": "y", "SSH_AUTH_SOCK": "/agent", "MIMIR_ACP_PROFILE": "x", "MIMIR_KEY": "raw"}) == {"PATH": "/bin", "SECRET": "public"}
+    allowed = {"PATH": "/usr/bin:/bin", "HOME": "/home/operator", "LANG": "C",
+               "LC_ALL": "C", "LC_CTYPE": "C", "TZ": "UTC", "TERM": "xterm"}
+    denied = dict.fromkeys(("SECRET", "PYTHONPATH", "PYTHONHOME", "SSH_AUTH_SOCK",
+                            "MIMIR_ACP_PROFILE", "MIMIR_KEY", "LD_PRELOAD",
+                            "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+                            "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV", "FUTURE_VARIABLE"), "unsafe")
+    assert child_environment(allowed | denied) == allowed
+    assert child_environment({}) == {}
 
 
 class Reader:
@@ -227,9 +235,9 @@ async def test_hosted_shell_allows_terminal_environment_but_strips_proxy_secrets
 async def test_actual_subprocess_pumps_without_first_output_timeout_and_sanitizes_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     profile, _ = remote_profile(tmp_path)
     observed = tmp_path / "observed.json"
-    ssh = _fake_ssh(tmp_path, """
+    ssh = _fake_ssh(tmp_path, f"OBSERVED = {str(observed)!r}\n" + """
 import json,os,sys,time
-with open(os.environ['OBSERVED'],'w') as stream: json.dump({'argv':sys.argv,'env':dict(os.environ)},stream)
+with open(OBSERVED,'w') as stream: json.dump({'argv':sys.argv,'env':dict(os.environ)},stream)
 time.sleep(.08)
 for line in sys.stdin.buffer:
  message=json.loads(line); assert message['params']['_meta']=={'mimir.webKey':'sentinel'}
@@ -241,12 +249,15 @@ for line in sys.stdin.buffer:
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
     monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
-    environment = {"PATH": os.environ.get("PATH", ""), "OBSERVED": str(observed), "PYTHONPATH": "bad", "MIMIR_ACP_PROFILE": "remote"}
+    environment = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "OBSERVED": str(observed), "PYTHONPATH": "bad", "MIMIR_ACP_PROFILE": "remote", "BASH_ENV": "bad"}
     await run_ssh_proxy(profile, "sentinel", output, _ssh_path=ssh, _environment=environment)
     assert json.loads(output.getvalue())["result"] == {}
     captured = json.loads(observed.read_text())
     assert captured["argv"][-1] == "mimir-agent acp relay --home '/remote path'"
     assert "PYTHONPATH" not in captured["env"] and "MIMIR_ACP_PROFILE" not in captured["env"]
+    assert "OBSERVED" not in captured["env"] and "BASH_ENV" not in captured["env"]
+    assert captured["env"]["PATH"] == environment["PATH"]
+    assert captured["env"]["HOME"] == environment["HOME"]
     assert "sentinel" not in json.dumps(captured)
 
 
@@ -604,13 +615,13 @@ async def test_actual_subprocess_cancellation_terminates_child(
 ) -> None:
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "terminated"
-    ssh = _fake_ssh(tmp_path, """
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\n" + """
 import os,signal,sys,time
 def stop(*args):
- with open(os.environ['MARKER'],'w') as stream: stream.write('terminated')
+ with open(MARKER,'w') as stream: stream.write('terminated')
  raise SystemExit(0)
 signal.signal(signal.SIGTERM,stop)
-with open(os.environ['MARKER'] + '.ready','w') as stream: stream.write('ready')
+with open(MARKER + '.ready','w') as stream: stream.write('ready')
 # Teardown closes stdin before sending SIGTERM. Stay alive on EOF, even if
 # cancellation beats delivery of the queued authentication request.
 while True: time.sleep(1)
@@ -644,16 +655,16 @@ async def test_stubborn_child_is_killed_and_reaped(
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "child.json"
     terminated = tmp_path / "terminated"
-    ssh = _fake_ssh(tmp_path, """
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\nTERMINATED = {str(terminated)!r}\nHANDLER_DELAY = {handler_delay!r}\n" + """
 import json,os,signal,time
 def ignore(*args):
  # Publish acknowledgement without truncating/re-writing the readiness JSON:
  # SIGKILL may interrupt the handler at any instruction.
- fd=os.open(os.environ['TERMINATED'],os.O_CREAT|os.O_WRONLY,0o600)
+ fd=os.open(TERMINATED,os.O_CREAT|os.O_WRONLY,0o600)
  os.close(fd)
- time.sleep(float(os.environ['HANDLER_DELAY']))
+ time.sleep(HANDLER_DELAY)
 signal.signal(signal.SIGTERM,ignore)
-with open(os.environ['MARKER'],'w') as stream: json.dump({'pid':os.getpid()},stream)
+with open(MARKER,'w') as stream: json.dump({'pid':os.getpid()},stream)
 while True: time.sleep(1)
 """)
     reader = asyncio.StreamReader()
@@ -744,9 +755,9 @@ async def test_cancellation_during_writer_cleanup_reaps_child(monkeypatch: pytes
 async def test_unread_stdout_backpressure_cleanup_reaps_child(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     profile, _ = remote_profile(tmp_path)
     marker = tmp_path / "pid"
-    ssh = _fake_ssh(tmp_path, """
+    ssh = _fake_ssh(tmp_path, f"MARKER = {str(marker)!r}\n" + """
 import os,sys
-with open(os.environ['MARKER'],'w') as stream: stream.write(str(os.getpid()))
+with open(MARKER,'w') as stream: stream.write(str(os.getpid()))
 chunk=b'{"jsonrpc":"2.0","method":"session/update","params":{}}\\n'
 while True:
  sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()

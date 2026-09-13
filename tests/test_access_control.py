@@ -5796,7 +5796,7 @@ async def test_shadow_early_return_parity(
 
 
 @pytest.mark.asyncio
-async def test_shadow_admin_denial_omits_sink_refusal_not_returned_by_enforcement(
+async def test_shadow_admin_denial_records_both_sink_and_admin_reasons(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = ToolRegistry()
@@ -5817,8 +5817,51 @@ async def test_shadow_admin_denial_omits_sink_refusal_not_returned_by_enforcemen
     assert shadow.allowed is True
     assert enforced.allowed is False
     assert shadow.reason == enforced.reason == "admin_required"
-    assert len(captured) == 1
-    assert captured[0][1]["reason"] == enforced.reason
+    assert [fields["reason"] for kind, fields in captured] == [
+        "saga_mutation_blocked_by_tainted_turn", "admin_required",
+    ]
+    assert all(kind == "shadow_tool_decision" for kind, _fields in captured)
+    assert all(fields["would_block"] is True for _kind, fields in captured)
+    assert all(fields["allowed"] is True for _kind, fields in captured)
+
+
+@pytest.mark.asyncio
+async def test_nonadmin_ifc_shadow_census_preserves_causing_source(monkeypatch) -> None:
+    source = SourceLabel(
+        principal="alice", domain="recent_activity",
+        resource_id="slack-C2?token=secret-value", bridge_instance="slack",
+        sensitivity="private", authorized_principals=frozenset({"alice"}),
+        source_kind="protected_prompt", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(_write_auth(), ifc_labels=labels)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    captured = []
+
+    async def capture(kind, **fields):
+        captured.append((kind, fields))
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    shadow = registry.authorize_tool(
+        "spawn_open_code", auth, enforce=False, target_channel="/tmp/worktree",
+    )
+    enforced = registry.authorize_tool(
+        "spawn_open_code", auth, enforce=True, target_channel="/tmp/worktree",
+    )
+    await asyncio.sleep(0)
+    assert shadow.allowed is True
+    assert enforced.allowed is False
+    assert shadow.reason == enforced.reason == "admin_required"
+    assert [fields["reason"] for _, fields in captured] == [
+        "ifc_label_blocked:spawn", "admin_required",
+    ]
+    assert all(kind == "shadow_tool_decision" for kind, _ in captured)
+    assert all(fields["would_block"] is True for _, fields in captured)
+    assert captured[0][1]["ifc_source_scope"] == "causing_source"
+    assert captured[0][1]["ifc_source"]["resource_id"] == "slack-C2?token=[REDACTED]"
+    assert "secret-value" not in repr(captured)
 
 
 @pytest.mark.asyncio
@@ -11628,6 +11671,56 @@ def test_operator_arm2_git_hard_failures_never_produce_artifact(
     assert hardened is None
     assert reason == access_control._OPERATOR_GIT_REFUSAL
     assert rule is ServiceShellBindingRule.OPERATOR_GIT_HARDENING
+
+
+def test_operator_bindable_reader_sets_agree() -> None:
+    tree = ast.parse(Path(access_control.__file__).read_text(encoding="utf-8"))
+    functions = {
+        "_operator_read_execution_argv_with_diagnostics",
+        "_validated_operator_shell_argv_artifact",
+        "_operator_final_argv_matches_family",
+    }
+    sets = {}
+    for function in tree.body:
+        if not isinstance(function, ast.FunctionDef) or function.name not in functions:
+            continue
+        for node in ast.walk(function):
+            if not (
+                isinstance(node, ast.Compare)
+                and isinstance(node.left, ast.Name)
+                and node.left.id in {"command", "family"}
+            ):
+                continue
+            for comparator in node.comparators:
+                if isinstance(comparator, ast.Set):
+                    values = ast.literal_eval(comparator)
+                elif isinstance(comparator, ast.Name):
+                    values = getattr(access_control, comparator.id)
+                else:
+                    continue
+                if "wc" in values:
+                    sets[function.name] = set(values)
+    assert sets == {name: {"ls", "wc", "grep", "rg"} for name in functions}
+
+
+def test_operator_jq_is_not_bindable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    argv = [str(maintenance_pinned_executables["jq"]), ".", "safe.json"]
+    execution, _reason, rule = access_control._operator_read_execution_argv_with_diagnostics(
+        argv, resolved_cwd=root,
+    )
+    assert execution is None
+    assert rule is ServiceShellBindingRule.OPERATOR_READER_EXCLUDED
+    assert access_control._validated_operator_shell_argv_artifact(
+        argv, argv, resolved_cwd=root,
+    ) is None
+    artifact = access_control._OperatorShellArgvArtifact(
+        tuple(argv), "jq", str(root), access_control._OPERATOR_SHELL_ARGV_ISSUER,
+    )
+    assert access_control._operator_final_argv_matches_family(artifact) is False
 
 
 def test_operator_binding_issuance_is_immutable_and_withholds_identity_values(

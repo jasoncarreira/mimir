@@ -3857,6 +3857,9 @@ def _operator_recursive_read_preflight(
     return True
 
 
+_OPERATOR_BINDABLE_READ_COMMANDS = frozenset({"ls", "wc", "grep", "rg"})
+
+
 def _operator_read_execution_argv_with_diagnostics(
     argv: list[str], *, resolved_cwd: str | Path,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
@@ -3872,7 +3875,7 @@ def _operator_read_execution_argv_with_diagnostics(
             ServiceShellBindingRule.OPERATOR_READER_EXCLUDED,
         )
     slots = _shell_read_operand_slots(argv)
-    if command not in {"ls", "wc", "grep", "rg"} or slots is None:
+    if command not in _OPERATOR_BINDABLE_READ_COMMANDS or slots is None:
         return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
     try:
         cwd = Path(resolved_cwd).resolve(strict=True)
@@ -3987,7 +3990,7 @@ def _validated_operator_shell_argv_artifact(
         return None
     family = Path(parsed_argv[0]).name
     expected: list[str] | None
-    if family in {"ls", "wc", "grep", "rg", "jq"}:
+    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             parsed_argv, resolved_cwd=cwd,
         )
@@ -4017,7 +4020,7 @@ def _operator_final_argv_matches_family(
     family = artifact.family
     if not argv or Path(argv[0]).name != family:
         return False
-    if family in {"ls", "wc", "grep", "rg"}:
+    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             argv, resolved_cwd=artifact.resolved_cwd,
         )
@@ -8813,8 +8816,13 @@ class ToolRegistry:
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return finish(sink_check)
-            if sink_check.is_shadow_decision and sink_check.would_block and not preliminary_admin_denied:
-                shadow_sink = sink_check
+            if sink_check.is_shadow_decision and sink_check.would_block:
+                if preliminary_admin_denied:
+                    # Census both independent refusals without replacing the
+                    # admin denial returned by the authorization gate below.
+                    finish(sink_check)
+                else:
+                    shadow_sink = sink_check
 
         decision = preliminary_decision
         service_principal = None

@@ -1677,7 +1677,6 @@ class WriteGuardBackend:
         "ls", "als",
         "grep", "agrep",
         "glob", "aglob",
-        "execute", "aexecute",  # bash via backend — read-shaped from FS perspective
         "download_files", "adownload_files",
     })
 

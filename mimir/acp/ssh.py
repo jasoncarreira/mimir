@@ -59,7 +59,9 @@ def build_ssh_argv(profile: Profile, ssh_path: Path | None = None) -> tuple[str,
 
 def child_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     values = os.environ if environ is None else environ
-    return {key: value for key, value in values.items() if key not in {"PYTHONPATH", "PYTHONHOME", "SSH_AUTH_SOCK"} and not key.startswith("MIMIR_")}
+    # Match confinement's inherited settings, not its Python-specific overrides.
+    allowed = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM")
+    return {key: value for key, value in values.items() if key in allowed}
 
 async def _discard(reader: asyncio.StreamReader) -> None:
     while await reader.read(65536): pass
