@@ -1174,32 +1174,43 @@ asyncio.run(run())
 @pytest.mark.timeout(120)
 @pytest.mark.skipif(
     sys.platform != "linux",
-    reason="C-delivery handshake relies on Linux socketpair MSG_WAITALL readability semantics",
+    reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
 )
 async def test_shutdown_journal_wakeup_without_python_signal_handler(tmp_path: Path) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
-import asyncio, ctypes, select, socket, time
+import asyncio, ctypes, socket, time
 from types import SimpleNamespace
 
 reader, writer = socket.socketpair()
-writer.sendall(b'x')
-assert select.select([reader], [], [], 0)[0]
 libc = ctypes.CDLL(None)
 libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 libc.recv.restype = ctypes.c_ssize_t
 buffer = ctypes.create_string_buffer(2)
+watchdog_started = threading.Event()
+
+class ObservedTimer(InputTimer):
+    def start(self):
+        super().start()
+        watchdog_started.set()
+
+proxy.threading.Timer = ObservedTimer
 
 def deliver():
-    # Losing readability proves libc consumed the first byte of MSG_WAITALL.
-    # The peer stays open and never sends the second byte. Target this worker,
-    # not main: the C handler writes a byte without interrupting main's recv.
-    while select.select([reader], [], [], 0)[0]:
+    writer.sendall(b'x')
+    # Only main's recv writes this buffer: Linux copies the first byte into
+    # userspace before waiting for the rest of MSG_WAITALL. Observe that write,
+    # not socket readiness (which is not an acknowledgment from the receiver).
+    # Keep the peer open and withhold byte two, so main cannot leave this C call.
+    while buffer[0] != b'x':
         time.sleep(0.001)
     record(b'main-blocked')
+    # Target this worker, not main: C delivery must not interrupt main's recv.
     signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
     record(b'worker-signalled')
     _journal_flush()
+    # Tee completion only orders forwarding, not the observer's timer startup.
+    watchdog_started.wait()
     os.write(1, b'delivered\n')
 
 async def run():
@@ -1214,6 +1225,7 @@ asyncio.run(run())
 '''
     process = await asyncio.create_subprocess_exec(
         sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=Path(__file__).resolve().parents[1],
     )
@@ -1227,7 +1239,10 @@ asyncio.run(run())
             message = str(failure.value)
             assert "outstanding=Python handler" in message
             assert f"pid={process.pid}, returncode=None" in message
-            assert "handlers-installed\nmain-blocked\nworker-signalled\n" in message
+            # The observer may journal timer startup before pthread_kill returns.
+            setup = [line for line in progress.read_text().splitlines()
+                     if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
+            assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
             assert "signal-dispatch:" not in message
