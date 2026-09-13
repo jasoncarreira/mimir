@@ -2668,6 +2668,8 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="x")
     record = await agent.run_turn(event)
     assert record.error and "upstream failure" in record.error
+    assert record.result_is_error is True
+    assert record.result_subtype == "error_turn"
     assert record.events == []
     # feedback skipped on error
     assert fake_saga.feedback_calls == []
@@ -2716,6 +2718,73 @@ async def test_failed_turn_preserves_partial_tool_events(tmp_path: Path, failure
     assert secret not in json.dumps(persisted)
     assert secret not in json.dumps(_read_events(tmp_path))
     assert not any(e["type"] == "turn_completed" for e in _read_events(tmp_path))
+
+
+@pytest.mark.parametrize("ending", ["timeout", "exception", "budget_exception", "success"])
+@pytest.mark.parametrize("trigger", ["user_message", "poller"])
+async def test_turn_result_reconciles_stream_failure(tmp_path: Path, ending, trigger):
+    from mimir.skill_outcomes import aggregate
+
+    class Stream(_FakeAgent):
+        async def astream(self, *args, **kwargs):
+            async for snapshot in super().astream(*args, **kwargs):
+                yield snapshot
+            if ending == "timeout":
+                await asyncio.Event().wait()
+            if ending == "budget_exception":
+                from mimir._context import get_current_turn
+
+                ctx = get_current_turn()
+                ctx.tool_call_budget_exhausted = True
+                ctx.tool_call_budget_denied_count = 1
+            if ending in {"exception", "budget_exception"}:
+                raise RuntimeError("stream interrupted")
+
+    messages = [AIMessage(
+        content="working",
+        tool_calls=[{"id": "memory-call", "name": "task",
+                     "args": {"subagent_type": "memory"}}],
+        response_metadata={"stop_reason": "tool_use", "total_cost_usd": 0.0123},
+        usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+    )]
+    if ending == "success":
+        messages.append(AIMessage(content="done", response_metadata={
+            "stop_reason": "end_turn", "total_cost_usd": 0.0123,
+        }))
+    agent = _build_agent(tmp_path, fake_agent=Stream(messages))
+    agent._config = replace(agent._config, turn_timeout_seconds=0.05 if ending == "timeout" else 0)
+    record = await agent.run_turn(AgentEvent(trigger=trigger, channel_id="ch-1", content="work"))
+    turns_path = tmp_path / "home/logs/turns.jsonl"
+    persisted = json.loads(turns_path.read_text().splitlines()[-1])
+    failed = ending != "success"
+    expected = {
+        "result_subtype": (
+            "tool_budget_exhausted" if ending == "budget_exception"
+            else "error_turn" if failed else "success"
+        ),
+        "result_is_error": failed,
+        "stop_reason": "tool_use" if failed else "end_turn",
+        "num_turns": 1 if failed else 2,
+        "total_cost_usd": 0.0123,
+        "usage": {"input_tokens": 100, "output_tokens": 20,
+                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    }
+    outcomes = [e for e in _read_events(tmp_path) if e["type"] in {"turn_failed", "turn_completed"}]
+    assert [e["type"] for e in outcomes] == (
+        ["turn_failed"] if failed else ["turn_completed"] if trigger == "poller" else []
+    )
+    if failed:
+        assert persisted["error"].startswith("TurnTimeout:" if ending == "timeout" else "RuntimeError:")
+        assert outcomes[0]["error"] == record.error[:240]
+        assert outcomes[0]["attempt_reason"] == record.error[:240]
+    stats = aggregate(turns_path)["memory"]
+    assert (stats.success, stats.failure, stats.abandoned) == ((0, 1, 0) if failed else (1, 0, 0)), persisted
+    assert {key: persisted[key] for key in expected} == expected
+    assert {key: getattr(record, key) for key in expected} == expected
+    for outcome in outcomes:
+        assert outcome["attempt_disposition"] == "charge"
+        for key in ("result_subtype", "result_is_error", "stop_reason"):
+            assert outcome[key] == expected[key]
 
 
 @pytest.mark.parametrize("large_results", [False, True])
