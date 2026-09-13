@@ -336,6 +336,8 @@ def extract_turn_events(
                         body = _coerce_content(
                             _te_result if _te_result is not None else te.get("error")
                         )
+                        # Scrub before truncation can make a credential unrecognizable.
+                        body = redact_payload(body)
                         if len(body) > MAX_TOOL_RESULT_BYTES:
                             body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
                         events.append({
@@ -398,6 +400,7 @@ def extract_turn_events(
                 body = _coerce_content(
                     _tr_content if _tr_content is not None else tr.get("result")
                 )
+                body = redact_payload(body)
                 if len(body) > MAX_TOOL_RESULT_BYTES:
                     body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
                 tr_id = tr.get("tool_use_id", "") or ""
@@ -415,6 +418,7 @@ def extract_turn_events(
                 })
         elif isinstance(msg, ToolMessage):
             body = _coerce_content(msg.content)
+            body = redact_payload(body)
             if len(body) > MAX_TOOL_RESULT_BYTES:
                 body = body[:MAX_TOOL_RESULT_BYTES] + "…[truncated]"
             events.append({
