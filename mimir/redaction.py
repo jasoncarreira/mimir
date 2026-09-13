@@ -16,25 +16,20 @@ import yaml
 
 from mimir.shared_redaction_patterns import (
     BARE_PROVIDER_TOKEN_PATTERNS,
+    CREDENTIAL_WORD_LITERALS,
+    CREDENTIAL_WORD_PATTERN,
     JWT_PATTERN,
+    LOG_SECRET_PATTERNS,
 )
 
 
 _CREDENTIAL_KEY = re.compile(
-    r"[A-Za-z0-9_.:-]*(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
+    r"[A-Za-z0-9_.:-]*" + CREDENTIAL_WORD_PATTERN, re.IGNORECASE
 )
 _CREDENTIAL_WORD = re.compile(
-    r"(?:token|api[_-]?key|password|passwd|secret)", re.IGNORECASE
+    CREDENTIAL_WORD_PATTERN, re.IGNORECASE
 )
-_CREDENTIAL_WORD_LITERALS = (
-    "token",
-    "apikey",
-    "api_key",
-    "api-key",
-    "password",
-    "passwd",
-    "secret",
-)
+_CREDENTIAL_WORD_LITERALS = CREDENTIAL_WORD_LITERALS
 _IGNORECASE_LITERAL_TRANSLATION = {0x017F: "s", 0x0131: "i"}
 _BLOCK_HEADER = re.compile(
     r"(?:(?:[!&*](?:<[^>\r\n]+>|[^\s#]+))[ \t]+)*"
@@ -49,18 +44,18 @@ _COLON_KEY_CHAR = re.compile(r"[A-Za-z0-9_.-]", re.IGNORECASE)
 _COLON_CREDENTIAL_PATTERNS = (
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"(['\"]?[A-Za-z0-9_.-]*" + CREDENTIAL_WORD_PATTERN +
         r"['\"]?[ \t]*:[ \t]*\")((?:\\[\s\S]|[^\"\\\n])*)(?=\")"
     ),
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
+        r"(['\"]?[A-Za-z0-9_.-]*" + CREDENTIAL_WORD_PATTERN +
         r"['\"]?[ \t]*:[ \t]*')((?:''|[^'\\\n])*)(?=')"
     ),
     re.compile(
         r"(?i)(?<![A-Za-z0-9_./-])"
-        r"(['\"]?[A-Za-z0-9_.-]*(?:token|api[_-]?key|password|passwd|secret)"
-        r"['\"]?[ \t]*:[ \t]*)"
+        r"(['\"]?[A-Za-z0-9_.-]*" + CREDENTIAL_WORD_PATTERN +
+        r"['\"]?[ \t]*:[ \t]*(?:(?:basic|bearer)[ \t]+)?)"
         r"(?![#!&*]|[|>][-+0-9]*(?:\s|$))([^\s\"',&}]+)"
     ),
 )
@@ -86,13 +81,19 @@ def _sub_colon_credentials(
 ) -> str:
     parts: list[str] = []
     copied_to = 0
+    checked_to = 0
     for word_start in _credential_word_starts(text, lowered):
-        if word_start < copied_to:
+        if word_start < max(copied_to, checked_to):
             continue
 
         key_start = word_start
         while key_start and _COLON_KEY_CHAR.fullmatch(text[key_start - 1]) is not None:
             key_start -= 1
+        # Every candidate in this maximal key run has the same possible match.
+        # Check it once, including non-keys such as repeated "monkey" substrings.
+        checked_to = word_start
+        while checked_to < len(text) and _COLON_KEY_CHAR.fullmatch(text[checked_to]):
+            checked_to += 1
         starts = [key_start]
         if key_start and text[key_start - 1] in {'"', "'"}:
             starts.insert(0, key_start - 1)
@@ -136,6 +137,7 @@ def _mask_colon_credentials(text: str) -> str:
 # payload emits can land in durable JSONL logs, so broad masking is preferable
 # to call-site-specific best effort.
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *LOG_SECRET_PATTERNS,
     re.compile(r"(?:github_pat_|ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]+"),
     # Anthropic API keys. Prefix ``sk-ant-`` is stable across the API and
     # Claude Code provisioning paths. Allow the underscore / hyphen alphabet
@@ -158,7 +160,7 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     # ``token=…``, ``api_key=…``, ``password=…`` value-style fields (URL query,
     # env var dumps, JSON pretty-prints with bareword keys). The value alphabet
     # stops at common delimiters so the regex doesn't eat the rest of the line.
-    re.compile(r"(?i)(token=|api[_-]?key=|password=|passwd=|secret=)([^\s\"',&]+)"),
+    re.compile(r"(?i)(" + CREDENTIAL_WORD_PATTERN + r"\s*=\s*)([^\s\"',&]+)"),
     # Credential fields in header, YAML, JSON, and Python-repr colon forms.
     # The persistent log used to mask less than the transient SSE stream.
     # Keep secret-removal parity pinned by the shared-corpus tests, not merely
@@ -539,14 +541,17 @@ def redact_payload(value: Any) -> Any:
 
     The event sink accepts arbitrary payload values and serializes with
     ``json.dumps(..., default=str)``. Preserve container shape for normal JSON
-    values while redacting token-shaped substrings before serialization. Exotic
+    values, masking credential-keyed values and token-shaped substrings. Exotic
     objects are stringified early so ``json.dumps(default=str)`` cannot bypass
     redaction for an object whose ``__str__`` contains a token-shaped value.
     """
     if isinstance(value, str):
         return redact_text(value)
     if isinstance(value, Mapping):
-        return {key: redact_payload(item) for key, item in value.items()}
+        return {
+            key: "[REDACTED]" if _credential_key(key) else redact_payload(item)
+            for key, item in value.items()
+        }
     if isinstance(value, tuple):
         return tuple(redact_payload(item) for item in value)
     if isinstance(value, list):
