@@ -371,10 +371,10 @@ async def test_identity_block_surfaces_in_turn_prompt(tmp_path: Path):
     assert "**bob**" not in prompt
 
     # Recent activity uses canonical's display_name, not per-message.
-    assert "Alice Smith: slack-eng activity" in prompt
-    assert "Alice Smith: discord-eng activity" in prompt
+    assert "Alice Smith:\n| slack-eng activity" in prompt
+    assert "Alice Smith:\n| discord-eng activity" in prompt
     # Stranger has no record — falls back to per-message author_display.
-    assert "random_user: random" in prompt
+    assert "random_user:\n| random" in prompt
 
     # Header uses display name, not the raw matching key.
     assert "author: alice_slack" in prompt or "author: Alice Smith" in prompt
@@ -434,7 +434,7 @@ async def test_identity_block_absent_when_no_records_match(tmp_path: Path):
     )
     assert "## Known identities" not in prompt
     # Falls back to per-message display.
-    assert "someone: hi" in prompt
+    assert "someone:\n| hi" in prompt
 
 
 @pytest.mark.asyncio

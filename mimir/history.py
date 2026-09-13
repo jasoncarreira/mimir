@@ -28,7 +28,7 @@ from typing import Iterable, Literal
 from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .access_control import ChannelResourceAdapter
 from .pollers import POLLER_CHANNEL_PREFIX
-from .prompt_safety import sanitize_prompt_field
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
 from .redaction import redact_payload
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
@@ -636,7 +636,7 @@ def render_recent_activity(
     max_chars: int = 0,
     resolver: object | None = None,
 ) -> str:
-    """Render messages as ``[<ts> <channel>] <author>: <content>`` lines.
+    """Render metadata headers followed by ``| ``-prefixed message body lines.
 
     ``max_chars`` (>0) caps each individual message's content; longer bodies
     are truncated with ``…[truncated]`` (same convention as ``turn_logger``'s
@@ -666,7 +666,7 @@ def render_recent_activity(
     """
     lines: list[str] = []
     for m in messages:
-        ts_short = m.ts[:16] if m.ts else ""
+        ts_short = sanitize_prompt_field(m.ts[:16] if m.ts else "")
         author = None
         if resolver is not None and m.author and m.kind != "assistant_message":
             author = resolver.display_name(m.author)
@@ -686,18 +686,18 @@ def render_recent_activity(
         # Surface msg_id when present so the agent can target older
         # messages with ``<react message="<id>" />``. Skipped when the
         # record has no id (legacy entries, system_notes).
-        id_part = f" id={m.msg_id}" if m.msg_id else ""
+        id_part = f" id={sanitize_prompt_field(m.msg_id)}" if m.msg_id else ""
         # Phase C channel-side resolution: if the resolver knows this
         # channel, prefix its display_name. ``getattr`` guards against
         # legacy resolvers without the channel API.
-        channel_field = m.channel_id
+        channel_field = sanitize_prompt_field(m.channel_id)
         if resolver is not None:
             channel_lookup = getattr(resolver, "channel_display_name", None)
             if callable(channel_lookup):
                 display = channel_lookup(m.channel_id)
                 if display:
-                    channel_field = f"{sanitize_prompt_field(display)} ({m.channel_id})"
-        lines.append(f"[{ts_short} {channel_field}{id_part}] {author}: {content}")
+                    channel_field = f"{sanitize_prompt_field(display)} ({channel_field})"
+        lines.append(f"[{ts_short} {channel_field}{id_part}] {author}:\n{prefix_prompt_body(content)}")
     return "\n".join(lines)
 
 

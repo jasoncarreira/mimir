@@ -18,7 +18,7 @@ from typing import Iterable
 from .history import Message, render_identity_context, render_recent_activity
 from .core_blocks import CoreBlock, render_core_section
 from .models import AgentEvent
-from .prompt_safety import sanitize_prompt_field
+from .prompt_safety import prefix_prompt_body, sanitize_prompt_field
 
 _DEFAULT_PERSONA = """You are Mimir, a memory-centric agent. You communicate through
 channels (Slack, Discord, web, benchmark stdout).
@@ -568,7 +568,7 @@ def build_turn_prompt(
         # so the agent reads "this is what I'm responding to" clearly,
         # vs. ambient context blocks above. Recent activity already
         # shows the message tail; this block is the *active* one.
-        body = event.content or "(no content)"
+        body = prefix_prompt_body(event.content or "(no content)")
         if event.attachment_names:
             paths = "\n".join(
                 f"- {sanitize_prompt_field(path)}" for path in event.attachment_names
