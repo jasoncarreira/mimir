@@ -56,17 +56,19 @@ function renderBoard(entry = "/chainlink") {
 
 describe("ChainlinkBoardRoute queries", () => {
   it("retrieves more than 250 issues with bounded pages and matching totals", async () => {
-    const requests = renderBoard();
+    // Keep real 250/250/1 issue pages, but use the shared pagination controls in
+    // Dependencies: this fixture has no edges, so it avoids rendering 250 cards.
+    const requests = renderBoard("/chainlink?view=dependencies");
     await screen.findByText(/501 matching issues \| showing 1-250 of 501/);
     expect((screen.getByRole("button", { name: "Previous" }) as HTMLButtonElement).disabled).toBe(true);
     expect(requests[0].get("show_completed")).toBe("false");
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
-    await screen.findByText(/showing 251-500 of 501/);
+    await screen.findByText(/501 matching issues \| showing 251-500 of 501/);
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
-    await screen.findByText(/showing 501-501 of 501/);
+    await screen.findByText(/501 matching issues \| showing 501-501 of 501/);
     expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Previous" }));
-    await screen.findByText(/showing 251-500 of 501/);
+    await screen.findByText(/501 matching issues \| showing 251-500 of 501/);
     expect(requests.map((params) => params.get("offset"))).toEqual(expect.arrayContaining(["0", "250", "500"]));
   });
 
