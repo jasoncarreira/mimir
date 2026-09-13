@@ -498,9 +498,10 @@ def _configure_build_identity(
             # positional parameter, so a ``name`` payload key collides with it.
             user_name=name,
             user_email=email,
-            # False means the parent lent nothing and the fallback was used --
-            # commits are still attributable, but the operator should fix the
-            # parent's identity rather than rely on this.
+            # False means NOT FULLY inherited: either the parent lent nothing,
+            # or it lent one field and the other fell back. Commits stay
+            # attributable either way, but a partial identity is still the
+            # operator's to fix rather than something to rely on.
             inherited=inherited,
         )
     return name, email
