@@ -69,9 +69,34 @@ async def test_git_group_drained_before_rebase_abort(
     ready = asyncio.Event()
     processes, child_fds, aborted = [], [], []
     monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
+    # Own the reader limit and observe its public transport state instead of
+    # guessing when asyncio's private StreamReader._paused flag will flip.
+    class ObservedReader(asyncio.StreamReader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.received = 0
+            self.transport = None
+
+        def set_transport(self, transport):
+            super().set_transport(transport)
+            self.transport = transport
+
+        def feed_data(self, data):
+            super().feed_data(data)
+            self.received += len(data)
+
+        def saturated(self):
+            return self.received > 2048 and not self.transport.is_reading()
+
+        def diagnostic(self):
+            return (f"received={self.received}, "
+                    f"reading={self.transport.is_reading()}, eof={self.at_eof()}")
+
     child_source = (
-        "import fcntl, os, time; guard = open('writer.lock', 'w'); "
-        "fcntl.flock(guard, fcntl.LOCK_EX); print(os.getpid(), flush=True); "
+        "import fcntl, os, time; from pathlib import Path; "
+        "guard = open('writer.lock', 'w'); "
+        "fcntl.flock(guard, fcntl.LOCK_EX); "
+        "Path('child.pid').write_text(str(os.getpid())); "
         "os.write(1, b'x' * 1048576); time.sleep(300)"
     )
     parent_source = (
@@ -81,19 +106,44 @@ async def test_git_group_drained_before_rebase_abort(
            "os.write(2, b'y' * 1048576); time.sleep(300)")
     )
 
+    setup_errors = []
+    monkeypatch.setattr(asyncio.streams, "StreamReader", ObservedReader)
+
     async def git_process(*args, **kwargs):
-        proc = await spawn(sys.executable, "-c", parent_source, **kwargs)
-        processes.append(proc)
-        child_pid = int(await proc.stdout.readline())
-        child_fds.append(os.pidfd_open(child_pid))
-        # Deliberately fill the owned StreamReader buffers before communicate.
-        # A killed parent alone cannot close the child's inherited descriptors.
-        while not proc.stdout._paused or (
-            proc.returncode is None if parent_exited else not proc.stderr._paused
-        ):
-            await asyncio.sleep(0.001)
-        ready.set()
-        return proc
+        try:
+            proc = await spawn(sys.executable, "-c", parent_source, limit=1024, **kwargs)
+            processes.append(proc)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 8
+            pid_file = tmp_path / "child.pid"
+            while not pid_file.exists() or not pid_file.read_text():
+                assert loop.time() < deadline, (
+                    f"child did not acknowledge writer.lock ownership; "
+                    f"parent_returncode={proc.returncode}; "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            child_fds.append(os.pidfd_open(int(pid_file.read_text())))
+            # A killed parent alone cannot close the child's inherited pipes.
+            # With a 1 KiB reader limit, >2 KiB received and a non-reading
+            # transport demonstrate backpressure without inspecting _paused.
+            while not proc.stdout.saturated() or (
+                proc.returncode is None if parent_exited else not proc.stderr.saturated()
+            ):
+                assert loop.time() < deadline, (
+                    f"pipe precondition not reached (parent_exited={parent_exited}, "
+                    f"parent_returncode={proc.returncode}); "
+                    f"stdout: {proc.stdout.diagnostic()}; "
+                    f"stderr: {proc.stderr.diagnostic()}"
+                )
+                await asyncio.sleep(0.001)
+            return proc
+        except Exception as exc:
+            setup_errors.append(exc)
+            raise
+        finally:
+            ready.set()
 
     async def git(*args, **kwargs):
         if args[0] == "pull":
@@ -121,6 +171,8 @@ async def test_git_group_drained_before_rebase_abort(
     ))
     try:
         await asyncio.wait_for(ready.wait(), 10)
+        if setup_errors:
+            raise setup_errors[0]
         if cancel:
             task.cancel()
         # A hang guard, not a process-startup or performance assertion. Do not
