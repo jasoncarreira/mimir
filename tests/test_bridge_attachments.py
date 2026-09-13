@@ -285,6 +285,80 @@ async def test_download_to_path_http_error_returns_false(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [100, 199, 300, 301, 302, 303, 304, 307, 308, 399, 400, 500])
+async def test_download_rejects_non_2xx(tmp_path: Path, caplog, status: int):
+    target = tmp_path / "out.bin"
+    session = _make_aiohttp_mock([b"not an attachment"], status=status)
+    with patch("aiohttp.ClientSession", return_value=session):
+        assert await download_to_path(
+            "https://files.slack.com/file", target,
+            headers={"Authorization": "Bearer test-token"},
+        ) is False
+    assert not target.exists()
+    if 300 <= status < 400:
+        assert f"rejected redirect ({status})" in caplog.text
+    else:
+        assert f"returned {status}" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,chunks", [(204, []), (200, []), (200, [b"", b""])])
+async def test_download_rejects_empty_body(tmp_path: Path, caplog, status, chunks):
+    target = tmp_path / "out.bin"
+    with patch("aiohttp.ClientSession", return_value=_make_aiohttp_mock(chunks, status)):
+        assert await download_to_path("https://files.slack.com/file", target) is False
+    assert not target.exists()
+    assert "returned an empty body" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 201, 206, 299])
+async def test_download_accepts_nonempty_2xx(tmp_path: Path, status):
+    target = tmp_path / "out.bin"
+    with patch("aiohttp.ClientSession", return_value=_make_aiohttp_mock([b"", b"data"], status)):
+        assert await download_to_path("https://files.slack.com/file", target) is True
+    assert target.read_bytes() == b"data"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("header", ["Authorization", "authorization", "AUTHORIZATION"])
+@pytest.mark.parametrize("cross_origin", [False, True], ids=["same-origin", "cross-origin"])
+async def test_download_authenticated_redirect_never_followed(
+    tmp_path: Path, aiohttp_server, status, header, cross_origin,
+):
+    from aiohttp import web
+
+    requests = []
+
+    async def redirect(request):
+        requests.append((request.path, request.headers.get("Authorization")))
+        return web.Response(status=status, headers={"Location": location}, body=b"redirect")
+
+    async def stolen(request):
+        requests.append((request.path, request.headers.get("Authorization")))
+        return web.Response(body=b"stolen")
+
+    app = web.Application()
+    app.router.add_get("/file", redirect)
+    app.router.add_get("/stolen", stolen)
+    server = await aiohttp_server(app)
+    location = "/stolen"
+    if cross_origin:
+        other_app = web.Application()
+        other_app.router.add_get("/stolen", stolen)
+        other_server = await aiohttp_server(other_app)
+        location = str(other_server.make_url("/stolen"))
+    target = tmp_path / "out.bin"
+    assert await download_to_path(
+        str(server.make_url("/file")), target, headers={header: "Bearer test-token"},
+    ) is False
+    # Same-origin redirects would retain Authorization if following were enabled.
+    assert requests == [("/file", "Bearer test-token")]
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
 async def test_download_slack_attachment_enforces_cap(tmp_path: Path):
     """Slack attachment download enforces max_bytes even when pre-flight size is small.
 

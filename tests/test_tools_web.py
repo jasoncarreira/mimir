@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +226,8 @@ async def test_fetch_url_writes_body_and_meta(
 
     assert meta["url"] == "https://example.com/foo.html"
     assert meta["bytes"] == len(body)
+    assert meta["cached"] is False
+    assert datetime.fromisoformat(meta["fetched_at"]).tzinfo is not None
     # Body file under attachments/fetch-cache/
     body_rel = meta["file_path"].lstrip("/")
     assert (tmp_path / body_rel).read_bytes() == body
@@ -378,7 +381,7 @@ async def test_fetch_url_only_converts_pdf_content_type(
 
     assert set(meta) == {
         "url", "status", "content_type", "bytes", "sha256",
-        "file_path", "metadata_path",
+        "file_path", "metadata_path", "cached", "fetched_at",
     }
     cache_dir = tmp_path / "attachments" / "fetch-cache"
     assert not list(cache_dir.glob("*.txt"))
@@ -454,6 +457,102 @@ async def test_fetch_url_cache_hit_rebuilds_whitelisted_sanitized_result(
         "max_output_bytes": 1_000_000,
     }
     assert rewritten == cached
+
+
+@pytest.mark.parametrize("mode", ["fresh", "expired", "refresh", "zero", "missing", "invalid", "naive", "future"])
+async def test_fetch_cache_freshness(tmp_path, monkeypatch, mode):
+    import yaml
+
+    responses = iter([b"original", b"updated"])
+    calls = []
+
+    def response():
+        calls.append(True)
+        return _FakeResponse(next(responses))
+
+    _patch_safe_open(monkeypatch, response)
+    first = await _drive_fetch_url(tmp_path, b"original")
+    path = tmp_path / first["metadata_path"].lstrip("/")
+    stored = json.loads(path.read_text())
+    if mode == "expired":
+        stored["fetched_at"] = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
+    elif mode == "missing":
+        stored.pop("fetched_at")
+    elif mode == "invalid":
+        stored["fetched_at"] = "remote invalid timestamp"
+    elif mode == "naive":
+        stored["fetched_at"] = datetime.now().isoformat()
+    elif mode == "future":
+        stored["fetched_at"] = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    path.write_text(json.dumps(stored))
+    args = {"url": first["url"]}
+    if mode == "refresh":
+        args["refresh"] = True
+    elif mode == "zero":
+        args["max_age_seconds"] = 0
+    result = yaml.safe_load(await web_tools_mod.fetch_url.ainvoke(args))
+    assert result["cached"] is (mode == "fresh")
+    assert len(calls) == (1 if mode == "fresh" else 2)
+    assert (tmp_path / result["file_path"].lstrip("/")).read_bytes() == (
+        b"original" if mode == "fresh" else b"updated"
+    )
+    if mode == "fresh":
+        assert result["fetched_at"] == first["fetched_at"]
+
+
+async def test_fetch_cache_rejects_fresh_sidecar_for_different_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml
+
+    responses = iter([b"original", b"updated"])
+    calls = []
+
+    def response():
+        calls.append(True)
+        return _FakeResponse(next(responses))
+
+    _patch_safe_open(monkeypatch, response)
+    monkeypatch.setattr(web_tools_mod, "_home", tmp_path)
+    url = "https://example.com/foo.html"
+    first = yaml.safe_load(await web_tools_mod.fetch_url.ainvoke({"url": url}))
+    cached = yaml.safe_load(await web_tools_mod.fetch_url.ainvoke({"url": url}))
+    assert cached["cached"] is True
+    assert len(calls) == 1
+
+    # Keep the real URL-keyed paths, body and fresh timestamp; only the
+    # sidecar's exact URL binding is wrong (even the hostname is unchanged).
+    meta_path = tmp_path / first["metadata_path"].lstrip("/")
+    stored = json.loads(meta_path.read_text(encoding="utf-8"))
+    stored["url"] = "https://example.com/other.html"
+    meta_path.write_text(json.dumps(stored), encoding="utf-8")
+
+    result = yaml.safe_load(await web_tools_mod.fetch_url.ainvoke({"url": url}))
+
+    assert len(calls) == 2
+    assert result["cached"] is False
+    assert result["url"] == url
+    assert result["file_path"] == first["file_path"]
+    assert result["metadata_path"] == first["metadata_path"]
+    assert (tmp_path / result["file_path"].lstrip("/")).read_bytes() == b"updated"
+    assert result["sha256"] == hashlib.sha256(b"updated").hexdigest()
+    assert json.loads(meta_path.read_text(encoding="utf-8")) == result
+
+
+async def test_fetch_cache_custom_ttl_and_validation(tmp_path, monkeypatch):
+    import yaml
+
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(b"body"))
+    first = await _drive_fetch_url(tmp_path, b"body")
+    path = tmp_path / first["metadata_path"].lstrip("/")
+    stored = json.loads(path.read_text())
+    stored["fetched_at"] = (datetime.now(timezone.utc) - timedelta(seconds=400)).isoformat()
+    path.write_text(json.dumps(stored))
+    result = yaml.safe_load(await web_tools_mod.fetch_url.ainvoke({"url": first["url"], "max_age_seconds": 600}))
+    assert result["cached"] is True
+    assert await web_tools_mod.fetch_url.ainvoke({"url": first["url"], "max_age_seconds": -1}) == "max_age_seconds must be >= 0."
+    assert web_tools_mod.fetch_url.args["max_age_seconds"]["default"] == 300
+    assert web_tools_mod.fetch_url.args["refresh"]["default"] is False
 
 
 @pytest.mark.asyncio

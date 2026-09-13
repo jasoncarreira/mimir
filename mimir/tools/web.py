@@ -54,6 +54,7 @@ FETCH_PDF_MAX_PAGES_DEFAULT = 100
 FETCH_PDF_MAX_TEXT_BYTES_DEFAULT = 1_000_000
 FETCH_CONTENT_TYPE_MAX_CHARS = 127
 FETCH_CONTENT_TYPE_FALLBACK = "application/octet-stream"
+FETCH_MAX_AGE_SECONDS_DEFAULT = 300
 UTC = timezone.utc
 
 # ─── Module-level dependency injection ─────────────────────────────
@@ -158,7 +159,7 @@ def _inline_fetch_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Build the model-visible fetch result from the server-owned schema."""
     keys = (
         "url", "status", "content_type", "bytes", "sha256",
-        "file_path", "metadata_path", "text_path",
+        "file_path", "metadata_path", "text_path", "cached", "fetched_at",
     )
     payload = {key: metadata[key] for key in keys if key in metadata}
     payload["content_type"] = _parsed_content_type(payload.get("content_type", ""))
@@ -583,6 +584,8 @@ async def fetch_url(
     url: str,
     timeout_seconds: int = 20,
     max_bytes: int = 2_000_000,
+    max_age_seconds: int = FETCH_MAX_AGE_SECONDS_DEFAULT,
+    refresh: bool = False,
 ) -> str:
     """Download a URL to a cache file and return the virtual path + metadata.
 
@@ -596,6 +599,16 @@ async def fetch_url(
         url: HTTP/HTTPS URL.
         timeout_seconds: Socket timeout. Must be > 0.
         max_bytes: Hard cap on body size; the download aborts if exceeded.
+        max_age_seconds: Cache freshness TTL, default 300 seconds (5 minutes).
+            Reuses repeated reads without indefinitely hiding changing pages.
+            Must be >= 0; 0 always downloads. Missing/invalid legacy timestamps
+            are stale. Disk retention is separate: the daily scratch janitor
+            removes files older than MIMIR_SCRATCH_TTL_DAYS (default 1 day),
+            but retains fetch-cache files while any turn is active.
+        refresh: Force a download regardless of cache age. Defaults to False.
+
+    Results include cached (whether this call reused a body) and fetched_at
+    (UTC ISO-8601 download time, unchanged on cache hits).
     """
     normalized_url = url.strip()
     if not normalized_url:
@@ -604,6 +617,8 @@ async def fetch_url(
         return "timeout_seconds must be > 0."
     if max_bytes <= 0:
         return "max_bytes must be > 0."
+    if max_age_seconds < 0:
+        return "max_age_seconds must be >= 0."
 
     # SSRF + scheme validation. Returns a friendly error string instead
     # of letting the SSRFBlocked exception bubble out as a generic
@@ -618,22 +633,26 @@ async def fetch_url(
 
     base_name = _name_from_url(normalized_url)
     digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:12]
-    # Dedup on URL digest: the previous filename included a UTC stamp
-    # so repeat fetches of the same URL piled up on disk. Now the
-    # cache file is keyed solely on the digest + sanitized name, and
-    # we short-circuit if a cached body for this exact URL already
-    # exists (returning the existing metadata sidecar without
-    # re-downloading). Operators wanting forced refresh can delete the
-    # files manually.
+    # Stable URL keys bound disk growth; freshness comes from the sidecar,
+    # never its mtime (cache hits may rewrite sanitized metadata).
     body_path = cache_dir / f"{digest}-{base_name}"
     meta_path = cache_dir / f"{body_path.name}.meta.json"
     text_path = cache_dir / f"{body_path.name}.txt"
-    if body_path.is_file() and meta_path.is_file():
+    if not refresh and max_age_seconds > 0 and body_path.is_file() and meta_path.is_file():
         try:
             existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing_meta = None
-        if existing_meta and existing_meta.get("url") == normalized_url:
+        age = None
+        if isinstance(existing_meta, dict) and existing_meta.get("url") == normalized_url:
+            try:
+                fetched_at = datetime.fromisoformat(existing_meta["fetched_at"])
+                age = (datetime.now(UTC) - fetched_at).total_seconds()
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        if age is not None and 0 <= age < max_age_seconds:
+            existing_meta["cached"] = True
+            existing_meta["fetched_at"] = fetched_at.astimezone(UTC).isoformat()
             extraction = existing_meta.get("pdf_extraction")
             needs_extraction = not isinstance(extraction, dict) or (
                 extraction.get("status") == "success" and not text_path.is_file()
@@ -664,6 +683,9 @@ async def fetch_url(
             )
             return yaml.safe_dump(cached_payload, sort_keys=False)
 
+    # A failed refresh must not leave metadata blessing a partial replacement.
+    meta_path.unlink(missing_ok=True)
+    text_path.unlink(missing_ok=True)
     try:
         fetched = await asyncio.to_thread(
             _download_url_bytes,
@@ -690,6 +712,8 @@ async def fetch_url(
     meta_virtual_path = _virtual_path(meta_path, root=_home)
     meta_payload = {
         "url": normalized_url,
+        "cached": False,
+        "fetched_at": datetime.now(UTC).isoformat(),
         "status": fetched["status"],
         "content_type": fetched["content_type"],
         "bytes": fetched["bytes"],
