@@ -118,6 +118,10 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
     if rule_kind == "scheduler_loop_lag_monitor_failed":
         error = _sanitize_field(ev.get("error") or "(no detail)")
         return f"scheduler loop-lag monitor failed: {error}"
+    if rule_kind == "scheduler_job_rejected":
+        job = _sanitize_field(ev.get("job") or "?")
+        reason = _sanitize_field(ev.get("reason") or "(no detail)")
+        return f"scheduler job {job!r} rejected: {reason}"
     if rule_kind == "loop_stop":
         return f"send_message_loop_hard_stop after {ev.get('count', '?')}"
     if rule_kind == "loop_warn":

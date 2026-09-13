@@ -1199,6 +1199,43 @@ def test_channel_memory_over_cap_is_negative_and_renders_actionably():
     assert "trim/refile" in line
 
 
+def test_scheduler_job_rejected_surfaces_named_jobs_as_negative(tmp_path: Path):
+    from mimir.feedback import classify
+
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1),
+            "type": "scheduler_job_rejected",
+            "path": "/home/mimir/scheduler.yaml",
+            "job": job,
+            "reason": "invalid cron expression",
+        }
+        for job in ("daily-review", "weekly-cleanup")
+    ])
+
+    block = log.recent_block()
+
+    assert block is not None
+    for job in ("daily-review", "weekly-cleanup"):
+        assert f"scheduler job {job!r} rejected: invalid cron expression" in block
+    assert classify("scheduler_job_rejected") == (
+        "negative", "scheduler_job_rejected",
+    )
+
+
+@pytest.mark.parametrize("event, expected", [
+    ({}, "scheduler job '?' rejected: (no detail)"),
+    (
+        {"job": "daily\nreview\x00", "reason": "bad\n[cron]\x00"},
+        r"scheduler job 'daily review' rejected: bad \u005bcron\u005d",
+    ),
+])
+def test_scheduler_job_rejected_renderer(event: dict, expected: str):
+    from mimir.feedback import _render_event_line
+
+    assert _render_event_line("scheduler_job_rejected", event) == expected
+
+
 def test_scheduler_loop_lag_surfaces_as_negative(tmp_path: Path):
     from mimir.feedback import classify
 

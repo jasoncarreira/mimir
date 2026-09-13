@@ -393,7 +393,10 @@ def load_jobs_from_text(
     source: Path | str = "scheduler.yaml",
     writable_roots: tuple[Path, ...] = (),
 ) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
-    """Parse scheduler.yaml content without letting one bad job abort siblings."""
+    """Parse jobs and rejections; ``scope=document`` means no usable document.
+
+    An empty document has no rejections and remains an authoritative empty list.
+    """
     rejections: list[dict[str, Any]] = []
     try:
         raw = yaml.safe_load(text)
@@ -402,6 +405,7 @@ def load_jobs_from_text(
         return [], [{
             "path": str(source),
             "job": "<document>",
+            "scope": "document",
             "reason": f"{type(exc).__name__}: {exc}",
         }]
     if raw is None:
@@ -410,6 +414,7 @@ def load_jobs_from_text(
         return [], [{
             "path": str(source),
             "job": "<document>",
+            "scope": "document",
             "reason": "scheduler document must be a list",
         }]
     out: list[SchedulerJob] = []
@@ -1087,6 +1092,9 @@ class Scheduler:
         # operator edit cannot knock the last-known-good job offline.
         valid_prompt_jobs: list[tuple[SchedulerJob, CronTrigger]] = []
         rejection_events = list(rejections or [])
+        if any(item.get("scope") == "document" for item in rejection_events):
+            self._dispatch_reload_events("scheduler_job_rejected", rejection_events)
+            return {"registered": 0, "invalid": len(rejection_events)}
         invalid_prompt_names = {
             str(item["job"])
             for item in rejection_events
@@ -1656,9 +1664,14 @@ class Scheduler:
         else:
             _build_trigger(job, self._tz)  # validate up front
         async with self._mutate_lock:
-            current, _rejections = await asyncio.to_thread(
+            current, rejections = await asyncio.to_thread(
                 load_jobs, self._yaml_path,
             )
+            if rejections:
+                raise ValueError(
+                    "refusing to rewrite scheduler.yaml; fix rejected entries: "
+                    + ", ".join(str(item["job"]) for item in rejections)
+                )
             current = [j for j in current if j.name != job.name]
             current.append(job)
             await asyncio.to_thread(write_jobs, self._yaml_path, current)
@@ -1667,9 +1680,14 @@ class Scheduler:
 
     async def remove_job(self, name: str) -> bool:
         async with self._mutate_lock:
-            current, _rejections = await asyncio.to_thread(
+            current, rejections = await asyncio.to_thread(
                 load_jobs, self._yaml_path,
             )
+            if rejections:
+                raise ValueError(
+                    "refusing to rewrite scheduler.yaml; fix rejected entries: "
+                    + ", ".join(str(item["job"]) for item in rejections)
+                )
             kept = [j for j in current if j.name != name]
             if len(kept) == len(current):
                 return False
