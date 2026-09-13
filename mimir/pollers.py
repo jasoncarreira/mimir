@@ -75,6 +75,7 @@ overrunning discards all buffered events, leaving an unsaved cursor to retry.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import fcntl
 import hashlib
@@ -143,6 +144,11 @@ POLLER_TIMEOUT_SECONDS = 120
 # "a later event re-resolves", bounded so a same-author batch cannot turn an
 # unresolved attestation into O(items) network calls in an unbounded loop.
 GITHUB_TRUST_ATTEMPTS_PER_FIRE = 2
+# Shared phase-3 network budget, including actor lookup and both trust endpoints.
+# 6 x 10s = 60s nominal attestation wait, chosen to avoid multi-minute slot
+# starvation. This is not a hard wall-clock deadline: urlopen's timeout bounds
+# socket operations, not the whole response, and phase 3 also logs/enqueues.
+GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL = 6
 # Cap stderr text recorded in events.jsonl so a chatty poller doesn't
 # blow the algedonic stream's storage budget.
 POLLER_STDERR_LOG_CHARS = 2000
@@ -521,6 +527,19 @@ def _redact_poller_payload(
     return value
 
 
+@dataclasses.dataclass
+class _GithubFireAttestation:
+    attempts: int = 0
+    framework_cache: dict[tuple[str, int], tuple[int, Any] | None] = dataclasses.field(
+        default_factory=dict,
+    )
+
+
+_github_fire_attestation: contextvars.ContextVar[_GithubFireAttestation | None] = (
+    contextvars.ContextVar("github_fire_attestation", default=None)
+)
+
+
 def _github_api_attestation(
     endpoint: str,
     token: str,
@@ -528,6 +547,11 @@ def _github_api_attestation(
     timeout: float = 10.0,
 ) -> tuple[int, Any] | None:
     """Read one GitHub API endpoint from the server process, failing closed."""
+    fire = _github_fire_attestation.get()
+    if fire is not None:
+        if fire.attempts >= GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL:
+            return None
+        fire.attempts += 1
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "mimir-integrity-attestation",
@@ -737,9 +761,18 @@ def _github_framework_trigger_is_trusted(
     if any(set(value) - allowed for value in (*parts, self_login)):
         return False
     escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
-    attestation = _github_api_attestation(
-        f"repos/{escaped_repo}/pulls/{number}", token,
-    )
+    fire = _github_fire_attestation.get()
+    cache_key = (repo, number)
+    if fire is not None and cache_key in fire.framework_cache:
+        attestation = fire.framework_cache[cache_key]
+    else:
+        attestation = _github_api_attestation(
+            f"repos/{escaped_repo}/pulls/{number}", token,
+        )
+        if fire is not None:
+            # Cache live input, not the verdict: every item's claimed head/base
+            # must still match. Failures are also cached for this fire only.
+            fire.framework_cache[cache_key] = attestation
     if attestation is None or attestation[0] != 200 or not isinstance(attestation[1], dict):
         return False
     pull_request = attestation[1]
@@ -2943,6 +2976,16 @@ async def run_poller(
     # (repo, author) per fire keeps the #1441 requirement -- a later event does
     # re-resolve -- while capping the amplification at a constant.
     github_trust_attempts: dict[tuple[str, str], int] = {}
+    github_fire = _GithubFireAttestation()
+
+    def attest_in_fire(function, *args):
+        # Only these sequential worker calls share the budget. Reset even on
+        # failure so neither other fires nor later executor work inherit it.
+        token = _github_fire_attestation.set(github_fire)
+        try:
+            return function(*args)
+        finally:
+            _github_fire_attestation.reset(token)
 
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
@@ -2994,6 +3037,7 @@ async def run_poller(
                     # third-party prose. Trust still requires a matching live,
                     # agent-owned PR; active ingest remains recorded below.
                     trusted = await asyncio.to_thread(
+                        attest_in_fire,
                         _github_framework_trigger_is_trusted,
                         repo,
                         item_extras,
@@ -3002,6 +3046,7 @@ async def run_poller(
                     )
                 elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
                     author = await asyncio.to_thread(
+                        attest_in_fire,
                         _github_content_author,
                         repo,
                         item_extras,
@@ -3025,6 +3070,7 @@ async def run_poller(
                             github_trust_attempts.get(cache_key, 0) + 1
                         )
                         resolved_trust = await asyncio.to_thread(
+                            attest_in_fire,
                             _github_author_is_trusted,
                             repo,
                             author,
