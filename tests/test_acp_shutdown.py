@@ -1088,10 +1088,35 @@ async def test_shutdown_journal_timeout_distinguishes_surviving_child(
 import asyncio
 from types import SimpleNamespace
 
+watchdog_started = threading.Event()
+fire_watchdog = threading.Event()
+main_ident = threading.get_ident()
+
 class ControlledTimer(JournalTimer):
+    def start(self):
+        super().start()
+        watchdog_started.set()
+
     def run(self):
-        if os.read(0, 1) == b'x':
-            self.function(*self.args, **self.kwargs)
+        fire_watchdog.wait()
+        self.function(*self.args, **self.kwargs)
+
+original_signal = _journal_signal
+def observer_first_signal(self, signum, frame):
+    # Require C-byte observer arming, not the handler's fallback arming.
+    watchdog_started.wait()
+    return original_signal(self, signum, frame)
+_journal_signal = observer_first_signal
+
+def deliver():
+    while token := os.read(0, 1):
+        if token == b'x':
+            fire_watchdog.set()
+        else:
+            signum = {b't': signal.SIGTERM, b'i': signal.SIGINT}[token]
+            # These stages diagnose graceful dispatch and repeat-signal exit.
+            # Process-directed delivery can leave main blocked indefinitely.
+            signal.pthread_kill(main_ident, signum)
 
 proxy.threading.Timer = ControlledTimer
 _journal_force_exit = lambda self: record(b'force-exit-survived')
@@ -1104,6 +1129,7 @@ def cleanup():
 async def run():
     hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
     hooks.install()
+    threading.Thread(target=deliver, daemon=True).start()
     os.write(1, b'ready\n')
     threading.Event().wait()
 
@@ -1125,7 +1151,8 @@ asyncio.run(run())
         async with _shutdown_ceiling(process, progress, lambda: "self-test handshake", timeout=600):
             assert await process.stdout.readline() == b"ready\n"
             if stage != "unarmed":
-                process.send_signal(signal.SIGTERM)
+                process.stdin.write(b"t")
+                await process.stdin.drain()
                 await await_marker("cleanup-enter")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
             if stage == "force-exit":
@@ -1133,7 +1160,8 @@ asyncio.run(run())
                 await process.stdin.drain()
                 await await_marker("force-exit-survived")
             elif stage == "escalation":
-                process.send_signal(signal.SIGINT)
+                process.stdin.write(b"i")
+                await process.stdin.drain()
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
             # The short timeout tests formatting, never child startup or delivery.
