@@ -37,6 +37,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "startup_failed": ("negative", "startup_failed"),
     "loop_stall_watchdog_fired": ("negative", "loop_stall_watchdog_fired"),
     "scheduler_loop_lag": ("negative", "scheduler_loop_lag"),
+    "scheduler_job_rejected": ("negative", "scheduler_job_rejected"),
     # chainlink #682: ``scheduler_loop_lag_host`` (the loop was woken late while
     # idle/descheduled — a VM/host scheduling hiccup, not a mimir hot path) is
     # deliberately ABSENT here. classify() returns None for it, so every feedback

@@ -212,6 +212,97 @@ async def test_scheduler_reload_reports_every_rejected_yaml_entry(tmp_path: Path
     assert sched._scheduler.get_job("scheduler:bad-shell") is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_text", ["- name: [broken", "name: not-a-list"])
+@pytest.mark.parametrize("async_reload", [False, True])
+async def test_document_rejection_preserves_entire_jobstore(
+    tmp_path, monkeypatch, bad_text, async_reload,
+):
+    from unittest.mock import Mock
+
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(yaml.safe_dump([
+        {"name": "heartbeat", "prompt": "tick", "cron": "*/5 * * * *"},
+        {"name": "nightly", "prompt": "review", "cron": "0 8 * * *"},
+        {"name": "override", "callable": "demo", "cron": "0 6 * * *"},
+        {"name": "disabled", "callable": "disabled", "cron": ""},
+    ]))
+
+    async def noop(*args):
+        return True
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop)
+    sched.register_callable("demo", noop, default_cron="0 4 * * *")
+    sched.register_callable("disabled", noop, default_cron="0 4 * * *")
+    sched.reload()
+    before = {job.id: job for job in sched._scheduler.get_jobs()}
+    assert set(before) == {"scheduler:heartbeat", "scheduler:nightly", "demo"}
+    assert "hour='6'" in str(before["demo"].trigger)
+    events = Mock()
+    monkeypatch.setattr(sched, "_dispatch_reload_events", events)
+    path.write_text(bad_text)
+    stats = await sched._reload_async() if async_reload else sched.reload()
+    after = {job.id: job for job in sched._scheduler.get_jobs()}
+    assert after == before
+    assert all(after[key] is job for key, job in before.items())
+    assert stats == {"registered": 0, "invalid": 1}
+    kind, rejected = events.call_args.args
+    assert kind == "scheduler_job_rejected"
+    assert rejected[0]["job"] == "<document>"
+    assert rejected[0]["scope"] == "document"
+
+    # A real empty schedule still removes prompts and clears callable overrides.
+    for empty in ("", "[]\n"):
+        path.write_text(empty)
+        assert sched.reload() == {"registered": 0, "invalid": 0}
+        assert {job.id for job in sched._scheduler.get_jobs()} == {"demo", "disabled"}
+        assert "hour='4'" in str(sched._scheduler.get_job("demo").trigger)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["add", "remove", "add_schedule", "remove_schedule", "set_schedule_priority"])
+@pytest.mark.parametrize("bad_entry, rejected_name", [
+    ("- name: [broken\n", "<document>"),
+    ("- prompt: unnamed\n  cron: '0 9 * * *'\n", "entry[1]"),
+    ("- name: reflect\n  prompt: review\n  cron: '0 9 * * *'\n  time_of_day: '09:00'\n", "reflect"),
+    ("- name: mixed\n  prompt: review\n  callable: demo\n  cron: '0 9 * * *'\n", "mixed"),
+    ("- name: authority\n  prompt: review\n  cron: '0 9 * * *'\n  authority_profile: unknown\n", "authority"),
+])
+async def test_lossy_parse_refuses_mutations(
+    tmp_path, monkeypatch, operation, bad_entry, rejected_name,
+):
+    from mimir.tools import registry
+
+    path = tmp_path / "scheduler.yaml"
+    original = "# operator comment\n- name: keep\n  prompt: tick\n  cron: '0 8 * * *'\n" + bad_entry
+    path.write_text(original)
+
+    async def noop(_event):
+        return True
+
+    sched = Scheduler(scheduler_yaml=path, enqueue=noop)
+    monkeypatch.setitem(registry._STATE, "scheduler", sched)
+    if operation in {"add", "remove"}:
+        with pytest.raises(ValueError) as exc:
+            if operation == "add":
+                await sched.add_job(SchedulerJob(name="new", prompt="tick", cron="0 9 * * *"))
+            else:
+                await sched.remove_job("keep")
+        assert rejected_name in str(exc.value)
+    else:
+        tool = getattr(registry, operation)
+        args = {"name": "keep"}
+        if operation == "add_schedule":
+            args.update(name="new", prompt="tick", cron="0 9 * * *")
+        elif operation == "set_schedule_priority":
+            args["priority"] = "high"
+        result = await tool.ainvoke(args)
+        assert "failed:" in result
+        if operation != "set_schedule_priority" or rejected_name != "<document>":
+            assert rejected_name in result
+    assert path.read_bytes() == original.encode()
+
+
 def test_scheduler_channel_id_synthetic_for_global():
     assert _scheduler_channel_id("nightly", None) == "scheduler:nightly"
     assert _scheduler_channel_id("nightly", "real-channel") == "real-channel"
