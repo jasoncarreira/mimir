@@ -50,6 +50,7 @@ import yaml
 
 from .contained_execution import base_worker_environment
 from .redaction import redact_text
+from .worklink.evidence import shell_gate_environment
 
 log = logging.getLogger(__name__)
 
@@ -120,10 +121,13 @@ def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
     on missing binary (coreutils convention so callers can
     disambiguate)."""
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, timeout=timeout,
-            env=base_worker_environment("cred-verify"),
-        )
+        # Local probes have no executor-provisioned worker home. Provision a
+        # private writable one while retaining the bounded, secret-free env.
+        with shell_gate_environment() as probe_env:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=timeout,
+                env=probe_env,
+            )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except subprocess.TimeoutExpired:
         return 124, "", f"timeout after {timeout}s"

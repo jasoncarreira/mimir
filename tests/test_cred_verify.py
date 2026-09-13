@@ -214,31 +214,91 @@ def test_subprocess_probe_passes_on_zero_exit(
     assert "alice" in result.detail
 
 
-def test_subprocess_probe_uses_exact_restricted_environment(
+def test_subprocess_probe_uses_restricted_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    from mimir.contained_execution import base_worker_environment
+    from contextlib import contextmanager
 
+    expected = {}
+    provision_environment = cred_verify.shell_gate_environment
+
+    @contextmanager
+    def capture_environment():
+        with provision_environment() as env:
+            expected.update(env)
+            yield env
+
+    monkeypatch.setattr(cred_verify, "shell_gate_environment", capture_environment)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("LANG", "C.UTF-8")
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
-    monkeypatch.setenv("GITHUB_TOKEN", "test-github-secret")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-secret")
-    monkeypatch.setenv("UNRELATED_SECRET", "also-private")
+    forbidden = {
+        "GITHUB_TOKEN": "test-github-secret",
+        "ANTHROPIC_API_KEY": "test-anthropic-secret",
+        "DECLARED_CREDENTIAL": "declared-secret",
+        "UNRELATED_SECRET": "also-private",
+        "CRED_VERIFY_PARENT_SENTINEL": "must-not-leak",
+    }
+    for name, value in forbidden.items():
+        monkeypatch.setenv(name, value)
     cmd = [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"]
     probe = cred_verify._make_subprocess_probe(
         binary=sys.executable, cmd=cmd,
-        env_vars=("GITHUB_TOKEN", "ANTHROPIC_API_KEY"),
+        env_vars=("GITHUB_TOKEN", "ANTHROPIC_API_KEY", "DECLARED_CREDENTIAL"),
     )
 
     ok, detail = probe()
 
     assert ok, detail
     child_env = json.loads(detail)
-    assert "GITHUB_TOKEN" not in child_env
-    assert "ANTHROPIC_API_KEY" not in child_env
-    assert "UNRELATED_SECRET" not in child_env
-    assert child_env == base_worker_environment("cred-verify")
+    assert expected
+    # Platforms may add their own variables at process startup. Assert only
+    # the values and exclusions we control, not exact child-dict equality.
+    assert expected.items() <= child_env.items()
+    assert forbidden.keys().isdisjoint(child_env)
+    assert child_env["HOME"] != str(tmp_path)
+    assert not Path(child_env["HOME"]).exists()
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_subprocess_probe_home_is_writable_and_cleaned(tmp_path, monkeypatch, exit_code):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cmd = [sys.executable, "-c", "\n".join([
+        "import json, os, pathlib, stat, sys",
+        "home = pathlib.Path(os.environ['HOME'])",
+        "assert stat.S_IMODE(home.stat().st_mode) == 0o700",
+        "for name in ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME'):",
+        "    path = pathlib.Path(os.environ[name])",
+        "    assert path == home or home in path.parents",
+        "    (path / 'probe-write').write_text('ok')",
+        "print(json.dumps(str(home)))",
+        f"sys.exit({exit_code})",
+    ])]
+    rc, out, err = cred_verify._run_quiet(cmd)
+    assert rc == exit_code, err
+    home = Path(json.loads(out))
+    assert home != tmp_path
+    assert not home.exists()
+    assert not (tmp_path / 'probe-write').exists()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "missing"])
+def test_subprocess_probe_cleans_home_on_launch_exception(monkeypatch, failure):
+    homes = []
+
+    def fail_run(cmd, **kwargs):
+        home = Path(kwargs["env"]["HOME"])
+        assert home.is_dir()
+        homes.append(home)
+        if failure == "timeout":
+            raise cred_verify.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        raise FileNotFoundError("missing probe")
+
+    monkeypatch.setattr(cred_verify.subprocess, "run", fail_run)
+    rc, _, _ = cred_verify._run_quiet(["probe"])
+    assert rc == (124 if failure == "timeout" else 127)
+    assert len(homes) == 1
+    assert not homes[0].exists()
 
 
 def test_binary_lookup_uses_restricted_path(monkeypatch):
