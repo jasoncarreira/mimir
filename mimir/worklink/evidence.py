@@ -55,6 +55,7 @@ class TestResult:
     counts: TestCounts | None = None
     failed_tests: tuple[str, ...] = ()
     report_error: str | None = None
+    # Failed in the gate but passed in isolation; diagnostic, not proof of flakiness.
     flaky_tests: tuple[str, ...] = ()
     initial_run: TestResult | None = None
     rerun: TestResult | None = None
@@ -448,15 +449,12 @@ async def _observe_evidence_from_ref(
                 initial = tests
                 tests = replace(tests, initial_run=initial, rerun=rerun)
                 if complete:
+                    # Deliberately supersedes Chainlink #1557's verdict-flip:
+                    # parallel-only failures (xdist ordering/shared state) are real
+                    # defects; passing in isolation must not hide them. Preserve
+                    # the gate's verdict, counts and failures; rerun is evidence only.
                     tests = replace(
                         tests,
-                        exit_code=rerun.exit_code,
-                        counts=replace(
-                            initial.counts,
-                            passed=initial.counts.passed + len(failed_ids) - len(remaining),
-                            failed=len(remaining),
-                        ),
-                        failed_tests=tuple(redact_text(node)[:1000] for node in remaining),
                         flaky_tests=tuple(
                             redact_text(node)[:1000] for node in failed_ids if node not in remaining
                         ),

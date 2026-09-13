@@ -1391,6 +1391,47 @@ def test_gate_heartbeat_prevents_reaping_and_stops_with_run(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("failed_observation", [1, 2])
+def test_diagnostic_rerun_pass_does_not_push_or_open_pr(tmp_path, monkeypatch, failed_observation):
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.evidence import validate_evidence
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    original_observe = orchestrator.observe_evidence
+    observations = 0
+
+    async def observed(**kwargs):
+        nonlocal observations
+        observations += 1
+        validation = await original_observe(**kwargs)
+        if observations == failed_observation:
+            initial = TestResult("pytest -n 6", 1, failed_tests=("test_gate.py::test_parallel",))
+            tests = replace(
+                initial, initial_run=initial,
+                rerun=TestResult("pytest -n 0 -- test_gate.py::test_parallel", 0),
+                flaky_tests=initial.failed_tests,
+            )
+            return validate_evidence(replace(validation.evidence, tests=tests))
+        return validation
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observed)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+    assert observations == failed_observation
+    assert result.status == "failed"
+    assert result.review_ready is False
+    assert result.pr_url is None
+    assert not any(isinstance(call, list) and call[:3] == ["gh", "pr", "create"] for call in calls)
+    assert not any(isinstance(call, list) and call[0] == "git" and "push" in call for call in calls)
+
+
 @pytest.mark.parametrize("later_exit_code", [0, 1])
 def test_gate_flakes_survive_second_observation_without_masking_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, later_exit_code: int
@@ -1454,6 +1495,13 @@ def test_gate_flakes_survive_second_observation_without_masking_failure(
     )
     assert f"flaky_tests={json.dumps([flaky])}" in comment
     assert f"failed_tests={json.dumps([failed] if later_exit_code else [])}" in comment
+    if later_exit_code == 0:
+        pr_call = next(call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"])
+        body = pr_call[pr_call.index("--body") + 1]
+        assert "- Tests: `echo ok` → 0" in body
+        assert "- Original gate: `echo ok` → 1" in body
+        assert "- Diagnostic rerun (serial, failed nodes only): `echo ok` → 0" in body
+        assert f'flaky_tests (passed in isolation; not proof of flakiness): ["{flaky}"]' in body
 
 
 @pytest.mark.parametrize("has_tests", [True, False])
