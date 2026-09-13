@@ -103,7 +103,11 @@ def _file_parent(session: HostedSession, value: str, *, edit: bool = False):
             -32000, f"Edit alias resolved outside the boundary: {path}. "
             "Retry with this canonical absolute path so the permission names the target."
         )
-    # Walk the canonical path without following any replacement symlink. Keep
+    # Edits must walk the named path, not an alias's resolved destination, so
+    # permission prompts name the file written. Reads may follow scoped aliases.
+    if edit:
+        path = _resolved_path(session, value)
+    # Walk without following any replacement symlink. Keep
     # the parent pinned for reads, temporary creation, and atomic replacement.
     parent = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -112,6 +116,14 @@ def _file_parent(session: HostedSession, value: str, *, edit: bool = False):
                             dir_fd=parent)
             os.close(parent)
             parent = child
+        # This redundant lstat is only for the actionable error message, not
+        # symlink enforcement: it is TOCTOU-racy. O_NOFOLLOW at the _edit open
+        # is the enforcing guard; this diagnostic is deliberately not independently tested.
+        if edit and stat.S_ISLNK(os.lstat(path.name, dir_fd=parent).st_mode):
+            raise HostedMcpError(
+                -32000, "hands_edit failed: symlink target refused; retry with the target path "
+                "so the permission names the target."
+            )
         yield parent, path.name
     finally:
         os.close(parent)
