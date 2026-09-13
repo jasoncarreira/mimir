@@ -3857,6 +3857,9 @@ def _operator_recursive_read_preflight(
     return True
 
 
+_OPERATOR_BINDABLE_READ_COMMANDS = frozenset({"ls", "wc", "grep", "rg"})
+
+
 def _operator_read_execution_argv_with_diagnostics(
     argv: list[str], *, resolved_cwd: str | Path,
 ) -> tuple[list[str] | None, str, ServiceShellBindingRule | None]:
@@ -3872,7 +3875,7 @@ def _operator_read_execution_argv_with_diagnostics(
             ServiceShellBindingRule.OPERATOR_READER_EXCLUDED,
         )
     slots = _shell_read_operand_slots(argv)
-    if command not in {"ls", "wc", "grep", "rg"} or slots is None:
+    if command not in _OPERATOR_BINDABLE_READ_COMMANDS or slots is None:
         return None, _OPERATOR_READ_REFUSAL, ServiceShellBindingRule.OPERATOR_READ_OPERAND_POLICY
     try:
         cwd = Path(resolved_cwd).resolve(strict=True)
@@ -3987,7 +3990,7 @@ def _validated_operator_shell_argv_artifact(
         return None
     family = Path(parsed_argv[0]).name
     expected: list[str] | None
-    if family in {"ls", "wc", "grep", "rg", "jq"}:
+    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             parsed_argv, resolved_cwd=cwd,
         )
@@ -4017,7 +4020,7 @@ def _operator_final_argv_matches_family(
     family = artifact.family
     if not argv or Path(argv[0]).name != family:
         return False
-    if family in {"ls", "wc", "grep", "rg"}:
+    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             argv, resolved_cwd=artifact.resolved_cwd,
         )
@@ -5256,6 +5259,25 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
 
 
 def _target_matches_configured_github_repo_fetch(target: str) -> bool:
+    """Exempt only bounded poller evidence endpoints from the taint gate."""
+    if not _target_within_configured_github_repo(target):
+        return False
+    parsed = urlsplit(target.strip())
+    # No free-form path or query data: immutable SHA or bounded numeric run ID,
+    # and only GitHub's documented page-size range (1..100), once, unencoded.
+    return (
+        parsed.hostname.lower() == "api.github.com"
+        and re.fullmatch(
+            r"/repos/[^/]+/[^/]+/(?:actions/runs/[1-9][0-9]{0,19}/jobs"
+            r"|commits/[0-9a-fA-F]{40}/check-runs)",
+            parsed.path,
+        ) is not None
+        and re.fullmatch(r"(?:per_page=(?:[1-9][0-9]?|100))?", parsed.query) is not None
+        and not parsed.fragment
+    )
+
+
+def _target_within_configured_github_repo(target: str) -> bool:
     """Match HTTPS API or web reads scoped to a configured GitHub repository."""
     try:
         parsed = urlsplit(target.strip())
@@ -5367,7 +5389,7 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
         or _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
     ):
         return True
-    if _target_matches_configured_github_repo_fetch(target):
+    if _target_within_configured_github_repo(target):
         return True
     if policy is None:
         return False
@@ -8794,8 +8816,13 @@ class ToolRegistry:
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if not sink_check.allowed and enforce and not preliminary_admin_denied:
                 return finish(sink_check)
-            if sink_check.is_shadow_decision and sink_check.would_block and not preliminary_admin_denied:
-                shadow_sink = sink_check
+            if sink_check.is_shadow_decision and sink_check.would_block:
+                if preliminary_admin_denied:
+                    # Census both independent refusals without replacing the
+                    # admin denial returned by the authorization gate below.
+                    finish(sink_check)
+                else:
+                    shadow_sink = sink_check
 
         decision = preliminary_decision
         service_principal = None

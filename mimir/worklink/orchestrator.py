@@ -190,6 +190,7 @@ class _TerminalClaimRelease:
     attempted: bool = False
     confirmed: bool = False
     retain_for_recovery: bool = False
+    label_transition_applied: bool = False
 
     def __call__(self) -> bool:
         if self.retain_for_recovery:
@@ -212,6 +213,8 @@ class _TerminalClaimRelease:
                 issue_id=self.issue_id,
                 attempt=self.attempt,
                 outcome="terminal",
+                label_transition_applied=self.label_transition_applied,
+                state_retained=load_run_state(self.home, self.issue_id) is not None,
             )
         return self.confirmed
 
@@ -957,20 +960,21 @@ class WorklinkRunner:
         except Exception as exc:
             transition_applied = False
             transition_error = None
-            if terminal_release():
-                try:
-                    claims.transition_issue(
-                        issue.issue_id,
-                        status="failed",
-                        review_ready=False,
-                        attempt=record.budget_attempt or record.attempt,
-                        reason=str(exc),
-                    )
-                    transition_applied = True
-                except Exception as transition_exc:
-                    transition_error = str(transition_exc)
-            else:
-                transition_error = "Chainlink did not confirm lock release"
+            terminal_release.retain_for_recovery = True
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=record.budget_attempt or record.attempt,
+                    reason=str(exc),
+                )
+                transition_applied = True
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
+            except Exception as transition_exc:
+                transition_error = str(transition_exc)
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
@@ -1047,7 +1051,7 @@ class WorklinkRunner:
         runner: Runner,
         publication: ControllerGitPublication | None = None,
         executor_report_dir: Path | None = None,
-        terminal_release: Callable[[], bool],
+        terminal_release: _TerminalClaimRelease,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1307,18 +1311,13 @@ class WorklinkRunner:
         transition_applied = False
         transition_error = None
 
-        if not terminal_release():
-            return WorklinkRunResult(
-                issue.issue_id,
-                attempt,
-                "failed",
-                review_ready=validation.review_ready,
-                pr_url=pr_url,
-                evidence_path=evidence_path,
-                checkout=lease.path,
-                branch=lease.branch,
-                reason="terminal recovery incomplete: Chainlink lock release failed",
-            )
+        # Keep the lock until routing succeeds, including through outer finally.
+        terminal_release.retain_for_recovery = True
+        if pr_url:
+            # Execution is finished and publication evidence is durable. Retire
+            # the worker pointer so startup orphan reconciliation cannot demote
+            # this PR; terminal recovery now belongs to the stale-lock reaper.
+            run_bookkeeping("completed run state clear", lambda: clear_run_state(self.home, issue.issue_id))
 
         def transition_issue() -> None:
             nonlocal transition_applied, transition_error
@@ -1334,6 +1333,8 @@ class WorklinkRunner:
                 transition_error = str(exc)
                 raise
             transition_applied = True
+            terminal_release.label_transition_applied = True
+            terminal_release.retain_for_recovery = False
 
         def log_transition() -> None:
             _log_event(
@@ -1357,6 +1358,18 @@ class WorklinkRunner:
                 # The transition event is the observable record of this failure;
                 # emit it without turning a failed mutation into a successful run.
                 log_transition()
+        if transition_applied and not terminal_release():
+            return WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                "failed",
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+                evidence_path=evidence_path,
+                checkout=lease.path,
+                branch=lease.branch,
+                reason="terminal recovery incomplete: Chainlink lock release failed",
+            )
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -3262,15 +3275,18 @@ def _release_issue_and_clear_run_state(
     return True
 
 
-def _log_terminal_recovery_failed(*, issue_id: int, attempt: int, outcome: str) -> None:
+def _log_terminal_recovery_failed(
+    *, issue_id: int, attempt: int, outcome: str, label_transition_applied: bool,
+    state_retained: bool,
+) -> None:
     _log_event(
         "worklink_terminal_recovery_failed",
         issue_id=issue_id,
         attempt=attempt,
         outcome=outcome,
         lock_released=False,
-        label_transition_applied=False,
-        state_retained=True,
+        label_transition_applied=label_transition_applied,
+        state_retained=state_retained,
         error="Chainlink did not confirm lock release",
     )
 
@@ -4212,6 +4228,22 @@ def _open_pr(
         f"{evidence.tests.exit_code if evidence.tests else 'missing'}\n"
         f"- Transcript: `{evidence.transcript or '(none)'}`\n"
     )
+    if evidence.tests is not None:
+        tests = evidence.tests
+        if tests.initial_run is not None:
+            evidence_block += (
+                f"- Original gate: `{tests.initial_run.cmd}` → {tests.initial_run.exit_code}\n"
+            )
+        if tests.rerun is not None:
+            evidence_block += (
+                f"- Diagnostic rerun (serial, failed nodes only): `{tests.rerun.cmd}` → "
+                f"{tests.rerun.exit_code}\n"
+            )
+        if tests.flaky_tests:
+            evidence_block += (
+                "- flaky_tests (passed in isolation; not proof of flakiness): "
+                f"{json.dumps([redact_text(node) for node in tests.flaky_tests])}\n"
+            )
     body = evidence_block
     if pr_body_section:
         body = (

@@ -60,7 +60,9 @@ async def run_store_io(func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwar
 
     Cancellation is deferred until the worker finishes: callers holding a store
     lock must not release it while a durable write is still in flight. Worker
-    failures (including writer-lock TimeoutError) propagate unchanged.
+    failures (including writer-lock TimeoutError) propagate unchanged unless
+    cancellation was requested; then the retrieved failure is chained as the
+    cause of CancelledError so cancellation wins without losing diagnostics.
     """
     future = asyncio.get_running_loop().run_in_executor(
         _STORE_EXECUTOR, copy_context().run, partial(func, *args, **kwargs),
@@ -71,7 +73,15 @@ async def run_store_io(func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwar
             await asyncio.shield(future)
         except asyncio.CancelledError:
             cancelled = True
-    result = future.result()
+        except BaseException:
+            # Retrieve the completed worker's failure below, before cancellation.
+            break
+    try:
+        result = future.result()
+    except BaseException as exc:
+        if cancelled:
+            raise asyncio.CancelledError from exc
+        raise
     if cancelled:
         raise asyncio.CancelledError
     return result

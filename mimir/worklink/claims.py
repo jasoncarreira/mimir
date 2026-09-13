@@ -919,6 +919,14 @@ class ChainlinkClaims:
             if steal.returncode != 0:
                 record_skip("lock_steal_failed", record.issue_id)
                 continue
+            # A leaf may have published before terminal label routing failed,
+            # including after in-progress was removed. Repair from publication
+            # evidence before releasing its last discoverable recovery handle.
+            if not release_only and self.review_ready_evidence(record.issue_id) is not None:
+                self.transition_issue(record.issue_id, status="completed", review_ready=True)
+                self._run("locks", "release", str(record.issue_id))
+                reaped.append(record)
+                continue
             if release_only or not self._issue_has_label(record.issue_id, "worklink:in-progress"):
                 self._run("locks", "release", str(record.issue_id), check=False)
                 record_skip("in_progress_label_missing", record.issue_id)

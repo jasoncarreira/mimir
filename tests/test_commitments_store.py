@@ -27,6 +27,7 @@ from mimir.commitments import (
     make_dedupe_key,
 )
 from mimir.commitments.models import CommitmentOwnershipProvenance
+from mimir.commitments.store import run_store_io
 
 
 # ─── make_dedupe_key ────────────────────────────────────────────────
@@ -65,6 +66,60 @@ async def test_replay_leaves_loop_and_default_pool_free(tmp_path, monkeypatch, o
     finally:
         release.set()
         await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_run_store_io_cancellation_waits_and_wins(cancel, fails):
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    lock = asyncio.Lock()
+    error = TimeoutError("commitments writer lock busy; retry")
+
+    def worker():
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(5), "loop did not release worker"
+            if fails:
+                raise error
+            return 42
+        finally:
+            finished.set()
+
+    async def caller():
+        async with lock:
+            return await run_store_io(worker)
+
+    task = asyncio.create_task(caller())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if cancel:
+            for _ in range(2):
+                task.cancel()
+                await asyncio.sleep(0)
+        assert not task.done()
+        assert lock.locked()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            if fails:
+                assert isinstance(caught.value.__cause__, TimeoutError)
+                assert caught.value.__cause__.args == error.args
+            assert task.cancelled()
+        elif fails:
+            with pytest.raises(TimeoutError) as caught:
+                await task
+            assert caught.value.args == error.args
+        else:
+            assert await task == 42
+    assert finished.is_set()
+    assert not lock.locked()
 
 
 @pytest.mark.asyncio

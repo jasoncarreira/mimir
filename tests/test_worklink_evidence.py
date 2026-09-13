@@ -390,10 +390,70 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize("failure", ["parallel", "transient_infrastructure"])
+@pytest.mark.asyncio
+async def test_serial_rerun_cannot_publish_parallel_gate_as_pass(tmp_path, monkeypatch, failure):
+    from mimir.worklink.orchestrator import IssueContext, _open_pr
+
+    repo = _init_gate_repo(tmp_path, f'''
+from pathlib import Path
+
+def test_candidate(request):
+    if {failure!r} == "parallel":
+        assert not hasattr(request.config, "workerinput")
+    else:
+        marker = Path("infrastructure-ready")
+        ready = marker.exists()
+        marker.touch()
+        assert ready, "temporary infrastructure outage"
+
+def test_passes():
+    pass
+''')
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+    command = f"{shlex.quote(sys.executable)} -m pytest -q -n 2"
+    result = await observe_evidence(
+        issue=1692, attempt=1, backend="codex", branch="issue/1692-a1",
+        checkout=repo, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command=command,
+    )
+    tests = result.evidence.tests
+    assert tests.initial_run.exit_code == 1
+    assert tests.rerun.exit_code == 0
+    assert "-n 0" in tests.rerun.cmd
+    assert tests.flaky_tests == ("test_gate_sample.py::test_candidate",)
+    if failure == "transient_infrastructure":
+        assert "temporary infrastructure outage" in tests.initial_run.summary
+        assert "1 passed" in tests.rerun.summary
+    calls = []
+
+    def runner(args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "https://github.com/example/repo/pull/1\n", "")
+
+    # Exercise the renderer even for failed evidence, without publishing anything.
+    _open_pr(repo, IssueContext(1692, "gate", "", set()), "issue/1692-a1",
+             result.evidence, base="main", runner=runner)
+    pr_call = next(call for call in calls if call[:3] == ["gh", "pr", "create"])
+    body = pr_call[pr_call.index("--body") + 1]
+    assert (result.review_ready, tests.exit_code, f"- Tests: `{command}` → 0" in body) == (
+        False, 1, False,
+    ), body
+    assert tests.counts == tests.initial_run.counts
+    assert tests.failed_tests == tests.initial_run.failed_tests
+    assert result.status == "failed"
+    assert "tests_failed" in result.reasons
+    assert f"- Tests: `{command}` → 1" in body
+    assert f"- Original gate: `{command}` → 1" in body
+    assert f"- Diagnostic rerun (serial, failed nodes only): `{tests.rerun.cmd}` → 0" in body
+    assert "flaky_tests (passed in isolation; not proof of flakiness)" in body
+    assert "test_gate_sample.py::test_candidate" in body
+
+
 @pytest.mark.parametrize("mode,limit,green,flaky,failed,reran", [
-    ("flaky", 10, True, 1, 0, True),
+    ("flaky", 10, False, 1, 1, True),
     ("persistent", 10, False, 0, 1, True),
-    ("mixed", 10, False, 1, 1, True),
+    ("mixed", 10, False, 1, 2, True),
     ("mixed", 1, False, 0, 2, False),
     ("flaky", 0, False, 0, 1, False),
     ("skip", 10, False, 0, 1, True),

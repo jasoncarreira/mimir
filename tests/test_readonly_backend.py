@@ -72,6 +72,19 @@ def home(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.mark.parametrize("backend_kind", ["guard", "readonly"])
+@pytest.mark.parametrize("method", ["execute", "aexecute"])
+def test_shell_methods_never_forwarded(home, monkeypatch, backend_kind, method):
+    backend = (WriteGuardBackend(home, ["state"]) if backend_kind == "guard"
+               else ReadOnlyFilesystemBackend(home))
+    # Simulate an upstream release adding shell execution to FilesystemBackend.
+    monkeypatch.setattr(backend._fs, method, lambda *args: "executed", raising=False)
+    assert hasattr(backend._fs, method)
+    assert not hasattr(backend, method)
+    with pytest.raises(AttributeError, match="does not forward"):
+        getattr(backend, method)
+
+
 class TestBinaryReads:
     def test_missing_private_import_keeps_reads_working(self, home, monkeypatch):
         import builtins
