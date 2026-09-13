@@ -24,10 +24,11 @@ from mimir.acp.session_store import SessionStore
 from mimir.acp.transport import close_writer, pump_stream
 
 
-def _journal_source(progress: Path) -> str:
+def _journal_source(progress: Path, *, controlled_exit: bool = False) -> str:
     # Keep C-level bytes separate: they have no line framing and must not alter
     # the existing text journal's ordered prefix. Neither file needs pipe EOF.
-    return f"_journal_path = {str(progress)!r}\n" + r'''
+    return (f"_journal_path = {str(progress)!r}\n"
+            f"_controlled_exit = {controlled_exit!r}\n") + r'''
 import faulthandler, os, signal, socket, threading, time
 from mimir.acp import proxy
 _journal_fd = os.open(_journal_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -109,7 +110,8 @@ proxy._ShutdownHooks._close_wakeup = _close_wakeup
 _journal_signal = proxy._ShutdownHooks._handle_signal
 def _handle_signal(self, signum, frame):
     diagnose(f'signal-dispatch:{signum} interrupted={frame.f_code.co_name}:{frame.f_lineno}')
-    _journal_flush()
+    if not _controlled_exit:
+        _journal_flush()
     record(b'signal-enter:' + str(signum).encode())
     return _journal_signal(self, signum, frame)
 proxy._ShutdownHooks._handle_signal = _handle_signal
@@ -121,7 +123,13 @@ proxy._ShutdownHooks._force_exit = _force_exit
 _journal_exit = os._exit
 def _exit(code):
     diagnose(f'exit-dispatch:{code}')
-    _journal_flush()
+    if _controlled_exit:
+        # The parent observes this actual exit call, then checks C delivery.
+        # Never wait on the tee's shared Event inside a signal handler.
+        record(b'exit-ready:' + str(code).encode())
+        assert os.read(0, 1) == b'e'
+    else:
+        _journal_flush()
     _journal_exit(code)
 os._exit = _exit
 
@@ -584,7 +592,7 @@ raise SystemExit(bootstrap.main([]))
             await process.communicate()
 
 
-async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30) -> str:
+async def _await_diagnostic(progress: Path, marker: str, *, timeout: float | None = 30) -> str:
     """Wait for a diagnostic written by the child's watchdog THREAD.
 
     ``armed`` is written by ``Timer.start()`` on the thread that CALLS start, so
@@ -594,12 +602,12 @@ async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30)
     file only delays the same failure.
     """
     path = progress.with_suffix(".diagnostics")
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
     while True:
         text = path.read_text() if path.exists() else ""
         if marker in text:
             return text
-        assert time.monotonic() < deadline, (
+        assert deadline is None or time.monotonic() < deadline, (
             f"{marker!r} not observed within {timeout}s; diagnostics:\n{text or '<empty>'}"
         )
         await asyncio.sleep(0.01)
@@ -607,13 +615,14 @@ async def _await_diagnostic(progress: Path, marker: str, *, timeout: float = 30)
 
 async def _signal_exit_protocol(
     process: asyncio.subprocess.Process, progress: Path,
-    signum: signal.Signals, repeat: bool, *, timeout: float = 120,
+    signum: signal.Signals, repeat: bool, *, timeout: float = 600,
     after_armed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     outstanding = "ready"
 
     async def protocol() -> None:
         nonlocal outstanding, signum
+        delivered = bytes([signum])
         for marker in ("ready", "armed", "terminated", "draining"):
             outstanding = marker
             observed = await process.stdout.readline()
@@ -625,13 +634,31 @@ async def _signal_exit_protocol(
                 # loop, so this is the only point where a child-thread marker
                 # can be synchronised on.
                 await after_armed()
-        outstanding = "exit"
+        outstanding = "exit-ready"
         if repeat:
+            # Retire the controlled timer's stdin reader before the exit handshake.
+            # This is not expiry; only the repeated signal may call os._exit.
+            process.stdin.write(b"n")
+            await process.stdin.drain()
+            await _await_diagnostic(progress, "watchdog-input-run-returned", timeout=None)
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
+            delivered += bytes([signum])
             process.send_signal(signum)
         else:
             process.stdin.write(b"x")
             await process.stdin.drain()
+        marker = f"exit-ready:{128 + signum}"
+        while marker not in progress.read_text().splitlines():
+            assert process.returncode is None, (marker, progress.read_text())
+            await asyncio.sleep(0.01)
+        # The child is parked inside os._exit, not merely somewhere in teardown.
+        # Read the independently written C-delivery evidence before releasing it.
+        outstanding = "signal delivery after " + marker
+        while progress.with_suffix(".wakeup").read_bytes() != delivered:
+            await asyncio.sleep(0.01)
+        outstanding = "exit after " + marker
+        process.stdin.write(b"e")
+        await process.stdin.drain()
         stdout, stderr = await process.communicate()
         assert process.returncode == 128 + signum
         assert (stdout, stderr) == (b"", b"")
@@ -648,6 +675,7 @@ async def _signal_exit_protocol(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(0)  # The 600s asyncio backstop fails normally, including under xdist.
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
 @pytest.mark.parametrize("repeat", [False, True], ids=["deadline", "escalation"])
 @pytest.mark.parametrize("stage", ["route", "close", "writer", "outer", "post-loop", "blocked", "cleanup"])
@@ -655,7 +683,7 @@ async def test_signal_exit_bounds_entire_teardown(
     signum: signal.Signals, repeat: bool, stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress) + r'''
+    source = _journal_source(progress, controlled_exit=True) + r'''
 import atexit, asyncio, io, os, sys, threading
 from types import SimpleNamespace
 from mimir.acp import bootstrap, profiles, proxy
@@ -665,8 +693,9 @@ profiles.selected_profile = lambda name: 'test'
 
 def mark(value):
     record(value)
-    sink.write(value + b'\n')
-    sink.flush()
+    os.write(control_fd, value + b'\n')
+
+control_fd = os.dup(1)
 
 class ControlledTimer(InputTimer):
     def start(self):
@@ -684,8 +713,6 @@ async def stuck():
             pass
 
 async def run_proxy(name, output):
-    global sink
-    sink = output
     class Reader:
         async def read(self, size):
             mark(b'ready')
@@ -755,7 +782,7 @@ raise SystemExit(bootstrap.main([]))
             # protocol loop, after which no writer remains and polling the final
             # file would only delay the same failure. Ordering only — later
             # assertions re-read the file for markers written after this point.
-            await _await_diagnostic(progress, "watchdog-input-wait")
+            await _await_diagnostic(progress, "watchdog-input-wait", timeout=None)
 
         await _signal_exit_protocol(
             process, progress, signum, repeat, after_armed=_observe_input_wait,
@@ -772,7 +799,9 @@ raise SystemExit(bootstrap.main([]))
             delivered.append(signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM)
             assert f"signal-enter:{delivered[-1]}" in progress.read_text().splitlines()
         else:
-            assert progress.read_text().splitlines()[-2:] == ["watchdog-fired", "force-exit-enter"]
+            assert progress.read_text().splitlines()[-3:] == [
+                "watchdog-fired", "force-exit-enter", f"exit-ready:{128 + signum}",
+            ]
             assert "watchdog-input-returned:b'x' cancelled=False" in diagnostics
         assert progress.with_suffix(".wakeup").read_bytes() == bytes(delivered)
     finally:
@@ -971,7 +1000,7 @@ assert signal.getsignal(signal.SIGINT) is previous
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining"])
+@pytest.mark.parametrize("outstanding", ["armed", "terminated", "draining", "exit-ready"])
 async def test_signal_exit_timeout_reports_child_progress(
     outstanding: str, tmp_path: Path,
 ) -> None:
@@ -982,7 +1011,7 @@ async def test_signal_exit_timeout_reports_child_progress(
 import os, signal, sys, time
 signal.set_wakeup_fd(_wakeup_fd)
 signal.signal(signal.SIGINT, lambda signum, frame: record(b'signal-enter:' + str(signum).encode()))
-markers = ['ready', 'armed', 'terminated', 'draining']
+markers = ['ready', 'armed', 'terminated', 'draining', 'exit-ready']
 outstanding = sys.argv[1]
 record(('simulated child sleeping before ' + outstanding).encode())
 for marker in markers[:markers.index(outstanding)]:
@@ -1013,13 +1042,13 @@ time.sleep(3600)
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(120)
+@pytest.mark.timeout(0)  # The local backstop reports progress without killing a worker.
 @pytest.mark.parametrize("stage", ["unarmed", "never-fired", "force-exit", "escalation"])
 async def test_shutdown_journal_timeout_distinguishes_surviving_child(
     stage: str, tmp_path: Path,
 ) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress) + r'''
+    source = _journal_source(progress, controlled_exit=True) + r'''
 import asyncio
 from types import SimpleNamespace
 
@@ -1057,11 +1086,12 @@ asyncio.run(run())
             await asyncio.sleep(0.01)
 
     try:
-        async with _shutdown_ceiling(process, progress, lambda: "self-test handshake"):
+        async with _shutdown_ceiling(process, progress, lambda: "self-test handshake", timeout=600):
             assert await process.stdout.readline() == b"ready\n"
             if stage != "unarmed":
                 process.send_signal(signal.SIGTERM)
                 await await_marker("cleanup-enter")
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
             if stage == "force-exit":
                 process.stdin.write(b"x")
                 await process.stdin.drain()
@@ -1069,6 +1099,7 @@ asyncio.run(run())
             elif stage == "escalation":
                 process.send_signal(signal.SIGINT)
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
             # The short timeout tests formatting, never child startup or delivery.
             with pytest.raises(pytest.fail.Exception) as failure:
                 async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
