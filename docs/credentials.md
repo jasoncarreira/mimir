@@ -41,11 +41,17 @@ memory under `feedback_mimirbot_env_reload`.
 
 ## Inventory
 
+The consumer classification describes normal credential use, not the
+verification process's environment. CLI commands below are manual checks
+unless registered as probes. Automated subprocess probes do not inherit
+authentication or configuration from the parent environment; see
+[Probe execution policy](#probe-execution-policy).
+
 ### Type A — Subprocess re-spawn
 
 | Env var(s) | Used by | Upstream regen | Verification probe |
 |---|---|---|---|
-| `GITHUB_TOKEN` | `gh` CLI, git push to state repo | https://github.com/settings/tokens (PAT) or `gh auth refresh` | `gh auth status` (returns the authenticated login) |
+| `GITHUB_TOKEN` | `gh` CLI, git push to state repo | https://github.com/settings/tokens (PAT) or `gh auth refresh` | `mimir verify-cred GITHUB_TOKEN`: packaged in-process API token check against the fixed GitHub endpoint, not a `gh auth status` child |
 | `ACLI_TOKEN` (with `ACLI_EMAIL`, `ACLI_SITE`) | Atlassian CLI (Jira) | https://id.atlassian.com/manage-profile/security/api-tokens | `acli auth status` |
 | `GOG_KEYRING_PASSWORD` | `gog` keyring decryption | Operator-set; rotates with the keyring itself | `gog list` succeeds without prompting |
 | `OPENWEATHER_API_KEY` | `weather` skill / curl scripts | https://home.openweathermap.org/api_keys | `curl -fsSL "...?appid=$KEY"` returns 200 |
@@ -194,20 +200,26 @@ Same as A, plus:
 
 ## Per-skill credential manifests (Phase 2.5)
 
-The probe definitions in the table above are **not** hardcoded in
-the framework. Each skill that needs a credential ships a
-``credentials.yaml`` next to its ``SKILL.md``; mimir's discovery
-walker (mirroring the dual-skills-dir architecture from PR #272)
-loads all of them at startup and merges into a single registry.
+Automated probe definitions come only from the installed mimir package,
+not from writable home skill content. Discovery builds a single registry
+from these sources:
 
-Roots, in shadow order (later wins):
+1. `mimir/credentials.yaml` supplies core credentials: the model
+   provider, mimir's own HTTP gate, bridge tokens, and the state-repo PAT.
+2. Optional skills are selected by directory name existing under either
+   `<home>/skills/<skill>` or `<home>/.mimir_builtin_skills/<skill>`.
+   Their manifests and scripts are always loaded from the matching
+   installed `mimir/optional-skills/<skill>/` package directory.
 
-1. ``mimir/credentials.yaml`` (package) — mimir-core creds: the
-   model provider, mimir's own HTTP gate, bridge tokens, the state-
-   repo PAT.
-2. ``<home>/.mimir_builtin_skills/<skill>/credentials.yaml`` —
-   bundled optional skills.
-3. ``<home>/skills/<skill>/credentials.yaml`` — operator skills.
+Home directories are selection signals only. Discovery never loads a
+home `credentials.yaml` or probe script, even when a home skill has the
+same name as a packaged skill. An unmatched operator skill cannot add
+credentials to the registry.
+
+The former operator use case of overriding bundled probes or registering
+custom credentials through home skills is explicitly retired. There is
+no operator override layer. Adding or changing probes now requires an
+installed package update, including the packaged manifest and any script.
 
 Manifest schema:
 
@@ -227,7 +239,9 @@ Probe kinds:
 
 - **`subprocess`** — run a command; exit 0 = live.
   Keys: ``binary`` (short-circuits to ``unavailable`` if not on PATH),
-  ``cmd``, optional ``success_detail``.
+  ``cmd``, optional ``success_detail``. Declared ``env_vars`` remain
+  presence preconditions in the parent; they are not passed to the child.
+  See [Probe execution policy](#probe-execution-policy).
 - **`format`** — env present + (optional) prefix / length / charset
   / disallowed-prefix check.
   Keys: ``env`` (the env var to check), ``prefix``, ``min_len``,
@@ -238,17 +252,45 @@ Probe kinds:
   Keys: optional ``note`` appended to success detail.
 - **`not_implemented`** — explicit Phase-3 stub. Reports the cred's
   ``cred_type`` so the gap is grep-able.
-- **`python`** — escape hatch. Loads ``script`` (path relative to
-  ``credentials.yaml``) via importlib and calls ``function`` (default
-  ``"probe"``). The callable takes no args and returns
-  ``(ok: bool, detail: str)``. See ``mimir/optional-skills/social-cli/
-  scripts/probe_bsky_password.py`` for an example.
+- **`python`** — trusted packaged code. Loads ``script`` relative to
+  the packaged ``credentials.yaml`` via importlib and calls ``function``
+  (default ``"probe"``) in process. The callable takes no args and returns
+  ``(ok: bool, detail: str)``. The resolved script path must remain inside
+  the packaged manifest directory: absolute paths outside it, `../`
+  traversal out of it, and symlink escapes are rejected. See
+  `mimir/optional-skills/social-cli/scripts/probe_bsky_password.py`
+  for an example.
 
-If a skill has no ``credentials.yaml``, no credentials are registered
-on its behalf. Removing a skill (or never installing it) means
+If a selected skill has no packaged ``credentials.yaml``, no credentials
+are registered on its behalf. Removing its directory from both home
+skill roots (or never installing it) means
 ``mimir verify-creds`` won't list its credentials — which is the
 right behavior: a deployment that doesn't use jira has nothing to
 verify about ACLI_TOKEN.
+
+### Probe execution policy
+
+Subprocess probes use `contained_execution.base_worker_environment` for
+their child environment. It supplies a fixed minimal set of worker
+identity, shell, PATH, locale, and worker XDG directory variables, not a
+copy of `os.environ`. No parent credentials or parent authentication/config
+environment variables are forwarded, including credentials explicitly
+listed in `env_vars`. Those declarations only check presence before
+execution; they do not grant environment access. A CLI probe cannot rely
+on ambient tokens or parent configuration paths to authenticate.
+
+Python probes run in the mimir process and can read the target credential
+from its environment. Path confinement restricts which packaged script
+is loaded; it does not sandbox Python execution or restrict that code to
+reading only the target credential. Installing or updating a package that
+contains probes therefore requires trusting its code. The minimal child
+environment is not a sandbox guarantee either.
+
+GitHub verification uses a packaged, fixed-endpoint, in-process API token
+check instead of spawning `gh auth status`. It checks `GITHUB_TOKEN`
+directly rather than relying on a child CLI's authentication/config
+environment. Successful token verification does not prove access to every
+private repository or permission to push to the state repo.
 
 ## `mimir rotate` — automated rotation (Phase 3)
 
@@ -291,8 +333,11 @@ What it does, in order:
 7. **Wait for ready.** Polls `docker compose ps --format json`
    until the service reports `State=running` (60s timeout).
 8. **Verify in-container.** `docker compose exec -T <service> mimir
-   verify-cred <cred-name>` — runs the probe with the freshly-
-   rotated env value visible. Exit 0 = live.
+   verify-cred <cred-name>` — the verifier sees the freshly rotated
+   env value for presence/format checks and trusted in-process probes.
+   Subprocess probes still receive only the fixed minimal worker
+   environment, never the rotated credential. Interpret success according
+   to the registered probe kind; a format check is not live authentication.
 9. **On success.** Appends `credential_rotation_completed` to
    `rotations.jsonl` with `duration_s` + the verify probe's detail
    line. Backup file is left in place; operator decides whether
