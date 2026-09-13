@@ -1746,12 +1746,14 @@ async def test_detach_waits_for_prompt_before_reloading(
         await asyncio.gather(first, loading, cancellation_started, return_exceptions=True)
 
 
-@pytest.mark.parametrize(("route", "already_cancelling"), [
-    ("load", False), ("load", True), ("revalidate", False),
+@pytest.mark.parametrize(("route", "already_cancelling", "load_server"), [
+    ("load", False, None), ("load", True, None), ("revalidate", False, None),
+    ("load", False, "probe-hands"), ("load", True, "probe-hands"),
+    ("load", False, "server"), ("load", True, "server"),
 ])
 async def test_stalled_turn_detach_refuses_within_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    already_cancelling: bool, route: str,
+    already_cancelling: bool, route: str, load_server: str | None,
 ) -> None:
     bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -1802,7 +1804,10 @@ async def test_stalled_turn_detach_refuses_within_bound(
 
     async def handle(method: str, params: Any, notification: bool) -> Any:
         assert method == "session/load"
-        response = await agent.load_session("/two", session_id)
+        response = await agent.load_session(
+            "/two", session_id,
+            mcp_servers=_hands(load_server) if load_server else None,
+        )
         return response.model_dump(mode="json", by_alias=True)
 
     transport = Transport()
@@ -1837,6 +1842,10 @@ async def test_stalled_turn_detach_refuses_within_bound(
         # their dispatcher slots, even though the model remains stalled.
         dispatcher = dispatchers[0]
         capacity = dispatcher._runner_slots._value
+        owner_connection = agent._connection
+        prior_bound = set(owner_connection.bound_sessions)
+        prior_journal = agent._journals._sessions[session_id]
+        prior_client = prior_journal.current_client
         for request_id in range(3):
             await transport.incoming.put({
                 "jsonrpc": "2.0", "id": request_id, "method": "session/load",
@@ -1850,6 +1859,25 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 while dispatcher._runner_tasks:
                     await asyncio.sleep(0)
             assert dispatcher._runner_slots._value == capacity
+            # Cancellation legitimately retires the old provider. Refusal must
+            # retire every candidate too, restoring only the prior state's indexes.
+            assert owner_connection.connection_sessions == {}
+            assert owner_connection.server_sessions == {"server": state}
+            assert owner_connection.bound_sessions == prior_bound
+            assert agent._journals._sessions[session_id] is prior_journal
+            assert prior_journal.current_client is prior_client
+            assert state.provider is None and provider.closed
+            async with asyncio.timeout(1):
+                while "connection-1" not in client.disconnects:
+                    await asyncio.sleep(0)
+            if load_server:
+                assert client.connects == ["server"] + [load_server] * (request_id + 1)
+                assert sorted(client.disconnects) == [
+                    f"connection-{index + 1}" for index in range(request_id + 2)
+                ]
+            else:
+                assert client.connects == ["server"]
+                assert client.disconnects == ["connection-1"]
             assert agent._sessions[session_id] is state
             assert state.active_prompt is active
             assert state.dirty

@@ -641,6 +641,9 @@ class MimirAcpAgent:
             state = SessionState(record, SessionEnvironment(cwd, copy.deepcopy(mcp_servers)), self._generation, declaration, MIMIR_HANDS_V1 if declaration else None, execution_session_key=max(self._execution_keys.get(session_id, 0), self._sessions.get(session_id, SessionState(record, SessionEnvironment(cwd, None), self._generation)).execution_session_key) + 1)
             await self._admit_provider(state)
             await journal.send_replay(client)
+            # Detachment can refuse a still-running turn. The admitted candidate
+            # must be discarded and the prior session restored on that path too.
+            await self._detach_session(session_id)
         except RequestError:
             if state is not None:
                 await self._discard_candidate(state)
@@ -661,7 +664,6 @@ class MimirAcpAgent:
             else:
                 self._journals.release(session_id)
             raise internal_error() from None
-        await self._detach_session(session_id)
         self._journals.open(record, client)
         self._install_state(state)
         return LoadSessionResponse()
