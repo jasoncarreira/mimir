@@ -1295,6 +1295,41 @@ async def test_api_v1_turns_offloads_tail_read(monkeypatch, app):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["user_message", "assistant_message"])
+async def test_api_v1_sessions_redacts_stored_message_credentials(tmp_path: Path, kind: str):
+    from mimir.history import MessageBuffer
+
+    credential = "ghp_" + "syntheticDeployCredential123456789"
+    content = f"Deploy with {credential}\n\tThen report back: caf\u00e9, \u6771\u4eac."
+    ts = "2026-06-18T10:00:00Z"
+    buf = MessageBuffer(history_path=tmp_path / "messages" / "chat_history.jsonl")
+    await buf.append(buf.make_message(
+        channel_id="web-a", kind=kind, content=content, author="alice", ts=ts,
+    ))
+    turns_log = tmp_path / "turns.jsonl"
+    turns_log.write_text(json.dumps({
+        "turn_id": "t1", "ts": ts, "trigger": "user_message",
+        "channel_id": "web-a", "input": "deploy", "output": "received",
+    }) + "\n")
+    app = web.Application()
+    web_ui.register_routes(
+        app, turns_log=turns_log, events_log=tmp_path / "events.jsonl", home=tmp_path,
+    )
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/v1/sessions")
+        raw = await resp.text()
+
+    assert resp.status == 200
+    assert credential not in raw
+    body = json.loads(raw)
+    validate_api_envelope(body, expect_ok=True)
+    [session] = body["data"]["sessions"]
+    [message] = session["messages"]
+    assert message["kind"] == kind
+    assert message["content"] == content.replace(credential, "[REDACTED]")
+
+
+@pytest.mark.asyncio
 async def test_api_v1_sessions_groups_missing_saga_session_id_by_channel_time(tmp_path: Path):
     turns_log = tmp_path / "turns.jsonl"
     events_log = tmp_path / "events.jsonl"

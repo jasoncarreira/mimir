@@ -29,6 +29,7 @@ from ._jsonl_tail import _tail_lines, count_lines_chunked
 from .access_control import ChannelResourceAdapter
 from .pollers import POLLER_CHANNEL_PREFIX
 from .prompt_safety import sanitize_prompt_field
+from .redaction import redact_payload
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
 
 #: Channel-id prefixes that identify synthetic per-tick channels (no
@@ -201,7 +202,11 @@ class MessageBuffer:
         ch.append(msg)
 
     async def append(self, msg: Message) -> None:
-        """Append to disk + both deques.
+        """Redact a copy, then append to disk + both deques.
+
+        Redaction is write-only: legacy records are not scrubbed on read or
+        rewritten. Both live prompt history and disk receive the redacted copy;
+        the caller's message remains unchanged.
 
         The in-memory deque mutation is single-threaded under asyncio
         (synchronous, no awaits inside ``_append_in_memory``), and the disk
@@ -224,6 +229,7 @@ class MessageBuffer:
         aggressive fix would make the write fire-and-forget with a
         bounded queue — deferred (would need bg-task tracking on the
         buffer instance plus test-side flush hooks)."""
+        msg = Message.from_dict(redact_payload(msg.to_dict()))
         self._append_in_memory(msg)
         await asyncio.to_thread(self._append_disk, msg)
         self._line_count += 1
