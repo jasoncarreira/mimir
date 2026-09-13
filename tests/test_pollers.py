@@ -1429,6 +1429,44 @@ def test_discover_required_env_satisfied_by_manifest_override(tmp_path: Path, mo
 
 
 
+@pytest.mark.parametrize("field", ["env", "pass_env"])
+@pytest.mark.parametrize("adding", [True, False], ids=["adding", "removing"])
+def test_discover_required_env_uses_operator_replacements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, adding: bool,
+) -> None:
+    key = "MIMIR_TEST_REQUIRED_TOKEN"
+    monkeypatch.setenv(key, "present")
+    monkeypatch.delenv("MIMIR_POLLER_ENV_ALLOWLIST", raising=False)
+    populated = {key: "literal"} if field == "env" else [key]
+    empty = {} if field == "env" else []
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "needy", [{
+        "name": "needy", "command": "python p.py", "cron": "* * * * *",
+        "env_required": [key], field: empty if adding else populated,
+    }])
+    overrides = tmp_path / "pollers-overrides.yaml"
+    overrides.write_text(yaml.safe_dump({
+        "needy": {field: populated if adding else empty},
+    }))
+    invalid_entries = []
+
+    out = discover_pollers(
+        skills, overrides_path=overrides, invalid_entries=invalid_entries,
+    )
+
+    assert [p.name for p in out] == (["needy"] if adding else [])
+    if adding:
+        assert invalid_entries == []
+        assert getattr(out[0], field) == (
+            populated if field == "env" else tuple(populated)
+        )
+    else:
+        assert invalid_entries == [(
+            skills / "needy" / "pollers.json", "needy",
+            f"required environment unset: {key}",
+        )]
+
+
 def test_discover_required_env_uses_runtime_env_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2739,11 +2777,11 @@ print(json.dumps({"poller": "x", "prompt": "needs review", "id": "evt-1"}))
 
 
 @pytest.mark.asyncio
-async def test_run_poller_does_not_stash_rejected_events_by_default(
-    tmp_path: Path, home: Path,
+@pytest.mark.parametrize("raises", [False, True], ids=["rejected", "error"])
+async def test_run_poller_recovers_unaccepted_events_by_default(
+    tmp_path: Path, home: Path, raises: bool,
 ) -> None:
-    """A dispatcher rejection is back-pressure, not an in-flight turn;
-    it must not be stashed for later recovery."""
+    """Pending delivery retries without failed-turn opt-in or a restart."""
     skill_dir = tmp_path / "skill"
     persist_dir = tmp_path / "persist" / "x"
     _install_script(skill_dir, "poller.py", """
@@ -2755,10 +2793,68 @@ print(json.dumps({"poller": "x", "prompt": "queue full"}))
         cron="* * * * *", env={}, skill_dir=skill_dir,
         persist_dir=persist_dir,
     )
-    n = await run_poller(cfg, enqueue=_CapturingEnqueue(accept=False))
+    attempted = []
+
+    async def unavailable(event):
+        attempted.append(event)
+        if raises:
+            raise RuntimeError("queue unavailable")
+        return False
+
+    n = await run_poller(cfg, enqueue=unavailable)
 
     assert n == 0
-    assert poller_recovery._load_state(persist_dir)["inflight"] == {}
+    [event] = attempted
+    entry = poller_recovery._load_state(persist_dir)["inflight"][event.source_id]
+    assert entry["pending_enqueue"] is True
+    assert entry["attempts"] == 0
+    assert entry["event"]["content"] == "queue full"
+    assert entry["event"]["service_principal"] == event.service_principal
+
+    _install_script(skill_dir, "poller.py", "pass\n")
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq) == 0
+    assert [e.source_id for e in enq.events] == [event.source_id]
+    assert enq.events[0].content == event.content
+    entry = poller_recovery._load_state(persist_dir)["inflight"][event.source_id]
+    assert "pending_enqueue" not in entry
+    assert entry["attempts"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True], ids=["rejected", "error"])
+async def test_run_poller_bounds_unaccepted_events(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, raises: bool,
+) -> None:
+    monkeypatch.setattr(poller_recovery, "MAX_PENDING_ENQUEUE", 2)
+    skill_dir = tmp_path / "skill"
+    persist_dir = tmp_path / "persist" / "x"
+    _install_script(skill_dir, "poller.py", """
+import json
+for i in range(5):
+    print(json.dumps({"poller": "x", "prompt": f"event {i}"}))
+""")
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+        persist_dir=persist_dir, batch_size=1,
+    )
+
+    async def enqueue(event):
+        if event.content == "event 0":
+            return True
+        if raises:
+            raise RuntimeError("queue unavailable")
+        return False
+
+    assert await run_poller(cfg, enqueue=enqueue) == 1
+    entries = list(poller_recovery._load_state(persist_dir)["inflight"].values())
+    assert [e["event"]["content"] for e in entries] == [
+        "event 0", "event 3", "event 4",
+    ]
+    assert [e.get("pending_enqueue", False) for e in entries] == [False, True, True]
+    retired = [e for e in _read_events(home) if e["type"] == "poller_pending_gave_up"]
+    assert sum(e["retired"] for e in retired) == 2
 
 
 @pytest.mark.asyncio

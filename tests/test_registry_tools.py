@@ -1967,11 +1967,12 @@ class TestSendMessageInteractivityGuard:
         assert bridge.send_calls == []
 
     @pytest.mark.asyncio
-    async def test_directives_only_send_skips_targetless_react(self) -> None:
+    async def test_directives_only_send_skips_targetless_react(self, monkeypatch) -> None:
         """A send_message whose text is only an <actions> react (empty clean
         text → nothing sent → no message id) must SKIP the react rather than
         call bridge.react(cid, None, emoji) (chainlink #394)."""
         bridge = _StubBridge()
+        monkeypatch.setattr("mimir.history.get_global_buffer", lambda: None)
         set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
         out = await send_message.ainvoke({
             "text": '<actions><react emoji="thumbsup" /></actions>',
@@ -1980,7 +1981,49 @@ class TestSendMessageInteractivityGuard:
         # No text was sent and the targetless react was skipped (not None).
         assert bridge.send_calls == []
         assert bridge.react_calls == []
-        assert "send_message ok" in out
+        assert "send_message failed" in out
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["delivered", "declined", "raised", "other-channel"])
+    async def test_directives_only_send_uses_channel_scoped_recent_target(
+        self, tmp_path, monkeypatch, outcome,
+    ) -> None:
+        from mimir.history import MessageBuffer
+
+        buf = MessageBuffer(history_path=tmp_path / "h.jsonl")
+        monkeypatch.setattr("mimir.history.get_global_buffer", lambda: buf)
+        if outcome != "other-channel":
+            await buf.append(buf.make_message(
+                channel_id="chan-1", kind="user_message", content="hi", msg_id="recent-1",
+            ))
+        await buf.append(buf.make_message(
+            channel_id="chan-2", kind="user_message", content="elsewhere", msg_id="recent-2",
+        ))
+        bridge = _StubBridge()
+        bridge.react_returns = outcome == "delivered"
+        bridge.raise_on = "react" if outcome == "raised" else None
+        set_channel_registry(_StubRegistry(bridge, channel_id="chan-1"))
+        ctx = TurnContext(
+            turn_id="directive-test", session_id="test-session", started_at=time.time(),
+            channel_id="chan-1", trigger="user_message",
+        )
+        token = set_current_turn(ctx)
+        try:
+            out = await send_message.ainvoke({
+                "text": '<actions><react emoji="thumbsup" /></actions>',
+                "channel_id": "  chan-1  ",
+            })
+        finally:
+            reset_current_turn(token)
+        assert bridge.send_calls == []
+        assert bridge.react_calls == (
+            [] if outcome in {"raised", "other-channel"} else
+            [{"cid": "chan-1", "message_id": "recent-1", "emoji": "thumbsup"}]
+        )
+        assert out.startswith("send_message ok:" if outcome == "delivered" else "send_message failed:")
+        assert ctx.send_message_count == 0
+        assert ctx.react_count == int(outcome == "delivered")
+        assert ctx.delivered_channel_ids == ({"chan-1"} if outcome == "delivered" else set())
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

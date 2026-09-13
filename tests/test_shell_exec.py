@@ -370,7 +370,9 @@ def test_configured_project_test_timeout_is_named_and_output_is_bounded(
             extra,
             "_run_bounded_project_test",
             lambda *_args, **_kwargs: SimpleNamespace(
-                returncode=1, stdout=b"o" * 5000, stderr=b"e" * 3000,
+                returncode=1,
+                stdout=b"START OUT\n" + b"o" * 5000 + b"\nSUMMARY: 42 passed",
+                stderr=b"START ERR\n" + b"e" * 3000 + b"\nFINAL ERROR",
             ),
         )
         output = shell_exec.invoke({"command": f"{executable} test"})
@@ -381,9 +383,11 @@ def test_configured_project_test_timeout_is_named_and_output_is_bounded(
     assert "shell stdout truncated" in output
     assert "shell stderr truncated" in output
     assert len(output) < 7000
+    assert "START OUT" in output and "SUMMARY: 42 passed" in output
+    assert "START ERR" in output and output.endswith("FINAL ERROR")
 
 
-def test_project_test_capture_discards_output_past_hard_byte_cap(
+def test_project_test_capture_keeps_tail_with_hard_byte_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     processes = []
@@ -400,7 +404,9 @@ def test_project_test_capture_discards_output_past_hard_byte_cap(
         completed = extra._run_bounded_project_test(
             [sys.executable, "-c",
              "import sys; from pathlib import Path; "
-             "count = sys.stdout.write('x' * 1000000); sys.stdout.flush(); "
+             "count = sys.stdout.write('x' * 1000000); "
+             "sys.stdout.write('SUMMARY: 42 passed'); sys.stdout.flush(); "
+             "sys.stderr.write('e' * 1000000 + 'FINAL ERROR'); sys.stderr.flush(); "
              "Path(sys.argv[1]).write_text(str(count))", str(produced)],
             cwd=tmp_path,
             # No startup-inclusive stage deadline: pytest bounds the entire test.
@@ -413,6 +419,9 @@ def test_project_test_capture_discards_output_past_hard_byte_cap(
         assert completed.returncode == 0
         assert produced.read_text() == "1000000"
         assert len(completed.stdout) == extra._PROJECT_TEST_CAPTURE_BYTES
+        assert completed.stdout.endswith(b"SUMMARY: 42 passed")
+        assert len(completed.stderr) == extra._PROJECT_TEST_CAPTURE_BYTES
+        assert completed.stderr.endswith(b"FINAL ERROR")
     finally:
         for process in processes:
             if process.poll() is None:

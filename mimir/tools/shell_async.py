@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 from pathlib import Path
 from typing import Annotated, Any, Callable, Optional
 
@@ -155,11 +156,8 @@ def _intent_prefix(command: str) -> str:
 def _intent_suffix_key(command: str) -> str | None:
     """Return the rightmost URI in the command, or ``None`` if absent.
 
-    Supplementary intent key for wrapper-invariance (chainlink #192): when
-    an agent escalates from ``social-cli like at://X`` to a bash-wrapped
-    ``/usr/bin/node cli.js dispatch at://X``, the executables and verb differ
-    so ``_intent_prefix`` misses the match.  The AT-URI ``at://X`` is constant
-    across all escalation levels and serves as a reliable secondary signal.
+    Supplementary target key; callers must also compare cwd and action.
+    A shared URI alone does not imply a shared intent.
 
     Matches ``at://…``, ``https://…``, and ``http://…`` URIs.  Strips
     trailing shell-quote artefacts (``'``, ``"``).  Returns the rightmost
@@ -172,6 +170,35 @@ def _intent_suffix_key(command: str) -> str | None:
         return None
     uri = matches[-1].rstrip("'\".,;)")
     return uri.lower()
+
+
+def _intent_cwd(command: str, cwd: str | None) -> Path:
+    """Resolve the launch directory plus literal cd setup in an && chain."""
+    directory = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    for segment in _unwrap_shell_wrapper(command).split("&&")[:-1]:
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        if tokens[:1] == ["cd"]:
+            if tokens[1:2] == ["--"]:
+                tokens.pop(1)
+            if len(tokens) == 2 and tokens[1] != "-":
+                target = Path(tokens[1]).expanduser()
+                directory = (directory / target).resolve()
+            elif len(tokens) == 1:
+                directory = Path.home().resolve()
+    return directory
+
+
+def _intent_action(command: str) -> tuple[str, ...]:
+    """Keep the executable and verb path (including gh's resource subcommand)."""
+    action = []
+    for token in _intent_prefix(command).split():
+        if token.startswith("-") or _URI_RE.match(token):
+            break
+        action.append(token)
+    return tuple(action)
 
 
 # Module-level dependency injection — populated by ``server.py:build_app``
@@ -295,28 +322,33 @@ async def bash_async(
     #   1. Prefix key — normalised first N chars after stripping wrappers,
     #      cd-chains, env-exports, and path prefixes on the executable.
     #      Catches plain retries and env-export variants.
-    #   2. Suffix key — rightmost AT-URI / HTTP-URI in the raw command.
-    #      Catches wrapper-escalation where the caller swaps
-    #      ``social-cli like at://X`` for ``/bin/bash -c '… node cli.js
-    #      dispatch at://X'``: the executable + verb differ so the prefix
-    #      key misses, but the URI target is constant across all levels.
+    #   2. Suffix key — rightmost AT-URI / HTTP-URI with equal executable
+    #      and verb path. Different actions on one target are not duplicates.
     #
-    # Scope: per-channel.  Jobs on other channels don't block each other.
+    # Scope: per-channel and resolved effective working directory.
     #
     # chainlink #193: emit algedonic event on refusal so the operator can
     # audit "how many refused respawns happened" without reading turn
     # transcripts.  The tool return-string is the agent-visible signal;
     # the event is the operator/introspection-visible audit trail.
+    effective_intent_cwd = _intent_cwd(command, cwd)
     if channel_id is not None:
         new_intent = _intent_prefix(command)
         new_suffix = _intent_suffix_key(command)
+        new_action = _intent_action(command)
         for running_job in _REGISTRY.running_jobs():
             if running_job.channel_id != channel_id:
+                continue
+            running_cwd = getattr(running_job, "intent_cwd", None)
+            if running_cwd is None:
+                running_cwd = _intent_cwd(running_job.command, None)
+            if running_cwd != effective_intent_cwd:
                 continue
             prefix_match = _intent_prefix(running_job.command) == new_intent
             suffix_match = (
                 new_suffix is not None
                 and new_suffix == _intent_suffix_key(running_job.command)
+                and new_action == _intent_action(running_job.command)
             )
             if prefix_match or suffix_match:
                 match_kind = "prefix" if prefix_match else "uri-target"
@@ -376,6 +408,7 @@ async def bash_async(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,
         )
+        job.intent_cwd = effective_intent_cwd
         job.ifc_labels = (
             auth_context.ifc_state.current(auth_context.ifc_labels)
             if auth_context is not None

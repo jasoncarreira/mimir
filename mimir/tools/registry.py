@@ -1148,7 +1148,7 @@ async def send_message(
         bridge=bridge,
         channel_id=cid,
         sent_message_id=(getattr(result, "message_id", None) if result else None),
-        fallback_message_id=None,
+        fallback_message_id=_resolve_recent_message_id(cid),
         ctx=ctx,
         detector=detector,
     )
@@ -1187,6 +1187,9 @@ async def send_message(
             streak=decision.streak,
             similarity=round(decision.similarity, 4),
         )
+
+    if not delivered_by_text and not delivered_by_directive:
+        return f"send_message failed: no text or directive was delivered (channel={cid})"
 
     # chainlink #259: surface the bare message_id, not the SendResult repr,
     # so downstream parses/greps (e.g. a later react(message_id=...)) work.

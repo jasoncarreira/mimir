@@ -243,7 +243,12 @@ async def download_to_path(
             async with session.get(
                 url, headers=headers, allow_redirects=allow_redirects,
             ) as resp:
-                if resp.status >= 400:
+                if 300 <= resp.status < 400:
+                    log.warning(
+                        "download_to_path: %s rejected redirect (%s)", url, resp.status,
+                    )
+                    return False
+                if not 200 <= resp.status < 300:
                     log.warning(
                         "download_to_path: %s returned %s", url, resp.status,
                     )
@@ -264,6 +269,10 @@ async def download_to_path(
                                 pass
                             return False
                         f.write(chunk)
+        if written == 0:
+            log.warning("download_to_path: %s returned an empty body", url)
+            target.unlink(missing_ok=True)
+            return False
         return True
     except Exception as exc:  # noqa: BLE001
         log.warning("download_to_path: %s failed (%s)", url, exc)

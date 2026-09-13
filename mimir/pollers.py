@@ -1965,32 +1965,6 @@ def discover_pollers(
                 key = item.strip()
                 if key:
                     env_required_clean.append(key)
-            # chainlink #351/#357: don't even schedule a poller whose
-            # required env is unset in the env that ``run_poller`` will actually
-            # assemble. This must mirror runtime: scrubbed allowlist-filtered
-            # os.environ + explicit pass_env + manifest env + injected STATE_DIR
-            # / POLLER_NAME / MIMIR_HOME. Checking raw os.environ here schedules pollers that
-            # later no-op every tick because the required key is denied; failing
-            # to include injected keys skips pollers that would run.
-            if env_required_clean:
-                _env_avail = _poller_env_available_at_discovery(
-                    env_raw=env_raw,
-                    pass_env=pass_env_clean,
-                )
-                _missing_req = [k for k in env_required_clean if k not in _env_avail]
-                if _missing_req:
-                    log.warning(
-                        "poller_skipped_unset_env: %s name=%r — not scheduling; "
-                        "required env unset: %s",
-                        pollers_file, name, ", ".join(_missing_req),
-                    )
-                    if invalid_entries is not None:
-                        invalid_entries.append((
-                            pollers_file,
-                            name,
-                            f"required environment unset: {', '.join(_missing_req)}",
-                        ))
-                    continue
             persist_dir: Path | None = None
             if state_root is not None:
                 try:
@@ -2223,7 +2197,29 @@ def discover_pollers(
             if p.name in overrides else p
             for p in pollers
         ]
-    return pollers
+    # Check the runtime env model only after overrides replace env/pass_env.
+    schedulable = []
+    for poller in pollers:
+        if poller.env_required:
+            available = _poller_env_available_at_discovery(
+                env_raw=poller.env, pass_env=poller.pass_env,
+            )
+            missing = [key for key in poller.env_required if key not in available]
+            if missing:
+                log.warning(
+                    "poller_skipped_unset_env: %s name=%r — not scheduling; "
+                    "required env unset: %s",
+                    poller.manifest_path, poller.name, ", ".join(missing),
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((
+                        poller.manifest_path,
+                        poller.name,
+                        f"required environment unset: {', '.join(missing)}",
+                    ))
+                continue
+        schedulable.append(poller)
+    return schedulable
 
 
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -3151,6 +3147,9 @@ async def run_poller(
         try:
             accepted = await enqueue_for_delivery(event)
         except Exception as exc:  # noqa: BLE001
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
             await log_event(
                 "poller_enqueue_error",
                 poller=poller.name,
@@ -3173,6 +3172,9 @@ async def run_poller(
                 )
         else:
             rejected_count += 1
+            await poller_recovery.stash_enqueued_event(
+                persist_dir, event, enqueued_at=enqueued_at, pending_enqueue=True,
+            )
             # Back-pressure observability: when the dispatcher refuses
             # an event (queue cap hit, channel saturated, etc.) record
             # it so the events_emitted vs events_rejected gap on

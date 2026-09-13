@@ -135,11 +135,7 @@ _GIT_OPERATION_RESULT_TOOLS = frozenset({
     "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
 })
 _GIT_OPERATION_RESULT_FIELDS = frozenset({"ok", "code", "stdout", "stderr"})
-_PROJECT_TEST_RESULT_FIELDS = frozenset({
-    "ok", "code", "returncode", "stdout", "stderr", "command",
-    "command_source", "output_limited", "stdout_dropped_bytes",
-    "stderr_dropped_bytes", "git_context",
-})
+_PROJECT_TEST_RESULT_FIELDS = frozenset({"ok", "code"})
 _SPAWN_OPEN_CODE_RESULT_FIELDS = frozenset({
     "run_id", "status", "exit_code", "stdout", "result", "stderr",
     "artifact_dir", "name", "proposal",
@@ -2108,7 +2104,7 @@ def _execute_declassification_action(
 
 
 def _returned_value_is_error(tool_name: str, content: Any) -> bool:
-    """Recognize only first-party prose and exact typed-result contracts."""
+    """Recognize first-party prose and required typed-result fields, allowing additions."""
     text = content if isinstance(content, str) else str(content)
     result_prefixes = {tool_name}
     if tool_name == "mimir_get_turn":
@@ -2137,7 +2133,7 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
         return True
     if tool_name == "fetch_url" and text.startswith((
         "url is required.", "timeout_seconds must be > 0.",
-        "max_bytes must be > 0.",
+        "max_bytes must be > 0.", "max_age_seconds must be >= 0.",
     )):
         return True
     if tool_name == "shell_exec" and text.startswith("exit="):
@@ -2154,7 +2150,7 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
             return False
         return (
             isinstance(value, dict)
-            and frozenset(value) == _SPAWN_OPEN_CODE_RESULT_FIELDS
+            and _SPAWN_OPEN_CODE_RESULT_FIELDS.issubset(value)
             and value.get("status") in _SPAWN_OPEN_CODE_ERROR_STATUSES
         )
 
@@ -2171,7 +2167,7 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
         return False
     return (
         isinstance(value, dict)
-        and frozenset(value) == expected_fields
+        and expected_fields.issubset(value)
         and value.get("ok") is False
     )
 

@@ -26,6 +26,7 @@ import contextvars
 import json
 import subprocess
 import time
+from dataclasses import asdict, fields
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -5795,20 +5796,10 @@ async def test_middleware_records_raised_returned_and_typed_failures(
         )
 
     async def typed_handler(req: ToolCallRequest) -> ToolMessage:
+        from mimir.project_tests import ProjectTestResult
+
         return ToolMessage(
-            content=json.dumps({
-                "ok": False,
-                "code": "tests_failed",
-                "returncode": 1,
-                "stdout": "",
-                "stderr": "failed",
-                "command": ["pytest"],
-                "command_source": "deployment",
-                "output_limited": False,
-                "stdout_dropped_bytes": 0,
-                "stderr_dropped_bytes": 0,
-                "git_context": "clean",
-            }),
+            content=json.dumps(asdict(ProjectTestResult(False, "tests_failed", 1))),
             tool_call_id=req.tool_call["id"],
             name=req.tool_call["name"],
         )
@@ -5879,6 +5870,76 @@ async def test_middleware_records_raised_returned_and_typed_failures(
     assert [event["tool"] for event in tool_errors] == [
         "memory_query", "memory_query", "repo_test", "repo_status", "shell_exec",
     ]
+
+
+@pytest.mark.parametrize("tool_name", ["repo_test", "repo_status", "spawn_open_code"])
+@pytest.mark.parametrize("added_fields", [False, True])
+def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fields):
+    from mimir.opencode_proposal import SpawnTerminalResult
+    from mimir.project_tests import ProjectTestResult
+    from mimir.repo_tools import GitOperationResult
+    from mimir.tools.budget_gate import _returned_value_is_error
+
+    if tool_name == "repo_test":
+        producer = ProjectTestResult(False, "tests_failed", 1)
+    elif tool_name == "repo_status":
+        producer = GitOperationResult(False, "git_failed")
+    else:
+        producer = SpawnTerminalResult("failed", 1, "process_failed", "spawn_failed")
+    payload = {field.name: getattr(producer, field.name) for field in fields(producer)}
+    if tool_name == "spawn_open_code":
+        # The registry wraps the terminal dataclass in this public JSON envelope.
+        payload.pop("event_type")
+        payload.update(run_id="run-1", stdout="", result="", stderr="", artifact_dir=None, name=None)
+    if added_fields:
+        payload["future_diagnostic"] = "additional producer metadata"
+    assert _returned_value_is_error(tool_name, json.dumps(payload))
+    assert not _returned_value_is_error("memory_query", json.dumps(payload))
+    required_fields = ("ok", "code") if tool_name == "repo_test" else ("stdout",)
+    for missing_field in required_fields:
+        incomplete = {key: value for key, value in payload.items() if key != missing_field}
+        assert not _returned_value_is_error(tool_name, json.dumps(incomplete))
+    if tool_name == "repo_test":
+        minimal = {key: payload[key] for key in required_fields}
+        assert _returned_value_is_error(tool_name, json.dumps(minimal))
+    if tool_name == "spawn_open_code":
+        payload["status"] = "success"
+    else:
+        payload["ok"] = True
+    assert not _returned_value_is_error(tool_name, json.dumps(payload))
+    if tool_name != "spawn_open_code":
+        payload["ok"] = 0
+        assert not _returned_value_is_error(tool_name, json.dumps(payload))
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_max_age_validation_is_returned_error():
+    from mimir.tools.budget_gate import _result_is_error
+    from mimir.tools.web import fetch_url
+
+    content = await fetch_url.coroutine(url="https://example.invalid", max_age_seconds=-1)
+    assert content == "max_age_seconds must be >= 0."
+    message = ToolMessage(content=content, tool_call_id="invalid-max-age", status="success")
+    assert _result_is_error("fetch_url", message)
+    assert not _result_is_error("memory_query", message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok", [False, True])
+async def test_real_repo_test_payload_error_detection(monkeypatch, ok):
+    from mimir.project_tests import ProjectTestResult
+    from mimir.tools import repo as repo_module
+    from mimir.tools.budget_gate import _result_is_error
+    from unittest.mock import AsyncMock
+
+    producer = ProjectTestResult(ok, "tests_passed" if ok else "tests_failed", 0 if ok else 1)
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: object())
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", AsyncMock(return_value=producer))
+    payload = await repo_module.repo_test.coroutine(repository="owner/repo", pull_request=1)
+    assert {field.name for field in fields(producer)} < payload.keys()
+    assert payload["remediation_guidance"]
+    message = ToolMessage(content=json.dumps(payload), tool_call_id="real-repo-test", status="success")
+    assert _result_is_error("repo_test", message) is (not ok)
 
 
 @pytest.mark.asyncio
