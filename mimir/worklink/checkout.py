@@ -452,6 +452,60 @@ def normalize_checkout(
 
 
 
+#: Identity written into every attempt checkout when the parent repository has
+#: none to lend. ``git clone`` never copies ``user.*``, and the worklink uid runs
+#: with ``HOME=/nonexistent``, so without this the backend CLI invents its own:
+#: opencode commits as ``OpenCode <opencode@localhost>``, and GitHub's
+#: squash-merge then credits an unrelated real account that owns that username.
+FALLBACK_BUILD_IDENTITY = ("mimir-carreira", "mimir@muninnai.ai")
+
+
+def _configure_build_identity(
+    repo: Path,
+    path: Path,
+    *,
+    runner: Runner,
+    event_logger: EventLogger | None = None,
+) -> tuple[str, str]:
+    """Give the attempt checkout its own committer identity, in LOCAL config.
+
+    Local config is the only scope both uids can read: the controller resolves
+    the parent's identity through its own global/local config, while the worklink
+    uid has no HOME and is refused the parent repo outright on dubious ownership.
+    Writing the resolved value into the clone closes that gap for every backend.
+    """
+    resolved: dict[str, str] = {}
+    for key in ("user.name", "user.email"):
+        probe = runner(["git", "-C", str(repo), "config", "--get", key])
+        value = probe.stdout.strip() if probe.returncode == 0 else ""
+        if value:
+            resolved[key] = value
+    name = resolved.get("user.name") or FALLBACK_BUILD_IDENTITY[0]
+    email = resolved.get("user.email") or FALLBACK_BUILD_IDENTITY[1]
+    inherited = len(resolved) == 2
+    for key, value in (("user.name", name), ("user.email", email)):
+        applied = runner(["git", "-C", str(path), "config", key, value])
+        if applied.returncode != 0:
+            raise RuntimeError(
+                (applied.stderr or applied.stdout).strip()
+                or f"git config {key} failed for the attempt checkout"
+            )
+    if event_logger is not None:
+        event_logger(
+            "worklink_checkout_identity_configured",
+            checkout=str(path),
+            # NOT ``name``: the event logger takes the event name as its first
+            # positional parameter, so a ``name`` payload key collides with it.
+            user_name=name,
+            user_email=email,
+            # False means the parent lent nothing and the fallback was used --
+            # commits are still attributable, but the operator should fix the
+            # parent's identity rather than rely on this.
+            inherited=inherited,
+        )
+    return name, email
+
+
 def create_isolated_checkout(
     repo: Path,
     *,
@@ -573,6 +627,12 @@ def create_isolated_checkout(
     checkout = runner(["git", "-C", str(path), "checkout", "-B", branch, local_base])
     if checkout.returncode != 0:
         raise RuntimeError((checkout.stderr or checkout.stdout).strip() or "git checkout failed")
+
+    try:
+        _configure_build_identity(repo, path, runner=runner, event_logger=event_logger)
+    except RuntimeError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
 
     # #517: verify the clone is a real, self-contained repo rooted at ``path`` and
     # does not resolve back to the parent before any backend inspects its git
