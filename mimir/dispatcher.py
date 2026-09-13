@@ -19,6 +19,7 @@ import traceback
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from .access_control import AccessDecision, authorize_inbound
+from .background_tasks import cancel_background_tasks, spawn_background
 from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
@@ -212,9 +213,10 @@ class Dispatcher:
         # First-contact DM-channel capture (best-effort, fire-and-forget):
         # observe inbound user messages without blocking or risking admission.
         if self._on_event is not None and event.trigger == "user_message":
-            task = asyncio.create_task(self._on_event(event))
-            self._bg_tasks.add(task)
-            task.add_done_callback(self._bg_tasks.discard)
+            spawn_background(
+                self._bg_tasks, self._on_event(event),
+                name="dispatcher-event-observer",
+            )
 
         channel_id = event.channel_id
 
@@ -662,8 +664,15 @@ class Dispatcher:
         not hang the shutdown past the compose ``stop_grace_period`` (after which
         Docker SIGKILLs straight through the drain). On timeout we log how many
         turns were still running and cancel them so the exit stays deterministic.
-        ``None`` / ``0`` = wait unbounded (the prior behavior; used by tests)."""
+        ``None`` / ``0`` = wait unbounded (the prior behavior; used by tests).
+        Best-effort event observers are cancelled first using the shared bounded
+        background-task cleanup, independently of the turn timeout.
+        """
         self._closed = True
+        for error in await cancel_background_tasks(
+            self._bg_tasks, label="dispatcher observers",
+        ):
+            log.warning("dispatcher observer shutdown failed: %s", error)
         if not self._workers:
             return
         await log_event(

@@ -72,6 +72,80 @@ def _logger(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_event_observer_failure_is_observed(tmp_path: Path, monkeypatch):
+    from mimir import background_tasks
+
+    failures = []
+    release = asyncio.Event()
+    monkeypatch.setattr(
+        background_tasks, "log_event_sync",
+        lambda event, **fields: failures.append((event, fields)),
+    )
+
+    async def observer(event):
+        await release.wait()
+        raise RuntimeError("observer failed")
+
+    disp = Dispatcher(_make_config(tmp_path))
+    disp.set_on_event(observer)
+    try:
+        assert await disp.enqueue(AgentEvent(
+            channel_id="c1", source="api", trigger="user_message", content="hello",
+        ))
+        tasks = tuple(disp._bg_tasks)
+        assert len(tasks) == 1
+        # Let the task and its completion callback run without retrieving its result.
+        completed = asyncio.Event()
+        tasks[0].add_done_callback(lambda task: completed.set())
+        release.set()
+        await asyncio.wait_for(completed.wait(), timeout=2)
+        assert not disp._bg_tasks
+        assert failures == [("background_task_failed", {
+            "name": "dispatcher-event-observer",
+            "error": "RuntimeError: observer failed",
+        })]
+    finally:
+        await disp.drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retire_workers", [False, True])
+async def test_drain_cancels_retained_event_observer(tmp_path: Path, retire_workers):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def observer(event):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    disp = Dispatcher(_make_config(tmp_path))
+    disp.set_on_event(observer)
+    await disp.enqueue(AgentEvent(
+        channel_id="c1", source="api", trigger="user_message", content="hello",
+    ))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    tasks = tuple(disp._bg_tasks)
+    try:
+        if retire_workers:
+            await asyncio.wait_for(
+                asyncio.gather(*disp._workers.values()), timeout=3,
+            )
+            assert not disp._workers
+        await disp.drain(timeout=1)
+        assert cancelled.is_set()
+        assert all(task.cancelled() for task in tasks)
+        assert not disp._bg_tasks
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await disp.drain(timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_within_channel_events_run_in_order(tmp_path: Path):
     cfg = _make_config(tmp_path)
 

@@ -271,7 +271,7 @@ class MessageBuffer:
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         with self._io_condition:
             while self._trimming:
-                self._io_condition.wait()
+                self._io_condition.wait(timeout=1.0)
             self._active_writers += 1
         try:
             with self.history_path.open("a", encoding="utf-8") as f:
@@ -287,11 +287,11 @@ class MessageBuffer:
                     self._io_condition.notify_all()
 
     def _trim_sync(self) -> None:
-        with self._io_condition:
-            self._trimming = True
-            while self._active_writers:
-                self._io_condition.wait()
         try:
+            with self._io_condition:
+                self._trimming = True
+                while self._active_writers:
+                    self._io_condition.wait(timeout=1.0)
             kept_reversed: list[str] = []
             for line in _tail_lines(self.history_path):
                 stripped = line.strip()

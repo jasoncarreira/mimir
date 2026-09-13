@@ -1,14 +1,17 @@
 """Tests for mimir.mid_turn_injection (issue #376) — registry + middleware.
 
 The middleware reads the channel id via ``get_config()`` (it can't come off the
-``runtime`` arg — see the spec / mimir's #589 review), so the before_model tests
-monkeypatch ``mid_turn_injection.get_config``. PR 2 stores whole ``AgentEvent``s
+``runtime`` arg — see the spec / mimir's #589 review), so direct hook unit tests
+monkeypatch ``mid_turn_injection.get_config``; the framework invocation test
+uses the real graph config. PR 2 stores whole ``AgentEvent``s
 (not just text) so an un-folded leftover re-enqueues faithfully; tests assert on
 the folded ``HumanMessage`` content.
 """
 from __future__ import annotations
 
 import ast
+import asyncio
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -226,7 +229,7 @@ def test_folded_records_excludes_unfolded_leftovers():
 
 
 def test_deactivate_returns_folded_snapshot_even_after_stale_prior_read():
-    """A worker-thread drain can land after a caller's earlier folded_records()
+    """A concurrent synchronous drain can land after an earlier folded_records()
     read but before turn-finalization. deactivate() is the final atomic snapshot,
     so those newly folded records must not disappear."""
     mti.register_inflight("ch1")
@@ -392,6 +395,42 @@ def test_tainted_turn_cannot_defer_injected_message():
 
 
 # ─── MidTurnInjectionMiddleware.before_model ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_before_model_runs_on_event_loop_via_framework(monkeypatch):
+    """Pin the dependency's sync-hook scheduling, not a direct Python call."""
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    loop = asyncio.get_running_loop()
+    thread_id = threading.get_ident()
+    calls = []
+    drain = mti._drain
+
+    def observed_drain(channel_id):
+        calls.append((asyncio.get_running_loop(), threading.get_ident(), channel_id))
+        return drain(channel_id)
+
+    monkeypatch.setattr(mti, "_drain", observed_drain)
+    mti.register_inflight("ch1")
+    event = _ev("injected through the framework")
+    assert mti.inject_message("ch1", event) == "injected"
+    agent = create_agent(
+        model=FakeListChatModel(responses=["done"]),
+        middleware=[mti.MidTurnInjectionMiddleware()],
+    )
+
+    result = await agent.ainvoke(
+        {"messages": [HumanMessage(content="initial")]},
+        config={"configurable": {"channel_id": "ch1"}},
+    )
+
+    assert calls == [(loop, thread_id, "ch1")]
+    assert [message.content for message in result["messages"]] == [
+        "initial", mti.render_injected_message(event), "done",
+    ]
+    assert [event for event, _ in mti.folded_records("ch1")] == [event]
 
 
 def test_before_model_noop_on_empty_queue(monkeypatch):

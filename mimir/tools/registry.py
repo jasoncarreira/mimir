@@ -2163,12 +2163,13 @@ _SPAWN_GUARD = _SpawnGuard()
 
 
 def _spawn_guard_init() -> _SpawnGuard:
-    """Re-read env vars and (re)initialize the semaphore + lock on first
-    spawn. Env vars are read each invocation so tests can change them
-    per-case without restarting the process; the semaphore / lock are
-    created exactly once per ``max_concurrent`` value so the
-    concurrency cap is real (every fresh ``Semaphore`` would defeat
-    the gate by handing every caller a full set of slots)."""
+    """Refresh caps, applying concurrency changes only when fully idle.
+
+    Holders and queued acquires retain the old effective cap, even when
+    the requested cap is lower. No running spawn is preempted. The next
+    invocation with no holders or waiters applies the latest env value;
+    until then ``max_concurrent`` reports the old, enforced limit.
+    """
     g = _SPAWN_GUARD
     new_max_concurrent = _env_int_floor1(
         "MIMIR_SPAWN_MAX_CONCURRENT", _SPAWN_MAX_CONCURRENT_DEFAULT,
@@ -2179,12 +2180,14 @@ def _spawn_guard_init() -> _SpawnGuard:
     g.max_depth = _env_int_floor1(
         "MIMIR_SPAWN_MAX_DEPTH", _SPAWN_MAX_DEPTH_DEFAULT,
     )
-    # (Re)create only when the semaphore is missing or the cap
-    # changed — keeps the existing pending waiters in the same FIFO
-    # the loop scheduled them in. asyncio.Lock / Semaphore are
-    # loop-bound; the ``sem is None`` arm covers the cross-loop case
-    # (tests swap event loops between cases).
-    if g.sem is None or g.max_concurrent != new_max_concurrent:
+    # locked() alone misses partially occupied semaphores. Inspect both
+    # available permits and the waiter queue, including notified waiters
+    # that have not resumed yet. There is no await across this idle check.
+    if g.sem is None or (
+        g.max_concurrent != new_max_concurrent
+        and g.sem._value == g.max_concurrent
+        and not g.sem._waiters
+    ):
         g.sem = asyncio.Semaphore(new_max_concurrent)
         g.max_concurrent = new_max_concurrent
     if g.rate_lock is None:

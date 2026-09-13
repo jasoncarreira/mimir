@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,73 @@ from mimir.saga.ownership import (
     intersect_acl,
     is_user_accessible,
 )
+
+
+def test_shadow_turn_overflow_reports_aggregate_loss(monkeypatch) -> None:
+    from mimir import _context
+    from mimir.saga import ownership
+
+    accumulators = {}
+    events = []
+    turn = SimpleNamespace(turn_id="")
+    monkeypatch.setattr(ownership, "_SHADOW_TURN_ACCUMULATORS", accumulators)
+    monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
+    monkeypatch.setattr(
+        ownership, "_emit_saga_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    authorization = ownership.SagaReadAuthorization(None, "search")
+    authorization.observe_would_deny("atoms", {"sensitive-id"})
+    for index in range(4097):
+        turn.turn_id = f"turn-{index}"
+        authorization.finalize()
+
+    assert len(accumulators) == 2049
+    assert list(accumulators)[0] == "turn-2048"
+    assert events == [("saga_read_shadow_turns_dropped", {
+        "dropped_turn_count": 2048,
+        "reason": "capacity",
+    })]
+    ownership.finalize_shadow_read_turn(turn)
+    assert events[-1][0] == "saga_read_would_block"
+    assert events[-1][1]["resource_count"] == 1
+    assert turn.turn_id not in accumulators
+
+
+def test_shadow_turn_age_evicts_late_finalize_orphan(monkeypatch) -> None:
+    from mimir import _context
+    from mimir.saga import ownership
+
+    accumulators = {}
+    events = []
+    clock = [0.0]
+    turn = SimpleNamespace(turn_id="late-turn")
+    monkeypatch.setattr(ownership, "_SHADOW_TURN_ACCUMULATORS", accumulators)
+    monkeypatch.setattr(ownership, "monotonic", lambda: clock[0], raising=False)
+    monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
+    monkeypatch.setattr(
+        ownership, "_emit_saga_event",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    authorization = ownership.SagaReadAuthorization(None, "search")
+    authorization.observe_probe_failure()
+    authorization.finalize()
+    ownership.finalize_shadow_read_turn(turn)
+    authorization.finalize()  # A detached operation finishes after turn teardown.
+    assert "late-turn" in accumulators
+    events.clear()
+
+    clock[0] = 3600.0
+    turn.turn_id = "fresh-turn"
+    authorization.finalize()
+
+    assert list(accumulators) == ["fresh-turn"]
+    assert events == [("saga_read_shadow_turns_dropped", {
+        "dropped_turn_count": 1,
+        "reason": "age",
+    })]
+    ownership.finalize_shadow_read_turn(turn)
+    assert events[-1][1]["probe_failure_count"] == 1
 
 
 @pytest.mark.parametrize(
