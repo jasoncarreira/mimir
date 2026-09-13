@@ -2677,6 +2677,9 @@ class Agent:
                         "send_message_failed",
                         channel_id=event.channel_id,
                         error=str(getattr(result, "error", None) or "")[:200] or None,
+                        chunks=getattr(result, "chunks", 0),
+                        uploads=getattr(result, "uploads", 0),
+                        message_id=getattr(result, "message_id", None),
                     )
                 except Exception:  # noqa: BLE001
                     pass

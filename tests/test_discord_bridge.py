@@ -207,6 +207,27 @@ def bridge_with_fake_client(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", [1, 2])
+async def test_send_chunk_failure_preserves_progress(bridge_with_fake_client, fail_at):
+    import discord
+
+    bridge, _, _ = bridge_with_fake_client
+    send = AsyncMock(side_effect=[
+        *[SimpleNamespace(id=1001) for _ in range(fail_at - 1)],
+        discord.DiscordException("send failed"),
+    ])
+    bridge._client.get_channel(1).send = send
+    result = await bridge.send("discord-1", "x" * (DISCORD_MESSAGE_CHAR_LIMIT * 3))
+
+    assert result.sent is False
+    assert result.chunks == fail_at - 1
+    assert result.message_id == ("1001" if fail_at == 2 else None)
+    assert result.uploads == 0
+    assert send.await_count == fail_at
+    assert f"after {fail_at - 1} chunk(s)" in result.error
+
+
+@pytest.mark.asyncio
 async def test_send_chunks_long_text(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
     long_text = "y" * (DISCORD_MESSAGE_CHAR_LIMIT * 2 + 100)
