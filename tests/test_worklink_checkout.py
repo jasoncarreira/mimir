@@ -15,6 +15,7 @@ import pytest
 import mimir.worklink.checkout as checkout_module
 from mimir.worklink.backends.feature_factory import DEFAULT_FACTORY_ENTRYPOINT
 from mimir.worklink.checkout import (
+    FALLBACK_BUILD_IDENTITY,
     CheckoutAuthorization,
     CheckoutLease,
     _assert_self_contained_checkout,
@@ -1626,3 +1627,138 @@ def test_factory_cleanup_boundary_requires_exact_lease_shape(tmp_path, mismatch)
     assert cleanup_checkout(lease, outcome="completed") is True
     assert not path.exists()
     assert canary.read_text() == "keep"
+
+
+def _clean_git_env() -> dict[str, str]:
+    """An environment with no ambient identity, like the worklink uid's."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key not in {"HOME", "XDG_CONFIG_HOME"}
+    }
+    env["HOME"] = "/nonexistent"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
+
+
+def test_isolated_checkout_can_commit_without_an_ambient_identity(tmp_path: Path) -> None:
+    """``git clone`` never copies ``user.*`` and the worklink uid has no HOME.
+
+    Without a local identity the backend CLI invents one -- opencode commits as
+    ``OpenCode <opencode@localhost>`` and GitHub credits an unrelated account.
+    """
+    repo = _repo_with_main(tmp_path)
+    events: list[tuple[str, dict]] = []
+
+    lease = create_isolated_checkout(
+        repo, issue_id=9101, attempt=1,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    assert _git(lease.path, "config", "--get", "user.name") == "t"
+    assert _git(lease.path, "config", "--get", "user.email") == "t@e.com"
+
+    (lease.path / "built.txt").write_text("work\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "built.txt"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(lease.path), "commit", "-q", "-m", "build"],
+        env=_clean_git_env(), capture_output=True, text=True,
+    )
+    assert commit.returncode == 0, commit.stderr
+    author = subprocess.run(
+        ["git", "-C", str(lease.path), "log", "-1", "--format=%an <%ae>"],
+        env=_clean_git_env(), capture_output=True, text=True, check=True,
+    )
+    assert author.stdout.strip() == "t <t@e.com>"
+
+    [identity] = [payload for name, payload in events if name.endswith("identity_configured")]
+    assert identity["user_name"] == "t"
+    assert identity["user_email"] == "t@e.com"
+    assert identity["inherited"] is True
+
+
+def test_isolated_checkout_falls_back_when_the_parent_lends_no_identity(
+    tmp_path: Path,
+) -> None:
+    repo = _repo_with_main(tmp_path)
+    _git(repo, "config", "--unset", "user.name")
+    _git(repo, "config", "--unset", "user.email")
+    events: list[tuple[str, dict]] = []
+
+    # Unsetting the repo's own config is not enough: the developer running this
+    # has a global identity that ``git config --get`` would still resolve. Run
+    # every git call the way the worklink uid does, with no ambient identity.
+    def runner(args):
+        return subprocess.run(
+            list(args), capture_output=True, text=True, env=_clean_git_env(),
+        )
+
+    lease = create_isolated_checkout(
+        repo, issue_id=9102, attempt=1, runner=runner,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    name, email = FALLBACK_BUILD_IDENTITY
+    assert _git(lease.path, "config", "--get", "user.name") == name
+    assert _git(lease.path, "config", "--get", "user.email") == email
+
+    [identity] = [p for n, p in events if n.endswith("identity_configured")]
+    assert identity["inherited"] is False
+
+
+@pytest.mark.parametrize("lent", ["user.name", "user.email"])
+def test_isolated_checkout_reports_a_partial_identity_as_not_inherited(
+    tmp_path: Path, lent: str,
+) -> None:
+    """One field inherited and one fallen back is NOT ``inherited``.
+
+    ``inherited`` is ``len(resolved) == 2``, so a parent that lends only half an
+    identity reports False exactly like a parent that lends none. Pin that, and
+    pin that the lent field is still the one used.
+    """
+    repo = _repo_with_main(tmp_path)
+    dropped = "user.email" if lent == "user.name" else "user.name"
+    _git(repo, "config", "--unset", dropped)
+    events: list[tuple[str, dict]] = []
+
+    def runner(args):
+        return subprocess.run(
+            list(args), capture_output=True, text=True, env=_clean_git_env(),
+        )
+
+    lease = create_isolated_checkout(
+        repo, issue_id=9103, attempt=1, runner=runner,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    )
+
+    expected = {"user.name": "t", "user.email": "t@e.com"}[lent]
+    fallback = dict(zip(("user.name", "user.email"), FALLBACK_BUILD_IDENTITY))[dropped]
+    assert _git(lease.path, "config", "--get", lent) == expected
+    assert _git(lease.path, "config", "--get", dropped) == fallback
+
+    [identity] = [p for n, p in events if n.endswith("identity_configured")]
+    assert identity["inherited"] is False
+
+
+def test_isolated_checkout_is_removed_when_the_identity_write_fails(
+    tmp_path: Path,
+) -> None:
+    """The fail-closed cleanup path: a failed config write must not leave a checkout.
+
+    Without this the caller would receive a checkout whose committer identity the
+    backend cannot read, which is the defect this helper exists to prevent.
+    """
+    repo = _repo_with_main(tmp_path)
+    seen: list[Path] = []
+
+    def runner(args):
+        argv = list(args)
+        if argv[3:5] == ["config", "user.email"]:
+            seen.append(Path(argv[2]))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="disk full\n")
+        return subprocess.run(argv, capture_output=True, text=True)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        create_isolated_checkout(repo, issue_id=9104, attempt=1, runner=runner)
+
+    assert seen, "the identity write was never attempted"
+    assert not seen[0].exists(), "a half-made checkout survived a failed identity write"
