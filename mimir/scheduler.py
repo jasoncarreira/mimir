@@ -69,6 +69,7 @@ from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
     POLLER_CHANNEL_PREFIX,
+    POLLER_EXIT_GRACE_SECONDS,
     POLLER_TIMEOUT_SECONDS,
     PollerConfig,
     discover_pollers,
@@ -2494,14 +2495,32 @@ class Scheduler:
                     accepted_this_fire += 1
                 return accepted
 
-            await run_poller(
-                poller,
-                enqueue=enqueue_with_turn_budget,
-                home=self._home,
-                timeout=await self._effective_poller_timeout(poller),
-            )
+            timeout = await self._effective_poller_timeout(poller)
+            # Allow bounded drain, reap, and final cleanup beyond execution.
+            deadline_seconds = timeout + 3 * POLLER_EXIT_GRACE_SECONDS
+            deadline = asyncio.timeout(deadline_seconds)
+            try:
+                async with deadline:
+                    await run_poller(
+                        poller,
+                        enqueue=enqueue_with_turn_budget,
+                        home=self._home,
+                        timeout=timeout,
+                    )
+            except TimeoutError:
+                if not deadline.expired():
+                    raise
+            else:
+                return
         finally:
             self._poller_semaphore.release()
+
+        await log_event(
+            "poller_fire_deadline_exceeded",
+            poller=poller_name,
+            timeout_seconds=timeout,
+            deadline_seconds=deadline_seconds,
+        )
 
     def trigger_poller(self, poller_name: str, *, reason: str) -> bool:
         """Request a coalesced fire through the same gates as the cron path."""

@@ -96,6 +96,7 @@ def test_kill_process_group_killpg_error_returns_normally(
 ) -> None:
     proc = Mock(spec=asyncio.subprocess.Process)
     proc.pid = 12345
+    proc.returncode = None
     killpg = Mock(side_effect=error)
     monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
 
@@ -110,6 +111,7 @@ def test_kill_process_group_killpg_einval_propagates(
 ) -> None:
     proc = Mock(spec=asyncio.subprocess.Process)
     proc.pid = 12345
+    proc.returncode = None
     error = OSError(errno.EINVAL, "invalid signal")
     killpg = Mock(side_effect=error)
     monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
@@ -120,6 +122,14 @@ def test_kill_process_group_killpg_einval_propagates(
     assert raised.value is error
     killpg.assert_called_once_with(proc.pid, signal.SIGKILL)
     proc.kill.assert_not_called()
+
+
+def test_kill_process_group_does_not_signal_reaped_pid(monkeypatch):
+    proc = SimpleNamespace(pid=12345, returncode=0)
+    killpg = Mock()
+    monkeypatch.setattr("mimir.pollers.os.killpg", killpg)
+    _kill_process_group(proc)
+    killpg.assert_not_called()
 
 
 @pytest.fixture
@@ -3476,8 +3486,10 @@ def _control_poller_wait(monkeypatch, ready, *, expire=True, reap=False):
         return await asyncio.wait(tasks)
 
     async def wait_for(awaitable, *, timeout):
+        nonlocal reap
         calls.append(("reap", timeout))
         if reap:
+            reap = False
             awaitable.close()
             raise asyncio.TimeoutError
         return await asyncio.wait_for(awaitable, timeout=timeout)
@@ -3608,6 +3620,7 @@ with open(pgid_path, "w", encoding="utf-8") as f:
     f.write(str(os.getpgrp()))
 print(json.dumps({"poller": "x", "prompt": "would emit"}), flush=True)
 open("output-ready", "w").close()
+child.wait()
 """)
     cfg = PollerConfig(
         name="child-holder",
@@ -3670,6 +3683,94 @@ open("output-ready", "w").close()
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_run_poller_escaped_writer_releases_resources(
+    tmp_path: Path, home: Path, monkeypatch, cancel: bool,
+):
+    """The writer escapes before expiry and stays alive until test cleanup."""
+    from mimir import pollers
+
+    skill_dir = tmp_path / "escape"
+    _install_script(skill_dir, "poller.py", """
+import os, signal
+from pathlib import Path
+if os.fork() == 0:
+    os.setsid()
+    with open('release', 'rb', buffering=0) as release:
+        os.write(1, b'{"poller":"escape","prompt":"not committed"}\\n')
+        os.write(2, b'escaped writer diagnostic\\n')
+        Path('ready').write_text(str(os.getpid()))
+        release.read(1)
+    os.close(1)
+    os.close(2)
+    Path('finished').touch()
+    os._exit(0)
+signal.pause()
+""")
+    os.mkfifo(skill_dir / "release")
+    release_fd = os.open(skill_dir / "release", os.O_RDWR | os.O_NONBLOCK)
+    monkeypatch.setattr(pollers, "POLLER_EXIT_GRACE_SECONDS", 0.1)
+    buffers = []
+    drain = pollers._drain_capped
+
+    async def observed_drain(*args, **kwargs):
+        buffers.append(kwargs["buffer"])
+        return await drain(*args, **kwargs)
+
+    monkeypatch.setattr(pollers, "_drain_capped", observed_drain)
+    ready_event = asyncio.Event()
+
+    async def ready():
+        await _poller_file_ready(skill_dir / "ready")
+        while len(buffers) != 2 or not all(buffers):
+            await asyncio.sleep(0)
+        ready_event.set()
+        if cancel:
+            await asyncio.Future()
+
+    _control_poller_wait(monkeypatch, ready)
+    cfg = PollerConfig(
+        name="escape", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    enq = _CapturingEnqueue()
+    from mimir.scheduler import Scheduler
+    from unittest.mock import AsyncMock
+
+    sched = Scheduler(scheduler_yaml=tmp_path / "scheduler.yaml", enqueue=enq)
+    sched._home = home
+    sched._pollers[cfg.name] = cfg
+    sched._poller_semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(sched, "_effective_poller_timeout", AsyncMock(return_value=1))
+    task = asyncio.create_task(sched._fire_poller(poller_name=cfg.name))
+    try:
+        await ready_event.wait()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+        else:
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            diagnostics = [e for e in _read_events(home) if e["type"] == "poller_stderr"]
+            assert diagnostics[0]["stderr"] == "escaped writer diagnostic"
+            assert any(e["type"] == "poller_timeout" for e in _read_events(home))
+        assert not sched._poller_fire_locks[cfg.name].locked()
+        assert not sched._poller_semaphore.locked()
+        assert enq.events == []
+        assert bytes(buffers[0]).startswith(b'{"poller":"escape"')
+        escaped_pid = int((skill_dir / "ready").read_text())
+        assert os.getpgid(escaped_pid) == escaped_pid
+        assert not (skill_dir / "finished").exists()
+    finally:
+        os.write(release_fd, b"x")
+        os.close(release_fd)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await _poller_file_ready(skill_dir / "finished")
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("count", [0, 3])
 async def test_run_poller_bounded_when_child_closes_pipes_but_keeps_running(
@@ -3703,7 +3804,7 @@ signal.pause()
         expire=False, reap=True,
     )
     n = await run_poller(cfg, enqueue=enq, timeout=2.0)
-    assert calls == [("drain", 2.0), ("reap", 2.0)]
+    assert calls == [("drain", 2.0), ("reap", 2.0), ("reap", 5.0)]
     assert n == 0
     assert enq.events == []
     events = _read_events(home)
@@ -4405,13 +4506,14 @@ def _observe_poller_barrier(monkeypatch):
     completed = asyncio.Event()
     drain = pollers._drain_capped
 
-    async def observed_drain(stream, limit, overflow, on_line=None):
+    async def observed_drain(stream, limit, overflow, on_line=None, **kwargs):
         async def observed_line(line):
             await on_line(line)
             completed.set()
 
         return await drain(
             stream, limit, overflow, observed_line if on_line else None,
+            **kwargs,
         )
 
     monkeypatch.setattr(pollers, "_drain_capped", observed_drain)

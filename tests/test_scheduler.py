@@ -2454,6 +2454,84 @@ async def test_fire_poller_serializes_through_semaphore(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("external_cancel", [False, True], ids=["deadline", "cancel"])
+async def test_fire_poller_parked_run_releases_permit_and_lock(
+    tmp_path: Path, monkeypatch, external_cancel: bool,
+):
+    import mimir.scheduler as scheduler_module
+
+    monkeypatch.setenv("MIMIR_MAX_CONCURRENT_POLLERS", "1")
+    sched = Scheduler(
+        scheduler_yaml=tmp_path / "s.yaml", enqueue=mock.AsyncMock(return_value=True),
+    )
+    skills = tmp_path / "skills"
+    _drop_pollers_skill(skills, "p1")
+    sched.add_poller_jobs(skills)
+    monkeypatch.setattr(sched, "_effective_poller_timeout", mock.AsyncMock(return_value=7.0))
+    monkeypatch.setattr(scheduler_module, "POLLER_EXIT_GRACE_SECONDS", 0.5)
+
+    deadlines = []
+
+    def controlled_timeout(delay):
+        assert delay == 8.5
+        timer = asyncio.timeout(None)
+        deadlines.append(timer)
+        return timer
+
+    monkeypatch.setattr(scheduler_module, "asyncio", SimpleNamespace(
+        **{**vars(asyncio), "timeout": controlled_timeout},
+    ))
+    entered = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def parked_run(poller, enqueue, home=None, timeout=None):
+        assert timeout == 7.0
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    events = []
+
+    async def capture_event(kind, **payload):
+        if kind == "poller_fire_deadline_exceeded":
+            assert not sched._poller_semaphore.locked()
+        events.append((kind, payload))
+
+    monkeypatch.setattr(scheduler_module, "run_poller", parked_run)
+    monkeypatch.setattr(scheduler_module, "log_event", capture_event)
+    task = asyncio.create_task(sched._fire_poller(poller_name="p1"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert sched._poller_semaphore.locked()
+        assert sched._poller_fire_locks["p1"].locked()
+        if external_cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            deadlines[0].reschedule(asyncio.get_running_loop().time())
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert cleaned.is_set()
+    assert not sched._poller_semaphore.locked()
+    assert not sched._poller_fire_locks["p1"].locked()
+    deadline_events = [payload for kind, payload in events if kind == "poller_fire_deadline_exceeded"]
+    assert deadline_events == ([] if external_cancel else [{
+        "poller": "p1", "timeout_seconds": 7.0, "deadline_seconds": 8.5,
+    }])
+
+    recovered = mock.AsyncMock()
+    monkeypatch.setattr(scheduler_module, "run_poller", recovered)
+    await asyncio.wait_for(sched._fire_poller(poller_name="p1"), timeout=5)
+    recovered.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_fire_poller_passes_scheduler_home_to_run_poller(
     tmp_path: Path, monkeypatch,
 ):

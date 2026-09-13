@@ -366,8 +366,9 @@ POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS = 300
 # both fds and keeps running (daemonizing helper, post-cleanup hang)
 # would otherwise pin a bare ``proc.wait()`` — and the caller's
 # concurrency-semaphore slot — forever. Capped by the poller's own
-# timeout so a short-timeout caller is never held longer than 2x its
-# budget.
+# timeout for the normal EOF path. Also bounds post-kill drains/reaping:
+# five seconds allows buffered output to drain without letting escaped
+# descendants holding pipe writers pin a scheduler slot indefinitely.
 POLLER_EXIT_GRACE_SECONDS = 5.0
 
 #: Channel-id prefix for synthetic poller-tick channels. Each registered
@@ -2192,6 +2193,10 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     kill the whole process group. Fall back to ``proc.kill()`` where
     process groups are unavailable.
     """
+    # Once reaped, the PID/PGID may belong to an unrelated process. In
+    # particular an escaped descendant can overflow a pipe after reap.
+    if proc.returncode is not None:
+        return
     try:
         if hasattr(os, "killpg"):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -2206,6 +2211,8 @@ async def _drain_capped(
     limit: int,
     on_overflow: Callable[[], None],
     on_line: Callable[[bytes], Awaitable[None]] | None = None,
+    *,
+    buffer: bytearray | None = None,
 ) -> bytes:
     """Read from *stream* up to *limit* bytes, then stop accumulating.
 
@@ -2217,7 +2224,7 @@ async def _drain_capped(
     """
     if stream is None:
         return b""
-    buf = bytearray()
+    buf = buffer if buffer is not None else bytearray()
     line_buf = bytearray()
     overflowed = False
     while True:
@@ -2255,8 +2262,8 @@ async def run_poller(
     each emitted event. Returns the count of events successfully
     enqueued (excludes dispatcher-rejected events; those land in
     ``poller_event_rejected`` events for back-pressure auditing).
-    Timeouts deliver complete lines collected before the kill; errors and
-    silence return 0.
+    Timeouts retain stderr diagnostics but discard events (the child may
+    not have committed its cursor); errors and silence return 0.
 
     **Command parsing**: ``poller.command`` is parsed by ``/bin/sh -c``
     via ``asyncio.create_subprocess_shell``. Shell features (env-var
@@ -2591,6 +2598,9 @@ async def run_poller(
     stderr_bytes = b""
     fatal_error: str | None = None
     timed_out = False
+    drains: list[asyncio.Task[bytes]] = []
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
     try:
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -2620,25 +2630,34 @@ async def run_poller(
                     MAX_POLLER_STDOUT_BYTES,
                     _on_overflow,
                     _accept_delivery_barrier,
+                    buffer=stdout_buffer,
                 ),
             )
             stderr_task = asyncio.create_task(
                 _drain_capped(
                     proc.stderr, MAX_POLLER_STDERR_BYTES, _on_overflow,
+                    buffer=stderr_buffer,
                 ),
             )
+            drains = [stdout_task, stderr_task]
             _, pending = await asyncio.wait(
                 {stdout_task, stderr_task}, timeout=timeout,
             )
             if pending:
                 timed_out = True
                 _kill_process_group(proc)
-                await proc.wait()
-                # Killing the group closes its pipes. Finish the capped drains
-                # rather than cancelling away their already-collected output.
-                await asyncio.gather(stdout_task, stderr_task)
-            stdout_bytes = stdout_task.result()
-            stderr_bytes = stderr_task.result()
+                # An escaped descendant can retain pipe writers after SIGKILL.
+                # wait_for cancels both drains; their capped buffers survive.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(stdout_task, stderr_task),
+                        timeout=POLLER_EXIT_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    for task in drains:
+                        task.cancel()
+            stdout_bytes = bytes(stdout_buffer) if stdout_task.cancelled() else stdout_task.result()
+            stderr_bytes = bytes(stderr_buffer) if stderr_task.cancelled() else stderr_task.result()
             # chainlink #410: the ``asyncio.wait`` above bounds only the
             # pipe drains. Both drains hitting EOF means the child closed
             # its fds, not that it exited — a poller that closes stdout/
@@ -2654,7 +2673,6 @@ async def run_poller(
             except asyncio.TimeoutError:
                 timed_out = True
                 _kill_process_group(proc)
-                await proc.wait()
             if _overflow["hit"]:
                 await log_event(
                     "poller_output_overflow",
@@ -2704,6 +2722,19 @@ async def run_poller(
                 )
             return 0
     finally:
+        for task in drains:
+            if not task.done():
+                task.cancel()
+        if drains:
+            await asyncio.gather(*drains, return_exceptions=True)
+        if proc is not None:
+            # Process has no public pipe-close API. Close our read transports,
+            # not the escaped writer's process, to release descriptors and let
+            # asyncio's process waiter complete even without pipe EOF.
+            for fd in (1, 2):
+                transport = proc._transport.get_pipe_transport(fd)
+                if transport is not None:
+                    transport.close()
         # Kill + reap on every exit path. The ``returncode is None``
         # gate makes this a no-op on the happy path (process already
         # exited via ``communicate``); on timeout or exception it
@@ -2711,8 +2742,8 @@ async def run_poller(
         if proc is not None and proc.returncode is None:
             _kill_process_group(proc)
             try:
-                await proc.wait()
-            except (ProcessLookupError, asyncio.CancelledError):
+                await asyncio.wait_for(proc.wait(), timeout=POLLER_EXIT_GRACE_SECONDS)
+            except (ProcessLookupError, asyncio.TimeoutError):
                 pass
 
     stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
