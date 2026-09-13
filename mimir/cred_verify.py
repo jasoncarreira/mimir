@@ -6,19 +6,18 @@ manifest shipped alongside ``SKILL.md``. The framework discovers
 these at startup and builds the probe registry — no central
 hardcoded list to grow as new skills land.
 
-Discovery roots (operator-shadows-bundled, mirrors PR #272's
-skills walker):
+Probe code and manifests are loaded only from the installed package:
 
   1. ``mimir/credentials.yaml`` — mimir-core creds shipped with the
      package (ANTHROPIC_API_KEY, MIMIR_API_KEY, GITHUB_TOKEN, the
      Discord/Slack bridge tokens, Claude OAuth).
-  2. ``<home>/.mimir_builtin_skills/<skill>/credentials.yaml`` —
-     bundled optional skills.
-  3. ``<home>/skills/<skill>/credentials.yaml`` — operator skills.
+  2. ``mimir/optional-skills/<skill>/credentials.yaml`` for skills
+      installed under either home skills root.
 
-Within a given probe name, later roots shadow earlier ones — so an
-operator can override a bundled probe spec without forking the
-framework.
+Home directories select packaged optional skills by name only. Their
+manifests are never read: admitted shell commands can write there.
+Operator overrides and custom home probes are no longer supported;
+adding or changing a probe requires updating the installed package.
 
 Probe kinds (declarative, no Python needed for the common cases):
 
@@ -49,6 +48,7 @@ from typing import Any, Callable, Literal
 
 import yaml
 
+from .contained_execution import base_worker_environment
 from .redaction import redact_text
 
 log = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ def _all_env_set(*names: str) -> tuple[bool, str]:
 
 
 def _has_binary(name: str) -> bool:
-    return shutil.which(name) is not None
+    return shutil.which(name, path=base_worker_environment("cred-verify")["PATH"]) is not None
 
 
 def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
@@ -122,6 +122,7 @@ def _run_quiet(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=timeout,
+            env=base_worker_environment("cred-verify"),
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except subprocess.TimeoutExpired:
@@ -142,7 +143,9 @@ def _make_subprocess_probe(
     success_detail: str | None = None,
 ) -> Callable[[], tuple[bool, str]]:
     """``kind: subprocess`` — short-circuit if binary missing or
-    declared env vars unset; else run cmd, exit 0 = live."""
+    declared env vars unset; else run cmd, exit 0 = live.
+    Env declarations are presence checks, not permission to forward secrets.
+    """
     def _probe() -> tuple[bool, str]:
         if not _has_binary(binary):
             return _unavailable(f"`{binary}` not installed")
@@ -226,7 +229,7 @@ def _make_python_probe(
     manifest_dir: Path, script: str, function: str = "probe",
 ) -> Callable[[], tuple[bool, str]]:
     """``kind: python`` — escape hatch. The skill ships a Python file
-    next to ``credentials.yaml`` (or anywhere relative to it); the
+    within the ``credentials.yaml`` directory; the
     framework loads it via ``importlib.util`` and calls ``function()``.
 
     The callable's contract: zero args, returns ``(ok: bool, detail: str)``.
@@ -241,9 +244,12 @@ def _make_python_probe(
     broken script raises in here and surfaces as a failing probe;
     it doesn't crash the registry.
     """
-    script_path = (manifest_dir / script).resolve()
+    manifest_dir = manifest_dir.resolve()
 
     def _probe() -> tuple[bool, str]:
+        script_path = (manifest_dir / script).resolve()
+        if not script_path.is_relative_to(manifest_dir):
+            return (False, "probe script outside manifest directory")
         if not script_path.is_file():
             return _unavailable(f"probe script not found: {script_path}")
         try:
@@ -383,6 +389,7 @@ def _load_manifest(manifest_path: Path) -> list[Probe]:
 # Package-shipped manifest (mimir-core credentials). Sibling to this
 # file so it's always findable regardless of how mimir is installed.
 _PACKAGE_MANIFEST = Path(__file__).parent / "credentials.yaml"
+_PACKAGE_SKILLS_ROOT = Path(__file__).parent / "optional-skills"
 
 
 def _resolve_home(home: Path | None) -> Path | None:
@@ -393,9 +400,11 @@ def _resolve_home(home: Path | None) -> Path | None:
 
 
 def _discover_probes(home: Path | None) -> dict[str, Probe]:
-    """Walk the discovery roots, build a Probe per entry, return the
-    merged registry. Later-discovered names shadow earlier ones — the
-    operator's ``<home>/skills/`` always wins over the bundle."""
+    """Load packaged probes, using home skill names only as install markers.
+
+    Neither home skills root is trusted to supply executable probe code.
+    Later packaged names shadow earlier packaged entries.
+    """
     out: dict[str, Probe] = {}
 
     def _ingest(manifest_path: Path) -> None:
@@ -411,14 +420,14 @@ def _discover_probes(home: Path | None) -> dict[str, Probe]:
 
     _ingest(_PACKAGE_MANIFEST)
 
-    if home is not None:
-        for root_name in (".mimir_builtin_skills", "skills"):
-            root = home / root_name
-            if not root.is_dir():
+    if home is not None and _PACKAGE_SKILLS_ROOT.is_dir():
+        for skill_dir in sorted(_PACKAGE_SKILLS_ROOT.iterdir()):
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
                 continue
-            for skill_dir in sorted(root.iterdir()):
-                if not skill_dir.is_dir() or skill_dir.name.startswith("."):
-                    continue
+            if any(
+                (home / root_name / skill_dir.name).is_dir()
+                for root_name in (".mimir_builtin_skills", "skills")
+            ):
                 _ingest(skill_dir / "credentials.yaml")
 
     return out
