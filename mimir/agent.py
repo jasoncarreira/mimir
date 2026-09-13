@@ -3090,6 +3090,12 @@ class Agent:
         # Result fields drive both terminal events and the TurnRecord, so derive
         # them before finalization and reuse the exact classification.
         result_fields = derive_result_fields(messages, context=ctx)
+        if error is not None:
+            # Partial model messages cannot certify a failed host turn as success.
+            # Preserve specific failures (notably budget exhaustion) for recovery.
+            result_fields["result_is_error"] = True
+            if result_fields["result_subtype"] in (None, "success"):
+                result_fields["result_subtype"] = "error_turn"
         hard_refusals = list(getattr(ctx, "hard_boundary_denials", []) or [])
         remediation_effects = list(getattr(ctx, "remediation_effects", []) or [])
         refusal_is_exempt = bool(hard_refusals and not remediation_effects)
