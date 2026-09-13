@@ -346,7 +346,7 @@ async def test_safe_log_event_writes_when_logger_is_initialized(tmp_path: Path):
     lines = [json.loads(l) for l in path.read_text().strip().splitlines()]
     assert len(lines) == 1
     assert lines[0]["type"] == "test_event"
-    assert lines[0]["key"] == "value"
+    assert lines[0]["key"] == "[REDACTED]"
 
 
 @pytest.mark.asyncio

@@ -13,14 +13,16 @@ from mimir import turn_event_redaction as redaction
 from tests.redaction_corpus import SECRET_TEXT_CORPUS
 
 
-# Frozen pre-#1652 grammar and substitution loop, not the optimized dispatcher.
+# Unoptimized substitution loop; vocabulary expanded for #1685.
 _OLD_CREDENTIAL = re.compile(
-    r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|authorization)['\"]?\s*[:=]\s*)"
+    r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|passwd|authorization|credentials?|private[_-]?key|(?<![A-Za-z0-9_.:-])key(?![A-Za-z0-9_.-]))['\"]?\s*[:=]\s*)"
     r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
 )
 
 
 def _legacy_scrub_text(text: str) -> str:
+    for pattern in redaction.LOG_SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
     for index, pattern in enumerate(redaction._SECRET_PATTERNS):
         if index == 1:
             pattern = _OLD_CREDENTIAL

@@ -5875,7 +5875,9 @@ print('{"poller": "x", "prompt": "ok"}')
         if e.get("type") == "poller_env_passthrough_named_secret"
     ]
     assert len(passthrough_events) == 1
-    assert passthrough_events[0].get("key") == "GITHUB_TOKEN"
+    # Bare "key" is credential-shaped at the durable boundary, even when this
+    # producer puts an environment variable name rather than its value there.
+    assert passthrough_events[0].get("key") == "[REDACTED]"
     # Value must NOT leak into the event payload.
     payload = json.dumps(passthrough_events[0])
     assert "ghp_secret_should_not_appear_in_event" not in payload
@@ -5922,7 +5924,7 @@ print(json.dumps({"poller": "x", "prompt": f"observed: {val}"}))
     assert len(blocked_events) == 1, (
         f"expected one process_control_blocked event; got {len(blocked_events)}"
     )
-    assert blocked_events[0].get("key") == "LD_PRELOAD"
+    assert blocked_events[0].get("key") == "[REDACTED]"
 
     # The poller subprocess ran and emitted an event; the content shows
     # whether LD_PRELOAD made it through. Asserting that the LITERAL
@@ -5950,9 +5952,9 @@ async def test_run_poller_pass_env_process_control_vars_all_blocked(
     """chainlink #229: each var in the hard-deny set must be blocked."""
     monkeypatch.setenv(var_name, "/tmp/should-not-propagate")
     skill_dir = tmp_path / "skill"
-    _install_script(skill_dir, "poller.py", """
+    _install_script(skill_dir, "poller.py", f"""
 import json, os
-print(json.dumps({"poller": "x", "prompt": "ok"}))
+print(json.dumps({{"poller": "x", "prompt": os.environ.get({var_name!r}, "BLOCKED")}}))
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
@@ -5962,11 +5964,12 @@ print(json.dumps({"poller": "x", "prompt": "ok"}))
     enq = _CapturingEnqueue()
     await run_poller(cfg, enqueue=enq)
 
+    assert enq.events[0].content == "BLOCKED"
     events = _read_events(home)
     blocked = [
         e for e in events
         if e.get("type") == "poller_env_process_control_blocked"
-        and e.get("key") == var_name
+        and e.get("key") == "[REDACTED]"
     ]
     assert len(blocked) == 1, (
         f"{var_name} not blocked; events: {[e.get('type') for e in events]}"
@@ -6005,7 +6008,7 @@ print('{"poller": "x", "prompt": "ok"}')
     warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
     assert len(warn_events) == 1
     assert warn_events[0].get("poller") == "x"
-    assert warn_events[0].get("key") == "MY_API_KEY"
+    assert warn_events[0].get("key") == "[REDACTED]"
     # Value must NOT appear in the event payload.
     payload = json.dumps(warn_events[0])
     assert "literal_static_value" not in payload
@@ -6054,7 +6057,7 @@ print('{"poller": "x", "prompt": "ok"}')
     events = _read_events(home)
     warn_events = [e for e in events if e.get("type") == "poller_env_secret_reintroduced"]
     assert len(warn_events) == 1
-    assert warn_events[0].get("key") == "MIMIR_SOME_INTERNAL_KEY"
+    assert warn_events[0].get("key") == "[REDACTED]"
 
 
 @pytest.mark.asyncio
@@ -6098,7 +6101,7 @@ print(json.dumps({
     ]
     assert len(blocked) == 1
     assert blocked[0]["poller"] == "x"
-    assert blocked[0]["key"] == "LD_PRELOAD"
+    assert blocked[0]["key"] == "[REDACTED]"
     # The value must never be logged.
     assert "/tmp/evil.so" not in json.dumps(blocked[0])
 

@@ -7,7 +7,9 @@ from typing import Any
 
 from mimir.shared_redaction_patterns import (
     BARE_PROVIDER_TOKEN_PATTERNS,
+    CREDENTIAL_WORD_PATTERN,
     JWT_PATTERN,
+    LOG_SECRET_PATTERNS,
 )
 
 
@@ -18,27 +20,24 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]+"),
     # key=value, key: value, JSON, and Python dict-repr secret values.
     re.compile(
-        r"(?i)(['\"]?[A-Za-z0-9_.:-]*(?:token|api[_-]?key|secret|password|authorization)['\"]?\s*[:=]\s*)"
+        r"(?i)(['\"]?[A-Za-z0-9_.:-]*" + CREDENTIAL_WORD_PATTERN + r"['\"]?\s*[:=]\s*)"
         r"(?:['\"][^'\"]*['\"]|[^,\s}]+)"
     ),
     # Common provider / GitHub / AWS token prefixes.
     re.compile(r"\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,}|AKIA[0-9A-Z]{16})\b"),
     *BARE_PROVIDER_TOKEN_PATTERNS,
     JWT_PATTERN,
-    # Conservative high-entropy fallback for long unbroken credential-like blobs.
-    re.compile(r"\b(?=[A-Za-z0-9_+/=-]{40,}\b)(?=.*[A-Z])(?=.*[a-z])(?=.*\d)[A-Za-z0-9_+/=-]+\b"),
 )
 _PATH_PATTERN = re.compile(
     r"(?<![\w:])(?:/[^\s,'\"}]+|~/[^\s,'\"}]+|[A-Za-z]:\\[^\s,'\"}]+|"
     r"(?:attachments|scratch|state|memory|mimir|tests|frontend|docs|uploads|tmp|workspace)[/\\][^\s,'\"}]+)"
 )
 _SENSITIVE_KEY_PATTERN = re.compile(
-    r"(?i)(?:token|api[_-]?key|secret|password|authorization)"
+    CREDENTIAL_WORD_PATTERN, re.IGNORECASE
 )
 _CREDENTIAL_KEY_RUN = re.compile(r"(?i)['\"]?[A-Za-z0-9_.:-]+")
 _JWT_SEGMENT = re.compile(r"[A-Za-z0-9_-]+")
 _JWT_START = re.compile(r"\beyJ")
-_ENTROPY_RUN = re.compile(r"\b[A-Za-z0-9_+/=-]+\b")
 MAX_LIVE_STRING_CHARS = 64 * 1024
 
 
@@ -63,28 +62,6 @@ def _sub_jwts(text: str) -> str:
         return text
     parts.append(text[copied_to:])
     return "".join(parts)
-
-
-def _sub_entropy(text: str) -> str:
-    lines = text.split("\n")
-    for index, line in enumerate(lines):
-        # The original .* lookaheads inspect the entire remaining LINE, not
-        # just the blob. Preserve that behavior without rescanning each suffix.
-        reversed_line = line[::-1]
-        last_required = []
-        for alphabet in (r"[A-Z]", r"[a-z]", r"\d"):
-            match = re.search(alphabet, reversed_line)
-            last_required.append(len(line) - 1 - match.start() if match else -1)
-        eligible_through = min(last_required)
-        if eligible_through < 0:
-            continue
-        lines[index] = _ENTROPY_RUN.sub(
-            lambda match: "[redacted]"
-            if match.end() - match.start() >= 40 and match.start() <= eligible_through
-            else match.group(),
-            line,
-        )
-    return "\n".join(lines)
 
 
 def _sub_credentials(text: str, pattern: re.Pattern[str]) -> str:
@@ -149,15 +126,14 @@ def scrub_value(value: Any, *, key: str | None = None) -> Any:
 
 def scrub_text(text: str) -> str:
     redacted = text
+    for pattern in LOG_SECRET_PATTERNS:
+        redacted = pattern.sub("[redacted]", redacted)
     for pattern in _SECRET_PATTERNS:
         if pattern is _SECRET_PATTERNS[1]:
             redacted = _sub_credentials(redacted, pattern)
             continue
         if pattern is JWT_PATTERN:
             redacted = _sub_jwts(redacted)
-            continue
-        if pattern is _SECRET_PATTERNS[-1]:
-            redacted = _sub_entropy(redacted)
             continue
         replacement = r"\1[redacted]" if pattern.groups == 2 else "[redacted]"
         redacted = pattern.sub(replacement, redacted)

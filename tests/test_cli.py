@@ -1502,7 +1502,7 @@ def test_feedback_emit_unknown_type_warns_but_writes(
     assert events_path.exists()
     records = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     assert records[0]["type"] == "totally_custom_event_type"
-    assert records[0]["key"] == "val"
+    assert records[0]["key"] == "[REDACTED]"
 
 
 def test_feedback_emit_json_values_parses_structured_data(
