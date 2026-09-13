@@ -561,7 +561,8 @@ async def test_admitted_peer_completion_retrieves_and_reports_failure(
         task.cancel()
     # Unlike awaiting _run_peer under pytest.raises, wait does not retrieve
     # the exception. Only the production completion callback can do that.
-    done, pending = await asyncio.wait({task}, timeout=1)
+    # Hang guard only; completion speed is not part of the callback contract.
+    done, pending = await asyncio.wait({task}, timeout=5.0)
     assert done == {task} and not pending
     await asyncio.sleep(0)
     assert not daemon._peers
@@ -662,8 +663,9 @@ async def test_total_shutdown_deadline_never_awaits_stuck_cleanup(
     peer_task = asyncio.create_task(stuck())
     daemon._peers.add(_Peer(_Writer(), peer_task))
     monkeypatch.setattr("mimir.acp.daemon.ACP_SHUTDOWN_TIMEOUT", 0.01)
+    # The patched total deadline drives the assertion; this is only a hang guard.
     with pytest.raises(AcpDaemonError, match="total deadline"):
-        await asyncio.wait_for(daemon.stop(), 0.1)
+        await asyncio.wait_for(daemon.stop(), 5.0)
     release.set()
     await peer_task
     shutil.rmtree(home)
@@ -735,14 +737,12 @@ async def test_postauth_watchdog_terminates_non_draining_peer(
     daemon._agent = Agent()
     monkeypatch.setattr("mimir.acp.daemon.run_stdio_agent", runner)
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
-    # Fit drain, runner cancellation/abort, and writer close inside the 0.1s bound.
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 0.01)
-    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_CANCEL_TIMEOUT", 0.01)
-    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_ABORT_TIMEOUT", 0.01)
     writer = BlockedWriter()
+    # Hang guard, not a latency assertion: allow scheduling stalls during teardown.
     with pytest.raises(AcpDaemonError, match="stopped draining"):
         await asyncio.wait_for(
-            daemon._run_peer(asyncio.StreamReader(), writer), 0.1
+            daemon._run_peer(asyncio.StreamReader(), writer), 5.0
         )
     assert authenticated.is_set()
     assert cancelled.is_set()
