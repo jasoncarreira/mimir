@@ -367,8 +367,11 @@ async def run():
 loop.run_until_complete(run())
 loop.close()
 loop.close()
-assert len(sockets) == 2
+assert len(sockets) == 4
 assert all(sock.fileno() == -1 for sock in sockets)
+assert hooks._observer is None or not hooks._observer.is_alive()
+assert hooks._watchdog is None
+assert hooks.signum is None
 assert set_wakeup_fd(-1) == previous_writer.fileno()
 hooks.close()
 assert signal.getsignal(signal.SIGTERM) is previous_handler
@@ -421,7 +424,7 @@ assert loop.close is first._close_loop
 if mode == 'double':
     first.install()
     assert first._wakeup is first_pair
-    assert len(sockets) == 2
+    assert len(sockets) == 4
     first.close()
 elif mode == 'replacement':
     replacement_close = lambda: None
@@ -440,7 +443,7 @@ elif mode == 'replacement':
 else:
     second.install()
     second_pair = second._wakeup
-    assert len(sockets) == 4
+    assert len(sockets) == 8
     if mode == 'lifo':
         second.close()
         assert loop.close is first._close_loop
@@ -787,10 +790,15 @@ raise SystemExit(bootstrap.main([]))
         await _signal_exit_protocol(
             process, progress, signum, repeat, after_armed=_observe_input_wait,
         )
-        assert progress.read_text().splitlines()[:8] == [
+        prefix = progress.read_text().splitlines()[:8]
+        assert prefix[:4] == [
             "child-started", "install-enter", "handlers-installed", "ready",
-            f"signal-enter:{signum}", "watchdog-start-enter",
-            "watchdog-start-returned", "armed",
+        ]
+        # C delivery may arm before Python dispatch. Cleanup still waits for
+        # the single watchdog's start to complete, preserving protocol ordering.
+        assert f"signal-enter:{signum}" in prefix[4:]
+        assert [line for line in prefix[4:] if line != f"signal-enter:{signum}"] == [
+            "watchdog-start-enter", "watchdog-start-returned", "armed",
         ]
         delivered = [signum]
         diagnostics = progress.with_suffix(".diagnostics").read_text()
@@ -1115,7 +1123,10 @@ asyncio.run(run())
             else:
                 assert f"wakeup-byte:{signal.SIGTERM}" in message
                 assert f"signal-enter:{signal.SIGTERM}\n" in message
-                assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in message
+                # The observer can start the watchdog across Python dispatch;
+                # only watchdog-start completion must precede cleanup.
+                without_dispatch = message.replace(f"signal-enter:{signal.SIGTERM}\n", "")
+                assert "watchdog-start-enter\nwatchdog-start-returned\ncleanup-enter\n" in without_dispatch
             if stage == "force-exit":
                 assert "watchdog-fired\nforce-exit-enter\nforce-exit-survived\n" in message
             else:
@@ -1192,13 +1203,138 @@ asyncio.run(run())
             assert f"wakeup-byte:{signal.SIGTERM}" in message
             assert "signal-enter:" not in message
             assert "signal-dispatch:" not in message
-            assert "watchdog-start-enter" not in message
+            assert "watchdog-start-enter" in message
             assert "recv-returned" not in message
             assert process.returncode is None
     finally:
         if process.returncode is None:
             process.kill()
         await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux MSG_WAITALL handshake")
+@pytest.mark.parametrize("journal", [False, True], ids=["production", "journal"])
+@pytest.mark.parametrize("delivery", ["main", "worker", "main-worker", "main-main"])
+async def test_blocked_main_signal_delivery_matrix(
+    delivery: str, journal: bool, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = (_journal_source(progress) if journal else "") + r'''
+import asyncio, ctypes, os, select, signal, socket, sys, threading
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+delivery = sys.argv[1]
+main_ident = threading.get_ident()
+reader, writer = socket.socketpair()
+writer.sendall(b'x')
+cleanup_reader, cleanup_writer = socket.socketpair()
+cleanup_writer.sendall(b'x')
+libc = ctypes.CDLL(None)
+libc.recv.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+libc.recv.restype = ctypes.c_ssize_t
+buffer = ctypes.create_string_buffer(2)
+
+def cleanup():
+    os.write(1, b'cleanup\n')
+    libc.recv(cleanup_reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    raise AssertionError('blocked cleanup returned')
+
+def deliver():
+    # Readability disappears only after main enters the untimed C recv. No
+    # bytecode boundary or event-loop callback can dispatch a worker's signal.
+    while select.select([reader], [], [], 0)[0]:
+        pass
+    os.write(1, b'blocked\n')
+    assert os.read(0, 1) == b'x'
+    target = threading.get_ident() if delivery == 'worker' else main_ident
+    signal.pthread_kill(target, signal.SIGTERM)
+    if '-' in delivery:
+        assert os.read(0, 1) == b'y'
+        # The marker precedes the wait. Prove cleanup is actually blocked
+        # before choosing the second delivery thread, just as for the first.
+        while select.select([cleanup_reader], [], [], 0)[0]:
+            pass
+        target = threading.get_ident() if delivery == 'main-worker' else main_ident
+        signal.pthread_kill(target, signal.SIGINT)
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
+    hooks.install()
+    threading.Thread(target=deliver, daemon=True).start()
+    libc.recv(reader.fileno(), buffer, 2, socket.MSG_WAITALL)
+    raise AssertionError('blocked main returned')
+
+asyncio.run(run())
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source, delivery,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        async with _shutdown_ceiling(process, progress, lambda: "blocked main handshake"):
+            assert await process.stdout.readline() == b"blocked\n"
+        # The real, unchanged five-second watchdog must release this child.
+        async with asyncio.timeout(6):
+            process.stdin.write(b"x")
+            await process.stdin.drain()
+            if delivery != "worker":
+                assert await process.stdout.readline() == b"cleanup\n"
+            if "-" in delivery:
+                process.stdin.write(b"y")
+                await process.stdin.drain()
+            stdout, stderr = await process.communicate()
+        expected = signal.SIGINT if delivery == "main-main" else signal.SIGTERM
+        assert (process.returncode, stdout, stderr) == (128 + expected, b"", b"")
+        if journal:
+            state = progress.read_text()
+            assert state.count("watchdog-start-enter") == 1
+            assert ("watchdog-fired" in state) == (delivery != "main-main")
+            if delivery == "worker":
+                assert "signal-enter:" not in state
+                assert "signal-dispatch:" not in progress.with_suffix(".diagnostics").read_text()
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+def test_wakeup_observer_ignores_non_shutdown_bytes() -> None:
+    import subprocess
+
+    source = r'''
+import asyncio, os
+from types import SimpleNamespace
+from mimir.acp import proxy
+
+async def run():
+    hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
+    forwarded = asyncio.Event()
+    drain = hooks._drain_wakeup
+    def observed():
+        drain()
+        forwarded.set()
+    hooks._drain_wakeup = observed
+    hooks.install()
+    observer = hooks._observer
+    assert observer.is_alive()
+    os.write(hooks._wakeup[1].fileno(), b'\0\xff')
+    await forwarded.wait()
+    assert hooks._watchdog is None
+    assert hooks.signum is None
+    hooks.close()
+    assert not observer.is_alive()
+    assert hooks._watchdog is None
+    assert hooks._observer_sockets is None
+asyncio.run(run())
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, timeout=120,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
 
 
 @pytest.mark.asyncio
