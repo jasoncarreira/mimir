@@ -4436,6 +4436,109 @@ def test_repo_review_shell_result_remains_informational() -> None:
     assert labels.has_untrusted_active_ingest is False
 
 
+@pytest.mark.parametrize("home_configured", [False, True])
+def test_source_repo_read_trust_does_not_consult_ledger(
+    tmp_path, monkeypatch, home_configured,
+):
+    from mimir import access_control
+
+    repo = tmp_path / "mimir"
+    repo.mkdir()
+    target = repo / "acp.md"
+    target.write_text("merged documentation", encoding="utf-8")
+    alias = tmp_path / "source-alias"
+    alias.symlink_to(repo, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(alias))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo}:rw")
+    if home_configured:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+    else:
+        monkeypatch.delenv("MIMIR_HOME", raising=False)
+
+    def forbidden_ledger(*args, **kwargs):
+        pytest.fail("source checkout reads must not consult file integrity metadata")
+
+    monkeypatch.setattr(access_control, "_persisted_file_integrity", forbidden_ledger)
+    for content in ("merged documentation", "locally modified, uncommitted documentation"):
+        # The write gate refuses tainted-turn writes here, so local edits came
+        # from an untainted turn and need no separate file-state proof.
+        target.write_text(content, encoding="utf-8")
+        labels = classify_protected_result(
+            "read_file", {"file_path": str(alias / target.name)}, _auth(),
+            ToolAuthorization(tool_name="read_file", decision="open", allowed=True),
+            result=content,
+        )
+        assert labels is not None
+        assert not labels.has_untrusted_active_ingest
+        assert {(s.integrity, s.integrity_effect) for s in labels.sources} == {
+            ("trusted", "informational"),
+        }
+
+
+@pytest.mark.parametrize("configuration", ["unset", "empty", "missing", "file", "loop"])
+def test_invalid_source_repo_is_not_trust(tmp_path, monkeypatch, configuration):
+    from mimir.access_control import _filesystem_result_integrity
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "document.md"
+    target.write_text("external", encoding="utf-8")
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_SOURCE_REPO", raising=False)
+    if configuration != "unset":
+        monkeypatch.setenv("MIMIR_SOURCE_REPO", {
+            "empty": "", "missing": str(tmp_path / "missing"),
+            "file": str(target), "loop": str(loop),
+        }[configuration])
+    assert _filesystem_result_integrity(_auth(), str(target)) == (
+        "untrusted", "active_ingest",
+    )
+
+
+@pytest.mark.parametrize("location", [
+    "mimir-sibling/doc.md", "pr-leases/doc.md", "benchmark/doc.md",
+    "home/attachments/fetch-cache/body", "home/state/pollers/event",
+    "home/skills/dropped/SKILL.md", "home/memory/note.md",
+])
+def test_source_repo_does_not_change_other_roots(tmp_path, monkeypatch, location):
+    from mimir.access_control import _filesystem_result_integrity
+
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = tmp_path / "mimir"
+    repo.mkdir()
+    target = tmp_path / location
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("outside checkout", encoding="utf-8")
+    escape = repo / "escape"
+    escape.symlink_to(target)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    roots = [repo]
+    if not target.is_relative_to(home):
+        roots.append(target.parent)
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", ",".join(f"{root}:rw" for root in roots))
+    monkeypatch.delenv("MIMIR_SOURCE_REPO", raising=False)
+    baseline = _filesystem_result_integrity(_auth(), str(target))
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(repo))
+    assert _filesystem_result_integrity(_auth(), str(target)) == baseline
+    assert _filesystem_result_integrity(_auth(), str(escape)) == baseline
+    if "memory" not in location:
+        assert baseline == ("untrusted", "active_ingest")
+
+
+def test_source_repo_unresolved_resource_is_not_trust(tmp_path, monkeypatch):
+    from mimir.access_control import _filesystem_result_integrity
+
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(tmp_path))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert _filesystem_result_integrity(_auth(), str(tmp_path / "missing")) == (
+        "untrusted", "active_ingest",
+    )
+
+
 @pytest.mark.parametrize("root", sorted(_SELF_AUTHORED_FILE_ROOTS - {"skills"}))
 def test_operator_seeded_file_without_provenance_is_trusted_informational(
     tmp_path: Path,
