@@ -11984,7 +11984,7 @@ def test_operator_binding_genuine_match_and_sink_is_shell_only(
     ("command", "allowed", "reason"),
     [
         ("chainlink issue show 1337 --json", True, None),
-        ("pwd", False, "ifc_label_blocked:shell_process"),
+        ("pwd", True, None),
         (
             "chainlink issue close 1337",
             False,

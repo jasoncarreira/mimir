@@ -3836,9 +3836,13 @@ async def test_middleware_preparation_plumbing_activates_only_bound_execution(
     else:
         result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
 
-    assert result.status == "error"
-    assert "ifc_label_blocked:shell_process" in str(result.content)
-    assert handler_calls == 0
+    if preparation_kind == "bound":
+        assert result.status != "error"
+        assert handler_calls == 1
+    else:
+        assert result.status == "error"
+        assert "ifc_label_blocked:shell_process" in str(result.content)
+        assert handler_calls == 0
     assert order[:4] == [
         "validation", "standing_review", "preparation", "authorization",
     ]
@@ -4634,7 +4638,7 @@ async def test_operator_binding_is_authorization_and_execution_artifact(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
-async def test_tainted_operator_bound_command_executes_only_in_shadow_mode(
+async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
     middleware_path: str,
     enforcement_enabled: bool,
     tmp_path: Path,
@@ -4691,11 +4695,6 @@ async def test_tainted_operator_bound_command_executes_only_in_shadow_mode(
         result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
 
     expected = [str(maintenance_pinned_executables["pwd"]), "-P"]
-    if enforcement_enabled:
-        assert result.status == "error"
-        assert "ifc_label_blocked:shell_process" in str(result.content)
-        assert executions == []
-        return
     assert result.status != "error"
     assert len(executions) == 1
     argv, kwargs = executions[0]
@@ -5187,6 +5186,58 @@ async def test_operator_binding_mismatch_and_reuse_never_falls_back(
     assert calls == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+async def test_two_consecutive_shell_calls_do_not_self_taint(
+    middleware_path: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "operator-root"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    auth = _arm2_operator_auth(InformationFlowState(), enforcement_enabled=True)
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        return ToolMessage(content="ordinary output", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return handler(request)
+
+    for index in range(2):
+        request = _make_request(
+            tool_name, f"shell-{index}", auth,
+            {"command": "printf ordinary", "cwd": str(root)},
+        )
+        result = (
+            middleware.wrap_tool_call(request, handler)
+            if middleware_path == "sync"
+            else await middleware.awrap_tool_call(request, async_handler)
+        )
+        assert result.status != "error", result.content
+        assert not auth.ifc_state.has_untrusted_active_ingest(auth.ifc_labels)
+    assert calls == ["shell-0", "shell-1"]
+    if tool_name == "shell_exec":
+        shell_sources = [
+            source for source in auth.ifc_state.current(auth.ifc_labels).sources
+            if source.domain == "shell"
+        ]
+        assert shell_sources
+        assert all(
+            (source.integrity, source.integrity_effect) == ("untrusted", "informational")
+            for source in shell_sources
+        )
+
+
 @pytest.mark.parametrize("bounded_count", [1, 5], ids=["bounded-after-unbounded", "many-bounded"])
 def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
     bounded_count: int,
@@ -5231,6 +5282,19 @@ def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
         ),
         handler,
     )
+    # Shell output is now informational. Introduce genuine external ingest to
+    # retain this test's original bounded-iteration/unbounded-refusal contract.
+    auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="external-after-first-command",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
     bounded = [
         middleware.wrap_tool_call(
             _make_request(
@@ -5251,12 +5315,11 @@ def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
 
     current = auth.ifc_state.current(auth.ifc_labels)
     assert first.status != "error"
-    assert all(result.status == "error" for result in bounded)
-    assert all("ifc_label_blocked:shell_process" in str(result.content) for result in bounded)
+    assert all(result.status != "error" for result in bounded)
     assert current.has_untrusted_active_ingest is True
     assert final.status == "error"
     assert "ifc_label_blocked:shell_process" in str(final.content)
-    assert calls == ["initial-unbounded"]
+    assert calls == ["initial-unbounded", *(f"bounded-{index}" for index in range(bounded_count))]
 
 
 @pytest.mark.asyncio

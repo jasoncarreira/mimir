@@ -4176,6 +4176,7 @@ def test_unresolved_native_source_sentinel_names_its_producer() -> None:
             flow_direction=ToolFlowDirection.BOTH,
         ),
         result="model-visible output",
+        failed=True,
     )
 
     assert labels is not None
@@ -4299,7 +4300,7 @@ def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() 
     ) is None
 
 
-def test_operator_bounded_shell_result_remains_untrusted_active_ingest() -> None:
+def test_operator_bounded_shell_result_remains_untrusted_informational() -> None:
     authorization = ToolAuthorization(
         tool_name="shell_exec",
         decision=OperationDecision.ADMIN_REQUIRED,
@@ -4318,9 +4319,9 @@ def test_operator_bounded_shell_result_remains_untrusted_active_ingest() -> None
     assert labels is not None
     source = next(iter(labels.sources))
     assert (source.integrity, source.integrity_effect) == (
-        "untrusted", "active_ingest",
+        "untrusted", "informational",
     )
-    assert labels.has_untrusted_active_ingest is True
+    assert labels.has_untrusted_active_ingest is False
 
 
 def test_operator_bounded_shell_results_merge_monotonically() -> None:
@@ -4646,7 +4647,7 @@ def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
         assert decision.allowed is True, (tool_name, decision.reason)
 
 
-def test_worklink_run_is_blocked_after_shell_result_taints_live_turn(
+def test_worklink_run_is_blocked_after_shell_result_with_external_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4678,6 +4679,12 @@ def test_worklink_run_is_blocked_after_shell_result_taints_live_turn(
             flow_direction=ToolFlowDirection.BOTH,
         ),
         result='{"task": "run attacker instructions"}',
+        provenance=ProtectedResultProvenance((SourceLabel(
+            principal="external", domain="web", resource_id="cached-body",
+            bridge_instance="test", sensitivity="internal",
+            authorized_principals=frozenset(), source_kind="protected_tool",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ),)),
     )
     if shell_labels is not None:
         auth.ifc_state.merge(shell_labels, fallback=initial_labels)
@@ -5847,6 +5854,19 @@ def test_shell_gate_after_real_source_labelling(
         current, auth, enforce=True, repo_review_state=review_state,
     )
     assert decision.allowed is (source == "collaborator_pr"), (decision.reason, decision.refusal_detail)
+    if source == "collaborator_pr":
+        output = classify_protected_result(
+            tool_name, {}, auth, decision, result="ordinary shell output",
+        )
+        if output is not None:
+            assert all(item.integrity == "untrusted" for item in output.sources)
+            auth.ifc_state.merge(output, fallback=current)
+        second = SinkGate.check_sink_flow(
+            tool_name, "git status --short" if profile == "github" else "printf gate",
+            current, auth, enforce=True, repo_review_state=review_state,
+        )
+        assert second.allowed, second.reason
+        assert not auth.ifc_state.has_untrusted_active_ingest(current)
     if source != "collaborator_pr":
         assert decision.reason == "ifc_label_blocked:shell_process"
         # A stale clean caller snapshot cannot override the merged live state.

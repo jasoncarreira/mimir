@@ -6231,34 +6231,6 @@ class SinkGate:
             auth_context, ifc_labels,
             missing_is_tainted=tool_name in {"shell_exec", "bash_async"},
         )
-        # Shell is an executable sink even when argv is tightly scoped. The
-        # profile bounds capability; IFC independently prevents untrusted
-        # content from exercising that capability on the same turn.
-        if tool_name in {"shell_exec", "bash_async"} and has_untrusted_active_ingest:
-            chainlink_argv = _chainlink_target_argv(target)
-            mutation = (
-                chainlink_argv is not None
-                and _chainlink_command_is_mutation(chainlink_argv)
-            )
-            # Bounded tracker queries remain available, subject to the ordinary
-            # capability and destination checks below, never tracker mutations.
-            if chainlink_argv is None or mutation:
-                return ToolAuthorization(
-                    tool_name=tool_name,
-                    decision=OperationDecision.ADMIN_REQUIRED,
-                    allowed=not enforce,
-                    reason=(
-                        "chainlink_mutation_blocked_by_untrusted_ingest"
-                        if mutation else "ifc_label_blocked:shell_process"
-                    ),
-                    service_principal=service,
-                    required_tier=AccessTier.ADMIN,
-                    enforcement_enabled=enforce,
-                    is_shadow_decision=not enforce,
-                    would_block=True,
-                    resolved_sink_target=resolved_target,
-                    refusal_detail=_CHAINLINK_TAINT_REFUSAL if mutation else None,
-                )
         client_authorized = False
         if client_authorized_host_execution is not None:
             from .tools.client_provider import client_authorized_host_execution_matches
@@ -6298,6 +6270,37 @@ class SinkGate:
                 resolved_sink_target=resolved_target,
                 refusal_detail=_CHAINLINK_TAINT_REFUSAL,
             )
+        # Shell remains an executable sink for every principal. Preserve only
+        # the existing request-bound operator/client allowances and bounded
+        # tracker queries; these still pass capability/destination checks below.
+        # Neither an admin role nor declassification bypasses this veto.
+        if tool_name in {"shell_exec", "bash_async"} and has_untrusted_active_ingest:
+            chainlink_argv = _chainlink_target_argv(target)
+            mutation = (
+                chainlink_argv is not None
+                and _chainlink_command_is_mutation(chainlink_argv)
+            )
+            bounded_execution = client_authorized or (
+                operator_binding_matches
+                and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            )
+            if mutation or (chainlink_argv is None and not bounded_execution):
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=(
+                        "chainlink_mutation_blocked_by_untrusted_ingest"
+                        if mutation else "ifc_label_blocked:shell_process"
+                    ),
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=_CHAINLINK_TAINT_REFUSAL if mutation else None,
+                )
         if (
             is_application_egress
             and egress_target_requires_taint_gate
@@ -10291,20 +10294,32 @@ def classify_protected_result(
         return labels
 
     if (
-        tool_name in {"shell_exec", "bash_async"}
-        and getattr(auth_context, "repo_review_state", None) is not None
+        (
+            tool_name == "shell_exec"
+            or (
+                tool_name == "bash_async"
+                and getattr(auth_context, "repo_review_state", None) is not None
+            )
+        )
+        and authorization.allowed
+        and provenance is None
         and not failed
     ):
-        # A review turn necessarily needs several shell steps. Preserve the
-        # output's untrusted integrity without treating each authorized command
-        # as a new active external ingest that would deadlock the next step.
+        # Ordinary authorized shell output is untrusted information, not a new
+        # external ingest that deadlocks the next shell step. Explicit source
+        # provenance and failures retain their conservative classification below;
+        # merging these labels never clears earlier external active ingest.
         principal = getattr(auth_context, "canonical_principal", None)
-        if principal:
+        if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
         labels = InformationFlowLabels().with_source(SourceLabel(
             principal=principal,
             domain="shell",
-            resource_id="repo_review",
+            resource_id=(
+                "repo_review"
+                if getattr(auth_context, "repo_review_state", None) is not None
+                else tool_name
+            ),
             bridge_instance=getattr(auth_context, "bridge_instance", None),
             sensitivity="internal",
             authorized_principals=(
