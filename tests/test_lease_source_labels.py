@@ -131,7 +131,8 @@ def _auth(
 @pytest.mark.parametrize(
     ("verdict", "mismatch"),
     [(True, None), (False, None), (None, None),
-     (True, "number"), (True, "head_sha"), (True, "author")],
+     (True, "number"), (True, "head_sha"), (True, "author"),
+     (True, "missing_author"), (True, "no_attestation")],
 )
 def test_checkout_records_native_author_trust_for_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -142,7 +143,8 @@ def test_checkout_records_native_author_trust_for_file_reads(
     from mimir.forge import PullRequestProjection
     from mimir.tools import forge, repo
 
-    scope = _scope(author="collaborator")
+    author = "" if mismatch == "missing_author" else "collaborator"
+    scope = _scope(author=author)
     auth = _auth(scope=scope, recorded_verdict=mismatch is not None)
     runtime = SimpleNamespace(context=auth)
     lease_root = tmp_path / "leases"
@@ -156,10 +158,10 @@ def test_checkout_records_native_author_trust_for_file_reads(
     monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *args: (state, None))
     monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
     metadata = PullRequestProjection(
-        7, "Title", "open", "collaborator", False, "main", "change",
+        7, "Title", "open", author, False, "main", "change",
         "a" * 40, True, "created", "updated",
     )
-    if mismatch is not None:
+    if mismatch in {"number", "head_sha", "author"}:
         metadata = replace(metadata, **{
             mismatch: {"number": 8, "head_sha": "c" * 40, "author": "other"}[mismatch],
         })
@@ -177,6 +179,8 @@ def test_checkout_records_native_author_trust_for_file_reads(
         get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
         author_is_trusted=attest,
     )
+    if mismatch == "no_attestation":
+        client.author_is_trusted = None
     monkeypatch.setattr(forge, "_client", lambda scope: client)
     result = repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
     assert result["status"] == "checked_out"
