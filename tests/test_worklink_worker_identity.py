@@ -196,8 +196,98 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
     assert "MIMIR_FILE_TOOL_ROOTS=" in runs
 
     # MIMIR_FILE_TOOL_ROOTS must be set to a real value, not left empty.
-    env = job["steps"][-1].get("env") or {}
+    env = next(
+        step for step in job["steps"]
+        if step.get("name") == "Run mimir test suite as the non-owning worker uid"
+    ).get("env") or {}
     assert env.get("MIMIR_FILE_TOOL_ROOTS")
+
+
+def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
+    """Evidence retention must not move fixtures into controller-owned ancestry."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    assert "PYTEST_EVIDENCE_ROOT" not in workflow["env"]
+    root = workflow["env"]["PYTEST_EVIDENCE_DIR_NAME"]
+    assert root.startswith("mimir-pytest-evidence-")
+    assert "${{ github.run_id }}" in root
+    assert "${{ github.run_attempt }}" in root
+    evidence_jobs = 0
+    for job in workflow["jobs"].values():
+        steps = job["steps"]
+        uploads = [step for step in steps if step.get("name") == "Upload pytest evidence"]
+        if not uploads:
+            continue
+        evidence_jobs += 1
+        runs = "\n".join(step.get("run", "") for step in steps)
+        assert '--basetemp "$PYTEST_EVIDENCE_ROOT/' in runs
+        assert "$RUNNER_TEMP/pytest-evidence" not in runs
+        assert 'echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"' in runs
+        prepare = next(
+            (step for step in steps if step.get("name") == "Prepare pytest evidence directory"),
+            None,
+        )
+        if prepare is not None:
+            script = prepare["run"]
+            assert 'evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"' in script
+            assert 'chgrp "$(id -g)" "$evidence_root"' in script
+            assert 'chmod 700 "$evidence_root"' in script
+            assert 'evidence_root="$(cd "$evidence_root" && pwd -P)"' in script
+            assert script.index("chgrp") < script.index("chmod") < script.index("pwd -P")
+            assert steps.index(prepare) < next(
+                i for i, step in enumerate(steps) if "--basetemp" in step.get("run", "")
+            )
+        for upload in uploads:
+            assert upload["if"] == "failure()"
+            paths = upload["with"]["path"].splitlines()
+            assert paths
+            assert all(path.startswith("${{ env.PYTEST_EVIDENCE_ROOT }}/") for path in paths)
+    assert evidence_jobs == 7
+    worker_runs = "\n".join(step.get("run", "") for step in _worker_uid_job()["steps"])
+    assert 'sudo install -d -m 700 -o worklink -g worklink "$evidence_root"' in worker_runs
+    assert 'evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"' in worker_runs
+    assert 'sudo chmod o+x "$RUNNER_TEMP"' not in worker_runs
+
+
+def test_ci_evidence_prepare_exports_physical_private_member_group_root(tmp_path) -> None:
+    """Execute the actual prepare script with both real and symlinked temp roots."""
+    import os
+    import stat
+    import subprocess
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    for job_name in ("pytest", "pytest-macos"):
+        script = next(
+            step["run"] for step in workflow["jobs"][job_name]["steps"]
+            if step.get("name") == "Prepare pytest evidence directory"
+        )
+        for temp_root in (physical, alias):
+            name = f"mimir-pytest-evidence-{job_name}-{temp_root.name}"
+            env_file = tmp_path / f"env-{name}"
+            env_file.touch()
+            subprocess.run(
+                ["bash", "-c", script.replace('"/tmp/', f'"{temp_root}/')],
+                env={**os.environ, "PYTEST_EVIDENCE_DIR_NAME": name, "GITHUB_ENV": str(env_file)},
+                check=True, capture_output=True, text=True,
+            )
+            exported = env_file.read_text().strip().removeprefix("PYTEST_EVIDENCE_ROOT=")
+            root = physical / name
+            assert exported == str(root.resolve())
+            assert root.stat().st_uid == os.getuid()
+            assert root.stat().st_gid == os.getgid()
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
+            assert (root / "optional-skills").is_dir()
+            boundary = root / "boundary"
+            boundary.mkdir()
+            boundary.chmod(0o2700)
+            assert stat.S_IMODE(boundary.stat().st_mode) == 0o2700
 
 
 def test_ci_frontend_caches_root_dependencies_and_bounds_build() -> None:

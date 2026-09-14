@@ -46,8 +46,20 @@ def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]
     monkeypatch.setattr(contained_checkout, "OPENCODE_CHECKOUT_ROOT", opencode)
     monkeypatch.setattr(checkout, "_REPO_TEST_CHECKOUT_ROOT", repo_test)
     monkeypatch.setattr(checkout, "_OPENCODE_CHECKOUT_ROOT", opencode)
-    monkeypatch.setattr(contained_checkout.os, "chown", lambda *args, **kwargs: None)
-    monkeypatch.setattr(contained_checkout.os, "fchown", lambda *args, **kwargs: None)
+    # Map production ownership to the test user's real group instead of
+    # making chown a no-op. On macOS, /tmp descendants may inherit a group
+    # the user does not belong to; chmod then silently drops S_ISGID.
+    real_chown = os.chown
+    real_fchown = os.fchown
+    test_gid = os.getgid()
+    monkeypatch.setattr(
+        contained_checkout.os, "chown",
+        lambda path, uid, gid, **kwargs: real_chown(path, -1, test_gid, **kwargs),
+    )
+    monkeypatch.setattr(
+        contained_checkout.os, "fchown",
+        lambda fd, uid, gid: real_fchown(fd, -1, test_gid),
+    )
     return repo_test, opencode
 
 
@@ -264,6 +276,10 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     (source / "tracked.txt").write_text("working view\n")
     source_before = _tree_signature(source)
     mutations: list[tuple[str, tuple[int, int], tuple[int, int] | int]] = []
+    # Preserve _roots' real-group mapping beneath the recording spies. A
+    # no-op chown can leave an inherited macOS group that strips S_ISGID.
+    mapped_chown = os.chown
+    mapped_fchown = os.fchown
     real_chmod = os.chmod
     real_fchmod = os.fchmod
     real_stat = os.stat
@@ -277,6 +293,7 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     ) -> None:
         observed = real_stat(path, **kwargs)
         mutations.append(("chown", (observed.st_dev, observed.st_ino), (uid, gid)))
+        mapped_chown(path, uid, gid, **kwargs)
 
     def chmod(
         path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
@@ -290,6 +307,7 @@ def test_checkout_provisioning_mutates_only_its_admitted_root(
     def fchown(fd: int, uid: int, gid: int) -> None:
         observed = real_fstat(fd)
         mutations.append(("fchown", (observed.st_dev, observed.st_ino), (uid, gid)))
+        mapped_fchown(fd, uid, gid)
 
     def fchmod(fd: int, mode: int) -> None:
         observed = real_fstat(fd)
