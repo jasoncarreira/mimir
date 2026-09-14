@@ -682,7 +682,6 @@ def test_service_builtin_read_is_informational_but_write_is_denied(tmp_path, mon
     from mimir.skill_defs import refresh_builtin_skills
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    assert access_control.initialize_file_integrity_ledger(tmp_path)
     refresh_builtin_skills(tmp_path)
     target = tmp_path / ".mimir_builtin_skills/chainlink/SKILL.md"
     service = get_service_principal("scheduled_tick")

@@ -153,8 +153,8 @@ def _report_non_utf8(path: Path, bad_byte: int, position: int) -> None:
 
 
 def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
-    """Consult the ledger using the canonical home-relative file key."""
-    from .access_control import _persisted_file_integrity
+    """Admit existing canonical HOME files with trusted reference integrity."""
+    from .access_control import _home_reference_integrity
 
     try:
         home = home.resolve(strict=True)
@@ -164,8 +164,7 @@ def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
             "prompt_file_integrity_omitted path=%s reason=invalid_or_outside_home", path,
         )
         return False
-    if _persisted_file_integrity(home, relative) != "trusted":
-        # Report the omission, never the rejected contents or ledger payload.
+    if _home_reference_integrity(home, relative) != "trusted":
         log.warning(
             "prompt_file_integrity_omitted path=%s reason=untrusted", path,
         )

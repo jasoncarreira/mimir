@@ -1830,16 +1830,15 @@ async def test_soft_warning_fires_once_per_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("call_path", ["sync", "async"])
-async def test_file_write_refuses_when_integrity_cannot_be_recorded(
+async def test_authorized_file_write_ignores_legacy_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     call_path: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    monkeypatch.setattr(
-        "mimir.access_control.record_file_write_integrity",
-        lambda _target, _labels: False,
-    )
+    metadata = tmp_path / ".mimir/file-integrity.json"
+    metadata.parent.mkdir()
+    metadata.write_text("{broken")
     auth = _untainted_ifc_auth()
     turn = _ifc_turn(auth)
     handler_calls = 0
@@ -1853,7 +1852,7 @@ async def test_file_write_refuses_when_integrity_cannot_be_recorded(
         return sync_handler(request)
 
     request = _make_request(
-        "write_file", "integrity-refusal", auth,
+        "write_file", "authorized-write", auth,
         {"file_path": str(tmp_path / "memory" / "notes.md"), "content": "x"},
     )
     token = set_current_turn(turn)
@@ -1867,11 +1866,10 @@ async def test_file_write_refuses_when_integrity_cannot_be_recorded(
     finally:
         reset_current_turn(token)
 
-    assert result.status == "error"
-    assert result.content == (
-        "file write refused: integrity metadata could not be persisted"
-    )
-    assert handler_calls == 0
+    assert result.status == "success"
+    assert result.content == "ran"
+    assert handler_calls == 1
+    assert metadata.read_text() == "{broken"
 
 
 @pytest.mark.asyncio

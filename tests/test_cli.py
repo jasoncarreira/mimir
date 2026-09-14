@@ -19,13 +19,10 @@ def _clear_ambient_model_spec(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("preexisting", [False, True])
-def test_setup_records_only_new_scaffold_files(tmp_path, monkeypatch, preexisting):
-    from mimir import access_control
-
+def test_setup_preserves_existing_scaffold_files(tmp_path, monkeypatch, preexisting):
     home = tmp_path / "home"
     monkeypatch.setenv("MIMIR_GIT_TRACKING_ENABLED", "false")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "other-home"))
-    assert access_control.initialize_file_integrity_ledger(home)
     paths = (
         "state/wiki/AGENTS.md", "state/wiki/index.md", "state/wiki/log.md",
         "state/identities.yaml", "state/heartbeat-backlog.md",
@@ -41,15 +38,12 @@ def test_setup_records_only_new_scaffold_files(tmp_path, monkeypatch, preexistin
 
     for rel in paths:
         assert (rel in status["files_created"]) is not preexisting
-        assert access_control._persisted_file_integrity(
-            home, Path(rel), require_recorded=True,
-        ) == ("untrusted" if preexisting else "trusted")
+        assert (home / rel).is_file()
         if preexisting:
             assert (home / rel).read_text() == "custom content\n"
-    for rel in (*unrelated, ".env", "saga.toml"):
-        assert access_control._persisted_file_integrity(
-            home, Path(rel), require_recorded=True,
-        ) == "untrusted"
+    for rel in unrelated:
+        assert (home / rel).read_text() == "custom content\n"
+    assert not (home / ".mimir/file-integrity.json").exists()
 
 
 def test_setup_creates_home_layout(tmp_path: Path):

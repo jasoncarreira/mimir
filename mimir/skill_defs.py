@@ -255,31 +255,6 @@ def migrate_legacy_skills_dir(home: Path) -> dict[str, str]:
     return out
 
 
-def migrate_builtin_skill_integrity(home: Path) -> int:
-    """Back-fill only installed files whose bytes match the current package."""
-    from .access_control import record_framework_file_integrity
-
-    files: dict[Path, bytes] = {}
-    root = home_builtin_skills_dir(home)
-    for name in _bundled_skill_names():
-        src = _BUNDLED_ROOT / name
-        reject_escaping_symlinks(src)
-        for source in src.rglob("*"):
-            if not source.is_file():
-                continue
-            destination = root / name / source.relative_to(src)
-            content = source.read_bytes()
-            if (
-                destination.is_file()
-                and destination.resolve().is_relative_to((root / name).absolute())
-                and destination.read_bytes() == content
-            ):
-                files[destination] = content
-    count = record_framework_file_integrity(home, files, lambda: None, prune_builtin=True)
-    log.info("builtin_skill_integrity_migration recorded=%d", count)
-    return count
-
-
 def refresh_builtin_skills(home: Path) -> dict[str, str]:
     """Sync bundled skills from ``mimir/skills/`` (the package) to
     ``<home>/.mimir_builtin_skills/`` (the operator's home, read-only
@@ -297,9 +272,8 @@ def refresh_builtin_skills(home: Path) -> dict[str, str]:
     """
     target_root = home_builtin_skills_dir(home)
     target_root.mkdir(parents=True, exist_ok=True)
-    from .access_control import record_framework_file_integrity
+    from .access_control import publish_framework_files
 
-    migrate_builtin_skill_integrity(home)
     out: dict[str, str] = {}
     for name in _bundled_skill_names():
         src = _BUNDLED_ROOT / name
@@ -330,7 +304,7 @@ def refresh_builtin_skills(home: Path) -> dict[str, str]:
                 else:
                     tmp.rename(dst)
 
-            record_framework_file_integrity(home, files, publish, prune_builtin=True)
+            publish_framework_files(home, files, publish)
             out[name] = "refreshed"
         except (OSError, ValueError) as exc:
             log.warning(

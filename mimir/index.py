@@ -375,7 +375,7 @@ class IndexGenerator:
         self._write_generated_file(path, body)
 
     def _write_generated_file(self, path: Path, body: str) -> None:
-        from .access_control import record_framework_file_integrity
+        from .access_control import publish_framework_files
 
         content = body.encode("utf-8")
 
@@ -387,7 +387,7 @@ class IndexGenerator:
                 stream.write(content)
             tmp.replace(path)
 
-        record_framework_file_integrity(self._home, {path: content}, publish)
+        publish_framework_files(self._home, {path: content}, publish)
 
     def read_memory_index(self) -> str:
         """Return a trusted index; regenerate from filtered sources if unusable."""

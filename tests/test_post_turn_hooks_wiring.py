@@ -194,20 +194,16 @@ async def test_wiki_backlinks_swallow_exceptions(
 
 
 @pytest.mark.asyncio
-async def test_post_turn_indexes_have_recorded_integrity(
+async def test_post_turn_indexes_ignore_legacy_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir.access_control import (
-        _filesystem_result_integrity,
-        initialize_file_integrity_ledger,
-    )
+    from mimir.access_control import _filesystem_result_integrity
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     agent = _make_agent(tmp_path)
-    assert initialize_file_integrity_ledger(tmp_path)
     metadata = tmp_path / ".mimir/file-integrity.json"
-    # A deterministic migration boundary avoids filesystem clock granularity.
+    metadata.parent.mkdir(exist_ok=True)
     metadata.write_text(json.dumps({
         "__ledger_epoch_ns__": 1,
         "memory/tainted.md": "untrusted",
@@ -220,24 +216,21 @@ async def test_post_turn_indexes_have_recorded_integrity(
 
     for _ in range(2):
         await agent._post_turn_index_rebuild()
-        payload = json.loads(metadata.read_text())
         for relative in (
             "memory/INDEX.md", "memory/skills-catalog.md",
             "state/INDEX.md", "state/wiki/index.md",
         ):
             path = tmp_path / relative
             assert path.is_file()
-            assert payload[relative] == "trusted"
             assert _filesystem_result_integrity(None, str(path)) == (
                 "trusted", "informational",
             )
-        assert "memory/unrecorded.md" not in payload
         assert _filesystem_result_integrity(None, str(unrecorded)) == (
-            "untrusted", "active_ingest",
+            "trusted", "informational",
         )
-        assert payload["memory/tainted.md"] == "untrusted"
+        assert json.loads(metadata.read_text())["memory/tainted.md"] == "untrusted"
         assert _filesystem_result_integrity(None, str(tainted)) == (
-            "untrusted", "active_ingest",
+            "trusted", "informational",
         )
 
 

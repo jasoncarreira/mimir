@@ -2,19 +2,16 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from mimir import access_control, prompt_templates
 
 
-def test_seed_prompts_records_only_new_templates(tmp_path, monkeypatch):
+def test_seed_prompts_preserves_existing_templates(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "other-home"))
-    assert access_control.initialize_file_integrity_ledger(home)
     existing = home / "prompts" / "heartbeat.md"
-    existing.parent.mkdir()
+    existing.parent.mkdir(parents=True)
     existing.write_text("operator content\n")
 
     statuses = prompt_templates.seed_prompts(home)
@@ -22,12 +19,9 @@ def test_seed_prompts_records_only_new_templates(tmp_path, monkeypatch):
     assert statuses[existing.name] == "present"
     assert existing.read_text() == "operator content\n"
     for name, status in statuses.items():
-        expected = "untrusted" if status == "present" else "trusted"
-        assert access_control._persisted_file_integrity(
-            home, Path("prompts") / name, require_recorded=True,
-        ) == expected
         if status == "created":
             assert (home / "prompts" / name).read_text() == prompt_templates.bundled_defaults()[name]
+    assert not (home / ".mimir/file-integrity.json").exists()
 
 
 @pytest.mark.parametrize("error", [OSError, ValueError])

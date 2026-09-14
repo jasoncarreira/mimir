@@ -3218,29 +3218,20 @@ async def test_run_turn_persists_computed_operator_integrity(tmp_path: Path):
     assert _initialize_ifc_labels(event, resolver=resolver) == computed_labels
 
 
-@pytest.mark.parametrize("trusted", [True, False])
-async def test_run_turn_prompt_omits_ledger_untrusted_channel_memory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted: bool,
+@pytest.mark.parametrize("contained", [True, False])
+async def test_run_turn_prompt_admits_only_contained_channel_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, contained: bool,
 ):
-    from mimir.access_control import (
-        _persisted_file_integrity,
-        initialize_file_integrity_ledger,
-        record_file_write_integrity,
-    )
-
     home = tmp_path / "home"
     relative = Path("memory/channels/discord-123/notes.md")
     note = home / relative
     note.parent.mkdir(parents=True)
     note.write_text("CHANNEL_MEMORY_PAYLOAD", encoding="utf-8")
-    assert initialize_file_integrity_ledger(home)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    assert record_file_write_integrity(
-        str(note), InformationFlowLabels() if trusted else None,
-    )
-    assert _persisted_file_integrity(home, relative) == (
-        "trusted" if trusted else "untrusted"
-    )
+    if not contained:
+        outside = tmp_path / "outside.md"
+        note.rename(outside)
+        note.symlink_to(outside)
 
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent)
@@ -3260,7 +3251,7 @@ async def test_run_turn_prompt_omits_ledger_untrusted_channel_memory(
     [invocation] = fake_agent.invocations
     prompt = invocation["state"]["messages"][0].content
     assert "PROMPT_REQUEST_CONTROL" in prompt
-    assert ("CHANNEL_MEMORY_PAYLOAD" in prompt) is trusted
+    assert ("CHANNEL_MEMORY_PAYLOAD" in prompt) is contained
 
 
 async def test_run_turn_does_not_trust_event_supplied_integrity(tmp_path: Path):

@@ -139,14 +139,13 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_install_records_post_epoch_skill_as_trusted_informational(
+def test_install_records_skill_as_trusted_informational(
     fake_optional_root: Path,
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(fake_home))
-    assert access_control.initialize_file_integrity_ledger(fake_home) is True
     dest = fake_home / "skills" / "fake-skill"
     if existing:
         dest.mkdir(parents=True)
@@ -174,20 +173,14 @@ def test_install_records_post_epoch_skill_as_trusted_informational(
     )
 
 
-@pytest.mark.parametrize("created_before_epoch", [False, True])
 def test_unrecorded_skill_file_remains_untrusted(
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
-    created_before_epoch: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(fake_home))
     dropped = fake_home / "skills" / "poller-drop" / "SKILL.md"
     dropped.parent.mkdir(parents=True)
-    if created_before_epoch:
-        dropped.write_text("hostile instructions", encoding="utf-8")
-    assert access_control.initialize_file_integrity_ledger(fake_home) is True
-    if not created_before_epoch:
-        dropped.write_text("hostile instructions", encoding="utf-8")
+    dropped.write_text("hostile instructions", encoding="utf-8")
 
     assert access_control._filesystem_result_integrity(None, str(dropped)) == (
         "untrusted", "active_ingest",
@@ -204,7 +197,9 @@ def test_install_rolls_back_when_integrity_record_fails(
     failure: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(fake_home))
-    assert access_control.initialize_file_integrity_ledger(fake_home) is True
+    metadata = fake_home / ".mimir" / "skill-integrity.json"
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text("{}", encoding="utf-8")
     dest = fake_home / "skills" / "fake-skill"
     if existing:
         install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
@@ -213,7 +208,6 @@ def test_install_rolls_back_when_integrity_record_fails(
         old_content = (dest / "SKILL.md").read_bytes()
     (fake_optional_root / "fake-skill" / "SKILL.md").write_text("new content")
     (fake_optional_root / "fake-skill" / "new.txt").write_text("new file")
-    metadata = fake_home / ".mimir" / "file-integrity.json"
     if failure == "malformed":
         metadata.write_text("not json", encoding="utf-8")
     elif failure == "non-dict":

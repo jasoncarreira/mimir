@@ -658,18 +658,28 @@ async def test_runtime_enforces_fresh_adapter_preconditions(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_ledger", [False, True])
 async def test_agent_collaborator_parity_and_final_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_ledger: bool,
 ) -> None:
     events: list[tuple[str, Any]] = []
     _patch_factory(monkeypatch, events)
     adapters = _adapters(events)
     core = _core(tmp_path)
 
+    metadata = tmp_path / ".mimir/file-integrity.json"
+    if legacy_ledger:
+        metadata.parent.mkdir(exist_ok=True)
+        metadata.write_text("{broken")
     config = _config(tmp_path)
     bundle = await runtime.create_agent_runtime(config, core, adapters)
 
+    if legacy_ledger:
+        assert metadata.read_text() == "{broken"
+    else:
+        assert not metadata.exists()
     assert bundle.replayed_messages == 7
     assert bundle.migrated_commitments == 3
     assert bundle.agent.args == (

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -68,10 +67,9 @@ def test_build_memory_index_includes_core_with_tag(tmp_path: Path):
 
 
 @pytest.mark.parametrize("persisted", [False, True])
-def test_unusable_memory_index_omits_untrusted_descriptions(
+def test_unusable_memory_index_omits_escaping_descriptions(
     tmp_path: Path, monkeypatch, caplog, persisted: bool,
 ):
-    from mimir.access_control import initialize_file_integrity_ledger, record_file_write_integrity
     from mimir.prompts import build_system_prompt
 
     memory = tmp_path / "memory"
@@ -79,16 +77,12 @@ def test_unusable_memory_index_omits_untrusted_descriptions(
     trusted = memory / "trusted.md"
     trusted.write_text("<!-- desc: TRUSTED_DESCRIPTION -->\ntrusted body")
     untrusted = memory / "untrusted.md"
-    untrusted.write_text("<!-- desc: UNTRUSTED_DESCRIPTION -->\nuntrusted body")
-    assert initialize_file_integrity_ledger(tmp_path)
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    assert record_file_write_integrity(str(untrusted), None)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.md"
+    outside.write_text("<!-- desc: UNTRUSTED_DESCRIPTION -->\nuntrusted body")
+    untrusted.symlink_to(outside)
     index = memory / "INDEX.md"
     if persisted:
-        index.write_text("REJECTED_PERSISTED_INDEX_PAYLOAD")
-        assert record_file_write_integrity(str(index), None)
-    ledger = tmp_path / ".mimir" / "file-integrity.json"
-    ledger_before = ledger.read_bytes()
+        index.symlink_to(outside)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
 
     body = IndexGenerator(tmp_path).read_memory_index()
@@ -101,11 +95,10 @@ def test_unusable_memory_index_omits_untrusted_descriptions(
     assert str(untrusted) in caplog.text
     assert "UNTRUSTED_DESCRIPTION" not in caplog.text
     assert "REJECTED_PERSISTED_INDEX_PAYLOAD" not in caplog.text
-    # Regeneration must neither overwrite nor bless the rejected persisted file.
-    assert ledger.read_bytes() == ledger_before
+    # Regeneration must not overwrite the rejected persisted file.
     if persisted:
         assert str(index) in caplog.text
-        assert index.read_text() == "REJECTED_PERSISTED_INDEX_PAYLOAD"
+        assert index.is_symlink()
     else:
         assert not index.exists()
 
@@ -470,48 +463,37 @@ async def test_memory_flush_skips_write_when_catalog_already_current(tmp_path: P
     ("wiki", "state/wiki/index.md"),
     ("memory", "memory/skills-catalog.md"),
 ])
-@pytest.mark.parametrize("failure", ["malformed-ledger", "publication"])
 @pytest.mark.asyncio
-async def test_generator_integrity_failures_do_not_trust_output(
+async def test_generator_publication_failure_preserves_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    scope: str, relative: str, failure: str,
+    scope: str, relative: str,
 ):
-    from mimir.access_control import _filesystem_result_integrity, write_framework_file
+    from mimir.access_control import write_framework_file
 
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
     destination = tmp_path / relative
     write_framework_file(tmp_path, destination, b"old")
-    metadata = tmp_path / ".mimir/file-integrity.json"
-    if failure == "malformed-ledger":
-        metadata.write_text("{broken")
-    else:
-        original_replace = Path.replace
+    original_replace = Path.replace
 
-        def fail_publication(path, target):
-            if target == destination:
-                raise OSError("publication failed")
-            return original_replace(path, target)
+    def fail_publication(path, target):
+        if target == destination:
+            raise OSError("publication failed")
+        return original_replace(path, target)
 
-        monkeypatch.setattr(Path, "replace", fail_publication)
+    monkeypatch.setattr(Path, "replace", fail_publication)
 
     gen = IndexGenerator(tmp_path)
     gen.mark_dirty(scope)
     # Catalog publication is best-effort; other failures remain retryable.
-    if relative.endswith("skills-catalog.md") and failure == "publication":
+    if relative.endswith("skills-catalog.md"):
         await gen.flush()
     else:
         with pytest.raises((OSError, ValueError)):
             await gen.flush()
 
     assert destination.read_bytes() == b"old"
-    if failure == "publication":
-        assert json.loads(metadata.read_text())[relative] == "untrusted"
-    else:
-        assert metadata.read_text() == "{broken"
-    assert _filesystem_result_integrity(None, str(destination)) == (
-        "untrusted", "active_ingest",
-    )
+    assert not (tmp_path / ".mimir/file-integrity.json").exists()
 
 
 def test_unique_tmp_names_differ(tmp_path: Path):

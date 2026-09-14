@@ -272,7 +272,7 @@ class TestWriteGuardBackend:
         assert set(async_paths) == set(sync_paths) == expected
 
     @pytest.mark.asyncio
-    async def test_agrep_provenance_preserves_per_file_integrity_downgrade(
+    async def test_agrep_provenance_ignores_legacy_ledger(
         self,
         home: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -312,7 +312,7 @@ class TestWriteGuardBackend:
             provenance=provenance,
         )
         assert labels is not None
-        assert labels.has_untrusted_active_ingest is True
+        assert labels.has_untrusted_active_ingest is False
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

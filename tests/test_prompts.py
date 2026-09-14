@@ -6,7 +6,6 @@ indirectly by agent / dispatcher tests."""
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -16,18 +15,12 @@ from mimir.prompts import build_system_prompt
 
 
 @pytest.mark.parametrize("reader", ["core", "channel", "index"])
-@pytest.mark.parametrize("write_kind", ["recorded_untrusted", "external", "invalid_ledger"])
-def test_prompt_readers_omit_ledger_untrusted_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, reader: str, write_kind: str,
+def test_prompt_readers_admit_home_memory_despite_legacy_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
 ):
-    from mimir.access_control import (
-        _persisted_file_integrity,
-        initialize_file_integrity_ledger,
-        record_file_write_integrity,
-    )
     from mimir.core_blocks import load_channel_memory, load_core
     from mimir.index import IndexGenerator
-    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.models import AgentEvent
     from mimir.prompts import build_turn_prompt
 
     relative = Path({
@@ -38,10 +31,6 @@ def test_prompt_readers_omit_ledger_untrusted_files(
     target = tmp_path / relative
     target.parent.mkdir(parents=True)
     target.write_text("TRUSTED_MEMORY_CONTROL", encoding="utf-8")
-    assert initialize_file_integrity_ledger(tmp_path)
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    if write_kind == "recorded_untrusted":
-        assert record_file_write_integrity(str(target), InformationFlowLabels())
 
     def prompt():
         if reader == "core":
@@ -55,56 +44,98 @@ def test_prompt_readers_omit_ledger_untrusted_files(
             memory_index_body=IndexGenerator(tmp_path).read_memory_index(),
         )
 
-    # Both recorded and pre-epoch trust remain visible; don't just disable memory.
     assert "TRUSTED_MEMORY_CONTROL" in prompt()
-    if write_kind == "external":
-        # Cross filesystem timestamp granularity before bypassing protected writes.
-        time.sleep(0.02)
-    target.write_text("UNTRUSTED_MEMORY_PAYLOAD", encoding="utf-8")
-    if write_kind == "recorded_untrusted":
-        assert record_file_write_integrity(str(target), None)
-    elif write_kind == "invalid_ledger":
-        (tmp_path / ".mimir" / "file-integrity.json").write_text("not-json")
-    assert _persisted_file_integrity(tmp_path, relative) == "untrusted"
-
-    # Readers must use their supplied home, not an ambient deployment's ledger.
+    target.write_text("UPDATED_MEMORY_PAYLOAD", encoding="utf-8")
+    (tmp_path / ".mimir").mkdir()
+    (tmp_path / ".mimir/file-integrity.json").write_text("not-json")
+    # Readers use their supplied home rather than the ambient deployment.
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
-    rendered = prompt()
-    assert "UNTRUSTED_MEMORY_PAYLOAD" not in rendered
-    if reader == "index":
-        # The rejected persisted index is replaced by a filtered in-memory index.
-        assert "## Memory index" in rendered.splitlines()
-    else:
-        section = {"core": "Core memory", "channel": "Channel context"}
-        assert f"## {section[reader]}" not in rendered.splitlines()
-    assert "prompt_file_integrity_omitted" in caplog.text
-    assert str(target) in caplog.text
-    assert "reason=untrusted" in caplog.text
-    assert "UNTRUSTED_MEMORY_PAYLOAD" not in caplog.text
+    assert "UPDATED_MEMORY_PAYLOAD" in prompt()
 
 
 # ---- v0.4 §6: operator alert channel surfacing ---------------------------
 
 
-@pytest.mark.parametrize("target_kind", ["outside", "missing", "untrusted", "trusted"])
+@pytest.mark.parametrize("target_kind", ["outside", "missing", "trusted"])
 def test_prompt_file_trust_uses_canonical_contained_path(tmp_path: Path, target_kind: str):
-    from mimir.access_control import initialize_file_integrity_ledger
     from mimir.core_blocks import _prompt_file_is_trusted
 
     home = tmp_path / "home"
     home.mkdir()
-    target = (tmp_path if target_kind == "outside" else home) / "target.md"
+    (home / "memory").mkdir()
+    target = (tmp_path if target_kind == "outside" else home / "memory") / "target.md"
     if target_kind != "missing":
         target.write_text("memory")
     link = home / "alias.md"
     link.symlink_to(target)
-    assert initialize_file_integrity_ledger(home)
-    if target_kind == "untrusted":
-        # Only the canonical target has a ledger entry, not its alias.
-        (home / ".mimir" / "file-integrity.json").write_text(
-            '{"target.md":"untrusted"}', encoding="utf-8",
-        )
     assert _prompt_file_is_trusted(home, link) is (target_kind == "trusted")
+
+
+@pytest.mark.parametrize("reader", ["core", "channel", "index", "index-source"])
+@pytest.mark.parametrize("destination,trusted", [
+    ("attachments/fetch-cache/target.md", False),
+    ("attachments/inbound/target.md", False),
+    ("state/pollers/feed/target.md", False),
+    ("skills/unrecorded/SKILL.md", False),
+    ("arbitrary/target.md", False),
+    ("target.md", False),
+    ("../outside.md", False),
+    ("memory/missing.md", False),
+    ("memory/target.md", True),
+    ("docs/target.md", True),
+    ("prompts/target.md", True),
+    ("state/target.md", True),
+    (".mimir_builtin_skills/control/SKILL.md", True),
+    ("skills/installed/SKILL.md", True),
+])
+def test_prompt_readers_classify_resolved_home_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    reader: str, destination: str, trusted: bool,
+):
+    from mimir.access_control import record_admin_installed_skill_integrity
+    from mimir.core_blocks import load_channel_memory, load_core
+    from mimir.index import IndexGenerator, build_memory_index
+    from mimir.models import AgentEvent
+    from mimir.prompts import build_turn_prompt
+
+    home = tmp_path / "home"
+    target = home / destination
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if destination != "memory/missing.md":
+        target.write_text("SYMLINK_PAYLOAD.", encoding="utf-8")
+    if destination == "skills/installed/SKILL.md":
+        assert record_admin_installed_skill_integrity(home, target.parent)
+    # Installation authority, like root classification, uses the supplied HOME.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
+    link = home / {
+        "core": "memory/core/00-alias.md",
+        "channel": "memory/channels/chat/00-alias.md",
+        "index": "memory/INDEX.md",
+        "index-source": "memory/core/00-alias.md",
+    }[reader]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+
+    if reader == "core":
+        prompt = build_system_prompt(core_blocks=load_core(home))
+    elif reader == "channel":
+        prompt = build_turn_prompt(
+            AgentEvent(trigger="user_message", channel_id="chat", content="hello"),
+            channel_memory_block=load_channel_memory(home, "chat"),
+        )
+    else:
+        body = (
+            IndexGenerator(home).read_memory_index() if reader == "index"
+            else build_memory_index(home)
+        )
+        prompt = build_system_prompt(memory_index_body=body)
+    assert ("SYMLINK_PAYLOAD" in prompt) is trusted
+    if not trusted and destination != "memory/missing.md":
+        assert any(
+            "prompt_file_integrity_omitted" in record.message
+            and str(link) in record.message
+            for record in caplog.records
+        )
 
 
 def test_system_prompt_includes_operator_alert_channel():
