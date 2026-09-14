@@ -1191,11 +1191,26 @@ asyncio.run(run())
     sys.platform != "linux",
     reason="C-delivery handshake relies on Linux MSG_WAITALL copying partial data before waiting",
 )
-async def test_shutdown_journal_observer_arms_watchdog_without_python_dispatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("interleaved", [False, True])
+async def test_shutdown_journal_observer_arms_watchdog_without_python_dispatch(
+    tmp_path: Path, interleaved: bool,
+) -> None:
     progress = tmp_path / "child-progress"
-    source = _journal_source(progress) + r'''
+    source = _journal_source(progress) + f"\ninterleaved = {interleaved!r}\n" + r'''
 import asyncio, ctypes
 from types import SimpleNamespace
+
+# Force worker-signalled between the two timer-start markers in one variant.
+# These are independent threads; adjacency in the shared journal is not a
+# production invariant, even though both timer markers precede forwarding.
+timer_entered = threading.Event()
+worker_recorded = threading.Event()
+original_record = record
+def record(value):
+    original_record(value)
+    if interleaved and value == b'watchdog-start-enter':
+        timer_entered.set()
+        worker_recorded.wait()
 
 reader, writer = socket.socketpair()
 libc = ctypes.CDLL(None)
@@ -1212,7 +1227,10 @@ def deliver(hooks):
         time.sleep(0.001)
     record(b'main-blocked')
     signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+    if interleaved:
+        timer_entered.wait()
     record(b'worker-signalled')
+    worker_recorded.set()
     _journal_flush()
     # The observer forwards only after _arm_watchdog returns. Unlike waiting
     # for timer startup, this acknowledgment also completes if arming is broken.
@@ -1249,7 +1267,14 @@ asyncio.run(run())
                      if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
             assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
             assert progress.with_suffix(".wakeup").read_bytes() == bytes([signal.SIGTERM])
-            assert "watchdog-start-enter\nwatchdog-start-returned\n" in state
+            # Worker delivery can be journalled during Timer.start(). Require
+            # the timer's own ordered lifecycle, not cross-thread adjacency.
+            timer_start = [line for line in state.splitlines()
+                           if line.startswith("watchdog-start-")]
+            assert timer_start == ["watchdog-start-enter", "watchdog-start-returned"]
+            if interleaved:
+                assert ("watchdog-start-enter\nworker-signalled\n"
+                        "watchdog-start-returned\n") in state
             assert "signal-enter:" not in state
             assert "signal-dispatch:" not in diagnostics
             assert "cleanup-enter" not in state
