@@ -705,6 +705,13 @@ async def request_operator_approval(
     Consent is recorded only from a later authenticated inbound operator
     message; this tool cannot create a grant.
     """
+    if sink_category == "shell_process":
+        return (
+            "request_operator_approval refused: no approval admits shell on a tainted turn. "
+            "Use a single bounded pinned-family command without shell metacharacters, "
+            "or send an operator message for a fresh user turn."
+        )
+
     from .._context import get_current_turn
     from ..operator_approval import cancel_request, create_request
 
@@ -750,7 +757,6 @@ async def request_operator_approval(
             SinkCategory.SAME_CHANNEL,
             SinkCategory.CROSS_CHANNEL,
             SinkCategory.PUBLIC,
-            SinkCategory.SHELL_PROCESS,
             SinkCategory.SPAWN,
             SinkCategory.NOTIFICATION,
             SinkCategory.FILE,
@@ -761,6 +767,7 @@ async def request_operator_approval(
             SinkCategory.FORGE,
         })
         ineligible = frozenset({
+            SinkCategory.SHELL_PROCESS,
             SinkCategory.NETWORK,
             SinkCategory.HTTP_WEBHOOK,
             SinkCategory.EXTERNAL_MCP,
