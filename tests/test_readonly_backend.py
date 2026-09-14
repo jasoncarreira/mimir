@@ -1345,8 +1345,7 @@ class TestCreateOnlyWrites:
         assert ls_result.content == "No files found"
         assert glob_result.content == "No files found"
         assert read_result.content == (
-            "2  two\n3  three\n\n[Read 2 lines (lines 2-3 of 4 total). "
-            "1 line remaining from offset 3.]"
+            "@@ lines 2-3 of 4 | next offset 3 @@\ntwo\nthree"
         )
         assert "no lines were read because `limit` was 0" in zero_result.content
 
