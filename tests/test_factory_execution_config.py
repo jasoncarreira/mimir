@@ -194,9 +194,14 @@ def test_factory_git_recovery_uses_owner_not_safe_directory(tmp_path, monkeypatc
     monkeypatch.setattr(worker_client, "run_factory_control", worker)
     run = orchestrator._factory_git_runner(controller)
     args = ["git", "-C", str(checkout / ".factory-sandboxes/run"), "rev-parse", "HEAD"]
+    # macOS can inherit a non-member group from /tmp and then strip S_ISGID
+    # on chmod. Establish a real member group before modelling either phase.
+    os.chown(checkout.parent, -1, os.getgid())
     checkout.parent.chmod(0o2700)
+    assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2700
     assert run(args, text=text).stdout == ("initial" if text else b"initial")
     checkout.parent.chmod(0o2750)
+    assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2750
     assert run(args, text=text).stdout == ("retained" if text else b"retained")
     assert [who for who, _ in calls] == ["controller", "worker"]
 
