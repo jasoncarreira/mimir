@@ -1599,7 +1599,9 @@ async def test_real_producer_unchanged_result_preserves_category_capability(
 
     auth = _ifc_auth()
     turn = _ifc_turn(auth)
-    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    turn.ifc_labels = _install_sink_category_capability(
+        auth, turn_id=turn.turn_id, sink_category="file",
+    )
     middleware = BudgetGateMiddleware()
     source = turn.ifc_labels.sources[-1]
     sink_calls = 0
@@ -1620,7 +1622,8 @@ async def test_real_producer_unchanged_result_preserves_category_capability(
             producer,
         )
         admitted = await middleware.awrap_tool_call(
-            _make_request("shell_exec", "sink-after-unchanged", auth, {"command": "pwd"}),
+            _make_request("write_file", "sink-after-unchanged", auth,
+                          {"file_path": "/tmp/unchanged.txt", "content": "unchanged"}),
             sink,
         )
     finally:
@@ -3833,13 +3836,9 @@ async def test_middleware_preparation_plumbing_activates_only_bound_execution(
     else:
         result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
 
-    if preparation_kind == "bound":
-        assert result.status != "error"
-        assert handler_calls == 1
-    else:
-        assert result.status == "error"
-        assert "ifc_label_blocked:shell_process" in str(result.content)
-        assert handler_calls == 0
+    assert result.status == "error"
+    assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert handler_calls == 0
     assert order[:4] == [
         "validation", "standing_review", "preparation", "authorization",
     ]
@@ -4635,7 +4634,7 @@ async def test_operator_binding_is_authorization_and_execution_artifact(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
-async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
+async def test_tainted_operator_bound_command_executes_only_in_shadow_mode(
     middleware_path: str,
     enforcement_enabled: bool,
     tmp_path: Path,
@@ -4692,6 +4691,11 @@ async def test_tainted_operator_bound_command_reaches_real_direct_process_path(
         result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
 
     expected = [str(maintenance_pinned_executables["pwd"]), "-P"]
+    if enforcement_enabled:
+        assert result.status == "error"
+        assert "ifc_label_blocked:shell_process" in str(result.content)
+        assert executions == []
+        return
     assert result.status != "error"
     assert len(executions) == 1
     argv, kwargs = executions[0]
@@ -5247,11 +5251,12 @@ def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
 
     current = auth.ifc_state.current(auth.ifc_labels)
     assert first.status != "error"
-    assert all(result.status != "error" for result in bounded)
+    assert all(result.status == "error" for result in bounded)
+    assert all("ifc_label_blocked:shell_process" in str(result.content) for result in bounded)
     assert current.has_untrusted_active_ingest is True
     assert final.status == "error"
     assert "ifc_label_blocked:shell_process" in str(final.content)
-    assert calls == ["initial-unbounded", *(f"bounded-{index}" for index in range(bounded_count))]
+    assert calls == ["initial-unbounded"]
 
 
 @pytest.mark.asyncio

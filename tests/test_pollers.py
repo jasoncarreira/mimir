@@ -1988,31 +1988,106 @@ print(json.dumps({
 @pytest.mark.parametrize(
     ("collaborator", "membership", "expected"),
     [
-        ((204, None), None, True),
-        ((404, None), (200, {"state": "active"}), True),
-        ((404, None), (404, None), False),
-        (None, None, None),
-        (None, (200, {"state": "active"}), None),
-        ((403, {"message": "rate limited"}), (200, {"state": "active"}), None),
-        ((404, None), None, None),
+        pytest.param((204, None), None, True, id="collaborator"),
+        pytest.param((404, None), (200, {"state": "active"}), True, id="org-member"),
+        pytest.param((404, None), (404, None), False, id="nonmember"),
+        pytest.param((404, None), (200, {"state": "pending"}), False, id="pending-member"),
+        pytest.param((404, None), (200, {}), False, id="missing-state-is-false-not-none"),
+        pytest.param(None, (200, {"state": "active"}), None, id="collaborator-unavailable"),
+        *[
+            pytest.param((status, None), (200, {"state": "active"}), None,
+                         id=f"collaborator-http-{status}")
+            for status in (200, 401, 403, 429, 500)
+        ],
+        pytest.param((404, None), None, None, id="membership-unavailable"),
+        *[
+            pytest.param((404, None), (status, None), None, id=f"membership-http-{status}")
+            for status in (204, 401, 403, 429, 500)
+        ],
+        *[
+            pytest.param((404, None), (200, payload), None, id=f"membership-{name}")
+            for name, payload in (("null", None), ("list", []), ("string", "active"))
+        ],
     ],
 )
+@pytest.mark.parametrize("entrypoint", ["poller", "forge"])
 def test_github_author_trust_is_server_attested_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     collaborator: object,
     membership: object,
     expected: bool | None,
+    entrypoint: str,
 ) -> None:
     calls: list[str] = []
 
-    def fake_api(endpoint: str, _token: str):
+    def fake_api(endpoint: str, token: str, *, timeout: float):
+        assert token == "server-token"
+        assert timeout == 2.5
         calls.append(endpoint)
         return membership if endpoint.startswith("orgs/") else collaborator
 
     monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
 
-    assert _github_author_is_trusted("acme/widget", "alice", "server-token") is expected
-    assert calls[0] == "repos/acme/widget/collaborators/alice"
+    if entrypoint == "forge":
+        from mimir.forge.github import GitHubForgeClient
+
+        client = GitHubForgeClient(token="server-token", timeout=2.5)
+        verdict = client.author_is_trusted("acme/widget", "alice")
+    else:
+        verdict = _github_author_is_trusted("acme/widget", "alice", "server-token", timeout=2.5)
+    assert verdict is expected
+    assert calls == ["repos/acme/widget/collaborators/alice"] + (
+        ["orgs/acme/memberships/alice"] if collaborator is not None and collaborator[0] == 404 else []
+    )
+
+
+@pytest.mark.parametrize("repo, author", [
+    pytest.param(None, "alice", id="missing-repo"),
+    pytest.param("acme/widget", None, id="deleted-user"),
+    pytest.param("acme", "alice", id="malformed-repo"),
+    pytest.param("acme/", "alice", id="empty-repo-name"),
+    pytest.param("acme/widget", "dependabot[bot]", id="bot-login"),
+    pytest.param("acme/widget", "alice/other", id="invalid-author"),
+])
+def test_github_author_validation_is_false_not_unavailable(monkeypatch, repo, author):
+    api = Mock(side_effect=AssertionError("invalid identity must not reach GitHub"))
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", api)
+
+    assert _github_author_is_trusted(repo, author, "token") is False
+    api.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["os-error", "url-error", "timeout", "invalid-json", "budget"])
+@pytest.mark.parametrize("stage", ["collaborator", "membership"])
+def test_github_author_transport_unavailability(monkeypatch, failure, stage):
+    from contextlib import nullcontext
+    from mimir import pollers
+
+    fire = pollers._GithubFireAttestation()
+    calls = []
+
+    def urlopen(request, *, timeout):
+        calls.append(request.full_url)
+        assert timeout == 2.5
+        if stage == "membership" and len(calls) == 1:
+            raise pollers.urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
+        if failure == "invalid-json":
+            return nullcontext(SimpleNamespace(status=200, read=lambda: b"not json"))
+        if failure == "url-error":
+            raise pollers.urllib.error.URLError("connection refused")
+        if failure == "timeout":
+            raise TimeoutError("timed out")
+        raise OSError("connection reset")
+
+    if failure == "budget":
+        fire.attempts = pollers.GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL - (stage == "membership")
+    monkeypatch.setattr(pollers.urllib.request, "urlopen", urlopen)
+    token = pollers._github_fire_attestation.set(fire)
+    try:
+        assert _github_author_is_trusted("acme/widget", "alice", "token", timeout=2.5) is None
+        assert len(calls) == (stage == "membership") + (failure != "budget")
+    finally:
+        pollers._github_fire_attestation.reset(token)
 
 
 def test_github_public_read_permission_does_not_establish_collaborator_trust(

@@ -6015,15 +6015,6 @@ class SinkGate:
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
         )
-        # Shell is an executable sink even when argv is tightly scoped. The
-        # profile bounds capability; IFC independently prevents untrusted PR
-        # content from exercising that capability on the same turn.
-        if (
-            service.authority_profile == "github"
-            and tool_name in {"shell_exec", "bash_async"}
-            and has_untrusted_active_ingest
-        ):
-            return False, None
         if capability_tier is CapabilityTier.CODE_EXECUTION:
             return (
                 tool_name in {"worklink_run", "repo_test"}
@@ -6238,7 +6229,36 @@ class SinkGate:
         state = getattr(auth_context, "ifc_state", None)
         has_untrusted_active_ingest = _has_untrusted_active_ingest(
             auth_context, ifc_labels,
+            missing_is_tainted=tool_name in {"shell_exec", "bash_async"},
         )
+        # Shell is an executable sink even when argv is tightly scoped. The
+        # profile bounds capability; IFC independently prevents untrusted
+        # content from exercising that capability on the same turn.
+        if tool_name in {"shell_exec", "bash_async"} and has_untrusted_active_ingest:
+            chainlink_argv = _chainlink_target_argv(target)
+            mutation = (
+                chainlink_argv is not None
+                and _chainlink_command_is_mutation(chainlink_argv)
+            )
+            # Bounded tracker queries remain available, subject to the ordinary
+            # capability and destination checks below, never tracker mutations.
+            if chainlink_argv is None or mutation:
+                return ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=not enforce,
+                    reason=(
+                        "chainlink_mutation_blocked_by_untrusted_ingest"
+                        if mutation else "ifc_label_blocked:shell_process"
+                    ),
+                    service_principal=service,
+                    required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce,
+                    would_block=True,
+                    resolved_sink_target=resolved_target,
+                    refusal_detail=_CHAINLINK_TAINT_REFUSAL if mutation else None,
+                )
         client_authorized = False
         if client_authorized_host_execution is not None:
             from .tools.client_provider import client_authorized_host_execution_matches

