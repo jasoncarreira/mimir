@@ -35,7 +35,7 @@ from typing import Callable, Iterator
 log = logging.getLogger(__name__)
 
 
-CURRENT_SCHEMA_VERSION: int = 13
+CURRENT_SCHEMA_VERSION: int = 14
 
 # Registry of post-greenfield schema changes. Keys are version
 # numbers (must be > 1, must be contiguous, must equal
@@ -695,6 +695,20 @@ WHERE a.source_type = 'session_boundary'
         SET integrity = 'trusted'
         WHERE integrity = 'untrusted';
     """,
+    14: """
+        -- Check every row, including tombstones, before discarding the label.
+        CREATE TEMP TABLE migration_v14_require_trusted (
+            nontrusted_count INTEGER CONSTRAINT migration_v14_refused_nontrusted_atoms
+                CHECK(nontrusted_count = 0)
+        );
+        INSERT INTO migration_v14_require_trusted
+            SELECT COUNT(*) FROM atoms WHERE integrity IS NOT 'trusted';
+        DROP TABLE migration_v14_require_trusted;
+
+        DROP INDEX IF EXISTS idx_atoms_integrity_created_at;
+        DROP INDEX IF EXISTS idx_atoms_trusted_boundary_v13;
+        ALTER TABLE atoms DROP COLUMN integrity;
+    """,
 }
 
 
@@ -709,6 +723,7 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
 
     Detection markers, highest version first:
 
+    - **v14**: ``atoms`` retains origin provenance but has no ``integrity``.
     - **v13**: ``atoms`` has the ``idx_atoms_trusted_boundary_v13`` marker
       created with the unconditional legacy-integrity correction.
     - **v12**: ``atoms`` has the ``idx_atoms_integrity_created_at`` index used
@@ -742,6 +757,12 @@ def detect_schema_version(conn: sqlite3.Connection) -> int:
     so this is robust to bare-bones DBs (like the in-memory
     fixtures used by unit tests).
     """
+    atoms_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
+    }
+    if {"origin_trigger", "origin_ref"} <= atoms_cols and "integrity" not in atoms_cols:
+        return 14
+
     try:
         atom_indexes = {
             row[1] for row in conn.execute("PRAGMA index_list(atoms)").fetchall()
@@ -1127,7 +1148,10 @@ def _validate_ownership_schema(
         }
         missing.extend(
             f"atoms.{column}"
-            for column in sorted(_ATOM_PROVENANCE_COLUMNS - atom_columns)
+            for column in sorted(
+                (_ATOM_PROVENANCE_COLUMNS - {"integrity"} if target_version >= 14
+                 else _ATOM_PROVENANCE_COLUMNS) - atom_columns
+            )
         )
 
     if missing:
@@ -1171,6 +1195,20 @@ def apply_pending_migrations(
         migrations = MIGRATIONS
     if detector is None:
         detector = detect_schema_version
+
+    # Run before even creating/stamping schema_version or repairing boundaries:
+    # v12/v13 would otherwise launder existing nontrusted rows on the way to v14.
+    if target_version >= 14 and _column_exists(conn, "atoms", "integrity"):
+        nontrusted = conn.execute(
+            "SELECT integrity, COUNT(*) FROM atoms WHERE integrity IS NOT 'trusted' "
+            "GROUP BY integrity ORDER BY integrity"
+        ).fetchall()
+        if nontrusted:
+            raise sqlite3.IntegrityError(
+                "migration v14 refused: atoms contain nontrusted rows "
+                "(including tombstones); resolve explicitly before retrying: "
+                + ", ".join(f"{value!r}={count}" for value, count in nontrusted)
+            )
 
     applied: set[int] = set()
     inferred_baselines: set[int] = set()

@@ -4,15 +4,17 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from langchain.tools import ToolRuntime
 
 from mimir.access_control import CapabilityTier, build_trigger_service_principal, create_auth_context
+from mimir.access_control import SAGA_TAINT_REFUSAL, saga_mutation_taint_refusal
 from mimir.identities import IdentityResolver
 from mimir.models import (
-    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, Integrity,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
     SessionACL, SourceLabel,
 )
 from mimir.saga.client import SagaStore
@@ -131,6 +133,35 @@ def _trusted_synthesis_labels(channel: str) -> InformationFlowLabels:
     ))
 
 
+@pytest.mark.parametrize("case", [
+    "missing_context", "missing_state", "uncallable_current",
+    "evaluator_exception", "non_label", "empty_sources",
+])
+def test_saga_mutation_taint_refusal_fails_closed(case: str) -> None:
+    context = _service_context("saga_session_end", "synthesis:owned")
+
+    def current(fallback: Any) -> Any:
+        if case == "evaluator_exception":
+            raise RuntimeError("live state evaluation failed")
+        return SimpleNamespace(
+            sources=context.ifc_labels.sources, has_untrusted_active_ingest=False,
+        )
+
+    if case == "missing_context":
+        context = None
+    elif case == "missing_state":
+        context = replace(context, ifc_state=None)
+    elif case == "uncallable_current":
+        context = replace(context, ifc_state=SimpleNamespace(current=None))
+    elif case == "empty_sources":
+        labels = InformationFlowLabels()
+        context = replace(context, ifc_labels=labels, ifc_state=InformationFlowState(labels=labels))
+    else:
+        context = replace(context, ifc_state=SimpleNamespace(current=current))
+
+    assert saga_mutation_taint_refusal(context) == SAGA_TAINT_REFUSAL
+
+
 @pytest.mark.asyncio
 async def test_memory_store_regular_user_is_rejected(
     tmp_path: Path, write_store: _WriteStore,
@@ -239,13 +270,13 @@ async def test_memory_store_uses_active_ingest_only_integrity_boundary(
     assert ("stored" in out) is stored
     assert bool(write_store.atom_calls) is stored
     if stored:
-        assert write_store.atom_calls[-1]["integrity"] is Integrity.TRUSTED
+        assert "integrity" not in write_store.atom_calls[-1]
     else:
         assert "tainted" in out
 
 
 @pytest.mark.asyncio
-async def test_memory_store_stamps_trusted_when_all_sources_are_trusted(
+async def test_memory_store_omits_integrity_when_all_sources_are_trusted(
     tmp_path: Path, write_store: _WriteStore,
 ) -> None:
     context = _user_context(tmp_path, "discord-alice", "discord-private")
@@ -267,7 +298,54 @@ async def test_memory_store_stamps_trusted_when_all_sources_are_trusted(
     )
 
     assert "stored" in out
-    assert write_store.atom_calls[-1]["integrity"] == Integrity.TRUSTED
+    assert "integrity" not in write_store.atom_calls[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skill_learning", [False, True])
+async def test_real_store_rejects_write_after_turn_becomes_tainted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_learning: bool,
+) -> None:
+    class StubProvider:
+        def embed(self, text: str, *, input_type: str = "passage") -> list[float]:
+            return [1.0, 2.0, 3.0, 4.0]
+
+        def dimensions(self) -> int:
+            return 4
+
+    monkeypatch.setattr("mimir.saga.embeddings.get_provider", lambda: StubProvider())
+    store = SagaStore(db_path=tmp_path / "tainted-turn.saga.db", embedding_dim=4)
+    monkeypatch.setitem(_MEMORY_STATE, "client", store)
+    context = _user_context(tmp_path, "discord-alice", "discord-private")
+    tool = saga_ops.saga_record_skill_learning if skill_learning else memory_store
+    args = {"skill": "memory", "kind": "tip"} if skill_learning else {"stream": "semantic"}
+    try:
+        out = await tool.ainvoke({
+            **args, "content": "trusted operator fact",
+            "runtime": _runtime(context, "before-taint"),
+        })
+        assert "failed" not in out
+        conn = store._ensure_conn()
+        assert [row[0] for row in conn.execute("SELECT content FROM atoms")] == [
+            "trusted operator fact",
+        ]
+
+        context.ifc_state.merge(InformationFlowLabels().with_source(SourceLabel(
+            principal="web", domain="internet", resource_id="https://example.com",
+            bridge_instance="fetch", sensitivity="public",
+            authorized_principals=frozenset({"alice"}),
+            integrity="untrusted", integrity_effect="active_ingest",
+        )))
+        out = await tool.ainvoke({
+            **args, "content": "untrusted injected instruction",
+            "runtime": _runtime(context, "after-taint"),
+        })
+        assert "tainted" in out
+        assert [row[0] for row in conn.execute("SELECT content FROM atoms")] == [
+            "trusted operator fact",
+        ]
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

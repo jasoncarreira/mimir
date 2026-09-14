@@ -145,7 +145,7 @@ def recall_skill_learnings(
     counterfactual decision is logged when applicable.
 
     Each result includes ``id``, ``content``, ``kind``, ``created_at``,
-    ``owner_principal``, and ``integrity``. Tombstoned atoms are excluded.
+    and ``owner_principal``. Tombstoned atoms are excluded.
     """
     if not skill or not skill.strip():
         return []
@@ -178,7 +178,7 @@ def recall_skill_learnings(
     rows = conn.execute(
         f"""
         SELECT id, content, json_extract(metadata, '$.kind') AS kind, created_at,
-               owner_principal, integrity
+               owner_principal
         FROM atoms
         WHERE source_type = ?
           AND json_extract(metadata, '$.skill') = ?
@@ -209,7 +209,7 @@ def recall_skill_learnings(
     result = [
         {
             "id": r[0], "content": r[1], "kind": r[2], "created_at": r[3],
-            "owner_principal": r[4], "integrity": r[5],
+            "owner_principal": r[4],
         }
         for r in ranked[: int(limit)]
     ]
@@ -223,31 +223,18 @@ def recall_skill_learnings(
 def render_skill_learnings(learnings: list[dict]) -> str:
     """Render recalled skill-learning atoms as a compact prompt block.
 
-    Learnings are grouped by server-stamped origin trust, matching the other
-    recalled-atom renderers. Newest-first order is preserved within each group.
-    Missing or invalid integrity fails closed into the untrusted group. Content
-    is single-lined so a multi-line learning can't break the markdown structure.
+    Recall order is preserved. Content is single-lined so a multi-line learning
+    can't break the markdown structure.
     """
     if not learnings:
         return ""
     lines: list[str] = []
-    trusted = [item for item in learnings if item.get("integrity") == "trusted"]
-    untrusted = [item for item in learnings if item.get("integrity") != "trusted"]
-    for heading, group in (
-        ("Trusted-origin learnings:", trusted),
-        ("Untrusted-origin learnings:", untrusted),
-    ):
-        if not group:
-            continue
-        if lines:
-            lines.append("")
-        lines.append(heading)
-        for item in group:
-            kind = item.get("kind") or "?"
-            content = " ".join(str(item.get("content") or "").split())
-            if len(content) > _ATOM_CONTENT_CAP:
-                content = content[:_ATOM_CONTENT_CAP] + "…"
-            lines.append(f"- [{kind}] {content}")
+    for item in learnings:
+        kind = item.get("kind") or "?"
+        content = " ".join(str(item.get("content") or "").split())
+        if len(content) > _ATOM_CONTENT_CAP:
+            content = content[:_ATOM_CONTENT_CAP] + "…"
+        lines.append(f"- [{kind}] {content}")
     return "\n".join(lines)
 
 
@@ -309,7 +296,7 @@ def augment_skill_body(
         {
             "resource_id": f"atom:{item['id']}",
             "owner_principal": item.get("owner_principal"),
-            "integrity": item.get("integrity"),
+            "integrity": "trusted",
         }
         for item in learnings
         if item.get("id")
