@@ -46,8 +46,20 @@ def _roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]
     monkeypatch.setattr(contained_checkout, "OPENCODE_CHECKOUT_ROOT", opencode)
     monkeypatch.setattr(checkout, "_REPO_TEST_CHECKOUT_ROOT", repo_test)
     monkeypatch.setattr(checkout, "_OPENCODE_CHECKOUT_ROOT", opencode)
-    monkeypatch.setattr(contained_checkout.os, "chown", lambda *args, **kwargs: None)
-    monkeypatch.setattr(contained_checkout.os, "fchown", lambda *args, **kwargs: None)
+    # Map production ownership to the test user's real group instead of
+    # making chown a no-op. On macOS, /tmp descendants may inherit a group
+    # the user does not belong to; chmod then silently drops S_ISGID.
+    real_chown = os.chown
+    real_fchown = os.fchown
+    test_gid = os.getgid()
+    monkeypatch.setattr(
+        contained_checkout.os, "chown",
+        lambda path, uid, gid, **kwargs: real_chown(path, -1, test_gid, **kwargs),
+    )
+    monkeypatch.setattr(
+        contained_checkout.os, "fchown",
+        lambda fd, uid, gid: real_fchown(fd, -1, test_gid),
+    )
     return repo_test, opencode
 
 
