@@ -1074,6 +1074,104 @@ def test_build_turn_prompt_directs_scratch_to_server_supplied_turn_path() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trigger,channel_id,is_service,roles,visible",
+    [
+        ("poller", "poller:github-activity", True, (), False),
+        ("poller", "scheduler:heartbeat", True, (), False),
+        ("scheduled_tick", "scheduler:memory-hygiene", True, (), False),
+        ("scheduled_tick", "scheduler:heartbeat-extra", True, (), False),
+        ("scheduled_tick", "scheduler:heartbeat", True, (), True),
+        ("user_message", "web:operator", False, ("admin",), True),
+        ("user_message", "web:user", False, (), False),
+        ("poller", "poller:github-activity", False, ("admin",), False),
+    ],
+)
+async def test_usage_section_visibility_by_turn(
+    tmp_path, monkeypatch, trigger, channel_id, is_service, roles, visible,
+):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    agent = _make_agent(tmp_path)
+    agent._config = replace(agent._config, usage_block_enabled=True)
+    body = "OpenAI seven_day: 80% used; on pace: 239% by reset"
+    monkeypatch.setattr(
+        "mimir.stats_block.assemble_stats_block",
+        lambda *args, **kwargs: SimpleNamespace(body=body, alert=None, off_pace=[]),
+    )
+    event = AgentEvent(trigger=trigger, channel_id=channel_id, content="Do the work")
+    auth = AuthContext(
+        principal="operator", canonical_principal="operator", roles=roles,
+        event_ingress=None, trigger=trigger, channel_id=channel_id,
+        interactivity=None, is_service=is_service,
+    )
+    prompt, _ = await agent._build_turn_prompt(
+        _make_ctx(event), event, saga_block=None, initial_auth_context=auth,
+    )
+    assert ("## Resource usage" in prompt) is visible
+    assert (body in prompt) is visible
+
+
+@pytest.mark.parametrize("trigger,channel_id", [
+    ("poller", "poller:github-activity"),
+    ("scheduled_tick", "scheduler:memory-hygiene"),
+])
+@pytest.mark.parametrize("billing_mode,event_kind", [
+    ("pay-as-you-go", "cost_rate_alert"),
+    ("quota", "cost_rate_advisory"),
+])
+@pytest.mark.parametrize("cooling_down", [False, True])
+def test_hidden_usage_preserves_deferred_alerts(
+    tmp_path, monkeypatch, trigger, channel_id, billing_mode, event_kind, cooling_down,
+):
+    from unittest.mock import Mock, call
+    from mimir.billing import BillingMode
+    from mimir.usage_stats import CostRateAlert
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    agent = _make_agent(tmp_path)
+    agent._config = replace(
+        agent._config, usage_block_enabled=True, billing_mode=BillingMode(billing_mode),
+        cost_alert_cooldown_minutes=37,
+    )
+    monkeypatch.setattr(
+        "mimir.stats_block.assemble_stats_block",
+        lambda *args, **kwargs: SimpleNamespace(
+            body="live quota numbers",
+            alert=CostRateAlert("absolute_hourly_limit", 12.0, 10.0, None),
+            off_pace=[(
+                "openai:seven_day",
+                SimpleNamespace(utilization=0.8, resets_at="2026-09-15T00:00:00Z"),
+                SimpleNamespace(on_pace_utilization=2.39, hours_until_reset=12.0),
+            )],
+        ),
+    )
+    cooldown = Mock(return_value=cooling_down)
+    monkeypatch.setattr("mimir.agent.event_recently_emitted", cooldown)
+    auth = AuthContext(
+        principal="job", canonical_principal="job", roles=(), event_ingress=None,
+        trigger=trigger, channel_id=channel_id, interactivity=None, is_service=True,
+    )
+    block, deferred = agent._assemble_usage_block(auth)
+    assert block is None
+    assert cooldown.call_args_list == [
+        call(agent._config.events_log, kind, cooldown_minutes=37,
+             snapshot=agent._events_snapshot)
+        for kind in (event_kind, "rate_limit_off_pace")
+    ]
+    assert deferred == ([] if cooling_down else [
+        (event_kind, {
+            "reason": "absolute_hourly_limit", "rate_now_usd_per_hour": 12.0,
+            "threshold_usd_per_hour": 10.0, "baseline_usd_per_hour": None,
+        }),
+        ("rate_limit_off_pace", {
+            "rate_limit_type": "openai:seven_day", "utilization": 0.8,
+            "on_pace_utilization": 2.39, "hours_until_reset": 12.0,
+            "resets_at": "2026-09-15T00:00:00Z",
+        }),
+    ])
+
+
+@pytest.mark.asyncio
 async def test_agent_build_turn_prompt_threads_all_helper_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
