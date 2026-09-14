@@ -9463,6 +9463,24 @@ def _filesystem_result_integrity(
 ) -> tuple[str, str]:
     """Derive file trust only from resolved framework-owned paths and metadata."""
     home_value = os.environ.get("MIMIR_HOME", "").strip()
+    source_repo_value = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
+    if source_repo_value:
+        try:
+            source_repo = Path(source_repo_value).resolve(strict=True)
+            source_resource = Path(resource_id).resolve(strict=True)
+            source_home = Path(home_value).resolve(strict=True) if home_value else None
+        except (OSError, RuntimeError):
+            pass
+        else:
+            # Merge review anchors this checkout's trust, not file ledger state.
+            # HOME's own handling must win even when the checkout overlaps it.
+            if (
+                source_repo.is_dir()
+                and source_resource.is_relative_to(source_repo)
+                and (source_home is None or not source_resource.is_relative_to(source_home))
+            ):
+                return "trusted", "informational"
+
     if not home_value:
         return "untrusted", "active_ingest"
     try:
