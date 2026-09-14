@@ -234,7 +234,7 @@ def test_live_middleware_denies_tainted_shell_and_network_egress(
 
 
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
-def test_synthesis_write_executes_resolved_authorized_path(
+def test_synthesis_write_executes_resolved_authorized_path_but_edit_is_denied(
     tool_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,8 +281,13 @@ def test_synthesis_write_executes_resolved_authorized_path(
         handler,
     )
 
-    assert result.status != "error"
-    assert executed_paths == [str((own_channel / "summary.md").resolve())]
+    if tool_name == "write_file":
+        assert result.status != "error"
+        assert executed_paths == [str((own_channel / "summary.md").resolve())]
+    else:
+        assert result.status == "error"
+        assert "session_boundary_capability_denied" in str(result.content)
+        assert executed_paths == []
 
 
 def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
