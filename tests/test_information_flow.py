@@ -4529,6 +4529,28 @@ def test_source_repo_does_not_change_other_roots(tmp_path, monkeypatch, location
         assert baseline == ("untrusted", "active_ingest")
 
 
+@pytest.mark.parametrize("source_location", ["home", "parent"])
+@pytest.mark.parametrize("location", ["attachments/fetch-cache/body", "state/pollers/event"])
+def test_source_repo_overlap_preserves_home_integrity(
+    tmp_path, monkeypatch, source_location, location,
+):
+    from mimir.access_control import _filesystem_result_integrity
+
+    home = tmp_path / "home"
+    target = home / location
+    target.parent.mkdir(parents=True)
+    target.write_text("untrusted input", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_SOURCE_REPO", str(
+        home if source_location == "home" else tmp_path
+    ))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    assert _filesystem_result_integrity(_auth(), str(target)) == (
+        "untrusted", "active_ingest",
+    )
+
+
 def test_source_repo_unresolved_resource_is_not_trust(tmp_path, monkeypatch):
     from mimir.access_control import _filesystem_result_integrity
 
