@@ -321,12 +321,20 @@ async def _git_bytes(
 
 
 async def cancel_pending_pushes() -> None:
-    """Cancel and join git workers after their producers have quiesced."""
+    """Join this loop's workers after producers quiesce; discard foreign entries.
+
+    Tasks cannot be cancelled or joined safely from another loop. Dropping those
+    references also keeps closed-loop generations from accumulating here.
+    """
+    loop = asyncio.get_running_loop()
     snapshots = [
         (registry, list(registry.items()))
         for registry in (_pending_push_tasks, _push_retry_tasks)
     ]
-    tasks = {task for _, items in snapshots for _, task in items if task is not None}
+    tasks = {
+        task for _, items in snapshots for _, task in items
+        if task is not None and task.get_loop() is loop
+    }
     for task in tasks:
         if not task.done():
             task.cancel()
@@ -336,7 +344,9 @@ async def cancel_pending_pushes() -> None:
         # Workers can remove themselves while being joined. Never erase a replacement.
         for registry, items in snapshots:
             for key, task in items:
-                if registry.get(key) is task and (task is None or task.done()):
+                if registry.get(key) is task and (
+                    task is None or task.get_loop() is not loop or task.done()
+                ):
                     registry.pop(key, None)
     errors = [result for result in results if isinstance(result, Exception)]
     if errors:

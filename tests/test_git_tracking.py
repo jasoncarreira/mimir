@@ -280,6 +280,56 @@ async def test_git_worker_join_releases_home_lock(tmp_path, monkeypatch, success
         await git_tracking.cancel_pending_pushes()
 
 
+@pytest.mark.parametrize("registry_name", ["_pending_push_tasks", "_push_retry_tasks"])
+def test_cancel_pending_pushes_drops_closed_loop_tasks(monkeypatch, registry_name):
+    # Own the registries, not the surrounding pytest worker's ambient state.
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", {})
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", {})
+    registry = getattr(git_tracking, registry_name)
+
+    async def loop_a():
+        registry["stale-repo"] = asyncio.create_task(asyncio.Event().wait())
+
+    asyncio.run(loop_a())
+    assert registry["stale-repo"].get_loop().is_closed()
+
+    async def loop_b():
+        current = asyncio.create_task(asyncio.Event().wait())
+        registry["current-repo"] = current
+        await git_tracking.cancel_pending_pushes()
+        assert current.cancelled()
+
+    asyncio.run(loop_b())
+    assert git_tracking._pending_push_tasks == {}
+    assert git_tracking._push_retry_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_name", ["_pending_push_tasks", "_push_retry_tasks"])
+async def test_cancel_pending_pushes_propagates_worker_errors(monkeypatch, registry_name):
+    monkeypatch.setattr(git_tracking, "_pending_push_tasks", {})
+    monkeypatch.setattr(git_tracking, "_push_retry_tasks", {})
+    started = asyncio.Event()
+    failure = RuntimeError("worker cleanup failed")
+
+    async def worker():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise failure
+
+    task = asyncio.create_task(worker())
+    getattr(git_tracking, registry_name)["repo"] = task
+    await started.wait()
+    with pytest.raises(ExceptionGroup, match="git push cleanup failed") as caught:
+        await git_tracking.cancel_pending_pushes()
+    assert caught.value.exceptions == (failure,)
+    assert task.done()
+    assert git_tracking._pending_push_tasks == {}
+    assert git_tracking._push_retry_tasks == {}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("blob", [False, True])
 @pytest.mark.parametrize("failure", [asyncio.CancelledError, OSError, asyncio.TimeoutError])
