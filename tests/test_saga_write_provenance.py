@@ -238,6 +238,7 @@ async def test_synthesis_memory_store_preserves_service_provenance(
     assert call["owner_principal"] == "service:synthesis"
     assert call["origin_channel"] == f"{trigger}:owned"
     assert call["visibility"] == "service"
+    assert call["provenance"]["created_by"] == "service:synthesis"
 
 
 @pytest.mark.asyncio
