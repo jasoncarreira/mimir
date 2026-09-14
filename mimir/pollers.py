@@ -543,6 +543,9 @@ class _GithubFireAttestation:
 _github_fire_attestation: contextvars.ContextVar[_GithubFireAttestation | None] = (
     contextvars.ContextVar("github_fire_attestation", default=None)
 )
+_github_attestation_failure: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar("github_attestation_failure", default=None)
+)
 
 
 def _github_api_attestation(
@@ -555,6 +558,7 @@ def _github_api_attestation(
     fire = _github_fire_attestation.get()
     if fire is not None:
         if fire.attempts >= GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL:
+            _github_attestation_failure.set("budget")
             return None
         fire.attempts += 1
     headers = {
@@ -579,7 +583,16 @@ def _github_api_attestation(
         except (OSError, json.JSONDecodeError):
             payload = None
         return exc.code, payload
-    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
+        if isinstance(exc, json.JSONDecodeError):
+            reason = "malformed_payload"
+        elif isinstance(exc, TimeoutError) or (
+            isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, TimeoutError)
+        ):
+            reason = "timeout"
+        else:
+            reason = "transport"
+        _github_attestation_failure.set(reason)
         return None
 
 
@@ -603,31 +616,53 @@ def _github_author_is_trusted(
     )
     if any(set(value) - allowed for value in (*parts, author)):
         return False
+
+    def unavailable(request: str, failure_class: str) -> None:
+        try:
+            get_logger().log_sync(
+                "github_author_attestation_unavailable",
+                repository=repo, author=author, request=request,
+                failure_class=failure_class,
+            )
+        except Exception:
+            # Diagnostics must not change a trust verdict or trigger a retry.
+            pass
+
     escaped_repo = "/".join(urllib.parse.quote(value, safe="") for value in parts)
     escaped_author = urllib.parse.quote(author, safe="")
     # The permission endpoint reports ``read`` for any user on a public repo,
     # including non-collaborators.  The collaborator-existence endpoint keeps
     # those cases distinct: 204 means collaborator, 404 means not one.
     kwargs = {} if timeout is None else {"timeout": timeout}
+    # Existing mocks may return None without setting a diagnostic reason.
+    _github_attestation_failure.set(None)
     collaborator = _github_api_attestation(
         f"repos/{escaped_repo}/collaborators/{escaped_author}", token, **kwargs,
     )
     if collaborator is None:
+        unavailable("collaborator", _github_attestation_failure.get() or "transport")
         return None
     if collaborator[0] == 204:
         return True
     if collaborator[0] != 404:
+        unavailable("collaborator", "unexpected_status")
         return None
 
+    _github_attestation_failure.set(None)
     membership = _github_api_attestation(
         f"orgs/{urllib.parse.quote(parts[0], safe='')}/memberships/{escaped_author}",
         token, **kwargs,
     )
     if membership is None:
+        unavailable("membership", _github_attestation_failure.get() or "transport")
         return None
     if membership[0] == 404:
         return False
     if membership[0] != 200 or not isinstance(membership[1], dict):
+        unavailable(
+            "membership",
+            "unexpected_status" if membership[0] != 200 else "malformed_payload",
+        )
         return None
     return membership[1].get("state") == "active"
 

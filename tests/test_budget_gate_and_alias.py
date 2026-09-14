@@ -4813,6 +4813,9 @@ class _Arm2LiveState:
     def current(self, fallback: Any = None) -> Any:
         return self.state.current(fallback)
 
+    def author_attestation_was_unavailable(self) -> bool:
+        return self.state.author_attestation_was_unavailable()
+
     def merge(self, added: Any, fallback: Any = None) -> Any:
         return self.state.merge(added, fallback=fallback)
 

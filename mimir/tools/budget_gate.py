@@ -1852,6 +1852,16 @@ def _deny_admin_tool(
     service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
     if tool_name == "shell_exec" and service is not None and not detail:
         message = f"shell_exec was refused before execution ({reason})."
+    if (
+        reason.startswith("ifc_label_blocked:")
+        and isinstance(ctx, AuthContext)
+        and ctx.ifc_state.author_attestation_was_unavailable()
+    ):
+        message += (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
     return _service_shell_refusal_guidance(message, tool_name, service)
 
 

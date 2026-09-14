@@ -149,6 +149,64 @@ async def test_mixed_comment_authorship_and_retry(monkeypatch, other_verdict):
         set_forge_client(None)
 
 
+@pytest.mark.parametrize("verdict", [True, False, None])
+@pytest.mark.parametrize("logger_fails", [False, True])
+@pytest.mark.parametrize("author", ["other", "https://user:secret@github.com/body"])
+def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger_fails, author):
+    from mimir.tools.forge import _publish_author_attestation
+    import mimir.event_logger as events
+
+    recorded = []
+
+    def log(event, **fields):
+        recorded.append((event, fields))
+        if logger_fails:
+            raise RuntimeError("logger unavailable")
+
+    monkeypatch.setattr(events, "log_event_sync", log)
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda repo, author: (
+        True if author == "collaborator" else verdict
+    ), raising=False)
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        capture = access_control.begin_protected_result_capture()
+        try:
+            _publish_author_attestation(runtime, scope, ("collaborator", author, author))
+        finally:
+            provenance = access_control.end_protected_result_capture(capture)
+        assert (provenance.sources[0].integrity == "trusted") is (verdict is True)
+        assert runtime.context.ifc_state.author_attestation_was_unavailable() is (verdict is None)
+        if verdict is True:
+            assert recorded == []
+        else:
+            event, fields = recorded.pop()
+            assert event == "forge_author_attestation_downgraded"
+            assert fields["repository"] == "owner/repo"
+            assert fields["resource_id"] == provenance.sources[0].resource_id
+            diagnostic_author = "other" if author == "other" else "<invalid-author>"
+            assert fields["failed_authors"] == [diagnostic_author]
+            assert fields["unavailable_authors"] == ([diagnostic_author] if verdict is None else [])
+            assert "secret" not in json.dumps(fields)
+            assert fields["integrity"] == "untrusted"
+        monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *a, **kw: None)
+        refusal = budget_gate._deny_admin_tool(
+            "shell_exec", "ifc_label_blocked:shell_process",
+            ctx=runtime.context, enforcement_enabled=True,
+        )
+        assert ("GitHub author attestation was unavailable" in refusal) is (verdict is None)
+        fresh = _runtime(scope)
+        assert not fresh.context.ifc_state.author_attestation_was_unavailable()
+        unrelated = budget_gate._deny_admin_tool(
+            "shell_exec", "admin_required", ctx=runtime.context, enforcement_enabled=True,
+        )
+        assert "attestation" not in unrelated
+    finally:
+        set_forge_client(None)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["missing", "empty", "failed", "wrong_head", "mixed_provenance"])
 async def test_author_provenance_cannot_clear_unknown_or_failed_results(monkeypatch, case):
