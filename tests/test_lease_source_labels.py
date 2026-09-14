@@ -268,6 +268,69 @@ def test_lease_without_recorded_verdict_fails_closed(
     assert auth.ifc_state.has_untrusted_active_ingest()
 
 
+
+def test_metadata_failure_after_acquisition_clears_recorded_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport failure on re-acquisition must not leave a stale trusted verdict.
+
+    The verdict is cleared before metadata is fetched precisely so a raising
+    fetch fails closed. Forge ConnectionErrors are observed in production, so
+    this is a reachable path, not a theoretical one.
+    """
+    from mimir.forge import PullRequestProjection
+    from mimir.tools import forge, repo
+
+    scope = _scope(author="collaborator")
+    auth = _auth(scope=scope)
+    runtime = SimpleNamespace(context=auth)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root, scope=scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    lease = active_pr_checkout_lease_for_path(target)
+    assert lease is not None
+    state = RepoReviewState(action_scope=scope)
+    auth.server_discovered_pr_states.remember(state)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *args: (state, None))
+    monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
+    metadata = PullRequestProjection(
+        7, "Title", "open", "collaborator", False, "main", "change",
+        "a" * 40, True, "created", "updated",
+    )
+    client = SimpleNamespace(
+        get_pull_request=lambda scope: metadata,
+        get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
+        author_is_trusted=lambda repository, author: True,
+    )
+    monkeypatch.setattr(forge, "_client", lambda scope: client)
+
+    # First acquisition records an affirmative verdict.
+    assert repo.repo_checkout.func("owner/repo", 7, runtime=runtime)["path"] == str(checkout)
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is True
+
+    # Re-acquisition where the metadata fetch raises, as a forge transport
+    # failure does. The recorded verdict must not survive it.
+    def failing_metadata(scope):
+        raise ConnectionError("forge transport failed")
+
+    monkeypatch.setattr(client, "get_pull_request", failing_metadata)
+    with pytest.raises(Exception):
+        repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
+
+    # And the lease read that the stale verdict would have trusted is untrusted.
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=target.read_text(),
+    )
+    assert labels is not None
+    source = labels.sources[0]
+    assert (source.domain, source.integrity, source.integrity_effect) == (
+        "filesystem", "untrusted", "active_ingest",
+    )
+
 @pytest.mark.parametrize("tool_name", ["read_file", "grep"])
 def test_active_lease_file_results_use_repository_source_labels(
     tool_name: str,
