@@ -203,6 +203,36 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
     assert env.get("MIMIR_FILE_TOOL_ROOTS")
 
 
+def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
+    """Evidence retention must not move fixtures into controller-owned ancestry."""
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    root = workflow["env"]["PYTEST_EVIDENCE_ROOT"]
+    assert root.startswith("/tmp/mimir-pytest-evidence-")
+    assert "${{ github.run_id }}" in root
+    assert "${{ github.run_attempt }}" in root
+    evidence_jobs = 0
+    for job in workflow["jobs"].values():
+        steps = job["steps"]
+        uploads = [step for step in steps if step.get("name") == "Upload pytest evidence"]
+        if not uploads:
+            continue
+        evidence_jobs += 1
+        runs = "\n".join(step.get("run", "") for step in steps)
+        assert '--basetemp "$PYTEST_EVIDENCE_ROOT/' in runs
+        assert "$RUNNER_TEMP/pytest-evidence" not in runs
+        for upload in uploads:
+            assert upload["if"] == "failure()"
+            paths = upload["with"]["path"].splitlines()
+            assert paths
+            assert all(path.startswith("${{ env.PYTEST_EVIDENCE_ROOT }}/") for path in paths)
+    assert evidence_jobs == 7
+    worker_runs = "\n".join(step.get("run", "") for step in _worker_uid_job()["steps"])
+    assert 'sudo install -d -m 700 -o worklink -g worklink "$PYTEST_EVIDENCE_ROOT"' in worker_runs
+    assert 'sudo chmod o+x "$RUNNER_TEMP"' not in worker_runs
+
+
 def test_ci_frontend_caches_root_dependencies_and_bounds_build() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
