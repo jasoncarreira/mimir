@@ -2779,7 +2779,7 @@ async def test_permission_outcome_event(
     })]
 
 
-@pytest.mark.parametrize("untrusted_source", ["url", "forge", "message", "shell_output"])
+@pytest.mark.parametrize("untrusted_source", ["url", "forge", "message", "shell_output", "source_repo"])
 async def test_permission_outcome_after_trusted_cwd_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, untrusted_source: str,
 ) -> None:
@@ -2898,6 +2898,34 @@ async def test_permission_outcome_after_trusted_cwd_read(
             ))
 
         assert await request_shell("grant") is PermissionDecision.ALLOW_SESSION
+        if untrusted_source == "source_repo":
+            source_repo = tmp_path / "source-repo"
+            doc = source_repo / "docs" / "permissions.md"
+            doc.parent.mkdir(parents=True)
+            doc.write_text("Local source repository documentation.\n", encoding="utf-8")
+            monkeypatch.setenv("MIMIR_SOURCE_REPO", str(source_repo))
+            read_args = {"file_path": str(doc)}
+            authorization = get_tool_registry().authorize_tool(
+                "read_file", auth_context, enforce=True, arguments=read_args,
+            )
+            assert authorization.allowed
+            read_labels = classify_protected_result(
+                "read_file", read_args, auth_context, authorization,
+                result=doc.read_text(encoding="utf-8"),
+            )
+            assert read_labels is not None
+            auth_context.ifc_state.merge(read_labels, fallback=labels)
+            assert _live_untrusted_active_ingest(auth_context, labels) is False
+            assert client_authorized_host_execution_metadata(marker) == ("hands_shell", False)
+            assert await request_shell("after-read") is PermissionDecision.ALLOW_ONCE
+            result = await hands_shell.ainvoke(shell_args)
+            assert result == {"stdout": "PRIVATE OUTPUT", "stderr": "", "exitCode": 0}
+            assert [
+                (params["name"], params["arguments"])
+                for _, method, params in client.messages if method == "tools/call"
+            ] == [("shell", shell_args)]
+            return
+
         read_args = {"path": "notes.txt"}
         resource = canonical_client_file_resource(read_args["path"], cwd=context.cwd)
         assert resource == "client-file:%2Fproject%2Fnotes.txt"
@@ -2988,9 +3016,11 @@ async def test_permission_outcome_after_trusted_cwd_read(
                 "wrapper_name": "hands_shell", "tainted": tainted,
                 "resource_resolvable": False, "outcome": outcome,
             })
-            for tainted, outcome in [
+            for tainted, outcome in ([
+                (False, "operator_allow"), (False, "session_grant"),
+            ] if untrusted_source == "source_repo" else [
                 (False, "operator_allow"), (False, "session_grant"), (True, "operator_allow"),
-            ]
+            ])
         ]
     finally:
         await router.close()
