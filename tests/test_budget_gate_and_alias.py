@@ -4816,6 +4816,9 @@ class _Arm2LiveState:
     def current(self, fallback: Any = None) -> Any:
         return self.state.current(fallback)
 
+    def author_attestation_was_unavailable(self) -> bool:
+        return self.state.author_attestation_was_unavailable()
+
     def merge(self, added: Any, fallback: Any = None) -> Any:
         return self.state.merge(added, fallback=fallback)
 
@@ -5388,6 +5391,18 @@ async def test_real_operator_authorization_activates_query_not_mutation(
         assert "untrusted active ingest" in str(result.content)
 
 
+def test_operator_shell_live_taint_refusal_names_only_working_remedies() -> None:
+    from mimir.tools.budget_gate import _OPERATOR_SHELL_LIVE_TAINT_REFUSAL
+
+    text = _OPERATOR_SHELL_LIVE_TAINT_REFUSAL
+    assert "single bounded command from the pinned operator family" in text
+    assert "no shell metacharacters" in text
+    assert "send the operator a message" in text
+    assert "open a fresh user turn" in text
+    for dead_end in ("approval", "declassification", "clear_ingest_taint", "identity"):
+        assert dead_end not in text
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
@@ -5462,15 +5477,40 @@ async def test_operator_soft_fallback_rechecks_transitions_after_blocking_steps(
         auth,
         {"command": "gh pr review --approve 1 --repo owner/repo"},
     )
-    if middleware_path == "sync":
-        result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
-    else:
-        result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+    token = set_current_turn(_ifc_turn(auth))
+    try:
+        if middleware_path == "sync":
+            result = BudgetGateMiddleware().wrap_tool_call(request, sync_handler)
+        else:
+            result = await BudgetGateMiddleware().awrap_tool_call(request, async_handler)
+        retry = request.override(tool_call={**request.tool_call, "id": "repeat"})
+        if middleware_path == "sync":
+            repeated = BudgetGateMiddleware().wrap_tool_call(retry, sync_handler)
+        else:
+            repeated = await BudgetGateMiddleware().awrap_tool_call(retry, async_handler)
+    finally:
+        reset_current_turn(token)
 
     assert result.status == "error"
     assert "ifc_label_blocked:shell_process" in str(result.content)
+    assert repeated.status == "error"
+    assert repeated.tool_call_id == "repeat"
+    assert "Repeat" in repeated.content
+    assert result.content in repeated.content
     assert authorization_calls == 1
     assert claim_calls == int(transition_point == "review_claim")
+    assert handler_calls == 0
+
+    token = set_current_turn(_ifc_turn(auth))
+    try:
+        if middleware_path == "sync":
+            fresh = BudgetGateMiddleware().wrap_tool_call(retry, sync_handler)
+        else:
+            fresh = await BudgetGateMiddleware().awrap_tool_call(retry, async_handler)
+    finally:
+        reset_current_turn(token)
+    assert "Repeat" not in fresh.content
+    assert authorization_calls == 2
     assert handler_calls == 0
 
 
@@ -6866,3 +6906,124 @@ def test_admin_sensitive_tool_matches_mcp_name_variants():
     assert _is_admin_sensitive_tool("mcp_mimir_glob")
     assert _is_admin_sensitive_tool("mcp_mimir_grep")
     assert _is_admin_sensitive_tool("mcp_mimir_file_search")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize("attestation_unavailable", [False, True])
+@pytest.mark.parametrize("exact_grant", [False, True])
+async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_command(
+    middleware_path: str,
+    enforcement_enabled: bool,
+    attestation_unavailable: bool,
+    exact_grant: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
+    labels = state.merge(_ifc_labels(), fallback=auth.ifc_labels)
+    assert labels.has_untrusted_active_ingest is True
+    if attestation_unavailable:
+        state.record_author_attestation_unavailable()
+    command = "printf exact-shell-grant-regression"
+    if exact_grant:
+        assert state.approve_sink_once(
+            fallback=labels,
+            sink_category="shell_process",
+            destination=command,
+            canonical_principal=auth.canonical_principal or "",
+            lifetime_seconds=30,
+            durable_audit=lambda *_: True,
+        )
+    request = _make_request("shell_exec", "exact-shell-grant", auth, {"command": command})
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", auth, labels)
+    assert preparation is not None
+    assert preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+    assert preparation.binding is None
+
+    decisions: list[ToolAuthorization] = []
+    check_sink_flow = SinkGate.check_sink_flow
+
+    def capture_decision(*args: Any, **kwargs: Any) -> ToolAuthorization:
+        decision = check_sink_flow(*args, **kwargs)
+        if not exact_grant:
+            # Exercise the middleware's authorization-denial override separately
+            # from its live-state refusal after an allowed exact grant.
+            from dataclasses import replace
+
+            decision = replace(
+                decision, allowed=False, reason="ifc_label_blocked:shell_process",
+            )
+        decisions.append(decision)
+        return decision
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(SinkGate, "check_sink_flow", capture_decision)
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: captured.append((kind, fields)),
+    )
+    handler_calls = 0
+
+    def sync_handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_calls
+        handler_calls += 1
+        return ToolMessage(content="ran", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return sync_handler(request)
+
+    turn = _ifc_turn(auth)
+    turn.ifc_labels = labels
+    token = set_current_turn(turn)
+    try:
+        middleware = BudgetGateMiddleware()
+        if middleware_path == "sync":
+            result = middleware.wrap_tool_call(request, sync_handler)
+        else:
+            result = await middleware.awrap_tool_call(request, async_handler)
+        retry = request.override(tool_call={**request.tool_call, "id": "grant-repeat"})
+        if middleware_path == "sync":
+            repeated = middleware.wrap_tool_call(retry, sync_handler)
+        else:
+            repeated = await middleware.awrap_tool_call(retry, async_handler)
+    finally:
+        reset_current_turn(token)
+
+    assert len(decisions) == 1
+    assert repeated.status == "error"
+    assert repeated.tool_call_id == "grant-repeat"
+    assert repeated.content == (
+        f"Repeat of an identical command refused in this turn. {result.content}"
+    )
+    assert decisions[0].allowed is exact_grant
+    assert decisions[0].reason == (
+        "ifc_declassification_approved" if exact_grant else "ifc_label_blocked:shell_process"
+    )
+    assert ("GitHub author attestation was unavailable" in result.content) is attestation_unavailable
+    assert ("GitHub author attestation was unavailable" in repeated.content) is attestation_unavailable
+    assert handler_calls == 0
+    assert result.status == "error"
+    assert result.tool_call_id == "exact-shell-grant"
+    assert result.name == "shell_exec"
+    assert "ifc_label_blocked:shell_process" in result.content
+    assert "operator shell fallback requires exactly untainted live IFC" in result.content
+    assert "single bounded command from the pinned operator family with no shell metacharacters" in result.content
+    assert "send the operator a message asking them to open a fresh user turn" in result.content
+    assert state.current().has_untrusted_active_ingest is True
+    hard = [fields for kind, fields in captured if kind == "hard_boundary_denied"]
+    assert hard == [{
+        "tool": "shell_exec",
+        "boundary": "operator_shell_policy",
+        "reason": "operator_shell_tool_refused",
+        "target": None,
+        "trigger": "user_message",
+        "channel_id": "ch-1",
+        "service_principal": None,
+        "shell_profile": OPERATOR_SHELL_PROFILE,
+        "preparation_outcome": "soft_unbound",
+        "command_family": "profile_miss",
+        "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
+    }] * (1 if enforcement_enabled and not exact_grant else 2)
+    assert command not in json.dumps(captured)

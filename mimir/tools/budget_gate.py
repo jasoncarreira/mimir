@@ -729,8 +729,71 @@ _OPERATOR_SHELL_BINDING_REFUSAL = (
 )
 _OPERATOR_SHELL_LIVE_TAINT_REFUSAL = (
     "shell_exec was refused before execution (ifc_label_blocked:shell_process): "
-    "operator shell fallback requires exactly untainted live IFC"
+    "operator shell fallback requires exactly untainted live IFC. "
+    "Use a single bounded command from the pinned operator family with no shell "
+    "metacharacters, or send the operator a message asking them to open a fresh user turn."
 )
+
+
+def _with_author_attestation_note(message: str, reason: str, ctx: Any | None) -> str:
+    """Decorate refusal prose without changing the decision or machine reason."""
+    if (
+        reason.startswith("ifc_label_blocked:")
+        and isinstance(ctx, AuthContext)
+        and getattr(ctx, "ifc_state", None) is not None
+        and ctx.ifc_state.author_attestation_was_unavailable()
+    ):
+        message += (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
+    return message
+
+
+def _operator_shell_live_taint_refusal(ctx: Any | None) -> str:
+    return _with_author_attestation_note(
+        _OPERATOR_SHELL_LIVE_TAINT_REFUSAL, "ifc_label_blocked:shell_process", ctx,
+    )
+
+
+def _operator_shell_recorded_refusal(
+    request: ToolCallRequest,
+    *,
+    record: bool = False,
+    audit: Mapping[str, str] | None = None,
+    refusal: str = _OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+) -> ToolMessage | None:
+    turn = _get_current_turn_context()
+    if turn is None or _tool_name_from_request(request) != "shell_exec":
+        return None
+    arguments = _validated_arguments(request)
+    if arguments is None:
+        return None
+    key = json.dumps(arguments, sort_keys=True)
+    # This deny-only cache belongs to the turn, not the reusable middleware.
+    refusals = getattr(turn, "_operator_shell_live_refusals", None)
+    if record:
+        if refusals is None:
+            refusals = {}
+            turn._operator_shell_live_refusals = refusals
+        refusals[key] = (refusal, audit)
+        return None
+    if refusals is None or key not in refusals:
+        return None
+    refusal, recorded_audit = refusals[key]
+    content = f"Repeat of an identical command refused in this turn. {refusal}"
+    _record_tool_outcome(
+        "shell_exec", refused_reason=refusal, operator_shell_audit=recorded_audit,
+    )
+    _emit_tool_call_sync(
+        "shell_exec", ok=False, error=content, denied=True,
+        operator_shell_audit=recorded_audit,
+    )
+    return ToolMessage(
+        content=content, tool_call_id=_tool_call_id(request),
+        name="shell_exec", status="error",
+    )
 
 
 def _operator_shell_unbound(
@@ -864,16 +927,18 @@ def _operator_shell_soft_live_refusal(
         refused_reason=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
         operator_shell_audit=audit,
     )
+    refusal = _operator_shell_live_taint_refusal(auth_context)
+    _operator_shell_recorded_refusal(request, record=True, audit=audit, refusal=refusal)
     _emit_tool_call_sync(
         "shell_exec",
         ok=False,
         duration_ms=(time.monotonic() - started) * 1000.0,
-        error=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        error=refusal,
         denied=True,
         operator_shell_audit=audit,
     )
     return ToolMessage(
-        content=_OPERATOR_SHELL_LIVE_TAINT_REFUSAL,
+        content=refusal,
         tool_call_id=_tool_call_id(request),
         name="shell_exec",
         status="error",
@@ -1852,6 +1917,7 @@ def _deny_admin_tool(
     service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
     if tool_name == "shell_exec" and service is not None and not detail:
         message = f"shell_exec was refused before execution ({reason})."
+    message = _with_author_attestation_note(message, reason, ctx)
     return _service_shell_refusal_guidance(message, tool_name, service)
 
 
@@ -2755,6 +2821,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             return _malformed_arguments_refusal(request, tool_name)
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
+        repeated_refusal = _operator_shell_recorded_refusal(request)
+        if repeated_refusal is not None:
+            return repeated_refusal
         request = _request_with_resolved_service_write_path(
             request, tool_name, auth_context,
         )
@@ -2862,6 +2931,15 @@ class BudgetGateMiddleware(AgentMiddleware):
         if mutation_refusal is not None:
             return mutation_refusal
         if admin_denial is not None:
+            if (
+                operator_shell_preparation is not None
+                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+                and authorization.reason == "ifc_label_blocked:shell_process"
+            ):
+                admin_denial = _operator_shell_live_taint_refusal(auth_context)
+                _operator_shell_recorded_refusal(
+                    request, record=True, audit=operator_shell_audit, refusal=admin_denial,
+                )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
                 arguments=validated_arguments,
@@ -3032,6 +3110,12 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
+            if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
+                service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
+                _operator_shell_recorded_refusal(
+                    request, record=True, audit=operator_shell_audit,
+                    refusal=service_shell_refusal,
+                )
             _record_tool_outcome(
                 tool_name,
                 refused_reason=service_shell_refusal,
@@ -3287,6 +3371,9 @@ class BudgetGateMiddleware(AgentMiddleware):
             return _malformed_arguments_refusal(request, tool_name)
         auth_context = _auth_context_from_request(request)
         request = _strip_server_only_shell_args(request)
+        repeated_refusal = _operator_shell_recorded_refusal(request)
+        if repeated_refusal is not None:
+            return repeated_refusal
         request = _request_with_resolved_service_write_path(
             request, tool_name, auth_context,
         )
@@ -3394,6 +3481,15 @@ class BudgetGateMiddleware(AgentMiddleware):
         if mutation_refusal is not None:
             return mutation_refusal
         if admin_denial is not None:
+            if (
+                operator_shell_preparation is not None
+                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+                and authorization.reason == "ifc_label_blocked:shell_process"
+            ):
+                admin_denial = _operator_shell_live_taint_refusal(auth_context)
+                _operator_shell_recorded_refusal(
+                    request, record=True, audit=operator_shell_audit, refusal=admin_denial,
+                )
             _emit_tool_call_sync(
                 tool_name, ok=False, error=admin_denial, denied=True,
                 arguments=validated_arguments,
@@ -3564,6 +3660,12 @@ class BudgetGateMiddleware(AgentMiddleware):
         # so the caller reads why instead of an unexplained exit 1.
         service_shell_refusal = _service_shell_refusal(execution_request)
         if service_shell_refusal is not None:
+            if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
+                service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
+                _operator_shell_recorded_refusal(
+                    request, record=True, audit=operator_shell_audit,
+                    refusal=service_shell_refusal,
+                )
             _record_tool_outcome(
                 tool_name,
                 refused_reason=service_shell_refusal,

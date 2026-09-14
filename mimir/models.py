@@ -532,11 +532,21 @@ class InformationFlowState:
     # durable IFC cell carried by AuthContext so forked SDK/MCP tasks do not
     # depend on the ambient _current_turn ContextVar to retain turn authority.
     _sink_category_turn_id: str | None = field(default=None, repr=False, compare=False)
+    _author_attestation_unavailable: bool = field(default=False, repr=False, compare=False)
     _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
         with self._lock:
             return self.labels if self.labels is not None else fallback
+
+    def record_author_attestation_unavailable(self) -> None:
+        """Diagnostic history only; never clears taint or changes authority."""
+        with self._lock:
+            self._author_attestation_unavailable = True
+
+    def author_attestation_was_unavailable(self) -> bool:
+        with self._lock:
+            return self._author_attestation_unavailable
 
     def has_untrusted_active_ingest(
         self, fallback: InformationFlowLabels | None = None,

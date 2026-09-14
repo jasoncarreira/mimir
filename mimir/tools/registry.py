@@ -34,7 +34,7 @@ import tempfile
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -548,17 +548,6 @@ def _render_approval_metadata(value: object) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
-_MAX_APPROVAL_SOURCE_GROUPS = 20
-_APPROVAL_SOURCE_GROUP_FIELDS = (
-    "domain",
-    "sensitivity",
-    "authorized_principals",
-    "source_kind",
-    "integrity",
-    "integrity_effect",
-)
-
-
 def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
     render = _render_approval_metadata
     values = [
@@ -580,7 +569,9 @@ def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
 
 def _approval_source_group_key(source: Any) -> tuple[Any, ...]:
     return (
+        source.principal,
         source.domain,
+        source.bridge_instance,
         source.sensitivity,
         tuple(sorted(source.authorized_principals)),
         source.source_kind,
@@ -600,14 +591,7 @@ def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
     source = group[0]
     values = [
         f"count={render(len(group))}",
-        f"principal={render(source.principal or '(unknown)')}",
-        f"domain={render(source.domain or '(unknown)')}",
-        f"bridge_instance={render(source.bridge_instance or '(unknown)')}",
-        f"sensitivity={render(source.sensitivity)}",
-        f"authorized_principals={render(sorted(source.authorized_principals))}",
-        f"source_kind={render(source.source_kind)}",
-        f"integrity={render(source.integrity)}",
-        f"integrity_effect={render(source.integrity_effect)}",
+        _render_approval_source(source, include_resource_id=False),
     ]
     resource_ids = [source.resource_id or "(unknown)" for source in group]
     if source.domain == "filesystem":
@@ -617,77 +601,41 @@ def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
             common_prefix = ""
         if common_prefix:
             values.append(f"common_path_prefix={render(common_prefix)}")
-        values.append(f"example_resource_ids={render(resource_ids[:3])}")
+    values.append(f"example_resource_ids={render(resource_ids[:3])}")
     return [f"- {'; '.join(values)}"]
 
 
-def _render_approval_source_summary(sources: tuple[Any, ...]) -> str:
-    render = _render_approval_metadata
-    rendered_groups: list[tuple[list[str], int]] = []
-    active_ingest_grouped: dict[tuple[Any, ...], list[Any]] = {}
-    grouped: dict[tuple[Any, ...], list[Any]] = {}
+def _render_approval_source_summary(
+    sources: tuple[Any, ...], *, displayed_source: Any = None,
+) -> str:
+    """Filter operator presentation only; retain the complete carrier for audit."""
+    shown: list[str] = []
+    active_groups: dict[tuple[Any, ...], list[Any]] = {}
+    active_count = 0
+    omitted_count = 0
     for source in sources:
         if (
             source.integrity == Integrity.UNTRUSTED
             and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
         ):
-            key = (
-                *_approval_source_group_key(source),
-                source.principal,
-                source.bridge_instance,
-            )
-            active_ingest_grouped.setdefault(key, []).append(source)
-            continue
-        key = _approval_source_group_key(source)
-        grouped.setdefault(key, []).append(source)
+            active_count += 1
+            if source != displayed_source:
+                key = _approval_source_group_key(source)
+                active_groups.setdefault(key, []).append(source)
+        elif source != displayed_source:
+            omitted_count += 1
 
-    for group in active_ingest_grouped.values():
-        rendered_groups.append((_render_active_ingest_source_group(group), len(group)))
+    for group in active_groups.values():
+        shown.extend(_render_active_ingest_source_group(group))
 
-    known_fields = {
-        "principal", "resource_id", "bridge_instance", *_APPROVAL_SOURCE_GROUP_FIELDS,
-    }
-    extra_fields = tuple(
-        source_field.name
-        for source_field in fields(type(sources[0]))
-        if source_field.name not in known_fields
-    ) if sources else ()
-    for key, group in grouped.items():
-        domain, sensitivity, authorized, source_kind, integrity, integrity_effect = key
-        principals = sorted({source.principal or "(unknown)" for source in group})
-        bridges = sorted({source.bridge_instance or "(unknown)" for source in group})
-        values = [
-            f"count={render(len(group))}",
-            f"principals={render(principals)}",
-            f"domain={render(domain or '(unknown)')}",
-            f"bridge_instances={render(bridges)}",
-            f"sensitivity={render(sensitivity)}",
-            f"authorized_principals={render(list(authorized))}",
-            f"source_kind={render(source_kind)}",
-            f"integrity={render(integrity)}",
-            f"integrity_effect={render(integrity_effect)}",
-        ]
-        for field_name in extra_fields:
-            field_values = sorted({str(getattr(source, field_name)) for source in group})
-            values.append(f"{field_name}={render(field_values)}")
-        rendered_groups.append(([f"- {'; '.join(values)}"], len(group)))
-
-    if not rendered_groups:
-        return "- (none)"
-    shown: list[str] = []
-    omitted_groups = 0
-    omitted_sources = 0
-    for index, (group_lines, _source_count) in enumerate(rendered_groups):
-        if len(shown) + len(group_lines) > _MAX_APPROVAL_SOURCE_GROUPS:
-            omitted = rendered_groups[index:]
-            omitted_groups = len(omitted)
-            omitted_sources = sum(count for _lines, count in omitted)
-            break
-        shown.extend(group_lines)
-    if omitted_groups:
+    if not active_count:
+        shown.append("- No active untrusted ingest was present.")
+    elif not shown:
+        shown.append("- All active untrusted ingest is shown above.")
+    if omitted_count:
         shown.append(
-            f"- {render(omitted_groups)} additional source groups "
-            f"({render(omitted_sources)} sources) not shown"
+            f"- {omitted_count} other sources omitted: not active untrusted ingest; "
+            "cannot block this flow."
         )
     return "\n".join(shown)
 
@@ -705,6 +653,13 @@ async def request_operator_approval(
     Consent is recorded only from a later authenticated inbound operator
     message; this tool cannot create a grant.
     """
+    if sink_category == "shell_process":
+        return (
+            "request_operator_approval refused: no approval admits shell on a tainted turn. "
+            "Use a single bounded pinned-family command without shell metacharacters, "
+            "or send an operator message for a fresh user turn."
+        )
+
     from .._context import get_current_turn
     from ..operator_approval import cancel_request, create_request
 
@@ -750,7 +705,6 @@ async def request_operator_approval(
             SinkCategory.SAME_CHANNEL,
             SinkCategory.CROSS_CHANNEL,
             SinkCategory.PUBLIC,
-            SinkCategory.SHELL_PROCESS,
             SinkCategory.SPAWN,
             SinkCategory.NOTIFICATION,
             SinkCategory.FILE,
@@ -761,6 +715,7 @@ async def request_operator_approval(
             SinkCategory.FORGE,
         })
         ineligible = frozenset({
+            SinkCategory.SHELL_PROCESS,
             SinkCategory.NETWORK,
             SinkCategory.HTTP_WEBHOOK,
             SinkCategory.EXTERNAL_MCP,
@@ -831,7 +786,14 @@ async def request_operator_approval(
         else:
             blocking_details = "Blocking source: unknown; no source could be classified.\n"
 
-        rendered_sources = _render_approval_source_summary(request_carrier.sources)
+        rendered_sources = _render_approval_source_summary(
+            request_carrier.sources,
+            displayed_source=(
+                blocking_source
+                if blocking_scope in {"causing_source", "representative_source"}
+                else None
+            ),
+        )
         request_details = (
             f"Sink category: {render(category)}\n"
             f"Turn: {render(ctx.turn_id)}\n"

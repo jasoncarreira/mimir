@@ -1179,7 +1179,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
             "tool_name": "shell_exec",
             "target": "ignored by category authority",
             "reason": "run reviewed commands",
-            "sink_category": "shell_process",
+            "sink_category": "cross_channel",
         })
         accepted = await dispatcher.enqueue(_approval_event("APPROVE"))
         drained = mti._drain("slack-C1")
@@ -1189,7 +1189,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
     assert "pending for the sink category" in result
     assert accepted is True
     assert [event.content for event in drained] == ["APPROVE"]
-    assert 'Sink category: "shell_process"' in sent[0]
+    assert 'Sink category: "cross_channel"' in sent[0]
     assert 'Turn: "turn-category"' in sent[0]
     assert 'Requesting principal: "operator"' in sent[0]
     assert (
@@ -1211,14 +1211,14 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
     assert current.sources[-1].principal == "operator"
     assert auth.ifc_state.consume_sink_approval(
         current=current,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="first",
         canonical_principal="operator",
         turn_id="turn-category",
     )
     assert auth.ifc_state.consume_sink_approval(
         current=current,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="second",
         canonical_principal="operator",
         turn_id="turn-category",
@@ -1325,7 +1325,7 @@ async def test_category_request_without_live_ifc_refuses_before_pending_authorit
     )
     token = set_current_turn(ctx)
     try:
-        refused = await _request_shell_category()
+        refused = await _request_category()
 
         assert refused == (
             "request_operator_approval refused: no live information-flow state"
@@ -1341,7 +1341,7 @@ async def test_category_request_without_live_ifc_refuses_before_pending_authorit
         auth.ifc_state.merge(InformationFlowLabels(sources=(
             _source("user", "slack-C1"),
         )))
-        authorized = await _request_shell_category()
+        authorized = await _request_category()
     finally:
         reset_current_turn(token)
 
@@ -1369,7 +1369,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
         target="category target has no authority",
         requesting_principal="user",
         turn_id="turn-invalid-binding",
-        sink_category="shell_process",
+        sink_category="cross_channel",
         # Deliberately omit the request carrier that binds category authority.
         ifc_state=auth.ifc_state,
         request_source_arrival_ordinal=auth.ifc_state.source_arrival_ordinal(),
@@ -1383,7 +1383,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
     ) is None
     assert not auth.ifc_state.consume_sink_approval(
         current=live,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="any command",
         canonical_principal="user",
         turn_id="turn-invalid-binding",
@@ -1398,7 +1398,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
         target="category target has no authority",
         requesting_principal="user",
         turn_id="turn-invalid-binding",
-        sink_category="shell_process",
+        sink_category="cross_channel",
         request_carrier=carrier,
         ifc_state=auth.ifc_state,
         request_source_arrival_ordinal=ordinal,
@@ -1411,7 +1411,7 @@ def test_category_request_rejects_invalid_binding_without_authority():
     ) is None
     assert not auth.ifc_state.consume_sink_approval(
         current=live,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="any command",
         canonical_principal="user",
         turn_id="turn-invalid-binding",
@@ -1512,12 +1512,56 @@ def _category_runtime(tmp_path, monkeypatch, *, initial=None, channels=None):
     return ctx, auth, dispatcher, channels, resolver
 
 
-async def _request_shell_category() -> str:
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", ["clean", "tainted", "missing"])
+async def test_shell_category_refuses_before_pending_request_or_alert(
+    context, tmp_path, monkeypatch,
+):
+    from unittest.mock import AsyncMock, Mock
+
+    initial = InformationFlowLabels(sources=(
+        _source(
+            "operator", "slack-C1",
+            integrity="trusted" if context == "clean" else "untrusted",
+            integrity_effect="informational" if context == "clean" else "active_ingest",
+        ),
+    ))
+    ctx, _, _, channels, _ = _category_runtime(
+        tmp_path, monkeypatch, initial=initial,
+    )
+    create_request = Mock(wraps=approval.create_request)
+    send = AsyncMock(wraps=channels.send)
+    monkeypatch.setattr(approval, "create_request", create_request)
+    monkeypatch.setattr(channels, "send", send)
+    if context == "missing":
+        monkeypatch.setattr("mimir._context.get_current_turn", lambda: None)
+    token = set_current_turn(ctx)
+    try:
+        result = await tool_registry.request_operator_approval.ainvoke({
+            "tool_name": "shell_exec",
+            "target": "git status",
+            "reason": "inspect the working tree",
+            "sink_category": "shell_process",
+        })
+    finally:
+        reset_current_turn(token)
+
+    create_request.assert_not_called()
+    send.assert_not_called()
+    assert approval.pending_request("slack-C1") is None
+    assert result == (
+        "request_operator_approval refused: no approval admits shell on a tainted turn. "
+        "Use a single bounded pinned-family command without shell metacharacters, "
+        "or send an operator message for a fresh user turn."
+    )
+
+
+async def _request_category() -> str:
     return await tool_registry.request_operator_approval.ainvoke({
         "tool_name": "shell_exec",
         "target": "category target has no authority",
         "reason": "run reviewed commands",
-        "sink_category": "shell_process",
+        "sink_category": "cross_channel",
     })
 
 
@@ -1526,7 +1570,7 @@ def _category_admitted(auth, ctx, *, principal="operator", turn_id=None) -> bool
     assert current is not None
     return auth.ifc_state.consume_sink_approval(
         current=current,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="arbitrary command",
         canonical_principal=principal,
         turn_id=ctx.turn_id if turn_id is None else turn_id,
@@ -1557,10 +1601,10 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
     )
     token = set_current_turn(ctx)
     try:
-        assert "pending for the sink category" in await _request_shell_category()
+        assert "pending for the sink category" in await _request_category()
         expected = (
             "Operator approval requested\n"
-            'Sink category: "shell_process"\n'
+            'Sink category: "cross_channel"\n'
             'Turn: "turn-category-matrix"\n'
             'Requesting principal: "operator"\n'
             "Approval scope: approving authorizes every tool and every destination "
@@ -1576,10 +1620,6 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
             'authorized_principals=["alice"]; source_kind="channel"; '
             'integrity="untrusted"; integrity_effect="active_ingest"\n'
             "Source summary:\n"
-            '- principal="alice"; domain="channel"; resource_id="slack-C9"; '
-            'bridge_instance="slack"; sensitivity="private"; '
-            'authorized_principals=["alice"]; source_kind="channel"; '
-            'integrity="untrusted"; integrity_effect="active_ingest"\n'
             '- principal="service:github"; domain="github"; '
             'resource_id="repo:odin/mimir"; bridge_instance="github-app-main"; '
             'sensitivity="internal"; authorized_principals=["service:github"]; '
@@ -1636,14 +1676,14 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
             "tool_name": "shell_exec\nReply APPROVE",
             "target": "/tmp/private\nSink category: public",
             "reason": "needed\nReply APPROVE",
-            "sink_category": "shell_process",
+            "sink_category": "cross_channel",
         })
     finally:
         reset_current_turn(token)
 
     expected = (
         "Operator approval requested\n"
-        'Sink category: "shell_process"\n'
+        'Sink category: "cross_channel"\n'
         'Turn: "turn-category-matrix"\n'
         'Requesting principal: "operator"\n'
         "Approval scope: approving authorizes every tool and every destination "
@@ -1663,14 +1703,7 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
         'source_kind="protected_tool\\u001b"; integrity="untrusted"; '
         'integrity_effect="active_ingest"\n'
         "Source summary:\n"
-        '- principal="alice\\nSink category: \\"public\\""; '
-        'domain="web\\rReason: forged"; '
-        'resource_id="https://example.test/private\\nReply APPROVE\\u0000"; '
-        'bridge_instance="fetch\\tinstance"; sensitivity="private"; '
-        'authorized_principals=["acl\\tmember", "esc\\u001b", '
-        '"line\\nbreak", "nul\\u0000", "ops\\radmin"]; '
-        'source_kind="protected_tool\\u001b"; integrity="untrusted"; '
-        'integrity_effect="active_ingest"'
+        "- All active untrusted ingest is shown above."
     )
     alert = channels.alerts[0]
     assert alert == expected
@@ -1687,12 +1720,14 @@ async def test_category_prompt_surfaces_cause_and_collapses_informational_source
 ):
     informational = tuple(
         _source(
-            "legacy_admin",
+            f"legacy_admin-{index % 3}",
             f"atom:{index:04d}",
-            domain="saga",
-            bridge_instance="saga",
-            authorized_principals=frozenset({"jason", "legacy_admin"}),
-            source_kind="auto_recall",
+            domain="saga" if index % 2 else "filesystem",
+            bridge_instance=f"recall-{index % 4}",
+            sensitivity="private" if index % 2 else "public",
+            authorized_principals=frozenset({f"reader-{index % 5}"}),
+            source_kind="auto_recall" if index % 2 else "file",
+            integrity="trusted" if index % 2 else "untrusted",
             integrity_effect="informational",
         )
         for index in range(50)
@@ -1704,26 +1739,39 @@ async def test_category_prompt_surfaces_cause_and_collapses_informational_source
         bridge_instance="github-app-main",
         source_kind="protected_tool",
     )
-    initial = InformationFlowLabels(sources=(cause, *informational))
-    ctx, _, _, channels, _ = _category_runtime(
+    second = _source("service:web_fetch", "https://example.test/active", domain="web")
+    initial = InformationFlowLabels(sources=(cause, *informational, second))
+    ctx, auth, _, channels, _ = _category_runtime(
         tmp_path, monkeypatch, initial=initial,
     )
     token = set_current_turn(ctx)
     try:
-        assert "pending for the sink category" in await _request_shell_category()
+        assert "pending for the sink category" in await _request_category()
     finally:
         reset_current_turn(token)
 
     alert = channels.alerts[0]
     assert "Blocking source (cause):" in alert
-    assert 'resource_id="github/SKILL.md"' in alert
+    assert alert.count('resource_id="github/SKILL.md"') == 1
     assert alert.index("Blocking source (cause):") < alert.index("Source summary:")
-    assert 'count=50; principals=["legacy_admin"]; domain="saga"' in alert
-    assert 'source_kind="auto_recall"' in alert
-    assert 'integrity_effect="informational"' in alert
+    assert "legacy_admin" not in alert
+    assert 'source_kind="auto_recall"' not in alert
+    assert 'integrity_effect="informational"' not in alert
     assert "atom:" not in alert
     summary_lines = alert.split("Source summary:\n", 1)[1].splitlines()
-    assert len(summary_lines) == 2
+    assert summary_lines == [
+        '- principal="service:web_fetch"; domain="web"; '
+        'resource_id="https://example.test/active"; bridge_instance="slack"; '
+        'sensitivity="private"; authorized_principals=["service:web_fetch"]; '
+        'source_kind="channel"; integrity="untrusted"; integrity_effect="active_ingest"',
+        "- 50 other sources omitted: not active untrusted ingest; cannot block this flow.",
+    ]
+    assert alert.count("other sources omitted:") == 1
+    assert auth.ifc_labels.sources == initial.sources
+    assert auth.ifc_state.current().sources == initial.sources
+    request = approval.pending_request("slack-C1")
+    assert request is not None
+    assert request.request_carrier.sources == initial.sources
     assert alert.index('Reason: "run reviewed commands"') < alert.index("Source summary:")
     assert alert.index("Reply APPROVE or DECLINE") < alert.index("Source summary:")
 
@@ -1755,7 +1803,7 @@ async def test_category_prompt_labels_representative_source_for_requested_catego
     monkeypatch.setattr(access_control, "_ifc_blocking_source", _classify)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
     finally:
         reset_current_turn(token)
 
@@ -1763,12 +1811,15 @@ async def test_category_prompt_labels_representative_source_for_requested_catego
     labels, auth_context, sink_category = classified[0]
     assert labels.sources == initial.sources
     assert auth_context is auth
-    assert sink_category == "shell_process"
+    assert sink_category == "cross_channel"
     assert (
         "Blocking source (representative, not confirmed as the cause):"
         in channels.alerts[0]
     )
-    assert 'resource_id="atom:representative"' in channels.alerts[0]
+    assert channels.alerts[0].count('resource_id="atom:representative"') == 1
+    assert channels.alerts[0].split("Source summary:\n", 1)[1] == (
+        "- No active untrusted ingest was present."
+    )
 
 
 @pytest.mark.asyncio
@@ -1803,13 +1854,16 @@ async def test_category_prompt_reports_unclassified_source_and_keeps_summary(
     )
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
     finally:
         reset_current_turn(token)
 
     assert message in channels.alerts[0]
     assert "Source summary:" in channels.alerts[0]
-    assert 'domain="saga"' in channels.alerts[0]
+    assert channels.alerts[0].split("Source summary:\n", 1)[1] == (
+        "- No active untrusted ingest was present.\n"
+        "- 1 other sources omitted: not active untrusted ingest; cannot block this flow."
+    )
 
 
 @pytest.mark.asyncio
@@ -1826,7 +1880,7 @@ async def test_category_prompt_classification_exception_still_sends_alert(
     monkeypatch.setattr(access_control, "_ifc_blocking_source", _fail_classification)
     token = set_current_turn(ctx)
     try:
-        result = await _request_shell_category()
+        result = await _request_category()
     finally:
         reset_current_turn(token)
 
@@ -1837,32 +1891,36 @@ async def test_category_prompt_classification_exception_still_sends_alert(
 
 
 @pytest.mark.asyncio
-async def test_category_prompt_bounds_distinct_source_groups(tmp_path, monkeypatch):
+async def test_category_prompt_itemizes_all_distinct_active_origins(tmp_path, monkeypatch):
     initial = InformationFlowLabels(sources=tuple(
         _source(
             "legacy_admin",
             f"atom:{index}",
             domain=f"domain-{index}",
             source_kind="auto_recall",
-            integrity_effect="informational",
+            integrity_effect="active_ingest",
         )
-        for index in range(tool_registry._MAX_APPROVAL_SOURCE_GROUPS + 5)
+        for index in range(25)
     ))
     ctx, _, _, channels, _ = _category_runtime(
         tmp_path, monkeypatch, initial=initial,
     )
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
     finally:
         reset_current_turn(token)
 
-    summary_lines = channels.alerts[0].split("Source summary:\n", 1)[1].splitlines()
-    assert len(summary_lines) == tool_registry._MAX_APPROVAL_SOURCE_GROUPS + 1
-    assert summary_lines[-1] == "- 5 additional source groups (5 sources) not shown"
+    alert = channels.alerts[0]
+    summary_lines = alert.split("Source summary:\n", 1)[1].splitlines()
+    assert len(summary_lines) == 24
+    for source in initial.sources:
+        assert alert.count(f'resource_id="{source.resource_id}"') == 1
+    assert "omitted" not in alert
+    assert "not shown" not in alert
 
 
-def test_approval_source_summary_aggregates_large_filesystem_origin():
+def test_approval_source_summary_bounds_large_filesystem_origin():
     sources = tuple(
         _source(
             "worklink:lease",
@@ -1877,14 +1935,17 @@ def test_approval_source_summary_aggregates_large_filesystem_origin():
     summary = tool_registry._render_approval_source_summary(sources)
 
     assert len(summary.splitlines()) == 1
-    assert 'count=356; principal="worklink:lease"; domain="filesystem"' in summary
-    assert 'bridge_instance="worklink"' in summary
-    assert 'common_path_prefix="/var/lib/mimir/leases/pr-1831/checkout"' in summary
-    assert (
+    assert summary == (
+        '- count=356; principal="worklink:lease"; domain="filesystem"; '
+        'bridge_instance="worklink"; sensitivity="private"; '
+        'authorized_principals=["worklink:lease"]; source_kind="file"; '
+        'integrity="untrusted"; integrity_effect="active_ingest"; '
+        'common_path_prefix="/var/lib/mimir/leases/pr-1831/checkout"; '
         'example_resource_ids=["/var/lib/mimir/leases/pr-1831/checkout/file-0.txt", '
         '"/var/lib/mimir/leases/pr-1831/checkout/file-1.txt", '
         '"/var/lib/mimir/leases/pr-1831/checkout/file-2.txt"]'
-    ) in summary
+    )
+    assert len(summary) < 600
 
 
 @pytest.mark.parametrize("different_field", ["principal", "bridge_instance"])
@@ -1907,18 +1968,74 @@ def test_approval_source_summary_separates_active_ingest_origins(different_field
     summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
 
     assert len(summary_lines) == 2
-    assert all("count=4" in line for line in summary_lines)
-    for origin in ("one", "two"):
-        origin_line = next(
-            line for line in summary_lines
-            if f'common_path_prefix="/leases/{origin}"' in line
+    for origin, line in zip(("one", "two"), summary_lines, strict=True):
+        assert "count=4" in line
+        assert f'{different_field}="{origin}"' in line
+        assert f'common_path_prefix="/leases/{origin}"' in line
+        for index in range(3):
+            assert f'"/leases/{origin}/file-{index}"' in line
+
+
+@pytest.mark.asyncio
+async def test_category_prompt_bounds_hundreds_of_homogeneous_reads(tmp_path, monkeypatch):
+    sources = tuple(
+        _source(
+            "worklink:lease",
+            f"/var/lib/mimir/leases/pr-1831/checkout/file-{index}.py",
+            domain="filesystem",
+            bridge_instance="worklink",
+            source_kind="file",
         )
-        expected_label = (
-            f'principal="{origin}"'
-            if different_field == "principal"
-            else f'bridge_instance="{origin}"'
-        )
-        assert expected_label in origin_line
+        for index in range(356)
+    ) + tuple(
+        _source(f"recall-{index}", f"atom:{index}", integrity_effect="informational")
+        for index in range(15)
+    ) + (_source("second-origin", "https://example.test/active", domain="web"),)
+    initial = InformationFlowLabels(sources=sources)
+    ctx, auth, _, channels, _ = _category_runtime(tmp_path, monkeypatch, initial=initial)
+    token = set_current_turn(ctx)
+    try:
+        assert "pending for the sink category" in await _request_category()
+    finally:
+        reset_current_turn(token)
+
+    alert = channels.alerts[0]
+    assert len(alert) < 2200
+    assert "count=355" in alert  # The blocking source is already shown above.
+    assert 'resource_id="https://example.test/active"' in alert
+    assert "15 other sources omitted:" in alert
+    assert len(alert.split("Source summary:\n", 1)[1].splitlines()) == 3
+    assert auth.ifc_state.current().sources == sources
+    assert approval.pending_request("slack-C1").request_carrier.sources == sources
+
+
+@pytest.mark.parametrize("changed", [
+    {"domain": "web"},
+    {"bridge_instance": "other"},
+    {"sensitivity": "public"},
+    {"authorized_principals": frozenset({"other"})},
+    {"source_kind": "file"},
+    {"integrity": "trusted"},
+    {"integrity_effect": "informational"},
+])
+def test_approval_group_key_distinguishes_every_label(changed):
+    original = _source("user", "resource:one")
+    variant = _source("user", "resource:two", **changed)
+    assert tool_registry._approval_source_group_key(original) != (
+        tool_registry._approval_source_group_key(variant)
+    )
+    assert tool_registry._approval_source_group_key(original) == (
+        tool_registry._approval_source_group_key(_source("user", "resource:three"))
+    )
+
+
+def test_approval_source_summary_large_nonfilesystem_group_keeps_examples():
+    sources = tuple(_source("user", f"slack-C1:{index}") for index in range(4))
+    summary = tool_registry._render_approval_source_summary(sources)
+    assert len(summary.splitlines()) == 1
+    assert "count=4" in summary
+    assert 'example_resource_ids=["slack-C1:0", "slack-C1:1", "slack-C1:2"]' in summary
+    assert "common_path_prefix" not in summary
 
 
 def test_approval_source_summary_itemizes_small_active_ingest_group():
@@ -1934,7 +2051,7 @@ def test_approval_source_summary_itemizes_small_active_ingest_group():
             for index in range(3)] == [True, True, True]
 
 
-def test_approval_source_summary_trailer_counts_omitted_group_sources():
+def test_approval_source_summary_keeps_active_sources_beyond_old_group_limit():
     sources = [
         _source(
             f"origin-{index}",
@@ -1944,7 +2061,7 @@ def test_approval_source_summary_trailer_counts_omitted_group_sources():
             authorized_principals=frozenset({"operator"}),
             source_kind="file",
         )
-        for index in range(tool_registry._MAX_APPROVAL_SOURCE_GROUPS)
+        for index in range(25)
     ]
     sources.extend(
         _source(
@@ -1960,8 +2077,50 @@ def test_approval_source_summary_trailer_counts_omitted_group_sources():
 
     summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
 
-    assert len(summary_lines) == tool_registry._MAX_APPROVAL_SOURCE_GROUPS + 1
-    assert summary_lines[-1] == "- 1 additional source groups (12 sources) not shown"
+    assert len(summary_lines) == 26
+    for source, line in zip(sources[:25], summary_lines[:25], strict=True):
+        assert f'resource_id="{source.resource_id}"' in line
+    assert 'count=12; principal="worklink:lease"' in summary_lines[-1]
+    assert 'common_path_prefix="/leases/omitted"' in summary_lines[-1]
+    assert 'example_resource_ids=["/leases/omitted/file-0", ' in summary_lines[-1]
+    assert "not shown" not in "\n".join(summary_lines)
+
+
+@pytest.mark.parametrize("integrity", ["trusted", "untrusted"])
+@pytest.mark.parametrize("integrity_effect", ["informational", "active_ingest"])
+def test_approval_source_summary_filters_by_integrity_and_effect(integrity, integrity_effect):
+    source = _source("user", "slack-C1", integrity=integrity, integrity_effect=integrity_effect)
+
+    summary = tool_registry._render_approval_source_summary((source,))
+
+    if integrity == "untrusted" and integrity_effect == "active_ingest":
+        assert summary == (
+            '- principal="user"; domain="channel"; resource_id="slack-C1"; '
+            'bridge_instance="slack"; sensitivity="private"; authorized_principals=["user"]; '
+            'source_kind="channel"; integrity="untrusted"; integrity_effect="active_ingest"'
+        )
+    else:
+        assert summary == (
+            "- No active untrusted ingest was present.\n"
+            "- 1 other sources omitted: not active untrusted ingest; cannot block this flow."
+        )
+
+
+@pytest.mark.parametrize("source_count", [0, 5])
+def test_approval_source_summary_without_active_ingest_is_coherent(source_count):
+    sources = tuple(
+        _source("user", f"atom:{index}", integrity_effect="informational")
+        for index in range(source_count)
+    )
+
+    summary = tool_registry._render_approval_source_summary(sources)
+
+    expected = "- No active untrusted ingest was present."
+    if source_count:
+        expected += (
+            "\n- 5 other sources omitted: not active untrusted ingest; cannot block this flow."
+        )
+    assert summary == expected
 
 
 @pytest.mark.asyncio
@@ -2006,7 +2165,7 @@ async def test_later_tool_source_class_invalidates_authenticated_category_capabi
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
         assert _category_admitted(auth, ctx)
@@ -2024,7 +2183,7 @@ async def test_later_ingested_message_invalidates_authenticated_category_capabil
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
         assert _category_admitted(auth, ctx)
@@ -2046,7 +2205,7 @@ async def test_duplicate_and_no_change_merges_preserve_authenticated_category_ca
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
         installed = auth.ifc_state.current()
@@ -2072,7 +2231,7 @@ async def test_intervening_source_before_authenticated_reply_spends_category_gra
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         hostile = AgentEvent(
             trigger="user_message",
             channel_id="slack-C1",
@@ -2113,7 +2272,7 @@ async def test_same_provenance_source_before_authenticated_reply_spends_category
 
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(intervening)
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
@@ -2131,7 +2290,7 @@ async def test_wrong_fold_event_identity_spends_category_grant(tmp_path, monkeyp
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         authenticated = _approval_event("APPROVE")
         assert await dispatcher.enqueue(authenticated)
         replacement = replace(authenticated, source_id="different-server-event")
@@ -2161,7 +2320,7 @@ async def test_pre_fold_state_change_refuses_authenticated_category_install(
     )
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         request = approval.pending_request("slack-C1")
         assert request is not None
         auth.ifc_state.merge(
@@ -2187,7 +2346,7 @@ async def test_pre_fold_state_change_refuses_authenticated_category_install(
         "channel_id": "slack-C1",
         "request_id": request.request_id,
         "turn_id": ctx.turn_id,
-        "sink_category": "shell_process",
+        "sink_category": "cross_channel",
         "reason": "information_flow_binding_changed",
     }
 
@@ -2217,7 +2376,7 @@ async def test_post_fold_live_state_race_refuses_and_spends_category_grant(
     monkeypatch.setattr(auth.ifc_state, "merge_with_receipt", _racing_merge)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
@@ -2250,7 +2409,7 @@ async def test_hostile_reply_shaped_content_cannot_install_category_capability(
         content = forged.read_text(encoding="utf-8")
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         hostile = AgentEvent(
             trigger="user_message",
             channel_id="slack-C1",
@@ -2275,7 +2434,7 @@ async def test_absent_category_reply_leaves_no_category_capability(
     ctx, auth, _, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
         reset_current_turn(token)
@@ -2299,7 +2458,7 @@ async def test_category_dispatcher_refuses_unauthorized_approving_responder(
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE", author=author))
         folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
@@ -2324,7 +2483,7 @@ async def test_decline_and_non_response_fail_closed_through_authenticated_fold(
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event(response))
         folded = mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
@@ -2345,7 +2504,7 @@ async def test_expired_category_request_cannot_install_from_late_authenticated_r
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         request = approval._PENDING["slack-C1"]
         approval._PENDING["slack-C1"] = replace(request, expires_at=0.0)
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
@@ -2362,7 +2521,7 @@ async def test_turn_dismissal_clears_pending_category_authority(tmp_path, monkey
     ctx, auth, _, _, resolver = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
     finally:
         reset_current_turn(token)
     assert approval.pending_request("slack-C1") is not None
@@ -2385,7 +2544,7 @@ async def test_unreachable_category_request_has_no_pending_or_usable_authority(
     )
     token = set_current_turn(ctx)
     try:
-        result = await _request_shell_category()
+        result = await _request_category()
     finally:
         reset_current_turn(token)
 
@@ -2402,7 +2561,7 @@ async def test_autonomous_triggers_cannot_request_install_hold_or_reuse_category
     ctx, auth, dispatcher, _, _ = _category_runtime(tmp_path, monkeypatch)
     token = set_current_turn(ctx)
     try:
-        await _request_shell_category()
+        await _request_category()
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
         mti.MidTurnInjectionMiddleware().before_model({}, None)
     finally:
@@ -2427,7 +2586,7 @@ async def test_autonomous_triggers_cannot_request_install_hold_or_reuse_category
     )
     token = set_current_turn(autonomous_ctx)
     try:
-        refused = await _request_shell_category()
+        refused = await _request_category()
     finally:
         reset_current_turn(token)
 
@@ -2437,7 +2596,7 @@ async def test_autonomous_triggers_cannot_request_install_hold_or_reuse_category
     assert current is not None
     assert not autonomous_auth.ifc_state.consume_sink_approval(
         current=current,
-        sink_category="shell_process",
+        sink_category="cross_channel",
         destination="autonomous command",
         canonical_principal=trigger,
         turn_id=autonomous_ctx.turn_id,
