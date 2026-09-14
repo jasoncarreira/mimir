@@ -515,6 +515,10 @@ class InformationFlowState:
     repository_author_trust: RepositoryAuthorTrustCache = field(
         default_factory=RepositoryAuthorTrustCache, repr=False, compare=False, init=False,
     )
+    # Acquisition verdicts keyed by immutable scope ID (including PR author/head).
+    pr_checkout_author_trust: dict[str, bool | None] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
     labels: InformationFlowLabels | None = None
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,

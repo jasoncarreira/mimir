@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,7 +11,9 @@ from mimir.access_control import (
     OperationDecision,
     SinkGate,
     ToolAuthorization,
+    begin_protected_result_capture,
     classify_protected_result,
+    end_protected_result_capture,
     protected_result_source,
 )
 from mimir.models import (
@@ -18,6 +21,7 @@ from mimir.models import (
     InformationFlowLabels,
     InformationFlowState,
     RepoPRActionScope,
+    RepoReviewState,
     SourceLabel,
     TurnInteractivity,
 )
@@ -34,6 +38,7 @@ def _recorded_lease(
     *,
     repository: str = "owner/repo",
     expires_at: datetime | None = None,
+    scope: RepoPRActionScope | None = None,
 ) -> tuple[Path, Path, dict[str, object]]:
     checkout = root / "scope-lease"
     git_directory = checkout / ".git"
@@ -52,7 +57,7 @@ def _recorded_lease(
         "head_sha": "a" * 40,
         "destination_ref": "refs/heads/worklink/7",
         "owner": "mimir-bot",
-        "scope_id": _scope(repository).scope_id,
+        "scope_id": (scope or _scope(repository)).scope_id,
         "path": str(checkout),
         "lease_root": str(root),
         "created_at": now.isoformat(),
@@ -71,6 +76,7 @@ def _scope(
     *,
     pr_number: int = 7,
     observed_head_sha: str = "a" * 40,
+    author: str = "mimir-bot",
 ) -> RepoPRActionScope:
     return RepoPRActionScope(
         provenance="server_discovered",
@@ -87,7 +93,7 @@ def _scope(
         observed_head_sha=observed_head_sha,
         base_ref="main",
         observed_base_sha="b" * 40,
-        pull_request_author="mimir-bot",
+        pull_request_author=author,
     )
 
 
@@ -98,8 +104,15 @@ def _auth(
     pr_number: int = 7,
     observed_head_sha: str = "a" * 40,
     scope: RepoPRActionScope | None = None,
+    recorded_verdict: bool = True,
 ) -> AuthContext:
     current = labels or InformationFlowLabels()
+    scope = scope or _scope(
+        repository, pr_number=pr_number, observed_head_sha=observed_head_sha,
+    )
+    state = InformationFlowState(labels=current)
+    if recorded_verdict:
+        state.pr_checkout_author_trust[scope.scope_id] = True
     return AuthContext(
         principal="operator",
         canonical_principal="operator",
@@ -110,14 +123,213 @@ def _auth(
         interactivity=TurnInteractivity.INTERACTIVE,
         enforcement_enabled=True,
         ifc_labels=current,
-        ifc_state=InformationFlowState(labels=current),
-        repo_pr_action_scope=scope or _scope(
-            repository,
-            pr_number=pr_number,
-            observed_head_sha=observed_head_sha,
-        ),
+        ifc_state=state,
+        repo_pr_action_scope=scope,
     )
 
+
+@pytest.mark.parametrize(
+    ("verdict", "mismatch"),
+    [(True, None), (False, None), (None, None),
+     (True, "number"), (True, "head_sha"), (True, "author"),
+     (True, "missing_author"), (True, "no_attestation")],
+)
+def test_checkout_records_native_author_trust_for_file_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    verdict: bool | None, mismatch: str | None,
+) -> None:
+    from dataclasses import replace
+
+    from mimir.forge import PullRequestProjection
+    from mimir.tools import forge, repo
+
+    author = "" if mismatch == "missing_author" else "collaborator"
+    scope = _scope(author=author)
+    auth = _auth(scope=scope, recorded_verdict=mismatch is not None)
+    runtime = SimpleNamespace(context=auth)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root, scope=scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    lease = active_pr_checkout_lease_for_path(target)
+    assert lease is not None
+    state = RepoReviewState(action_scope=scope)
+    auth.server_discovered_pr_states.remember(state)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *args: (state, None))
+    monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
+    metadata = PullRequestProjection(
+        7, "Title", "open", author, False, "main", "change",
+        "a" * 40, True, "created", "updated",
+    )
+    if mismatch in {"number", "head_sha", "author"}:
+        metadata = replace(metadata, **{
+            mismatch: {"number": 8, "head_sha": "c" * 40, "author": "other"}[mismatch],
+        })
+        auth.ifc_state.repository_author_trust.resolve(
+            "owner/repo", "collaborator", lambda: True,
+        )
+    calls = []
+
+    def attest(repository, author):
+        calls.append((repository, author))
+        return verdict
+
+    client = SimpleNamespace(
+        get_pull_request=lambda scope: metadata,
+        get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
+        author_is_trusted=attest,
+    )
+    if mismatch == "no_attestation":
+        client.author_is_trusted = None
+    monkeypatch.setattr(forge, "_client", lambda scope: client)
+    result = repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
+    assert result["status"] == "checked_out"
+    assert result["path"] == str(checkout)
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is (
+        verdict if mismatch is None else None
+    )
+    assert calls == ([] if mismatch else [("owner/repo", "collaborator")])
+
+    def no_attestation(*args):
+        pytest.fail("filesystem read attempted author attestation")
+
+    monkeypatch.setattr(client, "author_is_trusted", no_attestation)
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=target.read_text(),
+    )
+    trusted = verdict is True and mismatch is None
+    assert labels is not None
+    assert len(labels.sources) == 1
+    source = labels.sources[0]
+    assert (source.domain, source.integrity, source.integrity_effect) == (
+        ("repository", "trusted", "informational") if trusted
+        else ("filesystem", "untrusted", "active_ingest")
+    )
+    assert source.resource_id == (
+        f"owner/repo#pull/7@{'a' * 40}" if trusted else str(target)
+    )
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+    if mismatch is not None:
+        return
+
+    # Definitive verdicts are shared; unavailable attestations must be retried.
+    if verdict is None:
+        monkeypatch.setattr(client, "author_is_trusted", attest)
+    token = begin_protected_result_capture()
+    try:
+        result = forge.pr_diff.func("owner/repo", 7, runtime=runtime)
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert provenance is not None
+    labels = classify_protected_result(
+        "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(
+            tool_name="pr_diff", decision="resource_scoped", allowed=True,
+            repo_pr_action_scope=scope,
+        ),
+        result=result, provenance=provenance,
+    )
+    assert labels is not None
+    assert len(labels.sources) == 1
+    source = labels.sources[0]
+    assert (source.domain, source.integrity, source.integrity_effect) == (
+        "repository", "trusted" if trusted else "untrusted", "active_ingest",
+    )
+    assert source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+    assert len(calls) == (2 if verdict is None else 1)
+
+
+@pytest.mark.parametrize("author", ["collaborator", "mimir-bot"])
+def test_lease_without_recorded_verdict_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, author: str,
+) -> None:
+    scope = _scope(author=author)
+    auth = _auth(scope=scope, recorded_verdict=False)
+    auth.ifc_state.repository_author_trust.resolve("owner/repo", author, lambda: True)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    _, target, _ = _recorded_lease(lease_root, scope=scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(target), bridge_instance="filesystem",
+    )
+
+    assert (source.domain, source.integrity, source.integrity_effect) == (
+        "filesystem", "untrusted", "active_ingest",
+    )
+    auth.ifc_state.merge(InformationFlowLabels().with_source(source))
+    assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+
+def test_metadata_failure_after_acquisition_clears_recorded_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport failure on re-acquisition must not leave a stale trusted verdict.
+
+    The verdict is cleared before metadata is fetched precisely so a raising
+    fetch fails closed. Forge ConnectionErrors are observed in production, so
+    this is a reachable path, not a theoretical one.
+    """
+    from mimir.forge import PullRequestProjection
+    from mimir.tools import forge, repo
+
+    scope = _scope(author="collaborator")
+    auth = _auth(scope=scope)
+    runtime = SimpleNamespace(context=auth)
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    checkout, target, _ = _recorded_lease(lease_root, scope=scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
+    lease = active_pr_checkout_lease_for_path(target)
+    assert lease is not None
+    state = RepoReviewState(action_scope=scope)
+    auth.server_discovered_pr_states.remember(state)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *args: (state, None))
+    monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
+    metadata = PullRequestProjection(
+        7, "Title", "open", "collaborator", False, "main", "change",
+        "a" * 40, True, "created", "updated",
+    )
+    client = SimpleNamespace(
+        get_pull_request=lambda scope: metadata,
+        get_diff=lambda scope: "diff --git a/src/work.py b/src/work.py",
+        author_is_trusted=lambda repository, author: True,
+    )
+    monkeypatch.setattr(forge, "_client", lambda scope: client)
+
+    # First acquisition records an affirmative verdict.
+    assert repo.repo_checkout.func("owner/repo", 7, runtime=runtime)["path"] == str(checkout)
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is True
+
+    # Re-acquisition where the metadata fetch raises, as a forge transport
+    # failure does. The recorded verdict must not survive it.
+    def failing_metadata(scope):
+        raise ConnectionError("forge transport failed")
+
+    monkeypatch.setattr(client, "get_pull_request", failing_metadata)
+    with pytest.raises(Exception):
+        repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
+    assert auth.ifc_state.pr_checkout_author_trust[scope.scope_id] is None
+
+    # And the lease read that the stale verdict would have trusted is untrusted.
+    labels = classify_protected_result(
+        "read_file", {"file_path": str(target)}, auth,
+        ToolAuthorization(tool_name="read_file", decision="resource_scoped", allowed=True),
+        result=target.read_text(),
+    )
+    assert labels is not None
+    source = labels.sources[0]
+    assert (source.domain, source.integrity, source.integrity_effect) == (
+        "filesystem", "untrusted", "active_ingest",
+    )
 
 @pytest.mark.parametrize("tool_name", ["read_file", "grep"])
 def test_active_lease_file_results_use_repository_source_labels(

@@ -199,6 +199,7 @@ def test_repo_cleanup_refuses_without_active_lease() -> None:
 def test_checkout_proof_is_isolated_to_named_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    set_forge_client(SimpleNamespace(author_is_trusted=None))
     first = _scope(RepoPRAction.CHECKOUT, RepoPRAction.INSPECT)
     second = _scope(RepoPRAction.CHECKOUT, RepoPRAction.INSPECT, number=8)
     context = _auth(first, second)

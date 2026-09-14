@@ -1528,7 +1528,7 @@ def _lease_read_auth(
     return replace(_auth(), repo_review_state=state, repo_pr_action_scope=scope)
 
 
-def test_self_authored_active_lease_is_trusted_but_arbitrary_root_is_not(
+def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1553,6 +1553,7 @@ def test_self_authored_active_lease_is_trusted_but_arbitrary_root_is_not(
     auth = _lease_read_auth(
         lease_root, checkout, pull_request_author="mimir-bot",
     )
+    auth.ifc_state.pr_checkout_author_trust[auth.repo_pr_action_scope.scope_id] = True
 
     sources = [
         protected_result_source(
@@ -1621,6 +1622,7 @@ def test_active_lease_does_not_trust_sibling_path_within_lease_root(
     auth = _lease_read_auth(
         lease_root, checkout, pull_request_author="mimir-bot",
     )
+    auth.ifc_state.pr_checkout_author_trust[auth.repo_pr_action_scope.scope_id] = True
 
     sources = [
         protected_result_source(
@@ -1677,6 +1679,7 @@ def test_active_lease_record_supersedes_generic_file_integrity_ledger(
     auth = _lease_read_auth(
         lease_root, checkout, pull_request_author="mimir-bot",
     )
+    auth.ifc_state.pr_checkout_author_trust[auth.repo_pr_action_scope.scope_id] = True
     assert _configured_pr_checkout_lease_root() == lease_root
     assert protected_result_source(
         auth, principal="filesystem", domain="filesystem",

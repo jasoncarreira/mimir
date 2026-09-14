@@ -9416,11 +9416,13 @@ def protected_result_source(
             if scope is None:
                 review_state = getattr(auth_context, "repo_review_state", None)
                 scope = getattr(review_state, "action_scope", None)
-        self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+        # Acquired from head-bound native PR metadata and the same turn-local
+        # author verdict cache as forge reads. No network lookup on file reads.
+        ifc_state = getattr(auth_context, "ifc_state", None)
+        author_trust = getattr(ifc_state, "pr_checkout_author_trust", {})
         trusted_lease = (
             lease is not None
-            and bool(self_login)
-            and getattr(scope, "pull_request_author", None) == self_login
+            and author_trust.get(getattr(scope, "scope_id", None)) is True
             and getattr(scope, "scope_id", None) == lease.scope_id
             and getattr(scope, "canonical_repo", "").lower()
             == lease.canonical_repo.lower()
