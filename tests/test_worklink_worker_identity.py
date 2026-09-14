@@ -196,7 +196,10 @@ def test_ci_worker_uid_leg_seeds_the_state_that_makes_it_discriminating() -> Non
     assert "MIMIR_FILE_TOOL_ROOTS=" in runs
 
     # MIMIR_FILE_TOOL_ROOTS must be set to a real value, not left empty.
-    env = job["steps"][-1].get("env") or {}
+    env = next(
+        step for step in job["steps"]
+        if step.get("name") == "Run mimir test suite as the non-owning worker uid"
+    ).get("env") or {}
     assert env.get("MIMIR_FILE_TOOL_ROOTS")
 
 
