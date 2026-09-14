@@ -1249,11 +1249,7 @@ asyncio.run(run())
                      if line in {"handlers-installed", "main-blocked", "worker-signalled"}]
             assert setup == ["handlers-installed", "main-blocked", "worker-signalled"]
             assert progress.with_suffix(".wakeup").read_bytes() == bytes([signal.SIGTERM])
-            # The signal-delivery worker can journal worker-signalled between
-            # the observer's timer-start records. Assert their order, not adjacency.
-            watchdog_start = [line for line in state.splitlines()
-                              if line in {"watchdog-start-enter", "watchdog-start-returned"}]
-            assert watchdog_start == ["watchdog-start-enter", "watchdog-start-returned"]
+            assert "watchdog-start-enter\nwatchdog-start-returned\n" in state
             assert "signal-enter:" not in state
             assert "signal-dispatch:" not in diagnostics
             assert "cleanup-enter" not in state
