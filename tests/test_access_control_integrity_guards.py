@@ -58,6 +58,7 @@ def test_skill_recorder_rejects_invalid_manifest(tmp_path: Path, manifest: bytes
 def test_skill_recorder_filters_keys_and_prunes_previous_install(tmp_path: Path) -> None:
     root = tmp_path / "skills/example"
     root.mkdir(parents=True)
+    (root / "empty-directory").mkdir()
     (root / "SKILL.md").write_text("installed")
     metadata = tmp_path / ".mimir/skill-integrity.json"
     metadata.parent.mkdir()
