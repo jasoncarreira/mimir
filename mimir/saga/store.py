@@ -86,7 +86,6 @@ def store(
     session_dedup_threshold: float | None = None,
     owner_principal: str | None = None,
     origin_channel: str | None = None,
-    integrity: str = "untrusted",
     origin_trigger: str | None = None,
     origin_ref: str | None = None,
     origin_domain: str | None = None,
@@ -116,8 +115,6 @@ def store(
     """
     if not content or not content.strip():
         raise ValueError("store: content cannot be empty")
-    if integrity not in {"trusted", "untrusted"}:
-        raise ValueError(f"store: invalid integrity {integrity!r}")
     content = content.strip()
     content_hash = _hash_content(content)
     created_at = _utc_now_iso()
@@ -180,7 +177,6 @@ def store(
             owner_principal=effective_owner,
             origin_domain=origin_domain,
             visibility=effective_visibility,
-            integrity=integrity,
         )
         if existing_id is not None:
             began = False
@@ -227,9 +223,9 @@ def store(
             "stream, profile, memory_type, arousal, valence, "
             "encoding_confidence, topics, source_type, metadata, "
             "agent_id, session_id, is_pinned, owner_principal, "
-            "origin_channel, integrity, origin_trigger, origin_ref, "
+            "origin_channel, origin_trigger, origin_ref, "
             "origin_domain, visibility, provenance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 atom_id, content, content_hash, created_at,
                 stream, profile, memory_type, arousal, valence,
@@ -238,7 +234,6 @@ def store(
                 agent_id, session_id, 1 if is_pinned else 0,
                 owner_principal or "legacy_admin",
                 origin_channel,
-                integrity,
                 origin_trigger,
                 origin_ref,
                 origin_domain,
@@ -286,7 +281,6 @@ def _find_session_near_duplicate(
     owner_principal: str,
     origin_domain: str | None,
     visibility: str,
-    integrity: str,
 ) -> str | None:
     """Cosine-scan every atom in ``session_id`` for one whose embedding
     is **strictly greater than** ``threshold`` similar to ``cand_vec_bytes``.
@@ -295,7 +289,7 @@ def _find_session_near_duplicate(
     not-duplicate — the threshold itself is the line that must be
     crossed, not touched.)
 
-    Scoped by session and the same owner/domain/visibility/integrity ACL
+    Scoped by session and the same owner/domain/visibility ACL
     partition used by the later consolidation dedup pass. Cross-session
     paraphrases get caught later by consolidation, not here.
 
@@ -315,10 +309,10 @@ def _find_session_near_duplicate(
         "JOIN embeddings e ON e.atom_id = a.id "
         "WHERE a.session_id = ? AND a.agent_id = ? AND a.tombstoned = 0 "
         "AND a.owner_principal = ? AND a.origin_domain IS ? "
-        "AND a.visibility = ? AND a.integrity = ?",
+        "AND a.visibility = ?",
         (
             session_id, agent_id, owner_principal, origin_domain,
-            visibility, integrity,
+            visibility,
         ),
     ).fetchall()
 

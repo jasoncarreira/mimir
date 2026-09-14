@@ -407,7 +407,7 @@ def recall(
     base_sql = (
         f"SELECT id, content, stream, profile, memory_type, source_type, "
         f"topics, metadata, agent_id, is_pinned, created_at, session_id, "
-        f"encoding_confidence, owner_principal, origin_channel, integrity, "
+        f"encoding_confidence, owner_principal, origin_channel, "
         f"origin_trigger, origin_ref "
         f"FROM atoms WHERE id IN ({placeholders}) AND tombstoned = 0 "
         f"AND {auth_where}"
@@ -419,7 +419,7 @@ def recall(
     cols = ("id", "content", "stream", "profile", "memory_type",
             "source_type", "topics", "metadata", "agent_id", "is_pinned",
             "created_at", "session_id", "encoding_confidence", "owner_principal",
-            "origin_channel", "integrity", "origin_trigger", "origin_ref")
+            "origin_channel", "origin_trigger", "origin_ref")
     atoms = {row[0]: dict(zip(cols, row)) for row in atom_rows}
 
     # Apply agent_id filter + optional stream filter at this stage.

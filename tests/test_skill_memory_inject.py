@@ -341,7 +341,7 @@ class TestInjectedIdCapture:
             assert learning_source.bridge_instance == "saga"
             assert learning_source.sensitivity == "private"
             assert learning_source.source_kind == "auto_recall"
-            assert learning_source.integrity == "untrusted"
+            assert learning_source.integrity == "trusted"
             assert learning_source.integrity_effect == "informational"
             assert learning_source.authorized_principals == frozenset({
                 "legacy_admin", "test-admin",

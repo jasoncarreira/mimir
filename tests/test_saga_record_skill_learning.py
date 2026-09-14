@@ -135,7 +135,7 @@ async def test_records_learning_with_validated_metadata(store, turn_with_session
 
 
 @pytest.mark.asyncio
-async def test_trusted_turn_records_trusted_learning_with_origin(
+async def test_trusted_turn_records_learning_with_origin_without_integrity_kwarg(
     store, turn_with_session,
 ):
     labels = InformationFlowLabels().with_source(SourceLabel(
@@ -156,7 +156,7 @@ async def test_trusted_turn_records_trusted_learning_with_origin(
     await _call(turn, skill="memory", kind="tip", content="trusted learning")
 
     call = store.calls[0]
-    assert call["integrity"] == Integrity.TRUSTED
+    assert "integrity" not in call
     assert call["origin_trigger"] == "poller:skill-review"
     assert call["origin_ref"] == "event:123"
 

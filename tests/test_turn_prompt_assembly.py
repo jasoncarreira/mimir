@@ -165,9 +165,9 @@ async def test_auto_loaded_skill_learning_contributes_atom_provenance(
     conn.execute(
         "INSERT INTO atoms "
         "(id, content, content_hash, source_type, metadata, created_at, "
-        "owner_principal, origin_channel, integrity, origin_trigger, "
+        "owner_principal, origin_channel, origin_trigger, "
         "origin_domain, visibility) "
-        "VALUES (?, ?, ?, 'skill_learning', ?, ?, ?, ?, 'untrusted', "
+        "VALUES (?, ?, ?, 'skill_learning', ?, ?, ?, ?, "
         "'poller', 'feed', 'private')",
         (
             "learning-poller-1",
@@ -219,7 +219,7 @@ async def test_auto_loaded_skill_learning_contributes_atom_provenance(
         "service:feed-poller", "operator",
     })
     assert source.source_kind == "auto_recall"
-    assert source.integrity == "untrusted"
+    assert source.integrity == "trusted"
     assert source.integrity_effect == "informational"
 
 

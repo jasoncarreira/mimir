@@ -1518,7 +1518,7 @@ class TestV7OwnershipMigration:
                 "WHERE type = 'index' AND tbl_name = 'world_state'"
             )
         }
-        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 13
+        assert max(versions) == m.CURRENT_SCHEMA_VERSION == 14
         assert {
             "owner_principal",
             "origin_channel",
@@ -1688,9 +1688,8 @@ def test_current_schema_has_owner_dedup_and_recall_provenance() -> None:
         atom_columns = {
             row[1]: row for row in conn.execute("PRAGMA table_info(atoms)").fetchall()
         }
-        assert {"integrity", "origin_trigger", "origin_ref"} <= atom_columns.keys()
-        assert atom_columns["integrity"][3] == 1
-        assert atom_columns["integrity"][4] == "'untrusted'"
+        assert {"origin_trigger", "origin_ref"} <= atom_columns.keys()
+        assert "integrity" not in atom_columns
         assert m.detect_schema_version(conn) == m.CURRENT_SCHEMA_VERSION
     finally:
         conn.close()
@@ -1726,8 +1725,7 @@ def test_v11_fresh_and_migrated_indexes_have_identical_pragma_output() -> None:
             "idx_sessions_channel_recency",
         ):
             migrated.execute(f"DROP INDEX {name}")
-        migrated.execute("DROP INDEX idx_atoms_trusted_boundary_v13")
-        migrated.execute("DROP INDEX idx_atoms_integrity_created_at")
+        migrated.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT")
         assert m.detect_schema_version(migrated) == 10
         m._execute_migration_script(migrated, m.MIGRATIONS[11])
         assert m.detect_schema_version(migrated) == 11
@@ -1750,6 +1748,7 @@ class TestV12LegacyIntegrityMigration:
     def _database(*, include_v10: bool = True) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:")
         conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted'")
         versions = [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 12)]
         if include_v10:
             versions[9] = (10, "2026-07-20 20:15:00")
@@ -1816,7 +1815,8 @@ class TestV13TrustedBoundaryMigration:
     def test_all_untrusted_atoms_are_flipped_without_other_changes(self, caplog) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript(Path("mimir/saga/schema.sql").read_text())
-        conn.execute("DROP INDEX idx_atoms_trusted_boundary_v13")
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted'")
+        m._execute_migration_script(conn, m.MIGRATIONS[12])
         conn.executemany(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             [(version, "2000-01-01T00:00:00+00:00") for version in range(1, 13)],
@@ -1851,7 +1851,7 @@ class TestV13TrustedBoundaryMigration:
 
         assert m.detect_schema_version(conn) == 12
         with caplog.at_level("INFO", logger=m.__name__):
-            m.apply_pending_migrations(conn, fresh=False)
+            m.apply_pending_migrations(conn, fresh=False, target_version=13)
 
         assert m.detect_schema_version(conn) == 13
         assert conn.execute(
@@ -1869,8 +1869,144 @@ class TestV13TrustedBoundaryMigration:
         versions = conn.execute(
             "SELECT version, applied_at FROM schema_version ORDER BY version"
         ).fetchall()
-        m.apply_pending_migrations(conn, fresh=False)
+        m.apply_pending_migrations(conn, fresh=False, target_version=13)
         assert conn.execute(
             "SELECT version, applied_at FROM schema_version ORDER BY version"
         ).fetchall() == versions
         assert m._execute_migration_script(conn, m.MIGRATIONS[13]) == 0
+
+
+class TestV14IntegrityRemoval:
+    @staticmethod
+    def _database(version: int = 13) -> sqlite3.Connection:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Nullable to also exercise fail-closed handling of malformed legacy data.
+        conn.execute("ALTER TABLE atoms ADD COLUMN integrity TEXT DEFAULT 'untrusted'")
+        if version < 11:
+            for index in (
+                "idx_triples_embedding_recency", "idx_sessions_recency",
+                "idx_sessions_channel_recency",
+            ):
+                conn.execute(f"DROP INDEX {index}")
+        for migration in range(12, version + 1):
+            m._execute_migration_script(conn, m.MIGRATIONS[migration])
+        conn.executemany(
+            "INSERT INTO schema_version VALUES (?, '2026-08-01T00:00:00+00:00')",
+            [(v,) for v in range(1, version + 1)],
+        )
+        conn.executemany(
+            "INSERT INTO atoms (rowid, id, content, content_hash, created_at, "
+            "integrity, tombstoned, origin_trigger, origin_ref) "
+            "VALUES (?, ?, ?, ?, '2020-01-01', 'trusted', ?, 'turn', 'message:1')",
+            [(7, "live", "searchable live", "h1", 0),
+             (42, "dead", "searchable tombstone", "h2", 1)],
+        )
+        conn.execute(
+            "INSERT INTO embeddings VALUES ('live', 'stub', 'stub', 1, x'01020304', '2020-01-01')"
+        )
+        conn.execute("INSERT INTO atom_topics VALUES ('dead', 'retained')")
+        conn.execute(
+            "INSERT INTO triples (id, subject, predicate, object, source_atom_id, created_at) "
+            "VALUES ('triple', 's', 'p', 'o', 'live', '2020-01-01')"
+        )
+        conn.commit()
+        assert m.detect_schema_version(conn) == version
+        return conn
+
+    @pytest.mark.parametrize("version", [10, 11, 12, 13])
+    def test_trusted_rows_and_dependents_survive(self, version: int) -> None:
+        conn = self._database(version)
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(atoms)")
+                   if r[1] != "integrity"]
+        atom_query = "SELECT rowid, " + ", ".join(columns) + " FROM atoms ORDER BY rowid"
+        before = conn.execute(atom_query).fetchall()
+        dependents = {table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                      for table in ("embeddings", "atom_topics", "triples")}
+        stamps = conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(atom_query).fetchall() == before
+        assert {table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                for table in dependents} == dependents
+        assert "integrity" not in {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert not {"idx_atoms_integrity_created_at", "idx_atoms_trusted_boundary_v13"} & {
+            r[1] for r in conn.execute("PRAGMA index_list(atoms)")
+        }
+        assert conn.execute("SELECT * FROM schema_version ORDER BY version").fetchall()[:version] == stamps
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'searchable' ORDER BY rowid"
+        ).fetchall() == [(7,), (42,)]
+        conn.execute("UPDATE atoms SET content = 'replacement' WHERE id = 'live'")
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'replacement'"
+        ).fetchall() == [(7,)]
+        conn.execute("DELETE FROM atoms WHERE id = 'live'")
+        assert conn.execute("SELECT * FROM embeddings").fetchall() == []
+        assert conn.execute("SELECT source_atom_id FROM triples").fetchone() == (None,)
+        assert conn.execute(
+            "SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH 'replacement'"
+        ).fetchall() == []
+        conn.commit()
+        conn.execute("DELETE FROM schema_version")
+        conn.commit()
+        assert m.detect_schema_version(conn) == 14
+        m.apply_pending_migrations(conn, fresh=False)
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
+        conn.close()
+
+    @pytest.mark.parametrize("version", [10, 11, 12, 13])
+    @pytest.mark.parametrize("stamps", ["present", "empty", "missing"])
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    @pytest.mark.parametrize("integrity", ["untrusted", None, "unknown"])
+    def test_nontrusted_refusal_changes_nothing(
+        self, version: int, stamps: str, atom_id: str, integrity: str | None
+    ) -> None:
+        conn = self._database(version)
+        conn.execute("UPDATE atoms SET integrity = ? WHERE id = ?", (integrity, atom_id))
+        if stamps == "empty":
+            conn.execute("DELETE FROM schema_version")
+        elif stamps == "missing":
+            conn.execute("DROP TABLE schema_version")
+        conn.commit()
+        before = list(conn.iterdump())
+
+        with pytest.raises(sqlite3.IntegrityError, match="v14 refused.*nontrusted.*tombstones") as exc:
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert f"{integrity!r}=1" in str(exc.value)
+        assert list(conn.iterdump()) == before
+        assert not conn.in_transaction
+        assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        conn.close()
+
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    def test_v14_sql_guard_independently_refuses_nontrusted(self, atom_id: str) -> None:
+        conn = self._database()
+        conn.execute("UPDATE atoms SET integrity = 'untrusted' WHERE id = ?", (atom_id,))
+        conn.commit()
+        before = list(conn.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match="migration_v14_refused_nontrusted_atoms"):
+            with conn:
+                conn.execute("BEGIN")
+                m._execute_migration_script(conn, m.MIGRATIONS[14])
+        assert list(conn.iterdump()) == before
+        assert conn.execute("SELECT name FROM sqlite_temp_master").fetchall() == []
+        conn.close()
+
+    @pytest.mark.parametrize("fresh", [True, False])
+    def test_fresh_schema_has_no_integrity(self, fresh: bool) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        m.apply_pending_migrations(conn, fresh=fresh)
+        assert m.detect_schema_version(conn) == 14
+        assert "integrity" not in {r[1] for r in conn.execute("PRAGMA table_info(atoms)")}
+        assert not {"idx_atoms_integrity_created_at", "idx_atoms_trusted_boundary_v13"} & {
+            r[1] for r in conn.execute("PRAGMA index_list(atoms)")
+        }
+        conn.close()

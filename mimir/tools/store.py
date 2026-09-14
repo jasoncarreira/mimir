@@ -100,8 +100,6 @@ async def memory_store(
     owner_principal = provenance["created_by"]
     origin_channel = auth_context.channel_id
     visibility = "service" if is_trusted_service(auth_context) else "private"
-    labels = auth_context.ifc_state.current(auth_context.ifc_labels)
-    integrity = labels.persisted_integrity
 
     try:
         result = await client.store(
@@ -111,7 +109,6 @@ async def memory_store(
             session_id=effective_session_id,
             owner_principal=owner_principal,
             origin_channel=origin_channel,
-            integrity=integrity,
             origin_trigger=auth_context.origin_trigger or auth_context.trigger,
             origin_ref=auth_context.origin_ref,
             origin_domain=None,
