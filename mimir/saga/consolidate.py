@@ -222,8 +222,8 @@ def emit_observation(
 def _compute_intersected_acl(
     conn: sqlite3.Connection,
     evidence_ids: list[str],
-) -> Ownership:
-    """Compute the intersected ACL from evidence atoms.
+) -> tuple[Ownership, str]:
+    """Compute the intersected ACL and integrity from evidence atoms.
 
     Fetches the ownership columns from the atoms table for all evidence
     atoms and computes the intersection using the fail-closed ACL
@@ -231,16 +231,17 @@ def _compute_intersected_acl(
     provenance, the result defaults to service/admin-only (legacy_admin).
 
     This ensures that observations are no more readable than their least
-    permissive source atom.
+    permissive source atom. Integrity is trusted only for a nonempty,
+    complete set of live evidence atoms that are all trusted.
     """
     if not evidence_ids:
         from .ownership import Ownership
-        return Ownership()
+        return Ownership(), "untrusted"
 
     placeholders = ",".join(["?"] * len(evidence_ids))
     rows = conn.execute(
         f"""SELECT id, owner_principal, origin_channel, origin_domain,
-                  visibility, provenance
+                  visibility, provenance, integrity
            FROM atoms
            WHERE id IN ({placeholders})
              AND tombstoned = 0""",
@@ -249,7 +250,7 @@ def _compute_intersected_acl(
 
     if len(rows) != len(set(evidence_ids)):
         from .ownership import Ownership
-        return Ownership()
+        return Ownership(), "untrusted"
 
     row_dicts = [
         {
@@ -261,7 +262,8 @@ def _compute_intersected_acl(
         }
         for r in rows
     ]
-    return intersect_acl_from_rows(row_dicts)
+    integrity = "trusted" if all(r[6] == "trusted" for r in rows) else "untrusted"
+    return intersect_acl_from_rows(row_dicts), integrity
 
 
 def _candidate_raws(
@@ -418,7 +420,7 @@ def consolidate(
 
         evidence_ids = [a["id"] for a in cluster]
 
-        intersected_acl = _compute_intersected_acl(conn, evidence_ids)
+        intersected_acl, integrity = _compute_intersected_acl(conn, evidence_ids)
 
         # Pre-check: an observation with exactly this evidence set
         # already exists? Skip synthesis (no LLM cost) and continue.
@@ -450,6 +452,7 @@ def consolidate(
                 origin_domain=intersected_acl.origin_domain,
                 visibility=intersected_acl.visibility,
                 provenance=intersected_acl.provenance,
+                integrity=integrity,
             ),
         )
         if emitted is None:

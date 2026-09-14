@@ -2055,7 +2055,7 @@ class SagaStore:
                         conn,
                         owner_principal=_compute_intersected_acl(
                             conn, eids
-                        ).owner_principal,
+                        )[0].owner_principal,
                         extra_subjects=list(extra_canonical_subjects or []),
                     ),
                 )
@@ -2182,7 +2182,7 @@ class SagaStore:
                     # for external-access record only.
                     continue
 
-                intersected_acl = _compute_intersected_acl(conn, evidence_ids)
+                intersected_acl, integrity = _compute_intersected_acl(conn, evidence_ids)
 
                 def _extra_writes(observation_id: str) -> None:
                     nonlocal triples_stored, contradicts_stored
@@ -2262,6 +2262,7 @@ class SagaStore:
                         origin_domain=intersected_acl.origin_domain,
                         visibility=intersected_acl.visibility,
                         provenance=intersected_acl.provenance,
+                        integrity=integrity,
                     ),
                     extra_writes=_extra_writes,
                     now=now,

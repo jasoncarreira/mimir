@@ -99,6 +99,16 @@ def store(
     propagate (caller can retry; nothing landed). DB errors propagate
     too.
 
+    ``integrity`` defaults to ``"untrusted"``: absent an explicit provenance
+    assertion, a new insert must not acquire trust. Caller inventory: the
+    public ``SagaStore.store`` facade forwards its own fail-closed label;
+    ``SagaStore.consolidate`` and the standalone ``consolidate`` both pass
+    integrity intersected from evidence. The package re-export and direct
+    test/legacy callers may omit it safely for unclassified inputs, never
+    as evidence of trust. No production caller relies on this default to
+    classify a derived observation. Dedupe returns the existing atom without
+    relabeling it; this default governs new inserts only.
+
     ``precomputed_embedding`` lets bulk callers (bench ingest, importer)
     batch-embed externally and skip the per-atom ``embed_fn`` call.
     Pass ``(vec_bytes, provider, model, dim)`` in the same shape

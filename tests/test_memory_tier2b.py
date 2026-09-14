@@ -374,7 +374,7 @@ def test_consolidate_missing_evidence_atom_fails_closed(conn):
         provenance={"acl_a": True},
     ).atom_id
 
-    assert _compute_intersected_acl(conn, [atom_id, "missing"]) == Ownership()
+    assert _compute_intersected_acl(conn, [atom_id, "missing"]) == (Ownership(), "untrusted")
 
 
 def test_consolidate_includes_already_cited_raws_in_pool(conn):
