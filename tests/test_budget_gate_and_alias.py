@@ -1599,7 +1599,9 @@ async def test_real_producer_unchanged_result_preserves_category_capability(
 
     auth = _ifc_auth()
     turn = _ifc_turn(auth)
-    turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
+    turn.ifc_labels = _install_sink_category_capability(
+        auth, turn_id=turn.turn_id, sink_category="file",
+    )
     middleware = BudgetGateMiddleware()
     source = turn.ifc_labels.sources[-1]
     sink_calls = 0
@@ -1620,7 +1622,8 @@ async def test_real_producer_unchanged_result_preserves_category_capability(
             producer,
         )
         admitted = await middleware.awrap_tool_call(
-            _make_request("shell_exec", "sink-after-unchanged", auth, {"command": "pwd"}),
+            _make_request("write_file", "sink-after-unchanged", auth,
+                          {"file_path": "/tmp/unchanged.txt", "content": "unchanged"}),
             sink,
         )
     finally:
@@ -5186,6 +5189,77 @@ async def test_operator_binding_mismatch_and_reuse_never_falls_back(
     assert calls == 0
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("middleware_path", ["sync", "async"])
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+async def test_two_consecutive_shell_calls_do_not_self_taint(
+    middleware_path: str,
+    tool_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "operator-root"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{root}:ro")
+    monkeypatch.setattr(
+        "mimir.read_policy.configured_non_admin_read_roots", lambda: (root,),
+    )
+    auth = _arm2_operator_auth(InformationFlowState(), enforcement_enabled=True)
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        calls.append(request.tool_call["id"])
+        return ToolMessage(content="ordinary output", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request: ToolCallRequest) -> ToolMessage:
+        return handler(request)
+
+    for index in range(2):
+        request = _make_request(
+            tool_name, f"shell-{index}", auth,
+            {"command": "printf ordinary", "cwd": str(root)},
+        )
+        result = (
+            middleware.wrap_tool_call(request, handler)
+            if middleware_path == "sync"
+            else await middleware.awrap_tool_call(request, async_handler)
+        )
+        assert result.status != "error", result.content
+        assert not auth.ifc_state.has_untrusted_active_ingest(auth.ifc_labels)
+        if tool_name == "bash_async":
+            # Launch handles carry no content. Exercise the mapped content and
+            # job-list paths before the next launch, not just two empty handles.
+            for companion, args in (
+                ("bash_job_output", {"job_id": f"job-{index}"}),
+                ("bash_jobs_list", {"scope": "visible"}),
+            ):
+                request = _make_request(companion, f"{companion}-{index}", auth, args)
+                result = (
+                    middleware.wrap_tool_call(request, handler)
+                    if middleware_path == "sync"
+                    else await middleware.awrap_tool_call(request, async_handler)
+                )
+                assert result.status != "error", result.content
+                assert not auth.ifc_state.has_untrusted_active_ingest(auth.ifc_labels)
+    assert calls == (
+        ["shell-0", "shell-1"] if tool_name == "shell_exec" else [
+            "shell-0", "bash_job_output-0", "bash_jobs_list-0",
+            "shell-1", "bash_job_output-1", "bash_jobs_list-1",
+        ]
+    )
+    shell_sources = [
+        source for source in auth.ifc_state.current(auth.ifc_labels).sources
+        if source.domain == ("shell" if tool_name == "shell_exec" else "shell_jobs")
+    ]
+    assert shell_sources
+    assert all(
+        (source.integrity, source.integrity_effect) == ("untrusted", "informational")
+        for source in shell_sources
+    )
+
+
 @pytest.mark.parametrize("bounded_count", [1, 5], ids=["bounded-after-unbounded", "many-bounded"])
 def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
     bounded_count: int,
@@ -5230,6 +5304,19 @@ def test_bounded_iteration_preserves_ingest_and_later_unbounded_refusal(
         ),
         handler,
     )
+    # Shell output is now informational. Introduce genuine external ingest to
+    # retain this test's original bounded-iteration/unbounded-refusal contract.
+    auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external-source",
+        domain="web",
+        resource_id="external-after-first-command",
+        bridge_instance="test",
+        sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
     bounded = [
         middleware.wrap_tool_call(
             _make_request(
@@ -6880,8 +6967,8 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
     def capture_decision(*args: Any, **kwargs: Any) -> ToolAuthorization:
         decision = check_sink_flow(*args, **kwargs)
         if not exact_grant:
-            # Exercise the middleware's authorization-denial override separately
-            # from its live-state refusal after an allowed exact grant.
+            # Exercise the middleware's authorization-denial override explicitly;
+            # the exact-grant arm uses the real non-bypassable shell veto.
             from dataclasses import replace
 
             decision = replace(
@@ -6929,10 +7016,11 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
     assert repeated.content == (
         f"Repeat of an identical command refused in this turn. {result.content}"
     )
-    assert decisions[0].allowed is exact_grant
-    assert decisions[0].reason == (
-        "ifc_declassification_approved" if exact_grant else "ifc_label_blocked:shell_process"
-    )
+    # #1725 now vetoes tainted unbounded shell before declassification. Shadow
+    # mode can report allowed, but the middleware still refuses execution. Keep
+    # the externally observable refusal assertions below unchanged.
+    assert decisions[0].allowed is (exact_grant and not enforcement_enabled)
+    assert decisions[0].reason == "ifc_label_blocked:shell_process"
     assert ("GitHub author attestation was unavailable" in result.content) is attestation_unavailable
     assert ("GitHub author attestation was unavailable" in repeated.content) is attestation_unavailable
     assert handler_calls == 0
@@ -6957,5 +7045,5 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
         "preparation_outcome": "soft_unbound",
         "command_family": "profile_miss",
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
-    }] * (1 if enforcement_enabled and not exact_grant else 2)
+    }] * (1 if enforcement_enabled else 2)
     assert command not in json.dumps(captured)

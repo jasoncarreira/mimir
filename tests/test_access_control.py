@@ -11984,6 +11984,7 @@ def test_operator_binding_genuine_match_and_sink_is_shell_only(
     ("command", "allowed", "reason"),
     [
         ("chainlink issue show 1337 --json", True, None),
+        ("pwd", True, None),
         (
             "chainlink issue close 1337",
             False,
@@ -12020,7 +12021,7 @@ def test_tainted_operator_bound_chainlink_query_and_mutation(
 
     assert decision.allowed is allowed
     assert decision.reason == reason
-    if not allowed:
+    if reason == "chainlink_mutation_blocked_by_untrusted_ingest":
         assert decision.refusal_detail == access_control._CHAINLINK_TAINT_REFUSAL
 
 
@@ -13243,6 +13244,36 @@ def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
         integrity_effect="active_ingest",
     )
     return InformationFlowLabels().with_channel("poller:test").with_source(source)
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize("case", ["missing_labels", "missing_state", "missing_predicate", "none", "non_boolean", "raises"])
+@pytest.mark.parametrize("roles", [("user",), ("admin",)])
+def test_shell_gate_fails_closed_for_indeterminate_live_ifc(tool_name, case, roles):
+    # Empty fallback labels would otherwise take the no_labels early allowance.
+    labels = InformationFlowLabels()
+
+    def predicate(_fallback):
+        if case == "raises":
+            raise RuntimeError("live IFC unavailable")
+        return 0 if case == "non_boolean" else None
+
+    auth = replace(
+        _service_auth(_chainlink_service("scheduler_read_only", "custom"), labels),
+        is_service=False, service_authority=None, roles=roles,
+        trigger="user_message",
+        ifc_state=(None if case == "missing_state" else SimpleNamespace()
+                   if case == "missing_predicate" else
+                   SimpleNamespace(has_untrusted_active_ingest=predicate)),
+    )
+    decision = SinkGate.check_sink_flow(
+        tool_name, "pwd", None if case == "missing_labels" else labels, auth,
+        enforce=True,
+    )
+    assert not decision.allowed
+    assert decision.reason == (
+        "missing_ifc_labels" if case == "missing_labels" else "ifc_label_blocked:shell_process"
+    )
 
 
 @pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
