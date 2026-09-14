@@ -5532,7 +5532,9 @@ _CHAINLINK_TAINT_REFUSAL = (
 
 SAGA_TAINT_REFUSAL = (
     "durable memory mutation refused because this turn is tainted: durable "
-    "memory requires a non-empty source set with no untrusted active ingest"
+    "memory requires a non-empty source set with no untrusted active ingest. "
+    "Ask the operator to open a fresh user turn, or open a PR for content that "
+    "belongs in the repository."
 )
 
 

@@ -5645,6 +5645,29 @@ def test_file_and_shell_sinks_still_refuse_untrusted_active_ingest(
     assert decision.reason == reason
 
 
+@pytest.mark.parametrize("tool_name", [
+    "memory_store", "saga_record_skill_learning", "saga_feedback",
+    "saga_mark_contributions", "saga_forget", "saga_end_session",
+])
+def test_saga_taint_refusal_names_way_forward(tool_name: str) -> None:
+    labels = _labels()
+    auth = replace(
+        _auth(roles=("admin",)), ifc_labels=labels,
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True, ifc_labels=labels,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
+    assert decision.refusal_detail == (
+        "durable memory mutation refused because this turn is tainted: durable "
+        "memory requires a non-empty source set with no untrusted active ingest. "
+        "Ask the operator to open a fresh user turn, or open a PR for content that "
+        "belongs in the repository."
+    )
+
+
 def test_saga_mutation_refuses_indeterminate_live_label_state() -> None:
     labels = InformationFlowLabels(sources=(SourceLabel(
         principal="root", domain="channel", resource_id="slack-C1",

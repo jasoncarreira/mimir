@@ -2970,6 +2970,43 @@ def test_authorization_refusal_names_actual_cause(
     assert admin_event["denial_reason"] == tool_event["reason"] == reason
 
 
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("spelling", ["relative", "virtual", "physical"])
+@pytest.mark.parametrize("path, durable", [
+    ("memory/core/note.md", True),
+    ("state/note.md", True),
+    ("state/wiki/note.md", True),
+    ("scratch/note.md", False),
+    ("memory-other/note.md", False),
+    ("state-other/note.md", False),
+])
+def test_file_taint_refusal_names_way_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tool_name: str, spelling: str, path: str, durable: bool,
+) -> None:
+    from mimir.tools.budget_gate import _authorize_tool_call
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    target = {"relative": path, "virtual": f"/{path}",
+              "physical": str(tmp_path / path)}[spelling]
+    decision, message = _authorize_tool_call(
+        tool_name, _ifc_auth(), arguments={"file_path": target},
+        target_channel=target,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:file"
+    prefix = f"{tool_name} was refused before execution (ifc_label_blocked:file): "
+    if durable:
+        assert message == prefix + (
+            "information-flow policy blocked this durable memory write. "
+            "Untrusted content must not be written to memory/ or state/ "
+            "(including state/wiki/). Ask the operator to open a fresh user "
+            "turn, or open a PR for content that belongs in the repository."
+        )
+    else:
+        assert message == prefix + "information-flow policy blocked this call."
+
+
 @pytest.mark.asyncio
 async def test_admin_sensitive_tool_denied_for_non_admin(
     tmp_path: Path,
