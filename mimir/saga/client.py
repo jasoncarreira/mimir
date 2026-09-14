@@ -1131,7 +1131,7 @@ class SagaStore:
                 placeholders = ",".join(["?"] * len(provenance_ids))
                 rows = conn.execute(
                     "SELECT id, owner_principal, origin_channel, origin_domain, visibility, "
-                    "integrity, origin_trigger, origin_ref, created_at "
+                    "origin_trigger, origin_ref, created_at "
                     f"FROM atoms WHERE id IN ({placeholders})",
                     provenance_ids,
                 ).fetchall()
@@ -1145,10 +1145,11 @@ class SagaStore:
                             "origin_channel": row[2],
                             "origin_domain": row[3],
                             "visibility": row[4],
-                            "integrity": row[5],
-                            "origin_trigger": row[6],
-                            "origin_ref": row[7],
-                            "captured_at": row[8],
+                            # Stored atoms originate at trusted write boundaries.
+                            "integrity": "trusted",
+                            "origin_trigger": row[5],
+                            "origin_ref": row[6],
+                            "captured_at": row[7],
                         })
                 provenance_by_id = {
                     item["resource_id"].removeprefix("atom:"): item
@@ -1159,7 +1160,7 @@ class SagaStore:
                     if provenance is not None:
                         triple.update({
                             key: provenance.get(key)
-                            for key in ("integrity", "origin_trigger", "origin_ref", "captured_at")
+                            for key in ("origin_trigger", "origin_ref", "captured_at")
                         })
             # Translate the RecallResult into saga's response shape so
             # mimir's call sites don't change.
@@ -1352,7 +1353,6 @@ class SagaStore:
                 "origin_channel",
                 "origin_domain",
                 "visibility",
-                "integrity",
                 "origin_trigger",
                 "origin_ref",
             )
@@ -1387,7 +1387,6 @@ class SagaStore:
                         "metadata": _safe_json_load(a.get("metadata")),
                         "owner_principal": a.get("owner_principal"),
                         "origin_channel": a.get("origin_channel"),
-                        "integrity": a.get("integrity"),
                         "origin_trigger": a.get("origin_trigger"),
                         "origin_ref": a.get("origin_ref"),
                     }
@@ -1404,7 +1403,7 @@ class SagaStore:
                         "origin_channel": found[a["id"]].get("origin_channel"),
                         "origin_domain": found[a["id"]].get("origin_domain"),
                         "visibility": found[a["id"]].get("visibility"),
-                        "integrity": found[a["id"]].get("integrity"),
+                        "integrity": "trusted",
                         "origin_trigger": found[a["id"]].get("origin_trigger"),
                         "origin_ref": found[a["id"]].get("origin_ref"),
                         "captured_at": found[a["id"]].get("created_at"),
@@ -1491,7 +1490,6 @@ class SagaStore:
         session_dedup_threshold: float | None = None,
         owner_principal: str | None = None,
         origin_channel: str | None = None,
-        integrity: str = "untrusted",
         origin_trigger: str | None = None,
         origin_ref: str | None = None,
         origin_domain: str | None = None,
@@ -1561,7 +1559,6 @@ class SagaStore:
                 session_dedup_threshold=session_dedup_threshold,
                 owner_principal=owner_principal,
                 origin_channel=origin_channel,
-                integrity=integrity,
                 origin_trigger=origin_trigger,
                 origin_ref=origin_ref,
                 origin_domain=origin_domain,
@@ -1922,7 +1919,7 @@ class SagaStore:
                 lambda: distinct_dedup_scopes(conn, agent_id=self._agent_id)
             )
             dedup_result = DedupResult()
-            for owner, domain, scope_visibility, integrity in scopes:
+            for owner, domain, scope_visibility in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -1938,7 +1935,6 @@ class SagaStore:
                     owner_principal=owner,
                     origin_domain=domain,
                     visibility=scope_visibility,
-                    integrity=integrity,
                     lookback_days=lookback_days,
                     min_cluster_size=2,
                     dry_run=dry_run,
@@ -2443,7 +2439,7 @@ class SagaStore:
                 )
             )
             res = DedupResult()
-            for owner, domain, scope_visibility, integrity in scopes:
+            for owner, domain, scope_visibility in scopes:
                 remaining = (
                     None
                     if dedup_max_clusters is None
@@ -2459,7 +2455,6 @@ class SagaStore:
                     owner_principal=owner,
                     origin_domain=domain,
                     visibility=scope_visibility,
-                    integrity=integrity,
                     lookback_days=lookback_days,
                     min_cluster_size=min_cluster_size,
                     dry_run=dry_run,
@@ -3146,7 +3141,6 @@ def _candidate_to_atom(c) -> dict[str, Any]:
         "metadata": _safe_json_load(a.get("metadata")),
         "owner_principal": a.get("owner_principal"),
         "origin_channel": a.get("origin_channel"),
-        "integrity": a.get("integrity"),
         "origin_trigger": a.get("origin_trigger"),
         "origin_ref": a.get("origin_ref"),
         "captured_at": a.get("created_at"),

@@ -356,19 +356,18 @@ class TestGeneralRecallExcludesSkillLearning:
 
 
 class TestRenderAndAugment:
-    @pytest.mark.parametrize("integrity", ["trusted", "untrusted"])
     @pytest.mark.parametrize("size", [20, _ATOM_CONTENT_CAP, _ATOM_CONTENT_CAP + 1, 100_000])
-    def test_render_content_bound(self, integrity, size):
+    def test_render_content_bound(self, size):
         from mimir.skill_memory import render_skill_learnings
 
         content = "x" * size
-        learning = {"kind": "tip", "content": content, "integrity": integrity}
+        learning = {"kind": "tip", "content": content}
         out = render_skill_learnings([learning])
 
         expected = content
         if size > _ATOM_CONTENT_CAP:
             expected = content[:_ATOM_CONTENT_CAP] + "\u2026"
-        assert out == f"{integrity.title()}-origin learnings:\n- [tip] {expected}"
+        assert out == f"- [tip] {expected}"
         assert learning["content"] == content
 
     def test_render_empty(self):
@@ -383,31 +382,28 @@ class TestRenderAndAugment:
             [
                 {
                     "kind": "failure-mode", "content": "resets on reconnect",
-                    "integrity": "trusted",
                 },
-                {"kind": "tip", "content": "pass --foo", "integrity": "untrusted"},
+                {"kind": "tip", "content": "pass --foo"},
             ]
         )
         assert out == (
-            "Trusted-origin learnings:\n"
-            "- [failure-mode] resets on reconnect\n\n"
-            "Untrusted-origin learnings:\n"
+            "- [failure-mode] resets on reconnect\n"
             "- [tip] pass --foo"
         )
 
-    def test_render_missing_integrity_fails_closed_as_untrusted(self):
+    def test_render_without_stored_integrity(self):
         from mimir.skill_memory import render_skill_learnings
 
         out = render_skill_learnings([{"kind": "tip", "content": "verify it"}])
 
-        assert out == "Untrusted-origin learnings:\n- [tip] verify it"
+        assert out == "- [tip] verify it"
 
     def test_render_single_lines_multiline_content(self):
         from mimir.skill_memory import render_skill_learnings
 
         out = render_skill_learnings([{"kind": "tip", "content": "line1\n\nline2"}])
         assert "\n" not in out.split("] ", 1)[1]  # content portion is one line
-        assert out == "Untrusted-origin learnings:\n- [tip] line1 line2"
+        assert out == "- [tip] line1 line2"
 
     @pytest.mark.asyncio
     async def test_augment_appends_learnings(self, store):
@@ -427,7 +423,7 @@ class TestRenderAndAugment:
         assert ifc_sources == [{
             "resource_id": f"atom:{sl['atom_id']}",
             "owner_principal": "legacy_admin",
-            "integrity": "untrusted",
+            "integrity": "trusted",
         }]
 
     @pytest.mark.asyncio

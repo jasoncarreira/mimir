@@ -5323,14 +5323,17 @@ def test_synthesis_retained_reads_require_trusted_content(
     context = retained_read_context(profile)
     row = {"turn_id": "prior", "id": "atom-1", "output": "record-body",
            "content": "atom-body", "owner_principal": "user-1"}
-    if integrity != "missing":
+    if tool_name == "mimir_get_turn" and integrity != "missing":
         row["integrity"] = integrity
     if tool_name == "memory_get":
-        # A mixed batch must not leak even its trusted content on refusal.
+        # Atom rows have no integrity field; server-owned IFC sources carry it.
+        source = {"resource_id": "atom:atom-1", "owner_principal": "user-1"}
+        if integrity != "missing":
+            source["integrity"] = integrity
         client = SimpleNamespace(get_atoms=AsyncMock(return_value={
-            "atoms": [{"id": "clean", "content": "clean-body", "integrity": "trusted"}, row],
+            "atoms": [{"id": "clean", "content": "clean-body"}, row],
             "missing": [],
-            "_ifc_sources": [{"resource_id": "atom:atom-1", "owner_principal": "user-1"}],
+            "_ifc_sources": [source, {"resource_id": "atom:clean", "integrity": "trusted"}],
         }))
         monkeypatch.setitem(memory._MEMORY_STATE, "client", client)
         result = context.read(tool_name, {"atom_ids": ["atom-1", "clean"]})
@@ -5360,9 +5363,7 @@ def test_synthesis_retained_reads_require_trusted_content(
         assert len(context.captures) == 1
         assert set(context.captures[0].sources) == set(retained_sources)
         assert {s.resource_id for s in retained_sources} == (
-            {"atom:atom-1", "atom:clean"} if tool_name == "memory_get"
-            and profile == "session-boundary" else
-            {"atom:atom-1"} if tool_name == "memory_get" else {"turn:prior"}
+            {"atom:atom-1", "atom:clean"} if tool_name == "memory_get" else {"turn:prior"}
         )
         assert all(s.integrity == ("trusted" if profile == "session-boundary" else "untrusted")
                    for s in retained_sources)

@@ -50,7 +50,6 @@ CREATE TABLE IF NOT EXISTS atoms (
     -- Ownership (chainlink #881: fail-closed legacy scope for unproven rows)
     owner_principal TEXT NOT NULL DEFAULT 'legacy_admin',  -- 'legacy_admin' | 'service' | 'system' | user-id
     origin_channel TEXT,               -- channel/source where atom originated
-    integrity TEXT NOT NULL DEFAULT 'untrusted' CHECK(integrity IN ('trusted', 'untrusted')),
     origin_trigger TEXT,               -- immutable server-selected trigger identity
     origin_ref TEXT,                   -- immutable concrete event/message/source reference
     origin_domain TEXT,                -- domain/namespace of origin
@@ -63,10 +62,6 @@ CREATE INDEX IF NOT EXISTS idx_atoms_agent ON atoms(agent_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_atoms_dedup
     ON atoms(content_hash, agent_id, owner_principal) WHERE tombstoned = 0;
 CREATE INDEX IF NOT EXISTS idx_atoms_created ON atoms(created_at);
-CREATE INDEX IF NOT EXISTS idx_atoms_integrity_created_at
-    ON atoms(integrity, created_at);
-CREATE INDEX IF NOT EXISTS idx_atoms_trusted_boundary_v13
-    ON atoms(integrity);
 CREATE INDEX IF NOT EXISTS idx_atoms_tombstoned ON atoms(tombstoned);
 -- session_id index: reflect._session_atoms + recall's recent-session
 -- lookup both filter on this. Partial index (skips NULL session_id
