@@ -8651,6 +8651,7 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     lease_auth = replace(
         _service_auth(service, clean), repo_review_state=state,
     )
+    lease_auth.ifc_state.pr_checkout_author_trust[state.action_scope.scope_id] = True
     lease_source = protected_result_source(
         lease_auth, principal="filesystem", domain="filesystem",
         resource_id=str(lease_file), bridge_instance="filesystem",

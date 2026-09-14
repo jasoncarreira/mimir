@@ -164,7 +164,7 @@ def repo_checkout(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
-    from .forge import remediation_checkout_preflight
+    from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
@@ -181,6 +181,20 @@ def repo_checkout(
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
         raise ToolException(f"repository checkout rejected: {detail}") from exc
+    scope = state.action_scope
+    # Record only turn-local authority, never trust in checkout-controlled metadata.
+    # Clear an earlier verdict before fetching metadata, so failures stay closed.
+    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+    client = _client(scope)
+    attest = getattr(client, "author_is_trusted", None)
+    if callable(attest):
+        authors = _call(lambda: _pr_content_authors(client, scope))
+        if authors == (scope.pull_request_author,) and scope.pull_request_author:
+            verdict = context.ifc_state.repository_author_trust.resolve(
+                scope.canonical_repo, scope.pull_request_author,
+                lambda: attest(scope.canonical_repo, scope.pull_request_author),
+            )
+            context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),
