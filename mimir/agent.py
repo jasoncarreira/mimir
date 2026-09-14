@@ -4079,6 +4079,14 @@ class Agent:
                 )
             )
 
+        # Admitted pollers/jobs must not re-decide quota policy. Heartbeat is
+        # discretionary; keep its pace data. Alerts above remain independent
+        # of prompt visibility and retain their existing cooldowns.
+        if auth_context.trigger == "poller" or (
+            auth_context.trigger == "scheduled_tick"
+            and auth_context.channel_id != "scheduler:heartbeat"
+        ):
+            return None, deferred
         if not result.body:
             return None, deferred
         return PromptBlock(
