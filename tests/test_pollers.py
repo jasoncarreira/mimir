@@ -2015,6 +2015,148 @@ def test_github_author_trust_is_server_attested_and_fail_closed(
     assert calls[0] == "repos/acme/widget/collaborators/alice"
 
 
+@pytest.mark.parametrize("stage", ["collaborator", "membership"])
+@pytest.mark.parametrize(
+    ("failure", "failure_class"),
+    [
+        ("transport", "transport"),
+        ("timeout", "timeout"),
+        ("wrapped_timeout", "timeout"),
+        ("budget", "budget"),
+        ("unexpected_status", "unexpected_status"),
+        ("malformed_payload", "malformed_payload"),
+    ],
+)
+@pytest.mark.parametrize("logger_error", [False, True])
+def test_github_author_unavailable_diagnostic_mutation(
+    monkeypatch: pytest.MonkeyPatch, stage: str, failure: str,
+    failure_class: str, logger_error: bool,
+) -> None:
+    """Removing or misclassifying a diagnostic fails independently of verdicts."""
+    from unittest.mock import MagicMock
+    from mimir import pollers
+
+    events = []
+    calls = []
+
+    def record(event, **payload):
+        events.append((event, payload))
+        if logger_error:
+            raise RuntimeError("logger failed")
+
+    logger = MagicMock()
+    logger.log_sync.side_effect = record
+    monkeypatch.setattr(pollers, "get_logger", lambda: logger)
+
+    def urlopen(request, *, timeout):
+        calls.append(request)
+        assert timeout == 0.25
+        response = MagicMock()
+        response.__enter__.return_value = response
+        if stage == "membership" and len(calls) == 1:
+            response.status = 404
+            response.read.return_value = b""
+            return response
+        secret = "secret-token https://private.example/body"
+        if failure == "transport":
+            raise pollers.urllib.error.URLError(secret)
+        if failure == "timeout":
+            raise TimeoutError(secret)
+        if failure == "wrapped_timeout":
+            raise pollers.urllib.error.URLError(TimeoutError(secret))
+        if failure == "unexpected_status":
+            import io
+            raise pollers.urllib.error.HTTPError(
+                request.full_url, 503, secret, {}, io.BytesIO(secret.encode()),
+            )
+        assert failure == "malformed_payload"
+        response.status = 200
+        response.read.return_value = secret.encode()
+        return response
+
+    monkeypatch.setattr(pollers.urllib.request, "urlopen", urlopen)
+    ceiling = pollers.GITHUB_TRUST_ATTEMPTS_PER_FIRE_TOTAL
+    initial = ceiling - (stage == "membership") if failure == "budget" else 0
+    fire = pollers._GithubFireAttestation(attempts=initial)
+    context = pollers._github_fire_attestation.set(fire)
+    reason = pollers._github_attestation_failure.set(None)
+    try:
+        assert _github_author_is_trusted(
+            "acme/widget", "alice", "secret-token", timeout=0.25,
+        ) is None
+    finally:
+        pollers._github_fire_attestation.reset(context)
+        pollers._github_attestation_failure.reset(reason)
+    expected_calls = (stage == "membership") + (failure != "budget")
+    assert len(calls) == expected_calls
+    assert fire.attempts == initial + expected_calls
+    assert events == [("github_author_attestation_unavailable", {
+        "repository": "acme/widget", "author": "alice", "request": stage,
+        "failure_class": failure_class,
+    })]
+
+
+@pytest.mark.parametrize("stage", ["collaborator", "membership"])
+def test_github_author_unavailable_mock_reason_is_reset(
+    monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    from unittest.mock import MagicMock
+    from mimir import pollers
+
+    logger = MagicMock()
+    monkeypatch.setattr(pollers, "get_logger", lambda: logger)
+
+    def api(endpoint, token):
+        if stage == "membership" and endpoint.startswith("repos/"):
+            pollers._github_attestation_failure.set("malformed_payload")
+            return 404, None
+        return None
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", api)
+    context = pollers._github_attestation_failure.set("budget")
+    try:
+        assert _github_author_is_trusted("acme/widget", "alice", "token") is None
+        logger.log_sync.assert_called_once_with(
+            "github_author_attestation_unavailable", repository="acme/widget",
+            author="alice", request=stage, failure_class="transport",
+        )
+    finally:
+        pollers._github_attestation_failure.reset(context)
+
+
+@pytest.mark.parametrize(
+    ("membership", "expected", "failure_class"),
+    [
+        ((404, None), False, None),
+        ((200, {}), False, None),
+        ((200, {"state": "pending"}), False, None),
+        ((200, {"state": "active"}), True, None),
+        ((200, []), None, "malformed_payload"),
+        ((200, None), None, "malformed_payload"),
+        ((503, []), None, "unexpected_status"),
+    ],
+)
+def test_github_author_membership_diagnostic_preserves_verdict(
+    monkeypatch: pytest.MonkeyPatch, membership, expected, failure_class,
+) -> None:
+    from unittest.mock import MagicMock
+    from mimir import pollers
+
+    logger = MagicMock()
+    monkeypatch.setattr(pollers, "get_logger", lambda: logger)
+    api = MagicMock(side_effect=[(404, None), membership])
+    monkeypatch.setattr(pollers, "_github_api_attestation", api)
+    assert _github_author_is_trusted("acme/widget", "alice", "token") is expected
+    assert api.call_count == 2
+    if failure_class is None:
+        logger.log_sync.assert_not_called()
+    else:
+        logger.log_sync.assert_called_once_with(
+            "github_author_attestation_unavailable", repository="acme/widget",
+            author="alice", request="membership", failure_class=failure_class,
+        )
+
+
 def test_github_public_read_permission_does_not_establish_collaborator_trust(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

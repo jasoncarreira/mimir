@@ -4813,6 +4813,9 @@ class _Arm2LiveState:
     def current(self, fallback: Any = None) -> Any:
         return self.state.current(fallback)
 
+    def author_attestation_was_unavailable(self) -> bool:
+        return self.state.author_attestation_was_unavailable()
+
     def merge(self, added: Any, fallback: Any = None) -> Any:
         return self.state.merge(added, fallback=fallback)
 
@@ -6840,24 +6843,31 @@ def test_admin_sensitive_tool_matches_mcp_name_variants():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("middleware_path", ["sync", "async"])
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
+@pytest.mark.parametrize("attestation_unavailable", [False, True])
+@pytest.mark.parametrize("exact_grant", [False, True])
 async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_command(
     middleware_path: str,
     enforcement_enabled: bool,
+    attestation_unavailable: bool,
+    exact_grant: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = InformationFlowState()
     auth = _arm2_operator_auth(state, enforcement_enabled=enforcement_enabled)
     labels = state.merge(_ifc_labels(), fallback=auth.ifc_labels)
     assert labels.has_untrusted_active_ingest is True
+    if attestation_unavailable:
+        state.record_author_attestation_unavailable()
     command = "printf exact-shell-grant-regression"
-    assert state.approve_sink_once(
-        fallback=labels,
-        sink_category="shell_process",
-        destination=command,
-        canonical_principal=auth.canonical_principal or "",
-        lifetime_seconds=30,
-        durable_audit=lambda *_: True,
-    )
+    if exact_grant:
+        assert state.approve_sink_once(
+            fallback=labels,
+            sink_category="shell_process",
+            destination=command,
+            canonical_principal=auth.canonical_principal or "",
+            lifetime_seconds=30,
+            durable_audit=lambda *_: True,
+        )
     request = _make_request("shell_exec", "exact-shell-grant", auth, {"command": command})
     preparation = _prepare_operator_shell_execution(request, "shell_exec", auth, labels)
     assert preparation is not None
@@ -6869,6 +6879,14 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
 
     def capture_decision(*args: Any, **kwargs: Any) -> ToolAuthorization:
         decision = check_sink_flow(*args, **kwargs)
+        if not exact_grant:
+            # Exercise the middleware's authorization-denial override separately
+            # from its live-state refusal after an allowed exact grant.
+            from dataclasses import replace
+
+            decision = replace(
+                decision, allowed=False, reason="ifc_label_blocked:shell_process",
+            )
         decisions.append(decision)
         return decision
 
@@ -6911,8 +6929,12 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
     assert repeated.content == (
         f"Repeat of an identical command refused in this turn. {result.content}"
     )
-    assert decisions[0].allowed is True
-    assert decisions[0].reason == "ifc_declassification_approved"
+    assert decisions[0].allowed is exact_grant
+    assert decisions[0].reason == (
+        "ifc_declassification_approved" if exact_grant else "ifc_label_blocked:shell_process"
+    )
+    assert ("GitHub author attestation was unavailable" in result.content) is attestation_unavailable
+    assert ("GitHub author attestation was unavailable" in repeated.content) is attestation_unavailable
     assert handler_calls == 0
     assert result.status == "error"
     assert result.tool_call_id == "exact-shell-grant"
@@ -6935,5 +6957,5 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
         "preparation_outcome": "soft_unbound",
         "command_family": "profile_miss",
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
-    }] * 2
+    }] * (1 if enforcement_enabled and not exact_grant else 2)
     assert command not in json.dumps(captured)

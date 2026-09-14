@@ -703,15 +703,25 @@ def _publish_author_attestation(
     if not callable(attest):
         return
     trusted = True
+    failed_authors = []
+    unavailable_authors = []
     for author in dict.fromkeys(authors):
         if not isinstance(author, str) or not author:
             trusted = False
+            failed_authors.append("<missing-author>")
             continue
         verdict = context.ifc_state.repository_author_trust.resolve(
             scope.canonical_repo, author,
             lambda: attest(scope.canonical_repo, author),
         )
         trusted = trusted and verdict is True
+        # Only identifiers, never arbitrary adapter strings, enter diagnostics.
+        diagnostic_author = author if re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", author) else "<invalid-author>"
+        if verdict is not True:
+            failed_authors.append(diagnostic_author)
+        if verdict is None:
+            unavailable_authors.append(diagnostic_author)
+            context.ifc_state.record_author_attestation_unavailable()
     principal = context.canonical_principal
     if context.is_service and principal:
         principal = f"service:{principal}"
@@ -723,6 +733,25 @@ def _publish_author_attestation(
         source_kind="protected_tool", integrity="trusted" if trusted else "untrusted",
         integrity_effect="active_ingest",
     ),))
+    if not trusted:
+        try:
+            from .._context import get_current_turn
+            from ..event_logger import log_event_sync
+
+            turn = get_current_turn()
+            log_event_sync(
+                "forge_author_attestation_downgraded",
+                session_id=context.channel_id,
+                turn_id=turn.turn_id if turn is not None else None,
+                repository=scope.canonical_repo,
+                resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+                integrity="untrusted", integrity_effect="active_ingest",
+                failed_authors=failed_authors,
+                unavailable_authors=unavailable_authors,
+            )
+        except Exception:
+            # Observability must not turn a successful read into a tool failure.
+            pass
 
 
 def _pr_content_authors(client: ForgeClient, scope: RepoPRActionScope) -> tuple[str, ...]:
