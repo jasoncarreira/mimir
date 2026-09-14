@@ -86,6 +86,7 @@ from ..access_control import (
     _operator_git_execution_argv_with_diagnostics,
     _operator_read_execution_argv_with_diagnostics,
     _project_test_execution_argv,
+    _resolve_file_tool_target,
     _resolve_operator_bounded_cwd,
     _validated_operator_shell_argv_artifact,
     service_filesystem_read_roots,
@@ -1820,6 +1821,7 @@ def _admin_denial_message(
     detail: str | None = None,
     *,
     principal_is_admin: bool = False,
+    target: str | None = None,
 ) -> str:
     # A shell-profile refusal is a command-shape problem, not a privilege
     # problem: no identity can run the command as written. Leading with
@@ -1832,6 +1834,20 @@ def _admin_denial_message(
     reason_text = f" ({reason})" if reason else ""
     if detail:
         return f"{tool_name} was refused before execution{reason_text}: {detail}"
+    if reason == "ifc_label_blocked:file" and target:
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        resolved = _resolve_file_tool_target(target)
+        if home and resolved is not None and any(
+            resolved.is_relative_to(Path(home).resolve() / root)
+            for root in ("memory", "state")
+        ):
+            return (
+                f"{tool_name} was refused before execution{reason_text}: "
+                "information-flow policy blocked this durable memory write. "
+                "Untrusted content must not be written to memory/ or state/ "
+                "(including state/wiki/). Ask the operator to open a fresh user "
+                "turn, or open a PR for content that belongs in the repository."
+            )
     if reason and reason.startswith("ifc_label_blocked:"):
         return (
             f"{tool_name} was refused before execution{reason_text}: "
@@ -1913,6 +1929,7 @@ def _deny_admin_tool(
     # the caller's tool result only, so the audit stream keeps grouping cleanly.
     message = _admin_denial_message(
         tool_name, reason, detail, principal_is_admin="admin" in roles,
+        target=target,
     )
     service = get_trusted_service_from_auth_context(ctx) if isinstance(ctx, AuthContext) else None
     if tool_name == "shell_exec" and service is not None and not detail:
@@ -2035,6 +2052,7 @@ def _authorize_tool_call(
         ctx=ctx,
         enforcement_enabled=enforce,
         detail=auth.refusal_detail,
+        target=target_channel or (arguments or {}).get("file_path") or (arguments or {}).get("path"),
     )
 
 
