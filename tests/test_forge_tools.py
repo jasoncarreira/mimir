@@ -207,6 +207,21 @@ def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger
         set_forge_client(None)
 
 
+def test_author_attestation_denial_without_ifc_state(monkeypatch):
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *a, **kw: None)
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    ctx = replace(runtime.context, ifc_state=None)
+
+    refusal = budget_gate._deny_admin_tool(
+        "shell_exec", "ifc_label_blocked:shell_process",
+        ctx=ctx, enforcement_enabled=True,
+    )
+
+    assert isinstance(refusal, str)
+    assert "ifc_label_blocked:shell_process" in refusal
+    assert "attestation" not in refusal
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["missing", "empty", "failed", "wrong_head", "mixed_provenance"])
 async def test_author_provenance_cannot_clear_unknown_or_failed_results(monkeypatch, case):

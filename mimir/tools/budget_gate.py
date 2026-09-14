@@ -1855,6 +1855,7 @@ def _deny_admin_tool(
     if (
         reason.startswith("ifc_label_blocked:")
         and isinstance(ctx, AuthContext)
+        and getattr(ctx, "ifc_state", None) is not None
         and ctx.ifc_state.author_attestation_was_unavailable()
     ):
         message += (
