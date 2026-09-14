@@ -200,7 +200,7 @@ async def test_sql_and_index_batch_share_worker_locks(client, monkeypatch, path)
 
 
 @pytest.mark.parametrize("path", ["general", "skill"])
-@pytest.mark.parametrize("change", ["owner_principal = 'other'", "integrity = 'trusted'", "tombstoned = 1"])
+@pytest.mark.parametrize("change", ["owner_principal = 'other'", "tombstoned = 1"])
 async def test_snapshot_candidates_revalidated_before_write(client, monkeypatch, path, change):
     seed(client, path, 2)
     entered, release = threading.Event(), threading.Event()

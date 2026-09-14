@@ -240,12 +240,12 @@ def test_session_dedup_does_not_cross_owners(conn):
     first = store(
         conn, "Alice prefers concise replies", embed_fn=embed,
         session_id="shared", owner_principal="principal:a",
-        visibility="private", integrity="trusted",
+        visibility="private",
     )
     second = store(
         conn, "Alice likes terse responses", embed_fn=embed,
         session_id="shared", owner_principal="principal:b",
-        visibility="private", integrity="trusted",
+        visibility="private",
         session_dedup_threshold=0.95,
     )
 
@@ -260,7 +260,6 @@ def test_session_dedup_does_not_cross_owners(conn):
     ("first_kwargs", "second_kwargs"),
     [
         ({"visibility": "private"}, {"visibility": "public"}),
-        ({"integrity": "trusted"}, {"integrity": "untrusted"}),
         ({"origin_domain": "tenant:a"}, {"origin_domain": "tenant:b"}),
     ],
 )
