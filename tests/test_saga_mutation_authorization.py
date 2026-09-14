@@ -97,11 +97,8 @@ _SAGA_MUTATIONS = (
         (
             "saga_session_end",
             {
-                "memory_store",
                 "saga_feedback",
-                "saga_mark_contributions",
                 "saga_end_session",
-                "saga_record_skill_learning",
             },
         ),
         ("upgrade", set()),
@@ -117,13 +114,17 @@ def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
     assert service is not None
     auth_context = _service_auth(trigger, service.canonical)
     expected = operation in allowed_operations
+    denial_reason = (
+        "session_boundary_capability_denied"
+        if trigger == "saga_session_end" else "admin_required"
+    )
 
     # Capability authority alone does not authorize IFC flow from an unbound turn.
     unbound = ToolRegistry().authorize_tool(
         operation, auth_context, enforce=True, ifc_labels=auth_context.ifc_labels,
     )
     assert unbound.allowed is False
-    assert unbound.reason == ("ifc_label_blocked:saga" if expected else "admin_required")
+    assert unbound.reason == ("ifc_label_blocked:saga" if expected else denial_reason)
     assert can_write_saga(auth_context, operation) is expected
 
     source_channel = auth_context.ifc_labels.sources[0].resource_id
@@ -142,7 +143,16 @@ def test_saga_mutation_service_capability_matrix_matches_at_both_guards(
     assert middleware.allowed is expected
     assert can_write_saga(auth_context, operation) is expected
     if not expected:
-        assert middleware.reason == "admin_required"
+        assert middleware.reason == denial_reason
+
+
+def test_synthesis_capabilities_are_exactly_session_boundary_tools() -> None:
+    service = get_service_principal("saga_session_end")
+    assert service is not None
+    assert set(service.capabilities) == {
+        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session",
+        "write_file",
+    }
 
 
 @pytest.mark.parametrize("operation", _SAGA_MUTATIONS)

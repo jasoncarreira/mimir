@@ -5531,7 +5531,7 @@ def test_declassification_action_has_explicit_non_sink_flow_metadata() -> None:
     assert get_sink_category("approve_declassification") is SinkCategory.UNKNOWN
 
 
-def test_same_scope_synthesis_write_remains_allowed():
+def test_same_scope_synthesis_feedback_remains_allowed():
     channel = "saga:session-end"
     synthesis = AuthContext(
         principal="service:synthesis",
@@ -5546,7 +5546,7 @@ def test_same_scope_synthesis_write_remains_allowed():
     )
 
     decision = ToolRegistry().authorize_tool(
-        "memory_store",
+        "saga_feedback",
         synthesis,
         enforce=True,
         ifc_labels=InformationFlowLabels(sources=(SourceLabel(
@@ -5693,37 +5693,41 @@ def test_saga_mutation_refuses_indeterminate_live_label_state() -> None:
     assert decision.reason == "saga_mutation_blocked_by_tainted_turn"
 
 
-def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(
+@pytest.mark.parametrize("enforce", [False, True])
+def test_session_synthesis_refuses_fetch_cache_and_can_write_own_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    enforce: bool,
+    bind_approval_turn,
 ) -> None:
     home = tmp_path / "home"
     (home / "memory" / "channels" / "slack-C1").mkdir(parents=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     authority = builtin_trigger_service_principal("session-boundary", home)
-    inherited = _labels()
     event = AgentEvent(
         trigger="saga_session_end",
         channel_id="slack-C1",
         service_principal="synthesis",
         service_authority=authority,
-        ifc_labels=inherited,
     )
     labels = _initialize_ifc_labels(event)
-    auth = AuthContext(
-        principal="service:synthesis",
-        canonical_principal="synthesis",
-        roles=("service",),
-        event_ingress=None,
-        trigger="saga_session_end",
-        channel_id="slack-C1",
-        interactivity=TurnInteractivity.NON_INTERACTIVE,
-        is_service=True,
-        service_authority=authority,
-        enforcement_enabled=True,
-        ifc_labels=labels,
-        ifc_state=InformationFlowState(labels=labels),
+    auth = create_auth_context(event, enforce=enforce, ifc_labels=labels)
+    bind_approval_turn(auth)
+
+    body = home / "attachments" / "fetch-cache" / "body.txt"
+    body.parent.mkdir(parents=True)
+    body.write_text("untrusted instructions", encoding="utf-8")
+    source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem",
+        resource_id=str(body), bridge_instance="filesystem",
     )
+    assert (source.integrity, source.integrity_effect) == ("untrusted", "active_ingest")
+    read = ToolRegistry().authorize_tool(
+        "read_file", auth, enforce=enforce,
+        arguments={"file_path": str(body)}, ifc_labels=labels,
+    )
+    assert read.allowed is False
+    assert read.reason == "session_boundary_capability_denied"
 
     memory_write = ToolRegistry().authorize_tool(
         "write_file",
@@ -5740,12 +5744,304 @@ def test_untrusted_session_synthesis_can_write_memory_but_not_cross_channel(
         source for source in labels.sources
         if source.principal == "service:synthesis"
     ]
-    assert inherited.has_untrusted_active_ingest is True
-    assert labels.has_untrusted_active_ingest is True
+    assert labels.has_untrusted_active_ingest is False
     assert synthesis_sources[-1].integrity_effect == IntegrityEffect.INFORMATIONAL
     assert memory_write.allowed is True
     assert cross_channel.allowed is False
     assert cross_channel.reason == "ifc_label_blocked:same_channel"
+    other_memory = ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=True, ifc_labels=labels,
+        target_channel="memory/channels/slack-C2/summary.md",
+    )
+    assert other_memory.allowed is False
+
+
+@pytest.fixture
+def retained_read_context(tmp_path, monkeypatch, bind_approval_turn):
+    import asyncio
+    from mimir import access_control
+    from mimir.tools import extra, memory
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "memory" / "channels" / "slack-C1").mkdir(parents=True)
+    captures = []
+    end_capture = access_control.end_protected_result_capture
+
+    def record_capture(token):
+        provenance = end_capture(token)
+        captures.append(provenance)
+        return provenance
+
+    monkeypatch.setattr(access_control, "end_protected_result_capture", record_capture)
+
+    def make(profile="session-boundary"):
+        authority = builtin_trigger_service_principal(profile, tmp_path)
+        event = AgentEvent(
+            trigger=authority.trigger, channel_id="slack-C1",
+            service_principal=authority.canonical, service_authority=authority,
+        )
+        labels = _initialize_ifc_labels(event)
+        auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+        turn = bind_approval_turn(auth)
+        calls = []
+
+        def read(tool_name, arguments):
+            request = ToolCallRequest(
+                tool_call={"name": tool_name, "args": arguments,
+                           "id": "retained-read", "type": "tool_call"},
+                tool=None, state=None, runtime=Runtime(context=auth),
+            )
+
+            def handler(request):
+                calls.append(request.tool_call)
+                args = request.tool_call["args"]
+                # Invoke the implementation so malformed inputs reach its own
+                # fail-closed guard rather than being masked by schema validation.
+                if tool_name == "memory_get":
+                    content = asyncio.run(memory.memory_get.coroutine(
+                        args.get("atom_ids"), runtime=SimpleNamespace(context=auth),
+                    ))
+                else:
+                    content = getattr(extra, tool_name).func(args.get("turn_id"))
+                return ToolMessage(content=content, tool_call_id="retained-read")
+
+            return BudgetGateMiddleware().wrap_tool_call(request, handler)
+
+        def assert_clean_sinks():
+            live = auth.ifc_state.current(labels)
+            assert live.has_untrusted_active_ingest is False
+            assert turn.ifc_labels == live
+            for sink in ("saga_feedback", "saga_end_session"):
+                assert ToolRegistry().authorize_tool(sink, auth, enforce=True).allowed
+            for channel, allowed in (("slack-C1", True), ("slack-C2", False)):
+                decision = ToolRegistry().authorize_tool(
+                    "write_file", auth, enforce=True, ifc_labels=live,
+                    target_channel=f"memory/channels/{channel}/summary.md",
+                )
+                assert decision.allowed is allowed, decision.reason
+            assert not SinkGate.check_sink_flow(
+                "send_message", "slack-C2", live, auth, enforce=True,
+            ).allowed
+
+        return SimpleNamespace(
+            auth=auth, turn=turn, labels=labels, read=read, calls=calls,
+            captures=captures, assert_clean_sinks=assert_clean_sinks,
+        )
+
+    return make
+
+
+@pytest.mark.parametrize("integrity", ["trusted", "untrusted", None, "invalid", "missing"])
+@pytest.mark.parametrize("profile", ["session-boundary", "heartbeat"])
+@pytest.mark.parametrize("tool_name", ["mimir_get_turn", "memory_get"])
+def test_synthesis_retained_reads_require_trusted_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retained_read_context,
+    integrity: str | None, profile: str, tool_name: str,
+) -> None:
+    from unittest.mock import AsyncMock
+    from mimir.tools import extra, memory
+
+    context = retained_read_context(profile)
+    row = {"turn_id": "prior", "id": "atom-1", "output": "record-body",
+           "content": "atom-body", "owner_principal": "user-1"}
+    if tool_name == "mimir_get_turn" and integrity != "missing":
+        row["integrity"] = integrity
+    if tool_name == "memory_get":
+        # Atom rows have no integrity field; server-owned IFC sources carry it.
+        source = {"resource_id": "atom:atom-1", "owner_principal": "user-1"}
+        if integrity != "missing":
+            source["integrity"] = integrity
+        client = SimpleNamespace(get_atoms=AsyncMock(return_value={
+            "atoms": [{"id": "clean", "content": "clean-body"}, row],
+            "missing": [],
+            "_ifc_sources": [source, {"resource_id": "atom:clean", "integrity": "trusted"}],
+        }))
+        monkeypatch.setitem(memory._MEMORY_STATE, "client", client)
+        result = context.read(tool_name, {"atom_ids": ["atom-1", "clean"]})
+        client.get_atoms.assert_awaited_once_with(
+            ["atom-1", "clean"], auth_context=context.auth,
+        )
+        body = "atom-body"
+    else:
+        path = tmp_path / "turns.jsonl"
+        path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", path)
+        result = context.read(tool_name, {"turn_id": "prior"})
+        body = "record-body"
+    assert len(context.calls) == 1
+    refused = profile == "session-boundary" and integrity != "trusted"
+    assert result.status == ("error" if refused else "success")
+    assert (body not in result.content) is refused
+    live = context.auth.ifc_state.current(context.labels)
+    retained_sources = [s for s in live.sources if s.domain in {"saga", "turn_history"}]
+    if refused:
+        assert "requires" in result.content
+        assert "clean-body" not in result.content
+        assert context.captures == [None]
+        assert live == context.labels
+        assert retained_sources == []
+    else:
+        assert len(context.captures) == 1
+        assert set(context.captures[0].sources) == set(retained_sources)
+        assert {s.resource_id for s in retained_sources} == (
+            {"atom:atom-1", "atom:clean"} if tool_name == "memory_get" else {"turn:prior"}
+        )
+        assert all(s.integrity == ("trusted" if profile == "session-boundary" else "untrusted")
+                   for s in retained_sources)
+    if profile == "session-boundary":
+        context.assert_clean_sinks()
+    else:
+        assert live.has_untrusted_active_ingest is True
+
+
+@pytest.mark.parametrize(
+    ("arguments", "failure", "message"),
+    [
+        ({}, None, "turn_id is required"),
+        ({"turn_id": None}, None, "turn_id is required"),
+        ({"turn_id": ""}, None, "turn_id is required"),
+        ({"turn_id": "  "}, None, "turn_id is required"),
+        ({"turn_id": "prior"}, "unconfigured", "turns log unavailable"),
+        ({"turn_id": "prior"}, "missing-file", "turns log unavailable"),
+        ({"turn_id": "prior"}, "directory", "turns log unavailable"),
+        ({"turn_id": "absent"}, None, "no matching turn record"),
+    ],
+)
+def test_synthesis_turn_read_unavailable_refuses_without_taint(
+    tmp_path, monkeypatch, retained_read_context, arguments, failure, message,
+):
+    from mimir.tools import extra
+
+    context = retained_read_context()
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        '\nnot-json\n' + json.dumps({
+            "turn_id": "prior", "integrity": "trusted", "output": "record-body",
+        }) + '\n', encoding="utf-8",
+    )
+    configured = {
+        "unconfigured": None, "missing-file": tmp_path / "missing.jsonl",
+        "directory": tmp_path,
+    }.get(failure, path)
+    monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", configured)
+
+    result = context.read("mimir_get_turn", arguments)
+
+    assert len(context.calls) == 1
+    assert result.status == "error"
+    assert f"get_turn refused: {message}" in result.content
+    assert "record-body" not in result.content
+    assert context.captures == [None]
+    assert context.auth.ifc_state.current(context.labels) == context.labels
+    context.assert_clean_sinks()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "failure", "message"),
+    [
+        ({}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": None}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": "atom-1"}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": {}}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": [None]}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": ["atom-1", 1]}, None, "atom_ids must be a list of id strings"),
+        ({"atom_ids": []}, None, "atom_ids is empty"),
+        ({"atom_ids": [""]}, None, "atom_ids is empty"),
+        ({"atom_ids": ["atom-1"]}, "unconfigured", "no SagaStore configured"),
+        ({"atom_ids": ["atom-1"]}, "exception", "memory unavailable"),
+    ],
+)
+def test_synthesis_memory_read_invalid_or_unavailable_refuses_without_taint(
+    monkeypatch, retained_read_context, arguments, failure, message,
+):
+    from unittest.mock import AsyncMock
+    from mimir.tools import memory
+
+    context = retained_read_context()
+    client = SimpleNamespace(get_atoms=AsyncMock(
+        return_value={"atoms": [{"id": "atom-1", "integrity": "trusted",
+                                 "content": "atom-body"}]},
+        side_effect=RuntimeError("private-store-exception") if failure == "exception" else None,
+    ))
+    monkeypatch.setitem(
+        memory._MEMORY_STATE, "client", None if failure == "unconfigured" else client,
+    )
+
+    result = context.read("memory_get", arguments)
+
+    assert len(context.calls) == 1
+    assert result.status == "error"
+    assert f"memory_get failed: {message}" in result.content
+    assert "private-store-exception" not in result.content
+    assert "atom-body" not in result.content
+    assert context.captures == [None]
+    if failure == "exception":
+        client.get_atoms.assert_awaited_once_with(["atom-1"], auth_context=context.auth)
+    else:
+        client.get_atoms.assert_not_awaited()
+    assert context.auth.ifc_state.current(context.labels) == context.labels
+    context.assert_clean_sinks()
+
+
+@pytest.mark.parametrize("payload", [{}, {"atoms": []}, {"atoms": [], "missing": ["absent"]}])
+def test_synthesis_empty_memory_payload_does_not_taint(
+    monkeypatch, retained_read_context, payload,
+):
+    from unittest.mock import AsyncMock
+    from mimir.tools import memory
+
+    context = retained_read_context()
+    client = SimpleNamespace(get_atoms=AsyncMock(return_value=payload))
+    monkeypatch.setitem(memory._MEMORY_STATE, "client", client)
+
+    result = context.read("memory_get", {"atom_ids": ["absent"]})
+
+    assert len(context.calls) == 1
+    client.get_atoms.assert_awaited_once_with(["absent"], auth_context=context.auth)
+    assert result.status == "success"
+    assert "(no atoms found)" in result.content
+    assert context.auth.ifc_state.current(context.labels) == context.labels
+    context.assert_clean_sinks()
+
+
+@pytest.mark.parametrize("integrity", ["trusted", "untrusted", None, "invalid", "missing"])
+def test_synthesis_turn_alias_shared_reader_and_middleware_denial(
+    tmp_path, monkeypatch, retained_read_context, integrity,
+):
+    from mimir import access_control
+    from mimir.tools import extra
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    context = retained_read_context()
+    row = {"turn_id": "prior", "output": "record-body"}
+    if integrity != "missing":
+        row["integrity"] = integrity
+    path = tmp_path / "turns.jsonl"
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", path)
+
+    result = context.read("get_turn", {"turn_id": "prior"})
+    assert result.status == "error"
+    assert "session_boundary_capability_denied" in result.content
+    assert context.calls == []
+    token = access_control.begin_protected_result_capture()
+    try:
+        if integrity == "trusted":
+            assert "record-body" in extra.get_turn.func("prior")
+        else:
+            with pytest.raises(ToolPolicyRefusal, match="requires a trusted turn record"):
+                extra.get_turn.func("prior")
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+    if integrity == "trusted":
+        assert len(provenance.sources) == 1
+        assert provenance.sources[0].resource_id == "turn:prior"
+        assert provenance.sources[0].integrity == "trusted"
+    else:
+        assert provenance is None
+    assert context.auth.ifc_state.current(context.labels) == context.labels
+    context.assert_clean_sinks()
 
 
 @pytest.mark.parametrize(

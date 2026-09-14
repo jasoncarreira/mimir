@@ -560,9 +560,6 @@ _PROFILE_CAPABILITY_COMPANIONS: dict[str, dict[str, frozenset[str]]] = {
     "heartbeat": {
         "worklink_run": frozenset({"read_file", "ls", "shell_exec"}),
     },
-    "session-boundary": {
-        "saga_end_session": frozenset({"fetch_url", "read_file", "ls", "shell_exec"}),
-    },
 }
 
 
@@ -634,14 +631,8 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "repo_revert", "repo_revert_abort", "repo_push",
     }),
     "session-boundary": frozenset({
-        "memory_store", "saga_feedback", "saga_mark_contributions",
-        "saga_end_session", "saga_record_skill_learning",
-        "memory_get",
-        "shell_exec", "bash_jobs_list", "bash_job_output", "fetch_url",
-        "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
-        "agrep", "file_search", "get_turn", "mimir_get_turn",
-        "write_file", "edit_file", "rebuild_index", "pr_metadata", "pr_checks",
-        "pr_reviews",
+        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session",
+        "write_file",
     }),
 }
 
@@ -8576,6 +8567,23 @@ class ToolRegistry:
                 )
             return auth
 
+        service = get_trusted_service_from_auth_context(auth_context)
+        if (
+            service is not None
+            and service.authority_profile == "session-boundary"
+            and not service.has_capability(tool_name)
+        ):
+            # Synthesis must not ingest around its trusted-turn input filter,
+            # including through generally available read tools in shadow mode.
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False,
+                reason="session_boundary_capability_denied",
+                enforcement_enabled=True,
+                would_block=True,
+            ))
+
         if tool_name == "hands_request_scope":
             # This can only ask the editor for scope; it neither executes input
             # nor grants IFC/host-execution authority. Never shadow-allow it.
@@ -10505,24 +10513,15 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
             canonical="synthesis",
             trigger="saga_session_end",
             capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
-            readable_domains=(
-                "session", "saga", "filesystem", "turn_history", "shell_jobs",
-                "repository",
-            ),
+            readable_domains=("session", "saga", "turn_history"),
             sink_destinations=(
-                "filesystem", "network", "session_boundary", "saga", "shell_process",
+                "filesystem", "session_boundary", "saga",
             ),
             sink_policies=(
                 ServiceSinkPolicy(
                     "write_file", "static_service_write_roots",
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
-                ServiceSinkPolicy(
-                    "edit_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "session_boundary"),
-                ServiceSinkPolicy("fetch_url", "github_pr_api", "GITHUB_REPOS"),
             ),
             saga_full_corpus_read=True,
             creation_path="mimir.server._on_session_idle",

@@ -16,7 +16,6 @@ from mimir.access_control import (
     OperationDecision,
     ResourceScope,
     ServicePrincipal,
-    ServiceSinkPolicy,
     ToolRegistry,
     create_auth_context,
     get_operation_catalog,
@@ -752,7 +751,8 @@ def test_explicit_service_principals_are_separate_and_frozen() -> None:
         ("upgrade", "submit_proposal", "spawn_open_code", True),
         ("upgrade", "read_file", "spawn_open_code", True),
         ("saga_session_end", "saga_end_session", "spawn_open_code", True),
-        ("saga_session_end", "read_file", "spawn_open_code", True),
+        ("saga_session_end", "saga_feedback", "spawn_open_code", True),
+        ("saga_session_end", "mimir_get_turn", "spawn_open_code", True),
         ("saga_session_end", "memory_get", "spawn_open_code", True),
     ],
 )
@@ -785,15 +785,7 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
     labels = _service_labels(event)
     ctx = create_auth_context(event, enforce=True, ifc_labels=labels)
     read_arguments = None
-    if trigger == "saga_session_end" and allowed_operation == "read_file":
-        note = (
-            maintenance_git_home / "memory" / "channels"
-            / str(event.channel_id) / "notes.md"
-        )
-        note.parent.mkdir(parents=True)
-        note.write_text("session notes\n", encoding="utf-8")
-        read_arguments = {"file_path": str(note)}
-    elif trigger == "upgrade" and allowed_operation == "read_file":
+    if trigger == "upgrade" and allowed_operation == "read_file":
         note = (
             maintenance_git_home / "scratch" / "proposals"
             / "upgrade" / "upgrade_defaults" / "notes.md"
@@ -823,8 +815,11 @@ def test_service_principals_allow_only_explicit_operations_and_compatible_flows(
         blocked_category = "spawn" if allowed_operation == "worklink_run" else "file"
         assert admitted.reason == f"ifc_label_blocked:{blocked_category}"
     assert denied.allowed is False
-    assert denied.reason == "admin_required"
-    assert denied.service_principal is get_service_principal(trigger)
+    if trigger == "saga_session_end":
+        assert denied.reason == "session_boundary_capability_denied"
+    else:
+        assert denied.reason == "admin_required"
+        assert denied.service_principal is get_service_principal(trigger)
 
 
 def test_service_authorization_is_stable_under_inventory_mutation_and_surface_width(
@@ -1378,52 +1373,43 @@ def test_poller_principal_has_required_capabilities() -> None:
 
 
 def test_synthesis_principal_has_required_capabilities_for_session_end() -> None:
-    """Verify synthesis principal has all capabilities needed for saga_session_end workflow.
-
-    Based on saga_session_end.md production prompt:
-    - Gets turn content (mimir_get_turn, get_turn)
-    - Reads files for memory capture (read_file, ls, glob)
-    - Inspects shell jobs started earlier in the session
-    - Stores atoms (memory_store)
-    - Gets atoms by ID (memory_get)
-    - Records feedback (saga_feedback)
-    - Records skill learnings (saga_record_skill_learning)
-    - Ends session (saga_end_session)
-    - Marks contributions (saga_mark_contributions)
-    """
+    """Synthesis has exactly the trusted-turn curation capabilities."""
     synthesis = get_service_principal("saga_session_end")
     assert synthesis is not None
-
-    turn_ops = {"mimir_get_turn", "get_turn"}
-    read_ops = {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search"}
-    write_ops = {"write_file", "edit_file"}
-    memory_ops = {"memory_get", "memory_store"}
-    saga_ops = {"saga_feedback", "saga_end_session", "saga_mark_contributions", "saga_record_skill_learning"}
-    shell_inspection_ops = {"shell_exec", "bash_jobs_list", "bash_job_output"}
-    network_ops = {"fetch_url"}
-    pr_read_ops = {"pr_metadata", "pr_checks", "pr_reviews"}
-
-    all_expected = turn_ops | read_ops | write_ops | memory_ops | saga_ops | shell_inspection_ops | network_ops | pr_read_ops
-    for cap in all_expected:
-        assert synthesis.has_capability(cap), f"synthesis missing {cap}"
-    assert synthesis.can_write_sink("filesystem")
-    assert synthesis.can_read_domain("shell_jobs")
-    assert synthesis.can_read_domain("repository")
-    assert synthesis.can_write_sink("shell_process")
-    assert synthesis.can_write_sink("network")
-    assert synthesis.sink_policy_for("shell_exec") == ServiceSinkPolicy(
-        "shell_exec", "shell_profile", "session_boundary",
-    )
-
-    forbidden = {
-        "bash_async",
-        "spawn_open_code",
-        "add_schedule",
-        "remove_schedule",
-        "send_message",
+    assert set(synthesis.capabilities) == {
+        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session", "write_file",
     }
-    for cap in forbidden:
-        assert not synthesis.has_capability(cap), f"synthesis should NOT have {cap}"
+    assert synthesis.can_write_sink("filesystem")
+    assert not synthesis.can_write_sink("shell_process")
+    assert not synthesis.can_write_sink("network")
+    assert synthesis.sink_policy_for("shell_exec") is None
+    assert synthesis.sink_policy_for("fetch_url") is None
+
+
+@pytest.mark.parametrize("enforce", [False, True], ids=["shadow", "enforced"])
+@pytest.mark.parametrize("operation", [
+    "get_turn", "read_file", "aread", "ls", "als", "glob", "aglob", "grep",
+    "agrep", "file_search", "edit_file", "memory_store", "memory_query",
+    "saga_mark_contributions", "saga_record_skill_learning", "rebuild_index",
+    "shell_exec", "bash_async", "bash_jobs_list", "bash_job_output",
+    "fetch_url", "web_search", "pr_metadata", "pr_checks", "pr_reviews",
+    "spawn_open_code", "task", "add_schedule", "remove_schedule", "send_message",
+    "write_todos", "new_unclassified_tool",
+])
+def test_synthesis_denies_non_capabilities_even_in_shadow(operation, enforce):
+    event = AgentEvent(
+        trigger="saga_session_end", channel_id="synthesis:test",
+        service_principal="synthesis",
+    )
+    context = create_auth_context(event, enforce=enforce, ifc_labels=_service_labels(event))
+    result = ToolRegistry().authorize_tool(operation, context, enforce=enforce)
+
+    assert result.allowed is False
+    assert result.reason == "session_boundary_capability_denied"
+    assert result.decision == OperationDecision.ADMIN_REQUIRED
+    assert result.enforcement_enabled is True
+    assert result.would_block is True
+    assert result.is_shadow_decision is False
 
 
 def test_system_principal_has_required_capabilities_for_upgrade() -> None:
@@ -1474,7 +1460,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
         ("scheduled_tick", "remove_schedule", False),
         ("scheduled_tick", "reload_pollers", False),
         ("saga_session_end", "saga_end_session", True),
-        ("saga_session_end", "shell_exec", True),
+        ("saga_session_end", "shell_exec", False),
         ("saga_session_end", "spawn_open_code", False),
         ("saga_session_end", "add_schedule", False),
         ("upgrade", "submit_proposal", True),
@@ -1522,6 +1508,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
                 "admin_required",
                 "unknown_operation",
                 "service_capability_denied",
+                "session_boundary_capability_denied",
                 "ifc_label_blocked:spawn",
             ), f"{trigger} {operation} denied for wrong reason: {result.reason}"
 
@@ -1537,7 +1524,7 @@ def test_adjacent_unauthorized_operations_deny_for_each_principal(
         ("upgrade", "bash_job_output", None),
     ],
 )
-def test_service_shell_companions_are_admitted_when_enforced(
+def test_service_shell_companions_follow_principal_authority_when_enforced(
     trigger: str,
     operation: str,
     target: str | None,
@@ -1559,7 +1546,9 @@ def test_service_shell_companions_are_admitted_when_enforced(
         operation, context, enforce=True, target_channel=target,
     )
 
-    assert result.allowed is True
+    assert result.allowed is (trigger != "saga_session_end")
+    if trigger == "saga_session_end":
+        assert result.reason == "session_boundary_capability_denied"
 
 
 def test_service_authorization_requires_two_factor_validation(

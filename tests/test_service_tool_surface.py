@@ -256,7 +256,7 @@ def test_synthesis_uses_catalog_and_exact_resource_requirements(tmp_path, monkey
     catalog = OperationCatalog()
     catalog.register_operation("explicit_open", OperationDecision.OPEN)
     monkeypatch.setattr("mimir.tools.service_tool_surface.get_operation_catalog", lambda: catalog)
-    candidates = [*INVENTORY, "explicit_open", "explicit_grant"]
+    candidates = [*INVENTORY, "mimir_get_turn", "explicit_open", "explicit_grant"]
     service = replace(service, capabilities=(*service.capabilities, "explicit_grant"))
 
     def surface(principal):
@@ -267,13 +267,18 @@ def test_synthesis_uses_catalog_and_exact_resource_requirements(tmp_path, monkey
         return [t.name for t in ServiceToolSurfaceMiddleware()._filter_request(request).tools]
 
     visible = surface(service)
-    assert all(name in visible for name in (
-        *OPEN, "read_file", "memory_store", "shell_exec", "bash_jobs_list",
-        "bash_job_output", "write_file", "edit_file", "rebuild_index",
-        "saga_feedback", "saga_mark_contributions", "saga_end_session",
-        "saga_record_skill_learning", "explicit_open", "explicit_grant",
-    ))
-    assert all(name not in visible for name in ("bash_async", "send_message", "saga_forget", "hands_shell"))
+    assert visible == [
+        *OPEN, "write_file", "saga_feedback",
+        "saga_end_session", "mimir_get_turn", "explicit_open", "explicit_grant",
+    ]
+    # Visibility is not authority: OPEN tools still reach the registry,
+    # which hard-denies synthesis calls outside its capabilities even in shadow.
+    for name in ("web_search", "fetch_url", "memory_query", "write_todos", "explicit_open"):
+        decision = ToolRegistry().authorize_tool(
+            name, auth(service, enforcement_enabled=enforce), enforce=enforce,
+        )
+        assert decision.allowed is False
+        assert decision.reason == "session_boundary_capability_denied"
     stripped = surface(replace(service, readable_domains=(), sink_destinations=()))
     assert stripped == [*OPEN, "explicit_open", "explicit_grant"]
     # OPEN memory reads do not require an explicit service grant. Non-open

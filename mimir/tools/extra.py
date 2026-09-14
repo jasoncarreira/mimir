@@ -215,9 +215,22 @@ def _read_turn_record(turn_id: str) -> str:
     ``get_turn`` alias. Reads turns.jsonl, returns the matching record
     JSON-formatted with large derived fields stripped, or an error
     string."""
+    from dataclasses import replace
+    from .._context import get_current_turn
+    from ..access_control import get_trusted_service_from_auth_context
+    from .refusals import ToolPolicyRefusal
+
+    turn = get_current_turn()
+    auth_context = getattr(turn, "auth_context", None)
+    service = get_trusted_service_from_auth_context(auth_context)
+    synthesis = service is not None and service.authority_profile == "session-boundary"
+    if synthesis and (not turn_id or not turn_id.strip()):
+        raise ToolPolicyRefusal("get_turn refused: turn_id is required")
     if not turn_id or not turn_id.strip():
         return "get_turn failed: turn_id is required"
     path = _TURN_STATE["turns_log_path"]
+    if synthesis and (path is None or not path.is_file()):
+        raise ToolPolicyRefusal("get_turn refused: turns log unavailable")
     if path is None:
         return "get_turn failed: turns log path not configured"
     if not path.exists():
@@ -235,6 +248,8 @@ def _read_turn_record(turn_id: str) -> str:
             if row.get("turn_id") == target:
                 from ..read_policy import non_admin_read_filter_enabled
 
+                if synthesis and row.get("integrity") != "trusted":
+                    raise ToolPolicyRefusal("get_turn refused: synthesis requires a trusted turn record")
                 if non_admin_read_filter_enabled():
                     from ..redaction import redact_payload
 
@@ -245,22 +260,24 @@ def _read_turn_record(turn_id: str) -> str:
                 # reader can see what the turn absorbed beyond ``input``.
                 for k in ("input", "saga_atom_ids", "usage"):
                     row.pop(k, None)
-                from .._context import get_current_turn
                 from ..access_control import (
                     protected_result_source,
                     publish_protected_result,
                 )
 
-                turn = get_current_turn()
-                auth_context = getattr(turn, "auth_context", None)
-                publish_protected_result((protected_result_source(
+                source = protected_result_source(
                     auth_context,
                     principal="mimir:turn-log",
                     domain="turn_history",
                     resource_id=f"turn:{target}",
                     bridge_instance="mimir",
-                ),))
+                )
+                if synthesis:
+                    source = replace(source, integrity="trusted")
+                publish_protected_result((source,))
                 return json.dumps(row, indent=2, ensure_ascii=False)
+    if synthesis:
+        raise ToolPolicyRefusal("get_turn refused: no matching turn record")
     return f"get_turn: no turn found with id {target!r}"
 
 

@@ -717,26 +717,39 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
     } == expected
 
 
-def test_session_boundary_poller_can_declare_rebuild_index(tmp_path: Path) -> None:
-    persist_dir = tmp_path / "state" / "pollers" / "session-boundary"
-    persist_dir.mkdir(parents=True)
-
+def test_session_boundary_poller_can_end_session_without_companions(tmp_path: Path) -> None:
     authority = _parse_poller_authority(
         _authority(
             profile="session-boundary",
-            tier="scoped-with-provenance",
-            capabilities=["rebuild_index"],
+            capabilities=["saga_end_session"],
             scoped_roots=[],
         ),
         name="session-boundary",
-        persist_dir=persist_dir,
-        state_root=tmp_path / "state" / "pollers",
-        manifest_path=tmp_path / "skills" / "session-boundary" / "pollers.json",
+        persist_dir=tmp_path,
+        state_root=None,
+        manifest_path=tmp_path / "pollers.json",
     )
 
-    assert authority.capabilities == ("rebuild_index",)
-    assert authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
-    assert authority.sink_destinations == ("filesystem",)
+    assert authority.capabilities == ("saga_end_session",)
+
+
+def test_session_boundary_poller_cannot_declare_rebuild_index(tmp_path: Path) -> None:
+    persist_dir = tmp_path / "state" / "pollers" / "session-boundary"
+    persist_dir.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="outside.*profile"):
+        _parse_poller_authority(
+            _authority(
+                profile="session-boundary",
+                tier="scoped-with-provenance",
+                capabilities=["rebuild_index"],
+                scoped_roots=[],
+            ),
+            name="session-boundary",
+            persist_dir=persist_dir,
+            state_root=tmp_path / "state" / "pollers",
+            manifest_path=tmp_path / "skills" / "session-boundary" / "pollers.json",
+        )
 
 
 def test_github_profile_allows_only_its_bounded_fetch_capability(
