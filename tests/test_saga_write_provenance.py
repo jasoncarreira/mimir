@@ -9,7 +9,10 @@ from typing import Any
 import pytest
 from langchain.tools import ToolRuntime
 
-from mimir.access_control import CapabilityTier, build_trigger_service_principal, create_auth_context
+from mimir.access_control import (
+    CapabilityTier, ServicePrincipal, build_trigger_service_principal,
+    builtin_trigger_service_principal, create_auth_context,
+)
 from mimir.identities import IdentityResolver
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, Integrity,
@@ -95,14 +98,16 @@ def _user_context(tmp_path: Path, author: str, channel: str) -> AuthContext:
     )
 
 
-def _service_context(trigger: str, channel: str) -> AuthContext:
+def _service_context(
+    trigger: str, channel: str, *, authority: ServicePrincipal | None = None,
+) -> AuthContext:
     principals = {
         "scheduled_tick": "scheduler",
         "poller": "poller",
         "saga_session_end": "synthesis",
         "upgrade": "system",
     }
-    canonical = principals[trigger]
+    canonical = authority.canonical if authority is not None else principals[trigger]
     labels = InformationFlowLabels().with_source(SourceLabel(
         principal=f"service:{canonical}", domain="service", resource_id=channel,
         bridge_instance=canonical, sensitivity="internal",
@@ -115,6 +120,7 @@ def _service_context(trigger: str, channel: str) -> AuthContext:
             trigger=trigger,
             channel_id=channel,
             service_principal=canonical,
+            service_authority=authority,
         ),
         enforce=True,
         ifc_labels=labels,
@@ -175,7 +181,7 @@ async def test_concurrent_memory_writes_keep_runtime_owned_provenance(
 
 @pytest.mark.parametrize(
     "trigger",
-    ["scheduled_tick", "poller", "upgrade"],
+    ["scheduled_tick", "poller", "upgrade", "saga_session_end"],
 )
 @pytest.mark.asyncio
 async def test_service_without_memory_store_capability_is_denied(
@@ -192,11 +198,14 @@ async def test_service_without_memory_store_capability_is_denied(
 
 
 @pytest.mark.asyncio
-async def test_synthesis_memory_store_preserves_service_provenance(
-    write_store: _WriteStore,
+async def test_heartbeat_memory_store_preserves_service_provenance(
+    tmp_path: Path, write_store: _WriteStore,
 ) -> None:
-    trigger = "saga_session_end"
-    context = _service_context(trigger, f"{trigger}:owned")
+    trigger = "scheduled_tick"
+    context = _service_context(
+        trigger, "scheduler:heartbeat",
+        authority=builtin_trigger_service_principal("heartbeat", tmp_path),
+    )
     out = await memory_store.ainvoke({
         "content": trigger, "stream": "episodic",
         "runtime": _runtime(context, f"{trigger}-store"),
@@ -204,9 +213,10 @@ async def test_synthesis_memory_store_preserves_service_provenance(
 
     assert "stored" in out
     call = write_store.atom_calls[-1]
-    assert call["owner_principal"] == "service:synthesis"
-    assert call["origin_channel"] == f"{trigger}:owned"
+    assert call["owner_principal"] == "service:heartbeat"
+    assert call["origin_channel"] == "scheduler:heartbeat"
     assert call["visibility"] == "service"
+    assert call["provenance"]["created_by"] == "service:heartbeat"
 
 
 @pytest.mark.asyncio

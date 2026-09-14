@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from langchain.tools import ToolRuntime
 
-from mimir.access_control import create_auth_context
+from mimir.access_control import builtin_trigger_service_principal, create_auth_context
 from mimir.models import (
     AgentEvent,
     AuthContext,
@@ -72,17 +72,18 @@ async def test_inventory_classifies_atoms_seeded_through_real_write_entries(
             ifc_state=InformationFlowState(labels=user_labels),
         )
         service_labels = InformationFlowLabels(sources=(SourceLabel(
-            principal="service:synthesis", domain="service",
-            resource_id="saga:synthesis", bridge_instance="synthesis",
+            principal="service:heartbeat", domain="service",
+            resource_id="scheduler:heartbeat", bridge_instance="heartbeat",
             sensitivity="internal",
-            authorized_principals=frozenset({"service:synthesis"}),
+            authorized_principals=frozenset({"service:heartbeat"}),
             source_kind="service", integrity="trusted",
             integrity_effect="informational",
         ),))
         service = create_auth_context(
             AgentEvent(
-                trigger="saga_session_end", channel_id="saga:synthesis",
-                service_principal="synthesis",
+                trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+                service_principal="heartbeat",
+                service_authority=builtin_trigger_service_principal("heartbeat", tmp_path),
             ),
             enforce=True,
             ifc_labels=service_labels,

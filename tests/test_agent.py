@@ -1390,26 +1390,26 @@ async def test_poller_turn_cannot_read_another_pollers_channel_memory(
 
 
 @pytest.mark.parametrize(
-    ("relative_path", "expected", "allowed"),
+    ("relative_path", "expected"),
     [
-        ("memory/channels/discord-a/notes.md", "session note\n", True),
-        ("memory/INDEX.md", "memory index\n", True),
-        ("memory/learnings-pending.md", "pending learning\n", True),
-        ("memory/learnings-pending/candidate.md", "pending candidate\n", True),
-        ("memory/issues/declarative-guard-test-vacuity.md", "issue note\n", True),
-        ("memory/shared/team.md", "shared note\n", True),
-        ("memory/skills-catalog.md", "skills catalog\n", True),
-        ("memory/channels/discord-b/notes.md", "other session\n", False),
-        ("memory/core/00-identity.md", "core memory\n", True),
-        ("state/reflection-policy.md", "reflection state\n", True),
-        ("memory/shared/.git/token", "protected name\n", False),
-        ("memory/issues/unprotected-name.md", "ghp_" + "a" * 30, False),
+        ("memory/channels/discord-a/notes.md", "session note\n"),
+        ("memory/INDEX.md", "memory index\n"),
+        ("memory/learnings-pending.md", "pending learning\n"),
+        ("memory/learnings-pending/candidate.md", "pending candidate\n"),
+        ("memory/issues/declarative-guard-test-vacuity.md", "issue note\n"),
+        ("memory/shared/team.md", "shared note\n"),
+        ("memory/skills-catalog.md", "skills catalog\n"),
+        ("memory/channels/discord-b/notes.md", "other session\n"),
+        ("memory/core/00-identity.md", "core memory\n"),
+        ("state/reflection-policy.md", "reflection state\n"),
+        ("memory/shared/.git/token", "protected name\n"),
+        ("memory/issues/unprotected-name.md", "ghp_" + "a" * 30),
+        ("attachments/fetch-cache/body.txt", "cached attachment body\n"),
     ],
 )
-async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
+async def test_enforced_synthesis_turn_denies_all_file_reads(
     relative_path: str,
     expected: str,
-    allowed: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1440,11 +1440,13 @@ async def test_enforced_synthesis_turn_has_session_scoped_memory_reads(
 
     assert record.error is None
     assert fake_agent.result is not None
-    assert (fake_agent.result.status != "error") is allowed
-    if allowed:
-        assert fake_agent.result.content == expected
-    else:
-        assert "refused" in str(fake_agent.result.content)
+    assert fake_agent.result.status == "error"
+    assert "refused" in str(fake_agent.result.content)
+    assert "session_boundary_capability_denied" in str(fake_agent.result.content)
+    assert expected.strip() not in str(fake_agent.result.content)
+    assert record.integrity == "trusted"
+    assert record.integrity_effect == "informational"
+    assert all(source["integrity"] == "trusted" for source in record.integrity_sources)
 
 
 async def test_heartbeat_turn_reads_explicitly_mapped_channel_memory(

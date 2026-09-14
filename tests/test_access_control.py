@@ -991,8 +991,9 @@ def test_poller_read_scope_is_limited_to_its_server_bound_skill(
 
 
 @pytest.mark.parametrize("enforce", [False, True])
-def test_large_tool_result_root_is_available_to_service_principals(
-    enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("profile", ["heartbeat", "session-boundary"])
+def test_large_tool_result_root_respects_service_capabilities(
+    enforce: bool, profile: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.read_policy import framework_large_tool_results_root
 
@@ -1006,14 +1007,7 @@ def test_large_tool_result_root_is_available_to_service_principals(
         "recoverable result ghp_" + "a" * 30 + "\n", encoding="utf-8",
     )
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    service = build_trigger_service_principal(
-        canonical="synthesis",
-        trigger="saga_session_end",
-        profile="session-boundary",
-        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-        capabilities=("write_file", "read_file", "ls", "glob", "grep"),
-        creation_path="test",
-    )
+    service = access_control.builtin_trigger_service_principal(profile, home)
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
@@ -1030,7 +1024,13 @@ def test_large_tool_result_root_is_available_to_service_principals(
         decision = registry.authorize_tool(
             tool_name, auth, enforce=enforce, arguments=arguments,
         )
-        assert decision.allowed is True, (tool_name, decision.reason)
+        assert decision.allowed is (profile == "heartbeat"), (
+            tool_name, decision.reason,
+        )
+        assert decision.would_block is (profile == "session-boundary")
+        if profile == "session-boundary":
+            assert decision.reason == "session_boundary_capability_denied"
+            assert decision.enforcement_enabled is True
 
     assert str(artifact_root.resolve()) in service.filesystem_read_roots
     private = home / "private.txt"
@@ -1417,24 +1417,16 @@ def test_full_corpus_flag_changes_only_saga_read_authority(tmp_path: Path) -> No
         assert broad_decision.allowed is False
 
 
-def test_synthesis_builtin_has_bounded_closing_reads(tmp_path: Path) -> None:
+def test_synthesis_builtin_has_exact_session_boundary_capabilities(tmp_path: Path) -> None:
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
     )
 
-    assert {"pr_metadata", "pr_checks", "pr_reviews"} <= set(
-        principal.capabilities
-    )
-    assert "repository" in principal.readable_domains
-    for capability in ("pr_metadata", "pr_checks", "pr_reviews"):
-        assert access_control.TRIGGER_CAPABILITY_TIERS[capability] is CapabilityTier.SCOPE_CONTAINED
-    assert {"shell_exec", "fetch_url"} <= set(principal.capabilities)
-    assert principal.sink_policy_for("shell_exec") == ServiceSinkPolicy(
-        "shell_exec", "shell_profile", "session_boundary",
-    )
-    assert principal.sink_policy_for("fetch_url") == ServiceSinkPolicy(
-        "fetch_url", "github_pr_api", "GITHUB_REPOS",
-    )
+    expected = {"memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session", "write_file"}
+    assert set(principal.capabilities) == expected
+    assert access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"] == expected
+    assert principal.sink_policy_for("shell_exec") is None
+    assert principal.sink_policy_for("fetch_url") is None
     assert principal.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
 
 
@@ -1611,7 +1603,7 @@ def _trusted_service_auth(service: ServicePrincipal, *, channel_id: str) -> Auth
         ("session-boundary", "chainlink issue update 1321 --title closed"),
     ],
 )
-def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
+def test_closing_principals_tracker_authority_is_profile_scoped(
     profile: str,
     command: str,
     tmp_path: Path,
@@ -1625,7 +1617,7 @@ def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
         arguments={"command": command},
     )
 
-    assert decision.allowed is True, decision.reason
+    assert decision.allowed is (profile == "heartbeat"), decision.reason
 
 
 @pytest.mark.parametrize(
@@ -1636,7 +1628,7 @@ def test_closing_principals_reach_bounded_tracker_operations_when_enforced(
         "gh issue view 9 --repo acme/widget --json number,title --comments",
     ],
 )
-def test_synthesis_reaches_observed_read_only_github_shell_reads(
+def test_synthesis_refuses_observed_read_only_github_shell_reads(
     command: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1653,7 +1645,7 @@ def test_synthesis_reaches_observed_read_only_github_shell_reads(
         arguments={"command": command},
     )
 
-    assert decision.allowed is True, decision.reason
+    assert decision.allowed is False, decision.reason
 
 
 @pytest.mark.parametrize(
@@ -1789,7 +1781,7 @@ def test_session_boundary_github_read_refuses_repo_flag_without_value(
     assert decision.allowed is False, decision.reason
 
 
-def test_synthesis_fetch_is_bounded_to_configured_github_repository(
+def test_synthesis_refuses_fetch_even_for_configured_github_repository(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1800,7 +1792,7 @@ def test_synthesis_fetch_is_bounded_to_configured_github_repository(
     auth = _trusted_service_auth(service, channel_id="channel-a")
     registry = ToolRegistry()
 
-    allowed = registry.authorize_tool(
+    configured = registry.authorize_tool(
         "fetch_url", auth, enforce=True,
         target_channel="https://api.github.com/repos/acme/widget/pulls/7",
     )
@@ -1809,9 +1801,9 @@ def test_synthesis_fetch_is_bounded_to_configured_github_repository(
         target_channel="https://api.github.com/repos/other/repo/pulls/7",
     )
 
-    assert allowed.allowed is True
+    assert configured.allowed is False
     assert denied.allowed is False
-    assert denied.reason == "egress_destination_not_approved"
+    assert configured.reason == denied.reason == "session_boundary_capability_denied"
 
 
 @pytest.mark.parametrize(
@@ -1823,7 +1815,7 @@ def test_synthesis_fetch_is_bounded_to_configured_github_repository(
         ("session-boundary", "channel-a", "ls"),
     ],
 )
-def test_closing_principals_read_only_their_own_channel_memory(
+def test_closing_principals_filesystem_reads_are_profile_scoped(
     profile: str,
     channel_id: str,
     tool_name: str,
@@ -1852,7 +1844,7 @@ def test_closing_principals_read_only_their_own_channel_memory(
         tool_name, auth, enforce=True, arguments={argument_name: str(other_target)},
     )
 
-    assert allowed.allowed is True, allowed.reason
+    assert allowed.allowed is (profile == "heartbeat"), allowed.reason
     assert denied.allowed is False
 
 
@@ -1876,30 +1868,10 @@ def test_closing_principals_still_refuse_github_and_repository_mutations(
     )
 
     assert decision.allowed is False
-    assert decision.reason == "service_sink_destination_denied"
-
-
-def test_session_boundary_companion_conformance_detects_omitted_closing_grant(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    principal = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "saga_session_end",
-        replace(
-            principal,
-            capabilities=tuple(
-                capability for capability in principal.capabilities
-                if capability != "fetch_url"
-            ),
-        ),
-    )
-
-    complete, errors = access_control.check_capability_matrix_complete()
-
-    assert complete is False
-    assert any(
-        "capabilities without companions: fetch_url" in error for error in errors
+    assert decision.reason == (
+        "session_boundary_capability_denied"
+        if profile == "session-boundary"
+        else "service_sink_destination_denied"
     )
 
 
@@ -1914,7 +1886,7 @@ def test_unrelated_system_principal_does_not_inherit_closing_authority() -> None
     )
 
 
-def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
+def test_synthesis_builtin_refuses_clean_and_tainted_index_rebuild(
     tmp_path: Path,
 ) -> None:
     from mimir.models import SourceLabel
@@ -1935,7 +1907,7 @@ def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
     ))
 
     assert labels.has_untrusted_active_ingest is True
-    assert "rebuild_index" in principal.capabilities
+    assert "rebuild_index" not in principal.capabilities
     assert access_control.TRIGGER_CAPABILITY_TIERS["rebuild_index"] is (
         CapabilityTier.SCOPE_CONTAINED
     )
@@ -1944,13 +1916,14 @@ def test_synthesis_builtin_authorizes_clean_but_refuses_tainted_index_rebuild(
         "rebuild_index",
         _service_auth(principal, InformationFlowLabels()),
         enforce=True,
-    ).allowed is True
+    ).allowed is False
     tainted_decision = registry.authorize_tool(
         "rebuild_index",
         _service_auth(principal, labels),
         enforce=True,
     )
     assert tainted_decision.allowed is False
+    assert tainted_decision.reason == "session_boundary_capability_denied"
     assert tainted_decision.argument_egress == "taint_gated"
 
 
@@ -2058,7 +2031,7 @@ def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
         decision = ToolRegistry().authorize_tool(
             tool_name, auth, enforce=True, target_channel=target,
         )
-        assert decision.allowed is True, (target, decision.reason)
+        assert decision.allowed is (tool_name == "write_file"), (target, decision.reason)
 
     other_channel = ToolRegistry().authorize_tool(
         tool_name,
@@ -2073,9 +2046,12 @@ def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
         target_channel="memory/core/00-persona.md",
     )
     assert other_channel.allowed is False
-    assert other_channel.reason == "service_sink_destination_denied"
     assert core.allowed is False
-    assert core.reason == "service_sink_destination_denied"
+    assert other_channel.reason == core.reason == (
+        "service_sink_destination_denied"
+        if tool_name == "write_file"
+        else "session_boundary_capability_denied"
+    )
 
 
 def test_synthesis_unresolvable_other_channel_target_fails_closed(
@@ -2107,7 +2083,7 @@ def test_synthesis_unresolvable_other_channel_target_fails_closed(
 
 
 @pytest.mark.parametrize("tool_name", ["read_file", "grep"])
-def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
+def test_synthesis_refuses_filesystem_reads_in_memory_and_repository_roots(
     tool_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2140,8 +2116,6 @@ def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
     registry = ToolRegistry()
 
     argument_name = "file_path" if tool_name == "read_file" else "path"
-    # The memory grant is additive: synthesis retains the
-    # repository roots declared by its principal instead of narrowing to memory.
     for target in (own_note, core_note, issue_note, shared_learnings, repository_note):
         decision = registry.authorize_tool(
             tool_name,
@@ -2149,7 +2123,7 @@ def test_synthesis_adds_session_memory_reads_without_revoking_repository_roots(
             enforce=True,
             arguments={argument_name: str(target)},
         )
-        assert decision.allowed is True, (target, decision.reason)
+        assert decision.allowed is False, (target, decision.reason)
 
     denied_targets = [other_note, protected_note]
     if tool_name == "read_file":
@@ -6697,7 +6671,6 @@ def test_existing_fetch_profile_policies_are_unchanged(tmp_path: Path) -> None:
     for profile, adapter, destination in (
         ("heartbeat", "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
         ("github", "github_pr_api", "GITHUB_REPOS"),
-        ("session-boundary", "github_pr_api", "GITHUB_REPOS"),
     ):
         service = build_trigger_service_principal(
             canonical=f"test:{profile}", trigger="poller", profile=profile,

@@ -11,6 +11,7 @@ LangChain Tool introspection (no custom registry, no MCP server).
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 from langchain.tools import ToolRuntime
@@ -158,26 +159,59 @@ async def memory_get(
         ids that weren't found (deleted, unknown, or out of your scope).
         "(no atoms found)" if none of the ids resolved.
     """
-    client = _MEMORY_STATE["client"]
-    if client is None:
-        return "memory_get failed: no SagaStore configured"
-    if not isinstance(atom_ids, list) or not all(
-        isinstance(a, str) for a in atom_ids
-    ):
-        return "memory_get failed: atom_ids must be a list of id strings"
-    ids = [a for a in atom_ids if a]
-    if not ids:
-        return "memory_get failed: atom_ids is empty"
+    from mimir.access_control import (
+        get_trusted_service_from_auth_context,
+        protected_result_source,
+        publish_protected_result,
+    )
+    from .refusals import ToolPolicyRefusal
 
     auth_context = (
         runtime.context
         if runtime is not None and isinstance(runtime.context, AuthContext)
         else None
     )
+    service = get_trusted_service_from_auth_context(auth_context)
+    synthesis = service is not None and service.authority_profile == "session-boundary"
+
+    def fail(message: str) -> str:
+        if synthesis:
+            raise ToolPolicyRefusal(message)
+        return message
+
+    client = _MEMORY_STATE["client"]
+    if client is None:
+        return fail("memory_get failed: no SagaStore configured")
+    if not isinstance(atom_ids, list) or not all(
+        isinstance(a, str) for a in atom_ids
+    ):
+        return fail("memory_get failed: atom_ids must be a list of id strings")
+    ids = [a for a in atom_ids if a]
+    if not ids:
+        return fail("memory_get failed: atom_ids is empty")
 
     try:
         payload = await client.get_atoms(ids, auth_context=auth_context)
     except Exception as exc:  # noqa: BLE001 — SagaError surfaces via str
+        if synthesis:
+            raise ToolPolicyRefusal("memory_get failed: memory unavailable") from exc
         return f"memory_get failed: {exc}"
+    if synthesis:
+        atoms = payload.get("atoms") or []
+        # Refuse the entire batch before rendering any content or provenance.
+        if any(atom.get("integrity") != "trusted" for atom in atoms):
+            raise ToolPolicyRefusal("memory_get failed: synthesis requires trusted memory atoms")
+        publish_protected_result(tuple(
+            replace(protected_result_source(
+                auth_context,
+                principal=atom.get("owner_principal"),
+                domain="saga",
+                resource_id=f"atom:{atom['id']}",
+                bridge_instance="saga",
+                sensitivity="private",
+            ), integrity="trusted")
+            for atom in atoms
+        ))
+        return _format_get_atoms(payload)
     _publish_memory_provenance(payload, auth_context)
     return _format_get_atoms(payload)
