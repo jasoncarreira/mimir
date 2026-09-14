@@ -14,9 +14,10 @@ permissions:
 
 # RUNNER_TEMP is beneath the controller's home on hosted runners. Fixtures
 # there trip controller-path scrubbing and non-owning-uid ancestor validation.
-# Keep evidence outside that home, under the platform's trusted sticky /tmp.
+# Keep evidence outside that home. Prepare steps canonicalize /tmp (which is
+# /private/tmp on macOS) and establish private ownership before exporting the root.
 env:
-  PYTEST_EVIDENCE_ROOT: /tmp/mimir-pytest-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+  PYTEST_EVIDENCE_DIR_NAME: mimir-pytest-evidence-${{ github.run_id }}-${{ github.run_attempt }}
 
 # Cancel in-flight runs for the same ref when a new commit lands. Saves
 # minutes on PR force-pushes; main-branch runs use ref=refs/heads/main
@@ -109,7 +110,15 @@ jobs:
         run: uv sync --extra dev --extra bench
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Skill conformance + catalog tests
         run: uv run pytest tests/test_skill_conformance.py tests/test_skill_catalog.py -v --basetemp "$PYTEST_EVIDENCE_ROOT/skill-conformance"
@@ -176,7 +185,15 @@ jobs:
           echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Audit live Chainlink command surface
         run: |
@@ -232,7 +249,15 @@ jobs:
           /usr/sbin/apparmor_parser --version
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT/optional-skills"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run mimir test suite
         # ``testpaths`` is set in pyproject.toml so no explicit path
@@ -354,7 +379,9 @@ jobs:
           sudo -u worklink test -x .venv/bin/python \
             || { echo "::error::worker uid cannot execute the venv interpreter"; exit 1; }
           echo "worker uid can read and not write the checkout"
-          sudo install -d -m 700 -o worklink -g worklink "$PYTEST_EVIDENCE_ROOT"
+          evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"
+          sudo install -d -m 700 -o worklink -g worklink "$evidence_root"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run mimir test suite as the non-owning worker uid
         # `.venv/bin/python -m pytest`, not `uv run`: uv derives its cache from HOME,
@@ -431,7 +458,15 @@ jobs:
         run: uv sync --extra dev --extra bench
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT/optional-skills"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run mimir test suite
         run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
@@ -506,7 +541,15 @@ jobs:
           /usr/sbin/apparmor_parser --version
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run mimir test suite against the fresh resolution
         run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
@@ -569,7 +612,15 @@ jobs:
           /usr/sbin/apparmor_parser --version
 
       - name: Prepare pytest evidence directory
-        run: mkdir -p "$PYTEST_EVIDENCE_ROOT"
+        run: |
+          set -euo pipefail
+          evidence_root="/tmp/$PYTEST_EVIDENCE_DIR_NAME"
+          mkdir -p "$evidence_root"
+          chgrp "$(id -g)" "$evidence_root"
+          chmod 700 "$evidence_root"
+          evidence_root="$(cd "$evidence_root" && pwd -P)"
+          mkdir -p "$evidence_root/optional-skills"
+          echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
       - name: Run mimir test suite (enforcement on)
         env:
