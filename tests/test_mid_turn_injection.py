@@ -1920,7 +1920,7 @@ async def test_category_prompt_itemizes_all_distinct_active_origins(tmp_path, mo
     assert "not shown" not in alert
 
 
-def test_approval_source_summary_itemizes_large_filesystem_origin():
+def test_approval_source_summary_bounds_large_filesystem_origin():
     sources = tuple(
         _source(
             "worklink:lease",
@@ -1934,13 +1934,18 @@ def test_approval_source_summary_itemizes_large_filesystem_origin():
 
     summary = tool_registry._render_approval_source_summary(sources)
 
-    assert len(summary.splitlines()) == 356
-    for source, line in zip(sources, summary.splitlines(), strict=True):
-        assert f'resource_id="{source.resource_id}"' in line
-        assert 'principal="worklink:lease"; domain="filesystem"' in line
-        assert 'bridge_instance="worklink"' in line
-    assert "count=" not in summary
-    assert "example_resource_ids=" not in summary
+    assert len(summary.splitlines()) == 1
+    assert summary == (
+        '- count=356; principal="worklink:lease"; domain="filesystem"; '
+        'bridge_instance="worklink"; sensitivity="private"; '
+        'authorized_principals=["worklink:lease"]; source_kind="file"; '
+        'integrity="untrusted"; integrity_effect="active_ingest"; '
+        'common_path_prefix="/var/lib/mimir/leases/pr-1831/checkout"; '
+        'example_resource_ids=["/var/lib/mimir/leases/pr-1831/checkout/file-0.txt", '
+        '"/var/lib/mimir/leases/pr-1831/checkout/file-1.txt", '
+        '"/var/lib/mimir/leases/pr-1831/checkout/file-2.txt"]'
+    )
+    assert len(summary) < 600
 
 
 @pytest.mark.parametrize("different_field", ["principal", "bridge_instance"])
@@ -1962,10 +1967,75 @@ def test_approval_source_summary_separates_active_ingest_origins(different_field
 
     summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
 
-    assert len(summary_lines) == 8
-    for source, line in zip(sources, summary_lines, strict=True):
-        assert f'resource_id="{source.resource_id}"' in line
-        assert f'{different_field}="{getattr(source, different_field)}"' in line
+    assert len(summary_lines) == 2
+    for origin, line in zip(("one", "two"), summary_lines, strict=True):
+        assert "count=4" in line
+        assert f'{different_field}="{origin}"' in line
+        assert f'common_path_prefix="/leases/{origin}"' in line
+        for index in range(3):
+            assert f'"/leases/{origin}/file-{index}"' in line
+
+
+@pytest.mark.asyncio
+async def test_category_prompt_bounds_hundreds_of_homogeneous_reads(tmp_path, monkeypatch):
+    sources = tuple(
+        _source(
+            "worklink:lease",
+            f"/var/lib/mimir/leases/pr-1831/checkout/file-{index}.py",
+            domain="filesystem",
+            bridge_instance="worklink",
+            source_kind="file",
+        )
+        for index in range(356)
+    ) + tuple(
+        _source(f"recall-{index}", f"atom:{index}", integrity_effect="informational")
+        for index in range(15)
+    ) + (_source("second-origin", "https://example.test/active", domain="web"),)
+    initial = InformationFlowLabels(sources=sources)
+    ctx, auth, _, channels, _ = _category_runtime(tmp_path, monkeypatch, initial=initial)
+    token = set_current_turn(ctx)
+    try:
+        assert "pending for the sink category" in await _request_category()
+    finally:
+        reset_current_turn(token)
+
+    alert = channels.alerts[0]
+    assert len(alert) < 2200
+    assert "count=355" in alert  # The blocking source is already shown above.
+    assert 'resource_id="https://example.test/active"' in alert
+    assert "15 other sources omitted:" in alert
+    assert len(alert.split("Source summary:\n", 1)[1].splitlines()) == 3
+    assert auth.ifc_state.current().sources == sources
+    assert approval.pending_request("slack-C1").request_carrier.sources == sources
+
+
+@pytest.mark.parametrize("changed", [
+    {"domain": "web"},
+    {"bridge_instance": "other"},
+    {"sensitivity": "public"},
+    {"authorized_principals": frozenset({"other"})},
+    {"source_kind": "file"},
+    {"integrity": "trusted"},
+    {"integrity_effect": "informational"},
+])
+def test_approval_group_key_distinguishes_every_label(changed):
+    original = _source("user", "resource:one")
+    variant = _source("user", "resource:two", **changed)
+    assert tool_registry._approval_source_group_key(original) != (
+        tool_registry._approval_source_group_key(variant)
+    )
+    assert tool_registry._approval_source_group_key(original) == (
+        tool_registry._approval_source_group_key(_source("user", "resource:three"))
+    )
+
+
+def test_approval_source_summary_large_nonfilesystem_group_keeps_examples():
+    sources = tuple(_source("user", f"slack-C1:{index}") for index in range(4))
+    summary = tool_registry._render_approval_source_summary(sources)
+    assert len(summary.splitlines()) == 1
+    assert "count=4" in summary
+    assert 'example_resource_ids=["slack-C1:0", "slack-C1:1", "slack-C1:2"]' in summary
+    assert "common_path_prefix" not in summary
 
 
 def test_approval_source_summary_itemizes_small_active_ingest_group():
@@ -2007,9 +2077,13 @@ def test_approval_source_summary_keeps_active_sources_beyond_old_group_limit():
 
     summary_lines = tool_registry._render_approval_source_summary(tuple(sources)).splitlines()
 
-    assert len(summary_lines) == 37
-    for source, line in zip(sources, summary_lines, strict=True):
+    assert len(summary_lines) == 26
+    for source, line in zip(sources[:25], summary_lines[:25], strict=True):
         assert f'resource_id="{source.resource_id}"' in line
+    assert 'count=12; principal="worklink:lease"' in summary_lines[-1]
+    assert 'common_path_prefix="/leases/omitted"' in summary_lines[-1]
+    assert 'example_resource_ids=["/leases/omitted/file-0", ' in summary_lines[-1]
+    assert "not shown" not in "\n".join(summary_lines)
 
 
 @pytest.mark.parametrize("integrity", ["trusted", "untrusted"])

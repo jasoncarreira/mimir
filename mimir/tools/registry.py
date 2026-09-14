@@ -567,11 +567,50 @@ def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
     return "; ".join(values)
 
 
+def _approval_source_group_key(source: Any) -> tuple[Any, ...]:
+    return (
+        source.principal,
+        source.domain,
+        source.bridge_instance,
+        source.sensitivity,
+        tuple(sorted(source.authorized_principals)),
+        source.source_kind,
+        source.integrity,
+        source.integrity_effect,
+    )
+
+
+def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
+    if len(group) <= 3:
+        return [
+            f"- {_render_approval_source(source, include_resource_id=True)}"
+            for source in group
+        ]
+
+    render = _render_approval_metadata
+    source = group[0]
+    values = [
+        f"count={render(len(group))}",
+        _render_approval_source(source, include_resource_id=False),
+    ]
+    resource_ids = [source.resource_id or "(unknown)" for source in group]
+    if source.domain == "filesystem":
+        try:
+            common_prefix = os.path.commonpath(resource_ids)
+        except ValueError:
+            common_prefix = ""
+        if common_prefix:
+            values.append(f"common_path_prefix={render(common_prefix)}")
+    values.append(f"example_resource_ids={render(resource_ids[:3])}")
+    return [f"- {'; '.join(values)}"]
+
+
 def _render_approval_source_summary(
     sources: tuple[Any, ...], *, displayed_source: Any = None,
 ) -> str:
     """Filter operator presentation only; retain the complete carrier for audit."""
     shown: list[str] = []
+    active_groups: dict[tuple[Any, ...], list[Any]] = {}
     active_count = 0
     omitted_count = 0
     for source in sources:
@@ -581,9 +620,13 @@ def _render_approval_source_summary(
         ):
             active_count += 1
             if source != displayed_source:
-                shown.append(f"- {_render_approval_source(source, include_resource_id=True)}")
+                key = _approval_source_group_key(source)
+                active_groups.setdefault(key, []).append(source)
         elif source != displayed_source:
             omitted_count += 1
+
+    for group in active_groups.values():
+        shown.extend(_render_active_ingest_source_group(group))
 
     if not active_count:
         shown.append("- No active untrusted ingest was present.")
