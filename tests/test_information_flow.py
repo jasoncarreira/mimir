@@ -5817,11 +5817,18 @@ def test_shell_gate_after_real_source_labelling(
             provenance=provenance,
         )
     elif source == "fetch_url":
+        import hashlib
+
         # fetch_url returns metadata; ingest happens when its cached body is read.
         monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-        body = tmp_path / "attachments" / "fetch-cache" / "response.txt"
+        url = "https://example.com/response"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+        body = tmp_path / "attachments" / "fetch-cache" / f"{digest}-response.txt"
         body.parent.mkdir(parents=True)
         body.write_text("untrusted web content", encoding="utf-8")
+        body.with_name(f"{body.name}.meta.json").write_text(json.dumps({
+            "url": url, "file_path": f"/attachments/fetch-cache/{body.name}",
+        }), encoding="utf-8")
         added = classify_protected_result(
             "read_file", {"file_path": str(body)}, auth,
             ToolAuthorization(tool_name="read_file", decision="open", allowed=True),
