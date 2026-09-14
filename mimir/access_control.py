@@ -10295,7 +10295,7 @@ def classify_protected_result(
 
     if (
         (
-            tool_name == "shell_exec"
+            tool_name in {"shell_exec", "bash_job_output", "bash_jobs_list"}
             or (
                 tool_name == "bash_async"
                 and getattr(auth_context, "repo_review_state", None) is not None
@@ -10306,15 +10306,21 @@ def classify_protected_result(
         and not failed
     ):
         # Ordinary authorized shell output is untrusted information, not a new
-        # external ingest that deadlocks the next shell step. Explicit source
-        # provenance and failures retain their conservative classification below;
-        # merging these labels never clears earlier external active ingest.
+        # external ingest that deadlocks the next shell step. bash_job_output is
+        # bash_async's mapped content path; bash_jobs_list belongs here too because
+        # it exposes job status and command excerpts, not a new external source.
+        # Explicit source provenance (including inherited job labels) and failures
+        # retain their conservative classification below; merging these labels
+        # never clears earlier external active ingest.
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
         labels = InformationFlowLabels().with_source(SourceLabel(
             principal=principal,
-            domain="shell",
+            domain=(
+                "shell_jobs" if tool_name in {"bash_job_output", "bash_jobs_list"}
+                else "shell"
+            ),
             resource_id=(
                 "repo_review"
                 if getattr(auth_context, "repo_review_state", None) is not None

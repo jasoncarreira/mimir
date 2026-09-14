@@ -4300,6 +4300,65 @@ def test_undomained_ingest_with_authoritative_empty_provenance_does_not_taint() 
     ) is None
 
 
+@pytest.mark.parametrize("tool_name", ["bash_job_output", "bash_jobs_list"])
+@pytest.mark.parametrize("case", ["ordinary", "denied", "failed", "provenance", "artifact"])
+def test_mapped_shell_result_informational_only_without_failure_or_provenance(
+    tool_name: str, case: str,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    auth = _auth(roles=("admin",))
+    authorization = ToolAuthorization(
+        tool_name=tool_name,
+        decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=case != "denied",
+        flow_direction=ToolFlowDirection.SOURCE,
+    )
+    external = SourceLabel(
+        principal="external", domain="web", resource_id="external-output",
+        bridge_instance="web", sensitivity="internal",
+        authorized_principals=frozenset({auth.canonical_principal}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    provenance = ProtectedResultProvenance((external,))
+    result = (
+        ToolMessage(content="output", tool_call_id="job-output", artifact=provenance)
+        if case == "artifact" else "output"
+    )
+    labels = classify_protected_result(
+        tool_name, {"job_id": "job-1", "scope": "visible"}, auth, authorization,
+        result=result, failed=case == "failed",
+        provenance=provenance if case == "provenance" else None,
+    )
+    assert labels is not None
+    [source] = labels.sources
+    assert source.integrity == "untrusted"
+    assert source.integrity_effect == (
+        "informational" if case == "ordinary" else "active_ingest"
+    )
+    if case in {"provenance", "artifact"}:
+        assert source == external
+    else:
+        assert source.domain == "shell_jobs"
+
+    # Even ordinary job output cannot clear genuine external ingest, nor can
+    # the resulting live taint be bypassed with a stale clean caller snapshot.
+    clean = InformationFlowLabels()
+    state = InformationFlowState(labels=clean)
+    state.merge(InformationFlowLabels(sources=(external,)), fallback=clean)
+    state.merge(labels, fallback=clean)
+    assert external in state.current(clean).sources
+    assert state.has_untrusted_active_ingest(clean)
+    tainted_auth = replace(auth, ifc_labels=clean, ifc_state=state)
+    for shell_tool in ("shell_exec", "bash_async"):
+        decision = SinkGate.check_sink_flow(
+            shell_tool, "printf ordinary", clean, tainted_auth, enforce=True,
+        )
+        assert not decision.allowed
+        assert decision.reason == "ifc_label_blocked:shell_process"
+
+
 def test_operator_bounded_shell_result_remains_untrusted_informational() -> None:
     authorization = ToolAuthorization(
         tool_name="shell_exec",
