@@ -96,7 +96,7 @@ def _domain_flow_decisions(classifier=_source_is_triggering_channel_compatible, 
         ("channel", "channel:private", "channel:public", "channel:unknown",
          "channel:custom:detail", "channel:", "channel_metadata", "channelXYZ",
          "service", "repository", "repository:custom", "filesystem", "saga"),
-        (*SourceKind, "unknown"), ("slack-C1", "slack-C2", "repo:x"),
+        (*SourceKind, "unknown_test_source_kind"), ("slack-C1", "slack-C2", "repo:x"),
         ("slack", "other", None), (frozenset(), frozenset({"user"})),
         (None, frozenset(), frozenset({"user"}), frozenset({"user", "other"})),
         (False, True),
@@ -104,9 +104,10 @@ def _domain_flow_decisions(classifier=_source_is_triggering_channel_compatible, 
         base, separator, qualifier = domain.partition(":")
         source = _source(
             domain=base, domain_qualifier=qualifier if separator else None,
-            source_kind=kind, resource_id=resource, bridge_instance=bridge,
+            resource_id=resource, bridge_instance=bridge,
             authorized_principals=acl,
         )
+        source = SourceLabel.from_record({**vars(source), "source_kind": kind})
         if legacy:
             source = SimpleNamespace(**{
                 **vars(source), "domain": domain, "is_complete": source.is_complete,

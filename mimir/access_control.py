@@ -5796,6 +5796,9 @@ def _source_is_triggering_channel_compatible(
         return True
     if source_kind == SourceKind.ACP_HANDS_RESULT:
         return True
+    # Unknown kinds cannot be authored by SourceLabel's constructor, but can
+    # still arrive from version-skewed records or duck-typed sources. Preserve
+    # this fail-closed fallback (also used by non-informational agent_self).
     return False
 
 
@@ -7090,11 +7093,7 @@ def clear_live_ingest_taint(
             "usage", "schedules", "self_state", "recent_activity", "channel_memory",
             "proposals", "identities", "skills", "feedback",
         }
-        kinds = {
-            "channel", "protected_tool", "protected_prompt", "mcp",
-            "acp_hands_result", "recent_activity_user", "recent_activity_assistant",
-            "auto_recall", "operator_command", "service", "feedback_chain",
-        }
+        kinds = set(SourceKind)
         groups: dict[tuple[str, str], int] = {}
         for source in sources:
             domain = (
