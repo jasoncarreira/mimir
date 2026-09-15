@@ -7,13 +7,17 @@ import contextlib
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
+import stat as stat_module
 import subprocess
 import tempfile
 from typing import Callable, Iterator, Protocol, Sequence
+import uuid
 import xml.etree.ElementTree as ET
 
 from ..redaction import redact_text
@@ -25,6 +29,9 @@ from .compute import (
     with_worker_environment,
 )
 from .dispatch_failures import terminal_error
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,12 @@ class TestResult:
     rerun: TestResult | None = None
     previous_observation: TestResult | None = None
     timed_out: bool = False
+    retained_artifacts: tuple[str, ...] = ()
+    retention_manifest: str | None = None
+    retention_truncated: bool = False
+    retention_error: str | None = None
+    gate_run_id: str | None = None
+    gate_phase: str | None = None
 
 
 @dataclass(frozen=True)
@@ -277,7 +290,9 @@ async def observe_evidence(
 
 
 @contextlib.contextmanager
-def _gate_report_directory(checkout: Path, worker_uid_drop: bool) -> Iterator[Path]:
+def _gate_report_directory(
+    checkout: Path, worker_uid_drop: bool, *, cleanup_errors: list[str] | None = None,
+) -> Iterator[Path]:
     """Yield a report directory the process that runs the gate can write.
 
     ``tempfile.TemporaryDirectory`` creates 0700 owned by the CONTROLLER. When the
@@ -293,16 +308,292 @@ def _gate_report_directory(checkout: Path, worker_uid_drop: bool) -> Iterator[Pa
     controller reads it back. This is narrower than widening a temp directory to
     0777, and needs no shared group membership between the two identities.
     """
-    if not worker_uid_drop:
-        with tempfile.TemporaryDirectory(prefix="worklink-gate-") as text:
-            yield Path(text)
-        return
-    checkout.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".worklink-gate-", dir=checkout) as text:
-        report_dir = Path(text)
-        # setgid on the checkout supplies the group; make it group-usable.
-        report_dir.chmod(0o770)
+    if worker_uid_drop:
+        checkout.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(
+        prefix=".worklink-gate-" if worker_uid_drop else "worklink-gate-",
+        dir=checkout if worker_uid_drop else None,
+    )
+    try:
+        report_dir = Path(temporary.name).resolve(strict=True)
+        if worker_uid_drop:
+            # setgid on the checkout supplies the group; make it group-usable.
+            report_dir.chmod(0o770)
         yield report_dir
+    finally:
+        # Only cleanup is caught here, never an exception from the gate body.
+        try:
+            temporary.cleanup()
+        except Exception as exc:
+            if cleanup_errors is not None:
+                cleanup_errors.append(f"report_cleanup_failed:{type(exc).__name__}")
+            with contextlib.suppress(Exception):
+                log.warning("Worklink gate report cleanup incomplete (%s)", type(exc).__name__)
+
+
+_GATE_RETENTION_BYTES = 32 * 1024 * 1024
+_GATE_RETENTION_ENTRIES = 2048
+_GATE_RETENTION_DEPTH = 32
+
+
+def _gate_tmp_directory(report_dir: Path) -> Path:
+    # Pytest makes basetemp private. It must never be a child of the controller's
+    # TemporaryDirectory: that identity cannot chmod/remove a worker's 0700 tree.
+    return report_dir.with_name(report_dir.name + "-tmp")
+
+
+def _export_gate_tmp(root: str, max_bytes: int, max_entries: int, max_depth: int) -> dict:
+    """Export regular whole files, also executable under the worker identity.
+
+    Keep imports local: the worker runs this source with isolated Python, without
+    importing code from the untrusted checkout or the controller's environment.
+    """
+    import base64
+    import os
+    import stat
+
+    result = {"files": [], "reasons": [], "entries": 0}
+    try:
+        metadata = os.stat(root, follow_symlinks=False)
+    except FileNotFoundError:
+        return result
+    except OSError:
+        result["reasons"].append("tmp_unavailable")
+        return result
+    if not stat.S_ISDIR(metadata.st_mode):
+        result["reasons"].append("tmp_not_directory")
+        return result
+
+    remaining = max_bytes
+
+    def omit(reason):
+        if reason not in result["reasons"]:
+            result["reasons"].append(reason)
+
+    def visit(fd, prefix, depth):
+        nonlocal remaining
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                if result["entries"] >= max_entries:
+                    omit("entry_limit")
+                    break
+                result["entries"] += 1
+                name = prefix + entry.name
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if depth >= max_depth:
+                            omit("depth_limit")
+                            continue
+                        child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                        try:
+                            visit(child, name + "/", depth + 1)
+                        finally:
+                            os.close(child)
+                    elif stat.S_ISREG(metadata.st_mode):
+                        child = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                        with os.fdopen(child, "rb") as source:
+                            metadata = os.fstat(source.fileno())
+                            if not stat.S_ISREG(metadata.st_mode):
+                                omit("unsafe_entry")
+                                continue
+                            if metadata.st_size > remaining:
+                                omit("byte_limit")
+                                continue
+                            data = source.read(remaining + 1)
+                            if len(data) > remaining or len(data) != metadata.st_size or os.fstat(source.fileno()).st_size != len(data):
+                                omit("file_changed_or_oversize")
+                                continue
+                        remaining -= len(data)
+                        result["files"].append({"name": name, "data": base64.b64encode(data).decode("ascii")})
+                    else:
+                        omit("unsafe_entry")
+                except OSError:
+                    omit("tmp_read_error")
+
+    # Anchor every component, including ancestors of the export root.
+    absolute = os.path.isabs(root)
+    components = root.split("/")[1:] if absolute else root.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ValueError("invalid export root")
+    fd = os.open("/" if absolute else ".", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in components:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        visit(fd, "", 1)
+    finally:
+        os.close(fd)
+    return result
+
+
+async def _retain_gate_failure(
+    observation: TestResult,
+    output: subprocess.CompletedProcess[str],
+    *,
+    report_dir: Path,
+    issue: int,
+    attempt: int,
+    run_id: str,
+    phase: str,
+    checkout: Path,
+    work_spec: WorkSpec | None,
+    compute: ComputeBackend | None,
+    compute_result: ComputeResult | None,
+    worker_uid_drop: bool,
+) -> TestResult:
+    """Best-effort diagnostics only. Gate execution is outside this boundary."""
+    artifacts: list[str] = []
+    records: list[dict] = []
+    reasons: list[str] = []
+    manifest_path = None
+    remaining = _GATE_RETENTION_BYTES
+    entries = 1  # Reserve an entry for the manifest in the shared budget.
+    try:
+        import base64
+        import inspect
+        from ..output_capture import open_output_sink
+
+        root = (work_spec.output_root if work_spec else None) or (
+            Path(os.environ.get("MIMIR_HOME", ".")).resolve() / "state/worklink/transcripts"
+        )
+        if not root.is_absolute() or ".." in root.parts:
+            raise ValueError("retention destination must be an absolute normalized path")
+        if any(root.is_relative_to(directory) for directory in (report_dir, _gate_tmp_directory(report_dir))):
+            raise ValueError("retention destination is inside a temporary gate directory")
+        stem = f"gate-{issue}-a{attempt}-{run_id}-{phase}"
+
+        def write(name: str, data: bytes) -> None:
+            nonlocal remaining, entries
+            if entries >= _GATE_RETENTION_ENTRIES:
+                reasons.append("entry_limit")
+                return
+            entries += 1
+            try:
+                data = redact_text(data.decode("utf-8")).encode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            if len(data) > remaining:
+                reasons.append("byte_limit")
+                return
+            destination = root / f"{stem}-{len(artifacts):04d}.artifact"
+            sink = open_output_sink(destination, max(1, len(data)))
+            try:
+                sink.file.write(data)
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            finally:
+                sink.close()
+            remaining -= len(data)
+            artifacts.append(str(destination))
+            records.append({"source": redact_text(name), "path": str(destination), "bytes": len(data)})
+
+        def copy(name: str, source: Path) -> None:
+            try:
+                data = _gate_read(source, remaining)
+            except (OSError, ValueError) as exc:
+                reasons.append(f"{name}:{type(exc).__name__}")
+                return
+            write(name, data)
+
+        if _is_pytest_command(observation.cmd or ""):
+            copy("junit.xml", report_dir / "junit.xml")
+        for stream in ("stdout", "stderr"):
+            path = getattr(compute_result, f"{stream}_path", None)
+            if path is not None:
+                copy(stream, path)
+            else:
+                write(stream, (getattr(output, stream) or "").encode("utf-8"))
+        if compute_result is not None and compute_result.output_overflow:
+            reasons.append("output_overflow")
+
+        tmp = _gate_tmp_directory(report_dir)
+        # A missing basetemp means pytest never used tmp_path. Permission/I/O
+        # failures instead mean its contents are unknown, not known empty.
+        try:
+            tmp.lstat()
+        except FileNotFoundError:
+            tmp_available = False
+        except OSError:
+            tmp_available = False
+            reasons.append("tmp_unavailable")
+        else:
+            tmp_available = True
+        exported_tmp = {"files": [], "reasons": [], "entries": 0}
+        if tmp_available and worker_uid_drop:
+            # Execute only the exporter in this guard, never the test command.
+            script = (
+                inspect.getsource(_export_gate_tmp)
+                + "\nimport json, shutil\n"
+                + f"root = {str(tmp.relative_to(checkout.resolve()))!r}\n"
+                + "try:\n"
+                + f" print(json.dumps(_export_gate_tmp(root, {remaining}, {_GATE_RETENTION_ENTRIES - entries}, {_GATE_RETENTION_DEPTH})))\n"
+                + "finally:\n shutil.rmtree(root, ignore_errors=True)\n"
+            )
+            # ComputeResult.stdout may be an excerpt. The controller owns these
+            # sinks; consume the full bounded export before deleting them.
+            with tempfile.TemporaryDirectory(prefix="worklink-gate-export-") as text:
+                export_root = Path(text).resolve(strict=True)
+                exported = await _run_compute_gate(
+                    shlex.join(["python3", "-I", "-c", script]),
+                    checkout=checkout, work_spec=replace(work_spec, output_root=export_root), compute=compute,
+                )
+                if exported.exit_code or exported.timed_out or exported.output_overflow:
+                    raise ValueError("tmp_export_failed")
+                if exported.stdout_path is None or exported.stdout_path.parent != export_root:
+                    raise ValueError("tmp_export_output_unavailable")
+                document = _gate_read(exported.stdout_path, 2 * _GATE_RETENTION_BYTES)
+                exported_tmp = json.loads(document)
+        elif tmp_available:
+            exported_tmp = _export_gate_tmp(
+                str(tmp), remaining, _GATE_RETENTION_ENTRIES - entries, _GATE_RETENTION_DEPTH,
+            )
+        reasons.extend(exported_tmp["reasons"])
+        for item in exported_tmp["files"]:
+            if entries >= _GATE_RETENTION_ENTRIES:
+                reasons.append("entry_limit")
+                break
+            # Names are metadata only, never destination paths.
+            name = item["name"]
+            if len(Path(name).parts) > _GATE_RETENTION_DEPTH:
+                reasons.append("depth_limit")
+                continue
+            write("tmp/" + name, base64.b64decode(item["data"], validate=True))
+        document = json.dumps({
+            "issue": issue, "attempt": attempt, "run_id": run_id, "phase": phase,
+            "exit_code": observation.exit_code, "timed_out": observation.timed_out,
+            "artifacts": records, "truncated": bool(reasons),
+            "reasons": sorted(set(reasons)),
+        }, ensure_ascii=True).encode("utf-8")
+        destination = root / f"{stem}.json"
+        if len(document) > remaining:
+            reasons.append("manifest_byte_limit")
+            raise ValueError("manifest_byte_limit")
+        if entries > _GATE_RETENTION_ENTRIES:
+            reasons.append("manifest_entry_limit")
+            raise ValueError("manifest_entry_limit")
+        sink = open_output_sink(destination, max(1, len(document)))
+        try:
+            sink.file.write(document)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            sink.close()
+        manifest_path = str(destination)
+    except Exception as exc:
+        reasons.append(f"retention_failed:{type(exc).__name__}")
+    if reasons:
+        with contextlib.suppress(Exception):
+            log.warning("Worklink gate retention incomplete issue=%s attempt=%s run=%s phase=%s (%s)",
+                        issue, attempt, run_id, phase, ", ".join(sorted(set(reasons))))
+    return replace(
+        observation, retained_artifacts=tuple(artifacts), retention_manifest=manifest_path,
+        retention_truncated=bool(reasons), retention_error=", ".join(sorted(set(reasons))) or None,
+        gate_run_id=run_id, gate_phase=phase,
+    )
 
 
 async def _observe_evidence_from_ref(
@@ -389,8 +680,11 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            async def run_gate(command: str, report_dir: Path) -> TestResult:
+            run_id = uuid.uuid4().hex
+
+            async def run_gate(command: str, report_dir: Path, phase: str) -> TestResult:
                 timed_out = False
+                result = None
                 if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
@@ -432,16 +726,62 @@ async def _observe_evidence_from_ref(
                         )
                 structured = read_pytest_result(command, report_dir)
                 commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
-                return replace(
+                observation = replace(
                     structured or TestResult(redact_text(command)),
                     cmd=redact_text(command),
                     exit_code=test.returncode,
                     summary=redact_text(_summarize_test_output(test)),
                     timed_out=timed_out,
+                    gate_run_id=run_id,
+                    gate_phase=phase,
                 )
+                if test.returncode != 0 or timed_out or phase == "rerun":
+                    try:
+                        observation = await _retain_gate_failure(
+                            observation, test, report_dir=report_dir, issue=issue,
+                            attempt=attempt, run_id=run_id, phase=phase, checkout=checkout,
+                            work_spec=work_spec, compute=compute, compute_result=result,
+                            worker_uid_drop=worker_uid_drop,
+                        )
+                    except Exception as exc:
+                        with contextlib.suppress(Exception):
+                            log.warning("Worklink gate retention failed (%s)", type(exc).__name__)
+                        observation = replace(
+                            observation, retention_truncated=True,
+                            retention_error=f"retention_failed:{type(exc).__name__}",
+                        )
+                # Cleanup is also diagnostic-only and must not mask the verdict.
+                try:
+                    tmp = _gate_tmp_directory(report_dir)
+                    if not worker_uid_drop:
+                        try:
+                            shutil.rmtree(tmp)
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        try:
+                            tmp.lstat()
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            cleanup = await _run_compute_gate(
+                                shlex.join(["python3", "-I", "-c", "import shutil; shutil.rmtree(" + repr(str(tmp.relative_to(checkout.resolve()))) + ")"]),
+                                checkout=checkout, work_spec=replace(work_spec, output_root=None), compute=compute,
+                            )
+                            if cleanup.exit_code != 0:
+                                raise OSError("tmp_cleanup_failed")
+                except Exception as exc:
+                    with contextlib.suppress(Exception):
+                        log.warning("Worklink gate tmp cleanup incomplete (%s)", type(exc).__name__)
+                    observation = replace(
+                        observation, retention_truncated=True,
+                        retention_error=", ".join(filter(None, (observation.retention_error, "tmp_cleanup_failed"))),
+                    )
+                return observation
 
-            with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
-                tests = await run_gate(test_command, report_dir)
+            cleanup_errors: list[str] = []
+            with _gate_report_directory(checkout, worker_uid_drop, cleanup_errors=cleanup_errors) as report_dir:
+                tests = await run_gate(test_command, report_dir, "initial")
                 failed_ids = _pytest_cache_ids(report_dir, "lastfailed")
                 rerun_command = _pytest_rerun_command(test_command, failed_ids)
                 eligible = (
@@ -454,9 +794,14 @@ async def _observe_evidence_from_ref(
                     and 0 < len(failed_ids) <= gate_rerun_max_failures
                     and rerun_command is not None
                 )
+            if cleanup_errors:
+                tests = replace(tests, retention_truncated=True, retention_error=", ".join(
+                    filter(None, (tests.retention_error, *cleanup_errors)),
+                ))
             if eligible:
-                with _gate_report_directory(checkout, worker_uid_drop) as rerun_dir:
-                    rerun = await run_gate(rerun_command, rerun_dir)
+                cleanup_errors = []
+                with _gate_report_directory(checkout, worker_uid_drop, cleanup_errors=cleanup_errors) as rerun_dir:
+                    rerun = await run_gate(rerun_command, rerun_dir, "rerun")
                     remaining = _pytest_cache_ids(rerun_dir, "lastfailed")
                     collected = _pytest_cache_ids(rerun_dir, "nodeids")
                     counts = rerun.counts
@@ -476,6 +821,10 @@ async def _observe_evidence_from_ref(
                         and set(remaining) <= set(failed_ids)
                         and (rerun.exit_code == 0) == (counts.failed == 0)
                     )
+                if cleanup_errors:
+                    rerun = replace(rerun, retention_truncated=True, retention_error=", ".join(
+                        filter(None, (rerun.retention_error, *cleanup_errors)),
+                    ))
                 initial = tests
                 tests = replace(tests, initial_run=initial, rerun=rerun, timed_out=rerun.timed_out)
                 if complete:
@@ -539,7 +888,7 @@ async def _run_compute_gate(
         try:
             # Contained workers enter the checkout through an authorized fd and
             # may not be able to traverse the controller's absolute parent path.
-            report_option_dir = report_dir.relative_to(checkout)
+            report_option_dir = report_dir.relative_to(checkout.resolve())
         except ValueError:
             pass
         gate_spec = with_worker_environment(
@@ -579,13 +928,43 @@ def _common_status(status: str) -> str:
 _PYTEST_REPORT_MAX_BYTES = 20_000_000
 
 
+@contextlib.contextmanager
+def _gate_open(path: Path):
+    """Open a fully resolved absolute path without following any symlinks."""
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("gate path must be absolute and resolved")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in path.parts[1:-1]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        child = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(child, "rb") as source:
+            if not stat_module.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise OSError("gate report is not a regular file")
+            yield source
+    finally:
+        os.close(fd)
+
+
+def _gate_read(path: Path, max_bytes: int) -> bytes:
+    with _gate_open(path) as source:
+        before = os.fstat(source.fileno())
+        if before.st_size > max_bytes:
+            raise ValueError("gate report exceeds byte limit")
+        data = source.read(max_bytes + 1)
+        after = os.fstat(source.fileno())
+        if len(data) > max_bytes or len(data) != before.st_size or after.st_size != len(data):
+            raise ValueError("gate report changed or exceeds byte limit")
+        return data
+
+
 def _pytest_cache_ids(report_dir: Path, name: str) -> tuple[str, ...]:
     """Keep executable selectors private; evidence IDs are separately scrubbed."""
     try:
         path = report_dir / "cache" / "v" / "cache" / name
-        if path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
-            return ()
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_gate_read(path, _PYTEST_REPORT_MAX_BYTES))
         if name == "lastfailed":
             if not isinstance(payload, dict) or any(value is not True for value in payload.values()):
                 return ()
@@ -671,6 +1050,8 @@ def pytest_report_environment(
         report_dir.mkdir(parents=True, exist_ok=True)
     options = (
         f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
+        f"--basetemp={shlex.quote(str(_gate_tmp_directory(report_dir)))} "
+        "-o tmp_path_retention_policy=all "
         f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
     )
     return {"PYTEST_ADDOPTS": " ".join(part for part in (existing, options) if part)}
@@ -683,9 +1064,11 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
     junit_path = report_dir / "junit.xml"
     lastfailed_path = report_dir / "cache" / "v" / "cache" / "lastfailed"
     try:
-        if junit_path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
+        try:
+            document = _gate_read(junit_path, _PYTEST_REPORT_MAX_BYTES)
+        except ValueError:
             return TestResult(command, report_error="junit_oversize")
-        root = ET.parse(junit_path).getroot()
+        root = ET.fromstring(document)
         suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
         total = sum(_xml_count(suite, "tests") for suite in suites)
         failed = sum(_xml_count(suite, "failures") for suite in suites)
@@ -702,15 +1085,14 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
 
     failed_tests: tuple[str, ...] = ()
     try:
-        if lastfailed_path.stat().st_size <= _PYTEST_REPORT_MAX_BYTES:
-            payload = json.loads(lastfailed_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                failed_tests = tuple(
-                    redact_text(node_id)[:1000]
-                    for node_id, is_failed in payload.items()
-                    if isinstance(node_id, str) and is_failed is True
-                )
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(_gate_read(lastfailed_path, _PYTEST_REPORT_MAX_BYTES))
+        if isinstance(payload, dict):
+            failed_tests = tuple(
+                redact_text(node_id)[:1000]
+                for node_id, is_failed in payload.items()
+                if isinstance(node_id, str) and is_failed is True
+            )
+    except (OSError, ValueError):
         pass
 
     counts = TestCounts(
