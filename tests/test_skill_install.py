@@ -139,13 +139,11 @@ def test_install_copies_directory(fake_optional_root: Path, fake_home: Path):
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_install_records_skill_as_trusted_informational(
+def test_install_publishes_complete_directory(
     fake_optional_root: Path,
     fake_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
     existing: bool,
 ) -> None:
-    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
     dest = fake_home / "skills" / "fake-skill"
     if existing:
         dest.mkdir(parents=True)
@@ -163,43 +161,17 @@ def test_install_records_skill_as_trusted_informational(
     ).read_bytes()
     assert set(dest.iterdir()) == {dest / "SKILL.md"}
     assert set(dest.parent.iterdir()) == {dest}
-    assert access_control._filesystem_result_integrity(
-        None, str(result.dest / "SKILL.md"),
-    ) == ("trusted", "informational")
-    dropped = dest / "unrecorded.md"
-    dropped.write_text("hostile instructions")
-    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
-        "untrusted", "active_ingest",
-    )
 
 
-def test_unrecorded_skill_file_remains_untrusted(
-    fake_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
-    dropped = fake_home / "skills" / "poller-drop" / "SKILL.md"
-    dropped.parent.mkdir(parents=True)
-    dropped.write_text("hostile instructions", encoding="utf-8")
-
-    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
-        "untrusted", "active_ingest",
-    )
-
-
-@pytest.mark.parametrize("failure", ["malformed", "non-dict", "unwritable"])
+@pytest.mark.parametrize("failure", ["copy", "rename"])
 @pytest.mark.parametrize("existing", [False, True])
-def test_install_rolls_back_when_integrity_record_fails(
+def test_install_rolls_back_on_filesystem_error(
     fake_optional_root: Path,
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
     existing: bool,
     failure: str,
 ) -> None:
-    monkeypatch.setenv("MIMIR_HOME", str(fake_home))
-    metadata = fake_home / ".mimir" / "skill-integrity.json"
-    metadata.parent.mkdir(parents=True, exist_ok=True)
-    metadata.write_text("{}", encoding="utf-8")
     dest = fake_home / "skills" / "fake-skill"
     if existing:
         install("fake-skill", fake_home, optional_skills_root=fake_optional_root)
@@ -208,22 +180,29 @@ def test_install_rolls_back_when_integrity_record_fails(
         old_content = (dest / "SKILL.md").read_bytes()
     (fake_optional_root / "fake-skill" / "SKILL.md").write_text("new content")
     (fake_optional_root / "fake-skill" / "new.txt").write_text("new file")
-    if failure == "malformed":
-        metadata.write_text("not json", encoding="utf-8")
-    elif failure == "non-dict":
-        metadata.write_text("[]", encoding="utf-8")
-    else:
-        # A directory blocks the recorder's actual write even under root.
-        metadata.with_suffix(".tmp").mkdir()
-    old_metadata = metadata.read_bytes()
+    if failure == "copy":
+        def fail_copy(src, dst, **kwargs):
+            Path(dst).mkdir()
+            (Path(dst) / "SKILL.md").write_text("partial copy")
+            raise OSError("simulated copy failure")
 
-    with pytest.raises(OSError, match="failed to record trusted skill integrity"):
+        monkeypatch.setattr("mimir.skill_install.shutil.copytree", fail_copy)
+    else:
+        real_rename = Path.rename
+
+        def fail_publish(path, target):
+            if path == dest.with_name("fake-skill.tmp"):
+                raise OSError("simulated rename failure")
+            return real_rename(path, target)
+
+        monkeypatch.setattr(Path, "rename", fail_publish)
+
+    with pytest.raises(OSError, match=f"simulated {failure} failure"):
         install(
             "fake-skill", fake_home, force=existing,
             optional_skills_root=fake_optional_root,
         )
 
-    assert metadata.read_bytes() == old_metadata
     assert set(dest.parent.iterdir()) == ({dest} if existing else set())
     if existing:
         assert (dest / "SKILL.md").read_bytes() == old_content
@@ -233,26 +212,8 @@ def test_install_rolls_back_when_integrity_record_fails(
         assert set(p.name for p in dest.iterdir()) == {
             "SKILL.md", "local.txt", "alias.txt",
         }
-        expected = (
-            ("trusted", "informational") if failure == "unwritable"
-            else ("untrusted", "active_ingest")
-        )
-        assert access_control._filesystem_result_integrity(
-            None, str(dest / "SKILL.md"),
-        ) == expected
-        assert access_control._filesystem_result_integrity(
-            None, str(dest / "local.txt"),
-        ) == ("untrusted", "active_ingest")
     else:
         assert not dest.exists()
-
-    # Files dropped without a successful record must never gain trust.
-    dest.mkdir(exist_ok=True)
-    dropped = dest / "new.txt"
-    dropped.write_text("new file")
-    assert access_control._filesystem_result_integrity(None, str(dropped)) == (
-        "untrusted", "active_ingest",
-    )
 
 
 def test_install_cleans_up_partial_copy_on_failure(
