@@ -29,6 +29,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -68,9 +69,14 @@ async def test_git_group_drained_before_rebase_abort(
     ready = asyncio.Event()
     processes, child_pids, aborted = [], [], []
     # Linux alone does not imply these optional CPython build capabilities.
-    # Exercise the hosted-CI capability set even on a pidfd-enabled interpreter.
-    monkeypatch.delattr(os, "pidfd_open", raising=False)
-    monkeypatch.delattr(signal, "pidfd_send_signal", raising=False)
+    # Restrict the capability simulation to the component under test. Removing
+    # os.pidfd_open globally breaks asyncio's already-selected pidfd watcher.
+    monkeypatch.setattr(git_tracking, "os", SimpleNamespace(
+        **{name: value for name, value in vars(os).items() if name != "pidfd_open"},
+    ))
+    monkeypatch.setattr(git_tracking, "signal", SimpleNamespace(
+        **{name: value for name, value in vars(signal).items() if name != "pidfd_send_signal"},
+    ))
     monkeypatch.setattr(git_tracking, "CLEANUP_JOIN_TIMEOUT", 1.0)
 
     def writer_released():
