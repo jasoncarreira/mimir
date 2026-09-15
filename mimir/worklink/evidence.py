@@ -342,9 +342,11 @@ def _gate_tmp_directory(report_dir: Path) -> Path:
     # TemporaryDirectory: that identity cannot chmod/remove a worker's 0700 tree.
     # Nor may it live in the group-writable checkout: output_capture rejects that
     # ancestor. Use the shared host /tmp (sticky), not TMPDIR or per-launch HOME.
+    # Resolve only the trusted parent: macOS /tmp -> /private/tmp would otherwise
+    # fail _gate_open's O_NOFOLLOW walk. Never resolve the worker-controlled leaf.
     # Hash the controller's unique report path into a single confined leaf.
     identity = hashlib.sha256(os.fsencode(report_dir.absolute())).hexdigest()
-    return Path("/tmp") / f"worklink-gate-{identity}-tmp"
+    return Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
 
 
 def _export_gate_tmp(root: str, max_bytes: int, max_entries: int, max_depth: int) -> dict:

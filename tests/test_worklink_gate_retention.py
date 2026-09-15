@@ -230,11 +230,44 @@ def test_pytest_temp_is_external_and_options_keep_sidecars(tmp_path):
     basetemp = Path(next(item.split("=", 1)[1] for item in options if item.startswith("--basetemp=")))
     assert basetemp == ev._gate_tmp_directory(directory)
     identity = hashlib.sha256(os.fsencode(directory.absolute())).hexdigest()
-    assert basetemp == Path("/tmp") / f"worklink-gate-{identity}-tmp"
+    assert basetemp == Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
+    assert basetemp == basetemp.resolve()
     assert directory not in basetemp.parents
     assert not basetemp.exists(), "pytest, not the controller, must own basetemp"
     assert "tmp_path_retention_policy=all" in options
     assert options[0] == "-q"
+
+
+def test_gate_tmp_resolves_symlinked_host_parent_not_worker_leaf(tmp_path, monkeypatch):
+    host_tmp = tmp_path / "host-tmp"
+    host_tmp.mkdir()
+    alias = tmp_path / "tmp-alias"
+    alias.symlink_to(host_tmp, target_is_directory=True)
+    # Model macOS /tmp -> /private/tmp on every test platform without changing
+    # the real host /tmp or relaxing the no-follow reader.
+    monkeypatch.setattr(ev, "Path", lambda value: alias if value == "/tmp" else Path(value))
+    report = tmp_path / "reports"
+    tree = ev._gate_tmp_directory(report)
+    assert tree.parent == host_tmp.resolve()
+    tree.mkdir(mode=0o700)
+    probe = tree / "probe"
+    probe.write_bytes(b"retained")
+    with ev._gate_open(probe) as source:
+        assert source.read() == b"retained"
+    probe.unlink()
+    tree.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "probe").write_bytes(b"must not follow")
+    tree.symlink_to(outside, target_is_directory=True)
+    try:
+        assert ev._gate_tmp_directory(report) == tree
+        assert ev._gate_tmp_directory(report) != outside.resolve()
+        with pytest.raises(OSError):
+            with ev._gate_open(tree / "probe"):
+                pass
+    finally:
+        tree.unlink()
 
 
 def test_gate_tmp_parent_walk_avoids_group_writable_checkout(tmp_path):
