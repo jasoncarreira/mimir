@@ -76,6 +76,25 @@ def test_add_defaults_verifiable_by_per_kind(tmp_path: Path):
     assert rec["verifiable_by"] == "turns_jsonl"
 
 
+def test_gen_id_unique_same_day_batch():
+    ids = [predictions._gen_id(NOW) for _ in range(100_000)]
+    assert len(set(ids)) == len(ids)
+    assert all(pred_id.startswith("pred-2026-05-02-") for pred_id in ids)
+    assert all(len(pred_id.rsplit("-", 1)[1]) == 32 for pred_id in ids)
+
+
+def test_add_refuses_generated_id_collision(tmp_path: Path, monkeypatch, capsys):
+    # Force a collision, not a sequence of mock-unique values.
+    fixed_uuid = predictions.uuid.uuid4()
+    monkeypatch.setattr(predictions.uuid, "uuid4", lambda: fixed_uuid)
+    assert predictions.cmd_add(_ns(home=tmp_path, claim="first")) == 0
+    path = tmp_path / "state" / "predictions.jsonl"
+    before = path.read_bytes()
+    assert predictions.cmd_add(_ns(home=tmp_path, claim="second")) == 1
+    assert "already exists" in capsys.readouterr().err
+    assert path.read_bytes() == before
+
+
 def test_add_rejects_tool_freq_without_target(tmp_path: Path, capsys):
     rc = predictions.cmd_add(_ns(
         predictions_action="add", home=tmp_path,
@@ -164,6 +183,69 @@ def test_mark_accepts_id_substring(tmp_path: Path):
         id=short, status="partial",
     ))
     assert rc == 0
+
+
+@pytest.mark.parametrize("ids, argument", [
+    (["pred-2026-05-02-abcd", "pred-2026-05-02-abef"], "pred-2026-05-02-ab"),
+    (["pred-2026-05-02-abcd", "pred-2026-05-02-abcd"], "pred-2026-05-02-abcd"),
+    (["pred-2026-05-02-abcd", "pred-2026-05-02-abcdef"], "pred-2026-05-02-abcd"),
+])
+def test_mark_refuses_ambiguous_id(tmp_path: Path, capsys, ids, argument):
+    preds = [predictions.Prediction(
+        id=pred_id, made_at=NOW.isoformat(), by="agent", claim=f"candidate {i}",
+        kind="binary", horizon_hours=24, verifiable_by="operator_review",
+        rationale="", review_after=(NOW + timedelta(hours=24)).isoformat(),
+    ) for i, pred_id in enumerate(ids)]
+    predictions._save_all(tmp_path, preds)
+    path = tmp_path / "state" / "predictions.jsonl"
+    before = path.read_bytes()
+
+    rc = predictions.cmd_mark(_ns(
+        home=tmp_path, id=argument, status="correct", actual="must not persist",
+    ))
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "ambiguous" in captured.err
+    for pred in preds:
+        assert f"{pred.id}: {pred.claim}" in captured.err
+    assert "marked" not in captured.out
+    assert path.read_bytes() == before
+
+
+def test_mark_legacy_short_id(tmp_path: Path):
+    legacy_id = "pred-2026-05-02-abcd"
+    predictions._save_all(tmp_path, [predictions.Prediction(
+        id=legacy_id, made_at=NOW.isoformat(), by="operator", claim="legacy",
+        kind="binary", horizon_hours=24, verifiable_by="operator_review",
+        rationale="", review_after=(NOW + timedelta(hours=24)).isoformat(),
+    )])
+    path = tmp_path / "state" / "predictions.jsonl"
+    before = path.read_bytes()
+    assert predictions._load(tmp_path)[0].id == legacy_id
+    assert path.read_bytes() == before
+    assert predictions.cmd_add(_ns(home=tmp_path, claim="new")) == 0
+    assert path.read_bytes().startswith(before)
+    assert predictions.cmd_mark(_ns(
+        home=tmp_path, id=legacy_id, status="correct",
+    )) == 0
+    records = _read_jsonl(path)
+    assert records[0]["id"] == legacy_id
+    assert records[0]["status"] == "correct"
+    assert records[1]["status"] == "pending"
+
+
+@pytest.mark.parametrize("argument, status, error", [
+    ("missing", "correct", "no prediction matching"),
+    ("", "invalid", "invalid --status"),
+])
+def test_mark_refuses_invalid_request(tmp_path: Path, capsys, argument, status, error):
+    assert predictions.cmd_add(_ns(home=tmp_path, claim="unchanged")) == 0
+    path = tmp_path / "state" / "predictions.jsonl"
+    before = path.read_bytes()
+    assert predictions.cmd_mark(_ns(home=tmp_path, id=argument, status=status)) == 1
+    assert error in capsys.readouterr().err
+    assert path.read_bytes() == before
 
 
 # ─── auto-verify ────────────────────────────────────────────────────────
