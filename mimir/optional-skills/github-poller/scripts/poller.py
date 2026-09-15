@@ -1731,9 +1731,7 @@ def _check_pr_pushes(
                         requested_at = _latest_review_request_at(
                             repo, number, me, token,
                         )
-                        if not _activity_postdates_review(
-                            requested_at, prior_review,
-                        ):
+                        if _review_satisfies_activity(prior_review, requested_at):
                             continue
 
                 # Recovery state separates turns that failed from turns still
@@ -1878,12 +1876,22 @@ def _has_current_head_review(
     completed current-head review. Treat APPROVED, CHANGES_REQUESTED, and
     COMMENTED as substantive submitted reviews so the review-request retry
     loop does not page on an already-completed review. Activity after the latest
-    such review is new information and no longer counts as satisfied.
+    such review is new information and no longer counts as satisfied. The CI
+    reconciliation pass separately resumes COMMENTED reviews once checks conclude,
+    using its existing listings rather than fetching checks from every caller.
     """
     review = _latest_current_head_review(
         repo, number, head_sha, reviewer, token,
     )
     if not review:
+        return False
+    return _review_satisfies_activity(review, activity_at)
+
+
+def _review_satisfies_activity(
+    review: dict, activity_at: object = None, *, checks_concluded: bool = False,
+) -> bool:
+    if str(review.get("state") or "").upper() == "COMMENTED" and checks_concluded:
         return False
     return not _activity_postdates_review(activity_at, review)
 
@@ -2684,6 +2692,9 @@ def _check_pr_ci_failures(
             continue
         key = str(number)
         attention_key = f"{key}:attention"
+        review_ci_key = f"{key}:review_ci"
+        if review_ci_key in prior:
+            new[review_ci_key] = prior[review_ci_key]
         # Preserve both delivery lanes until this PR's listings are complete.
         if attention_key in prior:
             new[attention_key] = prior[attention_key]
@@ -2703,6 +2714,7 @@ def _check_pr_ci_failures(
             continue
         if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
             new.pop(attention_key, None)
+            new.pop(review_ci_key, None)
             continue
         head = pr.get("head") or {}
         head_sha = head.get("sha") or ""
@@ -2732,6 +2744,48 @@ def _check_pr_ci_failures(
             if key in prior:
                 new[key] = prior[key]
             continue
+        # A submitted review may clear requested_reviewers. Retain completion
+        # markers for the PR's open lifetime, including across head changes.
+        # Empty successful listings conclude immediately: there is no CI to await.
+        checks_concluded = all(
+            isinstance(item, dict)
+            and item.get("status") == "completed"
+            and bool(item.get("conclusion"))
+            for item in [*checks, *runs]
+        )
+        if me and (_review_requested(pr, me) or (pr.get("user") or {}).get("login") != me):
+            entry = prior.get(review_ci_key)
+            completed_reviews = list(entry.get("completed_reviews", [])) if isinstance(entry, dict) else []
+            completion_key = f"{repo}:{number}:{head_sha}:{me}:review_ci_completed"
+            if completion_key not in completed_reviews:
+                review = _latest_current_head_review(repo, number, head_sha, me, token)
+                if (
+                    review
+                    and not _review_satisfies_activity(review, checks_concluded=checks_concluded)
+                    and (_review_requested(pr, me) or _latest_review_request_at(repo, number, me, token))
+                ):
+                    _emit_pr_review_needed(
+                        f"Checks concluded on {repo} PR #{number} at {head_sha}. "
+                        f"@{me}, complete your deferred COMMENTED review; "
+                        "the head is unchanged. All checks have concluded "
+                        "(an empty check list means there is no CI to await); "
+                        "inspect the outcomes before deciding the review.\n"
+                        f"{pr.get('html_url', '')}",
+                        token=token, reviewer=me, current_head_reviewed=False,
+                        event_type="pr_review_requested", reason="checks_concluded",
+                        repo=repo, number=number,
+                        url=pr.get("html_url", ""), head_sha=head_sha,
+                        head_repo=(head.get("repo") or {}).get("full_name"),
+                        head_remote="source", head_ref=head.get("ref"),
+                        base_ref=(pr.get("base") or {}).get("ref"),
+                        base_sha=(pr.get("base") or {}).get("sha"),
+                        author=(pr.get("user") or {}).get("login"),
+                        requested_reviewer=me, checks_concluded=True,
+                        delivery_key=completion_key, dedup_scope="head_sha,reviewer",
+                    )
+                    count += 1
+                    completed_reviews.append(completion_key)
+                    new[review_ci_key] = {"completed_reviews": completed_reviews}
         cancelled = [
             run for run in runs
             if run.get("head_sha") == head_sha
