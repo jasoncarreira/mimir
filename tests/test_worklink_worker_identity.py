@@ -3,6 +3,7 @@ from __future__ import annotations
 import runpy
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -249,6 +250,11 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
             assert steps.index(stage) < steps.index(upload)
             assert "os.walk(root, followlinks=False)" in stage["run"]
             assert "if not stat.S_ISREG(source.lstat().st_mode):" in stage["run"]
+            assert 'quote(part, safe="", errors="surrogatepass")' in stage["run"]
+            assert "safe_component(part) for part in source.relative_to(root).parts" in stage["run"]
+            assert "max_files = 5000" in stage["run"]
+            assert "max_bytes = 100 * 1024 * 1024" in stage["run"]
+            assert "max_file_bytes = 5 * 1024 * 1024" in stage["run"]
             paths = stage["env"]["PYTEST_EVIDENCE_PATHS"].splitlines()
             assert paths
             assert all(path.startswith("${{ env.PYTEST_EVIDENCE_ROOT }}/") for path in paths)
@@ -266,6 +272,7 @@ def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
     import os
     import shutil
     import subprocess
+    from urllib.parse import unquote
 
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
@@ -284,6 +291,13 @@ def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
         source.write_text(name)
         expected[str(source.relative_to(root))] = name
     (fixture / "irrelevant.txt").write_text("not evidence")
+    # Include literal escapes, hidden names and expansion beyond NAME_MAX too.
+    for value in ['"', ':', '<', '>', '|', '*', '?', '\r', '\n', '%3A', '\\', '+', '.hidden', ':' * 240]:
+        directory = fixture / value
+        directory.mkdir()
+        source = directory / (value + ".stdout.log")
+        source.write_text(repr(value))
+        expected[str(source.relative_to(root))] = repr(value)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "child-progress").write_text("outside evidence")
@@ -308,10 +322,56 @@ def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
     staged = Path(output.read_text().strip().removeprefix("path="))
     try:
         assert not any(path.is_symlink() for path in staged.rglob("*"))
+        for path in staged.rglob("*"):
+            relative = str(path.relative_to(staged))
+            assert not any(char in relative for char in '\":<>|*?\r\n\\')
+            assert not any(part.startswith(".") for part in path.relative_to(staged).parts)
         assert {
-            str(path.relative_to(staged)): path.read_text()
-            for path in staged.rglob("*") if path.is_file()
+            unquote(str(path.relative_to(staged)).replace("+/", ""), errors="surrogatepass"): path.read_text()
+            for path in staged.rglob("*") if path.is_file() and path.name != "STAGING.txt"
         } == expected
+        assert "truncated files: 0; stopped before remaining evidence: False" in (staged / "STAGING.txt").read_text()
+    finally:
+        shutil.rmtree(staged)
+
+
+@pytest.mark.parametrize(
+    "file_limit,byte_limit,per_file_limit,expected,truncated",
+    [(2, 100, 10, [b"abcdef", b"abcdef"], 0),
+     (10, 8, 10, [b"abcdef", b"ab"], 1),
+     (10, 100, 2, [b"ab"] * 3, 3)],
+)
+def test_ci_evidence_staging_bounds(tmp_path, file_limit, byte_limit, per_file_limit, expected, truncated) -> None:
+    import os
+    import shutil
+    import subprocess
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    stage = next(step for step in workflow["jobs"]["skill-conformance"]["steps"]
+                 if step.get("id") == "stage-pytest-evidence")
+    # Exercise the real collector with small budgets, not multi-megabyte fixtures.
+    script = stage["run"].replace("max_files = 5000", f"max_files = {file_limit}")
+    script = script.replace("max_bytes = 100 * 1024 * 1024", f"max_bytes = {byte_limit}")
+    script = script.replace("max_file_bytes = 5 * 1024 * 1024", f"max_file_bytes = {per_file_limit}")
+    root = tmp_path / "evidence"
+    root.mkdir()
+    for index in reversed(range(3)):
+        (root / f"{index}.stdout.log").write_bytes(b"abcdef")
+    output = tmp_path / "github-output"
+    subprocess.run(
+        ["bash", "-c", script], check=True, capture_output=True, text=True,
+        env={**os.environ, "PYTEST_EVIDENCE_ROOT": str(root),
+             "PYTEST_EVIDENCE_PATHS": stage["env"]["PYTEST_EVIDENCE_PATHS"],
+             "GITHUB_OUTPUT": str(output)},
+    )
+    staged = Path(output.read_text().strip().removeprefix("path="))
+    try:
+        assert [path.read_bytes() for path in sorted(staged.iterdir())
+                if path.name != "STAGING.txt"] == expected
+        summary = (staged / "STAGING.txt").read_text()
+        assert f"truncated files: {truncated}" in summary
+        assert f"stopped before remaining evidence: {len(expected) < 3}" in summary
+        assert len(list(staged.iterdir())) == len(expected) + 1
     finally:
         shutil.rmtree(staged)
 
