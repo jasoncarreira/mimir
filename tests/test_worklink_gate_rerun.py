@@ -82,7 +82,7 @@ async def test_enabled_gate_rerun_preserves_compute_spec(tmp_path, monkeypatch):
     for gate_spec, report in zip(specs, reports):
         assert gate_spec == replace(
             spec, local_argv=gate_spec.local_argv,
-            env={**spec.env, "PYTEST_ADDOPTS": f"-W error -n 2 --junitxml={report}/junit.xml --basetemp={report}/tmp -o cache_dir={report}/cache"},
+            env={**spec.env, "PYTEST_ADDOPTS": f"-W error -n 2 --junitxml={report}/junit.xml -o cache_dir={report}/cache"},
             backend_config={**spec.backend_config, "pass_env": ("GATE_SENTINEL", "PYTEST_ADDOPTS")},
         )
         assert gate_spec.local_argv[:2] == ("/bin/sh", "-c")
