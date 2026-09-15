@@ -44,7 +44,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import Enum, IntEnum
+from enum import Enum, IntEnum, StrEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -821,27 +821,35 @@ class Severity(IntEnum):
 # ``high`` digs into the quota tail for near-interactive feeds; nothing
 # fires under BLOCKED (the provider is actively refusing — headroom
 # math is moot).
-PRIORITY_LEVELS = ("low", "normal", "high")
-_PRIORITY_TOLERANCE: dict[str, Severity] = {
-    "low": Severity.CLEAR,
-    "normal": Severity.ELEVATED,
-    "high": Severity.TIGHT,
+class Priority(StrEnum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+PRIORITY_LEVELS = tuple(Priority)
+_PRIORITY_TOLERANCE: dict[Priority, Severity] = {
+    Priority.LOW: Severity.CLEAR,
+    Priority.NORMAL: Severity.ELEVATED,
+    Priority.HIGH: Severity.TIGHT,
 }
 
 
-def normalize_priority(raw: object, *, default: str = "normal") -> str:
-    """Coerce an operator-supplied priority value to a known level.
-    Unknown / non-string values fall back to ``default`` (callers warn
-    with their own file/entry context)."""
+def normalize_priority(raw: object, *, default: Priority = Priority.NORMAL) -> Priority:
+    """Normalize non-operator inputs, defaulting unknown/non-string values.
+
+    Operator overrides instead validate with Priority at the YAML boundary;
+    this permissive path remains for skill defaults and runtime callers.
+    """
     if isinstance(raw, str) and raw.strip().lower() in PRIORITY_LEVELS:
-        return raw.strip().lower()
+        return Priority(raw.strip().lower())
     return default
 
 
-def priority_tolerates(priority: str, severity: Severity) -> bool:
+def priority_tolerates(priority: Priority, severity: Severity) -> bool:
     """True when work of ``priority`` should still fire under
-    ``severity``. Unknown priorities are treated as ``normal``."""
-    tolerance = _PRIORITY_TOLERANCE.get(priority, _PRIORITY_TOLERANCE["normal"])
+    ``severity``. Normalize untyped inputs before calling."""
+    tolerance = _PRIORITY_TOLERANCE[priority]
     return severity <= tolerance
 
 

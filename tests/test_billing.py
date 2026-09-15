@@ -526,6 +526,22 @@ def test_arbiter_quota_mode_elevated_sheds_low_only(tmp_path):
     assert high.fire is True
 
 
+def test_priority_enum_and_permissive_normalization():
+    from mimir.billing import Priority, Severity, normalize_priority, priority_tolerates
+
+    assert normalize_priority(" High ") is Priority.HIGH
+    for value in ("hihg", None, 3, ["high"]):
+        assert normalize_priority(value) is Priority.NORMAL
+        assert normalize_priority(value, default=Priority.LOW) is Priority.LOW
+    for priority, tolerance in (
+        (Priority.LOW, Severity.CLEAR),
+        (Priority.NORMAL, Severity.ELEVATED),
+        (Priority.HIGH, Severity.TIGHT),
+    ):
+        for severity in Severity:
+            assert priority_tolerates(priority, severity) == (severity <= tolerance)
+
+
 def test_arbiter_unknown_priority_treated_as_normal(tmp_path):
     """Defense-in-depth: an unrecognized priority string behaves like
     ``normal`` (parse layers already normalize, but the arbiter must
