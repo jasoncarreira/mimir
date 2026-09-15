@@ -1447,7 +1447,7 @@ def _source(
     integrity: str = "untrusted",
     integrity_effect: str = "active_ingest",
 ) -> SourceLabel:
-    return SourceLabel(
+    return SourceLabel.from_record(dict(
         principal=principal,
         domain=domain,
         domain_qualifier=domain_qualifier,
@@ -1462,7 +1462,7 @@ def _source(
         source_kind=source_kind,
         integrity=integrity,
         integrity_effect=integrity_effect,
-    )
+    ))
 
 
 def _category_runtime(tmp_path, monkeypatch, *, initial=None, channels=None):
@@ -1731,7 +1731,7 @@ async def test_category_prompt_surfaces_cause_and_collapses_informational_source
             bridge_instance=f"recall-{index % 4}",
             sensitivity="private" if index % 2 else "public",
             authorized_principals=frozenset({f"reader-{index % 5}"}),
-            source_kind="auto_recall" if index % 2 else "file",
+            source_kind="auto_recall" if index % 2 else "unknown_test_source_kind",
             integrity="trusted" if index % 2 else "untrusted",
             integrity_effect="informational",
         )
@@ -1933,7 +1933,7 @@ def test_approval_source_summary_bounds_large_filesystem_origin():
             f"/var/lib/mimir/leases/pr-1831/checkout/file-{index}.txt",
             domain="filesystem",
             bridge_instance="worklink",
-            source_kind="file",
+            source_kind="unknown_test_source_kind",
         )
         for index in range(356)
     )
@@ -1945,7 +1945,7 @@ def test_approval_source_summary_bounds_large_filesystem_origin():
         '- count=356; principal="worklink:lease"; domain="filesystem"; '
         'domain_qualifier=null; '
         'bridge_instance="worklink"; sensitivity="private"; '
-        'authorized_principals=["worklink:lease"]; source_kind="file"; '
+        'authorized_principals=["worklink:lease"]; source_kind="unknown_test_source_kind"; '
         'integrity="untrusted"; integrity_effect="active_ingest"; '
         'common_path_prefix="/var/lib/mimir/leases/pr-1831/checkout"; '
         'example_resource_ids=["/var/lib/mimir/leases/pr-1831/checkout/file-0.txt", '
@@ -1959,7 +1959,7 @@ def test_approval_source_summary_bounds_large_filesystem_origin():
 def test_approval_source_summary_separates_active_ingest_origins(different_field):
     common = {
         "domain": "filesystem",
-        "source_kind": "file",
+        "source_kind": "unknown_test_source_kind",
         "authorized_principals": frozenset({"operator"}),
     }
     sources = []
@@ -1991,7 +1991,7 @@ async def test_category_prompt_bounds_hundreds_of_homogeneous_reads(tmp_path, mo
             f"/var/lib/mimir/leases/pr-1831/checkout/file-{index}.py",
             domain="filesystem",
             bridge_instance="worklink",
-            source_kind="file",
+            source_kind="unknown_test_source_kind",
         )
         for index in range(356)
     ) + tuple(
@@ -2021,7 +2021,7 @@ async def test_category_prompt_bounds_hundreds_of_homogeneous_reads(tmp_path, mo
     {"bridge_instance": "other"},
     {"sensitivity": "public"},
     {"authorized_principals": frozenset({"other"})},
-    {"source_kind": "file"},
+    {"source_kind": "unknown_test_source_kind"},
     {"integrity": "trusted"},
     {"integrity_effect": "informational"},
 ])
@@ -2066,7 +2066,7 @@ def test_approval_source_summary_keeps_active_sources_beyond_old_group_limit():
             domain="filesystem",
             bridge_instance="worklink",
             authorized_principals=frozenset({"operator"}),
-            source_kind="file",
+            source_kind="unknown_test_source_kind",
         )
         for index in range(25)
     ]
@@ -2077,7 +2077,7 @@ def test_approval_source_summary_keeps_active_sources_beyond_old_group_limit():
             domain="filesystem",
             bridge_instance="worklink",
             authorized_principals=frozenset({"operator"}),
-            source_kind="file",
+            source_kind="unknown_test_source_kind",
         )
         for index in range(12)
     )
@@ -2160,7 +2160,7 @@ def test_approval_source_summary_without_active_ingest_is_coherent(source_count)
                 "/tmp/later-secret",
                 domain="filesystem",
                 bridge_instance="local",
-                source_kind="file",
+                source_kind="unknown_test_source_kind",
             ),
             id="file-read",
         ),
@@ -2332,7 +2332,7 @@ async def test_pre_fold_state_change_refuses_authenticated_category_install(
         assert request is not None
         auth.ifc_state.merge(
             InformationFlowLabels().with_source(
-                _source("filesystem", "/tmp/new-secret", domain="filesystem", bridge_instance="local", source_kind="file")
+                _source("filesystem", "/tmp/new-secret", domain="filesystem", bridge_instance="local", source_kind="unknown_test_source_kind")
             )
         )
         assert await dispatcher.enqueue(_approval_event("APPROVE"))
@@ -2375,7 +2375,7 @@ async def test_post_fold_live_state_race_refuses_and_spends_category_grant(
             raced = True
             original_merge(
                 InformationFlowLabels().with_source(
-                    _source("tool", "race-result", domain="tool", bridge_instance="runtime", source_kind="tool")
+                    _source("tool", "race-result", domain="tool", bridge_instance="runtime", source_kind="unknown_test_source_kind")
                 )
             )
         return merged, receipt

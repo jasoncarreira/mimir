@@ -1,4 +1,4 @@
-"""Known-kind classification and compatibility with open runtime strings."""
+"""Known-kind classification and compatibility with unknown persisted strings."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ KINDS = (
     "recent_activity_assistant recent_activity_user service"
 ).split()
 UNKNOWN_KINDS = [
-    "web_ui", "operator_command", "file", "unknown", "",
+    "web_ui", "operator_command", "unknown_test_source_kind", "unknown", "",
     "protected_tool\x1b", "secret contents",
 ]
 
@@ -35,7 +35,7 @@ def test_source_kind_vocabulary_and_annotation():
     assert get_type_hints(SourceLabel)["source_kind"] is SourceKind
 
 
-@pytest.mark.parametrize("kind", KINDS + UNKNOWN_KINDS)
+@pytest.mark.parametrize("kind", KINDS)
 def test_source_kind_string_producer_compatibility(kind):
     source = prompt_source_label(
         SimpleNamespace(resource_id="slack-C1", channel_id="slack-C1"),
@@ -44,7 +44,49 @@ def test_source_kind_string_producer_compatibility(kind):
         authorized_principals=frozenset({"user"}), source_kind=kind,
     )
     assert source.source_kind == kind
+    assert type(source.source_kind) is str
+    assert type(replace(source, integrity="trusted").integrity) is str
     assert replace(source).source_kind == kind
+    assert json.loads(json.dumps({"source_kind": source.source_kind})) == {
+        "source_kind": kind,
+    }
+
+
+@pytest.mark.parametrize("kind", UNKNOWN_KINDS)
+def test_unknown_source_kind_constructor_rejected(kind):
+    with pytest.raises(ValueError, match="^invalid source kind: "):
+        SourceLabel(
+            principal="user", domain="channel", resource_id="slack-C1",
+            bridge_instance="slack", sensitivity="private", source_kind=kind,
+        )
+
+
+@pytest.mark.parametrize("decoded", [False, True])
+def test_unknown_source_kind_cross_channel_denied(decoded):
+    fields = dict(
+        principal="user", domain="channel", resource_id="slack-C2",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user"}),
+        source_kind="unknown_test_source_kind",
+    )
+    source = (SourceLabel.from_record(fields) if decoded else
+              SimpleNamespace(**fields, is_complete=True))
+    assert not _source_is_triggering_channel_compatible(
+        source, effective_principal="user", triggering_principal="user",
+        resolved_triggering="slack-C1", audience_provider=None,
+        cross_platform_pull=True, triggering_bridge_instance="slack",
+    )
+
+
+@pytest.mark.parametrize("kind", UNKNOWN_KINDS)
+def test_unknown_source_kind_record_compatibility(kind):
+    source = SourceLabel.from_record(dict(
+        principal="user", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user"}), source_kind=kind,
+    ))
+    assert source.source_kind == kind
+    assert SourceLabel.from_record(source.__dict__) == source
     assert json.loads(json.dumps({"source_kind": source.source_kind})) == {
         "source_kind": kind,
     }
@@ -83,7 +125,7 @@ def test_source_kind_flow_decisions_match_pre_enum_baseline():
         (None, frozenset(), frozenset({"user"}), frozenset({"user", "other"})),
         (False, True), (False, True),
     ):
-        source = SourceLabel(
+        fields = dict(
             principal="user", domain=domain, resource_id=resource,
             bridge_instance=bridge, sensitivity="private",
             authorized_principals=acl, source_kind=kind,
@@ -91,6 +133,9 @@ def test_source_kind_flow_decisions_match_pre_enum_baseline():
             owner_attestation=(
                 _mint_owner_attestation("user", "raw", resource) if attested else None
             ),
+        )
+        source = (
+            SourceLabel(**fields) if kind in KINDS else SourceLabel.from_record(fields)
         )
         provider = None if audience is None else SimpleNamespace(
             audience_for=lambda *a, **kw: audience,

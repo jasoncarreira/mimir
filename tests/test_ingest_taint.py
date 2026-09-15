@@ -12,7 +12,7 @@ from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
-    SourceLabel, TurnContext, TurnInteractivity,
+    SourceKind, SourceLabel, TurnContext, TurnInteractivity,
 )
 
 
@@ -188,10 +188,19 @@ def test_operator_declassification_then_fetch(live_turn, origin):
     assert calls == ["fetch_url"]
 
 
-def test_clear_audit_is_private_and_failure_is_atomic(live_turn, tmp_path, monkeypatch):
+@pytest.mark.parametrize(("source_kind", "expected_kind"), [
+    *((kind.value, kind.value) for kind in SourceKind),
+    ("secret contents", "other"),
+    ("operator_command", "other"),  # Archival metadata, not a SourceKind.
+])
+def test_clear_audit_is_private_and_failure_is_atomic(
+    live_turn, tmp_path, monkeypatch, source_kind, expected_kind,
+):
     auth = live_turn.auth_context
     original = auth.ifc_state.current()
-    hostile = replace(original.sources[0], domain="/private/domain", source_kind="secret contents")
+    hostile = SourceLabel.from_record(dict(
+        original.sources[0].__dict__, domain="/private/domain", source_kind=source_kind,
+    ))
     auth.ifc_state.merge(InformationFlowLabels().with_source(hostile))
     assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (True, "cleared")
     events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
@@ -200,7 +209,7 @@ def test_clear_audit_is_private_and_failure_is_atomic(live_turn, tmp_path, monke
     assert audit["source_count"] == 2
     assert audit["source_groups"] == [
         {"domain": "filesystem", "source_kind": "protected_tool", "count": 1},
-        {"domain": "other", "source_kind": "other", "count": 1},
+        {"domain": "other", "source_kind": expected_kind, "count": 1},
     ]
     assert "private/" not in json.dumps(audit)
     assert "secret" not in json.dumps(audit)

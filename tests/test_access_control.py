@@ -1893,17 +1893,17 @@ def test_synthesis_builtin_refuses_clean_and_tainted_index_rebuild(
     principal = access_control.builtin_trigger_service_principal(
         "session-boundary", tmp_path,
     )
-    labels = InformationFlowLabels().with_source(SourceLabel(
+    labels = InformationFlowLabels().with_source(SourceLabel.from_record(dict(
         principal="github-user",
         domain="github",
         resource_id="owner/repo#1",
         bridge_instance="github",
         sensitivity="internal",
         authorized_principals=frozenset({"service:synthesis"}),
-        source_kind="poller",
+        source_kind="unknown_test_source_kind",
         integrity="untrusted",
         integrity_effect="active_ingest",
-    ))
+    )))
 
     assert labels.has_untrusted_active_ingest is True
     assert "rebuild_index" not in principal.capabilities

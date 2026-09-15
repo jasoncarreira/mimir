@@ -91,11 +91,7 @@ class FlowLabel(StrEnum):
 
 
 class SourceKind(StrEnum):
-    """Kinds minted by first-party IFC producers, not validation of runtime data.
-
-    SourceLabel deliberately still accepts arbitrary strings from callers and
-    persisted labels. Unknown strings retain the existing flow policy.
-    """
+    """Kinds accepted from IFC producers; persisted labels may carry unknown kinds."""
 
     ACP_HANDS_RESULT = "acp_hands_result"
     AGENT_SELF = "agent_self"
@@ -242,6 +238,8 @@ class SourceLabel(_SourceLabelAuthoritySlot):
             raise TypeError("missing required source label field")
         if isinstance(self.domain, str) and ":" in self.domain:
             raise ValueError("source domain must not contain ':'")
+        if self.source_kind not in SourceKind._value2member_map_:
+            raise ValueError(f"invalid source kind: {self.source_kind!r}")
         if self.integrity not in Integrity._value2member_map_:
             raise ValueError(f"invalid source integrity: {self.integrity!r}")
         if self.integrity_effect not in IntegrityEffect._value2member_map_:
@@ -332,7 +330,13 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         values["authorized_principals"] = frozenset(
             values.get("authorized_principals") or ()
         )
-        return cls(**values)
+        # A different build may have written a future or retired kind. Retain
+        # that string for the policy's unknown-kind handling rather than crash
+        # recovery on version skew; all other constructor checks still apply.
+        source_kind = values.pop("source_kind", SourceKind.CHANNEL)
+        source = cls(**values)
+        object.__setattr__(source, "source_kind", source_kind)
+        return source
 
     @property
     def has_untrusted_active_ingest(self) -> bool:

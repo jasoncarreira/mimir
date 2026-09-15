@@ -1435,15 +1435,15 @@ def test_new_source_invalidates_category_capability_before_handler() -> None:
     auth = _ifc_auth()
     turn = _ifc_turn(auth)
     turn.ifc_labels = _install_sink_category_capability(auth, turn_id=turn.turn_id)
-    turn.ifc_labels = auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel(
+    turn.ifc_labels = auth.ifc_state.merge(InformationFlowLabels(sources=(SourceLabel.from_record(dict(
         principal="later-source",
         domain="file",
         resource_id="/tmp/new.txt",
         bridge_instance="filesystem",
         sensitivity="private",
         authorized_principals=frozenset({"user-1"}),
-        source_kind="file",
-    ),)))
+        source_kind="unknown_test_source_kind",
+    )),)))
     handler_calls = 0
 
     def handler(request: ToolCallRequest) -> ToolMessage:

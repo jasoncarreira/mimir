@@ -1135,20 +1135,24 @@ def test_prompt_source_labels_preserve_full_untrusted_label():
         principal="user-2",
         bridge="discord",
         authorized_principals=frozenset({"user-1", "user-2"}),
-        source_kind="recent_message",
+        source_kind="recent_activity_user",
         self_authored=False,
     ).sources))
-    assert source == SourceLabel(
+    assert source.source_kind == "recent_activity_user"
+    source = SourceLabel.from_record(dict(
+        source.__dict__, source_kind="unknown_test_source_kind",
+    ))
+    assert source == SourceLabel.from_record(dict(
         principal="user-2",
         domain="recent_activity",
         resource_id="discord-C2",
         bridge_instance="discord",
         sensitivity="private",
         authorized_principals=frozenset({"user-1", "user-2"}),
-        source_kind="recent_message",
+        source_kind="unknown_test_source_kind",
         integrity="untrusted",
         integrity_effect="informational",
-    )
+    ))
 
 
 def test_prompt_source_constructor_requires_explicit_provenance():
@@ -4301,7 +4305,9 @@ def test_review_skill_read_admits_scoped_forge_sinks_under_enforcement(
     target = f"acme/widget#pull/7@{'a' * 40}:{scope.scope_id}"
     request_carrier, ordinal = state.source_snapshot()
     grant_event = object()
-    grant_source = replace(ingress, source_kind="operator_review_grant")
+    grant_source = SourceLabel.from_record(dict(
+        ingress.__dict__, source_kind="unknown_test_source_kind",
+    ))
     labels, receipt = state.merge_with_receipt(
         InformationFlowLabels(sources=(grant_source,)),
         event_identity=grant_event,

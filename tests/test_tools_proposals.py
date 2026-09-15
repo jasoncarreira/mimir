@@ -232,11 +232,11 @@ def poller_runtime(monkeypatch, tmp_path):
         service_authority=service,
     ), enforce=True, ifc_labels=InformationFlowLabels(
         source_channels=frozenset({service.canonical}),
-        sources=(SourceLabel(
+        sources=(SourceLabel.from_record(dict(
             principal=None, domain="public", resource_id="https://arxiv.org/abs/2609.00042",
-            bridge_instance=None, sensitivity="public", source_kind="fetch_url",
+            bridge_instance=None, sensitivity="public", source_kind="unknown_test_source_kind",
             integrity="untrusted", integrity_effect="active_ingest",
-        ),),
+        )),),
     ))
     turn = TurnContext(
         turn_id="papers-turn-42", session_id=service.canonical, trigger="poller",
