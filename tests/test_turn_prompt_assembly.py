@@ -1950,6 +1950,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
             call = dotted(node.func)
             terminal = call.rsplit(".", 1)[-1] if call else None
             category = categories.get(terminal or "")
+            if call == "SourceLabel.from_record":
+                category = "producer"
             if terminal == "admit" and self.relative != "mimir/feedback/__init__.py":
                 # ``admit`` is too common a method name to match on bare. The
                 # feedback stream's admission helper is the only channel-bearing
@@ -2034,7 +2036,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "_prompt_source_labels", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "prompt_sources.prompt_source_label"): 1,
         ("producer", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "prompt_sources.prompt_source_label"): 1,
-        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel"): 1,
+        ("producer", "mimir/poller_recovery.py", "_event_from_stash", "SourceLabel.from_record"): 1,
         ("producer", "mimir/poller_recovery.py", "_restore_event", "SourceLabel"): 1,
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,

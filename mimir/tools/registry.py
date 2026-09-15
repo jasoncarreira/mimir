@@ -553,6 +553,7 @@ def _render_approval_source(source: Any, *, include_resource_id: bool) -> str:
     values = [
         f"principal={render(source.principal or '(unknown)')}",
         f"domain={render(source.domain or '(unknown)')}",
+        f"domain_qualifier={render(source.domain_qualifier)}",
     ]
     if include_resource_id:
         values.append(f"resource_id={render(source.resource_id or '(unknown)')}")
@@ -571,6 +572,7 @@ def _approval_source_group_key(source: Any) -> tuple[Any, ...]:
     return (
         source.principal,
         source.domain,
+        source.domain_qualifier,
         source.bridge_instance,
         source.sensitivity,
         tuple(sorted(source.authorized_principals)),
@@ -594,7 +596,7 @@ def _render_active_ingest_source_group(group: list[Any]) -> list[str]:
         _render_approval_source(source, include_resource_id=False),
     ]
     resource_ids = [source.resource_id or "(unknown)" for source in group]
-    if source.domain == "filesystem":
+    if source.domain == "filesystem" and source.domain_qualifier is None:
         try:
             common_prefix = os.path.commonpath(resource_ids)
         except ValueError:

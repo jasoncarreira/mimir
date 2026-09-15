@@ -213,6 +213,7 @@ def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
                 {
                     "principal": source.principal,
                     "domain": source.domain,
+                    "domain_qualifier": source.domain_qualifier,
                     "resource_id": source.resource_id,
                     "bridge_instance": source.bridge_instance,
                     "sensitivity": source.sensitivity,
@@ -226,6 +227,7 @@ def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
                     key=lambda source: (
                         source.principal or "",
                         source.domain or "",
+                        (source.domain_qualifier is not None, source.domain_qualifier or ""),
                         source.resource_id or "",
                         source.bridge_instance or "",
                         source.sensitivity,
@@ -350,17 +352,18 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         if isinstance(raw_labels, dict):
             raw_sources = raw_labels.get("sources") or ()
             sources = tuple(
-                SourceLabel(
-                    principal=source.get("principal"),
-                    domain=source.get("domain"),
-                    resource_id=source.get("resource_id"),
-                    bridge_instance=source.get("bridge_instance"),
-                    sensitivity=source.get("sensitivity", ""),
-                    authorized_principals=frozenset(source.get("authorized_principals") or ()),
-                    source_kind=source.get("source_kind", "channel"),
-                    integrity=source.get("integrity", "untrusted"),
-                    integrity_effect=source.get("integrity_effect", "active_ingest"),
-                )
+                SourceLabel.from_record({
+                    "principal": source.get("principal"),
+                    "domain": source.get("domain"),
+                    "domain_qualifier": source.get("domain_qualifier"),
+                    "resource_id": source.get("resource_id"),
+                    "bridge_instance": source.get("bridge_instance"),
+                    "sensitivity": source.get("sensitivity", ""),
+                    "authorized_principals": source.get("authorized_principals"),
+                    "source_kind": source.get("source_kind", "channel"),
+                    "integrity": source.get("integrity", "untrusted"),
+                    "integrity_effect": source.get("integrity_effect", "active_ingest"),
+                })
                 for source in raw_sources
                 if isinstance(source, dict)
             )

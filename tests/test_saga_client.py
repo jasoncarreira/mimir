@@ -34,7 +34,7 @@ async def test_maintenance_migrations_run_off_loop_under_db_lock(tmp_path, monke
         assert threading.get_ident() != loop_thread
         migration_connections.append(conn)
         loop.call_soon_threadsafe(migration_started.set)
-        assert release_migration.wait(10), "event loop did not release migration"
+        release_migration.wait()
         migrate(conn, fresh=fresh)
 
     monkeypatch.setattr(store, "_apply_pending_migrations", paused_migration)
@@ -42,8 +42,10 @@ async def test_maintenance_migrations_run_off_loop_under_db_lock(tmp_path, monke
     tasks = [asyncio.create_task(getattr(store, method)(**kwargs)) for _ in range(2)]
     started = asyncio.create_task(migration_started.wait())
     try:
+        # Assert ordering, not executor scheduling speed under suite load.
+        # pytest-timeout supplies the deadlock bound; finally releases workers.
         completed, _ = await asyncio.wait(
-            [started, *tasks], timeout=5, return_when=asyncio.FIRST_COMPLETED,
+            [started, *tasks], return_when=asyncio.FIRST_COMPLETED,
         )
         for task in tasks:
             if task in completed:
@@ -56,7 +58,7 @@ async def test_maintenance_migrations_run_off_loop_under_db_lock(tmp_path, monke
             store._db_lock.release()
         assert not acquired
         release_migration.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        await asyncio.gather(*tasks)
         assert migration_connections == [store._conn]
     finally:
         release_migration.set()

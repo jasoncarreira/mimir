@@ -4487,7 +4487,7 @@ def test_visibility_qualified_service_source_is_bound_to_triggering_channel():
         source_channels=frozenset({event.channel_id}),
         sources=frozenset({SourceLabel(
             principal="service:scheduler",
-            domain="channel:private",
+            domain="channel", domain_qualifier="private",
             resource_id="scheduler:other",
             bridge_instance="service:scheduler",
             sensitivity="private",
@@ -4809,7 +4809,7 @@ def test_service_channel_source_still_requires_matching_channel_provenance(
 ):
     source = SourceLabel(
         principal="service:context",
-        domain="channel:private",
+        domain="channel", domain_qualifier="private",
         resource_id=resource_id,
         bridge_instance=bridge_instance,
         sensitivity="private",

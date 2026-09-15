@@ -5605,7 +5605,7 @@ def _same_channel_authority(
     audience arms below, which compare real audiences rather than strings.
     """
     source_domain = getattr(source, "domain", "") or ""
-    if not (source_domain == "channel" or source_domain.startswith("channel:")):
+    if source_domain != "channel":
         # Not a bridge-scoped channel source (e.g. a protected tool result
         # carrying a "channel_metadata" domain); the shortcut is unaffected.
         return True
@@ -5919,7 +5919,10 @@ def _forge_repository_scope_mismatch(
         return repo, pr, component
 
     for source in getattr(ifc_labels, "sources", ()):
-        if getattr(source, "domain", None) != "repository":
+        if (
+            getattr(source, "domain", None) != "repository"
+            or getattr(source, "domain_qualifier", None) is not None
+        ):
             continue
         resource_id = getattr(source, "resource_id", None)
         match = (
@@ -6069,6 +6072,7 @@ class SinkGate:
             source.source_kind == "channel"
             and source.principal == principal
             and source.domain == domain
+            and source.domain_qualifier == getattr(auth_context, "domain_qualifier", None)
             and source.resource_id == channel
             and source.bridge_instance == bridge
             and principal in source.authorized_principals
@@ -6854,6 +6858,7 @@ class SinkGate:
             and bool(sources)
             and all(
                 source.domain == "repository"
+                and source.domain_qualifier is None
                 or (
                     tool_name == "pr_submit_review"
                     and getattr(repo_pr_action_scope, "pr_number", None) is not None
@@ -7092,7 +7097,11 @@ def clear_live_ingest_taint(
         }
         groups: dict[tuple[str, str], int] = {}
         for source in sources:
-            domain = source.domain if source.domain in domains else "other"
+            domain = (
+                source.domain
+                if source.domain in domains and source.domain_qualifier is None
+                else "other"
+            )
             kind = source.source_kind if source.source_kind in kinds else "other"
             key = (domain, kind)
             groups[key] = groups.get(key, 0) + 1
@@ -7193,6 +7202,7 @@ def approve_live_declassification(
             {
                 "principal": source.principal,
                 "domain": source.domain,
+                "domain_qualifier": source.domain_qualifier,
                 "resource_id": source.resource_id,
                 "bridge_instance": source.bridge_instance,
                 "sensitivity": source.sensitivity,
@@ -7204,7 +7214,9 @@ def approve_live_declassification(
             for source in sorted(
                 labels.sources,
                 key=lambda item: (
-                    str(item.domain), str(item.resource_id), str(item.principal),
+                    str(item.domain),
+                    (item.domain_qualifier is not None, item.domain_qualifier or ""),
+                    str(item.resource_id), str(item.principal),
                     str(item.sensitivity),
                 ),
             )
@@ -8503,6 +8515,7 @@ class ToolRegistry:
                         fields["ifc_source"] = {
                             "source_kind": source.source_kind,
                             "domain": source.domain,
+                            "domain_qualifier": source.domain_qualifier,
                             "integrity": source.integrity,
                             "integrity_effect": source.integrity_effect,
                             "resource_id": (
@@ -8684,6 +8697,7 @@ class ToolRegistry:
                 repository_sources = tuple(
                     source for source in getattr(ifc_labels, "sources", ())
                     if getattr(source, "domain", None) == "repository"
+                    and getattr(source, "domain_qualifier", None) is None
                 )
                 if not repository_sources:
                     return finish(ToolAuthorization(
@@ -9714,6 +9728,7 @@ def _acp_failed_tool_error_result(
         principal=principal,
         domain=domain,
         resource_id=channel,
+        domain_qualifier=getattr(auth_context, "domain_qualifier", None),
         bridge_instance=bridge,
         sensitivity="private",
         authorized_principals=frozenset({principal}),
@@ -9804,6 +9819,7 @@ def classify_protected_result(
         if not failed and provenance is not None and provenance.sources:
             if all(
                 item.domain == source.domain
+                and item.domain_qualifier == source.domain_qualifier
                 and item.resource_id == source.resource_id
                 and item.principal == source.principal
                 and item.bridge_instance == source.bridge_instance
@@ -9832,6 +9848,7 @@ def classify_protected_result(
         source = SourceLabel(
             principal=principal,
             domain=getattr(auth_context, "domain", None),
+            domain_qualifier=getattr(auth_context, "domain_qualifier", None),
             resource_id=ChannelResourceAdapter._resolve_channel(resource),
             bridge_instance=getattr(auth_context, "bridge_instance", None),
             sensitivity="private",
@@ -11098,11 +11115,8 @@ def create_auth_context(
         canonical_resource = resolver.resolve_channel(event.channel_id)
     extra = event.extra if isinstance(event.extra, dict) else {}
     visibility = extra.get("channel_visibility")
-    domain = (
-        f"channel:{visibility}"
-        if isinstance(visibility, str) and visibility
-        else "channel"
-    )
+    domain = "channel"
+    domain_qualifier = visibility if isinstance(visibility, str) and visibility else None
     bridge_instance = extra.get("bridge_instance")
     if not isinstance(bridge_instance, str) or not bridge_instance:
         bridge_instance = event.source
@@ -11165,6 +11179,7 @@ def create_auth_context(
         ),
         ifc_labels=ifc_labels,
         domain=domain,
+        domain_qualifier=domain_qualifier,
         resource_id=canonical_resource,
         bridge_instance=bridge_instance,
         origin_trigger=(
