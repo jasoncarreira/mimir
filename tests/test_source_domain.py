@@ -92,6 +92,7 @@ def test_qualifier_is_part_of_identity_and_derivation():
 
 def _domain_flow_decisions(classifier=_source_is_triggering_channel_compatible, *, legacy=False):
     decisions = []
+    changed = 0
     for domain, kind, resource, bridge, acl, audience, admin in itertools.product(
         ("channel", "channel:private", "channel:public", "channel:unknown",
          "channel:custom:detail", "channel:", "channel_metadata", "channelXYZ",
@@ -116,12 +117,23 @@ def _domain_flow_decisions(classifier=_source_is_triggering_channel_compatible, 
         provider = None if audience is None else SimpleNamespace(
             audience_for=lambda *a, **kw: audience,
         )
-        decisions.append(classifier(
+        decision = classifier(
             source, effective_principal="user", triggering_principal="user",
             resolved_triggering="slack-C1", audience_provider=provider,
             cross_platform_pull=True, admin_operator_cross_channel=admin,
             triggering_bridge_instance="slack",
-        ))
+        )
+        if kind == "unknown_test_source_kind":
+            assert decision == bool(admin and acl and source.is_complete)
+            # Project only #1748's explicit allow-to-deny delta back onto the
+            # historical domain baseline; all known-kind decisions stay intact.
+            if (not admin and acl and source.is_complete and resource == "slack-C1"
+                    and (base != "channel" or bridge == "slack")):
+                assert decision is False
+                changed += 1
+                decision = True
+        decisions.append(decision)
+    assert changed == 80
     return decisions
 
 

@@ -5658,7 +5658,7 @@ def _source_is_triggering_channel_compatible(
 
     After completeness and requester-ACL checks, ``agent_self`` permits trusted
     informational data, while ``auto_recall`` and ``mcp`` require the destination
-    audience to be within their source ACL. All remaining kinds may use the
+    audience to be within their source ACL. All remaining known kinds may use the
     same-channel shortcut. Otherwise, ``recent_activity_user`` requires an owner
     attestation and the requester-only destination audience;
     ``owner_attested_feedback`` requires an attestation and the requester-only
@@ -5667,9 +5667,10 @@ def _source_is_triggering_channel_compatible(
     the source channel audience; non-channel ``service`` data and
     ``protected_tool`` retain their explicit allowances. ``channel``,
     ``channel_scoped_feedback``, ``channel_bound_unowned_feedback``, and
-    ``feedback_chain`` have no further allowance. Unknown kinds likewise fail
-    closed after the shortcut. The admin-operator cross-channel path remains an
-    explicit bypass for every complete, requester-authorized kind.
+    ``feedback_chain`` have no further allowance. Unknown kinds fail closed
+    before the shortcut. The admin-operator cross-channel path remains an
+    explicit bypass for every complete, requester-authorized kind, even unknown
+    kinds, because the operator is deliberately authorizing the flow.
     """
     if not getattr(source, "is_complete", False):
         return False
@@ -5680,6 +5681,11 @@ def _source_is_triggering_channel_compatible(
     if admin_operator_cross_channel:
         return True
     source_kind = getattr(source, "source_kind", SourceKind.CHANNEL)
+    # Version-skewed records and duck-typed producers can supply unknown strings.
+    # They gain no automatic flow rights, even back to their source channel,
+    # until classified. The deliberate operator bypass above is the exception.
+    if source_kind not in SourceKind._value2member_map_:
+        return False
     if (
         source_kind == SourceKind.AGENT_SELF
         and source.integrity == "trusted"
@@ -5796,9 +5802,7 @@ def _source_is_triggering_channel_compatible(
         return True
     if source_kind == SourceKind.ACP_HANDS_RESULT:
         return True
-    # Unknown kinds cannot be authored by SourceLabel's constructor, but can
-    # still arrive from version-skewed records or duck-typed sources. Preserve
-    # this fail-closed fallback (also used by non-informational agent_self).
+    # agent_self without trusted informational integrity has no further allowance.
     return False
 
 

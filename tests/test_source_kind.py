@@ -62,20 +62,24 @@ def test_unknown_source_kind_constructor_rejected(kind):
 
 
 @pytest.mark.parametrize("decoded", [False, True])
-def test_unknown_source_kind_cross_channel_denied(decoded):
+@pytest.mark.parametrize("kind", UNKNOWN_KINDS)
+@pytest.mark.parametrize("resource", ["slack-C1", "slack-C2"])
+@pytest.mark.parametrize("admin", [False, True], ids=["ordinary", "admin"])
+def test_unknown_source_kind_flow_policy(decoded, kind, resource, admin):
     fields = dict(
-        principal="user", domain="channel", resource_id="slack-C2",
+        principal="user", domain="channel", resource_id=resource,
         bridge_instance="slack", sensitivity="private",
         authorized_principals=frozenset({"user"}),
-        source_kind="unknown_test_source_kind",
+        source_kind=kind,
     )
     source = (SourceLabel.from_record(fields) if decoded else
               SimpleNamespace(**fields, is_complete=True))
-    assert not _source_is_triggering_channel_compatible(
+    assert _source_is_triggering_channel_compatible(
         source, effective_principal="user", triggering_principal="user",
         resolved_triggering="slack-C1", audience_provider=None,
         cross_platform_pull=True, triggering_bridge_instance="slack",
-    )
+        admin_operator_cross_channel=admin,
+    ) is admin
 
 
 @pytest.mark.parametrize("kind", UNKNOWN_KINDS)
@@ -109,12 +113,13 @@ import mimir.access_control
     assert "AssertionError: unclassified SourceKind" in result.stderr
 
 
-def test_source_kind_flow_decisions_match_pre_enum_baseline():
+def test_source_kind_flow_decisions_match_baseline_except_unknown_same_channel():
     # Captured by executing this matrix against the unmodified string policy.
     # Covers every known kind plus open strings, with same/different/non-channel
     # resources, ACLs, bridge bindings, integrity, audiences, attestations, admin
     # bypass and cross-platform pull. Keep the ordering stable for the digest.
     decisions = []
+    changed = 0
     for (kind, resource, domain, bridge, acl, integrity, effect, admin,
          audience, attested, cross) in itertools.product(
         KINDS + UNKNOWN_KINDS,
@@ -154,7 +159,18 @@ def test_source_kind_flow_decisions_match_pre_enum_baseline():
             assert _source_is_triggering_channel_compatible(
                 replace(source, source_kind=SourceKind(kind)), **kwargs,
             ) == decision
+        else:
+            assert decision == bool(admin and acl)
+            # Exhaustive delta from the pre-enum policy: unknown kinds formerly
+            # took the same-channel shortcut. Restore only those denied cells
+            # for comparison with the original digest, never known-kind cells.
+            if (not admin and acl and resource == "slack-C1"
+                    and (domain != "channel" or bridge == "slack")):
+                assert decision is False
+                changed += 1
+                decision = True
         decisions.append(decision)
+    assert changed == 1344
     assert len(decisions) == 64512
     assert sum(decisions) == 22432
     assert hashlib.sha256(json.dumps(decisions).encode()).hexdigest() == (
