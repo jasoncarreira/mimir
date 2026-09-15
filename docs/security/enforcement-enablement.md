@@ -702,6 +702,47 @@ application gate can enforce — so this enablement scopes the two separately:
   to confine yet. When untrusted code work is enabled, the substrate must bring
   the task-level egress control with it.
 
+### Home filesystem isolation decision (#1435, 2026-09-15)
+
+On the measured macOS deployment, `<home>` (`/mimir-home`) is a virtiofs bind
+mount readable by every container uid regardless of mode bits. **No control may
+assume uid-based isolation of `<home>` on this mount.** Changing modes is not a
+fix. The image filesystem and `/workspace` (btrfs) denied the same non-owner
+0600 read; a Linux-host deployment need not share the virtiofs behavior.
+
+This is an active exposure, not a latent one: Worklink gate code runs as worker
+uid 1002, which was measured reading `<home>/.env` inside the live container.
+Credential relocation into the agent's process environment is a separate operator
+action in `jasoncarreira/mimirbot`, not implemented by this leaf. Process environment
+takes precedence over `<home>/.env`; `/proc/<agent pid>/environ` was measured denied
+to uid 1002 but readable to its owner uid 1001. This is not protection against
+same-uid children or credentials deliberately inherited by subprocesses. Remove
+credential material from the bind mount, rather than merely overriding its values.
+
+**Residual decision: not accepted as a confidentiality boundary for worker code.**
+Even after credential relocation, `<home>/.mimir/saga.db`,
+`<home>/.mimir/file-integrity.json`, and `<home>/memory/` remain private data readable
+by every container uid on that mount. This leaf leaves that exposure unresolved;
+continued operation must not be described as private-state isolation. Backend UID
+separation (#1436) alone cannot close it. Operator storage/isolation remediation
+must be verified by reads from a non-Mimir uid inside the running container, not
+by host-side modes or compose inspection. No credential or mount remediation is
+claimed here, and the probe does not test write isolation.
+
+At application startup, before agent runtime creation, `mimir.home_isolation`
+creates a root-owned 0600 probe directly under `<home>` and attempts a read in a
+separate non-root, non-owning uid process with supplementary groups cleared. A
+0644 sibling control must first be readable so that a traversal failure cannot
+masquerade as file-mode enforcement. Probe files contain only a fixed non-secret
+marker and are removed best-effort; existing files and home modes are untouched.
+Results surface in **boot logs**: `Home uid isolation: exposed` at ERROR,
+`Home uid isolation: unknown` at WARNING, or `Home uid isolation: isolated` at
+INFO. There is no durable event or boot refusal. `isolated` means only that this
+probe was denied for this uid, not that all home data or child processes are safe.
+An unprivileged server that cannot switch uid, no second uid, a read-only home,
+creation failure, unavailable interpreter, timeout, or failed control reports
+`unknown`, never `isolated`. The subprocess read has a five-second timeout.
+
 ### 5.5 GitHub poller code work → Worklink only; the `spawn_*` isolation contract
 
 All GitHub-poller code work — greenfield **and** "update/test from an existing

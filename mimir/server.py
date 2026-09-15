@@ -1426,6 +1426,10 @@ def build_app(config: Config) -> web.Application:
         ):
             raise RuntimeError("failed to persist unclean startup marker")
 
+        from .home_isolation import check_home_isolation
+
+        await asyncio.to_thread(check_home_isolation, config.home)
+
         startup_state.phase = "agent_runtime"
         startup_state.runtime_attempted = True
         bundle = await create_agent_runtime(config, core, runtime_adapters)

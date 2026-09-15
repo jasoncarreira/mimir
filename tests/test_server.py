@@ -1115,11 +1115,21 @@ async def test_startup_constructs_runtime_first_and_publishes_atomically(
     app, control = _controlled_server_app(tmp_path, monkeypatch)
     control.events.clear()
 
+    def check_home(home):
+        assert home == tmp_path
+        control.events.append("home:isolation")
+        return "unknown"
+
+    monkeypatch.setattr("mimir.home_isolation.check_home_isolation", check_home)
+
     assert app["agent"] is None
     await _run_startup(app)
     await asyncio.sleep(0)
 
     assert control.events.index("liveness:running") < control.events.index("runtime")
+    assert control.events.count("home:isolation") == 1
+    assert control.events.index("liveness:running") < control.events.index("home:isolation")
+    assert control.events.index("home:isolation") < control.events.index("runtime")
     assert "bridges:bound:True" in control.events
     assert app["agent"] is control.bundle.agent
     assert app["agent_runtime"] is control.bundle
