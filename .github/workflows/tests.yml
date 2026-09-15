@@ -298,7 +298,7 @@ jobs:
           path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   pytest:
-    # Full mimir test suite under py 3.11 + 3.12 matrix. ``needs:
+    # Full mimir test suite under py 3.11 + 3.12 + 3.13 matrix. ``needs:
     # skill-conformance`` makes the fast gate fail-fast PRs that bust
     # frontmatter, instead of waiting for the slower full matrix to
     # come back red on the same root cause.
@@ -308,7 +308,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -327,6 +329,10 @@ jobs:
         # ``--extra dev`` is required — see skill-conformance job's
         # comment for the rationale.
         run: uv sync --extra dev --extra bench
+
+      - name: Verify selected Python
+        run: |
+          uv run python -c 'import os, sys; actual = ".".join(map(str, sys.version_info[:2])); print(sys.version); assert actual == os.environ["UV_PYTHON"], (actual, os.environ["UV_PYTHON"])'
 
       - name: Install AppArmor syntax checker (no kernel enforcement required)
         run: |
@@ -529,7 +535,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -546,6 +554,10 @@ jobs:
 
       - name: Sync dependencies (with dev and bench extras)
         run: uv sync --extra dev --extra bench
+
+      - name: Verify selected Python
+        run: |
+          uv run python -c 'import os, sys; actual = ".".join(map(str, sys.version_info[:2])); print(sys.version); assert actual == os.environ["UV_PYTHON"], (actual, os.environ["UV_PYTHON"])'
 
       - name: Prepare pytest evidence directory
         run: |
