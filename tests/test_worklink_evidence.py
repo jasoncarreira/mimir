@@ -1098,17 +1098,24 @@ async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked
 
     compute = Compute()
     loop = asyncio.get_running_loop()
-    call_later = loop.call_later
+    call_at = loop.call_at
     deadlines = []
     observation = None
 
-    def record_deadline(delay, callback, *args, **kwargs):
-        timer = call_later(delay, callback, *args, **kwargs)
-        if asyncio.current_task() is observation and delay in (60, 5400):
-            deadlines.append((delay, callback, args, timer))
+    def record_deadline(when, callback, *args, **kwargs):
+        # Python 3.11 wait_for uses call_later (which delegates to call_at);
+        # Python 3.12 uses asyncio.timeout and calls call_at directly. Observe
+        # the shared absolute-timer boundary without replacing the supervisor.
+        remaining = when - loop.time()
+        timer = call_at(when, callback, *args, **kwargs)
+        if asyncio.current_task() is observation:
+            for budget in (60, 5400):
+                if abs(remaining - budget) < 0.1:
+                    deadlines.append((budget, callback, args, timer))
+                    break
         return timer
 
-    monkeypatch.setattr(loop, "call_later", record_deadline)
+    monkeypatch.setattr(loop, "call_at", record_deadline)
 
     def runner(command, **kwargs):
         return subprocess.CompletedProcess(command, 0, "changed.py\n" if "--name-only" in command else "", "")
