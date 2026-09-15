@@ -11,7 +11,7 @@ import sys
 import pytest
 
 from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec, _enabled_child_env
-from mimir.worklink.evidence import observe_evidence
+from mimir.worklink.evidence import _gate_tmp_directory, observe_evidence
 from tests.test_worklink_evidence import _init_gate_repo
 
 
@@ -84,7 +84,7 @@ async def test_enabled_gate_rerun_preserves_compute_spec(tmp_path, monkeypatch):
             spec, local_argv=gate_spec.local_argv,
             env={**spec.env, "PYTEST_ADDOPTS": (
                 f"-W error -n 2 --junitxml={report}/junit.xml "
-                f"--basetemp={report}-tmp -o tmp_path_retention_policy=all "
+                f"--basetemp={_gate_tmp_directory(repo / report)} -o tmp_path_retention_policy=all "
                 f"-o cache_dir={report}/cache"
             )},
             backend_config={**spec.backend_config, "pass_env": ("GATE_SENTINEL", "PYTEST_ADDOPTS")},

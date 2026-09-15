@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+import hashlib
 import json
 import logging
 import os
@@ -339,7 +340,11 @@ _GATE_RETENTION_DEPTH = 32
 def _gate_tmp_directory(report_dir: Path) -> Path:
     # Pytest makes basetemp private. It must never be a child of the controller's
     # TemporaryDirectory: that identity cannot chmod/remove a worker's 0700 tree.
-    return report_dir.with_name(report_dir.name + "-tmp")
+    # Nor may it live in the group-writable checkout: output_capture rejects that
+    # ancestor. Use the shared host /tmp (sticky), not TMPDIR or per-launch HOME.
+    # Hash the controller's unique report path into a single confined leaf.
+    identity = hashlib.sha256(os.fsencode(report_dir.absolute())).hexdigest()
+    return Path("/tmp") / f"worklink-gate-{identity}-tmp"
 
 
 def _export_gate_tmp(root: str, max_bytes: int, max_entries: int, max_depth: int) -> dict:
@@ -527,7 +532,7 @@ async def _retain_gate_failure(
             script = (
                 inspect.getsource(_export_gate_tmp)
                 + "\nimport json, shutil\n"
-                + f"root = {str(tmp.relative_to(checkout.resolve()))!r}\n"
+                + f"root = {str(tmp)!r}\n"
                 + "try:\n"
                 + f" print(json.dumps(_export_gate_tmp(root, {remaining}, {_GATE_RETENTION_ENTRIES - entries}, {_GATE_RETENTION_DEPTH})))\n"
                 + "finally:\n shutil.rmtree(root, ignore_errors=True)\n"
@@ -766,7 +771,7 @@ async def _observe_evidence_from_ref(
                             pass
                         else:
                             cleanup = await _run_compute_gate(
-                                shlex.join(["python3", "-I", "-c", "import shutil; shutil.rmtree(" + repr(str(tmp.relative_to(checkout.resolve()))) + ")"]),
+                                shlex.join(["python3", "-I", "-c", "import shutil; shutil.rmtree(" + repr(str(tmp)) + ")"]),
                                 checkout=checkout, work_spec=replace(work_spec, output_root=None), compute=compute,
                                 diagnostic=True,
                             )
@@ -905,6 +910,7 @@ async def _run_compute_gate(
                 report_option_dir,
                 existing=gate_spec.env.get("PYTEST_ADDOPTS"),
                 create_directory=False,
+                basetemp=_gate_tmp_directory(report_dir),
             ),
         )
     handle = await compute.launch(gate_spec)
@@ -1049,6 +1055,7 @@ def pytest_report_environment(
     *,
     existing: str | None = None,
     create_directory: bool = True,
+    basetemp: Path | None = None,
 ) -> dict[str, str]:
     """Configure pytest's machine reports without changing the retained output."""
     if not _is_pytest_command(command):
@@ -1057,7 +1064,7 @@ def pytest_report_environment(
         report_dir.mkdir(parents=True, exist_ok=True)
     options = (
         f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
-        f"--basetemp={shlex.quote(str(_gate_tmp_directory(report_dir)))} "
+        f"--basetemp={shlex.quote(str(basetemp if basetemp is not None else _gate_tmp_directory(report_dir)))} "
         "-o tmp_path_retention_policy=all "
         f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
     )
