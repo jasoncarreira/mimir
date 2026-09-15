@@ -49,6 +49,7 @@ from .models import (
     NormalizedPullRequestSnapshot,
     RepoPRAction,
     RepoPRScopeProvenance,
+    SourceKind,
 )
 from .read_policy import (
     READ_RESOURCE_OPERATIONS,
@@ -5617,6 +5618,31 @@ def _same_channel_authority(
     return source_bridge == triggering_bridge_instance
 
 
+_SOURCE_KIND_SOURCE_ACL = frozenset({SourceKind.AUTO_RECALL, SourceKind.MCP})
+_SOURCE_KIND_OWNER_ATTESTATION = frozenset({
+    SourceKind.RECENT_ACTIVITY_USER, SourceKind.OWNER_ATTESTED_FEEDBACK,
+})
+_SOURCE_KIND_CHANNEL_AUDIENCE = frozenset({
+    SourceKind.PROTECTED_PROMPT, SourceKind.RECENT_ACTIVITY_ASSISTANT,
+})
+_SOURCE_KIND_SAME_CHANNEL_ONLY = frozenset({
+    SourceKind.CHANNEL, SourceKind.CHANNEL_SCOPED_FEEDBACK,
+    SourceKind.CHANNEL_BOUND_UNOWNED_FEEDBACK, SourceKind.FEEDBACK_CHAIN,
+})
+
+# Classify every known kind explicitly; unknown runtime strings remain separate.
+# AGENT_SELF falls through when not trusted/informational. SERVICE depends on
+# domain; the two result kinds allow cross-channel flow after the common guards.
+assert set(SourceKind) == (
+    _SOURCE_KIND_SOURCE_ACL
+    | _SOURCE_KIND_OWNER_ATTESTATION
+    | _SOURCE_KIND_CHANNEL_AUDIENCE
+    | _SOURCE_KIND_SAME_CHANNEL_ONLY
+    | {SourceKind.AGENT_SELF, SourceKind.SERVICE,
+       SourceKind.PROTECTED_TOOL, SourceKind.ACP_HANDS_RESULT}
+), "unclassified SourceKind in triggering-channel flow policy"
+
+
 def _source_is_triggering_channel_compatible(
     source: Any,
     *,
@@ -5653,14 +5679,14 @@ def _source_is_triggering_channel_compatible(
         return False
     if admin_operator_cross_channel:
         return True
-    source_kind = getattr(source, "source_kind", "channel")
+    source_kind = getattr(source, "source_kind", SourceKind.CHANNEL)
     if (
-        source_kind == "agent_self"
+        source_kind == SourceKind.AGENT_SELF
         and source.integrity == "trusted"
         and source.integrity_effect == "informational"
     ):
         return True
-    if source_kind in {"auto_recall", "mcp"}:
+    if source_kind in _SOURCE_KIND_SOURCE_ACL:
         if audience_provider is None or not resolved_triggering:
             return False
         try:
@@ -5684,7 +5710,7 @@ def _source_is_triggering_channel_compatible(
         and _same_channel_authority(source, triggering_bridge_instance)
     ):
         return True
-    if source_kind in {"recent_activity_user", "owner_attested_feedback"}:
+    if source_kind in _SOURCE_KIND_OWNER_ATTESTATION:
         from .models import OwnerAttestation
 
         attestation = getattr(source, "owner_attestation", None)
@@ -5706,7 +5732,7 @@ def _source_is_triggering_channel_compatible(
             )
         except Exception:
             return False
-        if source_kind == "recent_activity_user":
+        if source_kind == SourceKind.RECENT_ACTIVITY_USER:
             return destination_audience == frozenset({effective_principal})
         try:
             resolver = getattr(audience_provider, "identity_resolver", None)
@@ -5745,12 +5771,9 @@ def _source_is_triggering_channel_compatible(
                 continue
             human_audience.add(canonical)
         return frozenset(human_audience) == frozenset({effective_principal})
-    if source_kind in {
-        "channel_scoped_feedback",
-        "channel_bound_unowned_feedback",
-    }:
+    if source_kind in _SOURCE_KIND_SAME_CHANNEL_ONLY:
         return False
-    if source_kind in {"protected_prompt", "recent_activity_assistant"}:
+    if source_kind in _SOURCE_KIND_CHANNEL_AUDIENCE:
         if audience_provider is None or not source_channel or not resolved_triggering:
             return False
         try:
@@ -5767,11 +5790,11 @@ def _source_is_triggering_channel_compatible(
             and source_audience
             and destination_audience <= source_audience
         )
-    if source_kind == "service":
+    if source_kind == SourceKind.SERVICE:
         return not source.domain.startswith("channel")
-    if source_kind == "protected_tool":
+    if source_kind == SourceKind.PROTECTED_TOOL:
         return True
-    if source_kind == _ACP_HANDS_RESULT_SOURCE_KIND:
+    if source_kind == SourceKind.ACP_HANDS_RESULT:
         return True
     return False
 
