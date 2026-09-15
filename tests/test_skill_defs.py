@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -317,7 +316,7 @@ def test_installed_skill_names_skips_dirs_without_skill_md(tmp_path: Path):
 
 
 @pytest.fixture
-def integrity_bundle(tmp_path, monkeypatch):
+def publication_bundle(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     package = tmp_path / "package"
@@ -327,16 +326,14 @@ def integrity_bundle(tmp_path, monkeypatch):
     (source / "script.py").write_text("print('package')\n")
     monkeypatch.setattr(skill_defs, "_BUNDLED_ROOT", package)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    assert access_control.initialize_file_integrity_ledger(home)
     metadata = home / ".mimir/file-integrity.json"
-    payload = json.loads(metadata.read_text())
-    payload["__ledger_epoch_ns__"] = 1
-    metadata.write_text(json.dumps(payload))
+    metadata.parent.mkdir()
+    metadata.write_text("{broken legacy ledger")
     return home, source, metadata
 
 
-def test_refresh_then_read_integrity_with_old_epoch(integrity_bundle):
-    home, source, metadata = integrity_bundle
+def test_refresh_ignores_legacy_ledger(publication_bundle):
+    home, source, metadata = publication_bundle
     for version in ("first", "second"):
         (source / "SKILL.md").write_text(version)
         assert skill_defs.refresh_builtin_skills(home) == {"example": "refreshed"}
@@ -346,55 +343,49 @@ def test_refresh_then_read_integrity_with_old_epoch(integrity_bundle):
             assert access_control._filesystem_result_integrity(None, str(target)) == (
                 "trusted", "informational",
             )
-            assert json.loads(metadata.read_text())[target.relative_to(home).as_posix()] == "trusted"
+        assert metadata.read_text() == "{broken legacy ledger"
 
 
-def test_builtin_stray_and_deleted_records(integrity_bundle):
-    home, source, metadata = integrity_bundle
+def test_builtin_refresh_removes_deleted_package_files(publication_bundle):
+    home, source, metadata = publication_bundle
     skill_defs.refresh_builtin_skills(home)
     stray = home / ".mimir_builtin_skills/stray.md"
     stray.write_text("unrecorded")
     (source / "script.py").unlink()
     skill_defs.refresh_builtin_skills(home)
-    assert access_control._filesystem_result_integrity(None, str(stray)) == (
-        "untrusted", "active_ingest",
-    )
-    payload = json.loads(metadata.read_text())
-    assert ".mimir_builtin_skills/stray.md" not in payload
-    assert ".mimir_builtin_skills/example/script.py" not in payload
+    assert stray.read_text() == "unrecorded"
+    assert metadata.read_text() == "{broken legacy ledger"
     assert not (home / ".mimir_builtin_skills/example/script.py").exists()
 
 
-def test_builtin_integrity_migration_is_content_bound_and_idempotent(integrity_bundle, caplog):
+def test_failed_atomic_refresh_preserves_old_tree(publication_bundle, monkeypatch):
     import shutil
 
-    home, source, metadata = integrity_bundle
+    home, source, metadata = publication_bundle
     target = home / ".mimir_builtin_skills/example"
     shutil.copytree(source, target)
-    (target / "script.py").write_text("not package bytes")
-    (target / "stray.md").write_text("stray")
-    with caplog.at_level("INFO", logger="mimir.skill_defs"):
-        assert skill_defs.migrate_builtin_skill_integrity(home) == 1
-    assert [record.message for record in caplog.records] == [
-        "builtin_skill_integrity_migration recorded=1",
-    ]
-    before = metadata.read_bytes()
-    assert skill_defs.migrate_builtin_skill_integrity(home) == 0
-    assert metadata.read_bytes() == before
-    for name in ("script.py", "stray.md"):
-        assert access_control._filesystem_result_integrity(None, str(target / name)) == (
-            "untrusted", "active_ingest",
-        )
+    old = (target / "SKILL.md").read_bytes()
+    (source / "SKILL.md").write_text("new package")
+
+    def fail(staged, destination):
+        assert destination.is_dir()
+        raise OSError("exchange unavailable")
+
+    monkeypatch.setattr(skill_defs, "_atomic_exchange_directories", fail)
+    assert skill_defs.refresh_builtin_skills(home) == {"example": "skipped"}
+    assert (target / "SKILL.md").read_bytes() == old
+    assert not target.with_name("example.tmp").exists()
 
 
-def test_builtin_integrity_migration_does_not_follow_redirected_skill(integrity_bundle):
+def test_builtin_refresh_does_not_follow_redirected_skill(publication_bundle):
     import shutil
 
-    home, source, metadata = integrity_bundle
+    home, source, metadata = publication_bundle
     outside = home / "docs/redirected"
     shutil.copytree(source, outside)
     root = home / ".mimir_builtin_skills"
     root.mkdir()
     (root / "example").symlink_to(outside, target_is_directory=True)
-    assert skill_defs.migrate_builtin_skill_integrity(home) == 0
-    assert "docs/redirected/SKILL.md" not in json.loads(metadata.read_text())
+    (source / "SKILL.md").write_text("new package")
+    assert skill_defs.refresh_builtin_skills(home) == {"example": "skipped"}
+    assert (outside / "SKILL.md").read_text() == "# Package documentation\n"

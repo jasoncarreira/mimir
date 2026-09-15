@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_persisted_file_integrity_lock = threading.Lock()
+_installed_skill_integrity_lock = threading.Lock()
 
 _MAX_REQUESTED_TARGET_LENGTH = 1024
 
@@ -9305,10 +9305,7 @@ _SELF_AUTHORED_FILE_ROOTS = frozenset({
     "skills",
     "state",
 })
-_FILE_INTEGRITY_RECORDED_ROOTS = _SELF_AUTHORED_FILE_ROOTS
-_FILE_INTEGRITY_EXCLUDED_SUBTREES = frozenset({("state", "pollers")})
-_FILE_INTEGRITY_DECLASSIFICATIONS_KEY = "__declassifications__"
-_FILE_INTEGRITY_EPOCH_KEY = "__ledger_epoch_ns__"
+_UNTRUSTED_REFERENCE_SUBTREES = frozenset({("state", "pollers")})
 _PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 
 
@@ -9469,6 +9466,20 @@ def protected_result_source(
     )
 
 
+def _home_reference_integrity(home: Path, relative: Path) -> str:
+    """Classify a resolved HOME-relative path using reference-root policy."""
+    if (
+        not relative.parts
+        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
+        or relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
+    ):
+        return "untrusted"
+    if relative.parts[0] == "skills":
+        return _installed_skill_integrity(home, relative)
+    # Reference roots rely on the protected write gate, not writer records.
+    return "trusted"
+
+
 def _filesystem_result_integrity(
     auth_context: "AuthContext | None",
     resource_id: str,
@@ -9511,34 +9522,9 @@ def _filesystem_result_integrity(
         and relative.parts
         and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS
     ):
-        # These roots contain framework or operator-authored reference material.
-        # Admin-installed files under ``skills`` are trusted only when the install
-        # path explicitly records them; unlike scaffolded roots, their location
-        # never supplies a trusted default. For the other roots, explicit writer
-        # records win and the ledger epoch distinguishes pre-existing files from
-        # later writes that bypassed the protected tool boundary.
-        #
-        # Poller subprocesses write this tree directly, outside the protected
-        # tool boundary, and may persist attacker-derived cursor/event fields.
-        # A path under state/pollers is therefore not proof of self-authorship.
-        if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
-            return "untrusted", "active_ingest"
-        persisted = _persisted_file_integrity(
-            home, relative, require_recorded=relative.parts[0] == "skills",
-        )
-        return persisted, (
-            "informational" if persisted == "trusted" else "active_ingest"
-        )
-
-    integrity_key = _configured_external_file_integrity_key(home, resource)
-    if integrity_key is not None:
-        # A configured root is an access boundary, not evidence that its existing
-        # contents are trusted. Only protected writes acquire integrity here.
-        persisted = _persisted_file_integrity(
-            home, integrity_key, require_recorded=True,
-        )
-        return persisted, (
-            "informational" if persisted == "trusted" else "active_ingest"
+        integrity = _home_reference_integrity(home, relative)
+        return integrity, (
+            "informational" if integrity == "trusted" else "active_ingest"
         )
 
     cache_root = home / "attachments" / "fetch-cache"
@@ -9593,110 +9579,26 @@ def _resolved_path_contains(root: object, resource: Path) -> bool:
     return True
 
 
-def _configured_external_file_integrity_key(home: Path, resource: Path) -> Path | None:
-    """Key a canonical resource only when an external writable root contains it."""
-    for root in _configured_file_write_roots():
-        try:
-            resolved_root = root.resolve(strict=False)
-        except (OSError, RuntimeError):
-            continue
-        if resolved_root == home:
-            continue
-        try:
-            resource.relative_to(resolved_root)
-        except ValueError:
-            continue
-        return resource
-    return None
-
-
-def _persisted_file_integrity(
-    home: Path,
-    integrity_key: Path,
-    *,
-    require_recorded: bool = False,
-) -> str:
-    """Return server-recorded integrity for one relative or absolute ledger key."""
-    metadata_path = home / ".mimir" / "file-integrity.json"
-    if not metadata_path.exists():
-        return "untrusted" if require_recorded else "trusted"
+def _installed_skill_integrity(home: Path, relative: Path) -> str:
+    """Trust only an explicitly recorded installation under HOME/skills."""
+    if len(relative.parts) < 3 or relative.parts[0] != "skills" or ".." in relative.parts:
+        return "untrusted"
+    metadata_path = home / ".mimir" / "skill-integrity.json"
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return "untrusted"
     if not isinstance(payload, dict):
         return "untrusted"
-    key = integrity_key.as_posix()
-    if key in payload:
-        value = payload[key]
-        return "trusted" if value == "trusted" else "untrusted"
-    if require_recorded:
-        return "untrusted"
-    epoch_ns = payload.get(_FILE_INTEGRITY_EPOCH_KEY)
-    # A ledger without an epoch predates this migration. Preserve its missing-key
-    # default until runtime initialization records the migration boundary.
-    if _FILE_INTEGRITY_EPOCH_KEY not in payload:
-        return "trusted"
-    if not isinstance(epoch_ns, int) or isinstance(epoch_ns, bool) or epoch_ns <= 0:
-        return "untrusted"
-    try:
-        file_ctime_ns = (home / integrity_key).stat().st_ctime_ns
-    except OSError:
-        return "untrusted"
-    return "trusted" if file_ctime_ns <= epoch_ns else "untrusted"
+    return "trusted" if payload.get(relative.as_posix()) == "trusted" else "untrusted"
 
 
-def initialize_file_integrity_ledger(home: Path) -> bool:
-    """Record the boundary after which unrecorded self-authored files are tainted.
-
-    Existing files remain trusted through their inode change time. Existing ledger
-    entries are retained verbatim, including untrusted marks.
-    """
-    metadata_path = home.resolve(strict=False) / ".mimir" / "file-integrity.json"
-    with _persisted_file_integrity_lock:
-        try:
-            payload = (
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-                if metadata_path.exists()
-                else {}
-            )
-            if not isinstance(payload, dict):
-                return False
-            if _FILE_INTEGRITY_EPOCH_KEY in payload:
-                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
-                return (
-                    isinstance(epoch_ns, int)
-                    and not isinstance(epoch_ns, bool)
-                    and epoch_ns > 0
-                )
-            payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
-            metadata_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = metadata_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            tmp.replace(metadata_path)
-            return True
-        except (OSError, json.JSONDecodeError):
-            log.exception("failed to initialize file integrity ledger at %s", metadata_path)
-            return False
-
-
-def record_framework_file_integrity(
+def publish_framework_files(
     home: Path,
     files: Mapping[Path, bytes],
     publish: Callable[[], None],
-    *,
-    prune_builtin: bool = False,
 ) -> int:
-    """Publish framework bytes with a fail-closed ledger transaction.
-
-    Only internal package/scaffold writers may call this. Invalidate old records
-    before publication so an interrupted write cannot inherit trust. The final
-    ledger replacement commits verified bytes together; a crash between the two
-    filesystem publications leaves untrusted records, never speculative trust.
-    """
+    """Publish internal package/scaffold files and verify their paths and bytes."""
     home = home.resolve(strict=True)
     expected: dict[str, tuple[Path, bytes]] = {}
     for path, content in files.items():
@@ -9705,41 +9607,20 @@ def record_framework_file_integrity(
         if (
             len(relative.parts) < 2
             or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS - {"skills"}
-            or relative.parts[:2] == ("state", "pollers")
+            or relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
         ):
             raise ValueError(f"not a framework scaffold destination: {path}")
         expected[relative.as_posix()] = (resolved, content)
 
-    metadata_path = home / ".mimir" / "file-integrity.json"
-    with _persisted_file_integrity_lock:
-        payload = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-        if not isinstance(payload, dict):
-            raise ValueError("invalid file integrity ledger")
-        epoch = payload.setdefault(_FILE_INTEGRITY_EPOCH_KEY, time.time_ns())
-        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch <= 0:
-            raise ValueError("invalid file integrity epoch")
-        recorded = sum(payload.get(key) != "trusted" for key in expected)
-        payload.update(dict.fromkeys(expected, "untrusted"))
-        metadata_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = metadata_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(metadata_path)
-        publish()
-        for path, content in expected.values():
-            if path.resolve(strict=True) != path or path.read_bytes() != content:
-                raise ValueError(f"framework output changed during publication: {path}")
-        if prune_builtin:
-            for key in tuple(payload):
-                if key.startswith(".mimir_builtin_skills/") and not (home / key).exists():
-                    del payload[key]
-        payload.update(dict.fromkeys(expected, "trusted"))
-        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(metadata_path)
-        return recorded
+    publish()
+    for path, content in expected.values():
+        if path.resolve(strict=True) != path or path.read_bytes() != content:
+            raise ValueError(f"framework output changed during publication: {path}")
+    return len(files)
 
 
 def write_framework_file(home: Path, destination: Path, content: bytes) -> None:
-    """Write one package/template scaffold through the integrity transaction."""
+    """Atomically publish and verify one package/template scaffold."""
     def publish() -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         tmp = destination.with_name(destination.name + ".tmp")
@@ -9748,7 +9629,7 @@ def write_framework_file(home: Path, destination: Path, content: bytes) -> None:
             stream.write(content)
         tmp.replace(destination)
 
-    record_framework_file_integrity(home, {destination: content}, publish)
+    publish_framework_files(home, {destination: content}, publish)
 
 
 def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool:
@@ -9777,9 +9658,9 @@ def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool
     except (OSError, RuntimeError, ValueError):
         return False
 
-    metadata_path = home / ".mimir" / "file-integrity.json"
+    metadata_path = home / ".mimir" / "skill-integrity.json"
     prefix = f"{skill_relative.as_posix()}/"
-    with _persisted_file_integrity_lock:
+    with _installed_skill_integrity_lock:
         try:
             payload = (
                 json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -9788,16 +9669,13 @@ def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool
             )
             if not isinstance(payload, dict):
                 return False
-            if _FILE_INTEGRITY_EPOCH_KEY not in payload:
-                payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
-            else:
-                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
-                if (
-                    not isinstance(epoch_ns, int)
-                    or isinstance(epoch_ns, bool)
-                    or epoch_ns <= 0
-                ):
-                    return False
+            payload = {
+                key: value for key, value in payload.items()
+                if len(Path(key).parts) >= 3
+                and Path(key).parts[0] == "skills"
+                and ".." not in Path(key).parts
+                and Path(key).as_posix() == key
+            }
             for key in tuple(payload):
                 if isinstance(key, str) and key.startswith(prefix):
                     del payload[key]
@@ -9810,202 +9688,10 @@ def record_admin_installed_skill_integrity(home: Path, skill_root: Path) -> bool
             )
             tmp.replace(metadata_path)
             return True
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             log.exception(
                 "failed to persist admin-installed skill integrity for %s", skill_root,
             )
-            return False
-
-
-def record_file_write_integrity(
-    resource_id: str | None,
-    labels: "InformationFlowLabels | None",
-) -> bool:
-    """Persist least-trust provenance before a model file write.
-
-    Metadata lives under the protected ``.mimir`` root, so a later model turn
-    cannot erase an untrusted mark. The destination chooses only which entry is
-    updated; integrity comes exclusively from the server-owned live carrier.
-    """
-    home_value = os.environ.get("MIMIR_HOME", "").strip()
-    if not home_value or not isinstance(resource_id, str) or not resource_id:
-        return True
-    home = Path(home_value).resolve(strict=False)
-    lease_root = _configured_pr_checkout_lease_root()
-    resource = _resolve_file_tool_target(
-        resource_id,
-        home_value,
-        physical_roots=(lease_root,) if lease_root is not None else (),
-    )
-    if resource is None:
-        return False
-    try:
-        resource = resource.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return False
-    requested = Path(resource_id)
-    if requested.is_absolute():
-        configured_home = Path(os.path.abspath(home_value))
-        for spelling in dict.fromkeys((configured_home, home)):
-            try:
-                requested.relative_to(spelling)
-            except ValueError:
-                continue
-            try:
-                resource.relative_to(home)
-            except ValueError:
-                # A target lexically under home that resolves outside is a
-                # symlink escape, not an unrelated external-root write.
-                return False
-            break
-    try:
-        relative = resource.relative_to(home)
-    except ValueError:
-        relative = None
-
-    if relative is not None:
-        if not relative.parts or relative.parts[0] not in _FILE_INTEGRITY_RECORDED_ROOTS:
-            return True
-        if relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES:
-            return True
-        integrity_key = relative
-    elif lease_root is not None and _resolved_path_contains(lease_root, resource):
-        # The configured root grants the backend access, not integrity. Writes
-        # still get an absolute integrity key so any later provenance-authorized
-        # read of the same checkout cannot launder a tainted mutation.
-        integrity_key = resource
-    else:
-        integrity_key = _configured_external_file_integrity_key(home, resource)
-        if integrity_key is None:
-            return False
-        # Canonical absolute keys preserve root identity, so equal relative paths
-        # in different configured roots cannot collide.
-    sources = getattr(labels, "sources", ())
-    integrity = (
-        "trusted"
-        if labels is not None
-        and all(source.integrity == "trusted" for source in sources)
-        else "untrusted"
-    )
-
-    metadata_path = home / ".mimir" / "file-integrity.json"
-    with _persisted_file_integrity_lock:
-        try:
-            payload = (
-                json.loads(metadata_path.read_text(encoding="utf-8"))
-                if metadata_path.exists()
-                else {}
-            )
-            if not isinstance(payload, dict):
-                return False
-            if _FILE_INTEGRITY_EPOCH_KEY not in payload:
-                payload[_FILE_INTEGRITY_EPOCH_KEY] = time.time_ns()
-            else:
-                epoch_ns = payload[_FILE_INTEGRITY_EPOCH_KEY]
-                if (
-                    not isinstance(epoch_ns, int)
-                    or isinstance(epoch_ns, bool)
-                    or epoch_ns <= 0
-                ):
-                    return False
-            key = integrity_key.as_posix()
-            existing = payload.get(key)
-            # This hook runs before the file mutation. A clean turn therefore
-            # cannot prove that an existing tainted file was fully replaced (or
-            # that the write succeeded), so ordinary writes never clear a mark.
-            # Exact, digest-bound operator repair is the declassification path.
-            if integrity == "untrusted" or key not in payload or existing == "trusted":
-                payload[key] = integrity
-            metadata_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = metadata_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            tmp.replace(metadata_path)
-            return True
-        except (OSError, json.JSONDecodeError):
-            log.exception("failed to persist file integrity for %s", integrity_key)
-            return False
-
-
-def repair_file_write_integrity(
-    resource_id: str,
-    *,
-    expected_sha256: str,
-    operator: str,
-    reason: str,
-) -> bool:
-    """Declassify one inspected file with a digest-bound audit record.
-
-    This is an offline operator primitive, not a model tool. Existing untrusted
-    records contain too little provenance for automatic repair, so the operator
-    must attest to the exact current bytes and explain the trust decision.
-    """
-    home_value = os.environ.get("MIMIR_HOME", "").strip()
-    if (
-        not home_value
-        or not isinstance(resource_id, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
-        or not operator.strip()
-        or not reason.strip()
-    ):
-        return False
-    try:
-        home = Path(home_value).resolve(strict=True)
-        requested = Path(resource_id)
-        resource = requested.resolve(strict=True)
-        relative = resource.relative_to(home)
-    except (OSError, RuntimeError, ValueError):
-        return False
-    if (
-        requested.is_symlink()
-        or not resource.is_file()
-        or not relative.parts
-        or relative.parts[0] not in _SELF_AUTHORED_FILE_ROOTS
-        or relative.parts[0:2] in _FILE_INTEGRITY_EXCLUDED_SUBTREES
-    ):
-        return False
-    try:
-        digest = hashlib.sha256(resource.read_bytes()).hexdigest()
-    except OSError:
-        return False
-    if digest != expected_sha256:
-        return False
-
-    metadata_path = home / ".mimir" / "file-integrity.json"
-    with _persisted_file_integrity_lock:
-        try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                return False
-            key = relative.as_posix()
-            prior = payload.get(key)
-            if key not in payload or prior == "trusted":
-                return False
-            audit = payload.get(_FILE_INTEGRITY_DECLASSIFICATIONS_KEY, [])
-            if not isinstance(audit, list):
-                return False
-            payload[key] = "trusted"
-            payload[_FILE_INTEGRITY_DECLASSIFICATIONS_KEY] = [
-                *audit,
-                {
-                    "path": key,
-                    "prior": prior,
-                    "sha256": digest,
-                    "operator": operator.strip(),
-                    "reason": reason.strip(),
-                },
-            ]
-            tmp = metadata_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
-            )
-            tmp.replace(metadata_path)
-            return True
-        except (OSError, json.JSONDecodeError):
-            log.exception("failed to repair file integrity for %s", relative)
             return False
 
 

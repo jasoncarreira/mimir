@@ -46,9 +46,8 @@ CORE_TEMPLATE_NAMES = (
 
 @pytest.mark.parametrize("seed", [seed_core_memory, seed_init_block])
 @pytest.mark.parametrize("preexisting", [False, True])
-def test_memory_seed_integrity_after_ledger_initialization(tmp_path, seed, preexisting):
+def test_memory_seed_preserves_existing_content(tmp_path, seed, preexisting):
     home = tmp_path / "home"
-    assert access_control.initialize_file_integrity_ledger(home)
     rel = Path("memory/core") / (INIT_BLOCK_NAME if seed is seed_init_block else "00-identity.md")
     if preexisting:
         (home / rel).parent.mkdir(parents=True)
@@ -58,9 +57,8 @@ def test_memory_seed_integrity_after_ledger_initialization(tmp_path, seed, preex
 
     status = result if isinstance(result, str) else result[rel.name]
     assert status == ("present" if preexisting else "created")
-    assert access_control._persisted_file_integrity(
-        home, rel, require_recorded=True,
-    ) == ("untrusted" if preexisting else "trusted")
+    assert (home / rel).is_file()
+    assert not (home / ".mimir/file-integrity.json").exists()
     if preexisting:
         assert (home / rel).read_text() == "custom content\n"
 
