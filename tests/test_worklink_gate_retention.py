@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
+import stat
 import subprocess
 import sys
 
@@ -17,6 +20,23 @@ import pytest
 from mimir import output_capture
 from mimir.worklink import evidence as ev
 from mimir.worklink.compute import ComputeResult, LaunchHandle, WorkSpec
+
+
+@pytest.fixture(autouse=True)
+def clean_gate_tmp(monkeypatch):
+    helper = ev._gate_tmp_directory
+    rmtree = shutil.rmtree
+    trees = set()
+
+    def tracked(report_dir):
+        tree = helper(report_dir)
+        trees.add(tree)
+        return tree
+
+    monkeypatch.setattr(ev, "_gate_tmp_directory", tracked)
+    yield
+    for tree in trees:
+        rmtree(tree, ignore_errors=True)
 
 
 def spec(tmp_path: Path) -> WorkSpec:
@@ -102,7 +122,7 @@ async def test_tmp_probe_failure_does_not_change_verdict(tmp_path, monkeypatch, 
     original = Path.lstat
 
     def probe(path):
-        if path == tmp_path / "reports-tmp":
+        if path == ev._gate_tmp_directory(tmp_path / "reports"):
             raise exception("injected probe failure")
         return original(path)
 
@@ -196,23 +216,77 @@ async def test_compute_output_uses_durable_files_not_excerpts(tmp_path):
 
 @pytest.mark.asyncio
 async def test_redacts_retained_text(tmp_path):
-    tree = tmp_path / "reports-tmp"
+    tree = ev._gate_tmp_directory(tmp_path / "reports")
     tree.mkdir()
     (tree / "diagnostics").write_text("token=top-secret\n")
     result = await retain(tmp_path)
     assert b"top-secret" not in retained(result)["tmp/diagnostics"]
 
 
-def test_pytest_temp_is_sibling_and_options_keep_sidecars(tmp_path):
+def test_pytest_temp_is_external_and_options_keep_sidecars(tmp_path):
     directory = tmp_path / "report space"
     env = ev.pytest_report_environment("pytest", directory, existing="-q")
     options = shlex.split(env["PYTEST_ADDOPTS"])
     basetemp = Path(next(item.split("=", 1)[1] for item in options if item.startswith("--basetemp=")))
     assert basetemp == ev._gate_tmp_directory(directory)
+    identity = hashlib.sha256(os.fsencode(directory.absolute())).hexdigest()
+    assert basetemp == Path("/tmp").resolve() / f"worklink-gate-{identity}-tmp"
+    assert basetemp == basetemp.resolve()
     assert directory not in basetemp.parents
     assert not basetemp.exists(), "pytest, not the controller, must own basetemp"
     assert "tmp_path_retention_policy=all" in options
     assert options[0] == "-q"
+
+
+def test_gate_tmp_resolves_symlinked_host_parent_not_worker_leaf(tmp_path, monkeypatch):
+    host_tmp = tmp_path / "host-tmp"
+    host_tmp.mkdir()
+    alias = tmp_path / "tmp-alias"
+    alias.symlink_to(host_tmp, target_is_directory=True)
+    # Model macOS /tmp -> /private/tmp on every test platform without changing
+    # the real host /tmp or relaxing the no-follow reader.
+    monkeypatch.setattr(ev, "Path", lambda value: alias if value == "/tmp" else Path(value))
+    report = tmp_path / "reports"
+    tree = ev._gate_tmp_directory(report)
+    assert tree.parent == host_tmp.resolve()
+    tree.mkdir(mode=0o700)
+    probe = tree / "probe"
+    probe.write_bytes(b"retained")
+    with ev._gate_open(probe) as source:
+        assert source.read() == b"retained"
+    probe.unlink()
+    tree.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "probe").write_bytes(b"must not follow")
+    tree.symlink_to(outside, target_is_directory=True)
+    try:
+        assert ev._gate_tmp_directory(report) == tree
+        assert ev._gate_tmp_directory(report) != outside.resolve()
+        with pytest.raises(OSError):
+            with ev._gate_open(tree / "probe"):
+                pass
+    finally:
+        tree.unlink()
+
+
+def test_gate_tmp_parent_walk_avoids_group_writable_checkout(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    checkout.chmod(0o2770)
+    tree = ev._gate_tmp_directory(checkout / "reports")
+    assert not tree.exists()
+    for parent in tree.parents:
+        mode = parent.stat().st_mode
+        assert not mode & 0o022 or mode & stat.S_ISVTX, parent
+    tree.mkdir(mode=0o700)
+    sink = output_capture.open_output_sink(tree / "probe", 100)
+    sink.close()
+    private = checkout / "private"
+    private.mkdir(mode=0o700)
+    with pytest.raises(PermissionError, match="unsafe writable Worklink output parent"):
+        output_capture.open_output_sink(private / "probe", 100)
+    assert checkout.stat().st_mode & 0o7777 == 0o2770
 
 
 async def observe(tmp_path, runner, **kwargs):
@@ -296,7 +370,7 @@ class ExportCompute:
 
 @pytest.mark.asyncio
 async def test_worker_export_executes_isolated_python_and_removes_private_tree(tmp_path):
-    tree = tmp_path / "reports-tmp"
+    tree = ev._gate_tmp_directory(tmp_path / "reports")
     tree.mkdir(mode=0o700)
     (tree / "private").mkdir(mode=0o700)
     (tree / "private/child-progress.stacks").write_bytes(b"whole stack")
@@ -311,7 +385,7 @@ async def test_worker_export_executes_isolated_python_and_removes_private_tree(t
 
 @pytest.mark.asyncio
 async def test_large_worker_export_reads_full_private_sink_before_cleanup(tmp_path):
-    tree = tmp_path / "reports-tmp"
+    tree = ev._gate_tmp_directory(tmp_path / "reports")
     tree.mkdir(mode=0o700)
     body = b"complete stack frame\n" * 100_000
     (tree / "child-progress.stacks").write_bytes(body)
@@ -342,7 +416,7 @@ async def test_large_worker_export_reads_full_private_sink_before_cleanup(tmp_pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path_kind", ["missing", "outside", "symlink", "oversize"])
 async def test_export_transport_refuses_untrusted_or_unavailable_files(tmp_path, path_kind):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
 
     class Compute(ExportCompute):
         async def wait(self, handle, timeout):
@@ -373,15 +447,19 @@ async def test_export_transport_refuses_untrusted_or_unavailable_files(tmp_path,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("destination", ["reports/artifacts", "reports-tmp/artifacts", "elsewhere/../reports/artifacts", "relative"])
+@pytest.mark.parametrize("destination", ["reports/artifacts", "basetemp", "elsewhere/../reports/artifacts", "relative"])
 async def test_retention_rejects_destinations_deleted_during_cleanup(tmp_path, destination):
     directory = tmp_path / "reports"
     report(directory)
     directory.chmod(0o700)
+    output_root = (
+        ev._gate_tmp_directory(directory) / "artifacts" if destination == "basetemp"
+        else Path(destination) if destination == "relative" else tmp_path / destination
+    )
     result = await ev._retain_gate_failure(
         ev.TestResult("pytest", 1), subprocess.CompletedProcess("pytest", 1, "output", ""),
         report_dir=directory, issue=1754, attempt=4, run_id="run123", phase="initial",
-        checkout=tmp_path, work_spec=replace(spec(tmp_path), output_root=Path(destination) if destination == "relative" else tmp_path / destination),
+        checkout=tmp_path, work_spec=replace(spec(tmp_path), output_root=output_root),
         compute=None, compute_result=None, worker_uid_drop=False,
     )
     assert result.exit_code == 1
@@ -392,7 +470,7 @@ async def test_retention_rejects_destinations_deleted_during_cleanup(tmp_path, d
 
 @pytest.mark.asyncio
 async def test_worker_export_failure_leaves_verdict_and_primary_artifacts(tmp_path):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
     result = await retain(tmp_path, compute=ExportCompute(tmp_path, RuntimeError("export failed")), worker_uid_drop=True)
     assert result.exit_code == 1
     assert result.retention_truncated
@@ -402,7 +480,7 @@ async def test_worker_export_failure_leaves_verdict_and_primary_artifacts(tmp_pa
 
 @pytest.mark.asyncio
 async def test_nonpytest_worker_retention_uses_worker_export_and_controller_sinks(tmp_path):
-    tree = tmp_path / "reports-tmp"
+    tree = ev._gate_tmp_directory(tmp_path / "reports")
     tree.mkdir(mode=0o700)
     (tree / "diagnostics").write_bytes(b"complete sidecar")
     result = await retain(tmp_path, command="false", compute=ExportCompute(tmp_path), worker_uid_drop=True)
@@ -539,6 +617,76 @@ async def test_real_pytest_sidecars_are_retained_and_temp_directory_removed(tmp_
     assert b"complete assertion body" in data["junit.xml"]
     assert any(name.endswith("child-progress.stacks") and body == b"whole stack" for name, body in data.items())
     assert all(not directory.exists() for directory in directories)
+
+
+@pytest.mark.asyncio
+async def test_compute_gate_group_writable_checkout_real_pytest_xdist(tmp_path, monkeypatch):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    checkout.chmod(0o2770)
+    (checkout / "pytest.ini").write_text("[pytest]\n")
+    (checkout / "test_sample.py").write_text(
+        "import os\n"
+        "import pytest\n"
+        "from mimir.output_capture import open_output_sink\n"
+        "@pytest.mark.parametrize('index', range(6))\n"
+        "def test_sink(tmp_path, tmp_path_factory, index):\n"
+        "    base = tmp_path_factory.getbasetemp()\n"
+        "    assert base.stat().st_uid == os.geteuid()\n"
+        "    assert base.stat().st_mode & 0o777 == 0o700\n"
+        "    sink = open_output_sink(tmp_path / 'child-progress.stacks', 100)\n"
+        "    try:\n"
+        "        sink.file.write(b'whole stack')\n"
+        "    finally:\n"
+        "        sink.close()\n"
+        "    assert index != 0, 'intentional gate failure'\n"
+    )
+    directories = []
+
+    class Compute(ExportCompute):
+        async def wait(self, handle, timeout):
+            work = self.specs[-1]
+            if "PYTEST_ADDOPTS" not in work.env:
+                return await super().wait(handle, timeout)
+            options = shlex.split(work.env["PYTEST_ADDOPTS"])
+            junit = Path(next(x.split("=", 1)[1] for x in options if x.startswith("--junitxml=")))
+            tree = Path(next(x.split("=", 1)[1] for x in options if x.startswith("--basetemp=")))
+            assert not junit.is_absolute()
+            assert tree.is_absolute()
+            assert tree == ev._gate_tmp_directory((checkout / junit).parent)
+            assert not tree.exists(), "only pytest may create basetemp"
+            directories.append((tree, (checkout / junit).parent))
+            process = subprocess.run(
+                work.local_argv, cwd=work.local_checkout, env=work.env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            assert process.returncode == 1, process.stdout + process.stderr
+            assert tree.stat().st_uid == os.geteuid()
+            assert tree.stat().st_mode & 0o777 == 0o700
+            return ComputeResult(process.returncode, process.stdout, process.stderr)
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    compute = Compute(checkout)
+    result = await ev.observe_evidence(
+        issue=1760, attempt=1, backend="opencode", branch="branch", checkout=checkout,
+        started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
+        test_command=shlex.join([sys.executable, "-m", "pytest", "-q", "-n", "6"]),
+        runner=lambda command, **kwargs: git_result(command),
+        work_spec=replace(spec(tmp_path), timeout_s=60), compute=compute,
+        gate_rerun_max_failures=0,
+    )
+    test = result.evidence.tests
+    assert test.counts == ev.TestCounts(6, 5, 1, 0, 0), test.summary
+    assert result.reasons == ("tests_failed",)
+    data = retained(test)
+    assert b"intentional gate failure" in data["junit.xml"]
+    sidecars = [body for name, body in data.items() if name.endswith("child-progress.stacks")]
+    assert sidecars == [b"whole stack"] * 6
+    assert len(directories) == 1
+    tree, reports = directories[0]
+    assert str(tree) in compute.specs[1].local_argv[-1]
+    assert not tree.exists() and not reports.exists()
+    assert checkout.stat().st_mode & 0o7777 == 0o2770
 
 
 def test_default_caps():
@@ -698,7 +846,7 @@ def test_export_root_probe_and_components(tmp_path, monkeypatch, root_kind):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("field,value", [("exit_code", 1), ("timed_out", True), ("output_overflow", True)])
 async def test_export_subprocess_failure_flags_are_not_accepted(tmp_path, field, value):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
 
     class Compute(ExportCompute):
         async def wait(self, handle, timeout):
@@ -716,7 +864,7 @@ async def test_export_subprocess_failure_flags_are_not_accepted(tmp_path, field,
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["byte", "entry", "depth", "base64"])
 async def test_controller_rechecks_export_limits(tmp_path, monkeypatch, kind):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
     record = {"name": "payload", "data": base64.b64encode(b"x" * 200_000).decode()}
     if kind == "byte":
         monkeypatch.setattr(ev, "_GATE_RETENTION_BYTES", 50_000)
@@ -874,7 +1022,7 @@ async def test_controller_counts_primary_bytes_before_next_file(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_controller_stops_before_decoding_entries_over_budget(tmp_path, monkeypatch):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
     monkeypatch.setattr(ev, "_GATE_RETENTION_ENTRIES", 4)
     monkeypatch.setattr(ev, "_export_gate_tmp", lambda *args: {
         "files": [{"name": "payload", "data": "!invalid!"}], "reasons": [], "entries": 1,
@@ -886,7 +1034,7 @@ async def test_controller_stops_before_decoding_entries_over_budget(tmp_path, mo
 
 @pytest.mark.asyncio
 async def test_transport_byte_limit_rejects_oversize_valid_json(tmp_path, monkeypatch):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
     monkeypatch.setattr(ev, "_GATE_RETENTION_BYTES", 50_000)
 
     class Compute(ExportCompute):
@@ -902,8 +1050,9 @@ async def test_transport_byte_limit_rejects_oversize_valid_json(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_manifest_source_names_are_redacted(tmp_path):
-    (tmp_path / "reports-tmp").mkdir()
-    (tmp_path / "reports-tmp/token=top-secret").write_text("body")
+    tree = ev._gate_tmp_directory(tmp_path / "reports")
+    tree.mkdir()
+    (tree / "token=top-secret").write_text("body")
     result = await retain(tmp_path)
     assert "top-secret" not in Path(result.retention_manifest).read_text()
 
@@ -960,7 +1109,7 @@ def _fail_log(*args, **kwargs):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing", [False, True])
 async def test_export_capture_root_is_canonical_before_compute(tmp_path, monkeypatch, missing):
-    (tmp_path / "reports-tmp").mkdir()
+    ev._gate_tmp_directory(tmp_path / "reports").mkdir()
     temporary_directory = ev.tempfile.TemporaryDirectory
 
     @contextlib.contextmanager

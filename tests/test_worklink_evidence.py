@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Sequence
 from unittest.mock import MagicMock
 
+from mimir.worklink import evidence as ev
 from mimir.worklink.evidence import (
     TestResult,
     WorklinkEvidence,
@@ -20,6 +21,23 @@ from mimir.worklink.evidence import (
     read_pytest_result,
     validate_evidence,
 )
+
+
+@pytest.fixture(autouse=True)
+def clean_gate_tmp(monkeypatch):
+    helper = ev._gate_tmp_directory
+    rmtree = shutil.rmtree
+    trees = set()
+
+    def tracked(report_dir):
+        tree = helper(report_dir)
+        trees.add(tree)
+        return tree
+
+    monkeypatch.setattr(ev, "_gate_tmp_directory", tracked)
+    yield
+    for tree in trees:
+        rmtree(tree, ignore_errors=True)
 
 
 def base_evidence(**overrides: object) -> WorklinkEvidence:
@@ -43,6 +61,21 @@ def base_evidence(**overrides: object) -> WorklinkEvidence:
     )
     values.update(overrides)
     return WorklinkEvidence(**values)  # type: ignore[arg-type]
+
+
+def test_pytest_report_environment_explicit_basetemp_keeps_relative_junit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    report = Path("report space")
+    basetemp = ev._gate_tmp_directory(tmp_path / report)
+    assert basetemp == ev._gate_tmp_directory(report)
+    assert basetemp != ev._gate_tmp_directory(tmp_path / "other" / report)
+    env = ev.pytest_report_environment(
+        "pytest -q", report, basetemp=basetemp, create_directory=False,
+    )
+    options = shlex.split(env["PYTEST_ADDOPTS"])
+    assert f"--junitxml={report / 'junit.xml'}" in options
+    assert f"--basetemp={basetemp}" in options
+    assert not report.exists() and not basetemp.exists()
 
 
 def test_completed_empty_diff_demotes_to_failed() -> None:
@@ -1025,6 +1058,13 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
     )
     assert not Path(report_option).is_absolute()
     assert report_option.startswith(".worklink-gate-")
+    basetemp = Path(next(
+        option.split("=", 1)[1]
+        for option in shlex.split(compute.specs[0].env["PYTEST_ADDOPTS"])
+        if option.startswith("--basetemp=")
+    ))
+    assert basetemp.is_absolute()
+    assert basetemp == ev._gate_tmp_directory((repo / report_option).parent)
     assert compute.specs[0].backend_config["pass_env"] == ("PYTEST_ADDOPTS",)
     assert compute.cleaned == [LaunchHandle("local_subprocess", "job")]
     assert result.evidence.tests is not None
