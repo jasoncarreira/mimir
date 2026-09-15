@@ -681,10 +681,13 @@ now retained only for the dispatch scaffolding that
 ``tests/test_bench_via_mimir.py`` exercises (route / score / hypothesis
 extraction helpers).
 
-For a working LongMemEval run:
+For a working memory-backend-only LongMemEval run:
   - SagaStore-direct: benchmarks.longmemeval_via_memory.runner
-  - mimir BenchBridge (in-progress):
-    benchmarks.longmemeval_via_mimir.runner_memory
+This bypasses the agent loop and BudgetGate; it is not agent-loop evidence.
+No executable agent-loop benchmark exists. Chainlink #1758 was closed as
+WONT-BUILD on 2026-09-15: the project will not build one. Agent-loop changes
+require the full suite in both access-control modes plus each change's own
+discriminating integration tests; see CONTRIBUTING.md.
 
 Pass ``--allow-deprecated`` to bypass this guard (the dispatch loop
 will still run but ingest no atoms; useful only for harness debugging).

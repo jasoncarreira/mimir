@@ -117,24 +117,32 @@ async def test_size_scaled_current_state_read_does_not_lag_event_loop(
             due_window_start_unix=time.time() + 3600,
         ))
 
-    ticks = 0
-    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    replay_started = asyncio.Event()
+    release_replay = threading.Event()
+    real_replay = store.replay
 
-    async def ticker() -> None:
-        nonlocal ticks
-        while not done.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+    def gated_replay():
+        # Fail promptly rather than blocking the loop if offloading regresses.
+        assert threading.get_ident() != loop_thread
+        loop.call_soon_threadsafe(replay_started.set)
+        assert release_replay.wait(timeout=5), "event loop did not release replay"
+        return real_replay()
 
-    ticker_task = asyncio.create_task(ticker())
+    store.replay = gated_replay  # type: ignore[method-assign]
+    check_task = asyncio.create_task(check_due_and_expired(store))
     try:
-        result = await asyncio.wait_for(check_due_and_expired(store), timeout=5)
+        # Prove loop progress while replay is in flight, not merely that a
+        # ticker happened to run before/after a fast executor completion.
+        await asyncio.wait_for(replay_started.wait(), timeout=5)
+        assert not check_task.done()
     finally:
-        done.set()
-        await ticker_task
+        release_replay.set()
+        result = await asyncio.wait_for(check_task, timeout=5)
 
     assert result.scanned == 2_000
-    assert ticks > 0, "event loop did not advance while current_state replay ran"
+    assert result.skipped_not_yet_due == 2_000
 
 
 @pytest.mark.asyncio
