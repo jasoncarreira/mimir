@@ -90,6 +90,29 @@ class FlowLabel(StrEnum):
     PUBLIC = "public"
 
 
+class SourceKind(StrEnum):
+    """Kinds minted by first-party IFC producers, not validation of runtime data.
+
+    SourceLabel deliberately still accepts arbitrary strings from callers and
+    persisted labels. Unknown strings retain the existing flow policy.
+    """
+
+    ACP_HANDS_RESULT = "acp_hands_result"
+    AGENT_SELF = "agent_self"
+    AUTO_RECALL = "auto_recall"
+    CHANNEL = "channel"
+    CHANNEL_BOUND_UNOWNED_FEEDBACK = "channel_bound_unowned_feedback"
+    CHANNEL_SCOPED_FEEDBACK = "channel_scoped_feedback"
+    FEEDBACK_CHAIN = "feedback_chain"
+    MCP = "mcp"
+    OWNER_ATTESTED_FEEDBACK = "owner_attested_feedback"
+    PROTECTED_PROMPT = "protected_prompt"
+    PROTECTED_TOOL = "protected_tool"
+    RECENT_ACTIVITY_ASSISTANT = "recent_activity_assistant"
+    RECENT_ACTIVITY_USER = "recent_activity_user"
+    SERVICE = "service"
+
+
 class Integrity(StrEnum):
     """Server-derived content trust, not a turn-gating decision.
 
@@ -193,7 +216,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
     bridge_instance: str | None = _MISSING_SOURCE_VALUE
     sensitivity: str = _MISSING_SOURCE_VALUE
     authorized_principals: InitVar[frozenset[str]] = frozenset()
-    source_kind: str = "channel"
+    source_kind: SourceKind = SourceKind.CHANNEL
     integrity: str = Integrity.UNTRUSTED
     # Gate participation, not content trust; see IntegrityEffect's contract.
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
