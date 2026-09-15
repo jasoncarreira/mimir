@@ -9435,19 +9435,17 @@ def protected_result_source(
             and getattr(scope, "observed_head_sha", "").lower()
             == lease.head_sha.lower()
         )
-        if trusted_lease:
+        anchor = _filesystem_read_trust_anchor(
+            resource_id, author_attested=trusted_lease,
+        )
+        integrity, integrity_effect = anchor.integrity
+        if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
             principal = requester
             domain = "repository"
             resource_id = (
                 f"{lease.canonical_repo}#pull/{lease.pr_number}@{lease.head_sha}"
             )
             bridge_instance = "forge"
-            integrity = "trusted"
-            integrity_effect = "informational"
-        else:
-            integrity, integrity_effect = _filesystem_result_integrity(
-                auth_context, resource_id,
-            )
     acl = {principal} if principal else set()
     if requester:
         acl.add(requester)
@@ -9480,76 +9478,90 @@ def _filesystem_result_integrity(
     auth_context: "AuthContext | None",
     resource_id: str,
 ) -> tuple[str, str]:
-    """Derive file trust only from resolved framework-owned paths and metadata."""
+    """Project the path-only trust decision onto the existing label fields."""
+    return _filesystem_read_trust_anchor(resource_id).integrity
+
+
+class FilesystemReadTrust(StrEnum):
+    """Trust anchors, or the boundary/default that prevented path trust.
+
+    Author attestation is cached at acquisition and bound to a PR lease's scope
+    and head. Write-side gating excludes tainted writes from self-authored HOME
+    trees (including admin-installed skills). Root membership relies on merge
+    review for the configured source checkout.
+    """
+
+    AUTHOR_ATTESTATION = "author_attestation"
+    HOME_CARVE_OUT = "home_carve_out"
+    WRITE_SIDE_GATING = "write_side_gating"
+    HOME_UNANCHORED = "home_unanchored"
+    ROOT_MEMBERSHIP = "root_membership"
+    UNANCHORED = "unanchored"
+
+    @property
+    def integrity(self) -> tuple[str, str]:
+        if self in {
+            self.AUTHOR_ATTESTATION, self.WRITE_SIDE_GATING, self.ROOT_MEMBERSHIP,
+        }:
+            return "trusted", "informational"
+        return "untrusted", "active_ingest"
+
+
+# First applicable rule wins. Attested leases retain their repository identity;
+# all HOME decisions (including denials) override overlapping source checkouts.
+_FILESYSTEM_READ_TRUST_PRECEDENCE = (
+    FilesystemReadTrust.AUTHOR_ATTESTATION,
+    FilesystemReadTrust.HOME_CARVE_OUT,
+    FilesystemReadTrust.WRITE_SIDE_GATING,
+    FilesystemReadTrust.HOME_UNANCHORED,
+    FilesystemReadTrust.ROOT_MEMBERSHIP,
+    FilesystemReadTrust.UNANCHORED,
+)
+
+
+def _filesystem_read_trust_anchor(
+    resource_id: str, *, author_attested: bool = False,
+) -> FilesystemReadTrust:
+    """Return the winning anchor/boundary for diagnostics and label construction.
+
+    ``author_attested`` must be the scope/head-bound lease verdict computed by
+    ``protected_result_source``, never a caller's claim about a file's author.
+    The reason is deliberately not persisted in SourceLabel: it describes the
+    current read decision, not a transferable authorization for future reads.
+    """
+    applicable = {FilesystemReadTrust.UNANCHORED}
+    if author_attested:
+        applicable.add(FilesystemReadTrust.AUTHOR_ATTESTATION)
     home_value = os.environ.get("MIMIR_HOME", "").strip()
     source_repo_value = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
-    if source_repo_value:
-        try:
-            source_repo = Path(source_repo_value).resolve(strict=True)
-            source_resource = Path(resource_id).resolve(strict=True)
-            source_home = Path(home_value).resolve(strict=True) if home_value else None
-        except (OSError, RuntimeError):
-            pass
-        else:
-            # Merge review anchors this checkout's trust, not file ledger state.
-            # HOME's own handling must win even when the checkout overlaps it.
-            if (
-                source_repo.is_dir()
-                and source_resource.is_relative_to(source_repo)
-                and (source_home is None or not source_resource.is_relative_to(source_home))
-            ):
-                return "trusted", "informational"
-
-    if not home_value:
-        return "untrusted", "active_ingest"
     try:
-        home = Path(home_value).resolve(strict=True)
+        home = Path(home_value).resolve(strict=True) if home_value else None
         resource = Path(resource_id).resolve(strict=True)
     except (OSError, RuntimeError):
-        return "untrusted", "active_ingest"
-
-    try:
-        relative = resource.relative_to(home)
-    except ValueError:
-        relative = None
-
-    if (
-        relative is not None
-        and relative.parts
-        and relative.parts[0] in _SELF_AUTHORED_FILE_ROOTS
-    ):
-        integrity = _home_reference_integrity(home, relative)
-        return integrity, (
-            "informational" if integrity == "trusted" else "active_ingest"
-        )
-
-    cache_root = home / "attachments" / "fetch-cache"
-    try:
-        resource.relative_to(cache_root.resolve(strict=True))
-    except (OSError, RuntimeError, ValueError):
-        return "untrusted", "active_ingest"
-
-    sidecar = resource.with_name(f"{resource.name}.meta.json")
-    try:
-        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "untrusted", "active_ingest"
-    url = metadata.get("url") if isinstance(metadata, dict) else None
-    file_path = metadata.get("file_path") if isinstance(metadata, dict) else None
-    if not isinstance(url, str) or not isinstance(file_path, str):
-        return "untrusted", "active_ingest"
-    expected_digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
-    if not resource.name.startswith(f"{expected_digest}-"):
-        return "untrusted", "active_ingest"
-    try:
-        recorded_resource = (home / file_path.lstrip("/")).resolve(strict=True)
-    except (OSError, RuntimeError, ValueError):
-        return "untrusted", "active_ingest"
-    if recorded_resource != resource:
-        return "untrusted", "active_ingest"
-    # URL approval authorizes GET egress only. It never vouches for returned
-    # bytes, including redirects or cached copies (#1139).
-    return "untrusted", "active_ingest"
+        pass
+    else:
+        if home is not None and resource.is_relative_to(home):
+            relative = resource.relative_to(home)
+            applicable.add(FilesystemReadTrust.HOME_UNANCHORED)
+            # Download approval and cache metadata never attest returned bytes.
+            if (
+                relative.parts[:2] in _UNTRUSTED_REFERENCE_SUBTREES
+                or relative.parts[:2] == ("attachments", "fetch-cache")
+            ):
+                applicable.add(FilesystemReadTrust.HOME_CARVE_OUT)
+            if _home_reference_integrity(home, relative) == "trusted":
+                applicable.add(FilesystemReadTrust.WRITE_SIDE_GATING)
+        if source_repo_value:
+            try:
+                source_repo = Path(source_repo_value).resolve(strict=True)
+            except (OSError, RuntimeError):
+                pass
+            else:
+                if source_repo.is_dir() and resource.is_relative_to(source_repo):
+                    applicable.add(FilesystemReadTrust.ROOT_MEMBERSHIP)
+    return next(
+        anchor for anchor in _FILESYSTEM_READ_TRUST_PRECEDENCE if anchor in applicable
+    )
 
 
 def _configured_pr_checkout_lease_root() -> Path | None:
