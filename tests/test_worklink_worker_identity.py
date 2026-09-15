@@ -269,6 +269,7 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
 
 def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
     """Run the workflow collector against pathological fixtures, not a reimplementation."""
+    import json
     import os
     import shutil
     import subprocess
@@ -298,6 +299,17 @@ def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
         source = directory / (value + ".stdout.log")
         source.write_text(repr(value))
         expected[str(source.relative_to(root))] = repr(value)
+    # Many modest components also overflow the total path after encoding.
+    deep = fixture.joinpath(*([":" * 18] * 12))
+    deep.mkdir(parents=True)
+    deep_source = deep / ((":" * 100) + ".stdout.log")
+    deep_source.write_text("deep evidence")
+    expected[str(deep_source.relative_to(root))] = "deep evidence"
+    # Literal fallback-looking source directories remain in a distinct namespace.
+    literal = root / "+long" / "child-progress"
+    literal.parent.mkdir()
+    literal.write_text("literal namespace")
+    expected[str(literal.relative_to(root))] = "literal namespace"
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "child-progress").write_text("outside evidence")
@@ -322,12 +334,28 @@ def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
     staged = Path(output.read_text().strip().removeprefix("path="))
     try:
         assert not any(path.is_symlink() for path in staged.rglob("*"))
+        summary = (staged / "STAGING.txt").read_text()
+        mappings = json.loads(summary.splitlines()[-1])
+        long_original = str((fixture / (":" * 240) / ((":" * 240) + ".stdout.log")).relative_to(root))
+        decoded_mappings = {key: unquote(value, errors="surrogatepass")
+                            for key, value in mappings.items()}
+        assert long_original in decoded_mappings.values()
+        assert str(deep_source.relative_to(root)) in decoded_mappings.values()
+        assert len(decoded_mappings) >= 2
+        for key, original in decoded_mappings.items():
+            assert key.startswith("+long/")
+            assert (staged / key).read_text() == expected[original]
         for path in staged.rglob("*"):
+            # Platform-independent regression: Linux must enforce the macOS bound too.
+            assert len(os.fsencode(path.resolve())) <= 900
+            assert all(len(os.fsencode(part)) <= 255 for part in path.parts)
             relative = str(path.relative_to(staged))
             assert not any(char in relative for char in '\":<>|*?\r\n\\')
             assert not any(part.startswith(".") for part in path.relative_to(staged).parts)
         assert {
-            unquote(str(path.relative_to(staged)).replace("+/", ""), errors="surrogatepass"): path.read_text()
+            decoded_mappings.get(str(path.relative_to(staged)),
+                                 unquote(str(path.relative_to(staged)).replace("+/", ""),
+                                         errors="surrogatepass")): path.read_text()
             for path in staged.rglob("*") if path.is_file() and path.name != "STAGING.txt"
         } == expected
         assert "truncated files: 0; stopped before remaining evidence: False" in (staged / "STAGING.txt").read_text()
