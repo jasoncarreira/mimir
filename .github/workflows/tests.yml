@@ -125,14 +125,14 @@ jobs:
 
       # Attempt-specific names preserve rerun evidence. Select raw sidecars, not
       # wholesale temporary fixtures, to keep logs short without losing diagnostics.
-      - name: Upload pytest evidence
+      # upload-artifact v4 hard-codes symlink following. Stage regular files only
+      # so loops, dangling links and links outside basetemp cannot break collection.
+      - &stage-pytest-evidence
+        name: Stage pytest evidence
+        id: stage-pytest-evidence
         if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-evidence-skill-conformance-3.11-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: ignore
-          retention-days: 14
-          path: &pytest-evidence-paths |
+        env:
+          PYTEST_EVIDENCE_PATHS: |
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress.wakeup
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress.diagnostics
@@ -148,6 +148,40 @@ jobs:
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/report.xml
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/events.jsonl
             ${{ env.PYTEST_EVIDENCE_ROOT }}/**/turns.jsonl
+        run: |
+          python3 - <<'PY'
+          import fnmatch
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+          import tempfile
+
+          root = Path(os.environ["PYTEST_EVIDENCE_ROOT"])
+          staged = Path(tempfile.mkdtemp(prefix="mimir-pytest-upload-", dir="/tmp"))
+          patterns = [Path(p).name for p in os.environ["PYTEST_EVIDENCE_PATHS"].splitlines()]
+          for directory, _, files in os.walk(root, followlinks=False):
+              for name in files:
+                  source = Path(directory) / name
+                  if not stat.S_ISREG(source.lstat().st_mode):
+                      continue
+                  if not any(fnmatch.fnmatchcase(name, p) for p in patterns):
+                      continue
+                  target = staged / source.relative_to(root)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(source, target)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"path={staged}", file=output)
+          PY
+
+      - name: Upload pytest evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-evidence-skill-conformance-3.11-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   chainlink-cli-audit:
     # Exercise the real pinned CLI help exactly once in CI. The full-suite jobs
@@ -202,6 +236,8 @@ jobs:
             --basetemp "$PYTEST_EVIDENCE_ROOT/audit" \
             -k 'chainlink_issue_help_has_an_explicit_read_or_mutation_decision or chainlink_top_level_help_has_an_explicit_scope_decision'
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -209,7 +245,7 @@ jobs:
           name: pytest-evidence-chainlink-cli-audit-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   pytest:
     # Full mimir test suite under py 3.11 + 3.12 matrix. ``needs:
@@ -298,6 +334,8 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -305,7 +343,7 @@ jobs:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   pytest-worker-uid:
     # Runs the suite as a uid that owns neither the checkout nor $HOME. That is the
@@ -422,6 +460,8 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "$PYTEST_EVIDENCE_ROOT"
           fi
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -429,7 +469,7 @@ jobs:
           name: pytest-evidence-pytest-worker-uid-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   pytest-macos:
     # Keep this separate from the required pytest matrix so its existing
@@ -490,6 +530,8 @@ jobs:
           fi
           echo "ran optional-skills tests for $ran skill(s)"
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -497,7 +539,7 @@ jobs:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   # Resolves dependencies FRESH instead of from uv.lock, so an upstream release
   # inside a permitted range is exercised here before it reaches a deployment.
@@ -554,6 +596,8 @@ jobs:
       - name: Run mimir test suite against the fresh resolution
         run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -561,7 +605,7 @@ jobs:
           name: pytest-evidence-pytest-fresh-resolve-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   pytest-enforced:
     # The same suite with MIMIR_ACCESS_CONTROL_ENFORCED=1.
@@ -627,6 +671,8 @@ jobs:
           MIMIR_ACCESS_CONTROL_ENFORCED: "1"
         run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
+      - *stage-pytest-evidence
+
       - name: Upload pytest evidence
         if: failure()
         uses: actions/upload-artifact@v4
@@ -634,7 +680,7 @@ jobs:
           name: pytest-evidence-pytest-enforced-3.12-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 14
-          path: *pytest-evidence-paths
+          path: ${{ steps.stage-pytest-evidence.outputs.path }}
 
   worklink-image-identity:
     runs-on: ubuntu-latest

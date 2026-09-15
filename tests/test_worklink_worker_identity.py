@@ -240,14 +240,80 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
             )
         for upload in uploads:
             assert upload["if"] == "failure()"
-            paths = upload["with"]["path"].splitlines()
+            assert not upload.get("continue-on-error", False)
+            assert "${{ github.run_id }}" in upload["with"]["name"]
+            assert "${{ github.run_attempt }}" in upload["with"]["name"]
+            assert upload["with"]["path"] == "${{ steps.stage-pytest-evidence.outputs.path }}"
+            stage = next(step for step in steps if step.get("id") == "stage-pytest-evidence")
+            assert stage["if"] == "failure()"
+            assert steps.index(stage) < steps.index(upload)
+            assert "os.walk(root, followlinks=False)" in stage["run"]
+            assert "if not stat.S_ISREG(source.lstat().st_mode):" in stage["run"]
+            paths = stage["env"]["PYTEST_EVIDENCE_PATHS"].splitlines()
             assert paths
             assert all(path.startswith("${{ env.PYTEST_EVIDENCE_ROOT }}/") for path in paths)
+            for suffix in ("", ".wakeup", ".diagnostics", ".stacks"):
+                assert "${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress" + suffix in paths
     assert evidence_jobs == 7
     worker_runs = "\n".join(step.get("run", "") for step in _worker_uid_job()["steps"])
     assert 'sudo install -d -m 700 -o worklink -g worklink "$evidence_root"' in worker_runs
     assert 'evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"' in worker_runs
     assert 'sudo chmod o+x "$RUNNER_TEMP"' not in worker_runs
+
+
+def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:
+    """Run the workflow collector against pathological fixtures, not a reimplementation."""
+    import os
+    import shutil
+    import subprocess
+
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    )
+    stage = next(
+        step for step in workflow["jobs"]["skill-conformance"]["steps"]
+        if step.get("id") == "stage-pytest-evidence"
+    )
+    root = tmp_path / "evidence"
+    fixture = root / "main" / "popen-gw0" / "fixture"
+    fixture.mkdir(parents=True)
+    expected = {}
+    for pattern in stage["env"]["PYTEST_EVIDENCE_PATHS"].splitlines():
+        name = Path(pattern).name.replace("*", "child")
+        source = fixture / name
+        source.write_text(name)
+        expected[str(source.relative_to(root))] = name
+    (fixture / "irrelevant.txt").write_text("not evidence")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "child-progress").write_text("outside evidence")
+    (fixture / "loop").symlink_to(fixture / "loop")
+    (fixture / "directory-loop").symlink_to(root, target_is_directory=True)
+    (fixture / "outside").symlink_to(outside, target_is_directory=True)
+    for name, target in (
+        ("stdout.log", fixture / "link-stdout.log" / "stdout.log"),
+        ("stderr.log", tmp_path / "missing"),
+        ("child-progress", outside / "child-progress"),
+    ):
+        link_dir = fixture / ("link-" + name)
+        link_dir.mkdir()
+        (link_dir / name).symlink_to(target)
+    output = tmp_path / "github-output"
+    subprocess.run(
+        ["bash", "-c", stage["run"]], check=True, capture_output=True, text=True,
+        env={**os.environ, "PYTEST_EVIDENCE_ROOT": str(root),
+             "PYTEST_EVIDENCE_PATHS": stage["env"]["PYTEST_EVIDENCE_PATHS"],
+             "GITHUB_OUTPUT": str(output)},
+    )
+    staged = Path(output.read_text().strip().removeprefix("path="))
+    try:
+        assert not any(path.is_symlink() for path in staged.rglob("*"))
+        assert {
+            str(path.relative_to(staged)): path.read_text()
+            for path in staged.rglob("*") if path.is_file()
+        } == expected
+    finally:
+        shutil.rmtree(staged)
 
 
 def test_ci_evidence_prepare_exports_physical_private_member_group_root(tmp_path) -> None:
