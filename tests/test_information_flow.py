@@ -170,6 +170,35 @@ def _labels(
     )
 
 
+@pytest.mark.parametrize("integrity,effect,tainted", [
+    (Integrity.TRUSTED, IntegrityEffect.INFORMATIONAL, False),
+    (Integrity.TRUSTED, IntegrityEffect.ACTIVE_INGEST, False),
+    (Integrity.UNTRUSTED, IntegrityEffect.INFORMATIONAL, False),
+    (Integrity.UNTRUSTED, IntegrityEffect.ACTIVE_INGEST, True),
+])
+def test_gate_query_uses_both_axes_and_live_state(integrity, effect, tainted):
+    from mimir.access_control import _has_untrusted_active_ingest, _live_untrusted_active_ingest
+
+    source = replace(_labels().sources[0], integrity=integrity, integrity_effect=effect)
+    labels = InformationFlowLabels(sources=(source,))
+    # A stale, clean snapshot must not hide subsequent live ingest.
+    stale = InformationFlowLabels()
+    state = InformationFlowState(labels=labels)
+    auth = replace(_auth(), ifc_labels=stale, ifc_state=state)
+
+    assert source.has_untrusted_active_ingest is tainted
+    assert labels.has_untrusted_active_ingest is tainted
+    assert state.has_untrusted_active_ingest(stale) is tainted
+    assert state.permission_has_untrusted_active_ingest(stale) is tainted
+    assert _live_untrusted_active_ingest(auth, stale) is tainted
+    assert _has_untrusted_active_ingest(auth, stale) is tainted
+    assert (saga_mutation_taint_refusal(auth, stale) is not None) is tainted
+    assert labels.persisted_integrity == (Integrity.UNTRUSTED if tainted else Integrity.TRUSTED)
+    assert labels.persisted_integrity_effect == (
+        IntegrityEffect.ACTIVE_INGEST if tainted else IntegrityEffect.INFORMATIONAL
+    )
+
+
 def test_initializes_before_first_model_call_from_ingress_and_preloaded_context():
     event = AgentEvent(
         trigger="user_message",

@@ -91,14 +91,29 @@ class FlowLabel(StrEnum):
 
 
 class Integrity(StrEnum):
-    """Server-derived trust classification for ingested content."""
+    """Server-derived content trust, not a turn-gating decision.
+
+    UNTRUSTED informational content does not taint a turn. Ask
+    ``has_untrusted_active_ingest`` instead of testing this axis alone.
+    """
 
     TRUSTED = "trusted"
     UNTRUSTED = "untrusted"
 
 
 class IntegrityEffect(StrEnum):
-    """Whether a source participates in the current turn's integrity gate."""
+    """The operative axis: participation in the current turn's integrity gate.
+
+    Only UNTRUSTED + ACTIVE_INGEST taints; INFORMATIONAL never adds taint,
+    even when the content is untrusted (for example ordinary shell output).
+    TRUSTED content does not taint with either effect. Informational sources
+    still retain their provenance, sensitivity and audience restrictions.
+
+    Labelling code assigns the two axes independently. Gate consumers must
+    ask ``has_untrusted_active_ingest`` on a source/carrier, or its live-state
+    variants, rather than reconstructing the rule. Keep ``integrity_effect``
+    as the wire name for existing turn records, recovery events and approvals.
+    """
 
     ACTIVE_INGEST = "active_ingest"
     INFORMATIONAL = "informational"
@@ -180,6 +195,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
     authorized_principals: InitVar[frozenset[str]] = frozenset()
     source_kind: str = "channel"
     integrity: str = Integrity.UNTRUSTED
+    # Gate participation, not content trust; see IntegrityEffect's contract.
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
     owner_attestation: InitVar[_RedactedOwnerAttestation] = None
 
@@ -274,6 +290,14 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         return schema
 
     @property
+    def has_untrusted_active_ingest(self) -> bool:
+        """Whether this source contributes taint, not whether a sink is allowed."""
+        return (
+            self.integrity == Integrity.UNTRUSTED
+            and self.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+        )
+
+    @property
     def is_complete(self) -> bool:
         return bool(
             self.principal
@@ -310,11 +334,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         )
         integrity_effect = (
             IntegrityEffect.ACTIVE_INGEST
-            if any(
-                source.integrity == Integrity.UNTRUSTED
-                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
-                for source in inputs
-            )
+            if any(source.has_untrusted_active_ingest for source in inputs)
             else IntegrityEffect.INFORMATIONAL
         )
         return cls(
@@ -436,12 +456,12 @@ class InformationFlowLabels:
 
     @property
     def has_untrusted_active_ingest(self) -> bool:
-        """Return the exact integrity-gate predicate for accumulated sources."""
-        return any(
-            source.integrity == Integrity.UNTRUSTED
-            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
-            for source in self.sources
-        )
+        """The supported taint query for a snapshot; live gates use live state.
+
+        False is not authorization: provenance completeness, ACLs and sink
+        policy remain separate checks. An empty source set has no taint.
+        """
+        return any(source.has_untrusted_active_ingest for source in self.sources)
 
     @property
     def persisted_integrity(self) -> Integrity:
@@ -462,11 +482,7 @@ class InformationFlowLabels:
         """Summarize whether an untrusted source actively tainted this turn."""
         return (
             IntegrityEffect.ACTIVE_INGEST
-            if any(
-                source.integrity == Integrity.UNTRUSTED
-                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
-                for source in self.sources
-            )
+            if self.has_untrusted_active_ingest
             else IntegrityEffect.INFORMATIONAL
         )
 
@@ -588,8 +604,7 @@ class InformationFlowState:
                 return False
             sources = tuple(
                 source for source in current.sources
-                if source.integrity == Integrity.UNTRUSTED
-                and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
+                if source.has_untrusted_active_ingest
             ) if current != self._acknowledged_ingest else ()
             if not durable_audit(sources):
                 return False
