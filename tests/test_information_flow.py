@@ -42,7 +42,6 @@ from mimir.access_control import (
     OperationDecision,
     ProtectedResultProvenance,
     protected_result_source,
-    record_admin_installed_skill_integrity,
     saga_mutation_taint_refusal,
 )
 from mimir.agent import (
@@ -1197,6 +1196,7 @@ def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     "relative",
     [
         ".mimir_builtin_skills/github/SKILL.md",
+        "skills/operator/SKILL.md",
         "docs/configuration.md",
         "memory/channels/poller:github-activity/notes.md",
         "prompts/system.md",
@@ -1228,7 +1228,7 @@ def test_framework_and_agent_owned_files_are_trusted_informational(
 
 @pytest.mark.parametrize(
     "relative",
-    ["skills/operator/SKILL.md", "attachments/upload.txt"],
+    ["attachments/upload.txt"],
 )
 def test_home_location_does_not_make_external_or_operator_files_trusted(
     tmp_path: Path,
@@ -1251,7 +1251,6 @@ def test_home_location_does_not_make_external_or_operator_files_trusted(
 
 
 @pytest.mark.parametrize("relative", [
-    "skills/dropped/SKILL.md",
     "attachments/fetch-cache/body.txt",
     "state/pollers/github/cursor.json",
 ])
@@ -1273,9 +1272,12 @@ def test_legacy_trusted_records_do_not_authorize_ingested_home_files(
     )
 
 
-def test_skill_trust_requires_new_installation_authority(
+@pytest.mark.parametrize("record", [None, b"{broken", b"\xff", b"[]", b"{}",
+    b'{"skills/installed/SKILL.md":"untrusted"}'])
+def test_skill_trust_ignores_obsolete_installation_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    record: bytes | None,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     skill = tmp_path / "skills" / "installed"
@@ -1284,37 +1286,22 @@ def test_skill_trust_requires_new_installation_authority(
     target.write_text("admin-installed instructions", encoding="utf-8")
     metadata = tmp_path / ".mimir" / "skill-integrity.json"
 
-    assert _filesystem_result_integrity(_auth(), str(target)) == (
-        "untrusted", "active_ingest",
-    )
-    assert record_admin_installed_skill_integrity(tmp_path, skill) is True
-    assert metadata.is_file()
-    assert not (metadata.parent / "file-integrity.json").exists()
+    if record is not None:
+        metadata.parent.mkdir()
+        metadata.write_bytes(record)
     assert _filesystem_result_integrity(_auth(), str(target)) == (
         "trusted", "informational",
     )
     dropped = skill / "new-instructions.md"
+    # Out-of-band writes bypass the gate; reads no longer detect that bypass.
     dropped.write_text("not part of installation", encoding="utf-8")
     assert _filesystem_result_integrity(_auth(), str(dropped)) == (
-        "untrusted", "active_ingest",
+        "trusted", "informational",
     )
-    metadata.unlink()
-    assert _filesystem_result_integrity(_auth(), str(target)) == (
-        "untrusted", "active_ingest",
-    )
-
-
-@pytest.mark.parametrize("relative", ["memory/notes", "state/pollers", "attachments/input"])
-def test_skill_installation_authority_rejects_non_skill_roots(
-    tmp_path: Path,
-    relative: str,
-) -> None:
-    root = tmp_path / relative
-    root.mkdir(parents=True)
-    (root / "SKILL.md").write_text("not a skill installation", encoding="utf-8")
-
-    assert record_admin_installed_skill_integrity(tmp_path, root) is False
-    assert not (tmp_path / ".mimir" / "skill-integrity.json").exists()
+    if record is not None:
+        assert metadata.read_bytes() == record
+    else:
+        assert not metadata.exists()
 
 
 @pytest.mark.parametrize("name", [".recovery.json", "cursor.json"])
@@ -4006,7 +3993,9 @@ def test_source_repo_does_not_change_other_roots(tmp_path, monkeypatch, location
     monkeypatch.setenv("MIMIR_SOURCE_REPO", str(repo))
     assert _filesystem_result_integrity(_auth(), str(target)) == baseline
     assert _filesystem_result_integrity(_auth(), str(escape)) == baseline
-    if "memory" not in location:
+    if location.startswith(("home/memory/", "home/skills/")):
+        assert baseline == ("trusted", "informational")
+    else:
         assert baseline == ("untrusted", "active_ingest")
 
 
@@ -4085,7 +4074,7 @@ def test_admin_installed_skill_read_does_not_block_turn_sinks(
     home.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     installed = install("github", home, optional_skills_root=source_root)
-    assert (home / ".mimir" / "skill-integrity.json").is_file()
+    assert not (home / ".mimir" / "skill-integrity.json").exists()
 
     event = AgentEvent(
         trigger="user_message", channel_id="slack-C1", author="user-1",
@@ -4115,8 +4104,8 @@ def test_admin_installed_skill_read_does_not_block_turn_sinks(
         "send_message", event.channel_id, labels, auth, enforce=True,
     ).allowed is True
 
-    dropped = home / "skills" / "dropped" / "SKILL.md"
-    dropped.parent.mkdir()
+    dropped = home / "attachments" / "fetch-cache" / "body.txt"
+    dropped.parent.mkdir(parents=True)
     dropped.write_text("untrusted instructions", encoding="utf-8")
     untrusted_read = classify_protected_result(
         "read_file", {"file_path": str(dropped)}, auth,

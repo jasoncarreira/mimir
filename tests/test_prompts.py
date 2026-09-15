@@ -76,7 +76,7 @@ def test_prompt_file_trust_uses_canonical_contained_path(tmp_path: Path, target_
     ("attachments/fetch-cache/target.md", False),
     ("attachments/inbound/target.md", False),
     ("state/pollers/feed/target.md", False),
-    ("skills/unrecorded/SKILL.md", False),
+    ("skills/unrecorded/SKILL.md", True),
     ("arbitrary/target.md", False),
     ("target.md", False),
     ("../outside.md", False),
@@ -92,7 +92,6 @@ def test_prompt_readers_classify_resolved_home_symlinks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     reader: str, destination: str, trusted: bool,
 ):
-    from mimir.access_control import record_admin_installed_skill_integrity
     from mimir.core_blocks import load_channel_memory, load_core
     from mimir.index import IndexGenerator, build_memory_index
     from mimir.models import AgentEvent
@@ -103,9 +102,7 @@ def test_prompt_readers_classify_resolved_home_symlinks(
     target.parent.mkdir(parents=True, exist_ok=True)
     if destination != "memory/missing.md":
         target.write_text("SYMLINK_PAYLOAD.", encoding="utf-8")
-    if destination == "skills/installed/SKILL.md":
-        assert record_admin_installed_skill_integrity(home, target.parent)
-    # Installation authority, like root classification, uses the supplied HOME.
+    # Root classification uses the supplied HOME.
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "different-home"))
     link = home / {
         "core": "memory/core/00-alias.md",
