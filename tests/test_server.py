@@ -3453,9 +3453,39 @@ class TestHandleEvent:
         assert event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
+@pytest.fixture
+def deterministic_server_embeddings():
+    from mimir.saga import embeddings
+
+    provider = MagicMock(spec=embeddings.EmbeddingProvider)
+    provider.provider_name = "server-test"
+    provider.model_id = "constant-4d"
+    provider.dimensions.return_value = 4
+    provider.embed.side_effect = lambda text, input_type="passage": [1.0, 0.0, 0.0, 0.0]
+    provider.batch_embed.side_effect = lambda texts, input_type="passage": [
+        provider.embed(text, input_type=input_type) for text in texts
+    ]
+    original = embeddings.get_provider
+    real_acquisition = MagicMock(wraps=original)
+    # The return value bypasses delegation to the real acquisition spy, including
+    # its process-global provider cache. Cover startup and turn-time memory alike.
+    acquire = MagicMock(wraps=real_acquisition, return_value=provider)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(embeddings, "get_provider", acquire)
+            yield provider
+            real_acquisition.assert_not_called()
+            acquire.assert_called()
+            provider.dimensions.assert_called()
+            provider.embed.assert_any_call("unrelated channel turn", input_type="query")
+    finally:
+        assert embeddings.get_provider is original
+
+
 @pytest.mark.asyncio
 async def test_real_acp_failure_leaves_exact_bundle_and_unrelated_channel_turn_healthy(
     monkeypatch: pytest.MonkeyPatch,
+    deterministic_server_embeddings,
 ) -> None:
     import mimir.tools
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
