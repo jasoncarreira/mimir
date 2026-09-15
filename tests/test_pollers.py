@@ -7259,6 +7259,80 @@ def _write_overrides(path: Path, content: str) -> Path:
     return path
 
 
+@pytest.mark.parametrize("value", ["hihg", None, 3, ["high"], {"tier": "high"}])
+def test_invalid_operator_priority_emits_event(home: Path, value):
+    from mimir.pollers import load_poller_overrides
+
+    path = _write_overrides(home / "pollers-overrides.yaml", json.dumps({
+        "github-ci-watch": {"priority": value, "batch_size": 7},
+    }))
+    # Direct loading must surface the error even without a diagnostics collector
+    # or an installed poller matching this entry.
+    assert load_poller_overrides(path) == {"github-ci-watch": {"batch_size": 7}}
+    [event] = [e for e in _read_events(home)
+               if e["type"] == "poller_overrides_invalid_priority"]
+    assert event["path"] == str(path)
+    assert event["name"] == "github-ci-watch"
+    assert event["value"] == value
+    assert event["action"] == "keep_skill_default"
+
+
+def test_invalid_operator_priority_keeps_booting_without_logger(tmp_path, monkeypatch):
+    from mimir import event_logger
+    from mimir.billing import Priority
+
+    monkeypatch.setattr(event_logger, "_logger", None)
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "skill", [
+        {"name": "p", "command": "echo", "cron": "0 * * * *", "priority": "high"},
+    ])
+    path = _write_overrides(tmp_path / "pollers-overrides.yaml", (
+        "p:\n  priority: hihg\n  batch_size: 7\n"
+    ))
+    rejected = []
+    [poller] = discover_pollers(skills, overrides_path=path, invalid_entries=rejected)
+    assert poller.priority is Priority.HIGH
+    assert poller.batch_size == 7
+    assert rejected == [(path, "p", "invalid priority override 'hihg'; expected low|normal|high")]
+
+
+def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
+    from mimir.billing import Priority
+
+    skills = home / "skills"
+    manifest = skills / "github-poller" / "pollers.json"
+    names = ["github-activity", "github-ci-watch", "worklink-ready-queue", "default", "typo"]
+    _write_pollers_json(manifest.parent, [
+        {"name": name, "command": "echo", "cron": "0 * * * *"} for name in names
+    ])
+    path = _write_overrides(home / "pollers-overrides.yaml", json.dumps({
+        **{name: {"priority": " High "} for name in names[:3]},
+        "typo": {"priority": "hihg"},
+    }))
+    with caplog.at_level("INFO", logger="mimir.pollers"):
+        pollers = discover_pollers(skills, overrides_path=path)
+    assert [p.priority for p in pollers] == [Priority.HIGH] * 3 + [Priority.NORMAL] * 2
+    [line] = [r.getMessage() for r in caplog.records
+              if r.getMessage().startswith("poller_priorities: ")]
+    assert json.loads(line.removeprefix("poller_priorities: ")) == [
+        {"name": name, "priority": "high" if name in names[:3] else "normal",
+         "source": "operator_override" if name in names[:3] else "skill_default",
+         "path": str(path if name in names[:3] else manifest)}
+        for name in names
+    ]
+
+
+def test_operator_priority_write_validation_rejects_typo(tmp_path):
+    from mimir.pollers import PollerOverridesValidationError, validate_poller_overrides_text
+
+    path = tmp_path / "pollers-overrides.yaml"
+    with pytest.raises(PollerOverridesValidationError, match="p.priority='hihg'"):
+        validate_poller_overrides_text("p:\n  priority: hihg\n", path=path)
+    assert validate_poller_overrides_text("p:\n  priority: HIGH\n", path=path) == {
+        "p": {"priority": "high"},
+    }
+
+
 def test_overrides_apply_cron_priority_and_budget(tmp_path: Path):
     """The operator overrides file wins over the skill-shipped manifest
     for tunable keys — and lives outside the skill dir, so updates and

@@ -54,6 +54,8 @@ from typing import Any
 from ._jsonl_tail import tail_jsonl_records  # noqa: F401 — re-export
 from .jsonl_snapshot import JsonlSnapshot, iter_window_records
 from .billing import (
+    Priority,
+    normalize_priority,
     BillingMode,
     QuotaProvider,
     Severity,
@@ -150,7 +152,7 @@ class FireDecision:
     fire: bool
     reason: str
     severity: Severity
-    priority: str
+    priority: Priority
     burst_multiple: float | None = None
 
 
@@ -485,7 +487,7 @@ class HomeostaticArbiter:
     def should_fire(
         self,
         *,
-        priority: str = "normal",
+        priority: Priority | str = Priority.NORMAL,
         now: datetime | None = None,
         event_loop: "asyncio.AbstractEventLoop | None" = None,
     ) -> "FireDecision":
@@ -505,6 +507,7 @@ class HomeostaticArbiter:
 
         ``reason`` carries the deciding constraint either way (callers
         log it on suppression; "ok" when CLEAR)."""
+        priority = normalize_priority(priority)
         assessment = self.assess(now=now, event_loop=event_loop)
         fire = priority_tolerates(priority, assessment.severity)
         return FireDecision(

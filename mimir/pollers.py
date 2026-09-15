@@ -97,7 +97,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .billing import normalize_priority
+from .billing import Priority, normalize_priority
 from .access_control import (
     BOUNDED_PROFILE_CAPABILITIES,
     CapabilityTier,
@@ -110,7 +110,7 @@ from .access_control import (
     normalize_sink_destination,
     parse_declared_shell_commands,
 )
-from .event_logger import log_event, get_events_path, get_logger
+from .event_logger import log_event, log_event_sync, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
@@ -1081,7 +1081,7 @@ class PollerConfig:
     #: Suppressed fires skip the subprocess entirely, so the poller's
     #: cursor stays frozen and catches up on the next tick after
     #: recovery — no events are lost, only delayed.
-    priority: str = "normal"
+    priority: Priority = Priority.NORMAL
     pass_env: tuple[str, ...] = ()
     # Server-owned trust derivation selected from operator-reviewed manifest
     # configuration. Poller stdout cannot override this value.
@@ -1498,6 +1498,28 @@ def _parse_poller_overrides_raw(
                 if rejections is not None:
                     rejections.append((path, str(name), f"unknown override field {key!r}"))
                 continue
+            if key == "priority":
+                try:
+                    value = Priority(
+                        value.strip().lower() if isinstance(value, str) else value
+                    )
+                except (ValueError, TypeError):
+                    reason = f"invalid priority override {value!r}; expected low|normal|high"
+                    msg = f"poller_overrides_invalid_priority: {path} - {name}.priority={value!r}"
+                    if strict:
+                        raise PollerOverridesValidationError(msg)
+                    log.error("%s; keeping skill default", msg)
+                    if rejections is not None:
+                        rejections.append((path, str(name), reason))
+                    try:
+                        log_event_sync(
+                            "poller_overrides_invalid_priority",
+                            path=str(path), name=str(name), value=value,
+                            action="keep_skill_default",
+                        )
+                    except Exception:  # telemetry must not interrupt boot
+                        log.exception("Could not emit priority configuration error")
+                    continue
             if strict and key == "env":
                 if not isinstance(value, dict):
                     raise PollerOverridesValidationError(
@@ -1569,8 +1591,9 @@ def load_poller_overrides(
     file logs one warning and applies nothing (the manifests keep
     working), and unknown FIELDS inside an entry are dropped with a
     warning so a typo can't smuggle arbitrary keys into PollerConfig.
-    Sync context (discovery runs before the event loop) → ``log.warning``,
-    same as the other discovery diagnostics.
+    Invalid priorities are rejected here, with an error event even when no
+    discovery diagnostics collector is supplied. Other fields still apply;
+    the skill priority is retained and boot continues.
     """
     if path is None or not path.is_file():
         return {}
@@ -1628,16 +1651,7 @@ def _apply_poller_overrides(
             )
             reject(f"invalid cron override {cron!r}: {exc}")
     if "priority" in overrides:
-        raw_p = overrides["priority"]
-        norm = normalize_priority(raw_p, default=poller.priority)
-        if not (isinstance(raw_p, str) and raw_p.strip().lower() == norm):
-            log.warning(
-                "poller_overrides_invalid_priority: %s — %s.priority=%r "
-                "(expected low|normal|high); keeping %r",
-                source, poller.name, raw_p, norm,
-            )
-            reject(f"invalid priority override {raw_p!r}")
-        updates["priority"] = norm
+        updates["priority"] = overrides["priority"]
     if "batch_size" in overrides:
         try:
             bs = int(overrides["batch_size"])
@@ -2138,7 +2152,7 @@ def discover_pollers(
             # warning — a typo shouldn't silently promote a poller to
             # ride through quota pressure (or demote it to shed early).
             raw_priority = entry.get("priority")
-            priority = "normal"
+            priority = Priority.NORMAL
             if raw_priority is not None:
                 priority = normalize_priority(raw_priority)
                 if not (
@@ -2259,6 +2273,24 @@ def discover_pollers(
                     ))
                 continue
         schedulable.append(poller)
+    log.info(
+        "poller_priorities: %s",
+        json.dumps([
+            {
+                "name": p.name,
+                "priority": p.priority,
+                "source": (
+                    "operator_override" if "priority" in overrides.get(p.name, {})
+                    else "skill_default"
+                ),
+                "path": str(
+                    overrides_path if "priority" in overrides.get(p.name, {})
+                    else p.manifest_path
+                ),
+            }
+            for p in schedulable
+        ]),
+    )
     return schedulable
 
 
