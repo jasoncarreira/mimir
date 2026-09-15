@@ -539,6 +539,7 @@ async def _retain_gate_failure(
                 exported = await _run_compute_gate(
                     shlex.join(["python3", "-I", "-c", script]),
                     checkout=checkout, work_spec=replace(work_spec, output_root=export_root), compute=compute,
+                    diagnostic=True,
                 )
                 if exported.exit_code or exported.timed_out or exported.output_overflow:
                     raise ValueError("tmp_export_failed")
@@ -767,6 +768,7 @@ async def _observe_evidence_from_ref(
                             cleanup = await _run_compute_gate(
                                 shlex.join(["python3", "-I", "-c", "import shutil; shutil.rmtree(" + repr(str(tmp.relative_to(checkout.resolve()))) + ")"]),
                                 checkout=checkout, work_spec=replace(work_spec, output_root=None), compute=compute,
+                                diagnostic=True,
                             )
                             if cleanup.exit_code != 0:
                                 raise OSError("tmp_cleanup_failed")
@@ -877,11 +879,16 @@ async def _run_compute_gate(
     compute: ComputeBackend,
     on_launch: Callable[[LaunchHandle], None] | None = None,
     report_dir: Path | None = None,
+    diagnostic: bool = False,
 ) -> ComputeResult:
+    # Diagnostics get their own job budget, never the test's full allowance.
+    # Keep deadline enforcement and bounded process teardown in compute.wait;
+    # the worker-side timeout must agree with that supervisor too.
     gate_spec = replace(
         work_spec,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
+        timeout_s=min(work_spec.timeout_s, 60) if diagnostic else work_spec.timeout_s,
     )
     if report_dir is not None:
         report_option_dir = report_dir
