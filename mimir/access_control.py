@@ -5558,7 +5558,11 @@ def saga_mutation_taint_refusal(
 def _live_untrusted_active_ingest(
     auth_context: Any, fallback: Any,
 ) -> bool | None:
-    """Read taint from the server-owned live IFC state, or report indeterminate."""
+    """Read taint from the server-owned live IFC state, or report indeterminate.
+
+    Live gates must use this query (or the fail-closed wrapper below), never
+    infer taint from source integrity or a persisted trust summary alone.
+    """
     state = getattr(auth_context, "ifc_state", None)
     predicate = getattr(state, "has_untrusted_active_ingest", None)
     if not callable(predicate):
@@ -5778,7 +5782,7 @@ def _ifc_blocking_source(
     sink_category: SinkCategory,
 ) -> tuple[Any | None, str]:
     """Classify one source for an IFC refusal and the certainty of the match."""
-    from .models import InformationFlowLabels, Integrity, IntegrityEffect
+    from .models import InformationFlowLabels
 
     current = ifc_labels
     state = getattr(auth_context, "ifc_state", None)
@@ -5822,10 +5826,7 @@ def _ifc_blocking_source(
     # This predicate is itself the gate for application egress and disables the
     # trusted-operator exemptions for shell, file, spawn, and channel sinks.
     for source in current.sources:
-        if (
-            source.integrity == Integrity.UNTRUSTED
-            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
-        ):
+        if source.has_untrusted_active_ingest:
             return source, "causing_source"
 
     # The remaining gate rules evaluate the labels as a set. Preserve a bounded

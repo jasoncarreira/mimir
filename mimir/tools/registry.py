@@ -614,10 +614,7 @@ def _render_approval_source_summary(
     active_count = 0
     omitted_count = 0
     for source in sources:
-        if (
-            source.integrity == Integrity.UNTRUSTED
-            and source.integrity_effect == IntegrityEffect.ACTIVE_INGEST
-        ):
+        if source.has_untrusted_active_ingest:
             active_count += 1
             if source != displayed_source:
                 key = _approval_source_group_key(source)
