@@ -151,25 +151,75 @@ jobs:
         run: |
           python3 - <<'PY'
           import fnmatch
+          import json
           import os
           from pathlib import Path
-          import shutil
           import stat
           import tempfile
+          from urllib.parse import quote
+
+          def safe_component(part):
+              # Escape '%' too, so literal escape-looking names cannot collide.
+              # Escape dots to avoid upload-artifact's hidden-file exclusion.
+              encoded = quote(part, safe="", errors="surrogatepass").replace(".", "%2E")
+              # '+' is escaped by quote; '+/' uniquely marks a continuation.
+              return "+/".join(encoded[i:i + 200] for i in range(0, len(encoded), 200))
 
           root = Path(os.environ["PYTEST_EVIDENCE_ROOT"])
-          staged = Path(tempfile.mkdtemp(prefix="mimir-pytest-upload-", dir="/tmp"))
+          staged = Path(tempfile.mkdtemp(prefix="mimir-pytest-upload-", dir="/tmp")).resolve()
+          long_paths = {}
           patterns = [Path(p).name for p in os.environ["PYTEST_EVIDENCE_PATHS"].splitlines()]
-          for directory, _, files in os.walk(root, followlinks=False):
-              for name in files:
+          max_files = 5000
+          max_bytes = 100 * 1024 * 1024
+          max_file_bytes = 5 * 1024 * 1024
+          count = total = truncated = 0
+          stopped = False
+          for directory, directories, files in os.walk(root, followlinks=False):
+              directories.sort()
+              for name in sorted(files):
                   source = Path(directory) / name
                   if not stat.S_ISREG(source.lstat().st_mode):
                       continue
                   if not any(fnmatch.fnmatchcase(name, p) for p in patterns):
                       continue
-                  target = staged / source.relative_to(root)
+                  if count >= max_files or total >= max_bytes:
+                      stopped = True
+                      break
+                  target = staged.joinpath(*(safe_component(part) for part in source.relative_to(root).parts))
+                  # Bound the entire physical path, not only NAME_MAX components.
+                  # Leave headroom below macOS PATH_MAX (1024, including NUL).
+                  if len(os.fsencode(target)) > 900:
+                      # '+' cannot appear literally in encoded source components.
+                      # The copy ordinal is unique without relying on hash collisions.
+                      relative = f"+long/{count:04d}"
+                      long_paths[relative] = "/".join(
+                          quote(part, safe="", errors="surrogatepass").replace(".", "%2E")
+                          for part in source.relative_to(root).parts
+                      )
+                      target = staged / relative
                   target.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copyfile(source, target)
+                  allowance = min(max_file_bytes, max_bytes - total)
+                  with source.open("rb") as incoming, target.open("wb") as outgoing:
+                      data = incoming.read(allowance)
+                      outgoing.write(data)
+                      truncated += bool(incoming.read(1))
+                  count += 1
+                  total += len(data)
+              if stopped:
+                  break
+          (staged / "STAGING.txt").write_text(
+              "Paths are percent-encoded per component (including dots). Decode by removing "
+              "'+/' continuations, then urllib.parse.unquote(path, errors='surrogatepass').\n"
+              f"Limits: {max_files} files, {max_bytes} payload bytes, {max_file_bytes} bytes/file.\n"
+              "Files retain their first bytes when truncated; traversal is sorted depth-first.\n"
+              f"Copied: {count} files, {total} bytes; truncated files: {truncated}; "
+              f"stopped before remaining evidence: {stopped}.\n"
+              "Paths exceeding 900 physical-path bytes use +long/<copy ordinal>.\n"
+              "Long-path mapping (JSON: staged path -> percent-encoded original path); "
+              "decode values with urllib.parse.unquote(value, errors='surrogatepass'):\n"
+              + json.dumps(long_paths, ensure_ascii=True, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               print(f"path={staged}", file=output)
           PY
