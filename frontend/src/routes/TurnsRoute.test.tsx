@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import React from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -42,6 +42,79 @@ afterEach(() => {
 });
 
 describe("TurnsRoute", () => {
+  it.each([
+    { state: "healthy data", turns: turnsFixture.turns, degraded: false },
+    { state: "healthy empty", turns: [], degraded: false },
+    { state: "unreadable", turns: [], degraded: true },
+    { state: "partial data", turns: turnsFixture.turns, degraded: true }
+  ])("distinguishes $state from other log states", async ({ turns, degraded }) => {
+    turnsApi.listTurns.mockResolvedValue({
+      ok: true, version: "v1", data: { turns, ...(degraded ? { degraded: true } : {}), error: "secret-canary" }
+    });
+    renderTurns();
+    await waitFor(() => expect(screen.queryByText("Loading turns")).toBeNull());
+    expect(Boolean(screen.queryByRole("list", { name: "Turns" }))).toBe(turns.length > 0);
+    expect(Boolean(screen.queryByText("No turns match the current filter"))).toBe(!degraded && !turns.length);
+    expect(Boolean(screen.queryByRole("alert"))).toBe(degraded);
+    if (degraded) {
+      expect(screen.getByRole("alert").textContent).toContain("Turns log could not be read");
+      expect(screen.queryByText("live")).toBeNull();
+    }
+    expect(screen.queryByText(/secret-canary/)).toBeNull();
+  });
+
+  it("preserves loaded rows on a degraded refresh and clears the warning on a healthy refresh", async () => {
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: turnsFixture.turns } });
+    renderTurns();
+    await screen.findByRole("list", { name: "Turns" });
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: [], degraded: true } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("Turns log could not be read");
+    expect(screen.getByRole("list", { name: "Turns" })).toBeTruthy();
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: [] } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await screen.findByText("No turns match the current filter");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("surfaces degraded polling and permits retrying a degraded older page", async () => {
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: turnsFixture.turns, degraded: true } });
+    const view = renderTurns();
+    await screen.findByRole("list", { name: "Turns" });
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: [], degraded: true } });
+    fireEvent.click(screen.getByRole("button", { name: "Load older" }));
+    await waitFor(() => expect(turnsApi.listTurns).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Load older" }).hasAttribute("disabled")).toBe(false);
+
+    turnsApi.listTurns.mockResolvedValue({ data: { turns: turnsFixture.turns } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    vi.useFakeTimers();
+    try {
+      turnsApi.listTurns.mockResolvedValue({ data: { turns: [], degraded: true } });
+      // Remount so this component's polling interval belongs to the fake clock.
+      view.unmount();
+      turnsApi.listTurns.mockResolvedValueOnce({ data: { turns: turnsFixture.turns } });
+      const polled = renderTurns();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(screen.getByRole("alert").textContent).toContain("Turns log could not be read");
+      expect(screen.getByRole("list", { name: "Turns" })).toBeTruthy();
+      turnsApi.listTurns.mockResolvedValue({ data: { turns: [] } });
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(screen.getByRole("alert")).toBeTruthy();
+      // Even an identical healthy snapshot (React Query structural sharing) repairs the warning.
+      turnsApi.listTurns.mockResolvedValue({ data: { turns: turnsFixture.turns } });
+      fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(screen.queryByRole("alert")).toBeNull();
+      polled.unmount();
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
   it("renders a representative turn with reasoning, tool calls, placeholders, feedback, related context, and collapsed sections", async () => {
     turnsApi.listTurns.mockResolvedValue({
       ok: true,

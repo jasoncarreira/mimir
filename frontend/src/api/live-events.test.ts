@@ -94,6 +94,49 @@ describe("createLiveEventStream", () => {
     handle.close();
   });
 
+  it("delivers degradation as a control frame without moving the cursor or reconnecting", async () => {
+    vi.useFakeTimers();
+    const onItem = vi.fn();
+    const onCursor = vi.fn();
+    const onDegraded = vi.fn();
+    const onError = vi.fn();
+    const onMalformedFrame = vi.fn();
+    let stream!: ReadableStreamDefaultController<Uint8Array>;
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) { stream = controller; }
+    })));
+    const handle = createLiveEventStream(onItem, {
+      fetchImpl,
+      initialCursor: "initial",
+      reconnectDelayMs: 10,
+      onCursor,
+      onDegraded,
+      onError,
+      onMalformedFrame
+    });
+    const encoder = new TextEncoder();
+    try {
+      stream.enqueue(encoder.encode('id: control-cursor\nevent: state-degraded\ndata: {"degraded":true}\n\n'));
+      await vi.waitFor(() => expect(onDegraded).toHaveBeenCalledOnce());
+      expect(handle.getCursor()).toBe("initial");
+      expect(onCursor).not.toHaveBeenCalled();
+      expect(onItem).not.toHaveBeenCalled();
+
+      stream.enqueue(encoder.encode('id: cursor-1\nevent: live-event\ndata: {"id":"event-1","cursor":"cursor-1","event":{"kind":"turn.lifecycle","turn_id":"t1"}}\n\n'));
+      await vi.waitFor(() => expect(onItem).toHaveBeenCalledOnce());
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handle.getCursor()).toBe("cursor-1");
+      expect(onCursor).toHaveBeenCalledExactlyOnceWith("cursor-1");
+      expect(handle.getMalformedFrameCount()).toBe(0);
+      expect(onMalformedFrame).not.toHaveBeenCalled();
+      expect(onError).not.toHaveBeenCalled();
+      expect(fetchImpl).toHaveBeenCalledOnce();
+    } finally {
+      handle.close();
+      stream.close();
+    }
+  });
+
   it("does not advance the cursor when the event consumer throws", async () => {
     const onError = vi.fn();
     const fetchImpl = vi.fn().mockResolvedValueOnce(sseResponse(

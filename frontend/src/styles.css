@@ -487,6 +487,10 @@ textarea {
   background: var(--mimir-color-status-danger-background, #f8e4e4);
 }
 
+.log-read-warning__message {
+  color: var(--mimir-color-text);
+}
+
 .ui-state--loading {
   min-height: auto;
   grid-auto-flow: column;

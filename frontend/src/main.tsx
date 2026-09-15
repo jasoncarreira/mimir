@@ -22,7 +22,7 @@ import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
 import { AdminRoute } from "./routes/AdminRoute";
-import { LiveEventsProvider, useLiveEvents } from "./live-events";
+import { LiveEventsProvider, LiveEventsWarning, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
 import { OpsRoute, UsageRoute } from "./routes/OpsRoute";
 import { SchedulerRoute } from "./routes/SchedulerRoute";
@@ -707,6 +707,7 @@ function TopNavShell({ surfaces, firstRoute, bootstrap }: ShellProps) {
         <AppNavigation surfaces={surfaces} />
       </div>
       <main className="app-main" id="main-content">
+        <LiveEventsWarning />
         <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
       </main>
       <AppStatus />
@@ -743,6 +744,7 @@ function SidebarShell({ surfaces, firstRoute, agentState, bootstrap, error, isEr
           <AuthPanel bootstrap={bootstrap} error={error} isError={isError} isLoading={isLoading} />
         </div>
         <main className="app-main" id="main-content">
+          <LiveEventsWarning />
           <DashboardRoutes surfaces={surfaces} firstRoute={firstRoute} />
         </main>
       </div>

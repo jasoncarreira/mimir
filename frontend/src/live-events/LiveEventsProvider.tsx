@@ -3,6 +3,7 @@ import { createLiveEventStream, type LiveEventStreamItem } from "../api/live-eve
 import type { TurnRecord } from "../api/generated/contracts";
 import { isAuthenticationSseError } from "../api/sse-reconnect";
 import { useUiState } from "../uiState";
+import { LogReadWarning } from "../LogReadWarning";
 
 type QueryKey = readonly unknown[];
 
@@ -23,6 +24,7 @@ export interface LiveEventsContextValue {
   cursor: string;
   lastEvent: LiveEventStreamItem | null;
   error: unknown;
+  degraded: boolean;
 }
 
 const LiveEventsContext = React.createContext<LiveEventsContextValue | null>(null);
@@ -75,7 +77,8 @@ export function LiveEventsProvider({
     status: enabled ? "connecting" : "closed",
     cursor: initialCursor,
     lastEvent: null,
-    error: null
+    error: null,
+    degraded: false
   });
   const invalidateTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const policyRef = React.useRef(cachePolicy);
@@ -84,10 +87,10 @@ export function LiveEventsProvider({
   React.useEffect(() => {
     if (!enabled) {
       // Not signed in (or auth policy still unknown): stay closed, no fetch.
-      setValue((current) => ({ ...current, status: "closed" }));
+      setValue((current) => ({ ...current, status: "closed", degraded: false }));
       return;
     }
-    setValue((current) => ({ ...current, status: "connecting", error: null }));
+    setValue((current) => ({ ...current, status: "connecting", error: null, degraded: false }));
 
     const flushAggregateInvalidations = () => {
       invalidateTimer.current = null;
@@ -136,6 +139,8 @@ export function LiveEventsProvider({
         initialCursor,
         onOpen: () => setValue((current) => ({ ...current, status: "open", error: null })),
         onCursor: (cursor) => setValue((current) => ({ ...current, cursor })),
+        // The stream has no recovery frame; ordinary events can still be partial.
+        onDegraded: () => setValue((current) => ({ ...current, degraded: true })),
         onError: (error) => {
           const reauthenticate = isAuthenticationSseError(error);
           if (reauthenticate) useUiState.getState().setApiKeyRejected(true);
@@ -166,4 +171,8 @@ export function useLiveEvents(): LiveEventsContextValue {
   const value = React.useContext(LiveEventsContext);
   if (!value) throw new Error("LiveEventsProvider missing");
   return value;
+}
+
+export function LiveEventsWarning() {
+  return useLiveEvents().degraded ? <LogReadWarning log="Events" /> : null;
 }
