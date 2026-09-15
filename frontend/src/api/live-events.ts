@@ -16,6 +16,7 @@ export interface LiveEventStreamOptions {
   onOpen?: () => void;
   onError?: (error: unknown) => void;
   onCursor?: (cursor: string) => void;
+  onDegraded?: () => void;
   onMalformedFrame?: (error: unknown, cursor: string) => void;
 }
 
@@ -25,7 +26,7 @@ export interface LiveEventStreamHandle {
   getMalformedFrameCount(): number;
 }
 
-function parseSseBlock(block: string): { data: string; cursor: string } | null {
+function parseSseBlock(block: string): { data: string; cursor: string; event: string } | null {
   const data = block
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -36,13 +37,17 @@ function parseSseBlock(block: string): { data: string; cursor: string } | null {
     .split(/\r?\n/)
     .find((line) => line.startsWith("id:"))
     ?.slice(3).trim() ?? "";
-  return { data, cursor };
+  const event = block
+    .split(/\r?\n/)
+    .find((line) => line.startsWith("event:"))
+    ?.slice(6).trim() ?? "";
+  return { data, cursor, event };
 }
 
 async function readSse(
   response: Response,
   signal: AbortSignal,
-  onBlock: (data: string, cursor: string) => void
+  onBlock: (data: string, cursor: string, event: string) => void
 ): Promise<void> {
   if (!response.body) throw new Error("live-events response body missing");
   const reader = response.body.getReader();
@@ -57,14 +62,14 @@ async function readSse(
     buffer = parts.pop() ?? "";
     for (const part of parts) {
       const parsed = parseSseBlock(part);
-      if (parsed) onBlock(parsed.data, parsed.cursor);
+      if (parsed) onBlock(parsed.data, parsed.cursor, parsed.event);
     }
   }
 
   buffer += decoder.decode();
   if (buffer && !signal.aborted) {
     const parsed = parseSseBlock(buffer);
-    if (parsed) onBlock(parsed.data, parsed.cursor);
+    if (parsed) onBlock(parsed.data, parsed.cursor, parsed.event);
   }
 }
 
@@ -84,6 +89,7 @@ export function createLiveEventStream(
     onOpen,
     onError,
     onCursor,
+    onDegraded,
     onMalformedFrame
   } = options;
   const controller = new AbortController();
@@ -117,13 +123,19 @@ export function createLiveEventStream(
     onMalformedFrame?.(error, cursor);
   };
 
-  const parseAndDeliver = (data: string, frameCursor: string) => {
+  const parseAndDeliver = (data: string, frameCursor: string, event: string) => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(data);
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       skipMalformedFrame(error, frameCursor);
+      return;
+    }
+    if (event === "state-degraded") {
+      if (parsed && typeof parsed === "object" && "degraded" in parsed && parsed.degraded === true) {
+        onDegraded?.();
+      }
       return;
     }
     if (

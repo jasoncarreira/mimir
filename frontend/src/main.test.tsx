@@ -82,6 +82,7 @@ vi.mock("./api", async (orig) => ({
 // doesn't exercise.
 vi.mock("./live-events", () => ({
   LiveEventsProvider: ({ children }: { children: ReactNode }) => children,
+  LiveEventsWarning: () => null,
   useLiveEvents: () => liveEventsState
 }));
 vi.mock("./skins/SkinProvider", () => ({

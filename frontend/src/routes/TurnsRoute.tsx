@@ -5,6 +5,7 @@ import { listSessions, listTurns, type TurnRecord } from "../api";
 import type { ConversationSession } from "../api/generated/contracts";
 import { drilldownHref } from "../routeState";
 import { TurnDetailsPanel } from "../TurnDetailsPanel";
+import { LogReadWarning } from "../LogReadWarning";
 import { TriggerPill } from "./triggerPill";
 import {
   Badge,
@@ -42,6 +43,7 @@ function useTurnPages() {
   const [allOlderLoaded, setAllOlderLoaded] = React.useState(false);
   const [loadError, setLoadError] = React.useState<Error | null>(null);
   const [loadingOlder, setLoadingOlder] = React.useState(false);
+  const [degraded, setDegraded] = React.useState(false);
   const newestId = turns[0]?.turn_id;
   const oldestId = turns[turns.length - 1]?.turn_id;
 
@@ -49,24 +51,30 @@ function useTurnPages() {
     queryKey: ["turns", "initial", PAGE_SIZE],
     queryFn: async () => {
       const envelope = await listTurns({ limit: PAGE_SIZE }, { cache: "no-store" });
-      return envelope.data.turns;
+      return envelope.data;
     },
     refetchInterval: newestId ? false : 5000
   });
 
   React.useEffect(() => {
     if (!initial.data) return;
-    const page = safeTurns(initial.data).reverse();
-    setTurns(page);
-    setAllOlderLoaded(page.length < PAGE_SIZE);
+    const page = safeTurns(initial.data.turns).reverse();
+    const unreadable = initial.data.degraded === true;
+    setDegraded(unreadable);
+    setTurns((current) => unreadable
+      ? [...page, ...current.filter((turn) => !page.some((item) => item.turn_id === turn.turn_id))]
+      : page);
+    setAllOlderLoaded(!unreadable && page.length < PAGE_SIZE);
     setLoadError(null);
-  }, [initial.data]);
+  }, [initial.data, initial.dataUpdatedAt]);
 
   React.useEffect(() => {
     if (!newestId) return;
     const id = window.setInterval(() => {
       listTurns({ after: newestId }, { cache: "no-store" })
         .then((envelope) => {
+          // A healthy incremental page cannot repair gaps in previously loaded history.
+          if (envelope.data.degraded === true) setDegraded(true);
           const fresh = safeTurns(envelope.data.turns).reverse();
           if (fresh.length) {
             setTurns((current) => [
@@ -87,7 +95,8 @@ function useTurnPages() {
     try {
       const envelope = await listTurns({ before: oldestId, limit: PAGE_SIZE }, { cache: "no-store" });
       const older = safeTurns(envelope.data.turns).reverse();
-      setAllOlderLoaded(older.length < PAGE_SIZE);
+      if (envelope.data.degraded === true) setDegraded(true);
+      setAllOlderLoaded(envelope.data.degraded !== true && older.length < PAGE_SIZE);
       setTurns((current) => [
         ...current,
         ...older.filter((turn) => !current.some((existing) => existing.turn_id === turn.turn_id))
@@ -102,6 +111,7 @@ function useTurnPages() {
 
   return {
     turns,
+    degraded,
     isLoading: initial.isLoading,
     isError: initial.isError,
     initialError: initial.error,
@@ -372,7 +382,7 @@ export function TurnsRoute() {
   const [sessionTo, setSessionTo] = React.useState(searchParams.get("to") || "");
   const [sessionQuery, setSessionQuery] = React.useState(searchParams.get("q") || searchParams.get("filter") || "");
   const [sessionBrowserOpen, setSessionBrowserOpen] = React.useState(false);
-  const { turns, isLoading, isError, initialError, loadError, loadingOlder, allOlderLoaded, loadOlder, refetch } = useTurnPages();
+  const { turns, degraded, isLoading, isError, initialError, loadError, loadingOlder, allOlderLoaded, loadOlder, refetch } = useTurnPages();
   const selectedId = searchParams.get("turn");
   const selectedSessionId = searchParams.get("session");
   const channelParam = searchParams.get("channel") || "";
@@ -495,7 +505,7 @@ export function TurnsRoute() {
           <p>{visibleTurns.length === turns.length ? `${turns.length} loaded` : `${visibleTurns.length} / ${turns.length} loaded`}</p>
         </div>
         <div className="turns-header-actions">
-          <Badge tone={loadError || isError ? "danger" : "success"}>{loadError || isError ? "stale" : "live"}</Badge>
+          <Badge tone={degraded || loadError || isError ? "danger" : "success"}>{degraded ? "degraded" : loadError || isError ? "stale" : "live"}</Badge>
           <Button onClick={() => refetch()}>Refresh</Button>
         </div>
       </div>
@@ -533,16 +543,17 @@ export function TurnsRoute() {
               />
             </div>
             {isLoading ? <LoadingState label="Loading turns" /> : null}
+            {degraded ? <LogReadWarning log="Turns" /> : null}
             {isError ? (
               <ErrorState title="Could not load turns">
                 {initialError instanceof Error ? initialError.message : String(initialError)}
               </ErrorState>
             ) : null}
             {loadError ? <ErrorState title="Turn refresh failed">{loadError.message}</ErrorState> : null}
-            {selectedId && !selectedTurn && !isLoading && !isError ? (
+            {selectedId && !selectedTurn && !isLoading && !isError && !degraded ? (
               <ErrorState title="Turn not found">No loaded turn matches {selectedId}. Load older turns or adjust the URL filters.</ErrorState>
             ) : null}
-            {!isLoading && !isError ? (
+            {!isLoading && !isError && (!degraded || visibleTurns.length > 0) ? (
               <TurnList
                 allOlderLoaded={allOlderLoaded}
                 loadingOlder={loadingOlder}

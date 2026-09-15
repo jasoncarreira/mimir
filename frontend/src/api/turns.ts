@@ -20,7 +20,8 @@ export type {
   SessionsData
 };
 
-export type TurnsResponse = TurnsData;
+// The read API also reports log degradation; generated record types omit it.
+export type TurnsResponse = TurnsData & { degraded?: boolean };
 
 export interface ListTurnsParams {
   limit?: number;
@@ -51,9 +52,9 @@ export function normalizeListTurnsParams(params: ListTurnsParams = {}): ListTurn
 export function listTurns(
   params: ListTurnsParams = {},
   options?: RequestInit & ApiClientOptions
-): Promise<ApiSuccessEnvelope<TurnsData, ListMeta>> {
+): Promise<ApiSuccessEnvelope<TurnsResponse, ListMeta>> {
   const normalized = normalizeListTurnsParams(params);
-  return apiFetchEnvelope<TurnsData, ListMeta>(
+  return apiFetchEnvelope<TurnsResponse, ListMeta>(
     `/api/v1/turns${buildQuery({
       limit: normalized.limit,
       after: normalized.after,
