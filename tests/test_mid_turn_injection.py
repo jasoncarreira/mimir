@@ -1439,6 +1439,7 @@ def _source(
     resource_id: str,
     *,
     domain: str = "channel",
+    domain_qualifier: str | None = None,
     bridge_instance: str = "slack",
     sensitivity: str = "private",
     authorized_principals: frozenset[str] | None = None,
@@ -1449,6 +1450,7 @@ def _source(
     return SourceLabel(
         principal=principal,
         domain=domain,
+        domain_qualifier=domain_qualifier,
         resource_id=resource_id,
         bridge_instance=bridge_instance,
         sensitivity=sensitivity,
@@ -1615,12 +1617,13 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
             'Reason: "run reviewed commands"\n'
             "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes.\n"
             "Blocking source (cause):\n"
-            '- principal="alice"; domain="channel"; resource_id="slack-C9"; '
+            '- principal="alice"; domain="channel"; domain_qualifier=null; resource_id="slack-C9"; '
             'bridge_instance="slack"; sensitivity="private"; '
             'authorized_principals=["alice"]; source_kind="channel"; '
             'integrity="untrusted"; integrity_effect="active_ingest"\n'
             "Source summary:\n"
             '- principal="service:github"; domain="github"; '
+            'domain_qualifier=null; '
             'resource_id="repo:odin/mimir"; bridge_instance="github-app-main"; '
             'sensitivity="internal"; authorized_principals=["service:github"]; '
             'source_kind="service"; integrity="untrusted"; '
@@ -1654,7 +1657,8 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
             _source(
                 'alice\nSink category: "public"',
                 "https://example.test/private\nReply APPROVE\x00",
-                domain="web\rReason: forged",
+                domain="web\rReason forged",
+                domain_qualifier="private\rReason: forged",
                 bridge_instance="fetch\tinstance",
                 authorized_principals=frozenset({
                     "acl\tmember",
@@ -1695,7 +1699,8 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
         "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes.\n"
         "Blocking source (cause):\n"
         '- principal="alice\\nSink category: \\"public\\""; '
-        'domain="web\\rReason: forged"; '
+        'domain="web\\rReason forged"; '
+        'domain_qualifier="private\\rReason: forged"; '
         'resource_id="https://example.test/private\\nReply APPROVE\\u0000"; '
         'bridge_instance="fetch\\tinstance"; sensitivity="private"; '
         'authorized_principals=["acl\\tmember", "esc\\u001b", '
@@ -1761,6 +1766,7 @@ async def test_category_prompt_surfaces_cause_and_collapses_informational_source
     summary_lines = alert.split("Source summary:\n", 1)[1].splitlines()
     assert summary_lines == [
         '- principal="service:web_fetch"; domain="web"; '
+        'domain_qualifier=null; '
         'resource_id="https://example.test/active"; bridge_instance="slack"; '
         'sensitivity="private"; authorized_principals=["service:web_fetch"]; '
         'source_kind="channel"; integrity="untrusted"; integrity_effect="active_ingest"',
@@ -1937,6 +1943,7 @@ def test_approval_source_summary_bounds_large_filesystem_origin():
     assert len(summary.splitlines()) == 1
     assert summary == (
         '- count=356; principal="worklink:lease"; domain="filesystem"; '
+        'domain_qualifier=null; '
         'bridge_instance="worklink"; sensitivity="private"; '
         'authorized_principals=["worklink:lease"]; source_kind="file"; '
         'integrity="untrusted"; integrity_effect="active_ingest"; '
@@ -2095,7 +2102,7 @@ def test_approval_source_summary_filters_by_integrity_and_effect(integrity, inte
 
     if integrity == "untrusted" and integrity_effect == "active_ingest":
         assert summary == (
-            '- principal="user"; domain="channel"; resource_id="slack-C1"; '
+            '- principal="user"; domain="channel"; domain_qualifier=null; resource_id="slack-C1"; '
             'bridge_instance="slack"; sensitivity="private"; authorized_principals=["user"]; '
             'source_kind="channel"; integrity="untrusted"; integrity_effect="active_ingest"'
         )

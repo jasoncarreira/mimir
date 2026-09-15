@@ -5067,6 +5067,30 @@ def _trusted_operator_write_auth(*, admin: bool = False) -> AuthContext:
     )
 
 
+@pytest.mark.parametrize("auth_qualifier,source_qualifier,allowed", [
+    (None, None, True),
+    ("private", "private", True),
+    ("private", "public", False),
+    (None, "private", False),
+    ("private", None, False),
+    (None, "", False),
+])
+def test_trusted_operator_ingress_requires_matching_qualifier(
+    auth_qualifier: str | None, source_qualifier: str | None, allowed: bool,
+) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    labels = replace(auth.ifc_labels, sources=(replace(
+        auth.ifc_labels.sources[0], domain_qualifier=source_qualifier,
+    ),))
+    auth = replace(auth, domain_qualifier=auth_qualifier, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        "shell_exec", "pwd", labels, auth, enforce=True,
+    )
+    assert decision.allowed is allowed, decision.reason
+    assert SinkGate._is_trusted_operator_turn(labels, auth) is allowed
+
+
 def _tainted_admin_operator_write_auth() -> AuthContext:
     auth = _trusted_operator_write_auth(admin=True)
     untrusted = SourceLabel(
@@ -7068,6 +7092,7 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     assert event["ifc_source"] == {
         "source_kind": "protected_prompt",
         "domain": "recent_activity",
+        "domain_qualifier": None,
         "integrity": "untrusted",
         "integrity_effect": "active_ingest",
         "resource_id": (
@@ -9338,6 +9363,73 @@ def test_forge_review_allowed_sinks_requires_exact_repository_scope(boundary: st
     )
 
     assert allowed == (frozenset({target}) if boundary == "same" else frozenset())
+
+
+@pytest.mark.parametrize("qualifier", [None, "private", ""])
+def test_forge_sink_allowance_requires_unqualified_repository(qualifier) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    source = _repository_result_labels("owner/repo", 17, scope.observed_head_sha).sources[0]
+    labels = InformationFlowLabels().with_source(replace(source, domain_qualifier=qualifier))
+    auth = replace(auth, ifc_labels=labels)
+
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is (qualifier is None), decision.reason
+    assert decision.forge_scope_mismatch is None
+
+
+@pytest.mark.parametrize("qualifier", [None, "private", ""])
+def test_forge_scope_mismatch_ignores_qualified_repository(qualifier) -> None:
+    from mimir.forge import IssueTarget
+
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("issue_comment",), creation_path="test",
+    )
+    source = _repository_result_labels("other/repo", 17, "a" * 40).sources[0]
+    labels = InformationFlowLabels().with_channel("poller:test").with_source(replace(
+        source, domain_qualifier=qualifier,
+    ))
+    scope = IssueTarget("owner/repo", 220)
+    mismatch = access_control._forge_repository_scope_mismatch(labels, scope)
+    # The service's same-origin allowance isolates the earlier scope rejection
+    # from the independent unqualified-repository sink allowance.
+    decision = SinkGate.check_sink_flow(
+        "issue_comment", "owner/repo#issue/220", labels, _service_auth(service, labels),
+        enforce=True, sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is (qualifier is not None), decision.reason
+    assert mismatch == (("other/repo", "17", "canonical_repo") if qualifier is None else None)
+
+
+@pytest.mark.parametrize("qualifier", [None, "private", ""])
+def test_repository_provenance_trust_requires_matching_qualifier(qualifier) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    authorization = access_control.ToolAuthorization(
+        tool_name="pr_metadata", decision=OperationDecision.RESOURCE_SCOPED,
+        allowed=True, repo_pr_action_scope=scope,
+    )
+    baseline = classify_protected_result("pr_metadata", {}, auth, authorization)
+    assert baseline is not None
+    provenance = access_control.ProtectedResultProvenance((replace(
+        baseline.sources[0], integrity="trusted", domain_qualifier=qualifier,
+    ),))
+    labels = classify_protected_result(
+        "pr_metadata", {}, auth, authorization, provenance=provenance,
+    )
+    assert labels is not None
+    source = labels.sources[0]
+    labels = auth.ifc_labels.with_source(labels.sources[0])
+    auth = replace(auth, ifc_labels=labels)
+    decision = SinkGate.check_sink_flow("shell_exec", "pwd", labels, auth, enforce=True)
+    assert decision.allowed is (qualifier is None), decision.reason
+    assert source.integrity == ("trusted" if qualifier is None else "untrusted")
+    assert source.domain_qualifier is None
 
 
 def test_forge_repository_result_from_different_repository_is_refused() -> None:
@@ -14205,8 +14297,10 @@ def test_review_skill_only_demonstrates_commands_the_poller_can_run() -> None:
     )
 
 
+@pytest.mark.parametrize("qualifier", [None, "private", ""])
 def test_issue_comment_authorization_requires_and_matches_repository_source(
     monkeypatch: pytest.MonkeyPatch,
+    qualifier: str | None,
 ) -> None:
     from mimir.forge import IssueTarget
     from mimir.tools.forge import set_forge_client
@@ -14229,6 +14323,7 @@ def test_issue_comment_authorization_requires_and_matches_repository_source(
     )
     source = SourceLabel(
         principal="service:poller:github-activity", domain="repository",
+        domain_qualifier=qualifier,
         resource_id=f"repo-a/project#pull/5@{'a' * 40}", bridge_instance="forge",
         sensitivity="internal",
         authorized_principals=frozenset({"service:poller:github-activity"}),
@@ -14253,6 +14348,14 @@ def test_issue_comment_authorization_requires_and_matches_repository_source(
         )
     finally:
         set_forge_client(None)
+
+    if qualifier is not None:
+        assert same_repo.allowed is False
+        assert same_repo.reason == "issue_repository_source_required"
+        assert other_repo.allowed is False
+        assert other_repo.reason == "issue_repository_source_required"
+        assert client.calls == []
+        return
 
     assert same_repo.allowed is True
     assert same_repo.resolved_sink_target == "repo-a/project#issue/220"

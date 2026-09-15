@@ -226,7 +226,7 @@ def _turn_auth(channel_id: str, principal: str):
 
     source = SourceLabel(
         principal=principal,
-        domain="channel:private",
+        domain="channel", domain_qualifier="private",
         resource_id=channel_id,
         bridge_instance="test",
         sensitivity="private",
@@ -394,7 +394,7 @@ async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
     channel_id = "slack-C1"
     source = SourceLabel(
         principal="alice",
-        domain="channel:private",
+        domain="channel", domain_qualifier="private",
         resource_id=channel_id,
         bridge_instance="slack",
         sensitivity="private",
@@ -412,7 +412,7 @@ async def test_job_complete_inherits_enforced_auth_for_same_channel_reply(
         enforcement_enabled=True,
         ifc_labels=origin_labels,
         ifc_state=InformationFlowState(labels=origin_labels),
-        domain="channel:private",
+        domain="channel", domain_qualifier="private",
         resource_id=channel_id,
         bridge_instance="slack",
     )

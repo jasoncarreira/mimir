@@ -645,7 +645,7 @@ class _AcpFailedProviderProbeAgent(_FakeAgent):
                     publish_protected_result(InformationFlowLabels().with_source(
                         SourceLabel(
                             principal="another-user",
-                            domain="channel:private",
+                            domain="channel", domain_qualifier="private",
                             resource_id="acp:another-session",
                             bridge_instance="acp-stdio",
                             sensitivity="private",
@@ -716,7 +716,7 @@ class _AcpCrossChannelProbeAgent(_FakeAgent):
     ):
         foreign = InformationFlowLabels().with_source(SourceLabel(
             principal="another-user",
-            domain="channel:private",
+            domain="channel", domain_qualifier="private",
             resource_id="acp:another-session",
             bridge_instance="acp-stdio",
             sensitivity="private",
@@ -1828,6 +1828,7 @@ async def test_run_turn_records_folded_mid_turn_inputs(tmp_path: Path):
     assert set(row["integrity_sources"][0]) == {
         "principal",
         "domain",
+        "domain_qualifier",
         "resource_id",
         "source_kind",
         "integrity",

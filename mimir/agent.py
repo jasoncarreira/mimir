@@ -427,7 +427,12 @@ def _initialize_ifc_labels(
     domain = (
         continuation_auth.domain
         if continuation_auth is not None
-        else f"channel:{visibility}" if isinstance(visibility, str) and visibility else "channel"
+        else "channel"
+    )
+    domain_qualifier = (
+        continuation_auth.domain_qualifier
+        if continuation_auth is not None
+        else visibility if isinstance(visibility, str) and visibility else None
     )
     bridge_instance = extra.get("bridge_instance")
     if continuation_auth is not None:
@@ -489,6 +494,7 @@ def _initialize_ifc_labels(
     labels = labels.with_source(SourceLabel(
         principal=canonical_principal,
         domain=domain,
+        domain_qualifier=domain_qualifier,
         resource_id=canonical_resource,
         bridge_instance=bridge_instance,
         sensitivity=sensitivity,
@@ -613,6 +619,7 @@ def _propagate_ifc_labels(
         propagated.sources,
         principal=f"service:{derived_by}",
         domain=domain,
+        domain_qualifier=getattr(auth_context, "domain_qualifier", None),
         resource_id=resource_id or "unknown",
         bridge_instance=bridge_instance,
         sensitivity=sensitivity,
@@ -3337,6 +3344,7 @@ class Agent:
             {
                 "principal": source.principal,
                 "domain": source.domain,
+                "domain_qualifier": source.domain_qualifier,
                 "resource_id": source.resource_id,
                 "source_kind": source.source_kind,
                 "integrity": source.integrity,

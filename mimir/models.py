@@ -208,6 +208,8 @@ class SourceLabel(_SourceLabelAuthoritySlot):
     ``authorized_principals`` is the effective read ACL. Derived service data
     must carry the intersection of its inputs' ACLs; an empty ACL is unknown,
     not public. All identity fields are required for ordinary channel egress.
+    ``domain`` is flat; subtypes belong in ``domain_qualifier``. Only the
+    persisted-record decoder accepts the former colon-separated representation.
     """
 
     principal: InitVar[str | None] = _MISSING_SOURCE_VALUE
@@ -221,6 +223,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
     # Gate participation, not content trust; see IntegrityEffect's contract.
     integrity_effect: str = IntegrityEffect.ACTIVE_INGEST
     owner_attestation: InitVar[_RedactedOwnerAttestation] = None
+    domain_qualifier: str | None = None
 
     def __post_init__(
         self,
@@ -237,6 +240,8 @@ class SourceLabel(_SourceLabelAuthoritySlot):
             )
         ):
             raise TypeError("missing required source label field")
+        if isinstance(self.domain, str) and ":" in self.domain:
+            raise ValueError("source domain must not contain ':'")
         if self.integrity not in Integrity._value2member_map_:
             raise ValueError(f"invalid source integrity: {self.integrity!r}")
         if self.integrity_effect not in IntegrityEffect._value2member_map_:
@@ -273,6 +278,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         return (
             self.principal,
             self.domain,
+            self.domain_qualifier,
             self.resource_id,
             self.bridge_instance,
             self.sensitivity,
@@ -300,6 +306,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
             lambda value: {
                 "principal": None,
                 "domain": value.domain,
+                "domain_qualifier": value.domain_qualifier,
                 "resource_id": None,
                 "bridge_instance": value.bridge_instance,
                 "sensitivity": value.sensitivity,
@@ -311,6 +318,21 @@ class SourceLabel(_SourceLabelAuthoritySlot):
             },
         )
         return schema
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> "SourceLabel":
+        """Decode persisted label fields, including the legacy qualified domain."""
+        values = dict(record)
+        domain = values.get("domain")
+        if isinstance(domain, str) and ":" in domain:
+            domain, qualifier = domain.split(":", 1)
+            if values.get("domain_qualifier") not in (None, qualifier):
+                raise ValueError("conflicting persisted domain qualifier")
+            values.update(domain=domain, domain_qualifier=qualifier)
+        values["authorized_principals"] = frozenset(
+            values.get("authorized_principals") or ()
+        )
+        return cls(**values)
 
     @property
     def has_untrusted_active_ingest(self) -> bool:
@@ -342,6 +364,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         bridge_instance: str,
         sensitivity: str,
         source_kind: str = "service",
+        domain_qualifier: str | None = None,
     ) -> "SourceLabel":
         """Create service-derived provenance without attenuating input trust."""
         acl: frozenset[str] = frozenset()
@@ -363,6 +386,7 @@ class SourceLabel(_SourceLabelAuthoritySlot):
         return cls(
             principal=principal,
             domain=domain,
+            domain_qualifier=domain_qualifier,
             resource_id=resource_id,
             bridge_instance=bridge_instance,
             sensitivity=sensitivity,
@@ -1482,6 +1506,7 @@ class AuthContext(_AuthContextAuthoritySlot):
     saga_session_id: str | None = None
     audience_provider: InitVar[_RedactedAudienceProvider] = None
     cross_platform_pull: bool = True
+    domain_qualifier: str | None = None
 
     def __post_init__(
         self,
@@ -1504,6 +1529,8 @@ class AuthContext(_AuthContextAuthoritySlot):
             )
         ):
             raise TypeError("missing required authorization context field")
+        if isinstance(self.domain, str) and ":" in self.domain:
+            raise ValueError("authorization domain must not contain ':'")
         object.__setattr__(self, "_principal", principal)
         object.__setattr__(self, "_canonical_principal", canonical_principal)
         object.__setattr__(self, "_channel_id", channel_id)
