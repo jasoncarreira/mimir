@@ -1750,6 +1750,23 @@ def test_worklink_runner_happy_path_fake_backend(tmp_path: Path) -> None:
     _reset_logger_for_tests()
 
 
+def test_leaf_run_has_no_factory_next(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    _, runner = _orchestrator_runner(repo, worktree)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok"
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.next is None
+
+
 def test_push_failure_blocks_build_and_reports_publication_step(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
@@ -6292,6 +6309,58 @@ def test_factory_terminal_outcomes_emit_transition_payload(
             },
         )
     ]
+
+
+@pytest.mark.parametrize("factory_status", ["needs-human", "blocked", "partial", "completed"])
+@pytest.mark.parametrize("next_action", [None, "", "unknown", "  inspect PR; resume\n"])
+def test_factory_terminal_result_preserves_next(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_status: str,
+    next_action: str | None,
+) -> None:
+    from dataclasses import replace
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    record = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "123", 456)
+    ).observed(
+        replace(_factory_lifecycle_status(sandbox, status=factory_status), next=next_action),
+        datetime.now(UTC).isoformat(),
+    )
+    transitions: list[dict[str, object]] = []
+
+    class Claims:
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            transitions.append(kwargs)
+
+    async def verify(**kwargs: object) -> tuple[Path, str]:
+        return tmp_path / "evidence.json", "https://github.com/owner/repo/pull/42"
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_completion", verify)
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._finish_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=object(),
+            compute=object(),
+            factory_record=record,
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    completed = factory_status == "completed"
+    assert result.next == next_action
+    assert result.status == ("review_ready" if completed else factory_status)
+    assert result.review_ready is completed
+    assert result.pr_url == ("https://github.com/owner/repo/pull/42" if completed else None)
+    assert len(transitions) == 1
+    assert transitions[0]["status"] == ("review" if completed else "blocked")
+    assert transitions[0]["review_ready"] is completed
 
 
 def test_factory_partial_survives_leaf_ledger_boundary_without_clearing_attention(
