@@ -1,14 +1,32 @@
 # LongMemEval through mimir
 
-End-to-end LongMemEval bench that exercises mimir's full dispatch path
+## Deprecated: unsupported post saga-decoupling
+
+`benchmarks.longmemeval_via_mimir.runner` is unsupported post saga-decoupling.
+Per-question ingest and consolidation became no-ops after the vendored saga
+engine was deleted. The runner is retained only for the dispatch scaffolding
+tested by `tests/test_bench_via_mimir.py` (route, score, and hypothesis
+extraction helpers). It exits with status 2 unless `--allow-deprecated` is
+passed; that bypass runs the dispatch loop but ingests no atoms and is useful
+only for harness debugging, not benchmark evidence.
+
+For a working memory-backend-only LongMemEval run, use
+`benchmarks.longmemeval_via_memory.runner`. It is SagaStore-direct and bypasses
+the agent loop and BudgetGate; it is not agent-loop evidence.
+
+No executable agent-loop benchmark exists. Chainlink #1758 was closed as
+WONT-BUILD on 2026-09-15: the project will not build one. Agent-loop changes
+require the full suite in both access-control modes plus each change's own
+discriminating integration tests; see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+The remainder of this document is historical, not supported run guidance.
+
+## Historical design
+
+The original end-to-end LongMemEval bench exercised mimir's full dispatch path
 (BenchBridge → pre_message_hook → saga query → agent response →
 post_message_hook → mark_contributions). Complementary to saga's
 direct retrieval bench at `benchmarks/saga/saga/benchmarks/longmemeval/`.
-
-Note: the current review-before-run workflow for the session-boundary
-adoption slice lives in `benchmarks/longmemeval_via_memory/README.md`. Use
-that runner for the corrected `session_boundary` RRF treatment; this
-BenchBridge runner is retained for dispatch-path coverage.
 
 ## Why two benches
 

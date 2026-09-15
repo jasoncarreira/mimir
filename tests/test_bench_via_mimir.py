@@ -28,6 +28,14 @@ from benchmarks.longmemeval_via_mimir.score import (
 from benchmarks.longmemeval_via_mimir.runner import _extract_hypothesis
 
 
+def test_contributing_does_not_require_deprecated_benchmark():
+    contributing = (Path(__file__).resolve().parents[1] / "CONTRIBUTING.md").read_text(
+        encoding="utf-8",
+    )
+    assert "benchmarks/longmemeval_via_mimir" not in contributing
+    assert "benchmarks.longmemeval_via_mimir" not in contributing
+
+
 def test_question_to_event_shape():
     q = {
         "question_id": "qa_30__simple",

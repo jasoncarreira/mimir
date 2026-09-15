@@ -51,10 +51,21 @@ uv run pytest tests/test_specific_module.py            # one file
 uv run pytest --ignore=tests/test_bench_via_mimir.py   # skip slow integration
 ```
 
-If your change touches the agent loop, run the bench harness before opening
-the PR — see `benchmarks/longmemeval_via_mimir/README.md`. Memory-backend
-changes (`mimir/saga/`) are covered by `tests/test_saga_*` in the main
-test suite — no separate `cd` is needed.
+There is no executable agent-loop benchmark today. Chainlink #1758 was closed
+as WONT-BUILD on 2026-09-15: the project will not build an agent-loop benchmark.
+Before opening a PR for an agent-loop change, require the full suite to pass
+in both modes, plus the change's own discriminating integration tests that
+exercise the changed agent-loop behavior and fail if it regresses:
+
+```bash
+env -u MIMIR_ACCESS_CONTROL_ENFORCED uv run --extra dev --extra bench pytest -q -n 6
+MIMIR_ACCESS_CONTROL_ENFORCED=1 uv run --extra dev --extra bench pytest -q -n 6
+```
+
+`benchmarks.longmemeval_via_memory.runner` is SagaStore-direct: it exercises
+only the memory backend, not the agent loop or BudgetGate, and is not
+agent-loop evidence. Memory-backend changes (`mimir/saga/`) are covered by
+`tests/test_saga_*` in the main test suite; no separate `cd` is needed.
 
 ### Run both, and require both green
 
