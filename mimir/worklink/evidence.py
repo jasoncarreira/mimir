@@ -683,7 +683,10 @@ async def _worker_gate_sidecars(
 ) -> dict[str, object]:
     try:
         (report_dir / "tmp").lstat()
-    except FileNotFoundError:
+    except OSError:
+        # Missing is the common case; EPERM/EACCES happen when the controller
+        # probes a path inside the worker-owned checkout under the uid split.
+        # Retention is best-effort evidence: never fail the gate over it.
         return {"files": [], "truncated": False}
     export_spec = replace(
         spec, local_checkout=checkout,
