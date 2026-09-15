@@ -1032,6 +1032,165 @@ async def test_enabled_opencode_gate_uses_authorized_compute(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_phase", ["gate", "export", "cleanup"])
+@pytest.mark.parametrize("stop", [False, True, "race"], ids=["deadline", "operator-stop", "stop-at-deadline"])
+async def test_gate_diagnostic_deadline_isolation(monkeypatch, tmp_path, blocked_phase, stop):
+    from types import SimpleNamespace
+    from mimir.contained_execution import CollectedExecutionResult
+    from mimir.worklink import compute as cp
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    specs = {}
+    jobs = {}
+    cancelled = []
+    cleaned = []
+
+    async def cancel_worker(identifier):
+        cancelled.append(identifier)
+        release.set()
+        await jobs[identifier]
+
+    class Compute(cp.LocalSubprocessComputeBackend):
+        # Replace only worker launch/IPC. Exercise the real compute.wait timer,
+        # shielding, timeout cancellation, terminal collection and cleanup.
+        async def launch(self, spec):
+            phase = "gate" if not specs else "export" if len(specs) == 1 else "cleanup"
+            specs[phase] = spec
+            stdout_path = None
+            if phase == "gate":
+                options = shlex.split(spec.env["PYTEST_ADDOPTS"])
+                report = tmp_path / next(x.split("=", 1)[1] for x in options if x.startswith("--junitxml="))
+                report.write_text(
+                    '<testsuite tests="1" failures="1" errors="0" skipped="0">'
+                    '<testcase classname="test_sample" name="test_one">'
+                    '<failure>underlying failure</failure></testcase></testsuite>'
+                )
+                basetemp = tmp_path / next(x.split("=", 1)[1] for x in options if x.startswith("--basetemp="))
+                basetemp.mkdir()
+            elif phase == "export":
+                stdout_path = spec.output_root / "export.stdout.log"
+                stdout_path.write_text('{"files": [], "reasons": [], "entries": 0}')
+
+            async def worker():
+                if phase == blocked_phase:
+                    entered.set()
+                    await release.wait()
+                return CollectedExecutionResult(
+                    1 if phase == "gate" or phase == blocked_phase else 0,
+                    b"underlying failure" if phase == "gate" else b"", b"",
+                    False, False, 0, 0,
+                )
+
+            handle = cp.LaunchHandle(self.name, phase)
+            job = asyncio.create_task(worker())
+            jobs[phase] = job
+            self._jobs[phase] = (job, spec, tuple(spec.local_argv))
+            self._handles[phase] = handle
+            self._worker_clients[phase] = SimpleNamespace(cancel=cancel_worker)
+            self._output_files[phase] = (stdout_path, None)
+            return handle
+
+        async def cleanup(self, handle):
+            await super().cleanup(handle)
+            cleaned.append(handle.identifier)
+
+    compute = Compute()
+    loop = asyncio.get_running_loop()
+    call_at = loop.call_at
+    deadlines = []
+    observation = None
+
+    def record_deadline(when, callback, *args, **kwargs):
+        # Python 3.11 wait_for uses call_later (which delegates to call_at);
+        # Python 3.12 uses asyncio.timeout and calls call_at directly. Observe
+        # the shared absolute-timer boundary without replacing the supervisor.
+        remaining = when - loop.time()
+        timer = call_at(when, callback, *args, **kwargs)
+        if asyncio.current_task() is observation:
+            for budget in (60, 5400):
+                if abs(remaining - budget) < 0.1:
+                    deadlines.append((budget, callback, args, timer))
+                    break
+        return timer
+
+    monkeypatch.setattr(loop, "call_at", record_deadline)
+
+    def runner(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, "changed.py\n" if "--name-only" in command else "", "")
+
+    observation = asyncio.create_task(observe_evidence(
+        issue=1755, attempt=1, backend="opencode", branch="branch",
+        checkout=tmp_path, started_at=datetime.now(UTC), base_ref="main",
+        backend_status="completed", test_command="pytest -q", runner=runner,
+        work_spec=cp.WorkSpec(1755, 1, "url", "main", "branch", "", None,
+                              "pytest -q", "opencode", 5400, output_root=tmp_path / "artifacts"),
+        compute=compute,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)  # Failure guard, not the test clock.
+        delay, callback, args, timer = deadlines[-1]
+        assert delay == (5400 if blocked_phase == "gate" else 60)
+        assert specs["gate"].timeout_s == 5400
+        assert specs[blocked_phase].timeout_s == delay
+        assert not release.is_set() and not jobs[blocked_phase].done()
+        if stop:
+            if stop == "race":
+                timer.cancel()
+                callback(*args)
+            observation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(observation, 5)
+        else:
+            # Fire the actual supervisor's timer while our worker is blocked.
+            # No sleeping or guessed scheduling latency establishes expiry.
+            timer.cancel()
+            loop.call_soon(callback, *args)
+            result = await asyncio.wait_for(observation, 5)
+            tests = result.evidence.tests
+            assert tests.exit_code == 1
+            assert tests.counts.failed == 1
+            assert "underlying failure" in tests.summary
+            assert tests.timed_out is (blocked_phase == "gate")
+            assert not result.review_ready
+            if blocked_phase != "gate":
+                assert tests.retention_truncated
+                assert tests.retention_error
+                # Only the diagnostic deadline fired, far before the gate's
+                # budget; the completed gate timer must already be disarmed.
+                assert deadlines[0][0] == 5400 and deadlines[0][3].cancelled()
+        assert cancelled == [blocked_phase]
+        assert blocked_phase in cleaned
+        assert not compute._jobs
+        assert all(job.done() for job in jobs.values())
+    finally:
+        release.set()
+        if not observation.done():
+            observation.cancel()
+        await asyncio.gather(observation, *jobs.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [30, 5400])
+@pytest.mark.parametrize("diagnostic", [False, True])
+async def test_compute_gate_budget_selection(tmp_path, budget, diagnostic):
+    from unittest.mock import AsyncMock
+    from mimir.worklink.compute import ComputeResult, WorkSpec
+    from mimir.worklink.evidence import _run_compute_gate
+
+    spec = WorkSpec(1755, 1, "url", "main", "branch", "", None, "pytest", "opencode", budget)
+    compute = AsyncMock()
+    compute.wait.return_value = ComputeResult(0, "", "")
+    await _run_compute_gate("pytest", checkout=tmp_path, work_spec=spec,
+                            compute=compute, diagnostic=diagnostic)
+    expected = min(budget, 60) if diagnostic else budget
+    assert compute.launch.call_args.args[0].timeout_s == expected
+    compute.wait.assert_awaited_once_with(compute.launch.return_value, expected)
+    assert spec.timeout_s == budget
+
+
+@pytest.mark.asyncio
 async def test_enabled_opencode_evidence_uses_controller_git_without_fd_publication(
     monkeypatch, tmp_path: Path
 ) -> None:
