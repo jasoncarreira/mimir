@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
@@ -12,17 +11,14 @@ import os
 from pathlib import Path
 import shlex
 import signal
-import stat as statmod
 import subprocess
 import tempfile
-import uuid
 from typing import Callable, Iterator, Protocol, Sequence
 import xml.etree.ElementTree as ET
 
-from ..redaction import redact_payload, redact_text
+from ..redaction import redact_text
 from .compute import (
     ComputeBackend,
-    ComputeLaunchError,
     ComputeResult,
     LaunchHandle,
     WorkSpec,
@@ -66,9 +62,6 @@ class TestResult:
     rerun: TestResult | None = None
     previous_observation: TestResult | None = None
     timed_out: bool = False
-    failure_bodies: tuple[dict[str, object], ...] = ()
-    failure_bodies_truncated: bool = False
-    artifacts: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -302,13 +295,10 @@ def _gate_report_directory(checkout: Path, worker_uid_drop: bool) -> Iterator[Pa
     """
     if not worker_uid_drop:
         with tempfile.TemporaryDirectory(prefix="worklink-gate-") as text:
-            # System temp roots may use OS aliases (macOS /var -> /private/var).
-            # Canonicalize this controller-created root once; keep _gate_open's
-            # no-follow checks for all subsequent report and artifact accesses.
-            yield Path(text).resolve(strict=True)
+            yield Path(text)
         return
     checkout.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".worklink-gate-", dir=checkout, ignore_cleanup_errors=True) as text:
+    with tempfile.TemporaryDirectory(prefix=".worklink-gate-", dir=checkout) as text:
         report_dir = Path(text)
         # setgid on the checkout supplies the group; make it group-usable.
         report_dir.chmod(0o770)
@@ -399,15 +389,8 @@ async def _observe_evidence_from_ref(
         if checkout_result is not None and checkout_result.returncode != 0:
             tests = TestResult(test_command, None, "checkout failed before test", observed=False)
         else:
-            run_id = uuid.uuid4().hex
-            artifact_root = (
-                work_spec.output_root if work_spec and work_spec.output_root else checkout.parent
-            )
-
-            async def run_gate(command: str, report_dir: Path, phase: str) -> TestResult:
+            async def run_gate(command: str, report_dir: Path) -> TestResult:
                 timed_out = False
-                output_overflow = False
-                sidecars = None
                 if worker_uid_drop:
                     if compute is None:
                         raise ValueError("enabled worker evidence requires a compute backend")
@@ -422,17 +405,11 @@ async def _observe_evidence_from_ref(
                         report_dir=report_dir,
                     )
                     timed_out = result.timed_out
-                    output_overflow = result.output_overflow
                     test = subprocess.CompletedProcess(
                         ["/bin/sh", "-c", command],
                         result.exit_code,
                         stdout=result.stdout,
                         stderr=result.stderr,
-                    )
-                    sidecars = await _worker_gate_sidecars(
-                        report_dir, checkout, work_spec, compute,
-                        failed=result.exit_code != 0 or timed_out,
-                        on_launch=on_gate_launch,
                     )
                 else:
                     observed_command = _command_with_pytest_report(command, report_dir)
@@ -454,14 +431,6 @@ async def _observe_evidence_from_ref(
                             stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
                         )
                 structured = read_pytest_result(command, report_dir)
-                artifacts = None
-                if test.returncode != 0 or timed_out:
-                    artifacts = _retain_gate_artifacts(
-                        Path(artifact_root), report_dir, test, issue=issue,
-                        attempt=attempt, run_id=run_id, phase=phase,
-                        output_incomplete=output_overflow or timed_out,
-                        sidecars=sidecars,
-                    )
                 commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
                 return replace(
                     structured or TestResult(redact_text(command)),
@@ -469,11 +438,10 @@ async def _observe_evidence_from_ref(
                     exit_code=test.returncode,
                     summary=redact_text(_summarize_test_output(test)),
                     timed_out=timed_out,
-                    artifacts=artifacts,
                 )
 
             with _gate_report_directory(checkout, worker_uid_drop) as report_dir:
-                tests = await run_gate(test_command, report_dir, "initial_gate")
+                tests = await run_gate(test_command, report_dir)
                 failed_ids = _pytest_cache_ids(report_dir, "lastfailed")
                 rerun_command = _pytest_rerun_command(test_command, failed_ids)
                 eligible = (
@@ -488,7 +456,7 @@ async def _observe_evidence_from_ref(
                 )
             if eligible:
                 with _gate_report_directory(checkout, worker_uid_drop) as rerun_dir:
-                    rerun = await run_gate(rerun_command, rerun_dir, "flake_rerun")
+                    rerun = await run_gate(rerun_command, rerun_dir)
                     remaining = _pytest_cache_ids(rerun_dir, "lastfailed")
                     collected = _pytest_cache_ids(rerun_dir, "nodeids")
                     counts = rerun.counts
@@ -565,8 +533,6 @@ async def _run_compute_gate(
         work_spec,
         local_checkout=checkout,
         local_argv=("/bin/sh", "-c", command),
-        # Gate output is retained below only on failure and after redaction.
-        output_root=None,
     )
     if report_dir is not None:
         report_option_dir = report_dir
@@ -583,7 +549,6 @@ async def _run_compute_gate(
                 report_option_dir,
                 existing=gate_spec.env.get("PYTEST_ADDOPTS"),
                 create_directory=False,
-                gate_tmp=True,
             ),
         )
     handle = await compute.launch(gate_spec)
@@ -612,287 +577,15 @@ def _common_status(status: str) -> str:
 
 
 _PYTEST_REPORT_MAX_BYTES = 20_000_000
-_GATE_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024
-_GATE_ARTIFACT_MAX_ENTRIES = 2048
-_FAILURE_BODY_MAX_CHARS = 16_384
-_FAILURE_BODIES_MAX_CHARS = 65_536
-
-
-# Run under the same authorized identity as pytest. Private tmp_path directories
-# cannot be read or removed by the controller; export bounded text over compute's
-# pipe, then remove staging as its owner. No checkout module is imported here.
-_WORKER_SIDECARS = '''
-import json, os, shutil, stat, sys
-root, failed = sys.argv[1:]
-result = {"files": [], "truncated": False}
-budget = 16 * 1024 * 1024
-visited = 0
-parent = None
-try:
-    # The harness supplies exactly '<report-directory>/tmp', relative to the
-    # authorized checkout. Anchor cleanup and traversal to that directory fd.
-    parent = os.open(os.path.dirname(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    root = os.path.basename(root)
-    if failed == "1":
-        for directory, dirs, files, fd in os.fwalk(root, dir_fd=parent, follow_symlinks=False):
-            visited += len(dirs) + len(files)
-            if visited > 2048 or directory.count(os.sep) - root.count(os.sep) > 32:
-                result["truncated"] = True
-                dirs[:] = []
-                if visited > 2048:
-                    break
-                continue
-            for name in files:
-                try:
-                    info = os.lstat(name, dir_fd=fd)
-                    if not stat.S_ISREG(info.st_mode):
-                        continue
-                    source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-                    with os.fdopen(source, "rb") as stream:
-                        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                            continue
-                        data = stream.read(min(budget, 20_000_000) + 1)
-                    item = {"path": "tmp/" + os.path.relpath(os.path.join(directory, name), root),
-                            "text": data.decode("utf-8", errors="replace")}
-                    size = len(json.dumps(item).encode()) + 2
-                    if size > budget:
-                        result["truncated"] = True
-                        continue
-                    budget -= size
-                    result["files"].append(item)
-                except OSError:
-                    result["truncated"] = True
-except OSError:
-    result["truncated"] = True
-finally:
-    if parent is not None:
-        try:
-            shutil.rmtree(root, dir_fd=parent)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            result["truncated"] = True
-        os.close(parent)
-print(json.dumps(result))
-'''
-
-
-async def _worker_gate_sidecars(
-    report_dir: Path, checkout: Path, spec: WorkSpec, compute: ComputeBackend, *,
-    failed: bool, on_launch: Callable[[LaunchHandle], None] | None,
-) -> dict[str, object]:
-    try:
-        (report_dir / "tmp").lstat()
-    except OSError:
-        # Missing is the common case; EPERM/EACCES happen when the controller
-        # probes a path inside the worker-owned checkout under the uid split.
-        # Retention is best-effort evidence: never fail the gate over it.
-        return {"files": [], "truncated": False}
-    export_spec = replace(
-        spec, local_checkout=checkout,
-        output_root=None,
-        local_argv=("/usr/bin/env", "python3", "-I", "-c", _WORKER_SIDECARS,
-                    str(report_dir.relative_to(checkout) / "tmp"), "1" if failed else "0"),
-        timeout_s=min(spec.timeout_s, 60),
-    )
-    try:
-        handle = await compute.launch(export_spec)
-    except (ComputeLaunchError, OSError):
-        return {"files": [], "truncated": True}
-    try:
-        if on_launch:
-            try:
-                on_launch(handle)
-            except BaseException:
-                await compute.cancel(handle)
-                raise
-        try:
-            result = await compute.wait(handle, export_spec.timeout_s)
-        except asyncio.CancelledError:
-            await compute.cancel(handle)
-            raise
-        except (ComputeLaunchError, OSError):
-            await compute.cancel(handle)
-            return {"files": [], "truncated": True}
-        if result.exit_code != 0 or result.timed_out or result.output_overflow:
-            return {"files": [], "truncated": True}
-        try:
-            payload = json.loads(result.stdout)
-        except ValueError:
-            return {"files": [], "truncated": True}
-        if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
-            return {"files": [], "truncated": True}
-        return payload
-    finally:
-        await compute.cleanup(handle)
-
-
-@contextlib.contextmanager
-def _gate_open(path: Path, flags: int = os.O_RDONLY, *, mkdir: bool = False) -> Iterator[int]:
-    """Open every component without following links, including replacement races."""
-    parts = path.absolute().parts
-    fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for index, part in enumerate(parts[1:]):
-            final = index == len(parts) - 2
-            if mkdir:
-                try:
-                    os.mkdir(part, mode=0o700, dir_fd=fd)
-                except FileExistsError:
-                    pass
-            next_fd = os.open(
-                part, (flags if final else os.O_RDONLY | os.O_DIRECTORY)
-                | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd,
-            )
-            os.close(fd)
-            fd = next_fd
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def _gate_read(path: Path, limit: int) -> bytes:
-    with _gate_open(path) as fd:
-        info = os.fstat(fd)
-        if not statmod.S_ISREG(info.st_mode):
-            raise OSError("not a regular file")
-        if info.st_size > limit:
-            raise ValueError("artifact exceeds read limit")
-        with os.fdopen(os.dup(fd), "rb") as stream:
-            data = stream.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError("artifact grew beyond read limit")
-        return data
-
-
-def _scrub_gate_artifact(data: str, *, xml: bool = False) -> str:
-    if xml:
-        # Decode XML entities before redacting; raw regex replacement alone can
-        # miss an encoded credential and can also break XML attribute quoting.
-        root = ET.fromstring(data)
-        for element in root.iter():
-            element.attrib = redact_payload(element.attrib)
-            if element.get("name") and "value" in element.attrib:
-                name = element.get("name")
-                element.set("value", str(redact_payload({name: element.get("value")})[name]))
-            if element.text:
-                element.text = str(redact_payload({element.tag: element.text})[element.tag])
-            if element.tail:
-                element.tail = redact_text(element.tail)
-        return ET.tostring(root, encoding="unicode")
-    if data.lstrip().startswith("<"):
-        try:
-            return _scrub_gate_artifact(data, xml=True)
-        except ET.ParseError:
-            pass
-    return redact_text(data)
-
-
-def _retain_gate_artifacts(
-    root: Path, report_dir: Path, result: subprocess.CompletedProcess[str], *,
-    issue: int, attempt: int, run_id: str, phase: str, output_incomplete: bool,
-    sidecars: dict[str, object] | None = None,
-) -> dict[str, object]:
-    """Append redacted file records to a failure-only JSONL artifact bundle.
-
-    The 32 MiB cap is shared by ALL phases, observations and repair rounds of an
-    attempt (including JSON metadata). Whole files that do not fit are omitted,
-    never silently sliced; the evidence record reports incomplete retention.
-    At most 2048 tree entries and 32 levels are visited per phase. Binary sidecars
-    are decoded with replacement so no opaque, unscrubbed bytes are persisted.
-    Worker sidecar export has an additional 16 MiB transport budget; overflow
-    omits whole files and marks retention truncated as well.
-    WorkSpec.output_root is controller state outside checkout cleanup; standalone
-    callers use the checkout's parent. Worker staging permissions stay unchanged.
-    """
-    directory = root / "gate-evidence"
-    bundle = directory / f"{issue}-{attempt}.jsonl"
-    identity = dict(issue=issue, attempt=attempt, run_id=run_id, phase=phase)
-    record: dict[str, object] = {
-        **identity, "bundle": str(bundle), "cap_bytes": _GATE_ARTIFACT_MAX_BYTES,
-        "retained_files": 0, "omitted_files": 0, "truncated": output_incomplete,
-    }
-    try:
-        with _gate_open(directory, os.O_RDONLY | os.O_DIRECTORY, mkdir=True):
-            pass
-        with _gate_open(bundle, os.O_WRONLY | os.O_CREAT | os.O_APPEND) as output:
-            fcntl.flock(output, fcntl.LOCK_EX)
-            if not statmod.S_ISREG(os.fstat(output).st_mode):
-                raise OSError("bundle is not a regular file")
-            record["offset"] = os.fstat(output).st_size
-            remaining = max(0, _GATE_ARTIFACT_MAX_BYTES - os.fstat(output).st_size)
-
-            def retain(name: str, text: str, *, xml: bool = False) -> None:
-                nonlocal remaining
-                scrubbed = _scrub_gate_artifact(text, xml=xml)
-                payload = (json.dumps({**identity, "path": redact_text(name), "text": scrubbed}) + "\n").encode()
-                if len(payload) > remaining:
-                    record["omitted_files"] += 1
-                    record["truncated"] = True
-                    return
-                with os.fdopen(os.dup(output), "ab") as stream:
-                    stream.write(payload)
-                remaining -= len(payload)
-                record["retained_files"] += 1
-
-            # Reports first: a noisy stdout must not crowd out the assertion.
-            try:
-                data = _gate_read(report_dir / "junit.xml", _PYTEST_REPORT_MAX_BYTES)
-                retain("junit.xml", data.decode("utf-8", errors="replace"), xml=True)
-            except (OSError, ValueError, ET.ParseError):
-                record["omitted_files"] += 1
-                record["truncated"] = True
-            retain("stdout.txt", result.stdout or "")
-            retain("stderr.txt", result.stderr or "")
-            if sidecars is not None:
-                record["truncated"] = bool(record["truncated"] or sidecars.get("truncated", True))
-                for item in sidecars.get("files", [])[:_GATE_ARTIFACT_MAX_ENTRIES]:
-                    if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("text"), str):
-                        retain(item["path"], item["text"])
-                    else:
-                        record["truncated"] = True
-            visited = 0
-
-            def collect(directory: Path, depth: int = 0) -> None:
-                nonlocal visited
-                if depth > 32:
-                    record["truncated"] = True
-                    return
-                with _gate_open(directory, os.O_RDONLY | os.O_DIRECTORY) as fd:
-                    with os.scandir(fd) as entries:
-                        for entry in entries:
-                            visited += 1
-                            if visited > _GATE_ARTIFACT_MAX_ENTRIES:
-                                record["truncated"] = True
-                                return
-                            path = directory / entry.name
-                            if path == report_dir / "junit.xml":
-                                continue
-                            try:
-                                info = os.lstat(entry.name, dir_fd=fd)
-                                if statmod.S_ISDIR(info.st_mode):
-                                    collect(path, depth + 1)
-                                elif statmod.S_ISREG(info.st_mode):
-                                    data = _gate_read(path, min(remaining, _PYTEST_REPORT_MAX_BYTES))
-                                    retain(str(path.relative_to(report_dir)), data.decode("utf-8", errors="replace"))
-                                else:
-                                    record["omitted_files"] += 1
-                            except (OSError, ValueError):
-                                record["omitted_files"] += 1
-                                record["truncated"] = True
-            collect(report_dir)
-            record["bytes"] = os.fstat(output).st_size - record["offset"]
-    except OSError as exc:
-        record["error"] = type(exc).__name__
-        record["truncated"] = True
-    return record
 
 
 def _pytest_cache_ids(report_dir: Path, name: str) -> tuple[str, ...]:
     """Keep executable selectors private; evidence IDs are separately scrubbed."""
     try:
         path = report_dir / "cache" / "v" / "cache" / name
-        payload = json.loads(_gate_read(path, _PYTEST_REPORT_MAX_BYTES))
+        if path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
+            return ()
+        payload = json.loads(path.read_text(encoding="utf-8"))
         if name == "lastfailed":
             if not isinstance(payload, dict) or any(value is not True for value in payload.values()):
                 return ()
@@ -970,36 +663,29 @@ def pytest_report_environment(
     *,
     existing: str | None = None,
     create_directory: bool = True,
-    gate_tmp: bool = False,
 ) -> dict[str, str]:
     """Configure pytest's machine reports without changing the retained output."""
     if not _is_pytest_command(command):
         return {}
     if create_directory:
         report_dir.mkdir(parents=True, exist_ok=True)
-    options = f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
-    if gate_tmp:
-        options += f"--basetemp={shlex.quote(str(report_dir / 'tmp'))} "
-    options += f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
+    options = (
+        f"--junitxml={shlex.quote(str(report_dir / 'junit.xml'))} "
+        f"-o cache_dir={shlex.quote(str(report_dir / 'cache'))}"
+    )
     return {"PYTEST_ADDOPTS": " ".join(part for part in (existing, options) if part)}
 
 
 def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
-    """Read counts, IDs and scrubbed assertions from pytest-owned machine files.
-
-    Bodies are capped at 16,384 characters each, 65,536 characters total, and
-    100 entries. Each shortened body and any omitted entries are marked explicitly.
-    """
+    """Read counts and exact failed node IDs from pytest-owned machine files."""
     if not _is_pytest_command(command):
         return None
     junit_path = report_dir / "junit.xml"
     lastfailed_path = report_dir / "cache" / "v" / "cache" / "lastfailed"
     try:
-        try:
-            data = _gate_read(junit_path, _PYTEST_REPORT_MAX_BYTES)
-        except ValueError:
+        if junit_path.stat().st_size > _PYTEST_REPORT_MAX_BYTES:
             return TestResult(command, report_error="junit_oversize")
-        root = ET.fromstring(data)
+        root = ET.parse(junit_path).getroot()
         suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
         total = sum(_xml_count(suite, "tests") for suite in suites)
         failed = sum(_xml_count(suite, "failures") for suite in suites)
@@ -1016,33 +702,16 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
 
     failed_tests: tuple[str, ...] = ()
     try:
-        payload = json.loads(_gate_read(lastfailed_path, _PYTEST_REPORT_MAX_BYTES))
-        if isinstance(payload, dict):
-            failed_tests = tuple(
-                redact_text(node_id)[:1000]
-                for node_id, is_failed in payload.items()
-                if isinstance(node_id, str) and is_failed is True
-            )
-    except (OSError, ValueError):
+        if lastfailed_path.stat().st_size <= _PYTEST_REPORT_MAX_BYTES:
+            payload = json.loads(lastfailed_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                failed_tests = tuple(
+                    redact_text(node_id)[:1000]
+                    for node_id, is_failed in payload.items()
+                    if isinstance(node_id, str) and is_failed is True
+                )
+    except (OSError, json.JSONDecodeError):
         pass
-
-    bodies = []
-    remaining = _FAILURE_BODIES_MAX_CHARS
-    bodies_truncated = False
-    for case in root.iter("testcase"):
-        for failure in case:
-            if failure.tag not in {"failure", "error"}:
-                continue
-            if remaining <= 0 or len(bodies) >= 100:
-                bodies_truncated = True
-                continue
-            text = redact_text("\n".join(filter(None, [failure.get("message"), failure.text])))
-            limit = min(remaining, _FAILURE_BODY_MAX_CHARS)
-            bodies.append({
-                "test": redact_text(f"{case.get('classname', '')}::{case.get('name', '')}")[:1000],
-                "kind": failure.tag, "body": text[:limit], "truncated": len(text) > limit,
-            })
-            remaining -= len(text[:limit])
 
     counts = TestCounts(
         total=total,
@@ -1056,8 +725,6 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
         exit_code=0 if failed == 0 and errors == 0 else 1,
         counts=counts,
         failed_tests=failed_tests,
-        failure_bodies=tuple(bodies),
-        failure_bodies_truncated=bodies_truncated,
     )
 
 
@@ -1074,7 +741,7 @@ def _is_pytest_command(command: str) -> bool:
 
 
 def _command_with_pytest_report(command: str, report_dir: Path) -> str:
-    environment = pytest_report_environment(command, report_dir, existing=os.environ.get("PYTEST_ADDOPTS"), gate_tmp=True)
+    environment = pytest_report_environment(command, report_dir, existing=os.environ.get("PYTEST_ADDOPTS"))
     if not environment:
         return command
     return f"PYTEST_ADDOPTS={shlex.quote(environment['PYTEST_ADDOPTS'])} {command}"
