@@ -126,7 +126,7 @@ def _append_one(home: Path, pred: Prediction) -> None:
 
 def _gen_id(now: datetime | None = None) -> str:
     now = now or datetime.now(tz=timezone.utc)
-    return f"pred-{now.strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:4]}"
+    return f"pred-{now.strftime('%Y-%m-%d')}-{uuid.uuid4().hex}"
 
 
 def _parse_iso(s: str) -> datetime | None:
@@ -301,6 +301,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         tolerance=args.tolerance,
     )
     home = _resolve_home(args)
+    if any(p.id == pred.id for p in _load(home)):
+        print(f"add: prediction id {pred.id!r} already exists; retry",
+              file=sys.stderr)
+        return 1
     _append_one(home, pred)
     print(pred.id)
     return 0
@@ -404,14 +408,17 @@ def cmd_mark(args: argparse.Namespace) -> int:
 
     home = _resolve_home(args)
     preds = _load(home)
-    found = None
-    for p in preds:
-        if p.id == args.id or args.id in p.id:
-            found = p
-            break
-    if found is None:
+    matches = [p for p in preds if args.id in p.id]
+    if not matches:
         print(f"mark: no prediction matching {args.id!r}", file=sys.stderr)
         return 1
+    if len(matches) > 1:
+        print(f"mark: ambiguous prediction id {args.id!r}; candidates:",
+              file=sys.stderr)
+        for p in matches:
+            print(f"  {p.id}: {p.claim}", file=sys.stderr)
+        return 1
+    found = matches[0]
 
     found.status = args.status
     if args.actual is not None:
