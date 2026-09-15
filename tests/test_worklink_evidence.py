@@ -46,6 +46,26 @@ def base_evidence(**overrides: object) -> WorklinkEvidence:
     return WorklinkEvidence(**values)  # type: ignore[arg-type]
 
 
+@pytest.mark.asyncio
+async def test_worker_sidecar_probe_degrades_on_permission_error(tmp_path, monkeypatch):
+    """EPERM probing the worker-owned report dir must not fail the gate.
+
+    Regression for the hotfix after #1749: the controller lstat()s a path inside
+    the worker-owned checkout under the uid split, which raises EPERM, not
+    FileNotFoundError. Retention is best-effort and must degrade instead.
+    """
+    from mimir.worklink import evidence as ev
+
+    def deny(self, *a, **k):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(Path, "lstat", deny)
+    out = await ev._worker_gate_sidecars(
+        tmp_path / "report", tmp_path, None, None, failed=True, on_launch=None,
+    )
+    assert out == {"files": [], "truncated": False}
+
+
 def test_completed_empty_diff_demotes_to_failed() -> None:
     result = validate_evidence(base_evidence(files_changed=[]))
 
