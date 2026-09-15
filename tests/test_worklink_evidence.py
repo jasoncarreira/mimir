@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import asyncio
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -1213,3 +1214,441 @@ def test_gate_report_directory_is_writable_by_the_gate_identity(tmp_path):
             "by group, not by ownership"
         )
     assert not worker_dir.exists(), "report directory must be cleaned up"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passes", [False, True])
+async def test_gate_retains_failure_bodies_logs_and_tmp_sidecars(tmp_path, monkeypatch, passes):
+    from dataclasses import asdict
+    import xml.etree.ElementTree as ET
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "false")
+    repo = _init_gate_repo(tmp_path, f'''
+import sys
+def test_failure(tmp_path):
+    (tmp_path / "journal.jsonl").write_text('distinctive-sidecar token=sidecar-secret')
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    print("stdout-start " + "x" * 7000 + " stdout-end token=stdout-secret")
+    print("stderr-start stderr-end token=stderr-secret", file=sys.stderr)
+    assert {passes!r}, "distinctive-1749-assertion token=assertion-secret"
+''')
+    result = await observe_evidence(
+        issue=1749, attempt=3, backend="codex", branch="branch", checkout=repo,
+        started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
+        test_command=f"{shlex.quote(sys.executable)} -m pytest -q -s",
+    )
+    tests = result.evidence.tests
+    if passes:
+        assert tests.artifacts is None
+        assert not (tmp_path / "gate-evidence").exists()
+        return
+    assert "distinctive-1749-assertion" in json.dumps(asdict(tests))
+    assert "distinctive-1749-assertion" in tests.failure_bodies[0]["body"]
+    initial, rerun = tests.initial_run.artifacts, tests.rerun.artifacts
+    assert initial["run_id"] == rerun["run_id"]
+    assert initial["phase"] == "initial_gate"
+    assert rerun["phase"] == "flake_rerun"
+    bundle = Path(initial["bundle"])
+    raw = bundle.read_text()
+    for secret in ("assertion-secret", "stdout-secret", "stderr-secret", "sidecar-secret"):
+        assert secret not in raw
+        assert secret not in json.dumps(asdict(tests))
+    records = [json.loads(line) for line in raw.splitlines()]
+    for phase in ("initial_gate", "flake_rerun"):
+        files = {r["path"]: r["text"] for r in records if r["phase"] == phase}
+        assert all(r["issue"] == 1749 and r["attempt"] == 3 for r in records)
+        assert "distinctive-1749-assertion" in ET.fromstring(files["junit.xml"]).find(".//failure").text
+        assert "stdout-start" in files["stdout.txt"] and "stdout-end" in files["stdout.txt"]
+        assert "stderr-start stderr-end" in files["stderr.txt"]
+        assert any("distinctive-sidecar" in text for name, text in files.items() if name.endswith("journal.jsonl"))
+        assert not any(name.endswith("loop") for name in files)
+    # The original report location printed by pytest has already disappeared.
+    assert not list(repo.glob(".worklink-gate-*"))
+    shutil.rmtree(repo)
+    assert "distinctive-1749-assertion" in bundle.read_text()
+
+
+def test_gate_failure_body_limits_and_xml_entity_redaction(tmp_path):
+    from mimir.worklink.evidence import _FAILURE_BODY_MAX_CHARS, _FAILURE_BODIES_MAX_CHARS
+    cases = ''.join(
+        '<testcase name="sample"><failure message="token=&#115;ecret">'
+        + "distinctive " + "x" * 20000 + '</failure></testcase>' for _ in range(10)
+    )
+    (tmp_path / "junit.xml").write_text('<testsuite tests="10" failures="10">' + cases + '</testsuite>')
+    result = read_pytest_result("pytest", tmp_path)
+    assert result.failure_bodies_truncated
+    assert len(result.failure_bodies) == 4
+    assert all(body["truncated"] for body in result.failure_bodies)
+    assert all(len(body["body"]) == _FAILURE_BODY_MAX_CHARS for body in result.failure_bodies)
+    assert sum(len(body["body"]) for body in result.failure_bodies) == _FAILURE_BODIES_MAX_CHARS
+    assert "secret" not in str(result.failure_bodies)
+
+
+def _retain_sample(tmp_path, report, **kwargs):
+    from mimir.worklink.evidence import _retain_gate_artifacts
+    return _retain_gate_artifacts(
+        tmp_path, report, subprocess.CompletedProcess("pytest", 1, "stdout", "stderr"),
+        issue=1749, attempt=1, run_id="unique-run", phase="initial_gate",
+        output_incomplete=False, **kwargs,
+    )
+
+
+def test_gate_artifact_cap_is_shared_across_phases_and_observations(tmp_path, monkeypatch):
+    import mimir.worklink.evidence as module
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "junit.xml").write_text('<testsuite tests="1" failures="1"/>')
+    (report / "huge").write_text("x" * 3000)
+    monkeypatch.setattr(module, "_GATE_ARTIFACT_MAX_BYTES", 1024)
+    for _ in range(10):
+        result = _retain_sample(tmp_path, report)
+        assert result["truncated"]
+        assert result["omitted_files"] > 0
+        assert Path(result["bundle"]).stat().st_size <= 1024
+    assert result["retained_files"] == 0
+
+
+@pytest.mark.parametrize("link_kind", ["file", "directory", "loop", "fifo"])
+def test_gate_collector_omits_links_and_special_files(tmp_path, link_kind):
+    report = tmp_path / "report"
+    report.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "secret").write_text("outside-sentinel")
+    (report / "junit.xml").write_text('<testsuite/>')
+    link = report / "sidecar"
+    if link_kind == "fifo":
+        os.mkfifo(link)
+    else:
+        link.symlink_to({"file": external / "secret", "directory": external, "loop": link}[link_kind])
+    result = _retain_sample(tmp_path, report)
+    assert result["omitted_files"] == 1
+    assert "outside-sentinel" not in Path(result["bundle"]).read_text()
+    assert '"path": "sidecar"' not in Path(result["bundle"]).read_text()
+
+
+@pytest.mark.parametrize("component", ["junit.xml", "cache", "bundle", "root"])
+def test_gate_artifact_reads_and_writes_refuse_symlink_components(tmp_path, component):
+    report = tmp_path / "report"
+    report.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    xml = '<testsuite tests="1" failures="1"><testcase><failure>outside-sentinel</failure></testcase></testsuite>'
+    (outside / "junit.xml").write_text(xml)
+    (outside / "v").mkdir()
+    (outside / "v" / "cache").mkdir()
+    (outside / "v" / "cache" / "lastfailed").write_text('{"outside-sentinel":true}')
+    if component in {"junit.xml", "cache"}:
+        (report / component).symlink_to(outside / component if component == "junit.xml" else outside)
+        if component == "cache":
+            (report / "junit.xml").write_text('<testsuite/>')
+        result = read_pytest_result("pytest", report)
+        assert "outside-sentinel" not in str(result)
+        return
+    if component == "root":
+        (tmp_path / "gate-evidence").symlink_to(outside)
+    else:
+        (tmp_path / "gate-evidence").mkdir()
+        (tmp_path / "gate-evidence" / "1749-1.jsonl").symlink_to(outside / "junit.xml")
+    result = _retain_sample(tmp_path, report)
+    assert result["error"] in {"NotADirectoryError", "OSError"}
+    assert (outside / "junit.xml").read_text() == xml
+    assert not (outside / "1749-1.jsonl").exists()
+
+
+def test_gate_reader_rejects_special_and_growing_files(tmp_path, monkeypatch):
+    import mimir.worklink.evidence as module
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(OSError, match="regular"):
+        module._gate_read(fifo, 100)
+    path = tmp_path / "growing"
+    path.write_bytes(b"x" * 11)
+    actual = os.fstat
+    def stale_size(fd):
+        info = actual(fd)
+        return type("Stat", (), {"st_mode": info.st_mode, "st_size": 0})()
+    monkeypatch.setattr(module.os, "fstat", stale_size)
+    with pytest.raises(ValueError, match="grew"):
+        module._gate_read(path, 10)
+
+
+def test_gate_collector_bounds_entries_and_depth(tmp_path, monkeypatch):
+    import mimir.worklink.evidence as module
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "junit.xml").write_text('<testsuite/>')
+    for index in range(10):
+        (report / str(index)).write_text("sidecar")
+    monkeypatch.setattr(module, "_GATE_ARTIFACT_MAX_ENTRIES", 3)
+    result = _retain_sample(tmp_path, report)
+    assert result["truncated"]
+    assert result["retained_files"] <= 6
+    monkeypatch.setattr(module, "_GATE_ARTIFACT_MAX_ENTRIES", 2048)
+    deep = report
+    for _ in range(34):
+        deep = deep / "nested"
+        deep.mkdir()
+    (deep / "file").write_text("depth-sentinel")
+    result = _retain_sample(tmp_path, report)
+    assert result["truncated"]
+    assert "depth-sentinel" not in Path(result["bundle"]).read_text()
+
+
+def test_gate_xml_artifacts_scrub_structural_credentials(tmp_path):
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "junit.xml").write_text(
+        '<testsuite><properties><property name="password" value="property-secret"/>'
+        '</properties><testcase><failure message="token=&#115;ecret">assertion</failure>'
+        '</testcase></testsuite>'
+    )
+    (report / "sidecar.xml").write_text(
+        '<config password="attribute-secret"><password>element-secret</password></config>'
+    )
+    record = _retain_sample(tmp_path, report)
+    contents = Path(record["bundle"]).read_text()
+    for secret in ("property-secret", "attribute-secret", "element-secret", "token=secret", "&#115;ecret"):
+        assert secret not in contents
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("passes", [False, True])
+async def test_worker_private_sidecars_exported_before_cleanup(tmp_path, monkeypatch, passes):
+    import mimir.worklink.evidence as module
+    from mimir.worklink.compute import WorkSpec, ComputeResult, LaunchHandle
+
+    repo = _init_gate_repo(tmp_path, f'''
+def test_worker(tmp_path):
+    (tmp_path / "journal").write_text("worker-journal token=worker-secret")
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    assert {passes!r}, "worker-distinctive-assertion"
+''')
+    repo.chmod(0o2770)
+    specs = []
+    callbacks = []
+    cleaned = []
+    private = []
+    class Compute:
+        async def launch(self, spec):
+            specs.append(spec)
+            assert spec.output_root is None, "raw worker output must not be durable"
+            if spec.local_argv[0] == "/usr/bin/env":
+                (repo / "json.py").write_text("raise RuntimeError('checkout shadowed exporter')")
+            return LaunchHandle("local_subprocess", str(len(specs)))
+
+        async def wait(self, handle, timeout_s):
+            spec = specs[int(handle.identifier) - 1]
+            if spec.local_argv[0] == "/usr/bin/env":
+                root = repo / spec.local_argv[-2]
+                assert root.stat().st_mode & 0o777 == 0o700
+                private.append(root)
+            result = await asyncio.to_thread(
+                subprocess.run, spec.local_argv, cwd=repo,
+                env={**os.environ, **spec.env}, capture_output=True, text=True,
+            )
+            return ComputeResult(result.returncode, result.stdout, result.stderr)
+
+        async def cleanup(self, handle):
+            cleaned.append(handle)
+
+    original_read = module._gate_read
+    def controller_read(path, limit):
+        # Model the real permission boundary: the controller cannot read a
+        # worker-owned 0700 tmp_path tree. Only the owner-identity export can.
+        assert "tmp" not in path.relative_to(repo).parts if path.is_relative_to(repo) else True
+        return original_read(path, limit)
+    monkeypatch.setattr(module, "_gate_read", controller_read)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    command = f"{shlex.quote(sys.executable)} -m pytest -q"
+    result = await observe_evidence(
+        issue=1749, attempt=1, backend="opencode", branch="branch", checkout=repo,
+        started_at=datetime.now(UTC), base_ref="main", backend_status="completed",
+        test_command=command, compute=Compute(), gate_rerun_max_failures=0,
+        on_gate_launch=callbacks.append,
+        work_spec=WorkSpec(1749, 1, "url", "main", "branch", "", None, command,
+                           "opencode", 60, output_root=tmp_path / "controller-state"),
+    )
+    assert len(specs) == 2
+    assert callbacks == cleaned
+    assert private and all(not path.exists() for path in private)
+    assert not list(repo.glob(".worklink-gate-*"))
+    if passes:
+        assert result.evidence.tests.artifacts is None
+        assert not (tmp_path / "controller-state").exists()
+    else:
+        record = result.evidence.tests.artifacts
+        assert not record["truncated"]
+        contents = Path(record["bundle"]).read_text()
+        assert "worker-journal" in contents
+        assert "worker-distinctive-assertion" in contents
+        assert "worker-secret" not in contents
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "parent", "root", "fifo", "size", "entries", "depth"])
+def test_worker_export_is_bounded_and_does_not_follow_links(tmp_path, kind):
+    from mimir.worklink.evidence import _WORKER_SIDECARS
+    report = tmp_path / "report"
+    report.mkdir()
+    root = report / "tmp"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("outside-sentinel")
+    if kind in {"file", "directory"}:
+        (root / "link").symlink_to(outside / "secret" if kind == "file" else outside)
+    elif kind == "fifo":
+        os.mkfifo(root / "fifo")
+    elif kind == "parent":
+        root.rmdir()
+        report.rmdir()
+        (outside / "tmp").mkdir()
+        (outside / "tmp" / "secret").write_text("outside-sentinel")
+        report.symlink_to(outside)
+    elif kind == "root":
+        root.rmdir()
+        root.symlink_to(outside)
+    elif kind == "size":
+        (root / "large").write_bytes(b"x" * (16 * 1024 * 1024 + 1))
+    elif kind == "entries":
+        for index in range(2050):
+            (root / str(index)).touch()
+    elif kind == "depth":
+        deep = root
+        for _ in range(34):
+            deep = deep / "nested"
+            deep.mkdir()
+        (deep / "secret").write_text("depth-sentinel")
+    result = subprocess.run(
+        [sys.executable, "-c", _WORKER_SIDECARS, "report/tmp", "1"],
+        cwd=tmp_path, text=True, capture_output=True, check=True,
+    )
+    payload = json.loads(result.stdout)
+    assert payload["files"] == []
+    assert "outside-sentinel" not in result.stdout
+    assert (outside / "secret").read_text() == "outside-sentinel"
+    if kind == "parent":
+        assert (outside / "tmp" / "secret").exists()
+    if kind in {"size", "entries", "depth"}:
+        assert payload["truncated"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["exit", "timeout", "overflow", "json", "shape"])
+async def test_worker_export_incomplete_fails_closed(tmp_path, fault):
+    from mimir.worklink.evidence import _worker_gate_sidecars
+    from mimir.worklink.compute import WorkSpec, ComputeResult, LaunchHandle
+    report = tmp_path / "report"
+    (report / "tmp").mkdir(parents=True)
+    spec = WorkSpec(1, 1, "url", "main", "branch", "", None, "pytest", "opencode", 60)
+    class Compute:
+        async def launch(self, spec):
+            return LaunchHandle("local_subprocess", "export")
+        async def wait(self, handle, timeout_s):
+            text = "bad json" if fault == "json" else ('[]' if fault == "shape" else '{"files":[{"path":"fake","text":"untrusted"}],"truncated":false}')
+            return ComputeResult(int(fault == "exit"), text, "", timed_out=fault == "timeout", output_overflow=fault == "overflow")
+        async def cleanup(self, handle):
+            pass
+    result = await _worker_gate_sidecars(report, tmp_path, spec, Compute(), failed=True, on_launch=None)
+    assert result == {"files": [], "truncated": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["launch", "wait", "callback", "cancel"])
+async def test_worker_export_faults_preserve_evidence_or_cancel(tmp_path, fault):
+    from mimir.worklink.evidence import _worker_gate_sidecars
+    from mimir.worklink.compute import WorkSpec, ComputeLaunchError, LaunchHandle
+    report = tmp_path / "report"
+    (report / "tmp").mkdir(parents=True)
+    spec = WorkSpec(1, 1, "url", "main", "branch", "", None, "pytest", "opencode", 60)
+    cancelled, cleaned = [], []
+    handle = LaunchHandle("local_subprocess", "export")
+    class Compute:
+        async def launch(self, spec):
+            assert spec.local_argv[:4] == ("/usr/bin/env", "python3", "-I", "-c")
+            if fault == "launch":
+                raise ComputeLaunchError("unavailable")
+            return handle
+        async def wait(self, handle, timeout_s):
+            if fault == "cancel":
+                raise asyncio.CancelledError()
+            raise OSError("unavailable")
+        async def cancel(self, handle):
+            cancelled.append(handle)
+        async def cleanup(self, handle):
+            cleaned.append(handle)
+    def callback(handle):
+        if fault == "callback":
+            raise ValueError("cannot persist handle")
+    if fault in {"callback", "cancel"}:
+        with pytest.raises(ValueError if fault == "callback" else asyncio.CancelledError):
+            await _worker_gate_sidecars(report, tmp_path, spec, Compute(), failed=True, on_launch=callback)
+    else:
+        result = await _worker_gate_sidecars(report, tmp_path, spec, Compute(), failed=True, on_launch=callback)
+        assert result == {"files": [], "truncated": True}
+    assert cancelled == ([] if fault == "launch" else [handle])
+    assert cleaned == ([] if fault == "launch" else [handle])
+
+
+def test_gate_reader_rejects_oversize_before_read(tmp_path, monkeypatch):
+    import mimir.worklink.evidence as module
+    path = tmp_path / "large"
+    path.write_text("x" * 11)
+    def no_read(*args, **kwargs):
+        pytest.fail("oversize artifact must be rejected before reading")
+    monkeypatch.setattr(module.os, "fdopen", no_read)
+    with pytest.raises(ValueError, match="exceeds"):
+        module._gate_read(path, 10)
+
+
+def test_gate_bundle_rejects_special_file(tmp_path):
+    (tmp_path / "gate-evidence").mkdir()
+    bundle = tmp_path / "gate-evidence" / "1749-1.jsonl"
+    os.mkfifo(bundle)
+    reader = os.open(bundle, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        record = _retain_sample(tmp_path, tmp_path)
+        assert record.get("error") == "OSError"
+        assert os.read(reader, 10000) == b""
+    finally:
+        os.close(reader)
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "fifo"])
+def test_worker_export_rejects_replacement_after_lstat(tmp_path, replacement):
+    from mimir.worklink.evidence import _WORKER_SIDECARS
+    root = tmp_path / "report" / "tmp"
+    root.mkdir(parents=True)
+    (root / "victim").write_text("original")
+    outside = tmp_path / "outside"
+    outside.write_text("outside-sentinel")
+    # Inject the race into the child, not into whole-process filesystem state.
+    injection = '''
+original_lstat = os.lstat
+def racing_lstat(name, **kwargs):
+    info = original_lstat(name, **kwargs)
+    if name == "victim":
+        os.unlink(name, dir_fd=kwargs["dir_fd"])
+        if REPLACEMENT == "symlink":
+            os.symlink(OUTSIDE, name, dir_fd=kwargs["dir_fd"])
+        else:
+            os.mkfifo(name, dir_fd=kwargs["dir_fd"])
+    return info
+os.lstat = racing_lstat
+'''.replace("REPLACEMENT", repr(replacement)).replace("OUTSIDE", repr(str(outside)))
+    script = _WORKER_SIDECARS.replace("root, failed =", injection + "\nroot, failed =")
+    result = subprocess.run(
+        [sys.executable, "-c", script, "report/tmp", "1"], cwd=tmp_path,
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(result.stdout)["files"] == []
+    assert "outside-sentinel" not in result.stdout
+
+
+def test_gate_caps_empty_failure_entries(tmp_path):
+    (tmp_path / "junit.xml").write_text(
+        '<testsuite>' + '<testcase><failure/></testcase>' * 101 + '</testsuite>'
+    )
+    result = read_pytest_result("pytest", tmp_path)
+    assert len(result.failure_bodies) == 100
+    assert result.failure_bodies_truncated
