@@ -1216,6 +1216,30 @@ def test_gate_report_directory_is_writable_by_the_gate_identity(tmp_path):
     assert not worker_dir.exists(), "report directory must be cleaned up"
 
 
+def test_controller_gate_report_uses_physical_temp_directory(tmp_path, monkeypatch):
+    """macOS's system temp root can have a /var -> /private/var ancestor.
+
+    Canonicalize the controller-created directory, not arbitrary report files:
+    the no-follow reader must still reject links inside the report tree.
+    """
+    import tempfile
+    from mimir.worklink.evidence import _gate_report_directory
+
+    physical = tmp_path / "physical"
+    physical.mkdir()
+    alias = tmp_path / "temp-alias"
+    alias.symlink_to(physical, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    with _gate_report_directory(tmp_path / "checkout", False) as report:
+        (report / "junit.xml").write_text('<testsuite tests="1" failures="0"/>')
+        result = read_pytest_result("pytest", report)
+        assert result.report_error is None
+        assert result.counts is not None
+        assert result.counts.total == 1
+        assert report == report.resolve()
+    assert not report.exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("passes", [False, True])
 async def test_gate_retains_failure_bodies_logs_and_tmp_sidecars(tmp_path, monkeypatch, passes):

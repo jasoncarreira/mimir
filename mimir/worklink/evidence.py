@@ -302,7 +302,10 @@ def _gate_report_directory(checkout: Path, worker_uid_drop: bool) -> Iterator[Pa
     """
     if not worker_uid_drop:
         with tempfile.TemporaryDirectory(prefix="worklink-gate-") as text:
-            yield Path(text)
+            # System temp roots may use OS aliases (macOS /var -> /private/var).
+            # Canonicalize this controller-created root once; keep _gate_open's
+            # no-follow checks for all subsequent report and artifact accesses.
+            yield Path(text).resolve(strict=True)
         return
     checkout.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".worklink-gate-", dir=checkout, ignore_cleanup_errors=True) as text:
