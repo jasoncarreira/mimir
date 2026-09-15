@@ -1083,12 +1083,16 @@ time.sleep(3600)
 async def test_shutdown_journal_timeout_distinguishes_surviving_child(
     stage: str, tmp_path: Path,
 ) -> None:
+    # Formatting only. test_blocked_main_signal_delivery_matrix owns the real
+    # five-second deadline; test_shutdown_journal_observer_arms_watchdog_without_python_dispatch
+    # owns observer-only arming with main blocked and a targeted worker.
     progress = tmp_path / "child-progress"
     source = _journal_source(progress, controlled_exit=True) + r'''
 import asyncio
 from types import SimpleNamespace
 
 fire_watchdog = threading.Event()
+park_main = threading.Event()
 main_ident = threading.get_ident()
 
 class ControlledTimer(JournalTimer):
@@ -1100,26 +1104,36 @@ def deliver():
     while token := os.read(0, 1):
         if token == b'x':
             fire_watchdog.set()
+        elif token == b'p':
+            park_main.set()
         else:
             signum = {b't': signal.SIGTERM, b'i': signal.SIGINT}[token]
-            # These stages diagnose graceful dispatch and repeat-signal exit.
-            # Process-directed delivery can leave main blocked indefinitely.
+            # Main remains runnable through both first and repeated dispatch.
             signal.pthread_kill(main_ident, signum)
 
 proxy.threading.Timer = ControlledTimer
 _journal_force_exit = lambda self: record(b'force-exit-survived')
 os._exit = lambda code: record(b'escalation-survived:' + str(code).encode())
 
+def survive():
+    # Never rely on a signal rescuing Event.wait's pre-wait window. The parent
+    # permits parking only after acknowledging this stage's journal evidence.
+    while not park_main.is_set():
+        pass
+    record(b'surviving-ready')
+    threading.Event().wait()
+
 def cleanup():
     record(b'cleanup-enter')
-    threading.Event().wait()
+    record(b'cleanup-ack')
+    survive()
 
 async def run():
     hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=cleanup))
     hooks.install()
     threading.Thread(target=deliver, daemon=True).start()
     os.write(1, b'ready\n')
-    threading.Event().wait()
+    survive()
 
 asyncio.run(run())
 '''
@@ -1131,8 +1145,13 @@ asyncio.run(run())
     )
 
     async def await_marker(marker: str) -> None:
+        deadline = time.monotonic() + 30
         while marker not in progress.read_text().splitlines():
             assert process.returncode is None
+            assert time.monotonic() < deadline, (
+                f"self-test acknowledgement missing: {marker}; child progress:\n"
+                + progress.read_text()
+            )
             await asyncio.sleep(0.01)
 
     try:
@@ -1141,7 +1160,7 @@ asyncio.run(run())
             if stage != "unarmed":
                 process.stdin.write(b"t")
                 await process.stdin.drain()
-                await await_marker("cleanup-enter")
+                await await_marker("cleanup-ack")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
             if stage == "force-exit":
                 process.stdin.write(b"x")
@@ -1152,6 +1171,9 @@ asyncio.run(run())
                 await process.stdin.drain()
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
                 await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
+            process.stdin.write(b"p")
+            await process.stdin.drain()
+            await await_marker("surviving-ready")
             # The short timeout tests formatting, never child startup or delivery.
             with pytest.raises(pytest.fail.Exception) as failure:
                 async with _shutdown_ceiling(process, progress, lambda: "exit", timeout=0.05):
