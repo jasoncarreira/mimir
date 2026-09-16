@@ -106,7 +106,18 @@ def _run_poller(
             raise ToolPolicyRefusal("proposal rejected: state ownership or worktree mismatch")
         if operation == "open_proposal":
             turn = get_current_turn()
-            if turn is None or turn.auth_context is not context or not turn.turn_id:
+            # IFC merges replace the carrier, but must not change turn identity.
+            if (
+                turn is None
+                or not turn.turn_id
+                or turn.auth_context is None
+                or turn.auth_context.principal != context.principal
+                or turn.auth_context.canonical_principal != context.canonical_principal
+                or turn.auth_context.trigger != context.trigger
+                or turn.auth_context.origin_ref != context.origin_ref
+                or turn.auth_context.channel_id != context.channel_id
+                or turn.auth_context.roles != context.roles
+            ):
                 raise ToolPolicyRefusal("proposal rejected: exact runtime turn required")
             try:
                 requested = PollerProposalScope(service.canonical, turn.turn_id, source, context.origin_ref)
