@@ -16499,6 +16499,56 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_hook", [False, True])
+@pytest.mark.parametrize("exit_code", [0, 1, 2, 127])
+async def test_consecutive_shell_exec_after_nonzero_exit(
+    async_hook, exit_code, tmp_path, monkeypatch,
+):
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware, _result_is_error
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    auth = _trusted_operator_write_auth(admin=True)
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    def handler(request):
+        result = ToolMessage(
+            content=f"exit={exit_code}\nidentical output",
+            tool_call_id=request.tool_call["id"],
+        )
+        calls.append(result)
+        return result
+
+    async def async_handler(request):
+        return handler(request)
+
+    token = set_current_turn(_turn("shell-retry", "shell-retry", auth))
+    try:
+        for _ in range(2):
+            request = _tool_request(auth, args={
+                "command": f"printf 'identical output'; exit {exit_code}",
+            })
+            if async_hook:
+                result = await middleware.awrap_tool_call(request, async_handler)
+            else:
+                result = middleware.wrap_tool_call(request, handler)
+            assert result is calls[-1]
+            assert result.content == f"exit={exit_code}\nidentical output"
+            assert _result_is_error("shell_exec", result) is (exit_code != 0)
+        assert len(calls) == 2
+        shell_sources = [source for source in auth.ifc_state.labels.sources if source.domain == "shell"]
+        assert shell_sources
+        assert {(source.integrity, source.integrity_effect) for source in shell_sources} == {
+            ("untrusted", "informational"),
+        }
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True])
 async def test_shell_exec_policy_and_execution_are_unchanged(
     async_hook: bool,
     tmp_path: Path,

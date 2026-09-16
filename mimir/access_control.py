@@ -9994,15 +9994,16 @@ def classify_protected_result(
         )
         and authorization.allowed
         and provenance is None
-        and not failed
+        and (not failed or tool_name == "shell_exec")
     ):
         # Ordinary authorized shell output is untrusted information, not a new
         # external ingest that deadlocks the next shell step. bash_job_output is
         # bash_async's mapped content path; bash_jobs_list belongs here too because
         # it exposes job status and command excerpts, not a new external source.
-        # Explicit source provenance (including inherited job labels) and failures
-        # retain their conservative classification below; merging these labels
-        # never clears earlier external active ingest.
+        # A shell_exec exit code is not evidence about the output's integrity.
+        # Explicit source provenance (including inherited job labels) and other
+        # tools' failures retain their conservative classification below;
+        # merging these labels never clears earlier external active ingest.
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
