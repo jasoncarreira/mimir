@@ -643,7 +643,7 @@ async def _signal_exit_protocol(
             # This is not expiry; only the repeated signal may call os._exit.
             process.stdin.write(b"n")
             await process.stdin.drain()
-            await _await_diagnostic(progress, "watchdog-input-run-returned", timeout=None)
+            await _await_diagnostic(progress, "watchdog-input-run-returned")
             signum = signal.SIGINT if signum != signal.SIGINT else signal.SIGTERM
             delivered += bytes([signum])
             process.send_signal(signum)
@@ -785,7 +785,7 @@ raise SystemExit(bootstrap.main([]))
             # protocol loop, after which no writer remains and polling the final
             # file would only delay the same failure. Ordering only — later
             # assertions re-read the file for markers written after this point.
-            await _await_diagnostic(progress, "watchdog-input-wait", timeout=None)
+            await _await_diagnostic(progress, "watchdog-input-wait")
 
         await _signal_exit_protocol(
             process, progress, signum, repeat, after_armed=_observe_input_wait,
@@ -1161,7 +1161,7 @@ asyncio.run(run())
                 process.stdin.write(b"t")
                 await process.stdin.drain()
                 await await_marker("cleanup-ack")
-                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}", timeout=None)
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGTERM}")
             if stage == "force-exit":
                 process.stdin.write(b"x")
                 await process.stdin.drain()
@@ -1170,7 +1170,7 @@ asyncio.run(run())
                 process.stdin.write(b"i")
                 await process.stdin.drain()
                 await await_marker(f"escalation-survived:{128 + signal.SIGINT}")
-                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}", timeout=None)
+                await _await_diagnostic(progress, f"tee-forward-returned:{signal.SIGINT}")
             process.stdin.write(b"p")
             await process.stdin.drain()
             await await_marker("surviving-ready")
