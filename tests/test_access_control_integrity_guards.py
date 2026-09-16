@@ -8,6 +8,64 @@ import pytest
 from mimir import access_control as ac
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["home", "outside", "symlink", "missing", "loop", "invalid"])
+async def test_file_search_publishes_strictly_resolved_sources(tmp_path, monkeypatch, location):
+    import json
+    from unittest.mock import AsyncMock
+
+    from mimir.search import HashEmbedder, Indexer, SearchResult
+    from mimir.tools import extra
+
+    home = tmp_path / "home"
+    target = home / "memory" / "note.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("reference")
+    outside = tmp_path / "external.md"
+    outside.write_text("external")
+    link = home / "memory" / "link.md"
+    link.symlink_to(outside)
+    loop = home / "memory" / "loop.md"
+    loop.symlink_to(loop)
+    path = {
+        "home": "memory/note.md", "outside": str(outside),
+        "symlink": "memory/link.md", "missing": "memory/missing.md",
+        "loop": "memory/loop.md", "invalid": "memory/\0.md",
+    }[location]
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_SOURCE_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    results = [
+        SearchResult(p, "memory", 0, 1, 1, 1, 1, "snippet", None)
+        for p in ("memory/note.md", path)
+    ]
+    indexer = Indexer(home, embedder=HashEmbedder())
+    monkeypatch.setattr(indexer, "search", AsyncMock(return_value=results))
+    monkeypatch.setitem(extra._SEARCH_STATE, "indexer", indexer)
+    token = ac.begin_protected_result_capture()
+    try:
+        # An earlier publication must not make an incomplete capture authoritative.
+        ac.publish_protected_result(())
+        payload = await extra.file_search.coroutine(query="reference")
+    finally:
+        provenance = ac.end_protected_result_capture(token)
+
+    assert json.loads(payload) == [r.to_dict() for r in results]
+    if location in {"missing", "loop", "invalid"}:
+        assert provenance is None
+    else:
+        assert provenance is not None
+        source = provenance.sources[-1]
+        expected_path = target if location == "home" else outside
+        expected = (
+            ac.FilesystemReadTrust.WRITE_SIDE_GATING if location == "home"
+            else ac.FilesystemReadTrust.UNANCHORED
+        )
+        assert source.resource_id == str(expected_path.resolve(strict=True))
+        assert ac._filesystem_read_trust_anchor(source.resource_id) is expected
+        assert (source.integrity, source.integrity_effect) == expected.integrity
+
+
 @pytest.mark.parametrize("relative", [".", "attachments/body", "unknown/file", "state/pollers/event"])
 def test_home_helper_rejects_nonreference_paths(tmp_path: Path, relative: str) -> None:
     assert ac._home_reference_integrity(tmp_path, Path(relative)) == "untrusted"
