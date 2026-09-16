@@ -178,6 +178,7 @@ class WorklinkRunResult:
     reason: str | None = None
     preserved_ref: str | None = None
     preservation_error: str | None = None
+    next: str | None = None
 
 
 @dataclass
@@ -2549,6 +2550,7 @@ class WorklinkRunner:
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
                 reason=park_report,
+                next=status.next,
             )
             _log_event(
                 "worklink_transition",
@@ -2577,6 +2579,7 @@ class WorklinkRunner:
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
+                next=status.next,
             )
             _log_event(
                 "worklink_transition",
@@ -2614,6 +2617,7 @@ class WorklinkRunner:
             evidence_path=evidence_path,
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
+            next=status.next,
         )
         _log_event(
             "worklink_transition",

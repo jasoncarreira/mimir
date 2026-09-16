@@ -11,6 +11,9 @@ Fills gaps NOT already in test_saga_ops_wiring.py:
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import time
 from unittest.mock import AsyncMock, Mock
 
@@ -246,23 +249,53 @@ class TestResolveSessionId:
         result = _resolve_session_id("  ")
         assert result == "sess-abc"
 
-    def test_none_with_no_active_turn_returns_none(self) -> None:
-        # No active TurnContext registered → returns None.
-        result = _resolve_session_id(None)
-        assert result is None
-
-    def test_none_uses_single_active_turn_when_contextvar_missing(
-        self, turn_with_session: TurnContext
+    @pytest.mark.parametrize("active_count", [0, 1, 2], ids=["none", "single", "ambiguous"])
+    def test_none_resolves_without_contextvar_in_owned_process(
+        self, active_count: int
     ) -> None:
-        # MCP tool dispatch can run on a forked task where the contextvar is
-        # missing even though run_turn registered the active turn.  Simulate that
-        # boundary by clearing only the contextvar, not _active_turns.
-        token = _context._current_turn.set(None)
-        try:
-            result = _resolve_session_id(None)
-        finally:
-            _context._current_turn.reset(token)
-        assert result == "sess-abc"
+        # The single-active heuristic reads the whole process registry. A turn
+        # registered by this test is not necessarily the only turn in a full
+        # suite worker. Exercise the real registration/resolution chain in a
+        # child rather than clearing globals or guessing among multiple turns.
+        script = textwrap.dedent("""
+            import sys
+            import time
+            from mimir import _context
+            from mimir.models import TurnContext
+            from mimir.tools.saga_ops import _resolve_session_id
+
+            count = int(sys.argv[1])
+            tokens = []
+            try:
+                for index in range(count):
+                    ctx = TurnContext(
+                        turn_id=f"turn-{index}",
+                        session_id=f"channel-{index}",
+                        trigger="user_message",
+                        channel_id=f"channel-{index}",
+                        started_at=time.monotonic(),
+                        saga_session_id=f"sess-{index}",
+                    )
+                    tokens.append(_context.set_current_turn(ctx))
+                assert len(_context._active_turns) == count
+                token = _context._current_turn.set(None)
+                try:
+                    expected = "sess-0" if count == 1 else None
+                    assert _resolve_session_id(None) == expected
+                finally:
+                    _context._current_turn.reset(token)
+            finally:
+                for token in reversed(tokens):
+                    _context.reset_current_turn(token)
+            assert not _context._active_turns
+        """)
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(active_count)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ────────────────────────────────────────────────────────────────────
