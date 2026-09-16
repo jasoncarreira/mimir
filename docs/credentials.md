@@ -91,7 +91,7 @@ analogue for git credentials.
 | Env var | Used by | Upstream regen | Verification probe |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | langchain-anthropic / ChatClaudeCode | https://console.anthropic.com/settings/keys | `mimir verify-cred ANTHROPIC_API_KEY` (TBD — Phase 2); for now a one-turn test message |
-| `MINIMAX_API_KEY` | Gateway routing (when `ANTHROPIC_BASE_URL` points there) | Provider console | Same — turn test |
+| `MINIMAX_API_KEY`, `OPENROUTER_API_KEY` | Gateway routing (when `ANTHROPIC_BASE_URL` points there) | Provider console | Same — turn test |
 | `VOYAGE_API_KEY` | Voyage embedding provider (saga calibration) | https://dashboard.voyageai.com/api-keys | `mimir saga calibrate --dry-run` |
 | `OPENAI_API_KEY` | Alternate embedding provider | https://platform.openai.com/api-keys | `mimir saga calibrate --dry-run` |
 | `NVIDIA_API_KEY` / `NVIDIA_NIM_API_KEY` | NVIDIA NIM embedder (alternate) | NVIDIA NGC console | `mimir saga calibrate --dry-run` |

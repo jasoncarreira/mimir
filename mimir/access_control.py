@@ -6889,9 +6889,13 @@ class SinkGate:
                 source.domain == "repository"
                 and source.domain_qualifier is None
                 or (
-                    tool_name == "pr_submit_review"
-                    and getattr(repo_pr_action_scope, "pr_number", None) is not None
-                    and "admin" in (getattr(auth_context, "roles", ()) or ())
+                    (
+                        (tool_name != "pr_submit_review" and repo_pr_action_scope is not None)
+                        or (
+                            getattr(repo_pr_action_scope, "pr_number", None) is not None
+                            and "admin" in (getattr(auth_context, "roles", ()) or ())
+                        )
+                    )
                     and cls._is_trusted_operator_turn(
                         InformationFlowLabels(sources=(source,)), auth_context,
                     )
@@ -6904,7 +6908,7 @@ class SinkGate:
             ) is None
         ):
             # Repository command output may flow only back to the immutable
-            # PR/head scope from which it was produced. An interactive review
+            # PR/head scope from which it was produced. An interactive forge turn
             # also carries its authenticated operator ingress. Use the resolved
             # per-call scope: discovery need not populate the turn's scope slot.
             # Check ingress per source, not global taint: repository reads are

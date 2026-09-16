@@ -149,12 +149,9 @@ _LOCAL_ENV_INFRA_PREFIXES = ("LC_", "XDG_")
 # Provider-credential families a routed coding CLI (codex / claude / opencode,
 # which is provider-agnostic) may legitimately need. Union kept broad on
 # purpose — opencode routes to whichever provider its config selects.
-# OPENROUTER_ is deliberately absent: routing this deployment's work through
-# OpenRouter is disallowed, and omitting the prefix makes that structural
-# rather than dependent on no key being set.
 _LOCAL_ENV_CRED_PREFIXES = (
     "OPENAI_", "CODEX_", "ANTHROPIC_", "CLAUDE_", "OPENCODE_",
-    "MINIMAX_", "GROQ_", "GEMINI_", "GOOGLE_",
+    "MINIMAX_", "OPENROUTER_", "GROQ_", "GEMINI_", "GOOGLE_",
     "VOYAGE_", "GITHUB_TOKEN", "GH_TOKEN",
 )
 
