@@ -15,6 +15,7 @@ from typing import Awaitable, Callable, Mapping, Sequence
 
 from ...config import model_spec_at_call_time
 from ...opencode_config import (
+    OpenCodeConfigError,
     OpenCodeInvocation,
     opencode_model_from_agent_spec,
     opencode_worker_documents,
@@ -98,6 +99,17 @@ class WorklinkOpenCodeResolution:
     env: Mapping[str, str] = field(repr=False)
 
 
+# Routing Worklink work through OpenRouter is prohibited. The check belongs
+# here rather than on a credential transport: a provider reaches the worker
+# through the projected auth document, which opencode_worker_documents builds
+# from either a saved auth.json entry or an ambient API key resolved in the
+# CONTROLLER's environment. Neither route passes through the worker env
+# allowlist, so filtering env alone leaves the provider selectable. Every
+# Worklink path -- leaf builds, the compute layer and factory runs -- resolves
+# through this function, so rejecting the provider here covers all of them.
+_PROHIBITED_PROVIDERS = frozenset({"openrouter"})
+
+
 def resolve_worklink_opencode_invocation(
     env: Mapping[str, str],
 ) -> WorklinkOpenCodeResolution:
@@ -108,6 +120,8 @@ def resolve_worklink_opencode_invocation(
     resolution_env = {**os.environ, **env}
     resolution_env.setdefault("MIMIR_MODEL_SPEC", configured_model_spec)
     invocation = resolve_opencode_invocation(env=resolution_env)
+    if invocation.provider in _PROHIBITED_PROVIDERS:
+        raise OpenCodeConfigError("config_provider_selection")
     configured_model = opencode_model_from_agent_spec(configured_model_spec)
     model_diverged = invocation.model != configured_model
     if model_diverged:
