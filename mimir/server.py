@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -826,16 +827,51 @@ class _MaskApiKeyInAccessLog(logging.Filter):
 async def _handle_health(request: web.Request) -> web.Response:
     from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
 
+    response: dict[str, object] = {"ok": True}
+    if not request.app.get("check_worker_executor_health"):
+        return web.json_response(response)
+
     executor_source_commit = None
-    if request.app.get("check_worker_executor_health") and DEFAULT_EXECUTOR_SOCKET.exists():
+    status = 200
+    if DEFAULT_EXECUTOR_SOCKET.exists():
         try:
             executor_source_commit = await verify_executor_identity()
         except (OSError, RuntimeError, ValueError) as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=503)
-    response: dict[str, object] = {"ok": True}
-    if executor_source_commit is not None:
-        response["worklink_executor_source_commit"] = executor_source_commit
-    return web.json_response(response)
+            response.update(ok=False, error=str(exc))
+            status = 503
+
+    controller_source_commit = None
+    repo = os.environ.get("WORKLINK_REPO")
+    if repo:
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            commit = result.stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", commit):
+                controller_source_commit = commit
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    source_status = "unknown"
+    if executor_source_commit is not None and controller_source_commit is not None:
+        source_status = (
+            "matched" if executor_source_commit == controller_source_commit else "mismatched"
+        )
+    if source_status == "mismatched":
+        log.warning(
+            "Worklink executor source drift: executor=%s controller=%s; rebuild the root executor image",
+            executor_source_commit, controller_source_commit,
+        )
+    # Source drift is advisory, independent of the existing protocol health guard.
+    response.update(
+        worklink_executor_source_commit=executor_source_commit,
+        worklink_controller_source_commit=controller_source_commit,
+        worklink_executor_source_status=source_status,
+    )
+    return web.json_response(response, status=status)
 
 
 async def _handle_root(request: web.Request) -> web.Response:

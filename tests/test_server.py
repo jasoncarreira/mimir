@@ -2469,6 +2469,7 @@ class TestHandleHealth:
     ) -> None:
         from mimir.worklink import worker_client
 
+        monkeypatch.delenv("WORKLINK_REPO", raising=False)
         socket_path = tmp_path / "executor.sock"
         socket_path.touch()
         monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
@@ -2487,7 +2488,99 @@ class TestHandleHealth:
         assert body == {
             "ok": True,
             "worklink_executor_source_commit": "c" * 40,
+            "worklink_controller_source_commit": None,
+            "worklink_executor_source_status": "unknown",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", [
+        "matched", "mismatched", "no_socket", "no_repo", "not_git",
+        "missing_commit_file", "git_timeout", "git_missing",
+    ])
+    async def test_health_executor_source_comparison(
+        self, case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import subprocess
+        from mimir.worklink import worker_client, worker_exec
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run([
+            "git", "-C", str(repo), "-c", "user.name=Test", "-c",
+            "user.email=test@example.com", "commit", "--allow-empty", "-m", "test",
+        ], check=True, capture_output=True)
+        commit = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        monkeypatch.setenv("WORKLINK_REPO", str(repo))
+        if case == "no_repo":
+            monkeypatch.delenv("WORKLINK_REPO")
+        elif case == "not_git":
+            monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+        elif case in {"git_timeout", "git_missing"}:
+            def unavailable_git(*args, **kwargs):
+                if case == "git_timeout":
+                    raise subprocess.TimeoutExpired(args[0], 5)
+                raise FileNotFoundError("git")
+            monkeypatch.setattr(subprocess, "run", unavailable_git)
+
+        source_file = tmp_path / "executor-source-commit"
+        executor_commit = "0" * 40 if case == "mismatched" else commit
+        if case != "missing_commit_file":
+            source_file.write_text(executor_commit)
+        monkeypatch.setattr(worker_exec, "EXECUTOR_SOURCE_COMMIT_PATH", source_file)
+        socket_path = tmp_path / "executor.sock"
+        if case != "no_socket":
+            socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+
+        # Exercise the real identity verifier, including the executor's missing-file error.
+        class IdentitySocket:
+            def send(self, payload):
+                assert json.loads(payload)["op"] == "identity"
+
+            def recv(self, size):
+                try:
+                    response = {
+                        "status": "identity",
+                        "executor_identity": worker_client.EXECUTOR_PROTOCOL_IDENTITY,
+                        "source_commit": worker_exec._executor_source_commit(),
+                    }
+                except RuntimeError as exc:
+                    response = {"error": str(exc)}
+                return json.dumps(response).encode()
+
+            def close(self):
+                pass
+
+        def connect(self):
+            assert case != "no_socket"
+            return IdentitySocket()
+
+        monkeypatch.setattr(worker_client.WorkerClient, "_connect", connect)
+        app = _health_app()
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/health")
+            body = await resp.json()
+
+        expected = case if case in {"matched", "mismatched"} else "unknown"
+        assert body["worklink_executor_source_status"] == expected
+        assert resp.status == (503 if case == "missing_commit_file" else 200)
+        assert body["ok"] is (case != "missing_commit_file")
+        assert body["worklink_executor_source_commit"] == (
+            None if case in {"no_socket", "missing_commit_file"} else executor_commit
+        )
+        assert body["worklink_controller_source_commit"] == (
+            None if case in {"no_repo", "not_git", "git_timeout", "git_missing"} else commit
+        )
+        if case == "mismatched":
+            assert "Worklink executor source drift" in caplog.text
+            assert executor_commit in caplog.text
+            assert commit in caplog.text
 
 
 # ──────────────────────────────────────────────────────────────────────────────
