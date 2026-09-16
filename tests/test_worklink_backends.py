@@ -1818,3 +1818,52 @@ def test_registry_compute_is_unbound_and_authorized_backends_are_fresh() -> None
     assert first._authorized_checkout is authorization
     assert second._authorized_checkout is authorization
     assert first._jobs is not second._jobs
+
+
+def _provider_env(tmp_path: Path, spec: str, **values: str) -> dict[str, str]:
+    """Hermetic env for a Worklink resolution selecting an arbitrary provider."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    return {
+        "HOME": str(tmp_path),
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": spec,
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+        **values,
+    }
+
+
+def _write_opencode_auth(tmp_path: Path, payload: object) -> None:
+    path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("credential", ["saved_auth", "ambient_key"])
+def test_worklink_resolution_admits_any_configured_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential: str,
+) -> None:
+    """Worklink resolution carries whichever provider the operator configured.
+
+    Provider choice belongs to whoever runs the deployment, so the resolver must
+    not special-case particular vendors. Both credential transports are covered
+    because each reaches the worker through the projected auth document rather
+    than the worker environment allowlist, so a regression could hide in either.
+    """
+    from mimir.worklink.backends.opencode import resolve_worklink_opencode_invocation
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus-4.8")
+    if credential == "saved_auth":
+        _write_opencode_auth(tmp_path, {"openrouter": {"type": "api", "key": "sk-or-synthetic"}})
+    else:
+        env["OPENROUTER_API_KEY"] = "sk-or-synthetic"
+
+    resolution = resolve_worklink_opencode_invocation(env)
+
+    assert resolution.invocation.provider == "openrouter"
+    assert resolution.invocation.model == "openrouter/anthropic/claude-opus-4.8"
+    assert resolution.invocation.auth_type == "api"
+    assert "sk-or-synthetic" not in repr(resolution.invocation)
