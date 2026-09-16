@@ -1828,6 +1828,9 @@ def _openrouter_env(tmp_path: Path, **values: str) -> dict[str, str]:
         "HOME": str(tmp_path),
         "MIMIR_HOME": str(home),
         "MIMIR_MODEL_SPEC": "openrouter:anthropic/claude-opus-4.8",
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
         **values,
     }
 

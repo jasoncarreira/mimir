@@ -8600,6 +8600,7 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     lease_root.mkdir()
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
     checkout = _attach_test_checkout_lease(state, lease_root, "lease-7")
@@ -8607,7 +8608,7 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     lease_file.write_text('{"lease":"7"}', encoding="utf-8")
     service = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
-        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_checkout", "repo_test"),
         creation_path="test",
     )
     self_trigger = SourceLabel(
@@ -8625,22 +8626,34 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         source_kind="protected_tool", integrity="untrusted",
         integrity_effect="active_ingest",
     )
-    clean = InformationFlowLabels().with_channel(
+    initial = InformationFlowLabels().with_channel(
         "poller:github-activity",
-    ).with_source(self_trigger).with_source(SourceLabel(
-        principal="service:poller:github-activity",
-        domain="repository",
-        resource_id=(
-            f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
-            f"@{state.action_scope.observed_head_sha}"
-        ),
-        bridge_instance="forge",
-        sensitivity="internal",
-        authorized_principals=frozenset({"service:poller:github-activity"}),
-        source_kind="protected_tool",
-        integrity="untrusted",
-        integrity_effect="informational",
-    ))
+    ).with_source(self_trigger)
+    checkout_auth = replace(
+        _service_auth(service, initial), repo_review_state=state,
+        channel_id="poller:github-activity",
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+    )
+    target = (
+        f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
+        f"@{state.action_scope.observed_head_sha}:{state.action_scope.scope_id}"
+    )
+    checkout_decision = ToolRegistry().authorize_tool(
+        "repo_checkout", checkout_auth, enforce=True,
+        arguments={"repository": "o/r", "pull_request": 7},
+    )
+    assert checkout_decision.allowed, checkout_decision.reason
+    assert checkout_decision.repo_pr_action_scope == state.action_scope
+    checkout_labels = classify_protected_result(
+        "repo_checkout", {}, checkout_auth, checkout_decision, result="checked out",
+    )
+    assert checkout_labels is not None
+    repository_source, = checkout_labels.sources
+    assert (repository_source.integrity, repository_source.integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    clean = checkout_auth.ifc_state.merge(checkout_labels, fallback=initial)
+    assert clean.has_untrusted_active_ingest
     untrusted_only = InformationFlowLabels().with_channel(
         "poller:github-activity",
     ).with_source(untrusted_page)
@@ -8654,21 +8667,15 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         resource_id=str(lease_file), bridge_instance="filesystem",
     )
     after_lease_read = clean.with_source(lease_source)
-    target = (
-        f"{state.action_scope.canonical_repo}#pull/{state.action_scope.pr_number}"
-        f"@{state.action_scope.observed_head_sha}:{state.action_scope.scope_id}"
-    )
 
     def decision(labels: InformationFlowLabels):
         auth = replace(
-            _service_auth(service, labels),
-            channel_id="poller:github-activity", repo_review_state=state,
+            checkout_auth, ifc_labels=labels,
             ifc_state=InformationFlowState(labels=labels),
         )
-        return SinkGate.check_sink_flow(
-            "repo_test", target, labels, auth, enforce=True,
-            repo_review_state=state,
-            repo_pr_action_scope=state.action_scope,
+        return ToolRegistry().authorize_tool(
+            "repo_test", auth, enforce=True,
+            arguments={"repository": "o/r", "pull_request": 7},
         )
 
     clean_decision = decision(clean)
@@ -8682,6 +8689,29 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         blocked = decision(labels)
         assert blocked.allowed is False
         assert blocked.reason == "ifc_label_blocked:forge"
+
+    for source in (
+        untrusted_page,
+        replace(repository_source, domain_qualifier="other"),
+        replace(repository_source, resource_id=f"other/repo#pull/7@{'a' * 40}"),
+        replace(repository_source, resource_id=f"o/r#pull/8@{'a' * 40}"),
+        replace(repository_source, resource_id=f"o/r#pull/7@{'c' * 40}"),
+    ):
+        labels = clean.with_source(source)
+        auth = replace(
+            _service_auth(service, labels), ifc_state=InformationFlowState(labels=labels),
+        )
+        assert not decision(labels).allowed
+        # Exercise the tier boundary independently of the outer scope veto.
+        assert SinkGate._service_tier_allows(
+            "repo_test", labels, auth, service, target,
+            repo_pr_action_scope=state.action_scope,
+        ) == (False, None)
+        # A stale caller snapshot cannot erase later active ingestion.
+        assert SinkGate._service_tier_allows(
+            "repo_test", clean, auth, service, target,
+            repo_pr_action_scope=state.action_scope,
+        ) == (False, None)
 
 
 @pytest.mark.asyncio

@@ -6014,6 +6014,7 @@ class SinkGate:
         auth_context: Any,
         service: ServicePrincipal,
         target: str | None = None,
+        repo_pr_action_scope: Any = None,
     ) -> tuple[bool, str | None]:
         """Apply the integrity axis to one exact declared service capability."""
         if not service.has_capability(tool_name):
@@ -6041,8 +6042,29 @@ class SinkGate:
             auth_context, ifc_labels,
         )
         if capability_tier is CapabilityTier.CODE_EXECUTION:
+            if tool_name == "repo_test":
+                # Checkout output is active ingestion, but this runner is bounded
+                # to the resolved immutable scope rather than arbitrary execution.
+                state = getattr(auth_context, "ifc_state", None)
+                if state is not None:
+                    ifc_labels = state.current(ifc_labels)
+                sources = getattr(ifc_labels, "sources", ())
+                return (
+                    all(
+                        not source.has_untrusted_active_ingest
+                        or (
+                            source.domain == "repository"
+                            and source.domain_qualifier is None
+                        )
+                        for source in sources
+                    )
+                    and _forge_repository_scope_mismatch(
+                        ifc_labels, repo_pr_action_scope,
+                    ) is None,
+                    None,
+                )
             return (
-                tool_name in {"worklink_run", "repo_test"}
+                tool_name == "worklink_run"
                 and not has_untrusted_active_ingest,
                 None,
             )
@@ -6896,6 +6918,7 @@ class SinkGate:
         if service is not None and not is_triggering_channel_reply:
             tier_allowed, _ = cls._service_tier_allows(
                 tool_name, ifc_labels, auth_context, service, target,
+                repo_pr_action_scope=repo_pr_action_scope,
             )
             if not tier_allowed:
                 return frozenset()
