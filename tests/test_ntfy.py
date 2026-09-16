@@ -661,30 +661,36 @@ async def test_size_scaled_events_log_scan_does_not_lag_event_loop(
         encoding="utf-8",
     )
 
-    ticks = 0
-    done = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    scan_started = asyncio.Event()
+    release_scan = threading.Event()
+    real_assess = ntfy._assess_scheduler_wedge
 
-    async def ticker() -> None:
-        nonlocal ticks
-        while not done.is_set():
-            ticks += 1
-            await asyncio.sleep(0)
+    def gated_assess(*args: Any, **kwargs: Any):
+        # Fail promptly rather than blocking the loop if offloading regresses.
+        assert threading.get_ident() != loop_thread
+        loop.call_soon_threadsafe(scan_started.set)
+        assert release_scan.wait(timeout=5), "event loop did not release scan"
+        return real_assess(*args, **kwargs)
 
-    ticker_task = asyncio.create_task(ticker())
-    try:
-        await asyncio.wait_for(
-            ntfy.fire_scheduler_wedge_alarm_if_warranted(
-                events_file,
-                scheduler_yaml_path=sched_yaml,
-                now=now,
-            ),
-            timeout=5,
+    monkeypatch.setattr(ntfy, "_assess_scheduler_wedge", gated_assess)
+    alarm_task = asyncio.create_task(
+        ntfy.fire_scheduler_wedge_alarm_if_warranted(
+            events_file,
+            scheduler_yaml_path=sched_yaml,
+            now=now,
         )
+    )
+    try:
+        # Prove loop progress while the scan is in flight, not merely that a
+        # ticker happened to run before/after a fast executor completion.
+        await asyncio.wait_for(scan_started.wait(), timeout=5)
+        assert not alarm_task.done()
     finally:
-        done.set()
-        await ticker_task
+        release_scan.set()
+        await asyncio.wait_for(alarm_task, timeout=5)
 
-    assert ticks > 0, "event loop did not advance while events.jsonl was scanned"
     assert captured_events == []
 
 
