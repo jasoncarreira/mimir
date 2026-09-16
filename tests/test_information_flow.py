@@ -760,6 +760,40 @@ def _runtime_operator_context(
     return auth, labels
 
 
+@pytest.mark.parametrize("visibility", [None, "private"])
+@pytest.mark.parametrize("tool_name", ["pr_comment", "repo_push"])
+def test_operator_runtime_ingress_admits_scoped_forge(
+    ingress_resolver: IdentityResolver, visibility: str | None, tool_name: str,
+) -> None:
+    event = AgentEvent(
+        trigger="user_message", channel_id="slack-C1", author="user-1",
+        source="slack", extra={"channel_visibility": visibility},
+    )
+    auth, labels = _runtime_operator_context(event, ingress_resolver)
+    scope = RepoPRActionScope(
+        provenance="server_discovered", canonical_repo="acme/widget",
+        canonical_root="/srv/repo", canonical_origin="https://github.com/acme/widget.git",
+        principal="user-1", event_type="operator_review",
+        allowed_operations=frozenset({"pr.comment", "repo.push"}),
+        pr_number=7, observed_head_sha="a" * 40,
+        head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    labels = labels.with_source(SourceLabel(
+        principal="user-1", domain="repository",
+        resource_id=f"acme/widget#pull/7@{'a' * 40}", bridge_instance="slack",
+        sensitivity="private", authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = replace(auth, roles=("user",), ifc_labels=labels)
+    decision = SinkGate.check_sink_flow(
+        tool_name, "acme/widget", labels, auth, enforce=True,
+        repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is True, decision.reason
+    assert decision.would_block is False
+
+
 def test_clean_operator_runtime_ingress_can_use_required_sinks_under_enforcement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

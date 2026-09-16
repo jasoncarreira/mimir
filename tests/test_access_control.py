@@ -9363,15 +9363,36 @@ def test_forge_review_ingress_allowance_guards(case: str) -> None:
         sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
     )
 
-    expected_allowed = case in {"review", "active-repository-ingest"}
+    expected_allowed = case in {"review", "other-tool", "active-repository-ingest"}
     assert decision.allowed is expected_allowed, decision.reason
     assert decision.would_block is (not expected_allowed)
     if not expected_allowed:
         assert decision.reason == "ifc_label_blocked:forge"
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("resource_id", "slack-other"), ("principal", "other"),
+    ("bridge_instance", "other"), ("domain", "file"),
+    ("domain_qualifier", "other"), ("source_kind", "protected_tool"),
+    ("authorized_principals", frozenset({"other"})),
+    ("integrity", "untrusted"), ("integrity_effect", "informational"),
+])
+@pytest.mark.parametrize("tool_name", ["pr_submit_review", "pr_comment", "repo_push"])
+def test_forge_ingress_exemption_rejects_other_sources(field, value, tool_name: str) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
+    labels = auth.ifc_labels.with_source(replace(auth.ifc_labels.sources[0], **{field: value}))
+    assert SinkGate._get_allowed_sinks(
+        tool_name, SinkCategory.FORGE, auth, ifc_labels=labels,
+        target="owner/repo", repo_pr_action_scope=scope,
+    ) == frozenset()
+
+
 @pytest.mark.parametrize("boundary", ["same", "repo", "pr", "head"])
-def test_forge_review_allowed_sinks_requires_exact_repository_scope(boundary: str) -> None:
+@pytest.mark.parametrize("tool_name", ["pr_submit_review", "pr_comment", "repo_push"])
+def test_forge_review_allowed_sinks_requires_exact_repository_scope(
+    boundary: str, tool_name: str,
+) -> None:
     auth = _trusted_operator_write_auth(admin=True)
     scope = _review_state("owner/repo", 17, "fix", "/srv/repo").action_scope
     source = _repository_result_labels(
@@ -9388,7 +9409,7 @@ def test_forge_review_allowed_sinks_requires_exact_repository_scope(boundary: st
     # Exercise the local allowance independently of check_sink_flow's earlier
     # mismatch rejection, which otherwise masks removal of this boundary.
     allowed = SinkGate._get_allowed_sinks(
-        "pr_submit_review", SinkCategory.FORGE, auth,
+        tool_name, SinkCategory.FORGE, auth,
         ifc_labels=labels, target=target, repo_pr_action_scope=scope,
     )
 
