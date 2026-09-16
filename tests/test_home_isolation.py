@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 from pathlib import Path
@@ -12,6 +13,23 @@ from types import SimpleNamespace
 import pytest
 
 from mimir import home_isolation
+
+
+@pytest.fixture(autouse=True)
+def mount_table(monkeypatch):
+    """Own the mount metadata; tests must not depend on the runner filesystem."""
+    real_open = Path.open
+    metadata = {"text": "1 0 0:1 / / rw - btrfs /dev/test rw\n"}
+
+    def open_path(path, *args, **kwargs):
+        if path == Path("/proc/self/mountinfo"):
+            if isinstance(metadata["text"], Exception):
+                raise metadata["text"]
+            return io.StringIO(metadata["text"])
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_path)
+    return metadata
 
 
 @pytest.fixture
@@ -147,3 +165,71 @@ def test_child_unexpected_read_error_is_not_isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["-c", "0", "1002", str(tmp_path / "missing"), str(control)])
     with pytest.raises(FileNotFoundError):
         exec(home_isolation._READ_PROBE, {})
+
+
+@pytest.mark.parametrize("filesystem,verdict,level", [
+    ("virtiofs", "suspected-exposed", logging.ERROR),
+    ("btrfs", "unknown", logging.WARNING),
+    ("ext4", "unknown", logging.WARNING),
+])
+def test_unprivileged_mount_fallback(tmp_path, monkeypatch, caplog, mount_table,
+                                    filesystem, verdict, level):
+    monkeypatch.setattr(os, "geteuid", lambda: 1001)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("must not spawn"))
+    mount_table["text"] = f"1 0 0:1 / / rw - {filesystem} source rw\n"
+    assert home_isolation.check_home_isolation(tmp_path) == verdict
+    assert any(r.levelno == level and f"Home uid isolation: {verdict}" in r.message
+               for r in caplog.records)
+    assert "A non-owning uid read" not in caplog.text
+    if filesystem == "virtiofs":
+        assert "Mount-type inference only" in caplog.text
+        assert "cannot switch" in caplog.text
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("metadata", ["", "broken\n", "1 - virtiofs\n",
+                                       FileNotFoundError("no proc"),
+                                       PermissionError("unreadable")])
+def test_missing_mount_evidence_stays_unknown(tmp_path, monkeypatch, caplog,
+                                              mount_table, metadata):
+    monkeypatch.setattr(os, "geteuid", lambda: 1001)
+    mount_table["text"] = metadata
+    assert home_isolation.check_home_isolation(tmp_path) == "unknown"
+    assert "suspected-exposed" not in caplog.text
+
+
+def test_mount_lookup_uses_resolved_longest_component_match(tmp_path, mount_table):
+    home = tmp_path / "home space\\name"
+    nested = home / "nested"
+    nested.mkdir(parents=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(nested, target_is_directory=True)
+
+    def escape(path):
+        return str(path).replace("\\", r"\134").replace(" ", r"\040")
+
+    mount_table["text"] = (
+        "1 0 0:1 / / rw - btrfs source rw\n"
+        f"2 1 0:2 / {escape(home)} rw - virtiofs source rw\n"
+        f"3 2 0:3 / {escape(nested)} rw - ext4 source rw\n"
+        f"4 1 0:4 / {escape(tmp_path)}/hom rw - virtiofs source rw\n"
+    )
+    assert home_isolation._home_filesystem(home) == "virtiofs"
+    assert home_isolation._home_filesystem(alias) == "ext4"
+    other = tmp_path / "home-other"
+    other.mkdir()
+    assert home_isolation._home_filesystem(other) == "btrfs"
+    # Stacked mountpoints are deliberately not guessed from record ordering.
+    mount_table["text"] += f"5 2 0:5 / {escape(home)} rw - btrfs source rw\n"
+    assert home_isolation._home_filesystem(home) is None
+
+
+@pytest.mark.parametrize("exit_code,verdict", [(10, "isolated"), (11, "exposed"),
+                                                (2, "suspected-exposed")])
+def test_read_probe_takes_precedence_over_mount_inference(
+    tmp_path, monkeypatch, probe_identity, mount_table, exit_code, verdict,
+):
+    mount_table["text"] = "1 0 0:1 / / rw - virtiofs source rw\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=exit_code))
+    assert home_isolation.check_home_isolation(tmp_path) == verdict
+    assert not list(tmp_path.iterdir())
