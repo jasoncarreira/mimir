@@ -362,7 +362,7 @@ def test_poller_authority_denials(monkeypatch, tmp_path, poller_runtime, tool, k
         asyncio.run(tool.coroutine(runtime=runtime, lane=lane, **kwargs))
 
 
-@pytest.mark.parametrize("invalid", ["source", "source_missing", "origin", "turn_missing", "turn_copy", "turn_empty"])
+@pytest.mark.parametrize("invalid", ["source", "source_missing", "origin"])
 def test_poller_open_requires_source_and_exact_turn(monkeypatch, tmp_path, poller_runtime, invalid):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     runtime = poller_runtime
@@ -370,20 +370,71 @@ def test_poller_open_requires_source_and_exact_turn(monkeypatch, tmp_path, polle
         runtime = replace(runtime, context=replace(runtime.context, origin_ref=None))
         turn = replace(_context.get_current_turn(), auth_context=runtime.context)
         monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
-    elif invalid == "turn_missing":
-        monkeypatch.setattr(_context, "get_current_turn", lambda: None)
-    elif invalid == "turn_copy":
-        turn = replace(_context.get_current_turn(), auth_context=replace(runtime.context))
-        assert turn.auth_context == runtime.context and turn.auth_context is not runtime.context
-        monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
-    elif invalid == "turn_empty":
-        turn = replace(_context.get_current_turn(), turn_id="")
-        monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
     monkeypatch.setattr(tp, "_open_proposal", lambda *a, **k: pytest.fail("unbound open"))
     kwargs = {} if invalid == "source_missing" else {"source": "  " if invalid == "source" else "paper:42"}
     with pytest.raises(ToolPolicyRefusal):
         _inv(tp.open_proposal, runtime=runtime, **kwargs)
     assert not runtime.context.poller_proposal_state.active
+
+
+@pytest.mark.parametrize("invalid", [
+    "turn_missing", "turn_empty", "auth_missing", "principal", "canonical_principal",
+    "trigger", "origin_ref", "channel_id", "roles",
+])
+def test_poller_open_exact_runtime_turn_refusal(monkeypatch, tmp_path, poller_runtime, invalid):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    turn = _context.get_current_turn()
+    if invalid == "turn_missing":
+        turn = None
+    elif invalid == "turn_empty":
+        turn.turn_id = ""
+    elif invalid == "auth_missing":
+        turn.auth_context = None
+    else:
+        value = ("other",) if invalid == "roles" else "other"
+        turn.auth_context = replace(turn.auth_context, **{invalid: value})
+    monkeypatch.setattr(_context, "get_current_turn", lambda: turn)
+    monkeypatch.setattr(tp, "_open_proposal", lambda *a, **k: pytest.fail("unbound open"))
+    with pytest.raises(ToolPolicyRefusal, match="exact runtime turn required"):
+        _inv(tp.open_proposal, runtime=poller_runtime, source="paper:42")
+    assert not poller_runtime.context.poller_proposal_state.active
+
+
+@pytest.mark.asyncio
+async def test_poller_open_after_labelled_read(proposal_home, poller_runtime):
+    from langchain.agents.middleware.types import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langgraph.runtime import Runtime
+
+    from mimir.access_control import publish_protected_result
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = poller_runtime.context
+    turn = _context.get_current_turn()
+    path = proposal_home / "state/pollers/papers/draft.md"
+    label = SourceLabel(
+        principal=auth.canonical_principal, domain="filesystem", resource_id=str(path),
+        bridge_instance="filesystem", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+
+    async def read(request):
+        publish_protected_result((label,))
+        return ToolMessage(content="Paper notes", tool_call_id=request.tool_call["id"])
+
+    result = await BudgetGateMiddleware().awrap_tool_call(ToolCallRequest(
+        tool_call={"name": "read_file", "args": {"file_path": str(path)},
+                   "id": "read-paper", "type": "tool_call"},
+        tool=None, state=None, runtime=Runtime(context=auth),
+    ), read)
+    assert result.status != "error"
+    assert turn.auth_context is not auth
+    assert turn.auth_context.ifc_labels != auth.ifc_labels
+    assert label in turn.auth_context.ifc_labels.sources
+    result = await tp.open_proposal.ainvoke({"runtime": poller_runtime, "source": "paper:42"})
+    assert "Opened `poller`" in result
+    assert auth.poller_proposal_state.active
+    assert auth.poller_proposal_state.scope.turn_id == turn.turn_id
 
 
 @pytest.mark.parametrize("tool,kwargs", [
