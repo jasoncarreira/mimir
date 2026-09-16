@@ -1901,3 +1901,59 @@ def test_worklink_resolution_admits_a_permitted_provider(tmp_path: Path) -> None
 
     resolution = resolve_worklink_opencode_invocation(env)
     assert resolution.invocation.provider == "zai"
+
+
+def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
+    """A factory run must never be able to reach an interactive permission ask.
+
+    The leaf backend sends a permission override; the factory path did not, so
+    OpenCode's built-in `ask` rules stayed live and the first prompt wedged the
+    run with no way to answer it.
+    """
+    from mimir.worklink.backends.feature_factory import _FACTORY_PERMISSION
+
+    home = tmp_path / "home"
+    home.mkdir()
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"zai": {"type": "api", "key": "zai-key"}}), encoding="utf-8")
+    env = {
+        "HOME": str(tmp_path),
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": "zai:glm-5",
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+    }
+    backend = FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js")
+    order = WorkOrder(4242, tmp_path, "prompt", None, 30, env=env)
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+
+    permission = json.loads(spec.env["OPENCODE_PERMISSION"])
+    assert permission["read"][".env"] == "deny"
+    assert permission["read"]["**/.env"] == "deny"
+    assert "ask" not in json.dumps(permission)
+
+    # An operator-supplied override still wins.
+    order_override = WorkOrder(
+        4242, tmp_path, "prompt", None, 30,
+        env={**env, "OPENCODE_PERMISSION": '{"read":{"**":"deny"}}'},
+    )
+    spec_override = backend.work_spec(
+        order_override,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+    assert spec_override.env["OPENCODE_PERMISSION"] == '{"read":{"**":"deny"}}'
+    assert spec_override.env["OPENCODE_PERMISSION"] != _FACTORY_PERMISSION

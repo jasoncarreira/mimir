@@ -45,6 +45,18 @@ _MAX_STATUS_BYTES = 1024 * 1024
 _MAX_LIST_ITEMS = 1000
 _MAX_TEXT_BYTES = 16 * 1024
 _MAX_JSON_DEPTH = 32
+# The leaf OpenCode backend sends a permission override; the factory path never
+# has, so factory runs execute under OpenCode's defaults and its built-in `ask`
+# rules stay live. An autonomous run has nobody to answer a prompt, so the first
+# one wedges the run forever: attempt 8 of chainlink #1762 stopped dead on a read
+# of `.env`, emitting `asking ... permission=read patterns=[".env"]` and nothing
+# further, while the controller kept heartbeating so the run still looked alive.
+# Deny the secret reads outright. A denial surfaces as a tool error the run can
+# observe and route around; an `ask` cannot be answered and is unrecoverable.
+_FACTORY_PERMISSION = json.dumps(
+    {"read": {".env": "deny", "**/.env": "deny", "**/.env.*": "deny"}},
+    separators=(",", ":"),
+)
 _DEFAULT_FACTORY_MAX_RETRIES = 5
 _MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
 _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
@@ -626,7 +638,7 @@ class FeatureFactoryBackend:
             test_command=test_command,
             backend=self.name,
             timeout_s=order.timeout_s,
-            env=order.env,
+            env={"OPENCODE_PERMISSION": _FACTORY_PERMISSION, **order.env},
             backend_config={
                 "entrypoint": str(self.entrypoint),
                 "run_id": run_id,
