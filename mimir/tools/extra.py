@@ -119,22 +119,30 @@ async def file_search(
         return "(no matches)"
     from .._context import get_current_turn
     from ..access_control import (
+        invalidate_protected_result_capture,
         protected_result_source,
         publish_protected_result,
     )
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
-    publish_protected_result(tuple(
-        protected_result_source(
-            auth_context,
-            principal="filesystem",
-            domain="filesystem",
-            resource_id=r.path,
-            bridge_instance="filesystem",
-        )
-        for r in results
-    ))
+    try:
+        resolved_paths = [
+            str(indexer._abs_path(r.path).resolve(strict=True)) for r in results
+        ]
+    except (OSError, RuntimeError, ValueError):
+        invalidate_protected_result_capture()
+    else:
+        publish_protected_result(tuple(
+            protected_result_source(
+                auth_context,
+                principal="filesystem",
+                domain="filesystem",
+                resource_id=resolved,
+                bridge_instance="filesystem",
+            )
+            for resolved in resolved_paths
+        ))
     payload = [r.to_dict() for r in results]
     return json.dumps(payload, indent=2, ensure_ascii=False)
 

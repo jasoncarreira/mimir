@@ -2276,6 +2276,71 @@ async def test_read_refusal_does_not_clear_separate_untrusted_ingestion(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["home", "outside", "missing"])
+@pytest.mark.parametrize("tool_name", ["edit_file", "write_file", "shell_exec"])
+async def test_real_file_search_preserves_only_anchored_turn_authority(
+    tmp_path, monkeypatch, location, tool_name,
+):
+    from unittest.mock import AsyncMock
+
+    from mimir.search import HashEmbedder, Indexer, SearchResult
+    from mimir.tools import extra
+
+    home = tmp_path / "home"
+    target = home / "memory" / "note.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("reference")
+    outside = tmp_path / "external.md"
+    outside.write_text("external")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_SOURCE_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    path = {"home": "memory/note.md", "outside": str(outside), "missing": "memory/missing.md"}[location]
+    indexer = Indexer(home, embedder=HashEmbedder())
+    monkeypatch.setattr(indexer, "search", AsyncMock(return_value=[
+        SearchResult(path, "memory", 0, 1, 1, 1, 1, "snippet", None),
+    ]))
+    monkeypatch.setitem(extra._SEARCH_STATE, "indexer", indexer)
+    auth = _arm2_operator_auth(InformationFlowState(), enforcement_enabled=True)
+    ctx = _ifc_turn(auth)
+    middleware = BudgetGateMiddleware()
+    calls = []
+
+    async def search(req):
+        content = await extra.file_search.coroutine(**req.tool_call["args"])
+        return ToolMessage(content=content, tool_call_id=req.tool_call["id"])
+
+    async def sink(req):
+        calls.append(req.tool_call["name"])
+        return ToolMessage(content="ok", tool_call_id=req.tool_call["id"])
+
+    args = {
+        "edit_file": {"file_path": str(target), "old_string": "reference", "new_string": "updated"},
+        "write_file": {"file_path": str(target), "content": "updated"},
+        "shell_exec": {"command": "printf reference"},
+    }[tool_name]
+    token = set_current_turn(ctx)
+    try:
+        result = await middleware.awrap_tool_call(
+            _make_request("file_search", "search", auth, {"query": "reference"}), search,
+        )
+        assert result.status != "error"
+        assert len(ctx.ifc_labels.sources) > len(auth.ifc_labels.sources)
+        if location == "home":
+            assert all(s.integrity == "trusted" for s in ctx.ifc_labels.sources), ctx.ifc_labels.sources
+        admitted = await middleware.awrap_tool_call(
+            _make_request(tool_name, "sink", auth, args), sink,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert (admitted.status != "error") == (location == "home")
+    assert calls == ([tool_name] if location == "home" else [])
+    if location != "home":
+        assert "ifc_label_blocked:" in str(admitted.content)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ["grep", "glob", "ls", "file_search"])
 async def test_partial_collection_denial_preserves_successful_path_labels(
     tool_name: str,
