@@ -120,3 +120,35 @@ def test_named_anchor_integrity_projection(decision):
         ac.FilesystemReadTrust.ROOT_MEMBERSHIP,
     }
     assert decision.integrity == (("trusted", "informational") if trusted else ("untrusted", "active_ingest"))
+
+
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("boundary", ["ordinary", "denied", "provenance", "job_failure"])
+def test_shell_result_integrity_depends_on_provenance_not_exit(failed, boundary):
+    from mimir.models import SourceLabel
+
+    tool_name = "bash_job_output" if boundary == "job_failure" else "shell_exec"
+    provenance = None
+    if boundary == "provenance":
+        provenance = ac.ProtectedResultProvenance(sources=(SourceLabel(
+            principal="external", domain="web", resource_id="https://example.test",
+            bridge_instance="fetch_url", sensitivity="internal",
+            integrity="untrusted", integrity_effect="active_ingest",
+        ),))
+    labels = ac.classify_protected_result(
+        tool_name, {}, None, ac.ToolAuthorization(
+            tool_name=tool_name, decision=ac.OperationDecision.ADMIN_REQUIRED,
+            allowed=boundary != "denied",
+        ),
+        result=f"exit={1 if failed else 0}\nidentical output",
+        provenance=provenance, failed=failed,
+    )
+    assert labels is not None
+    effect = (
+        "informational"
+        if boundary == "ordinary" or (boundary == "job_failure" and not failed)
+        else "active_ingest"
+    )
+    assert {(source.integrity, source.integrity_effect) for source in labels.sources} == {
+        ("untrusted", effect),
+    }
