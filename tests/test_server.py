@@ -47,6 +47,7 @@ from mimir.server import (
     _safe_str_eq,
     _start_mcp_servers,
     _handle_health,
+    _capture_controller_source_commit,
     _handle_event,
     _handle_root,
     build_app,
@@ -1101,6 +1102,11 @@ def test_route_and_hook_parity_with_runtime_proxies(
         getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
         for hook in app.on_cleanup
     ) == 1
+    assert _capture_controller_source_commit in app.on_startup
+    assert app.on_startup.index(_capture_controller_source_commit) < next(
+        index for index, hook in enumerate(app.on_startup)
+        if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+    )
     assert isinstance(control.route_kwargs["commitments_store"], _RuntimeFieldProxy)
     assert isinstance(control.route_kwargs["turn_event_bus"], _RuntimeFieldProxy)
     with pytest.raises(RuntimeError, match="agent runtime is not initialized"):
@@ -2398,6 +2404,7 @@ def _health_app() -> web.Application:
     """Minimal app with only the /health route."""
     app = web.Application()
     app.router.add_get("/health", _handle_health)
+    app.on_startup.append(_capture_controller_source_commit)
     return app
 
 
@@ -2491,6 +2498,68 @@ class TestHandleHealth:
             "worklink_controller_source_commit": None,
             "worklink_executor_source_status": "unknown",
         }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("boot_commit", ["a" * 40, None])
+    @pytest.mark.parametrize("executor_commit", ["a" * 40, "b" * 40])
+    async def test_health_keeps_boot_commit_after_checkout_moves(
+        self, boot_commit: str | None, executor_commit: str,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import subprocess
+        import threading
+        from mimir.worklink import worker_client
+
+        monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+        socket_path = tmp_path / "executor.sock"
+        socket_path.touch()
+        monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
+        head = boot_commit
+        calls = []
+        loop_thread = threading.get_ident()
+
+        def read_head(argv, **kwargs):
+            assert threading.get_ident() != loop_thread
+            assert argv == ["git", "-C", str(tmp_path), "rev-parse", "--verify", "HEAD"]
+            assert kwargs == {
+                "capture_output": True, "text": True, "check": True, "timeout": 5,
+            }
+            calls.append(head)
+            if head is None:
+                raise FileNotFoundError("git")
+            return subprocess.CompletedProcess(argv, 0, stdout=head + "\n")
+
+        monkeypatch.setattr(subprocess, "run", read_head)
+
+        async def identity():
+            return executor_commit
+
+        monkeypatch.setattr(worker_client, "verify_executor_identity", identity)
+        app = _health_app()
+        app["check_worker_executor_health"] = True
+        async with TestClient(TestServer(app)) as client:
+            # Move/repair the checkout AFTER startup but BEFORE the first probe.
+            # Lazy first-request caching would already report the wrong commit.
+            assert calls == [boot_commit]
+            head = "b" * 40
+            for _ in range(3):
+                resp = await client.get("/health")
+                body = await resp.json()
+                assert resp.status == 200
+                assert body["worklink_controller_source_commit"] == boot_commit
+                assert body["worklink_executor_source_status"] == (
+                    "unknown" if boot_commit is None else
+                    "matched" if boot_commit == executor_commit else "mismatched"
+                )
+            assert calls == [boot_commit]
+
+        # A fresh server startup (restart) captures the new source instead.
+        restarted = _health_app()
+        restarted["check_worker_executor_health"] = True
+        async with TestClient(TestServer(restarted)) as client:
+            resp = await client.get("/health")
+            assert (await resp.json())["worklink_controller_source_commit"] == head
+        assert calls == [boot_commit, head]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", [

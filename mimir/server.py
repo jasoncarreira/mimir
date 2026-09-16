@@ -824,6 +824,31 @@ class _MaskApiKeyInAccessLog(logging.Filter):
         return True
 
 
+async def _capture_controller_source_commit(app: web.Application) -> None:
+    """Snapshot the boot source, not a checkout that may move after startup.
+
+    Cache unavailable results too: a later checkout repair cannot change the
+    code already loaded by this server. Never resolve lazily from /health.
+    """
+    if "worklink_controller_source_commit" in app:
+        return
+    controller_source_commit = None
+    repo = os.environ.get("WORKLINK_REPO")
+    if app.get("check_worker_executor_health") and repo:
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
+                capture_output=True, text=True, check=True, timeout=5,
+            )
+            commit = result.stdout.strip()
+            if re.fullmatch(r"[0-9a-f]{40}", commit):
+                controller_source_commit = commit
+        except (OSError, subprocess.SubprocessError):
+            pass
+    app["worklink_controller_source_commit"] = controller_source_commit
+
+
 async def _handle_health(request: web.Request) -> web.Response:
     from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
 
@@ -840,20 +865,7 @@ async def _handle_health(request: web.Request) -> web.Response:
             response.update(ok=False, error=str(exc))
             status = 503
 
-    controller_source_commit = None
-    repo = os.environ.get("WORKLINK_REPO")
-    if repo:
-        try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                ["git", "-C", repo, "rev-parse", "--verify", "HEAD"],
-                capture_output=True, text=True, check=True, timeout=5,
-            )
-            commit = result.stdout.strip()
-            if re.fullmatch(r"[0-9a-f]{40}", commit):
-                controller_source_commit = commit
-        except (OSError, subprocess.SubprocessError):
-            pass
+    controller_source_commit = request.app.get("worklink_controller_source_commit")
 
     source_status = "unknown"
     if executor_source_commit is not None and controller_source_commit is not None:
@@ -2476,6 +2488,7 @@ def build_app(config: Config) -> web.Application:
         if errors:
             raise ExceptionGroup("server cleanup failed", errors)
 
+    app.on_startup.append(_capture_controller_source_commit)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
