@@ -1904,11 +1904,16 @@ def test_worklink_resolution_admits_a_permitted_provider(tmp_path: Path) -> None
 
 
 def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
-    """A factory run must never be able to reach an interactive permission ask.
+    """The factory launch policy denies dotenv reads rather than prompting.
 
     The leaf backend sends a permission override; the factory path did not, so
-    OpenCode's built-in `ask` rules stayed live and the first prompt wedged the
-    run with no way to answer it.
+    OpenCode's built-in `ask` rule for secret files stayed live and the first
+    prompt wedged an autonomous run with no way to answer it.
+
+    This asserts the policy fragment Worklink emits. It is NOT a guarantee that
+    no interactive ask remains: OpenCode merges this with its own defaults, and
+    other ask categories are untouched by this change. Proving that would need an
+    integration check against the pinned OpenCode permission evaluator.
     """
     from mimir.worklink.backends.feature_factory import _FACTORY_PERMISSION
 
@@ -1938,9 +1943,9 @@ def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
     )
 
     permission = json.loads(spec.env["OPENCODE_PERMISSION"])
-    assert permission["read"][".env"] == "deny"
-    assert permission["read"]["**/.env"] == "deny"
-    assert "ask" not in json.dumps(permission)
+    assert permission["read"] == {
+        ".env": "deny", "**/.env": "deny", "**/.env.*": "deny",
+    }
 
     # An operator-supplied override still wins.
     order_override = WorkOrder(
