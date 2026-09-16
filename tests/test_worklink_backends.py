@@ -1867,3 +1867,64 @@ def test_worklink_resolution_admits_any_configured_provider(
     assert resolution.invocation.model == "openrouter/anthropic/claude-opus-4.8"
     assert resolution.invocation.auth_type == "api"
     assert "sk-or-synthetic" not in repr(resolution.invocation)
+
+
+def test_factory_work_spec_denies_dotenv_reads(tmp_path: Path) -> None:
+    """The factory launch policy denies dotenv reads rather than prompting.
+
+    The leaf backend sends a permission override; the factory path did not, so
+    OpenCode's built-in `ask` rule for secret files stayed live and the first
+    prompt wedged an autonomous run with no way to answer it.
+
+    This asserts the policy fragment Worklink emits. It is NOT a guarantee that
+    no interactive ask remains: OpenCode merges this with its own defaults, and
+    other ask categories are untouched by this change. Proving that would need an
+    integration check against the pinned OpenCode permission evaluator.
+    """
+    from mimir.worklink.backends.feature_factory import _FACTORY_PERMISSION
+
+    home = tmp_path / "home"
+    home.mkdir()
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(json.dumps({"zai": {"type": "api", "key": "zai-key"}}), encoding="utf-8")
+    env = {
+        "HOME": str(tmp_path),
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": "zai:glm-5",
+        "OPENCODE_CONFIG": "",
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+    }
+    backend = FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js")
+    order = WorkOrder(4242, tmp_path, "prompt", None, 30, env=env)
+
+    spec = backend.work_spec(
+        order,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+
+    permission = json.loads(spec.env["OPENCODE_PERMISSION"])
+    assert permission["read"] == {
+        ".env": "deny", "**/.env": "deny", "**/.env.*": "deny",
+    }
+
+    # An operator-supplied override still wins.
+    order_override = WorkOrder(
+        4242, tmp_path, "prompt", None, 30,
+        env={**env, "OPENCODE_PERMISSION": '{"read":{"**":"deny"}}'},
+    )
+    spec_override = backend.work_spec(
+        order_override,
+        attempt=1,
+        repo_url="https://github.com/jasoncarreira/mimir.git",
+        base_ref="main",
+        branch="feature/chainlink-4242",
+        test_command="uv run pytest -q",
+    )
+    assert spec_override.env["OPENCODE_PERMISSION"] == '{"read":{"**":"deny"}}'
+    assert spec_override.env["OPENCODE_PERMISSION"] != _FACTORY_PERMISSION

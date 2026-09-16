@@ -32,7 +32,11 @@ from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, Wo
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
-from mimir.worklink.backends.feature_factory import FeatureFactoryBackend, parse_factory_status
+from mimir.worklink.backends.feature_factory import (
+    _FACTORY_PERMISSION,
+    FeatureFactoryBackend,
+    parse_factory_status,
+)
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
     archive_factory_record,
@@ -5688,6 +5692,12 @@ def test_factory_new_run_uses_resolved_base_for_single_checkout_placement(
             "GIT_COMMITTER_EMAIL": "factory@example.com",
             # Forwarded under the FACTORY child's name, resolved controller-side.
             "FACTORY_PUBLISHING_IDENTITY": "factory-owner",
+            # Default launch policy: a headless factory run cannot answer an
+            # interactive permission prompt, so secret reads are denied rather
+            # than left to OpenCode's built-in ask rule. A WorkOrder may override
+            # this, which is why it is asserted here as part of the exact
+            # launch-environment contract.
+            "OPENCODE_PERMISSION": _FACTORY_PERMISSION,
         }
         raise RuntimeError("stop after placement")
 
