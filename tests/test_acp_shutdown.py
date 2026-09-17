@@ -1394,6 +1394,62 @@ asyncio.run(run())
         await process.communicate()
 
 
+def _assert_blocked_main_exit(
+    returncode: int, stdout: bytes, stderr: bytes, expected: int, progress: Path,
+) -> None:
+    if (returncode, stdout, stderr) == (expected, b"", b""):
+        return
+    status = f"signal {signal.Signals(-returncode).name}" if returncode < 0 else f"exit {returncode}"
+    details = [
+        f"ACP blocked-main child: {status} (returncode={returncode}); expected exit {expected}",
+        f"stdout: {stdout!r}",
+        "stderr:\n" + stderr.decode(errors="replace"),
+    ]
+    for suffix in ("", ".wakeup", ".diagnostics", ".stacks"):
+        path = Path(str(progress) + suffix)
+        if path.exists():
+            content = path.read_bytes()
+            details.append(f"{path.name}:\n" + (
+                repr(content) if suffix == ".wakeup" else content.decode(errors="replace")
+            ))
+    raise AssertionError("\n".join(details))
+
+
+@pytest.mark.parametrize("signum", [signal.SIGSEGV, signal.SIGKILL])
+def test_blocked_main_exit_reports_child_signal(signum: signal.Signals, tmp_path: Path) -> None:
+    import subprocess
+
+    progress = tmp_path / "child-progress"
+    progress.write_text("child-started\n")
+    progress.with_suffix(".diagnostics").write_text("crash-stage\n")
+    source = """
+import os, resource, signal, sys
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+def crash_child():
+    os.kill(os.getpid(), int(sys.argv[1]))
+crash_child()
+"""
+    result = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", source, str(signum)],
+        capture_output=True, timeout=120,
+    )
+    assert result.returncode == -signum
+    with pytest.raises(AssertionError) as failure:
+        _assert_blocked_main_exit(
+            result.returncode, result.stdout, result.stderr, 128 + signal.SIGTERM, progress,
+        )
+    message = str(failure.value)
+    assert f"signal {signum.name}" in message
+    assert "expected exit 143" in message
+    assert "child-started" in message
+    assert "crash-stage" in message
+    if signum == signal.SIGSEGV:
+        assert "Fatal Python error: Segmentation fault" in message
+        assert "in crash_child" in message
+    else:
+        assert result.stderr == b""  # SIGKILL cannot run a diagnostic handler.
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux MSG_WAITALL handshake")
 @pytest.mark.parametrize("journal", [False, True], ids=["production", "journal"])
@@ -1451,7 +1507,7 @@ async def run():
 asyncio.run(run())
 '''
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", source, delivery,
+        sys.executable, "-X", "faulthandler", "-c", source, delivery,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, cwd=Path(__file__).resolve().parents[1],
     )
@@ -1469,7 +1525,7 @@ asyncio.run(run())
                 await process.stdin.drain()
             stdout, stderr = await process.communicate()
         expected = signal.SIGINT if delivery == "main-main" else signal.SIGTERM
-        assert (process.returncode, stdout, stderr) == (128 + expected, b"", b"")
+        _assert_blocked_main_exit(process.returncode, stdout, stderr, 128 + expected, progress)
         if journal:
             state = progress.read_text()
             assert state.count("watchdog-start-enter") == 1
