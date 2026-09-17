@@ -8,6 +8,7 @@ is involved — outcomes are written directly and ``enqueue`` is a fake.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from datetime import datetime, timedelta, timezone
@@ -72,6 +73,68 @@ class _FakeEnqueue:
         return True
 
 
+def _attention_event(source_id: str, occurrence: str) -> AgentEvent:
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:worklink-attention",
+        content="inspect and acknowledge",
+        source_id=source_id,
+        source="poller",
+        service_principal="poller:worklink-attention",
+        extra={
+            "poller_name": "worklink-attention",
+            "items": [{
+                "issue_id": 17,
+                "signature": "signature",
+                "occurrence_id": occurrence,
+                "delivery_key": f"worklink-attention:17:signature:{occurrence}",
+            }],
+        },
+    )
+
+
+def _attention_occurrence(home: Path, occurrence: str, execution: str) -> None:
+    from mimir.worklink.attention import (
+        AccountingBasis,
+        AttentionCause,
+        AttentionKind,
+        AttentionOutcome,
+        AttentionRecord,
+        AttentionSource,
+        Settlement,
+    )
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        promote_reservation,
+        reserve_execution,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    reservation = reserve_execution(
+        state_dir, issue_id=17, source="leaf_claim", operation_stage="terminal",
+        execution_id=execution,
+    )
+    promote_reservation(
+        state_dir,
+        17,
+        reservation["reservation_id"],
+        AttentionRecord(
+            occurrence_id=occurrence,
+            delivery_key=f"worklink-attention:17:signature:{occurrence}",
+            kind=AttentionKind.ATTENTION,
+            cause=AttentionCause.CLAIM_FAILED,
+            issue_id=17,
+            execution_id=execution,
+            source=AttentionSource.LEAF_CLAIM,
+            outcome=AttentionOutcome.INFRASTRUCTURE_FAILURE,
+            accounting_basis=AccountingBasis.PRECLAIM,
+            attempt_consumed=False,
+            settlement=Settlement.NOT_NEEDED,
+            error_signature="signature",
+        ),
+    )
+
+
 # ── stash ────────────────────────────────────────────────────────────
 
 
@@ -88,6 +151,61 @@ async def test_stash_noop_without_source_id(tmp_path: Path):
     ev.source_id = None
     await poller_recovery.stash_enqueued_event(tmp_path, ev)
     assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
+async def test_attention_prepare_serializes_concurrent_state_updates(tmp_path: Path):
+    persist_dir = tmp_path / "state" / "pollers" / "worklink-attention"
+    events = []
+    for index in range(16):
+        occurrence = f"occurrence-{index}"
+        _attention_occurrence(tmp_path, occurrence, f"execution-{index}")
+        events.append(_attention_event(f"source-{index}", occurrence))
+    prepared = await asyncio.gather(*(
+        poller_recovery.prepare_attention_event(tmp_path, persist_dir, event)
+        for event in events
+    ))
+    state = poller_recovery._load_state(persist_dir)
+    assert prepared == [True] * len(events)
+    assert set(state["inflight"]) == {event.source_id for event in events}
+    assert all(entry["pending_enqueue"] is True for entry in state["inflight"].values())
+
+
+async def test_attention_unrecoverable_stash_is_retained_when_retirement_is_impossible(
+    tmp_path: Path,
+):
+    persist_dir = tmp_path / "state" / "pollers" / "worklink-attention"
+    events_path = tmp_path / "events.jsonl"
+    source_id = "malformed-source"
+    state = {
+        "last_reconciled": "",
+        "inflight": {
+            source_id: {
+                "attempts": 0,
+                "stashed_at": _ts(1),
+                "enqueued_at": _ts(1),
+                "event": {"source_id": source_id, "extra": {"items": []}},
+            }
+        },
+    }
+    poller_recovery._save_state_strict(persist_dir, state)
+    _write_outcome(
+        events_path,
+        type_="turn_failed",
+        channel_id="poller:worklink-attention",
+        source_id=source_id,
+        ts=_ts(0),
+    )
+    summary = await poller_recovery.reconcile_failed_turns(
+        persist_dir=persist_dir,
+        events_path=events_path,
+        poller_name="worklink-attention",
+        channel_id="poller:worklink-attention",
+        enqueue=_FakeEnqueue(),
+        recover_failed_turns=True,
+        service_principal="poller:worklink-attention",
+    )
+    assert summary["deferred"] == 1
+    assert source_id in poller_recovery._load_state(persist_dir)["inflight"]
 
 
 async def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_path: Path):

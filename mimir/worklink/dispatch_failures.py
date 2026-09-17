@@ -14,7 +14,7 @@ from typing import Any, Iterator, Mapping
 
 from .._atomic import atomic_write_json
 from ..redaction import redact_text
-from .attention import AttentionRecord, HandlingDisposition, RecoveryRetirement
+from .attention import AttentionRecord, AttentionSource, HandlingDisposition, RecoveryRetirement
 
 STATE_FILE = "dispatch_failures.json"
 POLLER_NAME = "worklink-ready-queue"
@@ -108,8 +108,7 @@ def _normalize_issue(key: str, raw: Any, *, legacy: bool) -> dict[str, Any]:
     for reservation_id, reservation in reservations.items():
         _validate_reservation(str(reservation_id), reservation)
     for occurrence_id, occurrence in occurrences.items():
-        if not isinstance(occurrence, dict) or occurrence.get("occurrence_id") != occurrence_id:
-            raise FailureStateError(f"attention occurrence {occurrence_id} is invalid")
+        _validate_occurrence(key, str(occurrence_id), occurrence, legacy=occurrence.get("source") == "legacy_v1" if isinstance(occurrence, dict) else False)
     return entry
 
 
@@ -193,6 +192,61 @@ def _validate_reservation(reservation_id: str, value: Any) -> None:
     valid = (state, closure, occurrence is None) in {("reserved", None, True), ("closed", "excluded", True)} or (state == "closed" and closure == "promoted" and isinstance(occurrence, str) and bool(occurrence))
     if not valid:
         raise FailureStateError(f"execution reservation {reservation_id} invariant failed")
+    if type(value.get("issue_id")) is not int or value["issue_id"] <= 0:
+        raise FailureStateError(f"execution reservation {reservation_id} issue is invalid")
+    if not isinstance(value.get("execution_id"), str) or not value["execution_id"]:
+        raise FailureStateError(f"execution reservation {reservation_id} execution is invalid")
+    try:
+        AttentionSource(str(value.get("source")))
+    except ValueError as exc:
+        raise FailureStateError(f"execution reservation {reservation_id} source is invalid") from exc
+    if value.get("claim_binding_state") not in {"none", "prepared", "confirmed"}:
+        raise FailureStateError(f"execution reservation {reservation_id} claim binding is invalid")
+    for name in ("prepared_claim", "confirmed_claim"):
+        claim = value.get(name)
+        if claim is not None and not _valid_claim(claim, value["issue_id"]):
+            raise FailureStateError(f"execution reservation {reservation_id} {name} is invalid")
+    if value.get("claim_binding_state") == "prepared" and value.get("prepared_claim") is None:
+        raise FailureStateError(f"execution reservation {reservation_id} prepared claim is missing")
+    if value.get("claim_binding_state") == "confirmed" and value.get("confirmed_claim") is None:
+        raise FailureStateError(f"execution reservation {reservation_id} confirmed claim is missing")
+
+
+def _valid_claim(value: Any, issue_id: int) -> bool:
+    return bool(
+        isinstance(value, Mapping)
+        and value.get("issue_id") == issue_id
+        and type(value.get("attempt")) is int
+        and value["attempt"] > 0
+        and isinstance(value.get("agent_id"), str)
+        and value["agent_id"]
+        and parse_time(value.get("claimed_at")) is not None
+    )
+
+
+def _validate_occurrence(issue_key: str, occurrence_id: str, value: Any, *, legacy: bool) -> None:
+    if not isinstance(value, dict) or value.get("occurrence_id") != occurrence_id:
+        raise FailureStateError(f"attention occurrence {occurrence_id} is invalid")
+    try:
+        record = AttentionRecord.from_json(value, legacy=legacy)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FailureStateError(f"attention occurrence {occurrence_id} contract is invalid") from exc
+    if record.issue_id != int(issue_key) or record.publication_state.value != "ready":
+        raise FailureStateError(f"attention occurrence {occurrence_id} identity is invalid")
+    expected = f"worklink-attention:{record.issue_id}:{record.error_signature}:{record.occurrence_id}"
+    if not legacy and record.delivery_key != expected:
+        raise FailureStateError(f"attention occurrence {occurrence_id} delivery identity is invalid")
+    if value.get("handled_at") is not None and value.get("handling_disposition") not in {item.value for item in HandlingDisposition}:
+        raise FailureStateError(f"attention occurrence {occurrence_id} handling is invalid")
+    lease = value.get("handling_lease")
+    if lease is not None and (
+        not isinstance(lease, dict)
+        or not isinstance(lease.get("lease_id"), str)
+        or not lease["lease_id"]
+        or not isinstance(lease.get("owner"), str)
+        or parse_time(lease.get("expires_at")) is None
+    ):
+        raise FailureStateError(f"attention occurrence {occurrence_id} lease is invalid")
 
 
 def reserve_execution(
@@ -292,18 +346,26 @@ def promote_reservation(state_dir: Path, issue_id: int, reservation_id: str, rec
             if reservation["closure"] != "promoted" or reservation["promoted_occurrence_id"] != record.occurrence_id:
                 raise FailureStateError("execution reservation closure mismatch")
             existing = entry["occurrences"].get(record.occurrence_id)
-            if existing != payload:
-                raise FailureStateError("attention occurrence replay changed frozen primary")
+            _validate_replay(existing, record)
             return dict(existing)
         existing = entry["occurrences"].get(record.occurrence_id)
-        if existing is not None and existing != payload:
-            raise FailureStateError("attention occurrence identity collision")
+        if existing is not None:
+            _validate_replay(existing, record)
         entry["occurrences"][record.occurrence_id] = payload
         now = datetime.now(UTC).isoformat()
         reservation.update(state="closed", closure="promoted", promoted_occurrence_id=record.occurrence_id, closed_at=now, updated_at=now)
         entry["inhibited"] = record.inhibited
         _set_compatibility_fields(entry, payload)
     return payload
+
+
+def _validate_replay(existing: Any, record: AttentionRecord) -> None:
+    if not isinstance(existing, dict):
+        raise FailureStateError("attention occurrence replay is missing")
+    frozen = AttentionRecord.from_json(existing, legacy=existing.get("source") == "legacy_v1")
+    identity = ("issue_id", "execution_id", "occurrence_id", "delivery_key", "source", "kind", "primary_source")
+    if any(getattr(frozen, name) != getattr(record, name) for name in identity):
+        raise FailureStateError("attention occurrence replay identity mismatch")
 
 
 def append_secondary_fault(state_dir: Path, issue_id: int, occurrence_id: str, *, source: str, cause: str, reason: str) -> None:
@@ -347,6 +409,25 @@ def pending_attention_records(state_dir: Path, *, limit: int = 32) -> list[dict[
                 continue
             pending.append(dict(occurrence))
     pending.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("occurrence_id") or "")))
+    return pending[: max(0, min(limit, 32))]
+
+
+def pending_execution_reservations(
+    state_dir: Path,
+    *,
+    execution_id: str | None = None,
+    limit: int = 32,
+) -> list[dict[str, Any]]:
+    state = load_failure_state(state_dir)
+    pending = []
+    for entry in state["issues"].values():
+        for reservation in entry.get("reservations", {}).values():
+            if not isinstance(reservation, dict) or reservation.get("state") != "reserved":
+                continue
+            if execution_id is not None and reservation.get("execution_id") != execution_id:
+                continue
+            pending.append(dict(reservation))
+    pending.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("reservation_id") or "")))
     return pending[: max(0, min(limit, 32))]
 
 
@@ -395,7 +476,7 @@ def acquire_handling_lease(state_dir: Path, issue_id: int, occurrence_id: str, *
             return None
         lease = occurrence.get("handling_lease")
         if isinstance(lease, dict) and (expires := parse_time(lease.get("expires_at"))) is not None and expires > now:
-            return lease.get("lease_id") if lease.get("owner") == owner else None
+            return None
         lease_id = uuid.uuid4().hex
         occurrence["handling_lease"] = {"lease_id": lease_id, "owner": owner, "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat()}
         return lease_id
@@ -424,9 +505,18 @@ def mark_attention_handled(
             return False
         occurrence["handling_disposition"] = disposition.value
         occurrence["handled_at"] = datetime.now(UTC).isoformat()
-        occurrence["handling"] = dict(metadata or {})
+        occurrence["handling"] = {"lease_id": lease_id, **dict(metadata or {})}
         occurrence.pop("handling_lease", None)
-        entry["inhibited"] = any(item.get("inhibited") is True and not item.get("handled_at") for item in entry["occurrences"].values() if isinstance(item, dict))
+        return True
+
+
+def release_handling_lease(state_dir: Path, issue_id: int, occurrence_id: str, lease_id: str) -> bool:
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        lease = occurrence.get("handling_lease") if isinstance(occurrence, dict) else None
+        if not isinstance(lease, dict) or lease.get("lease_id") != lease_id:
+            return False
+        occurrence.pop("handling_lease", None)
         return True
 
 
@@ -507,6 +597,33 @@ def observe_rearm_state(
     return rearmed
 
 
+def observe_reset_rearm(state_dir: Path, issue_id: int, reset_generation: int) -> bool:
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        prior = entry.get("reset_generation")
+        entry["reset_generation"] = reset_generation
+        if type(prior) is int and reset_generation > prior and entry.get("inhibited") is True:
+            entry["inhibited"] = False
+            entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
+            return True
+        return False
+
+
+def observe_manual_claim_rearm(state_dir: Path, issue_id: int, claim_identity: Mapping[str, Any]) -> bool:
+    if not _valid_claim(claim_identity, issue_id):
+        raise ValueError("manual rearm requires an exact claim identity")
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        prior = entry.get("manual_claim_witness")
+        witness = dict(claim_identity)
+        entry["manual_claim_witness"] = witness
+        if prior != witness and entry.get("inhibited") is True:
+            entry["inhibited"] = False
+            entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
+            return True
+        return False
+
+
 def is_transient_contention(error: str) -> bool:
     normalized = error.casefold()
     return any(all(marker in normalized for marker in markers) for markers in _TRANSIENT_CONTENTION_MARKERS)
@@ -525,10 +642,20 @@ def record_transient_contention(
         entry = _issue(state, issue_id)
         reservation = entry["reservations"].get(reservation_id)
         _validate_reservation(reservation_id, reservation)
-        observations = int(entry.get("transient_contention_observations", 0)) + 1
-        entry["transient_contention_observations"] = observations
-        if observations > 1:
+        generation = int(entry.get("arming_generation", 0))
+        signature = error_signature(terminal_error(error))
+        key = f"{generation}:{reservation['source']}:{signature}"
+        observations = entry.setdefault("transient_contention", {})
+        if not isinstance(observations, dict):
+            raise FailureStateError("transient contention state is invalid")
+        generation_retry = entry.get("transient_retry_generation") == generation
+        observations[key] = int(observations.get(key, 0)) + 1
+        entry["transient_contention_observations"] = int(
+            entry.get("transient_contention_observations", 0)
+        ) + 1
+        if generation_retry:
             return True
+        entry["transient_retry_generation"] = generation
         timestamp = now.isoformat()
         reservation.update(
             state="closed",
@@ -629,7 +756,10 @@ def record_success(state_dir: Path, issue_id: int) -> None:
         entry["active"] = False
         entry["consecutive"] = 0
         entry["notified_signatures"] = []
+        entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
+        entry["transient_contention"] = {}
         entry["transient_contention_observations"] = 0
+        entry.pop("transient_retry_generation", None)
 
 
 def _set_compatibility_fields(entry: dict[str, Any], occurrence: Mapping[str, Any]) -> None:

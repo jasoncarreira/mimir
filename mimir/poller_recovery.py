@@ -51,8 +51,11 @@ Hardening (chainlink #305/#309/#310/#318/#329, 2026-06-01 review):
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -131,7 +134,7 @@ def read_attention_binding(
     if channel_id != "poller:worklink-attention" or service_canonical != "poller:worklink-attention" or not origin_ref:
         raise ValueError("attention binding service identity mismatch")
     persist_dir = home / "state" / "pollers" / "worklink-attention"
-    state = _load_state(persist_dir)
+    state = _read_attention_state(persist_dir)
     if state.get("_unreadable_path"):
         raise ValueError("attention recovery state unavailable")
     entry = state["inflight"].get(origin_ref)
@@ -217,11 +220,6 @@ async def prepare_attention_event(home: Path, persist_dir: Path, event: AgentEve
     if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
         raise ValueError("attention event requires one item")
     item = items[0]
-    state = await asyncio.to_thread(_load_state, persist_dir)
-    if state.get("_unreadable_path"):
-        raise ValueError("attention recovery state unavailable")
-    if event.source_id in state["inflight"]:
-        return False
     from .worklink.dispatch_failures import bind_attention_origin, dispatch_failure_state_dir
 
     bound = await asyncio.to_thread(
@@ -236,16 +234,22 @@ async def prepare_attention_event(home: Path, persist_dir: Path, event: AgentEve
     if not bound:
         raise ValueError("attention event cannot bind ledger occurrence")
     now = _utc_now_iso()
-    state["inflight"][event.source_id] = {
-        "attempts": 0,
-        "stashed_at": now,
-        "enqueued_at": now,
-        "scan_from": now,
-        "event": _attention_stash_payload(event),
-        "pending_enqueue": True,
-    }
-    await asyncio.to_thread(_save_state_strict, persist_dir, state)
-    return True
+    payload = _attention_stash_payload(event)
+
+    def prepare(state: dict) -> bool:
+        if event.source_id in state["inflight"]:
+            return False
+        state["inflight"][event.source_id] = {
+            "attempts": 0,
+            "stashed_at": now,
+            "enqueued_at": now,
+            "scan_from": now,
+            "event": payload,
+            "pending_enqueue": True,
+        }
+        return True
+
+    return await asyncio.to_thread(_mutate_attention_state, persist_dir, prepare)
 
 
 async def commit_attention_event_accepted(
@@ -254,16 +258,17 @@ async def commit_attention_event_accepted(
     *,
     enqueued_at: str,
 ) -> None:
-    state = await asyncio.to_thread(_load_state, persist_dir)
-    if state.get("_unreadable_path"):
-        raise OSError("attention recovery state unavailable")
-    entry = state["inflight"].get(event.source_id)
-    if not isinstance(entry, dict) or entry.get("event") != _attention_stash_payload(event):
-        raise OSError("attention recovery binding changed before acceptance")
-    entry["enqueued_at"] = enqueued_at
-    entry["stashed_at"] = enqueued_at
-    entry.pop("pending_enqueue", None)
-    await asyncio.to_thread(_save_state_strict, persist_dir, state)
+    payload = _attention_stash_payload(event)
+
+    def accept(state: dict) -> None:
+        entry = state["inflight"].get(event.source_id)
+        if not isinstance(entry, dict) or entry.get("event") != payload:
+            raise OSError("attention recovery binding changed before acceptance")
+        entry["enqueued_at"] = enqueued_at
+        entry["stashed_at"] = enqueued_at
+        entry.pop("pending_enqueue", None)
+
+    await asyncio.to_thread(_mutate_attention_state, persist_dir, accept)
 
 
 def _utc_now() -> datetime:
@@ -285,6 +290,36 @@ def _parse_iso(ts: Any) -> datetime | None:
 
 def _state_path(persist_dir: Path) -> Path:
     return persist_dir / RECOVERY_STATE_FILE
+
+
+@contextmanager
+def _attention_state_lock(persist_dir: Path):
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(persist_dir / ".recovery.lock", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _read_attention_state(persist_dir: Path) -> dict:
+    with _attention_state_lock(persist_dir):
+        state = _load_state(persist_dir)
+        if state.get("_unreadable_path"):
+            raise ValueError("attention recovery state unavailable")
+        return state
+
+
+def _mutate_attention_state(persist_dir: Path, mutate: Callable[[dict], Any]) -> Any:
+    with _attention_state_lock(persist_dir):
+        state = _load_state(persist_dir)
+        if state.get("_unreadable_path"):
+            raise OSError("attention recovery state unavailable")
+        result = mutate(state)
+        _save_state_strict(persist_dir, state)
+        return result
 
 
 def _load_state(persist_dir: Path) -> dict:
@@ -911,7 +946,10 @@ async def reconcile_failed_turns(
                     entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns:
-                        del inflight[source_id]
+                        if poller_name != "worklink-attention" or _retire_attention_entry(
+                            persist_dir, entry, "hard_refusal"
+                        ):
+                            del inflight[source_id]
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
@@ -940,7 +978,10 @@ async def reconcile_failed_turns(
                     entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
                     if recover_failed_turns:
-                        del inflight[source_id]
+                        if poller_name != "worklink-attention" or _retire_attention_entry(
+                            persist_dir, entry, "hard_refusal"
+                        ):
+                            del inflight[source_id]
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
@@ -985,11 +1026,16 @@ async def reconcile_failed_turns(
                     service_authority=service_authority,
                 )
                 if event is not None and await _is_stale(event, relevance_check):
-                    del inflight[source_id]
-                    summary["stale_dropped"] += 1
-                    if isinstance(ts, str):
-                        watermark = max(watermark, ts)
-                    continue
+                    if poller_name != "worklink-attention" or _retire_attention_entry(
+                        persist_dir, entry, "hard_refusal"
+                    ):
+                        del inflight[source_id]
+                        summary["stale_dropped"] += 1
+                        if isinstance(ts, str):
+                            watermark = max(watermark, ts)
+                        continue
+                    summary["deferred"] += 1
+                    break
                 if attempts > max_attempts:
                     # Wedge guard hit. Emit best-effort (#318): a log
                     # failure must not strand the entry — we still give up.
@@ -1007,10 +1053,14 @@ async def reconcile_failed_turns(
                         summary["gave_up"] += 1
                 else:
                     if event is None:
-                        # Unreconstructable stash (older schema) — drop so we
-                        # don't loop on it forever.
-                        del inflight[source_id]
-                        summary["dropped"] += 1
+                        if poller_name != "worklink-attention" or _retire_attention_entry(
+                            persist_dir, entry, "unrecoverable_stash"
+                        ):
+                            del inflight[source_id]
+                            summary["dropped"] += 1
+                        else:
+                            summary["deferred"] += 1
+                            break
                     else:
                         prior_attempts = int(entry.get("attempts", 0))
                         if poller_name == "worklink-attention":
@@ -1148,9 +1198,14 @@ async def reconcile_failed_turns(
                 service_authority=service_authority,
             )
             if event is not None and await _is_stale(event, relevance_check):
-                del inflight[source_id]
-                summary["stale_dropped"] += 1
-                continue
+                if poller_name != "worklink-attention" or _retire_attention_entry(
+                    persist_dir, entry, "hard_refusal"
+                ):
+                    del inflight[source_id]
+                    summary["stale_dropped"] += 1
+                    continue
+                summary["deferred"] += 1
+                break
             if not pending_enqueue and attempts > max_attempts:
                 try:
                     await _emit_gave_up(poller_name, channel_id, entry, source_id)
@@ -1166,8 +1221,14 @@ async def reconcile_failed_turns(
                     summary["gave_up"] += 1
                 continue
             if event is None:
-                del inflight[source_id]
-                summary["dropped"] += 1
+                if poller_name != "worklink-attention" or _retire_attention_entry(
+                    persist_dir, entry, "unrecoverable_stash"
+                ):
+                    del inflight[source_id]
+                    summary["dropped"] += 1
+                else:
+                    summary["deferred"] += 1
+                    break
                 continue
             enqueued_at = _utc_now_iso()
             prior_attempts = int(entry.get("attempts", 0))

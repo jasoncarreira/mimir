@@ -27,6 +27,74 @@ from mimir.tools.extra import shell_exec
 from mimir.tools.shell_async import bash_async
 
 
+@pytest.mark.parametrize("enforce", [False, True])
+def test_worklink_attention_context_is_service_only_in_both_modes(
+    tmp_path, monkeypatch, enforce
+):
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.models import TurnContext
+    from mimir.poller_recovery import AttentionBinding
+    from mimir.tools.registry import _worklink_attention_context
+
+    service = ServicePrincipal(
+        canonical="poller:worklink-attention",
+        trigger="poller",
+        capabilities=("worklink_attention_inspect", "worklink_attention_ack", "operator_alert"),
+        readable_domains=("worklink",),
+        sink_destinations=("worklink_attention_ledger", "operator_channel"),
+        authority_profile="custom",
+    )
+    binding = AttentionBinding(
+        17, "signature", "occurrence", "delivery", "origin",
+        "poller:worklink-attention", "poller:worklink-attention",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr("mimir.poller_recovery.read_attention_binding", lambda *args: binding)
+
+    def turn(auth):
+        return TurnContext(
+            turn_id="turn", session_id="poller:worklink-attention", trigger=auth.trigger,
+            channel_id=auth.channel_id, started_at=0, auth_context=auth,
+        )
+
+    service_auth = AuthContext(
+        principal=service.canonical,
+        canonical_principal=service.canonical,
+        roles=(),
+        event_ingress=None,
+        trigger="poller",
+        channel_id="poller:worklink-attention",
+        interactivity=None,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=enforce,
+        origin_ref="origin",
+    )
+    token = set_current_turn(turn(service_auth))
+    try:
+        resolved = _worklink_attention_context(17, "signature", "occurrence")
+        assert resolved[2] is service
+    finally:
+        reset_current_turn(token)
+
+    for auth in (
+        AuthContext(
+            principal="operator", canonical_principal="operator", roles=("admin",),
+            event_ingress=None, trigger="user_message", channel_id="operator",
+            interactivity=None, enforcement_enabled=enforce, origin_ref="origin",
+        ),
+        replace(service_auth, event_ingress="http"),
+        replace(service_auth, channel_id="poller:foreign"),
+        replace(service_auth, canonical_principal="poller:foreign"),
+    ):
+        token = set_current_turn(turn(auth))
+        try:
+            with pytest.raises(Exception, match="trusted attention service required"):
+                _worklink_attention_context(17, "signature", "occurrence")
+        finally:
+            reset_current_turn(token)
+
+
 _OLD_ADMIN_TOOLS = {
     "add_schedule",
     "set_schedule_priority",

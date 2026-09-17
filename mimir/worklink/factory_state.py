@@ -441,7 +441,11 @@ def archive_factory_record(
     return destination
 
 
-def list_factory_records(home: Path) -> list[FactoryRunRecord]:
+def list_factory_records(
+    home: Path,
+    *,
+    on_error: Callable[[Path, FactoryRecordError], None] | None = None,
+) -> list[FactoryRunRecord]:
     directory = factory_records_dir(home)
     if not _require_safe_directory(directory, create=False):
         return []
@@ -449,7 +453,12 @@ def list_factory_records(home: Path) -> list[FactoryRunRecord]:
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         if not path.name.endswith(".json") or not _valid_record_run_id(path.stem):
             continue
-        records.append(load_factory_record(home, path.stem))
+        try:
+            records.append(load_factory_record(home, path.stem))
+        except FactoryRecordError as exc:
+            if on_error is None:
+                raise
+            on_error(path, exc)
     return [record for record in records if record is not None]
 
 
@@ -470,13 +479,14 @@ def report_retained_factory_records(
     home: Path,
     *,
     event_logger: Callable[..., None] | None = None,
+    on_error: Callable[[Path, FactoryRecordError], None] | None = None,
 ) -> None:
     """Report factory runs whose control plane remains retained for recovery."""
     if event_logger is None:
         from ..event_logger import log_event_sync
 
         event_logger = log_event_sync
-    for record in list_factory_records(home):
+    for record in list_factory_records(home, on_error=on_error):
         if record.controller_phase not in RETAINED_CONTROLLER_PHASES and not (
             record.controller_phase in LIVE_CONTROLLER_PHASES
             and factory_process_is_verified_dead(record)

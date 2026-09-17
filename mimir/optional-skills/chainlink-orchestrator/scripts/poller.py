@@ -45,7 +45,7 @@ from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
 from mimir.worklink.continuation import consume_worklink_budget_continuations
-from mimir.worklink.control import reconcile_attention_accounting
+from mimir.worklink.control import reconcile_attention_accounting, reconcile_reserved_executions
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
     delivery_receipt_exists,
@@ -548,6 +548,7 @@ def main() -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
         reconcile_attention_accounting(home)
+        reconcile_reserved_executions(home)
     except Exception as exc:
         _emit({"signal": "worklink_attention_reconcile_failed", "reason": str(exc)})
         return 0

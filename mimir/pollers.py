@@ -214,17 +214,20 @@ _GITHUB_PR_EVENT_TYPES = frozenset(
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 
 
-def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
+def _prune_worklink_delivery_receipts(
+    persist_dir: Path, home: Path, poller_name: str = "worklink-ready-queue"
+) -> None:
     """Sweep occurrence receipts only after the failure ledger supersedes them.
 
     The shipped ready-queue emits only failure and continuation delivery keys.
     Failure UUIDs are never reused; current unacknowledged occurrences and all
     extant continuation sidecars remain protected, without an age limit.
     """
-    from .worklink.dispatch_failures import STATE_FILE, dispatch_failure_state_dir
+    from .worklink.dispatch_failures import STATE_FILE
 
     try:
-        if persist_dir.resolve() != dispatch_failure_state_dir(home).resolve():
+        expected = home / "state" / "pollers" / poller_name
+        if poller_name not in {"worklink-ready-queue", "worklink-attention"} or persist_dir.resolve() != expected.resolve():
             return
         with ExitStack() as stack:
             # Anchor both cursor trees to the authoritative home. Refuse
@@ -232,7 +235,7 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
             home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
             stack.callback(os.close, home_fd)
             parent_fd = home_fd
-            for component in ("state", "pollers", "worklink-ready-queue"):
+            for component in ("state", "pollers"):
                 root_fd = os.open(
                     component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=parent_fd,
@@ -241,9 +244,20 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 if component == "state":
                     state_root_fd = root_fd
                 parent_fd = root_fd
+            pollers_fd = root_fd
+            ledger_fd = os.open(
+                "worklink-ready-queue", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=pollers_fd,
+            )
+            stack.callback(os.close, ledger_fd)
+            receipt_root_fd = os.open(
+                poller_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=pollers_fd,
+            )
+            stack.callback(os.close, receipt_root_fd)
             receipts_fd = os.open(
                 _DELIVERY_RECEIPTS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
+                dir_fd=receipt_root_fd,
             )
             stack.callback(os.close, receipts_fd)
             # Never sweep a receipt created after this snapshot. In particular,
@@ -256,7 +270,7 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 }
             lock_fd = os.open(
                 f"{STATE_FILE}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
-                0o600, dir_fd=root_fd,
+                0o600, dir_fd=ledger_fd,
             )
             stack.callback(os.close, lock_fd)
             try:
@@ -264,7 +278,7 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
             except BlockingIOError:
                 return
             state_fd = os.open(
-                STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd,
+                STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=ledger_fd,
             )
             with os.fdopen(state_fd, encoding="utf-8") as handle:
                 if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -277,6 +291,19 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 for entry in state["issues"].values():
                     if not isinstance(entry, dict):
                         return
+                    if poller_name == "worklink-attention":
+                        occurrences = entry.get("occurrences", {})
+                        if not isinstance(occurrences, dict):
+                            return
+                        for occurrence in occurrences.values():
+                            if not isinstance(occurrence, dict):
+                                return
+                            key = occurrence.get("delivery_key")
+                            if not isinstance(key, str):
+                                return
+                            if occurrence.get("handled_at") is None and occurrence.get("retirement") is None:
+                                live.add(hashlib.sha256(key.encode()).hexdigest())
+                        continue
                     issue = entry.get("issue_id")
                     signature = entry.get("signature")
                     notified = entry.get("notified_signatures")
@@ -293,7 +320,12 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 # The existing writer's directory fsync is best-effort. Require
                 # it here before allowing receipt deletion to become durable.
                 os.fsync(handle.fileno())
-            os.fsync(root_fd)
+            os.fsync(ledger_fd)
+            if poller_name == "worklink-attention":
+                for name in candidates - live:
+                    os.unlink(name, dir_fd=receipts_fd)
+                os.fsync(receipts_fd)
+                return
             try:
                 worklink_fd = os.open(
                     "worklink", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -338,8 +370,8 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
 
 def _prune_delivery_receipts(poller: PollerConfig, home: Path | None = None) -> None:
     """Only Worklink's occurrence/continuation contract supports this sweep."""
-    if poller.name == "worklink-ready-queue" and home is not None:
-        _prune_worklink_delivery_receipts(poller.resolved_persist_dir(), home)
+    if poller.name in {"worklink-ready-queue", "worklink-attention"} and home is not None:
+        _prune_worklink_delivery_receipts(poller.resolved_persist_dir(), home, poller.name)
 
 
 def _write_delivery_receipt(persist_dir: Path, delivery_key: object) -> None:

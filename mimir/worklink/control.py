@@ -419,6 +419,99 @@ def stop_worklink(
         )
 
 
+def _raw_reserved_execution(home: Path, path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("autonomous") is not True:
+        return None
+    execution_id = payload.get("execution_id")
+    if not isinstance(execution_id, str) or not execution_id:
+        return None
+    from .dispatch_failures import dispatch_failure_state_dir, pending_execution_reservations
+
+    matches = pending_execution_reservations(
+        dispatch_failure_state_dir(home), execution_id=execution_id, limit=2
+    )
+    if len(matches) != 1:
+        return None
+    reservation = matches[0]
+    raw_issue = payload.get("issue_id")
+    if type(raw_issue) is int and raw_issue != reservation["issue_id"]:
+        return None
+    return reservation
+
+
+def _promote_reserved_execution(
+    home: Path,
+    reservation: dict[str, Any],
+    source: str,
+    reason: str,
+) -> str:
+    from .orchestrator import WorklinkRunResult, _record_attention_result
+
+    claim = reservation.get("confirmed_claim") or reservation.get("prepared_claim")
+    attempt = claim.get("attempt") if isinstance(claim, dict) else None
+    record = _record_attention_result(
+        home,
+        WorklinkRunResult(
+            issue_id=int(reservation["issue_id"]),
+            attempt=attempt if type(attempt) is int else None,
+            status="failed",
+            reason=reason,
+            attention_source=source,
+        ),
+        reservation,
+        source=source,
+    )
+    return record.occurrence_id
+
+
+def reconcile_reserved_executions(
+    home: Path,
+    *,
+    active_execution_ids: set[str] | None = None,
+    recover_recent: bool = False,
+    now: datetime | None = None,
+    limit: int = 32,
+) -> list[str]:
+    from .dispatch_failures import dispatch_failure_state_dir, parse_time, pending_execution_reservations
+
+    if active_execution_ids is None:
+        from .factory_state import FactoryRecordError, list_factory_records
+
+        try:
+            active_execution_ids = {
+                execution_id
+                for execution_id in (
+                    *(state.execution_id for state in list_run_states(home)),
+                    *(record.execution_id for record in list_factory_records(home)),
+                )
+                if execution_id
+            }
+        except (FactoryRecordError, OSError, ValueError):
+            return []
+    active = active_execution_ids
+    cutoff = (now or datetime.now(UTC)).timestamp() - 300
+    recovered = []
+    for reservation in pending_execution_reservations(
+        dispatch_failure_state_dir(home), limit=limit
+    ):
+        if reservation["execution_id"] in active:
+            continue
+        updated = parse_time(reservation.get("updated_at"))
+        if not recover_recent and (updated is None or updated.timestamp() > cutoff):
+            continue
+        recovered.append(_promote_reserved_execution(
+            home,
+            reservation,
+            "execution_recovery",
+            "reserved autonomous execution has no recoverable owner",
+        ))
+    return recovered
+
+
 def reconcile_run_states(
     home: Path,
     *,
@@ -448,6 +541,14 @@ def reconcile_run_states(
     if directory.exists():
         for path in sorted(directory.glob("*.json")):
             if path.stem not in known_paths:
+                reservation = _raw_reserved_execution(home, path)
+                if reservation is not None:
+                    _promote_reserved_execution(
+                        home,
+                        reservation,
+                        "startup_run_record_read",
+                        "autonomous run state is unreadable or malformed",
+                    )
                 _emit_reconcile_event(
                     event_logger,
                     "worklink_run_state_reconcile_failed",
@@ -462,13 +563,6 @@ def reconcile_run_states(
             publication_outcome, publication_reason = _checkout_has_unpublished_commits(
                 state, run_git
             )
-            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
-            if release.returncode != 0:
-                _emit_orphan_reconcile_failed(
-                    event_logger, state, "lock_release_failed", release
-                )
-                continue
-
             checkout_exists = bool(state.checkout and Path(state.checkout).is_dir())
             would_rearm = publication_outcome != "determined-unpublished" and not (
                 publication_outcome == "undetermined" and checkout_exists
@@ -489,6 +583,70 @@ def reconcile_run_states(
                 or (publication_outcome == "undetermined" and checkout_exists)
                 else "worklink:ready"
             )
+            reservation = None
+            occurrence_id = None
+            primary_source = (
+                "orphan_epic" if is_epic
+                else "orphan_labels_unknown" if labels_unknown
+                else "orphan_unpublished" if publication_outcome == "determined-unpublished"
+                else "orphan_ambiguous" if publication_outcome == "undetermined" and checkout_exists
+                else None
+            )
+            if state.autonomous:
+                from .claims import ClaimRecord
+                from .orchestrator import (
+                    WorklinkRunResult,
+                    _record_attention_result,
+                    _reserve_attention_execution,
+                )
+
+                reservation = _reserve_attention_execution(
+                    home, state.issue_id, primary_source or "orphan_state_update",
+                    autonomous=True,
+                )
+                claim = None
+                if state.claim_identity is not None:
+                    try:
+                        claim = ClaimRecord.from_payload(state.claim_identity)
+                    except (KeyError, TypeError, ValueError):
+                        claim = None
+                if primary_source is not None:
+                    record = _record_attention_result(
+                        home,
+                        WorklinkRunResult(
+                            state.issue_id,
+                            state.attempt,
+                            "failed",
+                            reason=publication_reason,
+                            checkout=Path(state.checkout) if state.checkout else None,
+                            branch=state.branch,
+                            claim_record=claim,
+                            unpublished_commits=publication_outcome == "determined-unpublished",
+                        ),
+                        reservation,
+                        source=primary_source,
+                    )
+                    occurrence_id = record.occurrence_id
+            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
+            if release.returncode != 0:
+                if state.autonomous and occurrence_id is None:
+                    record = _record_attention_result(
+                        home,
+                        WorklinkRunResult(
+                            state.issue_id, state.attempt, "failed",
+                            reason="lock release failed",
+                            checkout=Path(state.checkout) if state.checkout else None,
+                            branch=state.branch,
+                            claim_record=claim,
+                        ),
+                        reservation,
+                        source="orphan_lock_release",
+                    )
+                    occurrence_id = record.occurrence_id
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, "lock_release_failed", release
+                )
+                continue
             comment_text = _orphan_reconcile_comment(
                 state,
                 publication_outcome=publication_outcome,
@@ -501,6 +659,14 @@ def reconcile_run_states(
                 [chainlink_bin, "issue", "comment", str(state.issue_id), comment_text]
             )
             if comment.returncode != 0:
+                if occurrence_id:
+                    from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+                    append_secondary_fault(
+                        dispatch_failure_state_dir(home), state.issue_id, occurrence_id,
+                        source="orphan_comment", cause="reconcile_failed",
+                        reason=comment.stderr or comment.stdout or "comment failed",
+                    )
                 _emit_orphan_reconcile_failed(
                     event_logger, state, "orphan_comment_failed", comment
                 )
@@ -541,6 +707,12 @@ def reconcile_run_states(
                 continue
 
             clear_run_state(home, state.issue_id)
+            if state.autonomous and occurrence_id is None:
+                from .orchestrator import _close_attention_excluded
+
+                _close_attention_excluded(
+                    home, state.issue_id, reservation, "orphan reconciled without attention"
+                )
             _emit_reconcile_event(
                 event_logger,
                 "worklink_run_orphaned",

@@ -1010,11 +1010,15 @@ def reattach_inflight_worklink_runs(
     import subprocess
 
     from .event_logger import log_event_sync
-    from .worklink.control import reconcile_run_states
+    from .worklink.control import (
+        _promote_reserved_execution,
+        _raw_reserved_execution,
+        reconcile_reserved_executions,
+        reconcile_run_states,
+    )
     from .worklink.factory_state import (
         factory_process_is_verified_dead,
         list_factory_records,
-        report_retained_factory_records,
     )
     from .worklink.run_state import reattach_dispatch_argv
 
@@ -1031,11 +1035,44 @@ def reattach_inflight_worklink_runs(
     # homes without a configured reattach repository; malformed records emit an
     # event and never abort startup.
     states = reconcile_run_states(home, event_logger=emit)
+    def factory_record_error(path: Path, exc: Exception) -> None:
+        reservation = _raw_reserved_execution(home, path)
+        issue_id = None
+        if reservation is not None:
+            issue_id = int(reservation["issue_id"])
+            _promote_reserved_execution(
+                home,
+                reservation,
+                "startup_factory_record_read",
+                "autonomous factory record is unreadable or malformed",
+            )
+        failure = {
+            "issue_id": issue_id,
+            "reason": "factory_record_enumeration_failed",
+            "error": str(exc)[:500],
+        }
+        failures.append(failure)
+        emit("worklink_reattach_dispatch_failed", **failure)
+
+    all_factory_records = []
     try:
-        report_retained_factory_records(home, event_logger=emit)
+        all_factory_records = list_factory_records(home, on_error=factory_record_error)
+        for record in all_factory_records:
+            if record.controller_phase in {"failed", "parked", "stopped", "terminal"} or (
+                record.controller_phase == "running" and factory_process_is_verified_dead(record)
+            ):
+                emit(
+                    "worklink_factory_run_retained",
+                    issue_id=record.issue_id,
+                    run_id=record.run_id,
+                    attempt=record.attempt,
+                    phase=record.controller_phase,
+                    sandbox=record.sandbox,
+                    reason="factory handoff has not archived and verified the control plane",
+                )
         factory_records = [
             record
-            for record in list_factory_records(home)
+            for record in all_factory_records
             if factory_process_is_verified_dead(record)
             and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)
@@ -1049,6 +1086,19 @@ def reattach_inflight_worklink_runs(
         }
         failures.append(failure)
         emit("worklink_reattach_dispatch_failed", **failure)
+    active_execution_ids = {
+        execution_id
+        for execution_id in (
+            *(state.execution_id for state in states),
+            *(record.execution_id for record in all_factory_records),
+        )
+        if execution_id
+    }
+    reconcile_reserved_executions(
+        home,
+        active_execution_ids=active_execution_ids,
+        recover_recent=True,
+    )
     repo = os.environ.get("WORKLINK_REPO")
     if not repo:
         emit(
@@ -1075,6 +1125,13 @@ def reattach_inflight_worklink_runs(
             # persistent remote substrate it cannot be reattached by a new one.
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
+        reservation = None
+        if state.autonomous:
+            from .worklink.orchestrator import _reserve_attention_execution
+
+            reservation = _reserve_attention_execution(
+                home, state.issue_id, "startup_leaf_spawn", autonomous=True
+            )
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:
             log_fh: Any = log_path.open("ab")
@@ -1114,7 +1171,7 @@ def reattach_inflight_worklink_runs(
                         branch=state.branch or None,
                         attention_source="startup_leaf_spawn",
                     ),
-                    None,
+                    reservation,
                     source="startup_leaf_spawn",
                 )
             continue
@@ -1125,6 +1182,12 @@ def reattach_inflight_worklink_runs(
                 except OSError:
                     pass
         dispatched.append(state.issue_id)
+        if state.autonomous:
+            from .worklink.orchestrator import _close_attention_excluded
+
+            _close_attention_excluded(
+                home, state.issue_id, reservation, "matching reattach spawned"
+            )
     for record in factory_records:
         argv = [
             *run_bin,
@@ -1138,6 +1201,13 @@ def reattach_inflight_worklink_runs(
             repo,
         ]
         log_path = state_dir / f"factory-recover-{record.issue_id}.log"
+        reservation = None
+        if record.autonomous:
+            from .worklink.orchestrator import _reserve_attention_execution
+
+            reservation = _reserve_attention_execution(
+                home, record.issue_id, "startup_factory_spawn", autonomous=True
+            )
         try:
             log_fh = log_path.open("ab")
         except OSError:
@@ -1176,7 +1246,7 @@ def reattach_inflight_worklink_runs(
                         branch=record.branch,
                         attention_source="startup_factory_spawn",
                     ),
-                    None,
+                    reservation,
                     source="startup_factory_spawn",
                 )
             continue
@@ -1187,6 +1257,12 @@ def reattach_inflight_worklink_runs(
                 except OSError:
                     pass
         dispatched.append(record.issue_id)
+        if record.autonomous:
+            from .worklink.orchestrator import _close_attention_excluded
+
+            _close_attention_excluded(
+                home, record.issue_id, reservation, "factory recovery spawned"
+            )
     emit(
         "worklink_reattach_attempted",
         examined=len(states) + len(factory_records),

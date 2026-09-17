@@ -9,6 +9,7 @@ PR only after the evidence gate passes, then clean up and release the lock.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -187,6 +188,19 @@ class WorklinkRunResult:
     next: str | None = None
     attention_source: str | None = None
     attention_secondary_faults: tuple[dict[str, str], ...] = ()
+    attention_occurrence_id: str | None = None
+    claim_record: ClaimRecord | None = None
+    factory_status: FactoryStatus | None = None
+    accepted_factory_status: FactoryStatus | None = None
+    next_present: bool = False
+    controller_phase: str | None = None
+    controller_error: str | None = None
+    pr_state: str | None = None
+    pr_head: str | None = None
+    normalized_leaf_result: bool = False
+    launch_error: bool = False
+    unpublished_commits: bool = False
+    claim_manager: Any = None
 
 
 @dataclass
@@ -230,6 +244,12 @@ class _TerminalClaimRelease:
 
 class WorklinkError(RuntimeError):
     """Base error for operator-facing Worklink failures."""
+
+
+class _AttentionBoundaryError(WorklinkError):
+    def __init__(self, source: str, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.attention_source = source
 
 
 class LeafValidationError(WorklinkError):
@@ -498,6 +518,8 @@ def _demote_template_invalid_ready_leaf(
     reason: str,
     runner: Runner,
     chainlink_bin: str,
+    home: Path | None = None,
+    attention_result: WorklinkRunResult | None = None,
 ) -> None:
     """Best-effort demotion for strict-template invalid ready leaves.
 
@@ -524,10 +546,13 @@ def _demote_template_invalid_ready_leaf(
         (chainlink_bin, "issue", "label", issue_id, "worklink:blocked"),
         (chainlink_bin, "issue", "comment", issue_id, comment),
     )
-    for command in commands:
+    sources = ("template_unready", "template_block_label", "template_comment")
+    for command, source in zip(commands, sources, strict=True):
         try:
             result = runner(list(command))
         except Exception as exc:  # pragma: no cover - defensive best-effort guard
+            if home is not None and attention_result is not None:
+                _append_attention_secondary(home, attention_result, source, "reconcile_failed", exc)
             _log_event(
                 "worklink_template_invalid_demote_failed",
                 issue_id=issue.issue_id,
@@ -536,6 +561,11 @@ def _demote_template_invalid_ready_leaf(
             )
             continue
         if result.returncode != 0:
+            if home is not None and attention_result is not None:
+                _append_attention_secondary(
+                    home, attention_result, source, "reconcile_failed",
+                    result.stderr or result.stdout or "template transition failed",
+                )
             _log_event(
                 "worklink_template_invalid_demote_failed",
                 issue_id=issue.issue_id,
@@ -584,18 +614,41 @@ class WorklinkRunner:
         test_command: str | None = None,
         base_branch: str | None = None,
         autonomous: bool = False,
+        attention_reservation: dict[str, Any] | None = None,
     ) -> WorklinkRunResult:
+        reservation = attention_reservation or _reserve_attention_execution(
+            self.home, issue_id, "leaf_run_boundary", autonomous=autonomous
+        )
+
+        def promote(result: WorklinkRunResult, source: str) -> WorklinkRunResult:
+            if not autonomous:
+                return result
+            record = _record_attention_result(
+                self.home, result, reservation, source=source
+            )
+            return replace(
+                result,
+                attention_source=source,
+                attention_occurrence_id=record.occurrence_id,
+            )
+
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         try:
             validate_leaf(issue)
         except LeafValidationError as exc:
+            attention_result = promote(
+                WorklinkRunResult(issue.issue_id, None, "failed", reason=str(exc)),
+                "leaf_template",
+            )
             if not dry_run:
                 _demote_template_invalid_ready_leaf(
                     issue,
                     reason=str(exc),
                     runner=runner,
                     chainlink_bin=self.chainlink_bin,
+                    home=self.home,
+                    attention_result=attention_result,
                 )
             raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
@@ -667,7 +720,10 @@ class WorklinkRunner:
                     issue_id=issue.issue_id,
                     compute_backend=compute.name,
                 )
-                return WorklinkRunResult(issue.issue_id, None, "refused", reason=reason)
+                return promote(
+                    WorklinkRunResult(issue.issue_id, None, "refused", reason=reason),
+                    "leaf_compute",
+                )
 
         claims = ChainlinkClaims(
             chainlink_bin=self.chainlink_bin,
@@ -713,31 +769,79 @@ class WorklinkRunner:
             )
             claiming_state_written = True
 
-        try:
-            claim = claims.claim_issue(
+        def record_prepared(prepared: ClaimRecord) -> None:
+            if reservation is None:
+                return
+            from .dispatch_failures import checkpoint_reservation, dispatch_failure_state_dir
+
+            checkpoint_reservation(
+                dispatch_failure_state_dir(self.home),
                 issue.issue_id,
-                issue.comments,
-                labels=issue.labels,
-                max_active_locks=config.defaults.max_concurrent if autonomous else None,
-                exclude_active_label=WORKLINK_EPIC_LABEL,
-                before_claim=record_claiming,
+                str(reservation["reservation_id"]),
+                prepared_claim={
+                    "issue_id": prepared.issue_id,
+                    "attempt": prepared.attempt,
+                    "agent_id": prepared.agent_id,
+                    "claimed_at": prepared.claimed_at.isoformat(),
+                },
+                claim_binding_state="prepared",
+                operation_stage="claim_prepared",
             )
+
+        try:
+            claim_options = {
+                "labels": issue.labels,
+                "max_active_locks": config.defaults.max_concurrent if autonomous else None,
+                "exclude_active_label": WORKLINK_EPIC_LABEL,
+                "before_claim": record_claiming,
+            }
+            if autonomous:
+                claim_options["on_record_prepared"] = record_prepared
+            claim = claims.claim_issue(issue.issue_id, issue.comments, **claim_options)
         except Exception:
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
             raise
         if claim.attempts_exhausted:
+            result = promote(
+                WorklinkRunResult(
+                    issue.issue_id,
+                    None,
+                    "blocked",
+                    reason="attempts_exhausted",
+                    attention_source="leaf_exhaustion",
+                ),
+                "leaf_exhaustion",
+            )
+            claims.transition_issue(
+                issue.issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=None,
+                reason=result.reason,
+            )
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
-            return WorklinkRunResult(
+            return result
+        if not claim.claimed or claim.record is None:
+            status = _claim_refusal_status(claim.reason, claim.reason_code)
+            result = WorklinkRunResult(
                 issue.issue_id,
                 None,
-                "blocked",
-                reason="attempts_exhausted",
-                attention_source="leaf_exhaustion",
+                status,
+                reason=claim.reason or "claim_failed",
+                attention_source=None if status == "refused" else "leaf_claim",
             )
-        if not claim.claimed or claim.record is None:
+            if status != "refused":
+                result = promote(result, "leaf_claim")
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=None,
+                    reason=result.reason,
+                )
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
             _log_event(
@@ -745,15 +849,7 @@ class WorklinkRunner:
                 issue_id=issue.issue_id,
                 reason=claim.reason or "claim_failed",
             )
-            return WorklinkRunResult(
-                issue.issue_id, None, _claim_refusal_status(claim.reason, claim.reason_code),
-                reason=claim.reason or "claim_failed",
-                attention_source=(
-                    None
-                    if _claim_refusal_status(claim.reason, claim.reason_code) == "refused"
-                    else "leaf_claim"
-                ),
-            )
+            return result
         record = claim.record
         terminal_release = _TerminalClaimRelease(
             claims,
@@ -815,7 +911,7 @@ class WorklinkRunner:
                     backend=selected_name,
                     compute_backend=compute.name,
                 )
-                return WorklinkRunResult(
+                result = promote(WorklinkRunResult(
                     issue.issue_id,
                     record.attempt,
                     "blocked",
@@ -825,7 +921,18 @@ class WorklinkRunner:
                         "(chainlink #517/#1019)"
                     ),
                     attention_source="leaf_checkout",
+                    claim_record=record,
+                    claim_manager=claims,
+                ), "leaf_checkout")
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=record.budget_attempt or record.attempt,
+                    reason=result.reason,
                 )
+                terminal_release.label_transition_applied = True
+                return result
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
             prompt = render_work_order(
                 issue,
@@ -907,7 +1014,7 @@ class WorklinkRunner:
                             error=str(exc),
                         )
                         await compute.cancel(handle)
-                        raise
+                        raise _AttentionBoundaryError("leaf_runstate_save", exc) from exc
                     return await _heartbeat_while(
                         compute.wait(handle, spec.timeout_s),
                         claims=claims,
@@ -922,7 +1029,10 @@ class WorklinkRunner:
                     )
                 finally:
                     if handle is not None:
-                        await compute.cleanup(handle)
+                        try:
+                            await compute.cleanup(handle)
+                        except Exception as exc:
+                            raise _AttentionBoundaryError("leaf_compute_cleanup", exc) from exc
 
             if isinstance(backend, OpenCodeBackend):
                 compute_result = await backend.invoke_with_startup_retry(
@@ -955,6 +1065,8 @@ class WorklinkRunner:
                     publication=publication,
                     executor_report_dir=executor_report_dir,
                     terminal_release=terminal_release,
+                    attention_reservation=reservation,
+                    autonomous=autonomous,
                 ),
                 claims=claims,
                 record=record,
@@ -975,6 +1087,10 @@ class WorklinkRunner:
                     errors=cleanup_errors,
                 )
                 if cleanup_errors:
+                    _append_attention_secondary(
+                        self.home, result, "leaf_checkout_cleanup", "controller_failed",
+                        "; ".join(cleanup_errors),
+                    )
                     result = replace(
                         result,
                         reason=_append_post_publication_error(
@@ -986,6 +1102,20 @@ class WorklinkRunner:
             transition_applied = False
             transition_error = None
             terminal_release.retain_for_recovery = True
+            result = promote(
+                WorklinkRunResult(
+                    issue.issue_id,
+                    record.attempt,
+                    "failed",
+                    reason=str(exc),
+                    checkout=lease.path if lease else None,
+                    branch=lease.branch if lease else None,
+                    attention_source=getattr(exc, "attention_source", "leaf_postclaim"),
+                    claim_record=record,
+                    claim_manager=claims,
+                ),
+                getattr(exc, "attention_source", "leaf_postclaim"),
+            )
             try:
                 claims.transition_issue(
                     issue.issue_id,
@@ -1000,6 +1130,10 @@ class WorklinkRunner:
                 terminal_release()
             except Exception as transition_exc:
                 transition_error = str(transition_exc)
+                _append_attention_secondary(
+                    self.home, result, "leaf_error_transition", "reconcile_failed",
+                    transition_exc,
+                )
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
@@ -1011,15 +1145,7 @@ class WorklinkRunner:
                 transition_applied=transition_applied,
                 error=transition_error,
             )
-            return WorklinkRunResult(
-                issue.issue_id,
-                record.attempt,
-                "failed",
-                reason=str(exc),
-                checkout=lease.path if lease else None,
-                branch=lease.branch if lease else None,
-                attention_source="leaf_postclaim",
-            )
+            return result
         except BaseException as exc:
             # No terminal routing occurred. Keep both recovery handles, even
             # when the finally block below requests release after teardown.
@@ -1041,6 +1167,10 @@ class WorklinkRunner:
                         delete_checkout=delete_authorized_checkout,
                     )
                 except Exception as exc:  # noqa: BLE001 - teardown must continue
+                    if "result" in locals():
+                        _append_attention_secondary(
+                            self.home, result, "leaf_capability_cleanup", "controller_failed", exc
+                        )
                     _log_event(
                         "worklink_cleanup_failed",
                         issue_id=issue.issue_id,
@@ -1078,6 +1208,8 @@ class WorklinkRunner:
         publication: ControllerGitPublication | None = None,
         executor_report_dir: Path | None = None,
         terminal_release: _TerminalClaimRelease,
+        attention_reservation: dict[str, Any] | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1116,6 +1248,7 @@ class WorklinkRunner:
                 transcript=str(raw.transcript_path) if raw.transcript_path else None,
             )
         pr_url = None
+        publication_failure_source = None
 
         def persist_gate_handle(handle: LaunchHandle) -> None:
             _persist_run_state(
@@ -1178,6 +1311,7 @@ class WorklinkRunner:
                 )
                 _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
             except Exception as exc:
+                publication_failure_source = "leaf_work_failed"
                 validation = _publication_failed_validation(
                     validation,
                     step="commit",
@@ -1268,6 +1402,12 @@ class WorklinkRunner:
                     evidence_path = _write_evidence(self.home, validation.evidence)
                     intent.completed = True
             except Exception as exc:
+                publication_failure_source = {
+                    "fence": "leaf_publication_fence",
+                    "push": "leaf_publication_push",
+                    "pull request": "leaf_publication_pr",
+                    "completed evidence": "leaf_publication_evidence",
+                }.get(step, "leaf_publication_fence")
                 validation = _publication_failed_validation(
                     validation, step=step, error=exc,
                     issue_id=issue.issue_id, attempt=attempt,
@@ -1338,13 +1478,72 @@ class WorklinkRunner:
         transition_applied = False
         transition_error = None
 
+        primary_source = publication_failure_source or (
+            "leaf_launch" if compute_result.launch_error
+            else "leaf_output_overflow" if raw.output_overflow
+            else "leaf_gate_timeout" if "gate_timed_out" in validation.reasons
+            else "leaf_gate_missing" if "gate_command_not_found" in validation.reasons
+            else "leaf_backend_blocked" if validation.status == "blocked"
+            else "leaf_work_failed" if raw.exit_code != 0 or validation.status == "failed"
+            else None
+        )
+        secondary_sources = {
+            "completed evidence write": "leaf_completed_evidence_write",
+            "evidence comment": "leaf_evidence_comment",
+            "completed run state clear": "leaf_completed_state_clear",
+            "issue transition": "leaf_transition",
+            "authorized branch cleanup": "leaf_checkout_cleanup",
+        }
+        secondary_faults = tuple(
+            {
+                "source": secondary_sources.get(error.partition(":")[0], "leaf_run_boundary"),
+                "cause": "reconcile_failed",
+                "reason": error,
+            }
+            for error in post_publication_errors
+        )
+        attention_record = None
+        if autonomous and (primary_source is not None or secondary_faults):
+            primary_source = primary_source or secondary_faults[0]["source"]
+            terminal = WorklinkRunResult(
+                issue.issue_id,
+                attempt,
+                transition_status,
+                review_ready=validation.review_ready,
+                pr_url=pr_url,
+                evidence_path=evidence_path,
+                checkout=lease.path,
+                branch=lease.branch,
+                reason=transition_reason or "; ".join(post_publication_errors) or transition_status,
+                attention_source=primary_source,
+                attention_secondary_faults=secondary_faults,
+                claim_record=claim_record,
+                claim_manager=claims,
+                normalized_leaf_result=not bool(compute_result.launch_error),
+                launch_error=bool(compute_result.launch_error),
+            )
+            attention_record = _record_attention_result(
+                self.home,
+                terminal,
+                attention_reservation,
+                source=primary_source,
+            )
+
         # Keep the lock until routing succeeds, including through outer finally.
         terminal_release.retain_for_recovery = True
         if pr_url:
             # Execution is finished and publication evidence is durable. Retire
             # the worker pointer so startup orphan reconciliation cannot demote
             # this PR; terminal recovery now belongs to the stale-lock reaper.
+            prior_errors = len(post_publication_errors)
             run_bookkeeping("completed run state clear", lambda: clear_run_state(self.home, issue.issue_id))
+            for error in post_publication_errors[prior_errors:]:
+                if attention_record is not None:
+                    _append_attention_secondary(
+                        self.home,
+                        replace(terminal, attention_occurrence_id=attention_record.occurrence_id),
+                        "leaf_completed_state_clear", "reconcile_failed", error,
+                    )
 
         def transition_issue() -> None:
             nonlocal transition_applied, transition_error
@@ -1376,8 +1575,16 @@ class WorklinkRunner:
             )
 
         if pr_url:
+            prior_errors = len(post_publication_errors)
             run_bookkeeping("issue transition", transition_issue)
             run_bookkeeping("transition event", log_transition)
+            for error in post_publication_errors[prior_errors:]:
+                if attention_record is not None:
+                    _append_attention_secondary(
+                        self.home,
+                        replace(terminal, attention_occurrence_id=attention_record.occurrence_id),
+                        "leaf_transition", "reconcile_failed", error,
+                    )
         else:
             try:
                 transition_issue()
@@ -1386,6 +1593,12 @@ class WorklinkRunner:
                 # emit it without turning a failed mutation into a successful run.
                 log_transition()
         if transition_applied and not terminal_release():
+            if attention_record is not None:
+                _append_attention_secondary(
+                    self.home,
+                    replace(terminal, attention_occurrence_id=attention_record.occurrence_id),
+                    "leaf_release", "reconcile_failed", "claim release was not confirmed",
+                )
             return WorklinkRunResult(
                 issue.issue_id,
                 attempt,
@@ -1408,6 +1621,12 @@ class WorklinkRunner:
             )
             if cleanup_error and pr_url:
                 post_publication_errors.append(f"checkout cleanup: {cleanup_error}")
+            if cleanup_error and attention_record is not None:
+                _append_attention_secondary(
+                    self.home,
+                    replace(terminal, attention_occurrence_id=attention_record.occurrence_id),
+                    "leaf_checkout_cleanup", "controller_failed", cleanup_error,
+                )
         return WorklinkRunResult(
             issue.issue_id,
             attempt,
@@ -1427,20 +1646,14 @@ class WorklinkRunner:
                 else None
             ),
             attention_source=(
-                "leaf_launch"
-                if compute_result.launch_error
-                else "leaf_output_overflow"
-                if raw.output_overflow
-                else "leaf_gate_timeout"
-                if "gate_timed_out" in validation.reasons
-                else "leaf_gate_missing"
-                if "gate_command_not_found" in validation.reasons
-                else "leaf_backend_blocked"
-                if validation.status == "blocked"
-                else "leaf_work_failed"
-                if raw.exit_code != 0
-                else None
+                primary_source
             ),
+            attention_secondary_faults=secondary_faults,
+            attention_occurrence_id=attention_record.occurrence_id if attention_record else None,
+            claim_record=claim_record,
+            claim_manager=claims,
+            normalized_leaf_result=not bool(compute_result.launch_error),
+            launch_error=bool(compute_result.launch_error),
         )
 
     async def reattach(self, issue_id: int) -> WorklinkRunResult:
@@ -1752,33 +1965,64 @@ class WorklinkRunner:
         issue_id: int,
         *,
         autonomous: bool = False,
+        attention_reservation: dict[str, Any] | None = None,
     ) -> WorklinkRunResult:
-        return await self._run_factory_070(issue_id, autonomous=autonomous)
+        reservation = attention_reservation or _reserve_attention_execution(
+            self.home, issue_id, "epic_run_boundary", autonomous=autonomous
+        )
+        return await self._run_factory_070(
+            issue_id, autonomous=autonomous, attention_reservation=reservation
+        )
 
     async def _run_factory_070(
         self,
         issue_id: int,
         *,
         autonomous: bool,
+        attention_reservation: dict[str, Any] | None = None,
     ) -> WorklinkRunResult:
         with factory_checkout_interlock(self.home) as acquired:
             if not acquired:
+                _close_attention_excluded(
+                    self.home, issue_id, attention_reservation, "factory checkout interlock"
+                )
                 return WorklinkRunResult(
                     issue_id, None, "refused", reason="factory checkout interlock unavailable"
                 )
             # Keep checkout protection even after the worker dies, until failure
             # preservation, terminal handling and claim cleanup have finished.
-            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+            if attention_reservation is None:
+                return await self._run_factory_070_locked(
+                    issue_id, autonomous=autonomous
+                )
+            return await self._run_factory_070_locked(
+                issue_id, autonomous=autonomous,
+                attention_reservation=attention_reservation,
+            )
 
     async def _run_factory_070_locked(
         self,
         issue_id: int,
         *,
         autonomous: bool,
+        attention_reservation: dict[str, Any] | None = None,
     ) -> WorklinkRunResult:
         from .autonomy import factory_max_concurrent
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
+
+        def promote(result: WorklinkRunResult, source: str) -> WorklinkRunResult:
+            if not autonomous:
+                return result
+            record = _record_attention_result(
+                self.home, result, attention_reservation, source=source
+            )
+            return replace(
+                result,
+                attention_source=source,
+                attention_occurrence_id=record.occurrence_id,
+            )
+
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
         issue = issue_reader.read(issue_id)
         if "worklink:epic" not in issue.labels:
@@ -1787,20 +2031,28 @@ class WorklinkRunner:
                 issue_id=issue_id,
                 reason="not an epic issue",
             )
-            return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
-        validate_leaf(issue)
+            return promote(
+                WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue"),
+                "epic_label",
+            )
+        try:
+            validate_leaf(issue)
+        except Exception as exc:
+            promote(WorklinkRunResult(issue_id, None, "failed", reason=str(exc)), "epic_template")
+            raise
         config = WorklinkConfig.load(self.home / "worklink.yaml")
         registry = self.registry or BackendRegistry(config)
         selected = registry.get("feature_factory")
         if not isinstance(selected, FeatureFactoryBackend):
-            raise WorklinkError("feature_factory backend has an invalid implementation")
+            result = promote(WorklinkRunResult(issue_id, None, "failed", reason="feature_factory backend has an invalid implementation"), "epic_backend")
+            return result
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
         if repo_slug is None:
-            raise WorklinkError("factory repository must have a canonical GitHub origin")
+            return promote(WorklinkRunResult(issue_id, None, "failed", reason="factory repository must have a canonical GitHub origin"), "epic_repository")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         if compute.name != "local_subprocess":
-            raise WorklinkError("factory runs require local_subprocess supervision")
+            return promote(WorklinkRunResult(issue_id, None, "failed", reason="factory runs require local_subprocess supervision"), "epic_compute")
         if isinstance(compute, LocalSubprocessComputeBackend):
             runner = _factory_git_runner(runner)
         if autonomous:
@@ -1814,8 +2066,12 @@ class WorklinkRunner:
                     compute_backend=compute.name,
                     reason=reason,
                 )
-                return WorklinkRunResult(issue_id, None, "refused", reason=reason)
-        launcher = selected.admit()
+                return promote(WorklinkRunResult(issue_id, None, "refused", reason=reason), "epic_compute")
+        try:
+            launcher = selected.admit()
+        except Exception as exc:
+            promote(WorklinkRunResult(issue_id, None, "failed", reason=str(exc)), "epic_factory_admit")
+            raise
         inventory = RepositoryInventory.load(self.home / "repositories.yaml")
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
         base = (
@@ -1848,12 +2104,12 @@ class WorklinkRunner:
                 issue_id=issue_id,
                 reason=reason,
             )
-            return WorklinkRunResult(
+            return promote(WorklinkRunResult(
                 issue_id,
                 None,
                 "refused",
                 reason=reason,
-            )
+            ), "epic_base")
         test_cmd = (
             repository_config.test_command
             if repository_config is not None and repository_config.test_command is not None
@@ -1877,6 +2133,11 @@ class WorklinkRunner:
                 super().__init__(reason)
                 self.record = record
 
+        class FactoryBoundaryError(WorklinkError):
+            def __init__(self, source: str, error: BaseException) -> None:
+                super().__init__(str(error))
+                self.attention_source = source
+
         def prepare_factory_claim() -> None:
             nonlocal retained
             candidates = load_factory_records_for_issue(self.home, issue_id)
@@ -1897,15 +2158,35 @@ class WorklinkRunner:
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
             retained = candidate
 
-        try:
-            claim = claims.claim_issue(
+        def record_prepared(prepared: ClaimRecord) -> None:
+            if attention_reservation is None:
+                return
+            from .dispatch_failures import checkpoint_reservation, dispatch_failure_state_dir
+
+            checkpoint_reservation(
+                dispatch_failure_state_dir(self.home),
                 issue_id,
-                issue.comments,
-                labels=issue.labels,
-                max_active_locks=factory_max_concurrent(),
-                active_label=WORKLINK_EPIC_LABEL,
-                before_claim=prepare_factory_claim,
+                str(attention_reservation["reservation_id"]),
+                prepared_claim={
+                    "issue_id": prepared.issue_id,
+                    "attempt": prepared.attempt,
+                    "agent_id": prepared.agent_id,
+                    "claimed_at": prepared.claimed_at.isoformat(),
+                },
+                claim_binding_state="prepared",
+                operation_stage="claim_prepared",
             )
+
+        try:
+            claim_options = {
+                "labels": issue.labels,
+                "max_active_locks": factory_max_concurrent(),
+                "active_label": WORKLINK_EPIC_LABEL,
+                "before_claim": prepare_factory_claim,
+            }
+            if autonomous:
+                claim_options["on_record_prepared"] = record_prepared
+            claim = claims.claim_issue(issue_id, issue.comments, **claim_options)
         except FactoryRecoveryBlocked as exc:
             reason = f"retained factory sandbox {exc.record.sandbox}: {exc}"
             _log_event(
@@ -1915,56 +2196,88 @@ class WorklinkRunner:
                 sandbox=exc.record.sandbox,
                 reason=str(exc),
             )
-            current_issue = issue_reader.read(issue_id)
-            if "worklink:in-progress" not in current_issue.labels:
-                claims.transition_issue(
+            result = promote(
+                WorklinkRunResult(
                     issue_id,
-                    status="blocked",
-                    review_ready=False,
-                    attempt=exc.record.attempt,
+                    exc.record.attempt,
+                    "blocked",
+                    checkout=Path(exc.record.sandbox),
+                    branch=exc.record.branch,
                     reason=reason,
+                    accepted_factory_status=exc.record.status,
+                    factory_status=exc.record.status,
+                    next=exc.record.status.next if exc.record.status else None,
+                    next_present=exc.record.status.next_present if exc.record.status else False,
+                ),
+                "epic_retained_bind",
+            )
+            try:
+                current_issue = issue_reader.read(issue_id)
+            except Exception as reload_exc:
+                _append_attention_secondary(
+                    self.home, result, "epic_retained_issue_reload", "controller_failed",
+                    reload_exc,
                 )
+                return result
+            if "worklink:in-progress" not in current_issue.labels:
+                try:
+                    claims.transition_issue(
+                        issue_id,
+                        status="blocked",
+                        review_ready=False,
+                        attempt=exc.record.attempt,
+                        reason=reason,
+                    )
+                except Exception as transition_exc:
+                    _append_attention_secondary(
+                        self.home, result, "epic_retained_transition", "reconcile_failed",
+                        transition_exc,
+                    )
             else:
                 reason += "; current in-progress owner was left unchanged"
-            return WorklinkRunResult(
-                issue_id,
-                exc.record.attempt,
-                "blocked",
-                checkout=Path(exc.record.sandbox),
-                branch=exc.record.branch,
-                reason=reason,
-            )
+            return result
         if claim.attempts_exhausted:
+            result = promote(
+                WorklinkRunResult(
+                    issue_id,
+                    None,
+                    "blocked",
+                    reason="attempts_exhausted",
+                ),
+                "epic_exhaustion",
+            )
+            claims.transition_issue(
+                issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=None,
+                reason=result.reason,
+            )
             _log_event(
                 "worklink_attempts_exhausted",
                 issue_id=issue_id,
                 reason="attempts_exhausted",
             )
-            return WorklinkRunResult(
-                issue_id,
-                None,
-                "blocked",
-                reason="attempts_exhausted",
-                attention_source="epic_exhaustion",
-            )
+            return result
         if not claim.claimed or claim.record is None:
             reason = claim.reason or "claim_failed"
+            status = _claim_refusal_status(reason, claim.reason_code)
+            result = WorklinkRunResult(issue_id, None, status, reason=reason)
+            if status != "refused":
+                result = promote(result, "epic_claim")
+                claims.transition_issue(
+                    issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=None,
+                    reason=result.reason,
+                )
             _log_event(
                 "worklink_claim_failed",
                 issue_id=issue_id,
                 reason=reason,
             )
-            return WorklinkRunResult(
-                issue_id,
-                None,
-                _claim_refusal_status(reason, claim.reason_code),
-                reason=reason,
-                attention_source=(
-                    None
-                    if _claim_refusal_status(reason, claim.reason_code) == "refused"
-                    else "epic_claim"
-                ),
-            )
+            return result
         claim_record = claim.record
         _log_event(
             "worklink_claimed",
@@ -1973,21 +2286,27 @@ class WorklinkRunner:
             backend=selected.name,
         )
         lease: CheckoutLease | None = None
+        release_allowed = True
         try:
             if retained is not None:
-                result = await self._recover_factory_070(
-                    issue=issue,
-                    claim_record=claim_record,
-                    claims=claims,
-                    backend=selected,
-                    compute=compute,
-                    retained=retained,
-                    launcher=launcher,
-                    repo_slug=repo_slug,
-                    base=base,
-                    test_cmd=test_cmd,
-                    runner=runner,
-                )
+                try:
+                    result = await self._recover_factory_070(
+                        issue=issue,
+                        claim_record=claim_record,
+                        claims=claims,
+                        backend=selected,
+                        compute=compute,
+                        retained=retained,
+                        launcher=launcher,
+                        repo_slug=repo_slug,
+                        base=base,
+                        test_cmd=test_cmd,
+                        runner=runner,
+                        attention_reservation=attention_reservation,
+                        autonomous=autonomous,
+                    )
+                except Exception as exc:
+                    raise FactoryBoundaryError("epic_recovery", exc) from exc
             else:
                 lease = _create_backend_checkout(
                     self.repo,
@@ -2080,7 +2399,10 @@ class WorklinkRunner:
                     lease.path / ".factory-sandboxes",
                     worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
                 )
-                handle = await compute.launch(spec)
+                try:
+                    handle = await compute.launch(spec)
+                except Exception as exc:
+                    raise FactoryBoundaryError("epic_launch", exc) from exc
                 factory_record = replace(factory_record, handle=handle)
                 try:
                     save_factory_record(self.home, factory_record)
@@ -2089,24 +2411,60 @@ class WorklinkRunner:
                 except BaseException:
                     await _cancel_and_cleanup_factory_handle(compute, handle)
                     raise
-                result = await self._supervise_factory_070(
-                    issue=issue,
-                    claim_record=claim_record,
-                    claims=claims,
-                    backend=selected,
-                    compute=compute,
-                    factory_record=factory_record,
-                    test_cmd=test_cmd,
-                    runner=runner,
-                    started_at=datetime.now(UTC),
-                )
+                try:
+                    result = await self._supervise_factory_070(
+                        issue=issue,
+                        claim_record=claim_record,
+                        claims=claims,
+                        backend=selected,
+                        compute=compute,
+                        factory_record=factory_record,
+                        test_cmd=test_cmd,
+                        runner=runner,
+                        started_at=datetime.now(UTC),
+                        attention_reservation=attention_reservation,
+                        autonomous=autonomous,
+                    )
+                except Exception as exc:
+                    raise FactoryBoundaryError("epic_supervision", exc) from exc
+            release_allowed = True
         except Exception as exc:
+            from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+            release_allowed = False
             original_reason = str(exc)
+            reload_error = None
             try:
                 records = load_factory_records_for_issue(self.home, issue_id)
                 current = records[0] if records else None
-            except Exception:
+            except Exception as record_exc:
+                reload_error = record_exc
                 current = None
+            source = getattr(exc, "attention_source", "epic_controller")
+            result = promote(
+                WorklinkRunResult(
+                    issue_id,
+                    claim_record.attempt,
+                    "failed",
+                    checkout=Path(current.sandbox) if current is not None else None,
+                    branch=current.branch if current is not None else None,
+                    reason=original_reason,
+                    claim_record=claim_record,
+                    claim_manager=claims,
+                    factory_status=current.status if current is not None else None,
+                    accepted_factory_status=current.status if current is not None else None,
+                    next=current.status.next if current is not None and current.status else None,
+                    next_present=current.status.next_present if current is not None and current.status else False,
+                    controller_phase=current.controller_phase if current is not None else None,
+                    controller_error=current.controller_error if current is not None else None,
+                ),
+                source,
+            )
+            if reload_error is not None:
+                _append_attention_secondary(
+                    self.home, result, "epic_controller_reload", "controller_failed",
+                    reload_error,
+                )
             preserved_ref, preservation_error = _preserve_failed_factory_run(
                 home=self.home,
                 trusted_repo=self.repo,
@@ -2117,22 +2475,48 @@ class WorklinkRunner:
                 reason += f"; completed work preserved at {preserved_ref}"
             elif preservation_error is not None:
                 reason += f"; completed work preservation failed: {preservation_error}"
+                if result.attention_occurrence_id:
+                    append_secondary_fault(
+                        dispatch_failure_state_dir(self.home),
+                        issue_id,
+                        result.attention_occurrence_id,
+                        source="epic_preservation",
+                        cause="controller_failed",
+                        reason=preservation_error,
+                    )
             if current is not None:
-                save_factory_record(
-                    self.home,
-                    replace(
-                        current,
-                        controller_phase="failed",
-                        controller_error=_factory_controller_error(reason),
-                    ),
+                try:
+                    save_factory_record(
+                        self.home,
+                        replace(
+                            current,
+                            controller_phase="failed",
+                            controller_error=_factory_controller_error(reason),
+                        ),
+                    )
+                except Exception as save_exc:
+                    if result.attention_occurrence_id:
+                        append_secondary_fault(
+                            dispatch_failure_state_dir(self.home), issue_id,
+                            result.attention_occurrence_id, source="epic_error_save",
+                            cause="controller_failed", reason=str(save_exc),
+                        )
+            try:
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=reason,
                 )
-            claims.transition_issue(
-                issue_id,
-                status="failed",
-                review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=reason,
-            )
+                release_allowed = True
+            except Exception as transition_exc:
+                if result.attention_occurrence_id:
+                    append_secondary_fault(
+                        dispatch_failure_state_dir(self.home), issue_id,
+                        result.attention_occurrence_id, source="epic_error_transition",
+                        cause="reconcile_failed", reason=str(transition_exc),
+                    )
             _log_event(
                 "worklink_transition",
                 issue_id=issue_id,
@@ -2150,26 +2534,25 @@ class WorklinkRunner:
                     else {}
                 ),
             )
-            result = WorklinkRunResult(
-                issue_id,
-                claim_record.attempt,
-                "failed",
-                checkout=Path(current.sandbox) if current is not None else None,
-                branch=current.branch if current is not None else None,
+            result = replace(
+                result,
                 reason=reason,
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
-                attention_source="epic_controller",
             )
         finally:
-            released = _release_issue_and_clear_run_state(
-                claims,
-                home=self.home,
-                issue_id=issue_id,
-                attempt=claim_record.attempt,
-                trigger_ready_scan=autonomous,
-            )
+            released = release_allowed and _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=claim_record.attempt,
+                    trigger_ready_scan=autonomous,
+                )
         if not released:
+            _append_attention_secondary(
+                self.home, result, "epic_release", "reconcile_failed",
+                "claim release was not confirmed",
+            )
             reason = "terminal recovery incomplete: Chainlink lock release failed"
             if result.reason:
                 reason = f"{result.reason}; {reason}"
@@ -2194,6 +2577,8 @@ class WorklinkRunner:
         base: str,
         test_cmd: str,
         runner: Runner,
+        attention_reservation: dict[str, Any] | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         sandbox = _verify_factory_recovery_binding(
             runner=self,
@@ -2237,6 +2622,8 @@ class WorklinkRunner:
                 test_cmd=test_cmd,
                 runner=runner,
                 started_at=datetime.now(UTC),
+                attention_reservation=attention_reservation,
+                autonomous=autonomous,
             )
         if pre.status not in {"running", "needs-human"}:
             raise WorklinkError("factory recovery status is not resumable")
@@ -2360,6 +2747,8 @@ class WorklinkRunner:
             runner=runner,
             started_at=datetime.now(UTC),
             initial_status=resumed,
+            attention_reservation=attention_reservation,
+            autonomous=autonomous,
         )
 
     async def _supervise_factory_070(
@@ -2375,6 +2764,8 @@ class WorklinkRunner:
         runner: Runner,
         started_at: datetime,
         initial_status: FactoryStatus | None = None,
+        attention_reservation: dict[str, Any] | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         handle = factory_record.handle
         if handle is None:
@@ -2409,31 +2800,37 @@ class WorklinkRunner:
                 self.home / "state" / "worklink" / "transcripts",
                 issue.issue_id,
             )
-            write_transcript(
-                path,
-                command=() if result is None else result.command,
-                exit_code=None if result is None else result.exit_code,
-                status=outcome,
-                stdout="" if result is None else result.stdout,
-                stderr=(
-                    "OpenCode supervision result was not drainable"
-                    if result is None
-                    else result.stderr
-                ),
-                timed_out=False if result is None else result.timed_out,
-                output_overflow=False if result is None else result.output_overflow,
-                stdout_path=None if result is None else result.stdout_path,
-                stderr_path=None if result is None else result.stderr_path,
-            )
-            factory_record = replace(factory_record, transcript=str(path))
-            save_factory_record(self.home, factory_record)
+            try:
+                write_transcript(
+                    path,
+                    command=() if result is None else result.command,
+                    exit_code=None if result is None else result.exit_code,
+                    status=outcome,
+                    stdout="" if result is None else result.stdout,
+                    stderr=(
+                        "OpenCode supervision result was not drainable"
+                        if result is None
+                        else result.stderr
+                    ),
+                    timed_out=False if result is None else result.timed_out,
+                    output_overflow=False if result is None else result.output_overflow,
+                    stdout_path=None if result is None else result.stdout_path,
+                    stderr_path=None if result is None else result.stderr_path,
+                )
+                factory_record = replace(factory_record, transcript=str(path))
+                save_factory_record(self.home, factory_record)
+            except Exception as exc:
+                raise _AttentionBoundaryError("epic_transcript_save", exc) from exc
 
         async def cancel_once() -> None:
             nonlocal cancel_attempted
             if cancel_attempted:
                 return
             cancel_attempted = True
-            await compute.cancel(handle)
+            try:
+                await compute.cancel(handle)
+            except Exception as exc:
+                raise _AttentionBoundaryError("epic_cancel", exc) from exc
 
         try:
             while True:
@@ -2519,6 +2916,8 @@ class WorklinkRunner:
                             test_cmd=test_cmd,
                             runner=runner,
                             started_at=started_at,
+                            attention_reservation=attention_reservation,
+                            autonomous=autonomous,
                         )
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
@@ -2537,14 +2936,54 @@ class WorklinkRunner:
                             controller_phase="parked",
                             controller_error=_factory_controller_error(reason),
                         )
-                        save_factory_record(self.home, factory_record)
-                        claims.transition_issue(
+                        result = WorklinkRunResult(
                             issue.issue_id,
-                            status="blocked",
-                            review_ready=False,
-                            attempt=claim_record.budget_attempt or claim_record.attempt,
-                            reason=f"{reason}; retained sandbox: {factory_record.sandbox}",
+                            factory_record.attempt,
+                            "needs-human",
+                            checkout=Path(factory_record.sandbox),
+                            branch=factory_record.branch,
+                            reason=reason,
+                            claim_record=claim_record,
+                            claim_manager=claims,
+                            factory_status=factory_record.status,
+                            accepted_factory_status=factory_record.status,
+                            controller_phase=factory_record.controller_phase,
+                            controller_error=factory_record.controller_error,
                         )
+                        if autonomous:
+                            attention = _record_attention_result(
+                                self.home, result, attention_reservation,
+                                source="epic_driver_lock",
+                            )
+                            result = replace(
+                                result,
+                                attention_source="epic_driver_lock",
+                                attention_occurrence_id=attention.occurrence_id,
+                            )
+                        try:
+                            save_factory_record(self.home, factory_record)
+                        except Exception as save_exc:
+                            if result.attention_occurrence_id:
+                                from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+                                append_secondary_fault(
+                                    dispatch_failure_state_dir(self.home), issue.issue_id,
+                                    result.attention_occurrence_id, source="epic_driver_lock_save",
+                                    cause="controller_failed", reason=str(save_exc),
+                                )
+                        try:
+                            claims.transition_issue(
+                                issue.issue_id,
+                                status="blocked",
+                                review_ready=False,
+                                attempt=claim_record.budget_attempt or claim_record.attempt,
+                                reason=f"{reason}; retained sandbox: {factory_record.sandbox}",
+                            )
+                        except Exception as transition_exc:
+                            _append_attention_secondary(
+                                self.home, result, "epic_driver_lock_transition",
+                                "reconcile_failed", transition_exc,
+                            )
                         _log_event(
                             "worklink_factory_lock_refused",
                             issue_id=issue.issue_id,
@@ -2553,14 +2992,7 @@ class WorklinkRunner:
                             reason=detail[:300] or reason,
                         )
                         failed = False
-                        return WorklinkRunResult(
-                            issue.issue_id,
-                            factory_record.attempt,
-                            "needs-human",
-                            checkout=Path(factory_record.sandbox),
-                            branch=factory_record.branch,
-                            reason=reason,
-                        )
+                        return result
                     suffix = f": {detail[:300]}" if detail else ""
                     raise WorklinkError(
                         f"OpenCode process exited while factory status was running{suffix}"
@@ -2580,6 +3012,10 @@ class WorklinkRunner:
                         await cancel_once()
                     finally:
                         wait_result = await _finish_factory_wait_task(wait_task)
+                        if wait_result is None:
+                            raise _AttentionBoundaryError(
+                                "epic_wait_drain", WorklinkError("factory wait did not drain")
+                            )
                         retain_result(wait_result, "refused")
                 elif wait_task.done():
                     drained = await asyncio.gather(wait_task, return_exceptions=True)
@@ -2587,7 +3023,10 @@ class WorklinkRunner:
                         wait_result = drained[0]
                     retain_result(wait_result, "refused" if failed else "completed")
             finally:
-                await compute.cleanup(handle)
+                try:
+                    await compute.cleanup(handle)
+                except Exception as exc:
+                    raise _AttentionBoundaryError("epic_compute_cleanup", exc) from exc
 
     async def _finish_factory_070(
         self,
@@ -2601,24 +3040,36 @@ class WorklinkRunner:
         test_cmd: str,
         runner: Runner,
         started_at: datetime,
+        attention_reservation: dict[str, Any] | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         status = factory_record.status
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
+
+        def promote(result: WorklinkRunResult, source: str, *, success: bool = False) -> WorklinkRunResult:
+            if not autonomous:
+                return result
+            record = _record_attention_result(
+                self.home,
+                result,
+                attention_reservation,
+                source=source,
+                lifecycle_success=success,
+            )
+            return replace(
+                result,
+                attention_source=source,
+                attention_occurrence_id=record.occurrence_id,
+            )
+
         if status.is_parked:
             park_report = (
                 f"factory run is parked; control-plane snapshot: {status.park_snapshot}"
                 if status.park_snapshot is not None
                 else "factory run is parked; no control-plane snapshot published"
             )
-            claims.transition_issue(
-                issue.issue_id,
-                status="blocked",
-                review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=park_report,
-            )
-            result = WorklinkRunResult(
+            result = promote(WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
                 "needs-human",
@@ -2626,8 +3077,28 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=park_report,
                 next=status.next,
+                next_present=status.next_present,
                 attention_source="factory_needs_human",
-            )
+                claim_record=claim_record,
+                claim_manager=claims,
+                factory_status=status,
+                accepted_factory_status=status,
+                controller_phase=factory_record.controller_phase,
+                controller_error=factory_record.controller_error,
+            ), "factory_needs_human")
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=park_report,
+                )
+            except Exception as transition_exc:
+                _append_attention_secondary(
+                    self.home, result, "factory_terminal_transition", "reconcile_failed",
+                    transition_exc,
+                )
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
@@ -2640,14 +3111,8 @@ class WorklinkRunner:
             )
             return result
         if status.status in {"blocked", "partial"}:
-            claims.transition_issue(
-                issue.issue_id,
-                status="blocked",
-                review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=f"factory status: {status.status}",
-            )
-            result = WorklinkRunResult(
+            source = "factory_partial" if status.status == "partial" else "factory_blocked"
+            result = promote(WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
                 status.status,
@@ -2656,10 +3121,28 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
                 next=status.next,
-                attention_source=(
-                    "factory_partial" if status.status == "partial" else "factory_blocked"
-                ),
-            )
+                next_present=status.next_present,
+                attention_source=source,
+                claim_record=claim_record,
+                claim_manager=claims,
+                factory_status=status,
+                accepted_factory_status=status,
+                controller_phase=factory_record.controller_phase,
+                controller_error=factory_record.controller_error,
+            ), source)
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=f"factory status: {status.status}",
+                )
+            except Exception as transition_exc:
+                _append_attention_secondary(
+                    self.home, result, "factory_terminal_transition", "reconcile_failed",
+                    transition_exc,
+                )
             _log_event(
                 "worklink_transition",
                 issue_id=issue.issue_id,
@@ -2670,24 +3153,55 @@ class WorklinkRunner:
                 reason=result.reason,
             )
             return result
-        evidence_path, pr_url = await _verify_factory_completion(
-            home=self.home,
-            issue=issue,
-            record=factory_record,
-            test_command=test_cmd,
-            gate_rerun_max_failures=WorklinkConfig.load(
-                self.home / "worklink.yaml"
-            ).defaults.gate_rerun_max_failures,
-            started_at=started_at,
-            runner=runner,
-        )
-        claims.transition_issue(
-            issue.issue_id,
-            status="review",
-            review_ready=True,
-            attempt=claim_record.budget_attempt or claim_record.attempt,
-        )
-        result = WorklinkRunResult(
+        try:
+            evidence_path, pr_url = await _verify_factory_completion(
+                home=self.home,
+                issue=issue,
+                record=factory_record,
+                test_command=test_cmd,
+                gate_rerun_max_failures=WorklinkConfig.load(
+                    self.home / "worklink.yaml"
+                ).defaults.gate_rerun_max_failures,
+                started_at=started_at,
+                runner=runner,
+            )
+        except Exception as exc:
+            if not autonomous:
+                raise
+            result = promote(
+                WorklinkRunResult(
+                    issue.issue_id,
+                    factory_record.attempt,
+                    "failed",
+                    checkout=Path(factory_record.sandbox),
+                    branch=factory_record.branch,
+                    reason=str(exc),
+                    next=status.next,
+                    next_present=status.next_present,
+                    claim_record=claim_record,
+                    claim_manager=claims,
+                    factory_status=status,
+                    accepted_factory_status=status,
+                    controller_phase=factory_record.controller_phase,
+                    controller_error=factory_record.controller_error,
+                ),
+                "factory_completion_verify",
+            )
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=result.reason,
+                )
+            except Exception as transition_exc:
+                _append_attention_secondary(
+                    self.home, result, "factory_terminal_transition", "reconcile_failed",
+                    transition_exc,
+                )
+            return result
+        result = promote(WorklinkRunResult(
             issue.issue_id,
             factory_record.attempt,
             "review_ready",
@@ -2697,7 +3211,26 @@ class WorklinkRunner:
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
             next=status.next,
-        )
+            next_present=status.next_present,
+            claim_record=claim_record,
+            claim_manager=claims,
+            factory_status=status,
+            accepted_factory_status=status,
+            controller_phase=factory_record.controller_phase,
+            controller_error=factory_record.controller_error,
+        ), "factory_success", success=True)
+        try:
+            claims.transition_issue(
+                issue.issue_id,
+                status="review",
+                review_ready=True,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+            )
+        except Exception as transition_exc:
+            _append_attention_secondary(
+                self.home, result, "factory_terminal_transition", "reconcile_failed",
+                transition_exc,
+            )
         _log_event(
             "worklink_transition",
             issue_id=issue.issue_id,
@@ -3559,7 +4092,7 @@ def _record_attention_result(
     *,
     source: str,
     lifecycle_success: bool = False,
-) -> None:
+):
     from .attention import (
         AccountingBasis,
         AttentionCause,
@@ -3568,6 +4101,7 @@ def _record_attention_result(
         AttentionOutcome,
         AttentionRecord,
         AttentionSource,
+        ClaimBindingState,
         ClaimRelation,
         Settlement,
         ValidationDetail,
@@ -3577,6 +4111,7 @@ def _record_attention_result(
         checkpoint_reservation,
         dispatch_failure_state_dir,
         error_signature,
+        load_failure_state,
         mark_attention_settlement,
         promote_reservation,
         reserve_execution,
@@ -3591,7 +4126,23 @@ def _record_attention_result(
             source=source,
             operation_stage="terminal",
         )
-    claim = _attention_claim(home, result.issue_id, result.attempt)
+    current_issue = load_failure_state(state_dir)["issues"].get(str(result.issue_id), {})
+    current_reservation = current_issue.get("reservations", {}).get(
+        str(reservation["reservation_id"])
+    ) if isinstance(current_issue, Mapping) else None
+    if isinstance(current_reservation, Mapping) and current_reservation.get("closure") == "promoted":
+        existing = current_issue.get("occurrences", {}).get(
+            current_reservation.get("promoted_occurrence_id")
+        )
+        if isinstance(existing, Mapping):
+            return AttentionRecord.from_json(
+                existing, legacy=existing.get("source") == "legacy_v1"
+            )
+    claim = result.claim_record
+    if claim is None:
+        claim_payload = reservation.get("confirmed_claim") or reservation.get("prepared_claim")
+        if isinstance(claim_payload, Mapping):
+            claim = ClaimRecord.from_payload(dict(claim_payload))
     if claim is not None:
         checkpoint_reservation(
             state_dir,
@@ -3606,13 +4157,7 @@ def _record_attention_result(
             claim_binding_state="confirmed",
             operation_stage="terminal",
         )
-    factory_status = None
-    try:
-        records = load_factory_records_for_issue(home, result.issue_id)
-        exact = [record for record in records if result.attempt is None or record.attempt == result.attempt]
-        factory_status = exact[0].status if len(exact) == 1 else None
-    except Exception:
-        factory_status = None
+    factory_status = result.factory_status
     primary = {
         "partial": AttentionOutcome.PARTIAL,
         "needs-human": AttentionOutcome.NEEDS_HUMAN,
@@ -3628,38 +4173,46 @@ def _record_attention_result(
         primary_outcome=primary,
         original_result_status=result.status,
         factory_status=factory_status,
+        accepted_factory_status=result.accepted_factory_status,
         verified_completion=lifecycle_success,
-        normalized_leaf_result=result.attempt is not None and source in {
-            "leaf_work_failed",
-            "leaf_backend_blocked",
-            "leaf_gate_timeout",
-            "leaf_gate_missing",
-            "leaf_output_overflow",
+        normalized_leaf_result=result.normalized_leaf_result,
+        launch_error=result.launch_error,
+        unpublished_commits=result.unpublished_commits,
+        preclaim=source in {
+            "detached_spawn", "leaf_template", "template_unready", "template_block_label",
+            "template_comment", "leaf_compute", "leaf_claim", "leaf_checkout",
+            "epic_label", "epic_template", "epic_backend", "epic_repository",
+            "epic_compute", "epic_factory_admit", "epic_base", "epic_retained_bind",
+            "epic_claim", "startup_leaf_spawn", "startup_factory_spawn",
         },
-        preclaim=result.attempt is None,
         exhaustion=result.reason == "attempts_exhausted",
         claim_relation=ClaimRelation.CURRENT_CLAIM if claim is not None else ClaimRelation.NONE,
     )
     accounting = classify_attention(facts)
-    cause = None if lifecycle_success else {
-        "leaf_template": AttentionCause.TEMPLATE_BLOCKED,
-        "leaf_checkout": AttentionCause.CHECKOUT_UNSAFE,
-        "leaf_backend_blocked": AttentionCause.BACKEND_BLOCKED,
-        "leaf_exhaustion": AttentionCause.ATTEMPTS_EXHAUSTED,
-        "epic_exhaustion": AttentionCause.ATTEMPTS_EXHAUSTED,
-        "factory_partial": AttentionCause.FACTORY_PARTIAL,
-        "factory_needs_human": AttentionCause.FACTORY_NEEDS_HUMAN,
-        "factory_blocked": AttentionCause.FACTORY_BLOCKED,
-        "leaf_work_failed": AttentionCause.WORK_FAILED,
-        "leaf_gate_timeout": AttentionCause.VALIDATION_BLOCKED,
-        "leaf_gate_missing": AttentionCause.VALIDATION_BLOCKED,
-        "leaf_output_overflow": AttentionCause.VALIDATION_BLOCKED,
-        "leaf_launch": AttentionCause.LAUNCH_FAILED,
-        "startup_leaf_spawn": AttentionCause.LAUNCH_FAILED,
-        "startup_factory_spawn": AttentionCause.LAUNCH_FAILED,
-        "leaf_claim": AttentionCause.CLAIM_FAILED,
-        "epic_claim": AttentionCause.CLAIM_FAILED,
-    }.get(source, AttentionCause.CONTROLLER_FAILED)
+    cause = None if lifecycle_success else next(
+        (
+            cause
+            for cause, sources in {
+                AttentionCause.LAUNCH_FAILED: {"detached_spawn", "leaf_launch", "epic_launch", "startup_leaf_spawn", "startup_factory_spawn"},
+                AttentionCause.TEMPLATE_BLOCKED: {"leaf_template", "epic_template"},
+                AttentionCause.ADMISSION_BLOCKED: {"leaf_compute", "epic_label", "epic_backend", "epic_repository", "epic_compute", "epic_factory_admit", "epic_base"},
+                AttentionCause.CLAIM_FAILED: {"leaf_claim", "epic_claim"},
+                AttentionCause.ATTEMPTS_EXHAUSTED: {"leaf_exhaustion", "epic_exhaustion"},
+                AttentionCause.CHECKOUT_UNSAFE: {"leaf_checkout"},
+                AttentionCause.BACKEND_BLOCKED: {"leaf_backend_blocked"},
+                AttentionCause.VALIDATION_BLOCKED: {"leaf_gate_timeout", "leaf_gate_missing", "leaf_output_overflow"},
+                AttentionCause.WORK_FAILED: {"leaf_work_failed", "leaf_publication_fence", "leaf_publication_push", "leaf_publication_pr"},
+                AttentionCause.RECOVERY_BLOCKED: {"epic_retained_bind", "epic_recovery", "epic_driver_lock"},
+                AttentionCause.FACTORY_NEEDS_HUMAN: {"factory_needs_human"},
+                AttentionCause.FACTORY_BLOCKED: {"factory_blocked"},
+                AttentionCause.FACTORY_PARTIAL: {"factory_partial"},
+                AttentionCause.DETACHED_BLOCKED: {"orphan_unpublished", "orphan_ambiguous", "orphan_epic", "orphan_labels_unknown"},
+                AttentionCause.RECONCILE_FAILED: {"template_unready", "template_block_label", "template_comment", "leaf_transition", "leaf_release", "leaf_error_transition", "leaf_publication_evidence", "leaf_completed_evidence_write", "leaf_evidence_comment", "leaf_completed_state_clear", "epic_retained_transition", "epic_driver_lock_transition", "factory_terminal_transition", "epic_error_transition", "epic_release", "orphan_lock_release", "orphan_comment", "orphan_target_label", "orphan_inprogress_unlabel", "orphan_state_update"},
+            }.items()
+            if source in sources
+        ),
+        AttentionCause.CONTROLLER_FAILED,
+    )
     reason = terminal_error(result.reason or result.status)
     signature = error_signature(reason)
     role = "success" if lifecycle_success else "terminal"
@@ -3681,6 +4234,8 @@ def _record_attention_result(
         attempt_consumed=accounting.attempt_consumed,
         settlement=accounting.settlement,
         claim=claim,
+        claim_relation=ClaimRelation.CURRENT_CLAIM if claim is not None else ClaimRelation.NONE,
+        claim_binding_state=ClaimBindingState.CONFIRMED if claim is not None else ClaimBindingState.NONE,
         error_signature=signature,
         attempt=result.attempt,
         reason=reason,
@@ -3698,8 +4253,13 @@ def _record_attention_result(
             "log": os.environ.get("WORKLINK_RUN_LOG"),
         },
         factory_projection=factory_status.to_json() if factory_status is not None else None,
+        controller_phase=result.controller_phase,
+        controller_error=result.controller_error,
+        pr_url=result.pr_url,
+        pr_state=result.pr_state,
+        pr_head=result.pr_head,
         next=result.next,
-        next_present=result.next is not None,
+        next_present=result.next_present,
         inhibited=not lifecycle_success,
         validation_detail={
             "leaf_gate_timeout": ValidationDetail.GATE_TIMED_OUT,
@@ -3714,7 +4274,7 @@ def _record_attention_result(
         record,
     )
     if accounting.settlement is Settlement.PENDING and claim is not None:
-        claims = ChainlinkClaims(
+        claims = result.claim_manager or ChainlinkClaims(
             agent_id=claim.agent_id,
             runner=_list_runner(_runner_for_home(home, "chainlink")),
             home_path=home,
@@ -3724,22 +4284,28 @@ def _record_attention_result(
             mark_attention_settlement(
                 state_dir, result.issue_id, occurrence_id, Settlement.APPLIED.value
             )
-    if not lifecycle_success:
-        try:
-            ChainlinkClaims(
-                agent_id=claim.agent_id if claim else "mimir-worklink",
-                runner=_list_runner(_runner_for_home(home, "chainlink")),
-                home_path=home,
-                max_attempts=WorklinkConfig.load(home / "worklink.yaml").defaults.max_claim_attempts,
-            ).transition_issue(
-                result.issue_id,
-                status="blocked",
-                review_ready=False,
-                attempt=result.attempt,
-                reason=reason,
-            )
-        except Exception:
-            pass
+    return record
+
+
+def _append_attention_secondary(
+    home: Path,
+    result: WorklinkRunResult,
+    source: str,
+    cause: str,
+    error: BaseException | str,
+) -> None:
+    if result.attention_occurrence_id is None:
+        return
+    from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+    append_secondary_fault(
+        dispatch_failure_state_dir(home),
+        result.issue_id,
+        result.attention_occurrence_id,
+        source=source,
+        cause=cause,
+        reason=str(error),
+    )
 
 
 def _record_factory_started(
@@ -3841,16 +4407,17 @@ def run_worklink(
         home, issue_id, "leaf_run_boundary", autonomous=autonomous
     )
     try:
-        result = asyncio.run(
-            WorklinkRunner(home=home, repo=repo).run(
-                issue_id,
-                backend_name=backend,
-                dry_run=dry_run,
-                test_command=test_command,
-                base_branch=base_branch,
-                autonomous=autonomous,
-            )
-        )
+        runner = WorklinkRunner(home=home, repo=repo)
+        options = {
+            "backend_name": backend,
+            "dry_run": dry_run,
+            "test_command": test_command,
+            "base_branch": base_branch,
+            "autonomous": autonomous,
+        }
+        if "attention_reservation" in inspect.signature(runner.run).parameters:
+            options["attention_reservation"] = reservation
+        result = asyncio.run(runner.run(issue_id, **options))
     except Exception as exc:
         _record_run_failure(
             home=home,
@@ -3877,7 +4444,7 @@ def run_worklink(
             source=result.attention_source
             or ("leaf_work_failed" if result.attempt is not None else "leaf_run_boundary"),
         )
-    elif autonomous and result.status in {"blocked"}:
+    elif autonomous and result.status in {"blocked"} and result.attention_occurrence_id is None:
         _record_attention_result(
             home,
             result,
@@ -3888,7 +4455,7 @@ def run_worklink(
         if autonomous:
             _record_run_success(home, issue_id)
             _close_attention_excluded(home, issue_id, reservation, "leaf_completed")
-    elif autonomous:
+    elif autonomous and result.attention_occurrence_id is None:
         _close_attention_excluded(home, issue_id, reservation, result.status)
     # Parked and refused outcomes do not resolve or replace prior failure attention.
     # Leaving it active preserves backoff without inflating its consecutive count.
@@ -3922,45 +4489,42 @@ def _record_run_failure(
         preservation_error=preservation_error,
     )
     if autonomous:
-        try:
-            from .dispatch_failures import (
-                is_transient_contention,
-                record_transient_contention,
-            )
+        from .dispatch_failures import (
+            is_transient_contention,
+            record_transient_contention,
+        )
 
-            if (
-                attempt is None
-                and reservation is not None
-                and is_transient_contention(str(error))
-                and not record_transient_contention(
-                    dispatch_failure_state_dir(home),
-                    issue_id,
-                    str(reservation["reservation_id"]),
-                    str(error),
-                )
-            ):
-                return
-            result = WorklinkRunResult(
-                issue_id=issue_id,
-                attempt=attempt,
-                status="failed",
-                reason=safe_error,
-                preserved_ref=preserved_ref,
-                preservation_error=preservation_error,
-            )
-            _record_attention_result(home, result, reservation, source=source)
-            record_failure(
+        if (
+            attempt is None
+            and reservation is not None
+            and is_transient_contention(str(error))
+            and not record_transient_contention(
                 dispatch_failure_state_dir(home),
-                issue_id=issue_id,
-                attempt=attempt,
-                exit_status=exit_status,
-                error=error,
-                log_path=os.environ.get("WORKLINK_RUN_LOG"),
-                preserved_ref=preserved_ref,
-                preservation_error=preservation_error,
+                issue_id,
+                str(reservation["reservation_id"]),
+                str(error),
             )
-        except (OSError, ValueError, RuntimeError):
-            pass
+        ):
+            return
+        result = WorklinkRunResult(
+            issue_id=issue_id,
+            attempt=attempt,
+            status="failed",
+            reason=safe_error,
+            preserved_ref=preserved_ref,
+            preservation_error=preservation_error,
+        )
+        _record_attention_result(home, result, reservation, source=source)
+        record_failure(
+            dispatch_failure_state_dir(home),
+            issue_id=issue_id,
+            attempt=attempt,
+            exit_status=exit_status,
+            error=error,
+            log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            preserved_ref=preserved_ref,
+            preservation_error=preservation_error,
+        )
 
 
 def _record_run_success(home: Path, issue_id: int) -> None:
@@ -3997,12 +4561,11 @@ def run_worklink_epic(
         home, issue_id, "epic_run_boundary", autonomous=autonomous
     )
     try:
-        result = asyncio.run(
-            WorklinkRunner(home=home, repo=repo).run_epic(
-                issue_id,
-                autonomous=autonomous,
-            )
-        )
+        runner = WorklinkRunner(home=home, repo=repo)
+        options = {"autonomous": autonomous}
+        if "attention_reservation" in inspect.signature(runner.run_epic).parameters:
+            options["attention_reservation"] = reservation
+        result = asyncio.run(runner.run_epic(issue_id, **options))
     except Exception as exc:
         _record_run_failure(
             home=home,
@@ -4028,7 +4591,7 @@ def run_worklink_epic(
             reservation=reservation,
             source=result.attention_source or "epic_controller",
         )
-    elif autonomous and result.status in {"blocked", "partial", "needs-human"}:
+    elif autonomous and result.status in {"blocked", "partial", "needs-human"} and result.attention_occurrence_id is None:
         _record_attention_result(
             home,
             result,
@@ -4042,10 +4605,11 @@ def run_worklink_epic(
     elif result.status in {"completed", "review_ready"}:
         if autonomous:
             _record_run_success(home, issue_id)
-            _record_attention_result(
-                home, result, reservation, source="factory_success", lifecycle_success=True
-            )
-    elif autonomous:
+            if result.attention_occurrence_id is None:
+                _record_attention_result(
+                    home, result, reservation, source="factory_success", lifecycle_success=True
+                )
+    elif autonomous and result.attention_occurrence_id is None:
         _close_attention_excluded(home, issue_id, reservation, result.status)
     return result
 

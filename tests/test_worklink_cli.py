@@ -21,6 +21,11 @@ from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+from mimir.worklink.dispatch_failures import (
+    dispatch_failure_state_dir,
+    load_failure_state,
+    reserve_execution,
+)
 from mimir.worklink.run_state import (
     OrphanBlockRecord,
     WorklinkRunState,
@@ -1098,7 +1103,10 @@ def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event
         now=now,
     )
 
-    assert calls == [["chainlink", "locks", "release", "13"]]
+    assert calls == [
+        ["chainlink", "issue", "show", "13", "--json"],
+        ["chainlink", "locks", "release", "13"],
+    ]
     assert load_run_state(tmp_path, 13) is not None
     assert events == [
         (
@@ -1335,3 +1343,28 @@ def test_factory_stop_cancels_verified_process_group(tmp_path: Path) -> None:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+
+
+def test_known_unreadable_run_origin_promotes_attention(tmp_path: Path) -> None:
+    reservation = reserve_execution(
+        dispatch_failure_state_dir(tmp_path),
+        issue_id=71,
+        source="leaf_run_boundary",
+        operation_stage="run_state",
+        execution_id="trusted-run-execution",
+    )
+    path = tmp_path / "state" / "worklink" / "runs" / "untrusted-name.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "issue_id": 71,
+        "autonomous": True,
+        "execution_id": reservation["execution_id"],
+    }))
+
+    reconcile_run_states(tmp_path)
+
+    issue = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["71"]
+    occurrence = next(iter(issue["occurrences"].values()))
+    assert occurrence["source"] == "startup_run_record_read"
+    assert occurrence["execution_id"] == "trusted-run-execution"
+    assert path.exists()

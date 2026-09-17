@@ -175,6 +175,16 @@ class ClaimRelation(StrEnum):
     RELATED_PRIOR_CLAIM = "related_prior_claim"
 
 
+class ClaimBindingState(StrEnum):
+    NONE = "none"
+    PREPARED = "prepared"
+    CONFIRMED = "confirmed"
+
+
+class PublicationState(StrEnum):
+    READY = "ready"
+
+
 class Settlement(StrEnum):
     NOT_NEEDED = "not_needed"
     PENDING = "pending"
@@ -243,8 +253,6 @@ def _factory_field(status: FactoryStatus | Mapping[str, Any], name: str) -> Any:
 def classify_attention(facts: AttentionFacts) -> AccountingDecision:
     if facts.kind is AttentionKind.FACTORY_STARTED:
         return AccountingDecision(AttentionOutcome.STARTED, AccountingBasis.PRECLAIM, None, Settlement.NOT_NEEDED)
-    if facts.kind is AttentionKind.FACTORY_SUCCEEDED or facts.verified_completion:
-        return AccountingDecision(AttentionOutcome.SUCCEEDED, AccountingBasis.VERIFIED_COMPLETION, True, Settlement.NOT_NEEDED)
     if facts.exhaustion or facts.primary_outcome is AttentionOutcome.ATTEMPTS_EXHAUSTED:
         return AccountingDecision(AttentionOutcome.ATTEMPTS_EXHAUSTED, AccountingBasis.EXHAUSTION, False, Settlement.NOT_NEEDED)
     if facts.preclaim or facts.claim_relation is ClaimRelation.RELATED_PRIOR_CLAIM:
@@ -253,6 +261,8 @@ def classify_attention(facts: AttentionFacts) -> AccountingDecision:
     primary = facts.primary_outcome or _outcome_for_status(facts.original_result_status)
     if primary is AttentionOutcome.PARTIAL:
         return AccountingDecision(primary, AccountingBasis.FACTORY_PARTIAL, True, Settlement.NOT_NEEDED)
+    if facts.kind is AttentionKind.FACTORY_SUCCEEDED or facts.verified_completion:
+        return AccountingDecision(AttentionOutcome.SUCCEEDED, AccountingBasis.VERIFIED_COMPLETION, True, Settlement.NOT_NEEDED)
     if status is not None:
         factory_result = _outcome_for_status(_factory_field(status, "status"))
         if factory_result is AttentionOutcome.PARTIAL:
@@ -264,9 +274,9 @@ def classify_attention(facts: AttentionFacts) -> AccountingDecision:
         selected = selected or AttentionOutcome.GENUINE_FAILURE
         if isinstance(pr_url, str) and pr_url.strip():
             return AccountingDecision(selected, AccountingBasis.FACTORY_PR, True, Settlement.NOT_NEEDED)
-        if isinstance(steps, (list, tuple)) and steps:
+        if _valid_factory_rows(steps, "agent"):
             return AccountingDecision(selected, AccountingBasis.FACTORY_STEPS, True, Settlement.NOT_NEEDED)
-        if isinstance(slices, (list, tuple)) and slices:
+        if _valid_factory_rows(slices, "id"):
             return AccountingDecision(selected, AccountingBasis.FACTORY_SLICES, True, Settlement.NOT_NEEDED)
     if facts.normalized_leaf_result and not facts.launch_error:
         return AccountingDecision(primary or AttentionOutcome.GENUINE_FAILURE, AccountingBasis.LEAF_EXECUTION, True, Settlement.NOT_NEEDED)
@@ -274,6 +284,23 @@ def classify_attention(facts: AttentionFacts) -> AccountingDecision:
         return AccountingDecision(primary or AttentionOutcome.GENUINE_FAILURE, AccountingBasis.UNPUBLISHED_COMMITS, True, Settlement.NOT_NEEDED)
     settlement = Settlement.PENDING if facts.claim_relation is ClaimRelation.CURRENT_CLAIM else Settlement.NOT_NEEDED
     return AccountingDecision(AttentionOutcome.INFRASTRUCTURE_FAILURE, AccountingBasis.INFRASTRUCTURE, False, settlement, facts.evidence_quality)
+
+
+def _valid_factory_rows(rows: Any, identity: str) -> bool:
+    return bool(
+        isinstance(rows, (list, tuple))
+        and rows
+        and all(
+            isinstance(row, Mapping)
+            and isinstance(row.get(identity), str)
+            and bool(row[identity].strip())
+            and isinstance(row.get("status"), str)
+            and bool(row["status"].strip())
+            and type(row.get("attempts")) is int
+            and row["attempts"] >= 0
+            for row in rows
+        )
+    )
 
 
 def _outcome_for_status(status: object) -> AttentionOutcome | None:
@@ -304,6 +331,9 @@ class AttentionRecord:
     run_id: str | None = None
     launch_id: str | None = None
     claim: ClaimRecord | None = None
+    prior_claim: ClaimRecord | None = None
+    claim_relation: ClaimRelation = ClaimRelation.NONE
+    claim_binding_state: ClaimBindingState = ClaimBindingState.NONE
     error_signature: str = ""
     attempt: int | None = None
     reason: str = ""
@@ -314,6 +344,11 @@ class AttentionRecord:
     secondary_faults: tuple[Mapping[str, Any], ...] = ()
     refs: Mapping[str, str | None] = field(default_factory=dict)
     factory_projection: Mapping[str, Any] | None = None
+    controller_phase: str | None = None
+    controller_error: str | None = None
+    pr_url: str | None = None
+    pr_state: str | None = None
+    pr_head: str | None = None
     next: str | None = None
     next_present: bool = False
     autonomous: bool = True
@@ -324,6 +359,7 @@ class AttentionRecord:
     handling_disposition: HandlingDisposition | None = None
     retirement: RecoveryRetirement | None = None
     validation_detail: ValidationDetail | None = None
+    publication_state: PublicationState = PublicationState.READY
     schema_version: int = ATTENTION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -339,6 +375,10 @@ class AttentionRecord:
             raise ValueError("legacy identities cannot be produced")
         if not self.occurrence_id or not self.execution_id or not self.delivery_key:
             raise ValueError("attention record identifiers must be nonblank")
+        if self.claim_relation is ClaimRelation.CURRENT_CLAIM and self.claim is None:
+            raise ValueError("current claim relation requires an exact claim")
+        if self.claim_binding_state is ClaimBindingState.CONFIRMED and self.claim is None:
+            raise ValueError("confirmed claim binding requires an exact claim")
 
     def to_json(self) -> dict[str, Any]:
         value = asdict(self)
@@ -349,16 +389,26 @@ class AttentionRecord:
         value["accounting_basis"] = self.accounting_basis.value
         value["settlement"] = self.settlement.value
         value["evidence_quality"] = self.evidence_quality.value
+        value["claim_relation"] = self.claim_relation.value
+        value["claim_binding_state"] = self.claim_binding_state.value
         value["primary_source"] = self.primary_source.value if self.primary_source else None
         value["handling_disposition"] = self.handling_disposition.value if self.handling_disposition else None
         value["retirement"] = self.retirement.value if self.retirement else None
         value["validation_detail"] = self.validation_detail.value if self.validation_detail else None
+        value["publication_state"] = self.publication_state.value
         if self.claim is not None:
             value["claim"] = {
                 "issue_id": self.claim.issue_id,
                 "attempt": self.claim.attempt,
                 "agent_id": self.claim.agent_id,
                 "claimed_at": self.claim.claimed_at.isoformat(),
+            }
+        if self.prior_claim is not None:
+            value["prior_claim"] = {
+                "issue_id": self.prior_claim.issue_id,
+                "attempt": self.prior_claim.attempt,
+                "agent_id": self.prior_claim.agent_id,
+                "claimed_at": self.prior_claim.claimed_at.isoformat(),
             }
         value["reason"] = redact_text(self.reason)[:MAX_REASON_CHARS]
         value["refs"] = {str(key): redact_text(str(item))[:MAX_SAFE_REF_CHARS] if item is not None else None for key, item in self.refs.items()}
@@ -368,6 +418,8 @@ class AttentionRecord:
     def from_json(cls, value: Mapping[str, Any], *, legacy: bool = False) -> AttentionRecord:
         claim_data = value.get("claim")
         claim = ClaimRecord.from_payload(dict(claim_data)) if isinstance(claim_data, Mapping) else None
+        prior_claim_data = value.get("prior_claim")
+        prior_claim = ClaimRecord.from_payload(dict(prior_claim_data)) if isinstance(prior_claim_data, Mapping) else None
         source = AttentionSource.LEGACY_V1 if legacy else AttentionSource(str(value["source"]))
         cause = AttentionCause.LEGACY_UNKNOWN if legacy else AttentionCause(str(value["cause"])) if value.get("cause") else None
         record = cls.__new__(cls)
@@ -386,6 +438,9 @@ class AttentionRecord:
             "run_id": value.get("run_id"),
             "launch_id": value.get("launch_id"),
             "claim": claim,
+            "prior_claim": prior_claim,
+            "claim_relation": ClaimRelation(str(value.get("claim_relation") or ClaimRelation.NONE)),
+            "claim_binding_state": ClaimBindingState(str(value.get("claim_binding_state") or ClaimBindingState.NONE)),
             "error_signature": str(value.get("error_signature") or value.get("signature") or ""),
             "attempt": int(value["attempt"]) if value.get("attempt") is not None else None,
             "reason": str(value.get("reason") or value.get("terminal_error") or ""),
@@ -396,6 +451,11 @@ class AttentionRecord:
             "secondary_faults": tuple(value.get("secondary_faults") or ()),
             "refs": dict(value.get("refs") or {}),
             "factory_projection": value.get("factory_projection"),
+            "controller_phase": value.get("controller_phase"),
+            "controller_error": value.get("controller_error"),
+            "pr_url": value.get("pr_url"),
+            "pr_state": value.get("pr_state"),
+            "pr_head": value.get("pr_head"),
             "next": value.get("next"),
             "next_present": value.get("next_present") is True,
             "autonomous": value.get("autonomous", False if legacy else True) is True,
@@ -406,6 +466,7 @@ class AttentionRecord:
             "handling_disposition": HandlingDisposition(str(value["handling_disposition"])) if value.get("handling_disposition") else None,
             "retirement": RecoveryRetirement(str(value["retirement"])) if value.get("retirement") else None,
             "validation_detail": ValidationDetail(str(value["validation_detail"])) if value.get("validation_detail") else None,
+            "publication_state": PublicationState(str(value.get("publication_state") or PublicationState.READY)),
             "schema_version": ATTENTION_SCHEMA_VERSION,
         }
         for name, item in fields.items():
@@ -462,6 +523,92 @@ class AttentionSnapshot:
         }
 
 
+_SOURCE_POLICIES: dict[AttentionSource, tuple[str, ...]] = {
+    AttentionSource.DETACHED_SPAWN: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.LEAF_TEMPLATE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.TEMPLATE_UNREADY: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.TEMPLATE_BLOCK_LABEL: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.TEMPLATE_COMMENT: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.LEAF_COMPUTE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.LEAF_CLAIM: ("disarmed", "superseded", "explicit_rearm"),
+    AttentionSource.LEAF_EXHAUSTION: ("budget_available", "disarmed", "superseded"),
+    AttentionSource.LEAF_CHECKOUT: ("disarmed", "superseded"),
+    AttentionSource.LEAF_LAUNCH: ("disarmed", "superseded"),
+    AttentionSource.LEAF_RUNSTATE_SAVE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_COMPUTE_CLEANUP: ("lock_and_owner_absent", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_BACKEND_BLOCKED: ("disarmed", "superseded", "publication_resolved", "explicit_rearm"),
+    AttentionSource.LEAF_GATE_TIMEOUT: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_GATE_MISSING: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_OUTPUT_OVERFLOW: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_WORK_FAILED: ("disarmed", "superseded", "publication_resolved", "explicit_rearm"),
+    AttentionSource.LEAF_TRANSITION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_RELEASE: ("lock_and_owner_absent", "superseded"),
+    AttentionSource.LEAF_CHECKOUT_CLEANUP: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_CAPABILITY_CLEANUP: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_POSTCLAIM: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_ERROR_TRANSITION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_RUN_BOUNDARY: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_PUBLICATION_FENCE: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_PUBLICATION_PUSH: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_PUBLICATION_PR: ("disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_PUBLICATION_EVIDENCE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_EVIDENCE_COMMENT: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.LEAF_COMPLETED_STATE_CLEAR: ("source_clear", "superseded"),
+    AttentionSource.EPIC_LABEL: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.EPIC_TEMPLATE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.EPIC_BACKEND: ("disarmed", "superseded"),
+    AttentionSource.EPIC_REPOSITORY: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.EPIC_COMPUTE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.EPIC_FACTORY_ADMIT: ("disarmed", "superseded"),
+    AttentionSource.EPIC_BASE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.EPIC_RETAINED_BIND: ("disarmed", "superseded", "factory_advanced"),
+    AttentionSource.EPIC_RETAINED_ISSUE_RELOAD: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_RETAINED_TRANSITION: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_CLAIM: ("disarmed", "superseded", "explicit_rearm"),
+    AttentionSource.EPIC_EXHAUSTION: ("budget_available", "disarmed", "superseded"),
+    AttentionSource.EPIC_LAUNCH: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_RECOVERY: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_SUPERVISION: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_DRIVER_LOCK: ("disarmed", "superseded", "factory_advanced"),
+    AttentionSource.EPIC_DRIVER_LOCK_SAVE: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_DRIVER_LOCK_TRANSITION: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.FACTORY_NEEDS_HUMAN: ("factory_advanced", "disarmed", "superseded", "publication_resolved", "explicit_rearm"),
+    AttentionSource.FACTORY_BLOCKED: ("factory_advanced", "disarmed", "superseded", "publication_resolved", "explicit_rearm"),
+    AttentionSource.FACTORY_PARTIAL: ("factory_advanced", "disarmed", "superseded", "publication_resolved", "explicit_rearm"),
+    AttentionSource.FACTORY_COMPLETION_VERIFY: ("publication_resolved", "disarmed", "superseded", "factory_advanced"),
+    AttentionSource.FACTORY_TERMINAL_TRANSITION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_CONTROLLER: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_CONTROLLER_RELOAD: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_PRESERVATION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_ERROR_SAVE: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_ERROR_TRANSITION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_CANCEL: ("source_clear", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_WAIT_DRAIN: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_TRANSCRIPT_SAVE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_COMPUTE_CLEANUP: ("lock_and_owner_absent", "superseded", "publication_resolved"),
+    AttentionSource.EPIC_RELEASE: ("lock_and_owner_absent", "superseded"),
+    AttentionSource.EPIC_RUN_BOUNDARY: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.ORPHAN_UNPUBLISHED: ("source_clear", "publication_resolved", "disarmed", "superseded"),
+    AttentionSource.ORPHAN_AMBIGUOUS: ("source_clear", "disarmed", "superseded", "explicit_rearm"),
+    AttentionSource.ORPHAN_EPIC: ("factory_advanced", "publication_resolved", "disarmed", "superseded", "explicit_rearm"),
+    AttentionSource.ORPHAN_LABELS_UNKNOWN: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.ORPHAN_LOCK_RELEASE: ("lock_and_owner_absent", "superseded"),
+    AttentionSource.ORPHAN_COMMENT: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.ORPHAN_TARGET_LABEL: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.ORPHAN_INPROGRESS_UNLABEL: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.ORPHAN_STATE_UPDATE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.STARTUP_LEAF_SPAWN: ("source_clear", "publication_resolved", "disarmed", "superseded"),
+    AttentionSource.STARTUP_FACTORY_SPAWN: ("factory_advanced", "publication_resolved", "disarmed", "superseded"),
+    AttentionSource.STARTUP_RUN_RECORD_READ: ("source_clear", "disarmed", "superseded", "publication_resolved"),
+    AttentionSource.STARTUP_FACTORY_RECORD_READ: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EXECUTION_RECOVERY: ("disarmed", "superseded", "publication_resolved", "factory_advanced"),
+    AttentionSource.FACTORY_INITIAL_START: ("source_clear", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.FACTORY_RECOVERY_START: ("source_clear", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.FACTORY_SUCCESS: ("source_clear", "superseded", "factory_advanced", "publication_resolved"),
+}
+
+
 def _invoke(reader: Callable[..., Any], *args: Any) -> Any:
     value = reader(*args)
     if inspect.isawaitable(value):
@@ -497,16 +644,16 @@ def inspect_attention(
     labels = _labels(issue)
     comments = _comments(issue)
     current["labels"] = sorted(labels) if labels is not None else None
-    current["occurrence_comment"] = any(occurrence_id in text for text in comments) if comments is not None else None
+    current["occurrence_comment"] = _occurrence_comment(comments, occurrence_id)
     old_owner = values.get("run_state") or values.get("factory")
     process_dead: bool | None = None
     if old_owner is not None:
         try:
             observed = _invoke(readers.process, old_owner)
-            process_dead = observed is False or observed == "verified_dead"
+            process_dead = True if observed is False or observed == "verified_dead" else False if observed is True or observed == "alive" else None
         except Exception as exc:
             errors.append(f"process:{type(exc).__name__}")
-    else:
+    elif record.attempt is None and record.run_id is None and record.launch_id is None:
         process_dead = True
     current["old_process_verified_dead"] = process_dead
     claims = values.get("claims")
@@ -527,6 +674,7 @@ def inspect_attention(
         "budget_available": budget,
         "lock_and_owner_absent": _tri(lock_absent is True and process_dead is True, lock_absent is None or process_dead is None),
         "explicit_rearm": rearmed,
+        "source_clear": _source_clearance(record, values, labels, comments, process_dead),
     }
     applicable = _applicable_predicates(record, predicates)
     resolution = Resolution.RESOLVED if Resolution.RESOLVED in applicable else Resolution.UNKNOWN if errors or Resolution.UNKNOWN in applicable else Resolution.UNRESOLVED
@@ -554,6 +702,22 @@ def _comments(issue: Any) -> tuple[str, ...] | None:
     return tuple(str(item.get("body") or item.get("text") or "") if isinstance(item, Mapping) else str(item) for item in raw)
 
 
+def _occurrence_comment(comments: tuple[str, ...] | None, occurrence_id: str) -> bool | None:
+    if comments is None:
+        return None
+    marker = f"WORKLINK_ATTENTION:{occurrence_id}"
+    for text in comments:
+        if marker in text.split():
+            return True
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, Mapping) and payload.get("occurrence_id") == occurrence_id:
+            return True
+    return False
+
+
 def _lock_absent(claims: Any) -> bool | None:
     if isinstance(claims, Mapping):
         if "lock_absent" in claims:
@@ -570,13 +734,23 @@ def _superseded(record: AttentionRecord, claims: Any, process_dead: bool | None)
     if not isinstance(latest, (ClaimRecord, Mapping)) or record.attempt is None:
         return Resolution.UNRESOLVED
     attempt = latest.attempt if isinstance(latest, ClaimRecord) else latest.get("attempt")
-    return _tri(type(attempt) is int and attempt > record.attempt)
+    agent = latest.agent_id if isinstance(latest, ClaimRecord) else latest.get("agent_id")
+    claimed_at = latest.claimed_at.isoformat() if isinstance(latest, ClaimRecord) else latest.get("claimed_at")
+    newer = type(attempt) is int and attempt > record.attempt
+    if record.claim is not None and attempt == record.claim.attempt:
+        newer = agent != record.claim.agent_id or claimed_at != record.claim.claimed_at.isoformat()
+    return _tri(newer)
 
 
 def _publication(record: AttentionRecord, evidence: Any, readers: AttentionReaders, errors: list[str]) -> Resolution:
     if not isinstance(evidence, Mapping) or evidence.get("status") != "completed":
         return Resolution.UNKNOWN if evidence is None else Resolution.UNRESOLVED
-    url = evidence.get("pr_url")
+    if evidence.get("issue") not in {None, record.issue_id} or evidence.get("attempt") not in {None, record.attempt}:
+        return Resolution.UNKNOWN
+    expected_branch = record.refs.get("branch")
+    if expected_branch and evidence.get("branch") not in {None, expected_branch}:
+        return Resolution.UNKNOWN
+    url = evidence.get("pr_url") or record.pr_url
     if not isinstance(url, str) or not url:
         return Resolution.UNRESOLVED
     try:
@@ -586,7 +760,7 @@ def _publication(record: AttentionRecord, evidence: Any, readers: AttentionReade
         return Resolution.UNKNOWN
     state = pr.get("state") if isinstance(pr, Mapping) else None
     head = pr.get("headRefOid") if isinstance(pr, Mapping) else None
-    expected = evidence.get("head") or evidence.get("head_sha")
+    expected = evidence.get("head") or evidence.get("head_sha") or record.pr_head
     return _tri(state in {"OPEN", "MERGED"} and isinstance(expected, str) and head == expected)
 
 
@@ -598,6 +772,11 @@ def _factory_advanced(record: AttentionRecord, factory: Any, process_dead: bool 
     if isinstance(factory, Mapping):
         status = factory.get("status")
         attempt = factory.get("attempt")
+        run_id = factory.get("run_id")
+    else:
+        run_id = getattr(factory, "run_id", None)
+    if record.run_id is not None and run_id != record.run_id:
+        return Resolution.UNKNOWN
     if status is not None and not isinstance(status, str):
         status = getattr(status, "status", None)
     advanced = type(attempt) is int and record.attempt is not None and attempt > record.attempt
@@ -624,14 +803,37 @@ def _rearmed(record: AttentionRecord, issue: Any, claims: Any) -> Resolution:
     return _tri("worklink:ready" in labels and witnessed)
 
 
+def _source_clearance(
+    record: AttentionRecord,
+    values: Mapping[str, Any],
+    labels: set[str] | None,
+    comments: tuple[str, ...] | None,
+    process_dead: bool | None,
+) -> Resolution:
+    if record.source is AttentionSource.TEMPLATE_UNREADY:
+        return _tri(labels is not None and "worklink:ready" not in labels, labels is None)
+    if record.source is AttentionSource.TEMPLATE_BLOCK_LABEL:
+        return _tri(labels is not None and "worklink:blocked" in labels and "worklink:ready" not in labels, labels is None)
+    if record.source in {AttentionSource.TEMPLATE_COMMENT, AttentionSource.ORPHAN_COMMENT, AttentionSource.LEAF_EVIDENCE_COMMENT}:
+        found = _occurrence_comment(comments, record.occurrence_id)
+        return _tri(found is True, found is None)
+    if record.source in {AttentionSource.LEAF_TRANSITION, AttentionSource.LEAF_ERROR_TRANSITION, AttentionSource.EPIC_RETAINED_TRANSITION, AttentionSource.EPIC_DRIVER_LOCK_TRANSITION, AttentionSource.FACTORY_TERMINAL_TRANSITION, AttentionSource.EPIC_ERROR_TRANSITION, AttentionSource.ORPHAN_TARGET_LABEL, AttentionSource.ORPHAN_INPROGRESS_UNLABEL}:
+        target = record.refs.get("target_label")
+        return _tri(labels is not None and isinstance(target, str) and target in labels and "worklink:in-progress" not in labels, labels is None or not isinstance(target, str))
+    if record.source in {AttentionSource.EPIC_CANCEL, AttentionSource.STARTUP_LEAF_SPAWN}:
+        return _tri(process_dead is True, process_dead is None)
+    key = f"{record.source.value}_resolved"
+    for value in values.values():
+        if isinstance(value, Mapping) and key in value:
+            return _tri(value[key] is True, not isinstance(value[key], bool))
+    return Resolution.UNKNOWN
+
+
 def _applicable_predicates(record: AttentionRecord, values: Mapping[str, Resolution]) -> tuple[Resolution, ...]:
-    if record.kind is not AttentionKind.ATTENTION:
-        return (values["superseded"], values["publication_resolved"], values["factory_advanced"])
-    if record.cause is AttentionCause.ATTEMPTS_EXHAUSTED:
-        return (values["budget_available"], values["disarmed"], values["superseded"])
-    if record.source.value.startswith("factory_") or record.source.value.startswith("epic_") or record.source is AttentionSource.ORPHAN_EPIC:
-        return (values["factory_advanced"], values["publication_resolved"], values["disarmed"], values["superseded"], values["explicit_rearm"])
-    return (values["publication_resolved"], values["disarmed"], values["superseded"], values["explicit_rearm"])
+    policy = _SOURCE_POLICIES.get(record.source)
+    if policy is None:
+        return (Resolution.UNKNOWN,)
+    return tuple(values[name] for name in policy)
 
 
 def render_attention_prompt(record: AttentionRecord) -> str:

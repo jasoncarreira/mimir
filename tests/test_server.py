@@ -84,7 +84,7 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     )
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
-    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(factory_state, "list_factory_records", lambda home, **kwargs: [record])
     monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
     spawned: list[list[str]] = []
 

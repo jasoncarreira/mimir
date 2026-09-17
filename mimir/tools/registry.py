@@ -3147,6 +3147,7 @@ async def worklink_attention_ack(
         acquire_handling_lease,
         dispatch_failure_state_dir,
         mark_attention_handled,
+        release_handling_lease,
     )
 
     try:
@@ -3178,11 +3179,15 @@ async def worklink_attention_ack(
             },
             sort_keys=True,
         )
+    if snapshot.resolution is Resolution.RESOLVED and selected is HandlingDisposition.OPERATOR_REQUIRED:
+        selected = HandlingDisposition.NOOP_RESOLVED
     if selected in {HandlingDisposition.NOOP_RESOLVED, HandlingDisposition.REMEDIATED} and snapshot.resolution is not Resolution.RESOLVED:
         raise ToolException("worklink attention ack refused: occurrence is not resolved")
     if selected is HandlingDisposition.OBSERVED and snapshot.record.kind is AttentionKind.ATTENTION:
         raise ToolException("worklink attention ack refused: observed is lifecycle-only")
-    clean_note = note.strip()
+    from ..redaction import redact_text
+
+    clean_note = redact_text(note.strip())
     if selected is HandlingDisposition.OPERATOR_REQUIRED and (not clean_note or len(clean_note) > 2000):
         raise ToolException("worklink attention ack refused: bounded operator note required")
     state_dir = dispatch_failure_state_dir(home)
@@ -3210,9 +3215,19 @@ async def worklink_attention_ack(
             f"cause={cause} next={snapshot.record.next if snapshot.record.next_present else 'unspecified'} "
             f"decision={clean_note}"
         )[:4000]
-        receipt = await asyncio.wait_for(
-            deliver_operator_alert(text, authorize=True), timeout=30
-        )
+        try:
+            receipt = await asyncio.wait_for(
+                deliver_operator_alert(text, authorize=True), timeout=30
+            )
+        except Exception:
+            await asyncio.to_thread(
+                release_handling_lease,
+                state_dir,
+                int(issue_id),
+                occurrence_id,
+                lease_id,
+            )
+            raise
         metadata.update(
             destination=receipt.destination,
             message_id=receipt.message_id,

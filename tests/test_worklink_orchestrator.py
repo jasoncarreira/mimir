@@ -6203,6 +6203,8 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
     assert result.reason == "concurrency cap reached (1/1 active claims)"
     before_claim = observed[0].pop("before_claim")
     assert callable(before_claim)
+    prepared = observed[0].pop("on_record_prepared", None)
+    assert callable(prepared) is autonomous
     assert observed == [{
         "labels": {"worklink", "worklink:epic", "worklink:ready"},
         "max_active_locks": 1,

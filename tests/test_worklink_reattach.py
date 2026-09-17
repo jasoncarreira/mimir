@@ -13,7 +13,12 @@ from mimir.worklink.backends import Caps, ComputeCaps, ComputeResult, RawResult,
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import LaunchHandle, WorkSpec
-from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+from mimir.worklink.dispatch_failures import (
+    dispatch_failure_state_dir,
+    load_failure_state,
+    reserve_execution,
+)
+from mimir.worklink.factory_state import FactoryRunRecord, factory_records_dir, save_factory_record
 from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
     WorklinkRunState,
@@ -765,6 +770,37 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     assert spawned == []
 
 
+def test_known_unreadable_factory_origin_promotes_attention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import server
+
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    reservation = reserve_execution(
+        dispatch_failure_state_dir(tmp_path),
+        issue_id=72,
+        source="epic_run_boundary",
+        operation_stage="factory_record",
+        execution_id="trusted-factory-execution",
+    )
+    directory = factory_records_dir(tmp_path)
+    directory.mkdir(parents=True)
+    path = directory / "72.json"
+    path.write_text(json.dumps({
+        "issue_id": 72,
+        "autonomous": True,
+        "execution_id": reservation["execution_id"],
+    }))
+
+    assert server.reattach_inflight_worklink_runs(tmp_path) == []
+
+    issue = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["72"]
+    occurrence = next(iter(issue["occurrences"].values()))
+    assert occurrence["source"] == "startup_factory_record_read"
+    assert occurrence["execution_id"] == "trusted-factory-execution"
+    assert path.exists()
+
+
 def _factory_restart_record(
     home: Path,
     *,
@@ -937,7 +973,7 @@ def test_part_b_startup_recovery_emits_for_all_five_outcomes(
     monkeypatch.setattr(
         factory_state,
         "list_factory_records",
-        lambda home: (_ for _ in ()).throw(OSError("records unavailable")),
+        lambda home, **kwargs: (_ for _ in ()).throw(OSError("records unavailable")),
     )
     events, logger = capture()
     server.reattach_inflight_worklink_runs(

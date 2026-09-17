@@ -7717,3 +7717,107 @@ for number in (1, 2, 3, 4, 5):
         if source.domain == "channel"
     ]
     assert integrities == ["untrusted"] * 5
+
+
+@pytest.mark.asyncio
+async def test_installed_attention_poller_event_can_ack_bound_occurrence(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.models import TurnContext
+    from mimir.tools import registry
+    from mimir.worklink.attention import (
+        AccountingBasis,
+        AttentionCause,
+        AttentionKind,
+        AttentionOutcome,
+        AttentionRecord,
+        AttentionSnapshot,
+        AttentionSource,
+        Resolution,
+        Settlement,
+    )
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        promote_reservation,
+        reserve_execution,
+    )
+
+    source_skill = Path(__file__).parent.parent / "mimir" / "optional-skills" / "chainlink-orchestrator"
+    skills = tmp_path / "installed-skills"
+    installed = skills / "chainlink-orchestrator"
+    shutil.copytree(source_skill, installed)
+    config = next(item for item in discover_pollers(skills) if item.name == "worklink-attention")
+    config = replace(
+        config,
+        command=f"{sys.executable} scripts/attention_poller.py",
+        persist_dir=home / "state" / "pollers" / "worklink-attention",
+    )
+    state_dir = dispatch_failure_state_dir(home)
+    reservation = reserve_execution(
+        state_dir,
+        issue_id=29,
+        source="leaf_claim",
+        operation_stage="terminal",
+        execution_id="installed-poller-execution",
+    )
+    record = AttentionRecord(
+        occurrence_id="installed-poller-occurrence",
+        delivery_key=(
+            "worklink-attention:29:installed-signature:installed-poller-occurrence"
+        ),
+        kind=AttentionKind.ATTENTION,
+        cause=AttentionCause.CLAIM_FAILED,
+        issue_id=29,
+        execution_id="installed-poller-execution",
+        source=AttentionSource.LEAF_CLAIM,
+        outcome=AttentionOutcome.INFRASTRUCTURE_FAILURE,
+        accounting_basis=AccountingBasis.PRECLAIM,
+        attempt_consumed=False,
+        settlement=Settlement.NOT_NEEDED,
+        error_signature="installed-signature",
+    )
+    promote_reservation(state_dir, 29, reservation["reservation_id"], record)
+    snapshot = AttentionSnapshot(record, Resolution.RESOLVED, {}, {})
+    monkeypatch.setattr("mimir.worklink.attention.inspect_attention", lambda *args: snapshot)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    results = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        auth = create_auth_context(
+            event,
+            enforce=True,
+            ifc_labels=event.ifc_labels,
+        )
+        turn = TurnContext(
+            turn_id="installed-turn",
+            session_id=event.channel_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
+            started_at=0,
+            auth_context=auth,
+        )
+        token = set_current_turn(turn)
+        try:
+            item = event.extra["items"][0]
+            results.append(json.loads(await registry.worklink_attention_ack.coroutine(
+                item["issue_id"],
+                item["signature"],
+                item["occurrence_id"],
+                "operator_required",
+                "already resolved",
+            )))
+        finally:
+            reset_current_turn(token)
+        return True
+
+    assert await run_poller(config, enqueue=enqueue, home=home) == 1
+    assert results == [{
+        "disposition": "noop_resolved",
+        "issue_id": 29,
+        "occurrence_id": "installed-poller-occurrence",
+        "status": "handled",
+    }]
+    occurrence = load_failure_state(state_dir)["issues"]["29"]["occurrences"][record.occurrence_id]
+    assert occurrence["handling_disposition"] == "noop_resolved"
