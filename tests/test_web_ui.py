@@ -655,9 +655,12 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
         "dead_lock": False,
         "lock_session": "session-1",
         "pr_url": None,
-        "gates": {"story": "approved", "brief": "pending"},
-        "steps": ["spec-writer:accepted"],
-        "slices": ["s1:merged"],
+        "gates": {
+            "story": {"status": "approved", "at": None, "artifact": None, "reviewed_head": None},
+            "brief": {"status": "pending", "at": None, "artifact": None, "reviewed_head": None},
+        },
+        "steps": [{"agent": "spec-writer", "status": "accepted", "attempts": 1}],
+        "slices": [{"id": "s1", "status": "merged", "attempts": 2}],
         "validator": None,
         "terminal_result": None,
         "next": "brief",
@@ -788,10 +791,16 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         "dead_lock": False,
         "lock_session": None,
         "pr_url": "https://github.com/owner/repo/pull/42",
-        "gates": {"story": "approved", "brief": "approved"},
-        "steps": ["spec-writer:accepted", "work-decomposer:completed"],
-        "slices": ["s1:merged"],
-        "validator": "GO",
+        "gates": {
+            "story": {"status": "approved", "at": None, "artifact": None, "reviewed_head": None},
+            "brief": {"status": "approved", "at": None, "artifact": None, "reviewed_head": "abc123"},
+        },
+        "steps": [
+            {"agent": "spec-writer", "status": "accepted", "attempts": 1},
+            {"agent": "work-decomposer", "status": "completed", "attempts": 2},
+        ],
+        "slices": [{"id": "s1", "status": "merged", "attempts": 3}],
+        "validator": {"verdict": "GO", "report": "validator.md", "reviewed_head": "abc123", "loops": 1},
         "terminal_result": {
             "status": "completed",
             "summary": "Successfully completed",
@@ -818,8 +827,9 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert run["status"] == "completed"
         assert run["pr_url"] == "https://github.com/owner/repo/pull/42"
         assert run["validator"] == "GO"
-        assert len(run["steps"]) == 2
-        assert len(run["slices"]) == 1
+        assert run["steps"] == ["spec-writer:accepted(1)", "work-decomposer:completed(2)"]
+        assert run["slices"] == ["s1:merged(3)"]
+        assert run["gates"]["brief"]["reviewed_head"] == "abc123"
         assert run["terminal_result"]["status"] == "completed"
 
 

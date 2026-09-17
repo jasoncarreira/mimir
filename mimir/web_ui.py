@@ -1640,9 +1640,18 @@ def register_routes(
         result = _serialize_factory_run_summary(record)
         state = record.status
         result["gates"] = state.gates if state is not None and state.gates is not None else {}
-        result["steps"] = list(state.steps) if state is not None and state.steps is not None else []
-        result["slices"] = list(state.slices) if state is not None and state.slices is not None else []
-        result["validator"] = state.validator if state is not None else None
+        # Keep the dashboard's display-string contract; retained status stays structured.
+        result["steps"] = [
+            f"{row['agent']}:{row['status']}({row['attempts']})"
+            for row in (state.steps or ())
+        ] if state is not None else []
+        result["slices"] = [
+            f"{row['id']}:{row['status']}({row['attempts']})"
+            for row in (state.slices or ())
+        ] if state is not None else []
+        result["validator"] = (
+            state.validator["verdict"] if state is not None and state.validator is not None else None
+        )
         result["terminal_result"] = (
             state.terminal_result if state is not None else None
         )
