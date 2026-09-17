@@ -103,9 +103,10 @@ class FactoryStatus:
     dead_lock: bool | None = None
     lock_session: str | None = None
     gates: dict[str, Any] | None = None
-    steps: tuple[str, ...] | None = None
-    slices: tuple[str, ...] | None = None
-    validator: str | None = None
+    steps: tuple[dict[str, Any], ...] | None = None
+    slices: tuple[dict[str, Any], ...] | None = None
+    validator: dict[str, Any] | None = None
+    next_action: dict[str, Any] | None = None
     pr_url: str | None = None
     terminal_result: dict[str, Any] | None = None
     park_snapshot: str | None = None
@@ -147,6 +148,7 @@ class FactoryStatus:
             "steps": list(self.steps) if self.steps is not None else None,
             "slices": list(self.slices) if self.slices is not None else None,
             "validator": self.validator,
+            "next_action": self.next_action,
             "pr_url": self.pr_url,
             "terminal_result": self.terminal_result,
             "park_snapshot": self.park_snapshot,
@@ -171,7 +173,11 @@ def _bounded_text(value: object, name: str, *, nullable: bool = False) -> str | 
     if not isinstance(value, str) or not value.strip():
         raise FactoryContractError(f"factory status {name} must be a nonblank string")
     text = value.strip()
-    if len(text.encode("utf-8")) > _MAX_TEXT_BYTES or "\x00" in text:
+    try:
+        size = len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise FactoryContractError(f"factory status {name} is not UTF-8") from exc
+    if size > _MAX_TEXT_BYTES or "\x00" in text:
         raise FactoryContractError(f"factory status {name} is invalid")
     return text
 
@@ -204,29 +210,68 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
     return dict(value)
 
 
-def _validator_verdict(value: object) -> str | None:
+_STATUS_ROW_FIELDS = {
+    "steps": {"agent": "text", "status": "text", "attempts": "count"},
+    "slices": {"id": "text", "status": "text", "attempts": "count"},
+    "gates": {
+        "status": "text", "at": "nullable", "artifact": "nullable",
+        "reviewed_head": "nullable",
+    },
+    "validator": {
+        "verdict": "text", "report": "nullable", "reviewed_head": "nullable",
+        "loops": "count",
+    },
+    "next_action": {"kind": "text", "subject": "nullable"},
+}
+_NEXT_ACTION_KINDS = frozenset({
+    "terminal", "gate", "step", "observe-slice", "blocked-slice",
+    "dispatch-slice", "seed-slices", "pr", "complete",
+})
+
+
+def _status_row(value: object, name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise FactoryContractError(f"factory status {name} must be an object")
+    result = {}
+    for member, kind in _STATUS_ROW_FIELDS[name].items():
+        field_name = f"{name}.{member}"
+        if member not in value:
+            raise FactoryContractError(f"factory status {field_name} missing")
+        item = value[member]
+        if kind == "count":
+            if type(item) is not int or item < 0:
+                raise FactoryContractError(f"factory status {field_name} must be a nonnegative integer")
+            result[member] = item
+        else:
+            result[member] = _bounded_text(item, field_name, nullable=kind == "nullable")
+    if name == "validator" and result["verdict"] not in _VALIDATOR_VERDICTS:
+        raise FactoryContractError("factory status validator.verdict has an unknown verdict")
+    if name == "next_action" and result["kind"] not in _NEXT_ACTION_KINDS:
+        raise FactoryContractError("factory status next_action.kind is unknown")
+    extra = value.keys() - _STATUS_ROW_FIELDS[name].keys()
+    if extra:
+        raise FactoryContractError(f"factory status {name}.{sorted(extra)[0]} is unknown")
+    # Keep the former per-row text budget as well as bounding each member.
+    if len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > _MAX_TEXT_BYTES:
+        raise FactoryContractError(f"factory status {name} row exceeds size limit")
+    return result
+
+
+def _structured_status(value: object, name: str) -> Any:
     if value is None:
         return None
-    if not isinstance(value, str):
-        raise FactoryContractError("factory status validator must be a documented verdict")
-    if value not in _VALIDATOR_VERDICTS:
-        raise FactoryContractError("factory status validator has an unknown verdict")
-    return value
-
-
-def _compact_strings(
-    value: object, name: str, *, nullable: bool = False
-) -> tuple[str, ...] | None:
-    if value is None and nullable:
-        return None
-    if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
-        raise FactoryContractError(f"factory status {name} must be a bounded string list")
-    result: list[str] = []
-    for item in value:
-        text = _bounded_text(item, name)
-        assert text is not None
-        result.append(text)
-    return tuple(result)
+    if name in {"steps", "slices"}:
+        if not isinstance(value, list) or len(value) > _MAX_LIST_ITEMS:
+            raise FactoryContractError(f"factory status {name} must be a bounded object list")
+        return tuple(_status_row(item, name) for item in value)
+    if name == "gates":
+        if not isinstance(value, dict) or len(value) > _MAX_LIST_ITEMS:
+            raise FactoryContractError("factory status gates must be a bounded object")
+        return {
+            _bounded_text(key, "gates key"): _status_row(item, name)
+            for key, item in value.items()
+        }
+    return _status_row(value, name)
 
 
 def _validate_json_value(value: object, *, name: str, depth: int = 0) -> None:
@@ -259,7 +304,11 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         except UnicodeDecodeError as exc:
             raise FactoryContractError("factory status output is not UTF-8") from exc
     if isinstance(payload, str):
-        if len(payload.encode("utf-8")) > _MAX_STATUS_BYTES or "\x00" in payload:
+        try:
+            size = len(payload.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise FactoryContractError("factory status output is not UTF-8") from exc
+        if size > _MAX_STATUS_BYTES or "\x00" in payload:
             raise FactoryContractError("factory status output exceeds bounds")
         try:
             decoded = json.loads(payload, parse_constant=_reject_json_constant)
@@ -303,10 +352,11 @@ def parse_factory_status(payload: bytes | str | Mapping[str, Any]) -> FactorySta
         lock=lock,
         dead_lock=_bool(decoded.get("dead_lock"), "dead_lock", nullable=True),
         lock_session=_bounded_text(decoded.get("lock_session"), "lock_session", nullable=True),
-        gates=_opaque_dict(decoded.get("gates"), "gates", nullable=True),
-        steps=_compact_strings(decoded.get("steps"), "steps", nullable=True),
-        slices=_compact_strings(decoded.get("slices"), "slices", nullable=True),
-        validator=_validator_verdict(decoded.get("validator")),
+        gates=_structured_status(decoded.get("gates"), "gates"),
+        steps=_structured_status(decoded.get("steps"), "steps"),
+        slices=_structured_status(decoded.get("slices"), "slices"),
+        validator=_structured_status(decoded.get("validator"), "validator"),
+        next_action=_structured_status(decoded.get("next_action"), "next_action"),
         pr_url=_bounded_text(decoded.get("pr_url"), "pr_url", nullable=True),
         terminal_result=_opaque_dict(
             decoded.get("terminal_result"), "terminal_result", nullable=True

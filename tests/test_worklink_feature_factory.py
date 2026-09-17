@@ -36,19 +36,35 @@ def status_payload(**overrides: Any) -> dict[str, Any]:
         "sandbox_path": "/tmp/operator",
         "status": "running",
         "mode": "autonomous",
+        "max_retries": 5,
+        "publishing_identity": "mimir-carreira",
         "branch": "epic/1551",
         "pr_base": "main",
         "pr_draft": False,
         "lock": "fresh",
         "dead_lock": False,
         "lock_session": "session-1",
-        "gates": {"brief": "approved"},
-        "steps": ["brief", "implementation"],
-        "slices": ["factory-070-migration"],
+        "gates": {
+            "brief": {
+                "status": "approved",
+                "at": None,
+                "artifact": None,
+                "reviewed_head": None,
+            },
+        },
+        "steps": [
+            {"agent": "brief", "status": "completed", "attempts": 1},
+            {"agent": "implementation", "status": "running", "attempts": 1},
+        ],
+        "slices": [
+            {"id": "factory-070-migration", "status": "pending", "attempts": 0},
+        ],
         "validator": None,
         "pr_url": None,
         "terminal_result": None,
+        "park_snapshot": None,
         "next": "implementation",
+        "next_action": {"kind": "step", "subject": "implementation"},
     }
     payload.update(overrides)
     return payload
@@ -71,6 +87,184 @@ def package_entrypoint(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return entrypoint
+
+
+def structured_status_payload() -> dict[str, Any]:
+    # 0.8.9 release shape, including Gate 3's commit binding, not a live probe.
+    return status_payload(
+        steps=[{"agent": "spec-writer", "status": "blocked", "attempts": 2}],
+        slices=[{"id": "be-x", "status": "merged", "attempts": 5}],
+        gates={"story": {
+            "status": "approved", "at": "2026-09-17T00:00:00Z",
+            "artifact": "story.md", "reviewed_head": "abc123",
+        }},
+        validator={"verdict": "GO", "report": "validator.md", "reviewed_head": "abc123", "loops": 2},
+        next_action={"kind": "gate", "subject": "pre_pr"},
+    )
+
+
+@pytest.mark.parametrize("wire", ["mapping", "text", "bytes"])
+def test_status_089_live_failure_regression(wire: str) -> None:
+    payload = structured_status_payload()
+    encoded = json.dumps(payload)
+    status = parse_factory_status(
+        payload if wire == "mapping" else encoded if wire == "text" else encoded.encode()
+    )
+    for field in ("steps", "slices", "gates", "validator", "next_action"):
+        assert status.to_json()[field] == payload[field]
+    assert parse_factory_status(status.to_json()) == status
+
+
+_STRUCTURED_ROWS = {
+    "steps": structured_status_payload()["steps"][0],
+    "slices": structured_status_payload()["slices"][0],
+    "gates": structured_status_payload()["gates"]["story"],
+    "validator": structured_status_payload()["validator"],
+    "next_action": structured_status_payload()["next_action"],
+}
+_ROW_MEMBERS = [(field, member) for field, row in _STRUCTURED_ROWS.items() for member in row]
+_TEXT_MEMBERS = [
+    (field, member) for field, member in _ROW_MEMBERS
+    if isinstance(_STRUCTURED_ROWS[field][member], str)
+]
+
+
+def row_payload(field: str, row: object) -> dict[str, Any]:
+    value = [row] if field in {"steps", "slices"} else {"story": row} if field == "gates" else row
+    return structured_status_payload() | {field: value}
+
+
+@pytest.mark.parametrize(("field", "member"), _ROW_MEMBERS)
+def test_status_requires_every_structured_member(field: str, member: str) -> None:
+    row = dict(_STRUCTURED_ROWS[field])
+    del row[member]
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member} missing"):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize("field", _STRUCTURED_ROWS)
+@pytest.mark.parametrize("row", ["approved", [], False, 1])
+def test_status_rejects_nonobject_rows(field: str, row: object) -> None:
+    with pytest.raises(FactoryContractError, match=field):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("field", "member"), _TEXT_MEMBERS)
+@pytest.mark.parametrize(
+    "value", ["", " ", 7, "a\x00b", "\u00e9" * 8193, "\ud800"],
+    ids=["empty", "blank", "nonstring", "nul", "oversized-utf8", "surrogate"],
+)
+def test_status_bounds_every_structured_text_member(field: str, member: str, value: object) -> None:
+    row = _STRUCTURED_ROWS[field] | {member: value}
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("field", "member"), [("steps", "attempts"), ("slices", "attempts"), ("validator", "loops")])
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2", None])
+def test_status_requires_nonnegative_integer_counts(field: str, member: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member}"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {member: value}))
+
+
+@pytest.mark.parametrize("field", _STRUCTURED_ROWS)
+def test_status_rejects_unknown_row_members(field: str) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.unexpected"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {"unexpected": "value"}))
+
+
+@pytest.mark.parametrize("field", ["steps", "slices", "gates"])
+def test_status_structured_collection_limits(field: str) -> None:
+    row = _STRUCTURED_ROWS[field]
+    value = {str(i): row for i in range(1000)} if field == "gates" else [row] * 1000
+    parse_factory_status(structured_status_payload() | {field: value})
+    if field == "gates":
+        value["overflow"] = row
+    else:
+        value.append(row)
+    with pytest.raises(FactoryContractError, match="cardinality|bounded"):
+        parse_factory_status(structured_status_payload() | {field: value})
+
+
+@pytest.mark.parametrize("field", ["steps", "slices", "gates"])
+@pytest.mark.parametrize("value", ["retired", 1, False, ()])
+def test_status_requires_structured_collections(field: str, value: object) -> None:
+    with pytest.raises(FactoryContractError, match=field):
+        parse_factory_status(structured_status_payload() | {field: value})
+
+
+@pytest.mark.parametrize(
+    "key", ["", " ", "a\x00b", "\u00e9" * 8193, "\ud800"],
+    ids=["empty", "blank", "nul", "oversized-utf8", "surrogate"],
+)
+def test_status_bounds_gate_names(key: str) -> None:
+    with pytest.raises(FactoryContractError):
+        parse_factory_status(structured_status_payload() | {"gates": {key: _STRUCTURED_ROWS["gates"]}})
+
+
+@pytest.mark.parametrize(("field", "members"), [
+    ("steps", ("agent", "status")), ("slices", ("id", "status")),
+    ("gates", ("at", "artifact")), ("validator", ("report", "reviewed_head")),
+    ("next_action", ("subject",)),
+])
+def test_status_bounds_combined_row_size(field: str, members: tuple[str, ...]) -> None:
+    row = _STRUCTURED_ROWS[field] | {member: "a" * (16384 // len(members)) for member in members}
+    with pytest.raises(FactoryContractError, match=rf"{field} row exceeds size limit"):
+        parse_factory_status(row_payload(field, row))
+
+
+@pytest.mark.parametrize(("kind", "subject"), [
+    ("terminal", "completed"), ("gate", "story"), ("step", "spec-writer"),
+    ("observe-slice", "be-x"), ("blocked-slice", "be-x"), ("dispatch-slice", "be-x"),
+    ("seed-slices", None), ("pr", None), ("complete", None),
+])
+def test_status_retains_next_action_without_classifying(kind: str, subject: str | None) -> None:
+    status = parse_factory_status(status_payload(next_action={"kind": kind, "subject": subject}))
+    assert status.next_action == {"kind": kind, "subject": subject}
+    assert not status.is_terminal
+    assert not status.is_parked
+
+
+def test_status_rejects_unknown_next_action_kind() -> None:
+    with pytest.raises(FactoryContractError, match=r"next_action\.kind"):
+        parse_factory_status(status_payload(next_action={"kind": "unknown", "subject": None}))
+
+
+@pytest.mark.parametrize("wire", ["mapping", "text", "bytes"])
+def test_status_preserves_total_payload_bound(wire: str) -> None:
+    payload = structured_status_payload() | {"padding": "x" * (1024 * 1024)}
+    text = json.dumps(payload)
+    with pytest.raises(FactoryContractError, match="bounds"):
+        parse_factory_status(payload if wire == "mapping" else text if wire == "text" else text.encode())
+
+
+def test_status_rejects_invalid_utf8_inside_structured_row() -> None:
+    payload = json.dumps(structured_status_payload()).encode().replace(b"spec-writer", b"spec-\xff")
+    with pytest.raises(FactoryContractError, match="UTF-8"):
+        parse_factory_status(payload)
+
+
+@pytest.mark.parametrize("payload", [b"\xff", "\ud800"])
+def test_status_rejects_invalid_wire_utf8(payload: bytes | str) -> None:
+    with pytest.raises(FactoryContractError, match="UTF-8"):
+        parse_factory_status(payload)
+
+
+def test_status_preserves_payload_nesting_bound() -> None:
+    nested: object = "value"
+    for _ in range(33):
+        nested = {"nested": nested}
+    with pytest.raises(FactoryContractError, match="nesting limit"):
+        parse_factory_status(structured_status_payload() | {"future_metadata": nested})
+
+
+@pytest.mark.parametrize(("field", "member"), [
+    ("steps", "agent"), ("steps", "status"), ("slices", "id"), ("slices", "status"),
+    ("gates", "status"), ("validator", "verdict"), ("next_action", "kind"),
+])
+def test_status_requires_nonnull_row_text(field: str, member: str) -> None:
+    with pytest.raises(FactoryContractError, match=rf"{field}\.{member}"):
+        parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {member: None}))
 
 
 def test_status_contract_preserves_optional_next_and_opaque_terminal_result() -> None:
@@ -120,7 +314,10 @@ def test_status_contract_preserves_nullable_fields_and_opaque_terminal_result() 
 def test_status_contract_preserves_optional_park_snapshot(
     payload: dict[str, object], expected: str | None
 ) -> None:
-    status = parse_factory_status(status_payload(**payload))
+    fixture = status_payload(**payload)
+    if "park_snapshot" not in payload:
+        fixture.pop("park_snapshot")
+    status = parse_factory_status(fixture)
 
     assert status.park_snapshot == expected
     assert parse_factory_status(status.to_json()) == status
@@ -135,6 +332,8 @@ def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
             "sandbox_path": "/tmp/feature-factory/chainlink-1337",
             "status": "running",
             "mode": "autonomous",
+            "max_retries": 5,
+            "publishing_identity": "mimir-carreira",
             "branch": "epic/chainlink-1337",
             "pr_base": "main",
             "pr_draft": False,
@@ -142,30 +341,45 @@ def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
             "dead_lock": False,
             "lock_session": "attempt-9",
             "gates": {
-                "story": "approved",
-                "brief": "approved",
-                "pre_pr": "pending",
+                name: {
+                    "status": gate_status,
+                    "at": None,
+                    "artifact": None,
+                    "reviewed_head": None,
+                }
+                for name, gate_status in (
+                    ("story", "approved"),
+                    ("brief", "approved"),
+                    ("pre_pr", "pending"),
+                )
             },
-            "steps": ["story", "brief", "slices", "validator"],
-            "slices": [
-                "slice-1",
-                "slice-2",
-                "slice-3",
-                "slice-4",
-                "slice-5",
-                "slice-6",
-                "slice-7",
+            "steps": [
+                {"agent": agent, "status": "completed", "attempts": 1}
+                for agent in ("story", "brief", "slices", "validator")
             ],
-            "validator": "GO",
+            "slices": [
+                {"id": f"slice-{index}", "status": "completed", "attempts": 1}
+                for index in range(1, 8)
+            ],
+            "validator": {
+                "verdict": "GO",
+                "report": None,
+                "reviewed_head": None,
+                "loops": 1,
+            },
             "pr_url": None,
             "terminal_result": None,
+            "park_snapshot": None,
             "next": "gate:pre_pr",
+            "next_action": {"kind": "gate", "subject": "pre_pr"},
         }
     )
 
     status = parse_factory_status(payload)
 
-    assert status.validator == "GO"
+    assert status.validator == {
+        "verdict": "GO", "report": None, "reviewed_head": None, "loops": 1,
+    }
     assert status.next == "gate:pre_pr"
     assert len(status.slices or ()) == 7
     assert parse_factory_status(status.to_json()) == status
@@ -173,7 +387,10 @@ def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
 
 @pytest.mark.parametrize("verdict", ["GO", "GO-WITH-NITS", "NO-GO"])
 def test_status_accepts_documented_validator_verdicts(verdict: str) -> None:
-    assert parse_factory_status(status_payload(validator=verdict)).validator == verdict
+    validator = {
+        "verdict": verdict, "report": None, "reviewed_head": None, "loops": 1,
+    }
+    assert parse_factory_status(status_payload(validator=validator)).validator == validator
 
 
 def test_status_accepts_null_validator_before_validation() -> None:
@@ -181,8 +398,10 @@ def test_status_accepts_null_validator_before_validation() -> None:
 
 
 def test_status_rejects_unknown_validator_verdict() -> None:
-    with pytest.raises(FactoryContractError, match="validator has an unknown verdict"):
-        parse_factory_status(status_payload(validator="APPROVED"))
+    with pytest.raises(FactoryContractError, match="validator"):
+        parse_factory_status(status_payload(validator={
+            "verdict": "APPROVED", "report": None, "reviewed_head": None, "loops": 1,
+        }))
 
 
 @pytest.mark.parametrize("terminal", ["completed", "blocked", "partial"])
@@ -218,7 +437,7 @@ def test_status_rejects_non_object_terminal_result(value: object) -> None:
 
 @pytest.mark.parametrize("value", [{}, [], True, 1])
 def test_status_rejects_invalid_validator_types(value: object) -> None:
-    with pytest.raises(FactoryContractError, match="validator must be a documented verdict"):
+    with pytest.raises(FactoryContractError, match="validator"):
         parse_factory_status(status_payload(validator=value))
 
 
@@ -302,8 +521,8 @@ def test_status_rejects_trailing_json_and_nul() -> None:
 @pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
 def test_status_rejects_nonfinite_json_constants(constant: str) -> None:
     payload = json.dumps(status_payload()).replace(
-        '"gates": {"brief": "approved"}',
-        f'"gates": {{"value": {constant}}}',
+        '"valid": true',
+        f'"valid": {constant}',
     )
     with pytest.raises(FactoryContractError, match="one JSON object"):
         parse_factory_status(payload)
@@ -871,8 +1090,8 @@ def test_status_control_rejects_malformed_trailing_and_nonfinite_output(tmp_path
         b"not-json",
         json.dumps(status_payload(sandbox_path=str(sandbox))).encode() + b"{}",
         json.dumps(status_payload(sandbox_path=str(sandbox))).replace(
-            '"gates": {"brief": "approved"}',
-            '"gates": {"value": NaN}',
+            '"valid": true',
+            '"valid": NaN',
         ).encode(),
     ):
         backend = FeatureFactoryBackend(

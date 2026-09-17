@@ -670,7 +670,15 @@ while True: time.sleep(1)
     reader = asyncio.StreamReader()
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
-    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    parent_ready = asyncio.Event()
+
+    async def open_stdio(target):
+        # No yield after signalling: the proxy reaches its routing try/finally
+        # before the test can resume and cancel it.
+        parent_ready.set()
+        return reader, Output(target), transport
+
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
     monkeypatch.setattr("mimir.acp.ssh.WAIT_TIMEOUT", 0.02)
     # Keep the production SIGTERM grace period so the child can acknowledge
     # the signal even on a loaded parallel CI runner.
@@ -691,6 +699,7 @@ while True: time.sleep(1)
                 except (OSError, json.JSONDecodeError):
                     await asyncio.sleep(0.01)
             pid = marker_data["pid"]
+            await parent_ready.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)

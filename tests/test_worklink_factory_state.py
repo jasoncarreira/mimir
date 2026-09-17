@@ -41,8 +41,8 @@ def record(tmp_path: Path) -> FactoryRunRecord:
             "dead_lock": False,
             "lock_session": "session-1",
             "gates": {},
-            "steps": ["implementation"],
-            "slices": ["factory-070-migration"],
+            "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
+            "slices": [{"id": "factory-070-migration", "status": "ready", "attempts": 0}],
             "validator": None,
             "pr_url": None,
             "terminal_result": None,
@@ -74,6 +74,43 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert list_factory_records(tmp_path) == [expected]
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -> None:
+    expected = record(tmp_path)
+    assert expected.status is not None
+    status = replace(
+        expected.status,
+        steps=({"agent": "implementation", "status": "completed", "attempts": 2},),
+        slices=({"id": "factory-070-migration", "status": "merged", "attempts": 1},),
+        gates={
+            "pre_pr": {
+                "status": "passed",
+                "at": "2026-08-18T12:00:00+00:00",
+                "artifact": "reports/pre-pr.json",
+                "reviewed_head": "abc123",
+            },
+            "post_pr": {
+                "status": "pending", "at": None, "artifact": None, "reviewed_head": None,
+            },
+        },
+        validator={
+            "verdict": "GO", "report": "reports/validator.md", "reviewed_head": "abc123",
+            "loops": 2,
+        },
+        next_action={"kind": "pr", "subject": None},
+    )
+    expected = replace(expected, status=status)
+
+    path = save_factory_record(tmp_path, expected)
+
+    assert load_factory_record(tmp_path, expected.run_id) == expected
+    persisted = json.loads(path.read_text(encoding="utf-8"))["status"]
+    assert persisted["steps"] == list(status.steps)
+    assert persisted["slices"] == list(status.slices)
+    assert persisted["gates"] == status.gates
+    assert persisted["validator"] == status.validator
+    assert persisted["next_action"] == status.next_action
 
 
 def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
@@ -269,7 +306,7 @@ def test_factory_record_binds_status_run_id_to_durable_identity(tmp_path: Path) 
         status=replace(
             status,
             pr_base=None,
-            validator="GO",
+            validator={"verdict": "GO", "report": None, "reviewed_head": None, "loops": 0},
             terminal_result={"reason": "opaque"},
         ),
     )

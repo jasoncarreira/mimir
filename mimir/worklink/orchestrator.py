@@ -2663,7 +2663,7 @@ def _preserve_failed_factory_run(
         or record.status is None
         or record.status.pr_url is not None
         or record.status.slices is None
-        or not any(":merged(" in item for item in record.status.slices)
+        or not any(row["status"] == "merged" for row in record.status.slices)
     ):
         return None, None
     try:
@@ -3040,7 +3040,7 @@ async def _verify_factory_completion(
         if status.status != "completed" or not status.is_terminal:
             raise WorklinkError("factory completion status is not authoritative")
         _require_factory_status(status, record, require_pr_base=True)
-        if status.slices is None or not any(":merged(" in item for item in status.slices):
+        if status.slices is None or not any(row["status"] == "merged" for row in status.slices):
             raise WorklinkError("factory completion has no merged slice")
         if status.pr_draft:
             raise WorklinkError("factory completed with a draft PR")
