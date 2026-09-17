@@ -6,6 +6,13 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.0. The release
+  removes the imported production-line ceiling that the factory's own brief
+  imposed on projects, and adds `factory decide` plus workflow refresh on resume
+  so a parked run can take an operator decision without being relaunched. The
+  status payload contract is unchanged from 0.8.9; verified by diffing the
+  published tarballs' status emitter rather than the release notes.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.9 so exact-match
   admission permits the planning-review policy fix and stricter review acceptance
   checks. Keep runtime, image, drift-detection, and documentation pins in lockstep.
