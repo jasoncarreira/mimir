@@ -1,5 +1,26 @@
 # WORKLINK — Chainlink worker orchestration (chainlink #380)
 
+## Autonomous attention
+
+Autonomous dispatch reserves an execution in
+`state/pollers/worklink-ready-queue/dispatch_failures.json` before claim, spawn,
+or work. A terminal outcome atomically promotes that reservation to a typed ready
+occurrence and inhibits automatic redispatch. Successful excluded operations close
+the reservation as an excluded tombstone without creating an occurrence. Lifecycle
+start and factory-success records use distinct occurrences.
+
+The high-priority `worklink-attention` poller emits one occurrence per prompt turn.
+The service can inspect only the exact tuple bound through its recovery stash and
+ledger delivery binding. It must acknowledge explicitly. `operator_required`
+acknowledgement sends the configured operator alert before committing handled state.
+Failed or unacknowledged turns use three accepted framework retries and retire the
+ledger occurrence before recovery state is dropped.
+
+Acknowledgement does not refund an attempt, settle pending accounting, or rearm an
+issue. Rearm requires a later ready witness after disarming, a newly honored reset,
+or a later explicit claim. Handled occurrences and excluded reservations are retained
+until a separate compaction design is approved.
+
 Mimir-native, toolchain-agnostic orchestration for durable work
 decomposition and execution. Chainlink is the coordination surface and
 source of truth; mimir plans; pluggable coding/maintenance CLIs build;

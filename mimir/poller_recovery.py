@@ -53,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -109,6 +109,161 @@ EnqueueFn = Callable[[AgentEvent], Awaitable[bool]]
 # ``None`` means the source could not determine relevance. Recovery must fail
 # open in that case so transient source/API failures cannot discard real work.
 RelevanceFn = Callable[[AgentEvent], Awaitable[bool | None]]
+
+
+@dataclass(frozen=True)
+class AttentionBinding:
+    issue_id: int
+    signature: str
+    occurrence_id: str
+    delivery_key: str
+    origin_ref: str
+    channel_id: str
+    service_canonical: str
+
+
+def read_attention_binding(
+    home: Path,
+    origin_ref: str,
+    channel_id: str,
+    service_canonical: str,
+) -> AttentionBinding:
+    if channel_id != "poller:worklink-attention" or service_canonical != "poller:worklink-attention" or not origin_ref:
+        raise ValueError("attention binding service identity mismatch")
+    persist_dir = home / "state" / "pollers" / "worklink-attention"
+    state = _load_state(persist_dir)
+    if state.get("_unreadable_path"):
+        raise ValueError("attention recovery state unavailable")
+    entry = state["inflight"].get(origin_ref)
+    event = entry.get("event") if isinstance(entry, dict) else None
+    extra = event.get("extra") if isinstance(event, dict) else None
+    items = extra.get("items") if isinstance(extra, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise ValueError("attention recovery binding is not a single item")
+    item = items[0]
+    try:
+        binding = AttentionBinding(
+            issue_id=int(item["issue_id"]),
+            signature=str(item["signature"]),
+            occurrence_id=str(item["occurrence_id"]),
+            delivery_key=str(item["delivery_key"]),
+            origin_ref=str(event["source_id"]),
+            channel_id=str(event["channel_id"]),
+            service_canonical=str(event["service_principal"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("attention recovery binding is malformed") from exc
+    if binding.origin_ref != origin_ref or binding.channel_id != channel_id or binding.service_canonical != service_canonical or not all((binding.signature, binding.occurrence_id, binding.delivery_key)):
+        raise ValueError("attention recovery binding identity mismatch")
+    from .worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    ledger = load_failure_state(dispatch_failure_state_dir(home))
+    issue = ledger["issues"].get(str(binding.issue_id))
+    occurrence = issue.get("occurrences", {}).get(binding.occurrence_id) if isinstance(issue, dict) else None
+    if not isinstance(occurrence, dict) or occurrence.get("error_signature") != binding.signature or occurrence.get("delivery_key") != binding.delivery_key or occurrence.get("delivery_binding") != {"origin_ref": origin_ref, "channel_id": channel_id}:
+        raise ValueError("attention recovery binding does not match the ledger")
+    return binding
+
+
+def _attention_item(entry: Any) -> dict[str, Any] | None:
+    event = entry.get("event") if isinstance(entry, dict) else None
+    extra = event.get("extra") if isinstance(event, dict) else None
+    items = extra.get("items") if isinstance(extra, dict) else None
+    if isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict):
+        return items[0]
+    return None
+
+
+def _attention_occurrence_state(persist_dir: Path, entry: Any) -> tuple[bool, bool]:
+    item = _attention_item(entry)
+    if item is None:
+        return False, False
+    try:
+        from .worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+        home = persist_dir.parents[2]
+        state = load_failure_state(dispatch_failure_state_dir(home))
+        issue = state["issues"].get(str(int(item["issue_id"])))
+        occurrence = issue.get("occurrences", {}).get(str(item["occurrence_id"])) if isinstance(issue, dict) else None
+    except Exception:
+        return False, False
+    if not isinstance(occurrence, dict) or occurrence.get("error_signature") != item.get("signature"):
+        return False, False
+    return occurrence.get("handled_at") is not None, occurrence.get("retirement") is not None
+
+
+def _retire_attention_entry(persist_dir: Path, entry: Any, reason: str) -> bool:
+    item = _attention_item(entry)
+    if item is None:
+        return False
+    try:
+        from .worklink.dispatch_failures import dispatch_failure_state_dir, retire_attention
+
+        retired = retire_attention(
+            dispatch_failure_state_dir(persist_dir.parents[2]),
+            int(item["issue_id"]),
+            str(item["occurrence_id"]),
+            reason,
+        )
+        return retired or _attention_occurrence_state(persist_dir, entry)[1]
+    except Exception:
+        return False
+
+
+async def prepare_attention_event(home: Path, persist_dir: Path, event: AgentEvent) -> bool:
+    if event.channel_id != "poller:worklink-attention" or event.service_principal != "poller:worklink-attention" or not event.source_id:
+        raise ValueError("attention event identity mismatch")
+    items = event.extra.get("items") if isinstance(event.extra, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise ValueError("attention event requires one item")
+    item = items[0]
+    state = await asyncio.to_thread(_load_state, persist_dir)
+    if state.get("_unreadable_path"):
+        raise ValueError("attention recovery state unavailable")
+    if event.source_id in state["inflight"]:
+        return False
+    from .worklink.dispatch_failures import bind_attention_origin, dispatch_failure_state_dir
+
+    bound = await asyncio.to_thread(
+        bind_attention_origin,
+        dispatch_failure_state_dir(home),
+        int(item["issue_id"]),
+        str(item["signature"]),
+        str(item["occurrence_id"]),
+        event.source_id,
+        event.channel_id,
+    )
+    if not bound:
+        raise ValueError("attention event cannot bind ledger occurrence")
+    now = _utc_now_iso()
+    state["inflight"][event.source_id] = {
+        "attempts": 0,
+        "stashed_at": now,
+        "enqueued_at": now,
+        "scan_from": now,
+        "event": _attention_stash_payload(event),
+        "pending_enqueue": True,
+    }
+    await asyncio.to_thread(_save_state_strict, persist_dir, state)
+    return True
+
+
+async def commit_attention_event_accepted(
+    persist_dir: Path,
+    event: AgentEvent,
+    *,
+    enqueued_at: str,
+) -> None:
+    state = await asyncio.to_thread(_load_state, persist_dir)
+    if state.get("_unreadable_path"):
+        raise OSError("attention recovery state unavailable")
+    entry = state["inflight"].get(event.source_id)
+    if not isinstance(entry, dict) or entry.get("event") != _attention_stash_payload(event):
+        raise OSError("attention recovery binding changed before acceptance")
+    entry["enqueued_at"] = enqueued_at
+    entry["stashed_at"] = enqueued_at
+    entry.pop("pending_enqueue", None)
+    await asyncio.to_thread(_save_state_strict, persist_dir, state)
 
 
 def _utc_now() -> datetime:
@@ -198,6 +353,13 @@ def _save_state(persist_dir: Path, state: dict) -> None:
         log.warning("poller recovery: state save failed for %s: %s", persist_dir, exc)
 
 
+def _save_state_strict(persist_dir: Path, state: dict) -> None:
+    if state.get("_unreadable_path"):
+        raise OSError("poller recovery state is unreadable")
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(_state_path(persist_dir), state)
+
+
 def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
     """Return a JSON-native event payload without stringifying IFC sets."""
     payload = asdict(replace(event, continuation_auth_context=None))
@@ -238,6 +400,9 @@ def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
             "created_at": labels.created_at,
         }
     return payload
+
+
+_attention_stash_payload = _event_to_stash
 
 
 async def stash_enqueued_event(
@@ -660,13 +825,40 @@ async def reconcile_failed_turns(
 
     # GC abandoned entries first so a vanished turn can't pin the stash
     # forever (#310).
-    summary["expired"], summary["dropped"] = _gc_expired_inflight(
-        inflight, stash_ttl_hours, now_dt,
-    )
+    if poller_name == "worklink-attention":
+        cutoff = stash_ttl_hours * 3600.0
+        for source_id in list(inflight):
+            entry = inflight.get(source_id)
+            if not isinstance(entry, dict):
+                continue
+            stashed = _parse_iso(entry.get("stashed_at"))
+            if stashed is not None and (now_dt - stashed).total_seconds() > cutoff:
+                if _retire_attention_entry(persist_dir, entry, "stash_expired"):
+                    del inflight[source_id]
+                    summary["expired"] += 1
+    else:
+        summary["expired"], summary["dropped"] = _gc_expired_inflight(
+            inflight, stash_ttl_hours, now_dt,
+        )
 
     # Pending entries have a separate count ceiling, including legacy ledgers
     # that grew before this bound existed. Run before any replay can defer.
-    summary["gave_up"] += await _bound_pending_enqueue(inflight, poller_name, channel_id)
+    if poller_name == "worklink-attention":
+        pending_ids = [
+            source_id
+            for source_id, entry in inflight.items()
+            if isinstance(entry, dict) and entry.get("pending_enqueue") is True
+        ]
+        excess = max(0, len(pending_ids) - MAX_PENDING_ENQUEUE)
+        for source_id in pending_ids[:excess]:
+            entry = inflight[source_id]
+            if _retire_attention_entry(persist_dir, entry, "pending_overflow"):
+                del inflight[source_id]
+                summary["gave_up"] += 1
+    else:
+        summary["gave_up"] += await _bound_pending_enqueue(
+            inflight, poller_name, channel_id
+        )
 
     # Fast path: nothing stashed → nothing to reconcile. Advance the
     # watermark so the first real reconcile after events accrue doesn't
@@ -674,7 +866,11 @@ async def reconcile_failed_turns(
     # a future timestamp).
     if not inflight:
         state["last_reconciled"] = now_iso
-        await asyncio.to_thread(_save_state, persist_dir, state)
+        await asyncio.to_thread(
+            _save_state_strict if poller_name == "worklink-attention" else _save_state,
+            persist_dir,
+            state,
+        )
         return summary
 
     watermark = state.get("last_reconciled", "")
@@ -693,6 +889,15 @@ async def reconcile_failed_turns(
             entry = inflight[source_id]
             if isinstance(ts, str):
                 entry["last_outcome_at"] = ts
+            if otype == "turn_completed" and poller_name == "worklink-attention":
+                handled, retired = _attention_occurrence_state(persist_dir, entry)
+                if handled or retired:
+                    del inflight[source_id]
+                    summary["completed"] += 1
+                    if isinstance(ts, str):
+                        watermark = max(watermark, ts)
+                    continue
+                otype = "turn_failed"
             if otype == "turn_completed":
                 summary["completed"] += 1
                 if rec.get("attempt_disposition") == "exempt_hard_refusal":
@@ -747,7 +952,10 @@ async def reconcile_failed_turns(
                 # Per-trigger sizing and durable resumption are tracked by
                 # #992/#994 respectively.
                 if rec.get("result_subtype") == "tool_budget_exhausted":
-                    del inflight[source_id]
+                    if poller_name != "worklink-attention" or _retire_attention_entry(
+                        persist_dir, entry, "tool_budget_exhausted"
+                    ):
+                        del inflight[source_id]
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
@@ -792,8 +1000,11 @@ async def reconcile_failed_turns(
                             "poller recovery: gave_up emit failed for %s: %s",
                             source_id, exc,
                         )
-                    del inflight[source_id]
-                    summary["gave_up"] += 1
+                    if poller_name != "worklink-attention" or _retire_attention_entry(
+                        persist_dir, entry, "retry_exhausted"
+                    ):
+                        del inflight[source_id]
+                        summary["gave_up"] += 1
                 else:
                     if event is None:
                         # Unreconstructable stash (older schema) — drop so we
@@ -801,6 +1012,17 @@ async def reconcile_failed_turns(
                         del inflight[source_id]
                         summary["dropped"] += 1
                     else:
+                        prior_attempts = int(entry.get("attempts", 0))
+                        if poller_name == "worklink-attention":
+                            entry["attempts"] = attempts
+                            try:
+                                await asyncio.to_thread(
+                                    _save_state_strict, persist_dir, state
+                                )
+                            except OSError:
+                                entry["attempts"] = prior_attempts
+                                summary["deferred"] += 1
+                                break
                         try:
                             accepted = await enqueue(event)
                         except Exception as exc:  # noqa: BLE001
@@ -817,6 +1039,15 @@ async def reconcile_failed_turns(
                             entry.pop("deferred_since", None)
                             summary["reenqueued"] += 1
                         else:
+                            if poller_name == "worklink-attention":
+                                entry["attempts"] = prior_attempts
+                                try:
+                                    await asyncio.to_thread(
+                                        _save_state_strict, persist_dir, state
+                                    )
+                                except OSError:
+                                    summary["deferred"] += 1
+                                    break
                             deferred_dt = _parse_iso(entry.get("deferred_since"))
                             if deferred_dt is None or deferred_dt.tzinfo is None:
                                 deferred_dt = now_dt
@@ -833,8 +1064,11 @@ async def reconcile_failed_turns(
                                     max(0.0, (now_dt - deferred_dt).total_seconds()),
                                 )
                             if (now_dt - deferred_dt).total_seconds() >= max_defer_seconds:
-                                del inflight[source_id]
-                                summary["dropped"] += 1
+                                if poller_name != "worklink-attention" or _retire_attention_entry(
+                                    persist_dir, entry, "enqueue_stall"
+                                ):
+                                    del inflight[source_id]
+                                    summary["dropped"] += 1
                                 log.warning(
                                     "poller recovery: deferred source retired "
                                     "poller=%s channel_id=%s reason=enqueue_stall_timeout",
@@ -925,14 +1159,26 @@ async def reconcile_failed_turns(
                         "poller recovery: gave_up emit failed for %s: %s",
                         source_id, exc,
                     )
-                del inflight[source_id]
-                summary["gave_up"] += 1
+                if poller_name != "worklink-attention" or _retire_attention_entry(
+                    persist_dir, entry, "retry_exhausted"
+                ):
+                    del inflight[source_id]
+                    summary["gave_up"] += 1
                 continue
             if event is None:
                 del inflight[source_id]
                 summary["dropped"] += 1
                 continue
             enqueued_at = _utc_now_iso()
+            prior_attempts = int(entry.get("attempts", 0))
+            if poller_name == "worklink-attention" and not pending_enqueue:
+                entry["attempts"] = attempts
+                try:
+                    await asyncio.to_thread(_save_state_strict, persist_dir, state)
+                except OSError:
+                    entry["attempts"] = prior_attempts
+                    summary["deferred"] += 1
+                    break
             try:
                 accepted = await enqueue(event)
             except Exception as exc:  # noqa: BLE001
@@ -942,6 +1188,12 @@ async def reconcile_failed_turns(
                 )
                 accepted = False
             if not accepted:
+                if poller_name == "worklink-attention" and not pending_enqueue:
+                    entry["attempts"] = prior_attempts
+                    try:
+                        await asyncio.to_thread(_save_state_strict, persist_dir, state)
+                    except OSError:
+                        pass
                 summary["deferred"] += 1
                 break
             entry["enqueued_at"] = enqueued_at
@@ -965,5 +1217,9 @@ async def reconcile_failed_turns(
         # No outcomes seen → keep advancing so we don't rescan history; any
         # future outcome for an in-flight item has a later timestamp anyway.
         state["last_reconciled"] = watermark or now_iso
-    await asyncio.to_thread(_save_state, persist_dir, state)
+    await asyncio.to_thread(
+        _save_state_strict if poller_name == "worklink-attention" else _save_state,
+        persist_dir,
+        state,
+    )
     return summary

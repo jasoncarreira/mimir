@@ -1,5 +1,12 @@
 # Authorization reference
 
+The `poller:worklink-attention` service uses a custom scope-contained profile with
+only `worklink_attention_inspect`, `worklink_attention_ack`, and `operator_alert`.
+These tools require the active server-created service carrier, exact poller channel
+and origin, one matching recovery-stash item, and the same authoritative ledger
+binding. Interactive users, including administrators, public ingress, other
+services, and forged configuration are denied in shadow and enforced modes.
+
 This is the authoritative operator and contributor reference for Mimir's
 requester-resource authorization system. It describes the implementation in
 `mimir/access_control.py`, the frozen carrier in `mimir/models.py`, SAGA

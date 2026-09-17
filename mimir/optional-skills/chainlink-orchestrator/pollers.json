@@ -42,6 +42,22 @@
         "GOOGLE_API_KEY",
         "VOYAGE_API_KEY"
       ]
+    },
+    {
+      "name": "worklink-attention",
+      "command": "python3 scripts/attention_poller.py",
+      "cron": "*/5 * * * *",
+      "priority": "high",
+      "batch_size": 1,
+      "recover_failed_turns": true,
+      "trust_source": "trusted_system",
+      "authority": {
+        "profile": "custom",
+        "tier": "scope-contained",
+        "capabilities": ["worklink_attention_inspect", "worklink_attention_ack", "operator_alert"],
+        "scoped_roots": ["state"]
+      },
+      "pass_env": ["MIMIR_HOME", "MIMIR_SOURCE_DIR"]
     }
   ]
 }

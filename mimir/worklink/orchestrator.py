@@ -22,6 +22,7 @@ import stat
 import subprocess
 import tempfile
 import unicodedata
+import uuid
 import warnings
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
@@ -44,7 +45,12 @@ from .compute import (
     LocalSubprocessComputeBackend,
     with_worker_environment,
 )
-from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
+from .claims import (
+    ChainlinkClaims,
+    ClaimRecord,
+    WORKLINK_EPIC_LABEL,
+    claim_records_from_comments,
+)
 from .evidence import (
     EvidenceValidation,
     TestResult,
@@ -179,6 +185,8 @@ class WorklinkRunResult:
     preserved_ref: str | None = None
     preservation_error: str | None = None
     next: str | None = None
+    attention_source: str | None = None
+    attention_secondary_faults: tuple[dict[str, str], ...] = ()
 
 
 @dataclass
@@ -698,6 +706,9 @@ class WorklinkRunner:
                     started_at=datetime.now(UTC).isoformat(),
                     process_start_ticks=process_start_ticks(os.getpid()),
                     phase="claiming",
+                    autonomous=autonomous,
+                    execution_id=_attention_protocol_value("WORKLINK_EXECUTION_ID"),
+                    invocation_id=_attention_protocol_value("WORKLINK_INVOCATION_ID"),
                 ),
             )
             claiming_state_written = True
@@ -719,7 +730,13 @@ class WorklinkRunner:
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
-            return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
+            return WorklinkRunResult(
+                issue.issue_id,
+                None,
+                "blocked",
+                reason="attempts_exhausted",
+                attention_source="leaf_exhaustion",
+            )
         if not claim.claimed or claim.record is None:
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
@@ -729,8 +746,13 @@ class WorklinkRunner:
                 reason=claim.reason or "claim_failed",
             )
             return WorklinkRunResult(
-                issue.issue_id, None, _claim_refusal_status(claim.reason),
-                reason=claim.reason or "claim_failed"
+                issue.issue_id, None, _claim_refusal_status(claim.reason, claim.reason_code),
+                reason=claim.reason or "claim_failed",
+                attention_source=(
+                    None
+                    if _claim_refusal_status(claim.reason, claim.reason_code) == "refused"
+                    else "leaf_claim"
+                ),
             )
         record = claim.record
         terminal_release = _TerminalClaimRelease(
@@ -802,6 +824,7 @@ class WorklinkRunner:
                         "not a parent-pointing worktree, to avoid exposing other checkouts "
                         "(chainlink #517/#1019)"
                     ),
+                    attention_source="leaf_checkout",
                 )
             root_dirty_before = _dirty_paths(self.repo, runner=runner)
             prompt = render_work_order(
@@ -875,6 +898,7 @@ class WorklinkRunner:
                             test_command=test_cmd,
                             started_at=started,
                             test_env=spec.backend_config.get("test_env", {}),
+                            claim_record=record,
                         )
                     except OSError as exc:
                         _log_event(
@@ -994,6 +1018,7 @@ class WorklinkRunner:
                 reason=str(exc),
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
+                attention_source="leaf_postclaim",
             )
         except BaseException as exc:
             # No terminal routing occurred. Keep both recovery handles, even
@@ -1106,6 +1131,7 @@ class WorklinkRunner:
                 test_command=test_cmd,
                 started_at=started,
                 test_env=spec.backend_config.get("test_env", {}),
+                claim_record=claim_record,
             )
 
         # After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -1398,6 +1424,21 @@ class WorklinkRunner:
                 if cleanup_error
                 else validation.evidence.failure_reason if raw.exit_code != 0
                 else validation.evidence.blocked_reason if validation.status == "blocked"
+                else None
+            ),
+            attention_source=(
+                "leaf_launch"
+                if compute_result.launch_error
+                else "leaf_output_overflow"
+                if raw.output_overflow
+                else "leaf_gate_timeout"
+                if "gate_timed_out" in validation.reasons
+                else "leaf_gate_missing"
+                if "gate_command_not_found" in validation.reasons
+                else "leaf_backend_blocked"
+                if validation.status == "blocked"
+                else "leaf_work_failed"
+                if raw.exit_code != 0
                 else None
             ),
         )
@@ -1899,7 +1940,13 @@ class WorklinkRunner:
                 issue_id=issue_id,
                 reason="attempts_exhausted",
             )
-            return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
+            return WorklinkRunResult(
+                issue_id,
+                None,
+                "blocked",
+                reason="attempts_exhausted",
+                attention_source="epic_exhaustion",
+            )
         if not claim.claimed or claim.record is None:
             reason = claim.reason or "claim_failed"
             _log_event(
@@ -1908,7 +1955,15 @@ class WorklinkRunner:
                 reason=reason,
             )
             return WorklinkRunResult(
-                issue_id, None, _claim_refusal_status(reason), reason=reason
+                issue_id,
+                None,
+                _claim_refusal_status(reason, claim.reason_code),
+                reason=reason,
+                attention_source=(
+                    None
+                    if _claim_refusal_status(reason, claim.reason_code) == "refused"
+                    else "epic_claim"
+                ),
             )
         claim_record = claim.record
         _log_event(
@@ -2010,6 +2065,15 @@ class WorklinkRunner:
                     observed_at=None,
                     controller_phase="running",
                     transcript=None,
+                    autonomous=autonomous,
+                    execution_id=_attention_protocol_value("WORKLINK_EXECUTION_ID") or uuid.uuid4().hex,
+                    launch_id=uuid.uuid4().hex,
+                    claim_identity={
+                        "issue_id": claim_record.issue_id,
+                        "attempt": claim_record.attempt,
+                        "agent_id": claim_record.agent_id,
+                        "claimed_at": claim_record.claimed_at.isoformat(),
+                    },
                 )
                 _create_factory_sandbox(factory_record, lease)
                 _prepare_factory_sandbox_permissions(
@@ -2020,6 +2084,8 @@ class WorklinkRunner:
                 factory_record = replace(factory_record, handle=handle)
                 try:
                     save_factory_record(self.home, factory_record)
+                    if autonomous:
+                        _record_factory_started(self.home, factory_record, recovery=False)
                 except BaseException:
                     await _cancel_and_cleanup_factory_handle(compute, handle)
                     raise
@@ -2093,6 +2159,7 @@ class WorklinkRunner:
                 reason=reason,
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
+                attention_source="epic_controller",
             )
         finally:
             released = _release_issue_and_clear_run_state(
@@ -2106,7 +2173,11 @@ class WorklinkRunner:
             reason = "terminal recovery incomplete: Chainlink lock release failed"
             if result.reason:
                 reason = f"{result.reason}; {reason}"
-            result = replace(result, status="failed", reason=reason)
+            result = replace(
+                result,
+                status=result.status if result.status == "partial" else "failed",
+                reason=reason,
+            )
         return result
 
     async def _recover_factory_070(
@@ -2268,9 +2339,13 @@ class WorklinkRunner:
             handle=handle,
             controller_phase="running",
             transcript=None,
+            launch_id=uuid.uuid4().hex,
+            autonomous=retained.autonomous,
         )
         try:
             save_factory_record(self.home, relaunched)
+            if relaunched.autonomous:
+                _record_factory_started(self.home, relaunched, recovery=True)
         except BaseException:
             await _cancel_and_cleanup_factory_handle(compute, handle)
             raise
@@ -2551,6 +2626,7 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=park_report,
                 next=status.next,
+                attention_source="factory_needs_human",
             )
             _log_event(
                 "worklink_transition",
@@ -2580,6 +2656,9 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
                 next=status.next,
+                attention_source=(
+                    "factory_partial" if status.status == "partial" else "factory_blocked"
+                ),
             )
             _log_event(
                 "worklink_transition",
@@ -3397,17 +3476,354 @@ def _record_post_publication_error(
         pass
 
 
-def _claim_refusal_status(reason: str | None) -> str:
+def _claim_refusal_status(reason: str | None, reason_code: object = None) -> str:
     # Only expected admission outcomes are benign; lock/guard faults still page.
-    if reason in {
+    code = str(reason_code) if reason_code is not None else reason
+    if code in {
         "duplicate_run_live",
-        "claim_contention_exhausted",
         "lifecycle_state_incompatible",
         "review_ready_evidence_exists",
         "publication_intent_exists",
-    } or (reason or "").startswith("concurrency cap reached ("):
+        "concurrency_cap",
+    }:
         return "refused"
     return "failed"
+
+
+def _reserve_attention_execution(
+    home: Path,
+    issue_id: int,
+    source: str,
+    *,
+    autonomous: bool,
+) -> dict[str, Any] | None:
+    if not autonomous:
+        return None
+    from .dispatch_failures import dispatch_failure_state_dir, reserve_execution
+
+    reservation_id = _attention_protocol_value("WORKLINK_RESERVATION_ID") or uuid.uuid4().hex
+    execution_id = _attention_protocol_value("WORKLINK_EXECUTION_ID") or uuid.uuid4().hex
+    return reserve_execution(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        source=_attention_protocol_value("WORKLINK_RESERVATION_SOURCE") or source,
+        operation_stage="controller",
+        execution_id=execution_id,
+        reservation_id=reservation_id,
+        invocation_id=_attention_protocol_value("WORKLINK_INVOCATION_ID"),
+    )
+
+
+def _attention_protocol_value(name: str) -> str | None:
+    return os.environ.get(name)
+
+
+def _close_attention_excluded(
+    home: Path,
+    issue_id: int,
+    reservation: dict[str, Any] | None,
+    witness: str,
+) -> None:
+    if reservation is None:
+        return
+    from .dispatch_failures import close_reservation_excluded, dispatch_failure_state_dir
+
+    close_reservation_excluded(
+        dispatch_failure_state_dir(home),
+        issue_id,
+        str(reservation["reservation_id"]),
+        witness=witness or "excluded",
+    )
+
+
+def _attention_claim(home: Path, issue_id: int, attempt: int | None) -> ClaimRecord | None:
+    if attempt is None:
+        return None
+    try:
+        runner = _runner_for_home(home, "chainlink")
+        issue = ChainlinkIssueReader(runner=runner).read(issue_id)
+    except Exception:
+        return None
+    records = [
+        record
+        for record in claim_records_from_comments(issue.comments)
+        if record.issue_id == issue_id and record.attempt == attempt
+    ]
+    return max(records, key=lambda record: record.claimed_at) if records else None
+
+
+def _record_attention_result(
+    home: Path,
+    result: WorklinkRunResult,
+    reservation: dict[str, Any] | None,
+    *,
+    source: str,
+    lifecycle_success: bool = False,
+) -> None:
+    from .attention import (
+        AccountingBasis,
+        AttentionCause,
+        AttentionFacts,
+        AttentionKind,
+        AttentionOutcome,
+        AttentionRecord,
+        AttentionSource,
+        ClaimRelation,
+        Settlement,
+        ValidationDetail,
+        classify_attention,
+    )
+    from .dispatch_failures import (
+        checkpoint_reservation,
+        dispatch_failure_state_dir,
+        error_signature,
+        mark_attention_settlement,
+        promote_reservation,
+        reserve_execution,
+        terminal_error,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    if reservation is None:
+        reservation = reserve_execution(
+            state_dir,
+            issue_id=result.issue_id,
+            source=source,
+            operation_stage="terminal",
+        )
+    claim = _attention_claim(home, result.issue_id, result.attempt)
+    if claim is not None:
+        checkpoint_reservation(
+            state_dir,
+            result.issue_id,
+            str(reservation["reservation_id"]),
+            confirmed_claim={
+                "issue_id": claim.issue_id,
+                "attempt": claim.attempt,
+                "agent_id": claim.agent_id,
+                "claimed_at": claim.claimed_at.isoformat(),
+            },
+            claim_binding_state="confirmed",
+            operation_stage="terminal",
+        )
+    factory_status = None
+    try:
+        records = load_factory_records_for_issue(home, result.issue_id)
+        exact = [record for record in records if result.attempt is None or record.attempt == result.attempt]
+        factory_status = exact[0].status if len(exact) == 1 else None
+    except Exception:
+        factory_status = None
+    primary = {
+        "partial": AttentionOutcome.PARTIAL,
+        "needs-human": AttentionOutcome.NEEDS_HUMAN,
+        "blocked": AttentionOutcome.BLOCKED,
+        "failed": AttentionOutcome.GENUINE_FAILURE,
+        "review_ready": AttentionOutcome.SUCCEEDED,
+        "completed": AttentionOutcome.SUCCEEDED,
+    }.get(result.status)
+    source_value = AttentionSource(source)
+    kind = AttentionKind.FACTORY_SUCCEEDED if lifecycle_success else AttentionKind.ATTENTION
+    facts = AttentionFacts(
+        kind=kind,
+        primary_outcome=primary,
+        original_result_status=result.status,
+        factory_status=factory_status,
+        verified_completion=lifecycle_success,
+        normalized_leaf_result=result.attempt is not None and source in {
+            "leaf_work_failed",
+            "leaf_backend_blocked",
+            "leaf_gate_timeout",
+            "leaf_gate_missing",
+            "leaf_output_overflow",
+        },
+        preclaim=result.attempt is None,
+        exhaustion=result.reason == "attempts_exhausted",
+        claim_relation=ClaimRelation.CURRENT_CLAIM if claim is not None else ClaimRelation.NONE,
+    )
+    accounting = classify_attention(facts)
+    cause = None if lifecycle_success else {
+        "leaf_template": AttentionCause.TEMPLATE_BLOCKED,
+        "leaf_checkout": AttentionCause.CHECKOUT_UNSAFE,
+        "leaf_backend_blocked": AttentionCause.BACKEND_BLOCKED,
+        "leaf_exhaustion": AttentionCause.ATTEMPTS_EXHAUSTED,
+        "epic_exhaustion": AttentionCause.ATTEMPTS_EXHAUSTED,
+        "factory_partial": AttentionCause.FACTORY_PARTIAL,
+        "factory_needs_human": AttentionCause.FACTORY_NEEDS_HUMAN,
+        "factory_blocked": AttentionCause.FACTORY_BLOCKED,
+        "leaf_work_failed": AttentionCause.WORK_FAILED,
+        "leaf_gate_timeout": AttentionCause.VALIDATION_BLOCKED,
+        "leaf_gate_missing": AttentionCause.VALIDATION_BLOCKED,
+        "leaf_output_overflow": AttentionCause.VALIDATION_BLOCKED,
+        "leaf_launch": AttentionCause.LAUNCH_FAILED,
+        "startup_leaf_spawn": AttentionCause.LAUNCH_FAILED,
+        "startup_factory_spawn": AttentionCause.LAUNCH_FAILED,
+        "leaf_claim": AttentionCause.CLAIM_FAILED,
+        "epic_claim": AttentionCause.CLAIM_FAILED,
+    }.get(source, AttentionCause.CONTROLLER_FAILED)
+    reason = terminal_error(result.reason or result.status)
+    signature = error_signature(reason)
+    role = "success" if lifecycle_success else "terminal"
+    identity = (
+        f"{reservation['execution_id']}:{source}:{role}:"
+        f"{claim.attempt if claim is not None else 'preclaim'}"
+    )
+    occurrence_id = uuid.uuid5(uuid.NAMESPACE_URL, identity).hex
+    record = AttentionRecord(
+        occurrence_id=occurrence_id,
+        delivery_key=f"worklink-attention:{result.issue_id}:{signature}:{occurrence_id}",
+        kind=kind,
+        cause=cause,
+        issue_id=result.issue_id,
+        execution_id=str(reservation["execution_id"]),
+        source=source_value,
+        outcome=accounting.outcome,
+        accounting_basis=accounting.basis,
+        attempt_consumed=accounting.attempt_consumed,
+        settlement=accounting.settlement,
+        claim=claim,
+        error_signature=signature,
+        attempt=result.attempt,
+        reason=reason,
+        original_result_status=result.status,
+        original_factory_status=getattr(factory_status, "status", None),
+        primary_source=source_value,
+        secondary_faults=result.attention_secondary_faults,
+        refs={
+            "evidence": str(result.evidence_path) if result.evidence_path else None,
+            "checkout": str(result.checkout) if result.checkout else None,
+            "branch": result.branch,
+            "pr_url": result.pr_url,
+            "preserved_ref": result.preserved_ref,
+            "preservation_error": result.preservation_error,
+            "log": os.environ.get("WORKLINK_RUN_LOG"),
+        },
+        factory_projection=factory_status.to_json() if factory_status is not None else None,
+        next=result.next,
+        next_present=result.next is not None,
+        inhibited=not lifecycle_success,
+        validation_detail={
+            "leaf_gate_timeout": ValidationDetail.GATE_TIMED_OUT,
+            "leaf_gate_missing": ValidationDetail.GATE_COMMAND_NOT_FOUND,
+            "leaf_output_overflow": ValidationDetail.OUTPUT_OVERFLOW,
+        }.get(source),
+    )
+    promote_reservation(
+        state_dir,
+        result.issue_id,
+        str(reservation["reservation_id"]),
+        record,
+    )
+    if accounting.settlement is Settlement.PENDING and claim is not None:
+        claims = ChainlinkClaims(
+            agent_id=claim.agent_id,
+            runner=_list_runner(_runner_for_home(home, "chainlink")),
+            home_path=home,
+            max_attempts=WorklinkConfig.load(home / "worklink.yaml").defaults.max_claim_attempts,
+        )
+        if claims.mark_attempt_nonconsuming(claim, occurrence_id):
+            mark_attention_settlement(
+                state_dir, result.issue_id, occurrence_id, Settlement.APPLIED.value
+            )
+    if not lifecycle_success:
+        try:
+            ChainlinkClaims(
+                agent_id=claim.agent_id if claim else "mimir-worklink",
+                runner=_list_runner(_runner_for_home(home, "chainlink")),
+                home_path=home,
+                max_attempts=WorklinkConfig.load(home / "worklink.yaml").defaults.max_claim_attempts,
+            ).transition_issue(
+                result.issue_id,
+                status="blocked",
+                review_ready=False,
+                attempt=result.attempt,
+                reason=reason,
+            )
+        except Exception:
+            pass
+
+
+def _record_factory_started(
+    home: Path,
+    factory_record: FactoryRunRecord,
+    *,
+    recovery: bool,
+) -> None:
+    from .attention import (
+        AccountingBasis,
+        AttentionKind,
+        AttentionOutcome,
+        AttentionRecord,
+        AttentionSource,
+        Settlement,
+    )
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        error_signature,
+        promote_reservation,
+        reserve_execution,
+    )
+
+    if not factory_record.autonomous or not factory_record.execution_id or not factory_record.launch_id:
+        return
+    state_dir = dispatch_failure_state_dir(home)
+    source = (
+        AttentionSource.FACTORY_RECOVERY_START
+        if recovery
+        else AttentionSource.FACTORY_INITIAL_START
+    )
+    reservation_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{factory_record.execution_id}:{factory_record.launch_id}:start",
+    ).hex
+    reservation = reserve_execution(
+        state_dir,
+        issue_id=factory_record.issue_id,
+        source=source.value,
+        operation_stage="factory_started",
+        execution_id=factory_record.execution_id,
+        run_id=factory_record.run_id,
+        launch_id=factory_record.launch_id,
+        reservation_id=reservation_id,
+    )
+    signature = error_signature(
+        f"{source.value}:{factory_record.run_id}:{factory_record.launch_id}"
+    )
+    occurrence_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"{factory_record.run_id}:{factory_record.attempt}:{factory_record.launch_id}",
+    ).hex
+    record = AttentionRecord(
+        occurrence_id=occurrence_id,
+        delivery_key=(
+            f"worklink-attention:{factory_record.issue_id}:{signature}:{occurrence_id}"
+        ),
+        kind=AttentionKind.FACTORY_STARTED,
+        cause=None,
+        issue_id=factory_record.issue_id,
+        run_id=factory_record.run_id,
+        execution_id=factory_record.execution_id,
+        launch_id=factory_record.launch_id,
+        source=source,
+        outcome=AttentionOutcome.STARTED,
+        accounting_basis=AccountingBasis.PRECLAIM,
+        attempt_consumed=None,
+        settlement=Settlement.NOT_NEEDED,
+        error_signature=signature,
+        attempt=factory_record.attempt,
+        reason="factory recovery started" if recovery else "factory started",
+        refs={
+            "sandbox": factory_record.sandbox,
+            "branch": factory_record.branch,
+            "transcript": factory_record.transcript,
+        },
+        inhibited=False,
+    )
+    promote_reservation(
+        state_dir,
+        factory_record.issue_id,
+        str(reservation["reservation_id"]),
+        record,
+    )
 
 
 def run_worklink(
@@ -3421,6 +3837,9 @@ def run_worklink(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    reservation = _reserve_attention_execution(
+        home, issue_id, "leaf_run_boundary", autonomous=autonomous
+    )
     try:
         result = asyncio.run(
             WorklinkRunner(home=home, repo=repo).run(
@@ -3440,6 +3859,8 @@ def run_worklink(
             error=exc,
             exit_status=2 if isinstance(exc, LeafValidationError) else 1,
             autonomous=autonomous,
+            reservation=reservation,
+            source="leaf_template" if isinstance(exc, LeafValidationError) else "leaf_run_boundary",
         )
         raise
     if result.status == "failed":
@@ -3452,9 +3873,23 @@ def run_worklink(
             autonomous=autonomous,
             preserved_ref=result.preserved_ref,
             preservation_error=result.preservation_error,
+            reservation=reservation,
+            source=result.attention_source
+            or ("leaf_work_failed" if result.attempt is not None else "leaf_run_boundary"),
+        )
+    elif autonomous and result.status in {"blocked"}:
+        _record_attention_result(
+            home,
+            result,
+            reservation,
+            source=result.attention_source or "leaf_backend_blocked",
         )
     elif result.status == "completed":
-        _record_run_success(home, issue_id)
+        if autonomous:
+            _record_run_success(home, issue_id)
+            _close_attention_excluded(home, issue_id, reservation, "leaf_completed")
+    elif autonomous:
+        _close_attention_excluded(home, issue_id, reservation, result.status)
     # Parked and refused outcomes do not resolve or replace prior failure attention.
     # Leaving it active preserves backoff without inflating its consecutive count.
     return result
@@ -3470,6 +3905,8 @@ def _record_run_failure(
     autonomous: bool,
     preserved_ref: str | None = None,
     preservation_error: str | None = None,
+    reservation: dict[str, Any] | None = None,
+    source: str = "leaf_run_boundary",
 ) -> None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
@@ -3486,6 +3923,32 @@ def _record_run_failure(
     )
     if autonomous:
         try:
+            from .dispatch_failures import (
+                is_transient_contention,
+                record_transient_contention,
+            )
+
+            if (
+                attempt is None
+                and reservation is not None
+                and is_transient_contention(str(error))
+                and not record_transient_contention(
+                    dispatch_failure_state_dir(home),
+                    issue_id,
+                    str(reservation["reservation_id"]),
+                    str(error),
+                )
+            ):
+                return
+            result = WorklinkRunResult(
+                issue_id=issue_id,
+                attempt=attempt,
+                status="failed",
+                reason=safe_error,
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
+            )
+            _record_attention_result(home, result, reservation, source=source)
             record_failure(
                 dispatch_failure_state_dir(home),
                 issue_id=issue_id,
@@ -3496,7 +3959,7 @@ def _record_run_failure(
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
             )
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             pass
 
 
@@ -3530,6 +3993,9 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    reservation = _reserve_attention_execution(
+        home, issue_id, "epic_run_boundary", autonomous=autonomous
+    )
     try:
         result = asyncio.run(
             WorklinkRunner(home=home, repo=repo).run_epic(
@@ -3545,6 +4011,8 @@ def run_worklink_epic(
             error=exc,
             exit_status=1,
             autonomous=autonomous,
+            reservation=reservation,
+            source="epic_run_boundary",
         )
         raise
     if result.status == "failed":
@@ -3557,9 +4025,28 @@ def run_worklink_epic(
             autonomous=autonomous,
             preserved_ref=result.preserved_ref,
             preservation_error=result.preservation_error,
+            reservation=reservation,
+            source=result.attention_source or "epic_controller",
+        )
+    elif autonomous and result.status in {"blocked", "partial", "needs-human"}:
+        _record_attention_result(
+            home,
+            result,
+            reservation,
+            source=result.attention_source or {
+                "partial": "factory_partial",
+                "needs-human": "factory_needs_human",
+                "blocked": "epic_exhaustion" if result.reason == "attempts_exhausted" else "factory_blocked",
+            }[result.status],
         )
     elif result.status in {"completed", "review_ready"}:
-        _record_run_success(home, issue_id)
+        if autonomous:
+            _record_run_success(home, issue_id)
+            _record_attention_result(
+                home, result, reservation, source="factory_success", lifecycle_success=True
+            )
+    elif autonomous:
+        _close_attention_excluded(home, issue_id, reservation, result.status)
     return result
 
 
@@ -3577,11 +4064,13 @@ def _persist_run_state(
     test_command: str | None,
     started_at: datetime,
     test_env: Mapping[str, str] | None = None,
+    claim_record: ClaimRecord | None = None,
 ) -> None:
     """Record the worker handle so a fresh controller can reattach (#561).
 
     A failed write is fatal to this launch: the caller cancels the worker rather
     than allowing a claimed run with no operator-visible liveness record."""
+    previous = load_run_state(home, issue.issue_id)
     save_run_state(
         home,
         WorklinkRunState(
@@ -3603,6 +4092,22 @@ def _persist_run_state(
             shim_pid=handle.shim_pid,
             phase="spawned",
             test_env=dict(test_env or {}),
+            autonomous=previous.autonomous if previous is not None else False,
+            execution_id=previous.execution_id if previous is not None else None,
+            launch_id=previous.launch_id if previous is not None else None,
+            claim_identity=(
+                {
+                    "issue_id": claim_record.issue_id,
+                    "attempt": claim_record.attempt,
+                    "agent_id": claim_record.agent_id,
+                    "claimed_at": claim_record.claimed_at.isoformat(),
+                }
+                if claim_record is not None
+                else previous.claim_identity
+                if previous is not None
+                else None
+            ),
+            invocation_id=previous.invocation_id if previous is not None else None,
         ),
     )
 

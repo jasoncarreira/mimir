@@ -740,7 +740,7 @@ def test_preclaim_registry_crash_emits_scrubbed_failure_event(
     _reset_logger_for_tests()
 
 
-def test_preclaim_multiline_git_contention_does_not_persist_backoff(
+def test_preclaim_multiline_git_contention_persists_bounded_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
@@ -761,7 +761,10 @@ def test_preclaim_multiline_git_contention_does_not_persist_backoff(
     with pytest.raises(RuntimeError, match="Unable to create"):
         run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=True)
 
-    assert load_failure_state(state_dir)["issues"] == {}
+    entry = load_failure_state(state_dir)["issues"]["441"]
+    assert entry["transient_contention_observations"] == 1
+    assert entry["occurrences"] == {}
+    assert next(iter(entry["reservations"].values()))["closure"] == "excluded"
     assert not ambient_state_dir.exists()
 
 
@@ -851,7 +854,7 @@ def test_non_autonomous_failure_does_not_persist_dispatch_failure(
     assert not (tmp_path / "ambient-state").exists()
 
 
-def test_manual_success_clears_autonomous_failure_ledger(
+def test_manual_success_does_not_clear_autonomous_failure_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
@@ -876,7 +879,7 @@ def test_manual_success_clears_autonomous_failure_ledger(
     result = run_worklink(home=tmp_path, repo=tmp_path, issue_id=441, autonomous=False)
 
     assert result.status == "completed"
-    assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
+    assert load_failure_state(state_dir)["issues"]["441"]["active"] is True
     assert not (tmp_path / "ambient-state").exists()
 
 
@@ -885,7 +888,7 @@ def test_manual_success_clears_autonomous_failure_ledger(
     ("reason", "status"),
     [
         ("duplicate_run_live", "refused"),
-        ("claim_contention_exhausted", "refused"),
+        ("claim_contention_exhausted", "failed"),
         ("lifecycle_state_incompatible", "refused"),
         ("review_ready_evidence_exists", "refused"),
         ("publication_intent_exists", "refused"),
@@ -926,8 +929,19 @@ def test_claim_refusal_dispatch_failure_accounting(
     events: list[tuple[str, dict[str, object]]] = []
 
     def refuse_claim(self: ChainlinkClaims, issue_id: int, *args: object, **kwargs: object):
+        from mimir.worklink.claims import ClaimReasonCode
+
         claim_calls.append(issue_id)
-        return ClaimResult(False, reason=reason)
+        code = {
+            "duplicate_run_live": ClaimReasonCode.DUPLICATE_RUN_LIVE,
+            "claim_contention_exhausted": ClaimReasonCode.CLAIM_CONTENTION_EXHAUSTED,
+            "lifecycle_state_incompatible": ClaimReasonCode.LIFECYCLE_STATE_INCOMPATIBLE,
+            "review_ready_evidence_exists": ClaimReasonCode.REVIEW_READY_EVIDENCE_EXISTS,
+            "publication_intent_exists": ClaimReasonCode.PUBLICATION_INTENT_EXISTS,
+            "concurrency cap reached (1/1 active claims)": ClaimReasonCode.CONCURRENCY_CAP,
+            "concurrency cap reached (4/3 active claims)": ClaimReasonCode.CONCURRENCY_CAP,
+        }.get(reason, ClaimReasonCode.CLAIM_FAILED)
+        return ClaimResult(False, reason=reason, reason_code=code)
 
     monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
     monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
@@ -951,7 +965,12 @@ def test_claim_refusal_dispatch_failure_accounting(
         assert claim_calls == [441] * consecutive
         issues = load_failure_state(state_dir)["issues"]
         if status == "refused":
-            assert issues == {}
+            entry = issues["441"]
+            assert entry["occurrences"] == {}
+            assert all(
+                reservation["closure"] == "excluded"
+                for reservation in entry["reservations"].values()
+            )
             assert pending_failure_alerts(state_dir) == (set(), [])
             assert not any(name == "worklink_run_failed" for name, _ in events)
         else:
@@ -975,10 +994,10 @@ def test_claim_refusal_dispatch_failure_accounting(
     assert not worktree.exists()
     assert load_run_state(tmp_path, 441) is None
     assert not (tmp_path / "state" / "worklink" / "factory-runs").exists()
-    assert not any(
+    assert any(
         isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
         for call in calls
-    )
+    ) is (status == "failed")
 
 
 def test_leaf_dispatch_failure_clears_ledger_only_after_success(
@@ -1020,7 +1039,7 @@ def test_leaf_dispatch_failure_clears_ledger_only_after_success(
     assert parked_entry["consecutive"] == failed_entry["consecutive"] == 1
     assert parked_entry["retry_after"] == failed_entry["retry_after"]
     assert parked_entry["notified_signatures"] == failed_entry["notified_signatures"]
-    assert parked_entry["occurrence_id"] == failed_entry["occurrence_id"]
+    assert parked_entry["occurrence_id"] != failed_entry["occurrence_id"]
     backed_off, alerts = pending_failure_alerts(state_dir, now=now)
     assert backed_off == {701}
     assert [alert["issue_id"] for alert in alerts] == [701]
@@ -1031,7 +1050,7 @@ def test_leaf_dispatch_failure_clears_ledger_only_after_success(
     monkeypatch.setattr(WorklinkRunner, "run", completed_leaf)
     run_worklink(home=tmp_path, repo=tmp_path, issue_id=701, autonomous=False)
     entry = load_failure_state(state_dir)["issues"]["701"]
-    assert entry["active"] is False
+    assert entry["active"] is True
 
 
 def test_epic_dispatch_failure_clears_ledger_only_after_success(
@@ -1074,7 +1093,7 @@ def test_epic_dispatch_failure_clears_ledger_only_after_success(
     monkeypatch.setattr(WorklinkRunner, "run_epic", completed_epic)
     run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
     entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
-    assert entry["active"] is False
+    assert entry["active"] is True
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:
@@ -6162,8 +6181,14 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
         return cp(args)
 
     def claim_issue(self: ChainlinkClaims, issue_id: int, comments: object, **kwargs: object):
+        from mimir.worklink.claims import ClaimReasonCode
+
         observed.append(kwargs)
-        return ClaimResult(False, reason="concurrency cap reached (1/1 active claims)")
+        return ClaimResult(
+            False,
+            reason="concurrency cap reached (1/1 active claims)",
+            reason_code=ClaimReasonCode.CONCURRENCY_CAP,
+        )
 
     monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "1")
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))

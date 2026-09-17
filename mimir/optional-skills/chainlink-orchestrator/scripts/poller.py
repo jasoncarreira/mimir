@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from mimir.worklink.autonomy import factory_max_concurrent
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_lock_ids
 from mimir.worklink.continuation import consume_worklink_budget_continuations
+from mimir.worklink.control import reconcile_attention_accounting
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
     delivery_receipt_exists,
@@ -51,7 +53,21 @@ from mimir.worklink.dispatch_failures import (
     failure_state_transaction,
     mark_failure_notified,
     pending_failure_alerts,
+    issue_is_inhibited,
+    observe_rearm_state,
+    promote_reservation,
+    reserve_execution,
 )
+from mimir.worklink.attention import (
+    AccountingBasis,
+    AttentionCause,
+    AttentionKind,
+    AttentionOutcome,
+    AttentionRecord,
+    AttentionSource,
+    Settlement,
+)
+from mimir.worklink.dispatch_failures import error_signature, terminal_error
 
 
 READY_LABEL = "worklink:ready"
@@ -334,6 +350,25 @@ def _dispatch(
     factory_cap: int,
 ) -> bool:
     effective_coding_enabled = coding_enabled()
+    execution_id = uuid.uuid4().hex
+    reservation_id = uuid.uuid4().hex
+    try:
+        reservation = reserve_execution(
+            state_dir,
+            issue_id=item.issue_id,
+            source="detached_spawn",
+            operation_stage="spawn",
+            execution_id=execution_id,
+            reservation_id=reservation_id,
+            invocation_id=f"{item.mode}:{item.issue_id}",
+        )
+    except Exception as exc:
+        _emit({
+            "signal": "worklink_dispatch_failure_state_error",
+            "issue_id": item.issue_id,
+            "reason": f"{type(exc).__name__}: {exc}",
+        })
+        return False
     argv = [
         *run_bin,
         "worklink",
@@ -358,6 +393,9 @@ def _dispatch(
                 **os.environ,
                 "STATE_DIR": str(state_dir),
                 "WORKLINK_RUN_LOG": str(log_path),
+                "WORKLINK_EXECUTION_ID": execution_id,
+                "WORKLINK_RESERVATION_ID": reservation_id,
+                "WORKLINK_RESERVATION_SOURCE": "detached_spawn",
             },
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
@@ -365,6 +403,33 @@ def _dispatch(
             start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        safe_error = terminal_error(exc)
+        signature = error_signature(safe_error)
+        occurrence_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"{execution_id}:detached_spawn:terminal"
+        ).hex
+        record = AttentionRecord(
+            occurrence_id=occurrence_id,
+            delivery_key=f"worklink-attention:{item.issue_id}:{signature}:{occurrence_id}",
+            kind=AttentionKind.ATTENTION,
+            cause=AttentionCause.LAUNCH_FAILED,
+            issue_id=item.issue_id,
+            execution_id=execution_id,
+            source=AttentionSource.DETACHED_SPAWN,
+            outcome=AttentionOutcome.INFRASTRUCTURE_FAILURE,
+            accounting_basis=AccountingBasis.PRECLAIM,
+            attempt_consumed=False,
+            settlement=Settlement.NOT_NEEDED,
+            error_signature=signature,
+            reason=safe_error,
+            refs={"log": str(log_path)},
+        )
+        promote_reservation(
+            state_dir,
+            item.issue_id,
+            str(reservation["reservation_id"]),
+            record,
+        )
         _emit(
             {
                 "signal": "worklink_dispatch_failed",
@@ -482,8 +547,13 @@ def main() -> int:
     state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
-        backed_off_ids, alerts = pending_failure_alerts(state_dir)
-        alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
+        reconcile_attention_accounting(home)
+    except Exception as exc:
+        _emit({"signal": "worklink_attention_reconcile_failed", "reason": str(exc)})
+        return 0
+    try:
+        backed_off_ids, _alerts = pending_failure_alerts(state_dir)
+        alerts_acknowledged = True
     except OSError as exc:
         backed_off_ids = set()
         alerts_acknowledged = False
@@ -552,8 +622,19 @@ def main() -> int:
         label_blocked_ready_count,
         epic_ids,
     ) = ready_result
+    ready_ids = {item.issue_id for item in ready}
+    observe_rearm_state(
+        state_dir,
+        ready_issue_ids=ready_ids,
+        blocked_issue_ids=set(),
+    )
     actionable_epic_count = len(epic_ids)
-    dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
+    dispatch_ready = [
+        item
+        for item in ready
+        if item.issue_id not in backed_off_ids
+        and not issue_is_inhibited(state_dir, item.issue_id)
+    ]
     leaf_cap = _configured_cap(home)
     factory_cap = factory_max_concurrent()
     active = len(scope_active_worklink_lock_ids(active_lock_ids, exclude_ids=epic_ids))

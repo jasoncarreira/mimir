@@ -1097,6 +1097,26 @@ def reattach_inflight_worklink_runs(
             }
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
+            if state.autonomous:
+                from .worklink.orchestrator import (
+                    WorklinkRunResult,
+                    _record_attention_result,
+                )
+
+                _record_attention_result(
+                    home,
+                    WorklinkRunResult(
+                        state.issue_id,
+                        None,
+                        "failed",
+                        reason=str(exc),
+                        checkout=Path(state.checkout) if state.checkout else None,
+                        branch=state.branch or None,
+                        attention_source="startup_leaf_spawn",
+                    ),
+                    None,
+                    source="startup_leaf_spawn",
+                )
             continue
         finally:
             if log_fh not in (subprocess.DEVNULL, None):
@@ -1139,6 +1159,26 @@ def reattach_inflight_worklink_runs(
             }
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
+            if record.autonomous:
+                from .worklink.orchestrator import (
+                    WorklinkRunResult,
+                    _record_attention_result,
+                )
+
+                _record_attention_result(
+                    home,
+                    WorklinkRunResult(
+                        record.issue_id,
+                        None,
+                        "failed",
+                        reason=str(exc),
+                        checkout=Path(record.sandbox),
+                        branch=record.branch,
+                        attention_source="startup_factory_spawn",
+                    ),
+                    None,
+                    source="startup_factory_spawn",
+                )
             continue
         finally:
             if log_fh not in (subprocess.DEVNULL, None):

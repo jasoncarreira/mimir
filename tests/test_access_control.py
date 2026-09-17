@@ -16325,7 +16325,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
         SinkCategory.SPAWN: {"spawn_open_code", "worklink_run"},
         SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
-        SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
+            SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update", "worklink_attention_ack"},
         SinkCategory.SAGA: {"memory_store", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
         SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
         SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
@@ -16498,9 +16498,15 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     }
 
     flows[access_control.ToolFlowDirection.SOURCE].add("pr_job_log")
+    flows[access_control.ToolFlowDirection.SOURCE].add("worklink_attention_inspect")
+    flows[access_control.ToolFlowDirection.SINK].add("worklink_attention_ack")
     decisions[OperationDecision.RESOURCE_SCOPED].add("pr_job_log")
+    decisions[OperationDecision.RESOURCE_SCOPED].update({"worklink_attention_inspect", "worklink_attention_ack"})
     readable["pr_job_log"] = "repository"
+    readable["worklink_attention_inspect"] = "worklink"
     protected["pr_job_log"] = "repository"
+    protected["worklink_attention_inspect"] = "worklink"
+    destinations["worklink_attention_ack"] = "worklink_attention_ledger"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}

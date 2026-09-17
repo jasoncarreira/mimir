@@ -270,7 +270,7 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     return
                 state = json.load(handle)
-                if (not isinstance(state, dict) or state.get("version") != 1
+                if (not isinstance(state, dict) or state.get("version") not in {1, 2}
                         or not isinstance(state.get("issues"), dict)):
                     return
                 live = set()
@@ -3204,6 +3204,12 @@ async def run_poller(
                 integrity="trusted" if trusted else "untrusted",
                 integrity_effect="active_ingest",
             ))
+        source_id = (
+            f"{POLLER_CHANNEL_PREFIX}worklink-attention:"
+            f"{batch[0]['extras']['occurrence_id']}"
+            if poller.name == "worklink-attention" and len(batch) == 1
+            else f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}"
+        )
         event = AgentEvent(
             trigger="poller",
             channel_id=channel_id,
@@ -3211,13 +3217,32 @@ async def run_poller(
             service_authority=authority,
             content=content,
             source="poller",
-            source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
+            source_id=source_id,
             extra=_redact_poller_payload(extra, env, explicit_env_redact_keys),
             # Stamp provenance before recovery stashes the event. Retries now
             # round-trip the exact service label instead of rebuilding it from
             # ambient state after a failed turn.
             ifc_labels=item_labels,
         )
+        if poller.name == "worklink-attention":
+            if home is None:
+                rejected_count += 1
+                continue
+            try:
+                prepared = await poller_recovery.prepare_attention_event(
+                    home, persist_dir, event
+                )
+            except Exception as exc:
+                await log_event(
+                    "poller_attention_prepare_failed",
+                    poller=poller.name,
+                    error=f"{type(exc).__name__}: {exc}",
+                    batch_index=batch_idx,
+                )
+                rejected_count += 1
+                continue
+            if not prepared:
+                continue
         enqueued_at = datetime.now(tz=timezone.utc).isoformat()
         try:
             accepted = await enqueue_for_delivery(event)
@@ -3236,15 +3261,33 @@ async def run_poller(
             event_count += 1
             # Best-effort durable handoff: every accepted poller event is
             # stashed so an unclean restart cannot erase the in-memory turn.
-            await poller_recovery.stash_enqueued_event(
-                persist_dir, event, enqueued_at=enqueued_at,
-            )
+            if poller.name == "worklink-attention":
+                await poller_recovery.commit_attention_event_accepted(
+                    persist_dir, event, enqueued_at=enqueued_at
+                )
+            else:
+                await poller_recovery.stash_enqueued_event(
+                    persist_dir, event, enqueued_at=enqueued_at,
+                )
             for item in batch:
                 await asyncio.to_thread(
                     _write_delivery_receipt,
                     persist_dir,
                     item["extras"].get("delivery_key"),
                 )
+                if poller.name == "worklink-attention" and home is not None:
+                    from .worklink.dispatch_failures import (
+                        dispatch_failure_state_dir,
+                        mark_attention_delivered,
+                    )
+
+                    await asyncio.to_thread(
+                        mark_attention_delivered,
+                        dispatch_failure_state_dir(home),
+                        int(item["extras"]["issue_id"]),
+                        str(item["extras"]["occurrence_id"]),
+                        origin_ref=event.source_id,
+                    )
         else:
             rejected_count += 1
             await poller_recovery.stash_enqueued_event(

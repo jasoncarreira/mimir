@@ -17,6 +17,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+from enum import StrEnum
 from typing import Any, Callable, Iterable, Sequence
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
@@ -44,6 +45,7 @@ CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
 #: needs a human decision rather than another retry.
 MAX_CLAIM_RESETS = 2
 SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
+ATTEMPT_NONCONSUMING_PREFIX = "WORKLINK_ATTEMPT_NONCONSUMING "
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
@@ -187,11 +189,71 @@ class ShutdownAbortRecord:
 
 
 @dataclass(frozen=True)
+class AttemptNonconsumingRecord:
+    issue_id: int
+    attempt: int
+    agent_id: str
+    claimed_at: datetime
+    occurrence_id: str
+    recorded_at: datetime
+    reason: str = "infrastructure"
+    version: int = 1
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if self.version != 1 or self.reason != "infrastructure" or not self.occurrence_id:
+            raise ValueError("invalid attempt nonconsumption marker")
+
+    def to_comment(self) -> str:
+        return ATTEMPT_NONCONSUMING_PREFIX + json.dumps(
+            {
+                "version": self.version,
+                "issue_id": self.issue_id,
+                "attempt": self.attempt,
+                "agent_id": self.agent_id,
+                "claimed_at": self.claimed_at.isoformat(),
+                "occurrence_id": self.occurrence_id,
+                "recorded_at": self.recorded_at.isoformat(),
+                "reason": self.reason,
+            },
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "AttemptNonconsumingRecord":
+        return cls(
+            version=int(payload["version"]),
+            issue_id=int(payload["issue_id"]),
+            attempt=int(payload["attempt"]),
+            agent_id=str(payload["agent_id"]),
+            claimed_at=_parse_dt(str(payload["claimed_at"])),
+            occurrence_id=str(payload["occurrence_id"]),
+            recorded_at=_parse_dt(str(payload["recorded_at"])),
+            reason=str(payload["reason"]),
+        )
+
+
+class ClaimReasonCode(StrEnum):
+    CLAIMED = "claimed"
+    LIFECYCLE_STATE_INCOMPATIBLE = "lifecycle_state_incompatible"
+    PUBLICATION_INTENT_EXISTS = "publication_intent_exists"
+    REVIEW_READY_EVIDENCE_EXISTS = "review_ready_evidence_exists"
+    CLAIM_CONTENTION_EXHAUSTED = "claim_contention_exhausted"
+    CLAIM_GUARD_DEGRADED = "claim_guard_degraded"
+    DUPLICATE_RUN_LIVE = "duplicate_run_live"
+    ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+    CONCURRENCY_CAP = "concurrency_cap"
+    CLAIM_FAILED = "claim_failed"
+    ATTENTION_STATE_UNAVAILABLE = "attention_state_unavailable"
+
+
+@dataclass(frozen=True)
 class ClaimResult:
     claimed: bool
     record: ClaimRecord | None = None
     attempts_exhausted: bool = False
     reason: str | None = None
+    reason_code: ClaimReasonCode | str | None = None
 
 
 @dataclass(frozen=True)
@@ -281,6 +343,45 @@ def _scan_claim_history(
     return records, aborts, generation
 
 
+def _scan_nonconsuming_history(
+    comments: Iterable[str],
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[AttemptNonconsumingRecord], int]:
+    records: list[ClaimRecord] = []
+    aborts: list[ShutdownAbortRecord] = []
+    markers: list[AttemptNonconsumingRecord] = []
+    known: set[tuple[int, int, str, datetime]] = set()
+    generation = 0
+    for comment in comments:
+        for line in comment.splitlines():
+            if line.startswith(CLAIM_RESET_PREFIX):
+                if generation < MAX_CLAIM_RESETS:
+                    generation += 1
+                continue
+            prefix: str | None = None
+            cls: Any = None
+            if line.startswith(CLAIM_PREFIX):
+                prefix, cls = CLAIM_PREFIX, ClaimRecord
+            elif line.startswith(SHUTDOWN_ABORT_PREFIX):
+                prefix, cls = SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord
+            elif line.startswith(ATTEMPT_NONCONSUMING_PREFIX):
+                prefix, cls = ATTEMPT_NONCONSUMING_PREFIX, AttemptNonconsumingRecord
+            if prefix is None:
+                continue
+            try:
+                parsed = cls.from_payload(json.loads(line[len(prefix) :]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            key = (parsed.issue_id, parsed.attempt, parsed.agent_id, parsed.claimed_at)
+            if cls is ClaimRecord:
+                records.append(replace(parsed, generation=generation))
+                known.add(key)
+            elif key in known and cls is ShutdownAbortRecord:
+                aborts.append(replace(parsed, generation=generation))
+            elif key in known and cls is AttemptNonconsumingRecord:
+                markers.append(replace(parsed, generation=generation))
+    return records, aborts, markers, generation
+
+
 def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
     records, _aborts, generation = _scan_claim_history(comments)
     return records, generation
@@ -288,6 +389,21 @@ def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], in
 
 def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
     return _scan_claim_comments(comments)[0]
+
+
+def _matching_nonconsuming_marker(
+    comments: Iterable[str], expected: AttemptNonconsumingRecord
+) -> bool:
+    _records, _aborts, markers, _generation = _scan_nonconsuming_history(comments)
+    return any(
+        marker.issue_id == expected.issue_id
+        and marker.attempt == expected.attempt
+        and marker.agent_id == expected.agent_id
+        and marker.claimed_at == expected.claimed_at
+        and marker.occurrence_id == expected.occurrence_id
+        and marker.reason == expected.reason
+        for marker in markers
+    )
 
 
 def _claim_is_newer(candidate: ClaimRecord, current: ClaimRecord) -> bool:
@@ -365,6 +481,7 @@ class ChainlinkClaims:
         active_label: str | None = None,
         exclude_active_label: str | None = None,
         before_claim: Callable[[], None] | None = None,
+        on_record_prepared: Callable[[ClaimRecord], None] | None = None,
     ) -> ClaimResult:
         """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
 
@@ -386,7 +503,7 @@ class ChainlinkClaims:
         if labels is not None:
             label_set.update(labels)
         if "worklink:review" in label_set:
-            return ClaimResult(False, reason="lifecycle_state_incompatible")
+            return ClaimResult(False, reason="lifecycle_state_incompatible", reason_code=ClaimReasonCode.LIFECYCLE_STATE_INCOMPATIBLE)
 
         claim_home = Path(home_path) if home_path is not None else self.home_path
         if claim_home is not None:
@@ -400,7 +517,7 @@ class ChainlinkClaims:
                     issue_id,
                     intent_path,
                 )
-                return ClaimResult(False, reason="publication_intent_exists")
+                return ClaimResult(False, reason="publication_intent_exists", reason_code=ClaimReasonCode.PUBLICATION_INTENT_EXISTS)
 
         review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
         if review_ready is not None:
@@ -419,16 +536,16 @@ class ChainlinkClaims:
                 review_ready.path,
                 review_ready.payload.get("pr_url"),
             )
-            return ClaimResult(False, reason="review_ready_evidence_exists")
+            return ClaimResult(False, reason="review_ready_evidence_exists", reason_code=ClaimReasonCode.REVIEW_READY_EVIDENCE_EXISTS)
 
         try:
             lock = self._claim_lock_with_retry(
                 issue_id, home_path=claim_home, before_claim=before_claim
             )
         except _ChainlinkContentionExhausted:
-            return ClaimResult(False, reason="claim_contention_exhausted")
+            return ClaimResult(False, reason="claim_contention_exhausted", reason_code=ClaimReasonCode.CLAIM_CONTENTION_EXHAUSTED)
         if lock.returncode != 0:
-            return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
+            return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed", reason_code=ClaimReasonCode.CLAIM_FAILED)
         if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
             # chainlink #822: the chainlink CLI treats a same-agent re-claim as
             # idempotent success ("You already hold the lock", rc=0). All poller
@@ -452,7 +569,7 @@ class ChainlinkClaims:
                         issue_id=issue_id,
                         error=f"{type(exc).__name__}: {exc}"[:500],
                     )
-                return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
+                return ClaimResult(False, reason=f"claim_guard_{guard_outcome}", reason_code=ClaimReasonCode.CLAIM_GUARD_DEGRADED)
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -462,7 +579,7 @@ class ChainlinkClaims:
                 anchor = latest.heartbeat_at or latest.claimed_at
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
-                    return ClaimResult(False, reason="duplicate_run_live")
+                    return ClaimResult(False, reason="duplicate_run_live", reason_code=ClaimReasonCode.DUPLICATE_RUN_LIVE)
                 guard_outcome = "stale_heartbeat"
             steal = self._run("locks", "steal", str(issue_id), check=False)
             self._emit_claim_stolen(
@@ -483,7 +600,7 @@ class ChainlinkClaims:
         if attempts_used >= self.max_attempts:
             self.release_issue(issue_id)
             self._attempts_exhausted(issue_id, attempts_used)
-            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
+            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted", reason_code=ClaimReasonCode.ATTEMPTS_EXHAUSTED)
 
         if max_active_locks is not None:
             try:
@@ -509,6 +626,7 @@ class ChainlinkClaims:
                         f"concurrency cap reached ({active - 1}/{max_active_locks} active "
                         f"claims before this reservation{ids_suffix})"
                     ),
+                    reason_code=ClaimReasonCode.CONCURRENCY_CAP,
                 )
 
         record = ClaimRecord(
@@ -519,13 +637,15 @@ class ChainlinkClaims:
             budget_attempt=attempts_used + 1,
         )
         try:
+            if on_record_prepared is not None:
+                on_record_prepared(record)
             self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
             self._run("issue", "label", str(issue_id), "worklink:in-progress")
             self._run("issue", "comment", str(issue_id), record.to_comment())
         except Exception:
             self.release_issue(issue_id)
             raise
-        return ClaimResult(True, record=record)
+        return ClaimResult(True, record=record, reason_code=ClaimReasonCode.CLAIMED)
 
     def _claim_lock_with_retry(
         self,
@@ -832,7 +952,7 @@ class ChainlinkClaims:
         history forgive their matching claims. Attempt ordinals still advance,
         preventing checkout/branch/evidence collisions.
         """
-        records, aborts, generation = _scan_claim_history(comments)
+        records, aborts, markers, generation = _scan_nonconsuming_history(comments)
         claim_keys = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
@@ -845,12 +965,47 @@ class ChainlinkClaims:
             if len(forgiven) >= MAX_SHUTDOWN_ABORT_FORGIVENESS:
                 break
             forgiven.add(key)
+        nonconsuming: set[tuple[int, int, str, datetime]] = set()
+        seen_occurrences: set[str] = set()
+        for marker in markers:
+            key = (marker.issue_id, marker.attempt, marker.agent_id, marker.claimed_at)
+            if marker.generation != generation or key not in claim_keys or marker.occurrence_id in seen_occurrences:
+                continue
+            seen_occurrences.add(marker.occurrence_id)
+            nonconsuming.add(key)
         active_claims = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
             if record.generation == generation
         }
-        return len(active_claims - forgiven)
+        return max(0, len(active_claims - (forgiven | nonconsuming)))
+
+    def mark_attempt_nonconsuming(
+        self,
+        record: ClaimRecord,
+        occurrence_id: str,
+        reason: str = "infrastructure",
+    ) -> bool:
+        marker = AttemptNonconsumingRecord(
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            agent_id=record.agent_id,
+            claimed_at=record.claimed_at,
+            occurrence_id=occurrence_id,
+            recorded_at=self.clock(),
+            reason=reason,
+        )
+        comments = self._issue_comments(record.issue_id, strict=True)
+        if _matching_nonconsuming_marker(comments, marker):
+            return True
+        result = self._run(
+            "issue", "comment", str(record.issue_id), marker.to_comment(), check=False
+        )
+        if result.returncode != 0:
+            return False
+        return _matching_nonconsuming_marker(
+            self._issue_comments(record.issue_id, strict=True), marker
+        )
 
     def reap_stale_claims(
         self,
@@ -882,6 +1037,21 @@ class ChainlinkClaims:
             if not record.is_stale(now, ttl):
                 continue
             examined += 1
+            if self.home_path is not None:
+                try:
+                    from .dispatch_failures import (
+                        dispatch_failure_state_dir,
+                        issue_has_unsettled_attention,
+                    )
+
+                    if issue_has_unsettled_attention(
+                        dispatch_failure_state_dir(self.home_path), record.issue_id
+                    ):
+                        record_skip("attention_pending", record.issue_id)
+                        continue
+                except Exception:
+                    record_skip("attention_state_unavailable", record.issue_id)
+                    continue
             try:
                 lock_held = self._lock_still_held_by(record)
             except RuntimeError:

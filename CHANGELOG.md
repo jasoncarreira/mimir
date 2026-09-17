@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Added durable typed Worklink attention occurrences, service-only inspection,
+  acknowledged operator escalation, and bounded prompt recovery.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.9 so exact-match
   admission permits the planning-review policy fix and stricter review acceptance
   checks. Keep runtime, image, drift-detection, and documentation pins in lockstep.

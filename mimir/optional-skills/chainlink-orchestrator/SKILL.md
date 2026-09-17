@@ -22,6 +22,13 @@ env:
 
 # Chainlink Orchestrator
 
+Autonomous terminal outcomes are retained as typed occurrences in the ready-queue
+dispatch ledger. The `worklink-attention` poller turns ready occurrences into
+one-item prompts. Its service authority is limited to exact-occurrence inspection,
+acknowledgement, and the configured operator alert. A completed model turn is not
+handling; the turn must acknowledge after fresh inspection. Reservations for
+excluded operations remain non-deliverable tombstones.
+
 This skill is the planning half of Worklink. It turns a vague or multi-step
 Chainlink parent into ready leaf issues that the deterministic Worklink executor
 can safely claim. The planner is allowed to mutate Chainlink issue structure;
@@ -150,7 +157,7 @@ Safety properties (do not bypass these in the poller):
   to claim and exits.
 - **Shedding under pressure**: the poller declares `priority: normal` in
   `pollers.json`, so the scheduler's arbiter suppresses the whole fire under
-  TIGHT (and worse). The in-turn `worklink_run` tool consults the arbiter
+  TIGHT (and worse). Operator/admin turns only: The in-turn `worklink_run` tool consults the arbiter
   directly; the operator CLI (`mimir worklink run`) bypasses both — it always
   proceeds.
 - **Stale recovery**: a worker that dies leaves a claim; the core TTL reaper

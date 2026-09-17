@@ -1,21 +1,25 @@
-"""Durable accounting for detached Worklink dispatch failures."""
+"""Durable Worklink dispatch reservations and attention occurrences."""
 
 from __future__ import annotations
 
 import fcntl
 import hashlib
 import json
+import os
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 from .._atomic import atomic_write_json
 from ..redaction import redact_text
+from .attention import AttentionRecord, HandlingDisposition, RecoveryRetirement
 
 STATE_FILE = "dispatch_failures.json"
 POLLER_NAME = "worklink-ready-queue"
+ATTENTION_POLLER_NAME = "worklink-attention"
+STATE_VERSION = 2
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
@@ -27,17 +31,16 @@ _TRANSIENT_CONTENTION_MARKERS = (
 )
 
 
+class FailureStateError(RuntimeError):
+    pass
+
+
 def dispatch_failure_state_dir(home: Path) -> Path:
-    """Return the durable failure ledger owned by a Worklink home."""
     return home / "state" / "pollers" / POLLER_NAME
 
 
 def terminal_error(value: BaseException | str) -> str:
-    """Return one bounded, scrubbed terminal line suitable for durable output."""
-    if isinstance(value, BaseException):
-        text = f"{type(value).__name__}: {value}"
-    else:
-        text = value
+    text = f"{type(value).__name__}: {value}" if isinstance(value, BaseException) else value
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     return redact_text(lines[-1] if lines else "Worklink run failed")[:1000]
 
@@ -46,31 +49,118 @@ def error_signature(error: str) -> str:
     return hashlib.sha256(error.encode("utf-8")).hexdigest()[:16]
 
 
-def load_failure_state(state_dir: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads((state_dir / STATE_FILE).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "issues": {}}
+def _empty_state() -> dict[str, Any]:
+    return {"version": STATE_VERSION, "revision": 0, "issues": {}}
+
+
+def _legacy_occurrence(issue: str, entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not entry.get("occurrence_id"):
+        return None
+    occurrence = str(entry["occurrence_id"])
+    signature = str(entry.get("signature") or "legacy")
+    return {
+        "schema_version": 2,
+        "kind": "attention",
+        "cause": "legacy_unknown",
+        "source": "legacy_v1",
+        "issue_id": int(entry.get("issue_id") or issue),
+        "run_id": None,
+        "execution_id": occurrence,
+        "launch_id": None,
+        "claim": None,
+        "error_signature": signature,
+        "occurrence_id": occurrence,
+        "delivery_key": f"worklink-attention:{issue}:{signature}:{occurrence}",
+        "attempt": entry.get("attempt"),
+        "outcome": "legacy_unknown",
+        "attempt_consumed": entry.get("attempt_consumed"),
+        "accounting_basis": "legacy_unknown",
+        "settlement": "not_needed",
+        "evidence_quality": "missing",
+        "reason": entry.get("terminal_error") or "legacy dispatch failure",
+        "refs": {"log": entry.get("log_path"), "preserved_ref": entry.get("preserved_ref")},
+        "autonomous": False,
+        "inhibited": entry.get("active") is True,
+        "created_at": entry.get("failed_at") or datetime.now(UTC).isoformat(),
+        "delivered_at": None,
+        "handled_at": None,
+        "handling_disposition": None,
+        "retirement": None,
+        "legacy_notified": signature in (entry.get("notified_signatures") or ()),
+    }
+
+
+def _normalize_issue(key: str, raw: Any, *, legacy: bool) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise FailureStateError(f"dispatch failure issue {key} is invalid")
+    entry = dict(raw)
+    reservations = entry.get("reservations", {})
+    occurrences = entry.get("occurrences", {})
+    if legacy:
+        migrated = _legacy_occurrence(key, entry)
+        occurrences = {migrated["occurrence_id"]: migrated} if migrated else {}
+    if not isinstance(reservations, dict) or not isinstance(occurrences, dict):
+        raise FailureStateError(f"dispatch failure issue {key} collections are invalid")
+    entry["reservations"] = reservations
+    entry["occurrences"] = occurrences
+    entry.setdefault("arming_generation", 0)
+    entry.setdefault("inhibited", any(isinstance(item, dict) and item.get("inhibited") is True and not item.get("handled_at") for item in occurrences.values()))
+    for reservation_id, reservation in reservations.items():
+        _validate_reservation(str(reservation_id), reservation)
+    for occurrence_id, occurrence in occurrences.items():
+        if not isinstance(occurrence, dict) or occurrence.get("occurrence_id") != occurrence_id:
+            raise FailureStateError(f"attention occurrence {occurrence_id} is invalid")
+    return entry
+
+
+def _normalize_state(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("issues"), dict):
-        return {"version": 1, "issues": {}}
-    return payload
+        raise FailureStateError("dispatch failure state has invalid shape")
+    version = payload.get("version")
+    if version not in {1, STATE_VERSION}:
+        raise FailureStateError("unsupported dispatch failure state version")
+    result = dict(payload)
+    result["version"] = STATE_VERSION
+    result["revision"] = int(payload.get("revision", 0))
+    result["issues"] = {str(key): _normalize_issue(str(key), value, legacy=version == 1) for key, value in payload["issues"].items()}
+    return result
+
+
+def load_failure_state(state_dir: Path) -> dict[str, Any]:
+    path = state_dir / STATE_FILE
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _empty_state()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FailureStateError("dispatch failure state is unreadable") from exc
+    return _normalize_state(payload)
 
 
 def save_failure_state(state_dir: Path, state: dict[str, Any]) -> None:
-    atomic_write_json(state_dir / STATE_FILE, state)
+    normalized = _normalize_state(state)
+    normalized["revision"] = int(normalized.get("revision", 0)) + 1
+    atomic_write_json(state_dir / STATE_FILE, normalized, mode=0o600)
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    state.clear()
+    state.update(normalized)
 
 
-def delivery_receipt_exists(state_dir: Path, delivery_key: str) -> bool:
-    """Return whether the framework durably accepted a poller record."""
+def delivery_receipt_exists(state_dir: Path, delivery_key: str, *, poller_name: str = POLLER_NAME) -> bool:
     digest = hashlib.sha256(delivery_key.encode()).hexdigest()
-    return (state_dir / _DELIVERY_RECEIPTS_DIR / digest).is_file()
+    directory = state_dir if poller_name == POLLER_NAME else state_dir.parent / poller_name
+    return (directory / _DELIVERY_RECEIPTS_DIR / digest).is_file()
 
 
 @contextmanager
-def failure_state_transaction(state_dir: Path):
-    """Serialize read-modify-write updates from concurrent detached runs."""
+def failure_state_transaction(state_dir: Path) -> Iterator[dict[str, Any]]:
     state_dir.mkdir(parents=True, exist_ok=True)
-    with (state_dir / f"{STATE_FILE}.lock").open("a", encoding="utf-8") as lock:
+    lock_path = state_dir / f"{STATE_FILE}.lock"
+    with lock_path.open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_failure_state(state_dir)
         try:
@@ -83,13 +173,382 @@ def failure_state_transaction(state_dir: Path):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def is_transient_contention(error: str) -> bool:
-    """Return whether a pre-claim failure is short-lived Git lock contention."""
-    normalized = error.casefold()
+def _issue(state: dict[str, Any], issue_id: int) -> dict[str, Any]:
+    key = str(issue_id)
+    raw = state["issues"].get(key)
+    if raw is None:
+        raw = {"issue_id": issue_id, "reservations": {}, "occurrences": {}, "arming_generation": 0, "inhibited": False}
+        state["issues"][key] = raw
+    if not isinstance(raw, dict):
+        raise FailureStateError("dispatch failure issue is invalid")
+    raw.setdefault("reservations", {})
+    raw.setdefault("occurrences", {})
+    return raw
+
+
+def _validate_reservation(reservation_id: str, value: Any) -> None:
+    if not isinstance(value, dict) or value.get("reservation_id") != reservation_id:
+        raise FailureStateError(f"execution reservation {reservation_id} is invalid")
+    state, closure, occurrence = value.get("state"), value.get("closure"), value.get("promoted_occurrence_id")
+    valid = (state, closure, occurrence is None) in {("reserved", None, True), ("closed", "excluded", True)} or (state == "closed" and closure == "promoted" and isinstance(occurrence, str) and bool(occurrence))
+    if not valid:
+        raise FailureStateError(f"execution reservation {reservation_id} invariant failed")
+
+
+def reserve_execution(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    source: str,
+    operation_stage: str,
+    execution_id: str | None = None,
+    run_id: str | None = None,
+    launch_id: str | None = None,
+    invocation_id: str | None = None,
+    autonomous: bool = True,
+    reservation_id: str | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if not autonomous:
+        raise ValueError("execution reservations require autonomous provenance")
+    now_iso = (now or datetime.now(UTC)).isoformat()
+    reservation_id = reservation_id or uuid.uuid4().hex
+    execution_id = execution_id or uuid.uuid4().hex
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        existing = entry["reservations"].get(reservation_id)
+        if existing is not None:
+            _validate_reservation(reservation_id, existing)
+            if existing.get("issue_id") != issue_id or existing.get("execution_id") != execution_id or existing.get("source") != source:
+                raise FailureStateError("execution reservation replay identity mismatch")
+            return dict(existing)
+        reservation = {
+            "reservation_id": reservation_id,
+            "execution_id": execution_id,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "launch_id": launch_id,
+            "autonomous": True,
+            "invocation_id": invocation_id,
+            "source": source,
+            "operation_stage": operation_stage,
+            "prepared_claim": None,
+            "confirmed_claim": None,
+            "claim_binding_state": "none",
+            "observations": {},
+            "state": "reserved",
+            "closure": None,
+            "promoted_occurrence_id": None,
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "closed_at": None,
+        }
+        entry["reservations"][reservation_id] = reservation
+    return reservation
+
+
+def checkpoint_reservation(state_dir: Path, issue_id: int, reservation_id: str, **updates: Any) -> dict[str, Any]:
+    permitted = {"operation_stage", "prepared_claim", "confirmed_claim", "claim_binding_state", "observations", "launch_id", "run_id"}
+    if set(updates) - permitted:
+        raise ValueError("unsupported execution reservation checkpoint")
+    with failure_state_transaction(state_dir) as state:
+        reservation = _issue(state, issue_id)["reservations"].get(reservation_id)
+        _validate_reservation(reservation_id, reservation)
+        if reservation["state"] != "reserved":
+            raise FailureStateError("closed execution reservation cannot be changed")
+        reservation.update(updates)
+        reservation["updated_at"] = datetime.now(UTC).isoformat()
+        result = dict(reservation)
+    return result
+
+
+def close_reservation_excluded(state_dir: Path, issue_id: int, reservation_id: str, *, witness: str) -> dict[str, Any]:
+    if not witness.strip():
+        raise ValueError("excluded reservation closure requires a witness")
+    with failure_state_transaction(state_dir) as state:
+        reservation = _issue(state, issue_id)["reservations"].get(reservation_id)
+        _validate_reservation(reservation_id, reservation)
+        if reservation["state"] == "closed":
+            if reservation["closure"] != "excluded":
+                raise FailureStateError("promoted reservation cannot be excluded")
+            return dict(reservation)
+        now = datetime.now(UTC).isoformat()
+        reservation.update(state="closed", closure="excluded", exclusion_witness=redact_text(witness)[:500], closed_at=now, updated_at=now)
+        result = dict(reservation)
+    return result
+
+
+def promote_reservation(state_dir: Path, issue_id: int, reservation_id: str, record: AttentionRecord) -> dict[str, Any]:
+    if record.issue_id != issue_id:
+        raise ValueError("attention occurrence issue mismatch")
+    payload = json.loads(json.dumps(record.to_json()))
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        reservation = entry["reservations"].get(reservation_id)
+        _validate_reservation(reservation_id, reservation)
+        if reservation["execution_id"] != record.execution_id:
+            raise FailureStateError("attention occurrence execution mismatch")
+        if reservation["state"] == "closed":
+            if reservation["closure"] != "promoted" or reservation["promoted_occurrence_id"] != record.occurrence_id:
+                raise FailureStateError("execution reservation closure mismatch")
+            existing = entry["occurrences"].get(record.occurrence_id)
+            if existing != payload:
+                raise FailureStateError("attention occurrence replay changed frozen primary")
+            return dict(existing)
+        existing = entry["occurrences"].get(record.occurrence_id)
+        if existing is not None and existing != payload:
+            raise FailureStateError("attention occurrence identity collision")
+        entry["occurrences"][record.occurrence_id] = payload
+        now = datetime.now(UTC).isoformat()
+        reservation.update(state="closed", closure="promoted", promoted_occurrence_id=record.occurrence_id, closed_at=now, updated_at=now)
+        entry["inhibited"] = record.inhibited
+        _set_compatibility_fields(entry, payload)
+    return payload
+
+
+def append_secondary_fault(state_dir: Path, issue_id: int, occurrence_id: str, *, source: str, cause: str, reason: str) -> None:
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict):
+            raise FailureStateError("attention occurrence not found")
+        faults = occurrence.setdefault("secondary_faults", [])
+        item = {"source": source, "cause": cause, "reason": terminal_error(reason)}
+        if item not in faults:
+            faults.append(item)
+
+
+def mark_attention_settlement(
+    state_dir: Path,
+    issue_id: int,
+    occurrence_id: str,
+    settlement: str,
+) -> bool:
+    if settlement not in {"pending", "applied", "not_needed"}:
+        raise ValueError("invalid attention settlement")
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict):
+            return False
+        prior = occurrence.get("settlement")
+        if prior == "applied" and settlement != "applied":
+            return False
+        occurrence["settlement"] = settlement
+        return True
+
+
+def pending_attention_records(state_dir: Path, *, limit: int = 32) -> list[dict[str, Any]]:
+    state = load_failure_state(state_dir)
+    pending = []
+    for entry in state["issues"].values():
+        for occurrence in entry.get("occurrences", {}).values():
+            if not isinstance(occurrence, dict) or occurrence.get("handled_at") or occurrence.get("retirement"):
+                continue
+            if occurrence.get("kind") not in {"attention", "factory_started", "factory_succeeded"}:
+                continue
+            pending.append(dict(occurrence))
+    pending.sort(key=lambda item: (str(item.get("created_at") or ""), str(item.get("occurrence_id") or "")))
+    return pending[: max(0, min(limit, 32))]
+
+
+def mark_attention_delivered(state_dir: Path, issue_id: int, occurrence_id: str, *, origin_ref: str | None = None, delivered_at: str | None = None) -> bool:
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict) or occurrence.get("handled_at") or occurrence.get("retirement"):
+            return False
+        if occurrence.get("delivered_at") is None:
+            occurrence["delivered_at"] = delivered_at or datetime.now(UTC).isoformat()
+        if origin_ref:
+            bound = occurrence.get("origin_ref")
+            if bound not in {None, origin_ref}:
+                raise FailureStateError("attention occurrence is bound to another origin")
+            occurrence["origin_ref"] = origin_ref
+        return True
+
+
+def bind_attention_origin(
+    state_dir: Path,
+    issue_id: int,
+    signature: str,
+    occurrence_id: str,
+    origin_ref: str,
+    channel_id: str,
+) -> bool:
+    if not origin_ref or channel_id != "poller:worklink-attention":
+        return False
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict) or occurrence.get("error_signature") != signature or occurrence.get("handled_at") or occurrence.get("retirement"):
+            return False
+        binding = occurrence.get("delivery_binding")
+        expected = {"origin_ref": origin_ref, "channel_id": channel_id}
+        if binding is not None and binding != expected:
+            return False
+        occurrence["delivery_binding"] = expected
+        return True
+
+
+def acquire_handling_lease(state_dir: Path, issue_id: int, occurrence_id: str, *, owner: str, ttl_seconds: int = 120) -> str | None:
+    now = datetime.now(UTC)
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict) or occurrence.get("handled_at") or occurrence.get("retirement"):
+            return None
+        lease = occurrence.get("handling_lease")
+        if isinstance(lease, dict) and (expires := parse_time(lease.get("expires_at"))) is not None and expires > now:
+            return lease.get("lease_id") if lease.get("owner") == owner else None
+        lease_id = uuid.uuid4().hex
+        occurrence["handling_lease"] = {"lease_id": lease_id, "owner": owner, "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat()}
+        return lease_id
+
+
+def mark_attention_handled(
+    state_dir: Path,
+    issue_id: int,
+    signature: str,
+    occurrence_id: str,
+    disposition: HandlingDisposition | str,
+    *,
+    lease_id: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    disposition = HandlingDisposition(disposition)
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        occurrence = entry["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict) or occurrence.get("error_signature") != signature:
+            return False
+        if occurrence.get("handled_at"):
+            return occurrence.get("handling_disposition") == disposition.value
+        lease = occurrence.get("handling_lease")
+        if lease_id is not None and (not isinstance(lease, dict) or lease.get("lease_id") != lease_id):
+            return False
+        occurrence["handling_disposition"] = disposition.value
+        occurrence["handled_at"] = datetime.now(UTC).isoformat()
+        occurrence["handling"] = dict(metadata or {})
+        occurrence.pop("handling_lease", None)
+        entry["inhibited"] = any(item.get("inhibited") is True and not item.get("handled_at") for item in entry["occurrences"].values() if isinstance(item, dict))
+        return True
+
+
+def retire_attention(state_dir: Path, issue_id: int, occurrence_id: str, retirement: RecoveryRetirement | str) -> bool:
+    retirement = RecoveryRetirement(retirement)
+    with failure_state_transaction(state_dir) as state:
+        occurrence = _issue(state, issue_id)["occurrences"].get(occurrence_id)
+        if not isinstance(occurrence, dict) or occurrence.get("handled_at"):
+            return False
+        prior = occurrence.get("retirement")
+        if prior not in {None, retirement.value}:
+            return False
+        occurrence["retirement"] = retirement.value
+        occurrence["retired_at"] = occurrence.get("retired_at") or datetime.now(UTC).isoformat()
+        return True
+
+
+def get_attention_record(home_or_state_dir: Path, issue_id: int, signature: str, occurrence_id: str) -> AttentionRecord:
+    state_dir = home_or_state_dir
+    if state_dir.name != POLLER_NAME:
+        state_dir = dispatch_failure_state_dir(home_or_state_dir)
+    state = load_failure_state(state_dir)
+    entry = state["issues"].get(str(issue_id))
+    occurrence = entry.get("occurrences", {}).get(occurrence_id) if isinstance(entry, dict) else None
+    if not isinstance(occurrence, dict) or str(occurrence.get("error_signature") or "") != signature:
+        raise KeyError("attention occurrence not found")
+    return AttentionRecord.from_json(occurrence, legacy=occurrence.get("source") == "legacy_v1")
+
+
+def issue_is_inhibited(state_dir: Path, issue_id: int) -> bool:
+    state = load_failure_state(state_dir)
+    entry = state["issues"].get(str(issue_id))
+    return isinstance(entry, dict) and entry.get("inhibited") is True
+
+
+def issue_has_unsettled_attention(state_dir: Path, issue_id: int) -> bool:
+    state = load_failure_state(state_dir)
+    entry = state["issues"].get(str(issue_id))
+    if not isinstance(entry, dict):
+        return False
+    if any(
+        isinstance(reservation, dict) and reservation.get("state") == "reserved"
+        for reservation in entry.get("reservations", {}).values()
+    ):
+        return True
     return any(
-        all(marker in normalized for marker in markers)
-        for markers in _TRANSIENT_CONTENTION_MARKERS
+        isinstance(occurrence, dict)
+        and (
+            occurrence.get("settlement") == "pending"
+            or occurrence.get("inhibited") is True
+            and not occurrence.get("handled_at")
+        )
+        for occurrence in entry.get("occurrences", {}).values()
     )
+
+
+def observe_rearm_state(
+    state_dir: Path,
+    *,
+    ready_issue_ids: set[int],
+    blocked_issue_ids: set[int],
+) -> set[int]:
+    rearmed: set[int] = set()
+    with failure_state_transaction(state_dir) as state:
+        for raw_issue, entry in state["issues"].items():
+            if not isinstance(entry, dict) or entry.get("inhibited") is not True:
+                continue
+            issue_id = int(raw_issue)
+            ready = issue_id in ready_issue_ids and issue_id not in blocked_issue_ids
+            if not ready:
+                entry["rearm_observation"] = "disarmed"
+                continue
+            if entry.get("rearm_observation") == "disarmed":
+                entry["inhibited"] = False
+                entry["rearm_observation"] = "ready_after_disarmed"
+                entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
+                rearmed.add(issue_id)
+    return rearmed
+
+
+def is_transient_contention(error: str) -> bool:
+    normalized = error.casefold()
+    return any(all(marker in normalized for marker in markers) for markers in _TRANSIENT_CONTENTION_MARKERS)
+
+
+def record_transient_contention(
+    state_dir: Path,
+    issue_id: int,
+    reservation_id: str,
+    error: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    now = now or datetime.now(UTC)
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        reservation = entry["reservations"].get(reservation_id)
+        _validate_reservation(reservation_id, reservation)
+        observations = int(entry.get("transient_contention_observations", 0)) + 1
+        entry["transient_contention_observations"] = observations
+        if observations > 1:
+            return True
+        timestamp = now.isoformat()
+        reservation.update(
+            state="closed",
+            closure="excluded",
+            exclusion_witness="bounded_transient_contention_retry",
+            closed_at=timestamp,
+            updated_at=timestamp,
+        )
+        entry.update(
+            active=True,
+            issue_id=issue_id,
+            signature="",
+            terminal_error=terminal_error(error),
+            retry_after=(now + timedelta(minutes=INITIAL_BACKOFF_MINUTES)).isoformat(),
+            occurrence_id=None,
+            notified_signatures=[],
+            consecutive=1,
+            inhibited=False,
+        )
+        return False
 
 
 def record_failure(
@@ -109,121 +568,54 @@ def record_failure(
     safe_error = terminal_error(error)
     signature = error_signature(safe_error)
     if attempt is None and is_transient_contention(full_error):
-        return {
-            "active": False,
-            "issue_id": issue_id,
-            "attempt": None,
-            "attempt_consumed": False,
-            "exit_status": exit_status,
-            "terminal_error": safe_error,
-            "signature": signature,
-            "transient_contention": True,
-            "failed_at": now.isoformat(),
-            "retry_after": None,
-            "log_path": redact_text(log_path or ""),
-            "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
-            "preservation_error": redact_text(preservation_error or "")[:1000] or None,
-            "notified_signatures": [],
-        }
+        return {"active": False, "issue_id": issue_id, "attempt": None, "attempt_consumed": False, "exit_status": exit_status, "terminal_error": safe_error, "signature": signature, "transient_contention": True, "failed_at": now.isoformat(), "retry_after": None, "log_path": redact_text(log_path or ""), "preserved_ref": redact_text(preserved_ref or "")[:1000] or None, "preservation_error": redact_text(preservation_error or "")[:1000] or None, "notified_signatures": []}
     with failure_state_transaction(state_dir) as state:
-        key = str(issue_id)
-        prior = state["issues"].get(key)
-        prior = prior if isinstance(prior, dict) else {}
-        consecutive = (
-            int(prior.get("consecutive", 0)) + 1
-            if prior.get("signature") == signature and prior.get("active") is True
-            else 1
-        )
-        delay = min(
-            INITIAL_BACKOFF_MINUTES * (2 ** min(consecutive - 1, 8)),
-            MAX_BACKOFF_MINUTES,
-        )
-        entry = {
-            "active": True,
-            "issue_id": issue_id,
-            "attempt": attempt,
-            "attempt_consumed": attempt is not None,
-            "exit_status": exit_status,
-            "terminal_error": safe_error,
-            "signature": signature,
-            "occurrence_id": uuid.uuid4().hex,
-            "consecutive": consecutive,
-            "failed_at": now.isoformat(),
-            "retry_after": (now + timedelta(minutes=delay)).isoformat(),
+        entry = _issue(state, issue_id)
+        consecutive = int(entry.get("consecutive", 0)) + 1 if entry.get("signature") == signature and entry.get("active") is True else 1
+        delay = min(INITIAL_BACKOFF_MINUTES * (2 ** min(consecutive - 1, 8)), MAX_BACKOFF_MINUTES)
+        compatibility = {
+            "active": True, "issue_id": issue_id, "attempt": attempt,
+            "attempt_consumed": attempt is not None, "exit_status": exit_status,
+            "terminal_error": safe_error, "signature": signature,
+            "occurrence_id": uuid.uuid4().hex, "consecutive": consecutive,
+            "failed_at": now.isoformat(), "retry_after": (now + timedelta(minutes=delay)).isoformat(),
             "log_path": redact_text(log_path or ""),
             "preserved_ref": redact_text(preserved_ref or "")[:1000] or None,
             "preservation_error": redact_text(preservation_error or "")[:1000] or None,
-            "notified_signatures": list(prior.get("notified_signatures") or [])[
-                -MAX_NOTIFIED_SIGNATURES:
-            ],
+            "notified_signatures": list(entry.get("notified_signatures") or [])[-MAX_NOTIFIED_SIGNATURES:],
         }
-        state["issues"][key] = entry
-    return entry
+        entry.update(compatibility)
+    return compatibility
 
 
-def pending_failure_alerts(
-    state_dir: Path, *, now: datetime | None = None
-) -> tuple[set[int], list[dict[str, object]]]:
-    """Return active backoffs and undelivered alerts without mutating delivery state."""
+def pending_failure_alerts(state_dir: Path, *, now: datetime | None = None) -> tuple[set[int], list[dict[str, object]]]:
     now = now or datetime.now(UTC)
     backed_off: set[int] = set()
     alerts: list[dict[str, object]] = []
-    with failure_state_transaction(state_dir) as state:
-        for entry in state["issues"].values():
-            if not isinstance(entry, dict) or entry.get("active") is not True:
-                continue
-            try:
-                issue_id = int(entry["issue_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            retry_after = parse_time(entry.get("retry_after"))
-            if retry_after is not None and now < retry_after:
-                backed_off.add(issue_id)
-            signature = str(entry.get("signature") or "")
-            notified = entry.get("notified_signatures")
-            notified = list(notified) if isinstance(notified, list) else []
-            if signature and signature not in notified:
-                alerts.append({
-                    "signal": "worklink_run_failure_escalated",
-                    "source_id": f"worklink-run-failure:{issue_id}:{signature}",
-                    "issue_id": issue_id,
-                    "attempt": entry.get("attempt"),
-                    "attempt_consumed": entry.get("attempt_consumed"),
-                    "exit_status": entry.get("exit_status"),
-                    "terminal_error": entry.get("terminal_error"),
-                    "error_signature": signature,
-                    "failure_occurrence_id": entry.get("occurrence_id"),
-                    "log": entry.get("log_path"),
-                    "preserved_ref": entry.get("preserved_ref"),
-                    "preservation_error": entry.get("preservation_error"),
-                    "retry_after": entry.get("retry_after"),
-                    "routing_instructions": (
-                        "Notify the operator that a detached Worklink run failed. "
-                        "Include the run-log path, terminal error, and any preserved "
-                        "ref or preservation error."
-                    ),
-                })
+    state = load_failure_state(state_dir)
+    for entry in state["issues"].values():
+        if not isinstance(entry, dict) or entry.get("active") is not True:
+            continue
+        try:
+            issue_id = int(entry["issue_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        retry_after = parse_time(entry.get("retry_after"))
+        if retry_after is not None and now < retry_after:
+            backed_off.add(issue_id)
+        signature = str(entry.get("signature") or "")
+        notified = entry.get("notified_signatures") if isinstance(entry.get("notified_signatures"), list) else []
+        if signature and signature not in notified:
+            alerts.append({"signal": "worklink_run_failure_escalated", "source_id": f"worklink-run-failure:{issue_id}:{signature}", "issue_id": issue_id, "attempt": entry.get("attempt"), "attempt_consumed": entry.get("attempt_consumed"), "exit_status": entry.get("exit_status"), "terminal_error": entry.get("terminal_error"), "error_signature": signature, "failure_occurrence_id": entry.get("occurrence_id"), "log": entry.get("log_path"), "preserved_ref": entry.get("preserved_ref"), "preservation_error": entry.get("preservation_error"), "retry_after": entry.get("retry_after"), "routing_instructions": "Notify the operator that a detached Worklink run failed. Include the run-log path, terminal error, and any preserved ref or preservation error."})
     return backed_off, alerts
 
 
-def mark_failure_notified(
-    state_dir: Path,
-    issue_id: int,
-    signature: str,
-    occurrence_id: str | None,
-) -> None:
-    """Record delivery only if the emitted failure occurrence remains current."""
+def mark_failure_notified(state_dir: Path, issue_id: int, signature: str, occurrence_id: str | None) -> None:
     with failure_state_transaction(state_dir) as state:
         entry = state["issues"].get(str(issue_id))
-        if (
-            not isinstance(entry, dict)
-            or entry.get("active") is not True
-            or entry.get("signature") != signature
-            or entry.get("occurrence_id") != occurrence_id
-        ):
+        if not isinstance(entry, dict) or entry.get("active") is not True or entry.get("signature") != signature or entry.get("occurrence_id") != occurrence_id:
             return
-        notified = entry.get("notified_signatures")
-        notified = list(notified) if isinstance(notified, list) else []
+        notified = list(entry.get("notified_signatures") or [])
         if signature not in notified:
             notified.append(signature)
         entry["notified_signatures"] = notified[-MAX_NOTIFIED_SIGNATURES:]
@@ -232,11 +624,16 @@ def mark_failure_notified(
 def record_success(state_dir: Path, issue_id: int) -> None:
     with failure_state_transaction(state_dir) as state:
         entry = state["issues"].get(str(issue_id))
-        if not isinstance(entry, dict) or entry.get("active") is not True:
+        if not isinstance(entry, dict):
             return
         entry["active"] = False
         entry["consecutive"] = 0
         entry["notified_signatures"] = []
+        entry["transient_contention_observations"] = 0
+
+
+def _set_compatibility_fields(entry: dict[str, Any], occurrence: Mapping[str, Any]) -> None:
+    entry.update({"active": occurrence.get("inhibited") is True, "issue_id": occurrence["issue_id"], "attempt": occurrence.get("attempt"), "attempt_consumed": occurrence.get("attempt_consumed"), "terminal_error": occurrence.get("reason"), "signature": occurrence.get("error_signature"), "occurrence_id": occurrence.get("occurrence_id"), "failed_at": occurrence.get("created_at"), "notified_signatures": list(entry.get("notified_signatures") or [])})
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -247,3 +644,10 @@ def parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+reserve_execution_reservation = reserve_execution
+checkpoint_execution_reservation = checkpoint_reservation
+close_execution_reservation = close_reservation_excluded
+promote_execution_reservation = promote_reservation
+mark_attention_retired = retire_attention

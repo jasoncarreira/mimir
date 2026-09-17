@@ -56,6 +56,10 @@ class FactoryRunRecord:
     controller_phase: str
     controller_error: str | None = None
     transcript: str | None = None
+    autonomous: bool = False
+    execution_id: str | None = None
+    launch_id: str | None = None
+    claim_identity: dict[str, Any] | None = None
     version: int = FACTORY_RECORD_VERSION
 
     def __post_init__(self) -> None:
@@ -115,6 +119,10 @@ class FactoryRunRecord:
             "controller_phase": self.controller_phase,
             "controller_error": self.controller_error,
             "transcript": self.transcript,
+            "autonomous": self.autonomous,
+            "execution_id": self.execution_id,
+            "launch_id": self.launch_id,
+            "claim_identity": self.claim_identity,
         }
 
     @classmethod
@@ -138,13 +146,22 @@ class FactoryRunRecord:
             "controller_phase",
             "controller_error",
             "transcript",
+            "autonomous",
+            "execution_id",
+            "launch_id",
+            "claim_identity",
         }
         version = data.get("version")
-        legacy = version == 1 and set(data) == expected - {"transcript"}
+        legacy_fields = {"autonomous", "execution_id", "launch_id", "claim_identity"}
+        legacy = version == 1 and frozenset(data) in {
+            frozenset(expected - {"transcript"} - legacy_fields),
+            frozenset(expected - {"transcript"}),
+        }
+        prior = version == FACTORY_RECORD_VERSION and set(data) == expected - legacy_fields
         if version not in {1, FACTORY_RECORD_VERSION}:
             raise FactoryRecordError("unsupported factory record version")
         if (version == 1 and not legacy) or (
-            version == FACTORY_RECORD_VERSION and set(data) != expected
+            version == FACTORY_RECORD_VERSION and set(data) != expected and not prior
         ):
             raise FactoryRecordError("factory record fields are invalid")
         handle_data = data["handle"]
@@ -199,6 +216,10 @@ class FactoryRunRecord:
             controller_phase=str(data["controller_phase"]),
             controller_error=controller_error,
             transcript=transcript,
+            autonomous=data.get("autonomous") is True,
+            execution_id=str(data["execution_id"]) if data.get("execution_id") else None,
+            launch_id=str(data["launch_id"]) if data.get("launch_id") else None,
+            claim_identity=dict(data["claim_identity"]) if isinstance(data.get("claim_identity"), dict) else None,
         )
 
     def observed(self, status: FactoryStatus, observed_at: str) -> FactoryRunRecord:

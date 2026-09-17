@@ -2968,6 +2968,278 @@ async def worklink_run(
     return " ".join(parts)
 
 
+def _worklink_attention_context(issue_id: int, signature: str, occurrence_id: str):
+    from .._context import get_current_turn
+    from ..access_control import (
+        get_trusted_service_from_auth_context,
+        service_can_invoke_operation,
+    )
+    from ..poller_recovery import read_attention_binding
+
+    turn = get_current_turn()
+    context = getattr(turn, "auth_context", None) if turn is not None else None
+    service = get_trusted_service_from_auth_context(context)
+    if (
+        turn is None
+        or service is None
+        or service.canonical != "poller:worklink-attention"
+        or service.trigger != "poller"
+        or service.authority_profile != "custom"
+        or context.channel_id != "poller:worklink-attention"
+        or not isinstance(context.origin_ref, str)
+        or not context.origin_ref
+    ):
+        raise ToolException("worklink attention refused: trusted attention service required")
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        raise ToolException("worklink attention refused: MIMIR_HOME is not configured")
+    home = Path(home_value)
+    binding = read_attention_binding(
+        home, context.origin_ref, context.channel_id, service.canonical
+    )
+    if (binding.issue_id, binding.signature, binding.occurrence_id) != (
+        issue_id, signature, occurrence_id
+    ):
+        raise ToolException("worklink attention refused: occurrence binding mismatch")
+    return turn, context, service, home, binding, service_can_invoke_operation
+
+
+def _attention_readers(home: Path):
+    from ..worklink.attention import AttentionReaders
+    from ..worklink.claims import ChainlinkClaims, claim_records_from_comments
+    from ..worklink.factory_state import (
+        factory_process_is_verified_dead,
+        load_factory_record,
+        load_factory_records_for_issue,
+    )
+    from ..worklink.orchestrator import ChainlinkIssueReader
+    from ..worklink.run_state import load_run_state_strict, process_is_verified_dead
+
+    def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, cwd=home, capture_output=True, text=True, check=False, timeout=10)
+
+    issue_reader = ChainlinkIssueReader(runner=run)
+
+    def read_issue(issue_id: int):
+        return issue_reader.read(issue_id)
+
+    def read_claims(issue_id: int):
+        issue = read_issue(issue_id)
+        claims = ChainlinkClaims(agent_id="attention-inspect", runner=run, home_path=home)
+        lock_result = run([claims.chainlink_bin, "locks", "list", "--json"])
+        if lock_result.returncode != 0:
+            raise RuntimeError("claim lock list unavailable")
+        data = json.loads(lock_result.stdout or "{}")
+        locks = data.get("locks", data if isinstance(data, list) else {})
+        lock_ids = set()
+        iterable = list(locks.values()) if isinstance(locks, dict) else locks
+        for item in iterable if isinstance(iterable, (list, tuple)) else ():
+            if isinstance(item, dict):
+                raw = item.get("issue_id", item.get("id"))
+                if raw is not None:
+                    lock_ids.add(int(raw))
+        if isinstance(locks, dict) and str(issue_id) in locks:
+            lock_ids.add(issue_id)
+        records = [record for record in claim_records_from_comments(issue.comments) if record.issue_id == issue_id]
+        latest = max(records, key=lambda item: (item.generation, item.attempt, item.claimed_at)) if records else None
+        return {
+            "locks": sorted(lock_ids),
+            "lock_absent": issue_id not in lock_ids,
+            "latest": latest,
+            "attempts_used": claims.attempts_used(issue.comments),
+            "max_attempts": claims.max_attempts,
+        }
+
+    def read_factory(run_id: str | None, issue_id: int):
+        if run_id:
+            return load_factory_record(home, run_id)
+        records = load_factory_records_for_issue(home, issue_id)
+        return records[0] if len(records) == 1 else None
+
+    def read_process(value: Any):
+        if hasattr(value, "run_id"):
+            return "verified_dead" if factory_process_is_verified_dead(value) else None
+        return "verified_dead" if process_is_verified_dead(value) else None
+
+    def read_evidence(record):
+        raw = record.refs.get("evidence") if isinstance(record.refs, dict) else None
+        if not raw:
+            return None
+        path = Path(raw)
+        allowed = (home / "state" / "worklink").resolve()
+        resolved = path.resolve(strict=True)
+        if path.is_symlink() or not resolved.is_relative_to(allowed):
+            raise ValueError("evidence path is not contained")
+        return json.loads(resolved.read_text(encoding="utf-8"))
+
+    def read_pr(url: str):
+        result = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "state,headRefOid"],
+            cwd=home,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("pull request read unavailable")
+        return json.loads(result.stdout)
+
+    return AttentionReaders(
+        issue=read_issue,
+        claims=read_claims,
+        run_state=lambda issue_id: load_run_state_strict(home, issue_id),
+        factory_record=read_factory,
+        process=read_process,
+        evidence=read_evidence,
+        pull_request=read_pr,
+    )
+@tool
+async def worklink_attention_inspect(
+    issue_id: int,
+    signature: str,
+    occurrence_id: str,
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Inspect one exact autonomous Worklink attention occurrence."""
+    del config
+    _turn, _context, service, home, _binding, allowed = _worklink_attention_context(
+        int(issue_id), signature, occurrence_id
+    )
+    if not allowed(service, "worklink_attention_inspect"):
+        raise ToolException("worklink attention inspect refused: capability required")
+    from ..worklink.attention import bounded_json, inspect_attention
+
+    snapshot = await asyncio.to_thread(
+        inspect_attention,
+        home,
+        int(issue_id),
+        signature,
+        occurrence_id,
+        _attention_readers(home),
+    )
+    return bounded_json(snapshot.to_json())
+
+
+@tool
+async def worklink_attention_ack(
+    issue_id: int,
+    signature: str,
+    occurrence_id: str,
+    disposition: str,
+    note: str = "",
+    config: Annotated[RunnableConfig | None, InjectedToolArg] = None,
+) -> str:
+    """Acknowledge one exact inspected Worklink attention occurrence."""
+    del config
+    turn, context, service, home, _binding, allowed = _worklink_attention_context(
+        int(issue_id), signature, occurrence_id
+    )
+    if not allowed(service, "worklink_attention_ack"):
+        raise ToolException("worklink attention ack refused: capability required")
+    from ..worklink.attention import (
+        AttentionKind,
+        HandlingDisposition,
+        Resolution,
+        inspect_attention,
+    )
+    from ..worklink.dispatch_failures import (
+        acquire_handling_lease,
+        dispatch_failure_state_dir,
+        mark_attention_handled,
+    )
+
+    try:
+        selected = HandlingDisposition(disposition)
+    except ValueError as exc:
+        raise ToolException("worklink attention ack refused: invalid disposition") from exc
+    snapshot = await asyncio.to_thread(
+        inspect_attention,
+        home,
+        int(issue_id),
+        signature,
+        occurrence_id,
+        _attention_readers(home),
+    )
+    if snapshot.record.handled_at is not None:
+        status = (
+            "handled"
+            if snapshot.record.handling_disposition is selected
+            else "stale"
+        )
+        return json.dumps(
+            {
+                "status": status,
+                "issue_id": int(issue_id),
+                "occurrence_id": occurrence_id,
+                "disposition": snapshot.record.handling_disposition.value
+                if snapshot.record.handling_disposition
+                else None,
+            },
+            sort_keys=True,
+        )
+    if selected in {HandlingDisposition.NOOP_RESOLVED, HandlingDisposition.REMEDIATED} and snapshot.resolution is not Resolution.RESOLVED:
+        raise ToolException("worklink attention ack refused: occurrence is not resolved")
+    if selected is HandlingDisposition.OBSERVED and snapshot.record.kind is AttentionKind.ATTENTION:
+        raise ToolException("worklink attention ack refused: observed is lifecycle-only")
+    clean_note = note.strip()
+    if selected is HandlingDisposition.OPERATOR_REQUIRED and (not clean_note or len(clean_note) > 2000):
+        raise ToolException("worklink attention ack refused: bounded operator note required")
+    state_dir = dispatch_failure_state_dir(home)
+    lease_id = await asyncio.to_thread(
+        acquire_handling_lease,
+        state_dir,
+        int(issue_id),
+        occurrence_id,
+        owner=f"{context.origin_ref}:{turn.turn_id}",
+    )
+    if lease_id is None:
+        return json.dumps({"status": "handling_in_progress", "issue_id": issue_id, "occurrence_id": occurrence_id}, sort_keys=True)
+    metadata: dict[str, Any] = {
+        "origin_ref": context.origin_ref,
+        "turn_id": turn.turn_id,
+        "note": clean_note[:2000],
+    }
+    if selected is HandlingDisposition.OPERATOR_REQUIRED:
+        from .operator_alert import deliver_operator_alert
+
+        cause = snapshot.record.cause.value if snapshot.record.cause else snapshot.record.kind.value
+        text = (
+            f"Worklink attention requires operator action. issue={issue_id} "
+            f"occurrence={occurrence_id} outcome={snapshot.record.outcome.value} "
+            f"cause={cause} next={snapshot.record.next if snapshot.record.next_present else 'unspecified'} "
+            f"decision={clean_note}"
+        )[:4000]
+        receipt = await asyncio.wait_for(
+            deliver_operator_alert(text, authorize=True), timeout=30
+        )
+        metadata.update(
+            destination=receipt.destination,
+            message_id=receipt.message_id,
+            delivered_at=receipt.delivered_at,
+            text_sha256=receipt.text_sha256,
+        )
+    handled = await asyncio.to_thread(
+        mark_attention_handled,
+        state_dir,
+        int(issue_id),
+        signature,
+        occurrence_id,
+        selected,
+        lease_id=lease_id,
+        metadata=metadata,
+    )
+    return json.dumps(
+        {
+            "status": "handled" if handled else "stale",
+            "issue_id": int(issue_id),
+            "occurrence_id": occurrence_id,
+            "disposition": selected.value,
+        },
+        sort_keys=True,
+    )
+
+
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
@@ -3059,7 +3331,7 @@ def all_mimir_tools(
         commitment_dismiss, commitment_list,
         # Worklink in-turn dispatch (#444). Core tool (no skill mechanism);
         # arbiter- + cap-gated autonomous dispatch to the deterministic executor.
-        worklink_run,
+        worklink_run, worklink_attention_inspect, worklink_attention_ack,
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,

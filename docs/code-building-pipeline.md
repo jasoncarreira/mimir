@@ -1,5 +1,12 @@
 # Code-building pipeline
 
+Autonomous Worklink terminal failures, blocks, partial results, and needs-human
+outcomes route to `worklink:blocked` after their typed attention occurrence is
+durable. Infrastructure outcomes may receive an exact nonconsumption marker, but
+remain inhibited until an explicit rearm witness. Partial and other structured
+evidence of genuine work consume the attempt. Cleanup faults append to the frozen
+primary occurrence and cannot replace its result or accounting.
+
 This guide takes an operator from an existing GitHub checkout to a Worklink
 leaf that is built, tested, and opened as a pull request, then explains how the
 separate GitHub poller surfaces review work. Paths below are relative to the

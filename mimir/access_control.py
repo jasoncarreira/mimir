@@ -205,6 +205,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "hands_python": SinkCategory.SHELL_PROCESS,
     "spawn_open_code": SinkCategory.SPAWN,
     "worklink_run": SinkCategory.SPAWN,
+    "worklink_attention_ack": SinkCategory.FILE,
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
@@ -305,6 +306,8 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "commitment_dismiss": ToolFlowDirection.SINK,
     "commitment_list": ToolFlowDirection.SOURCE,
     "worklink_run": ToolFlowDirection.BOTH,
+    "worklink_attention_inspect": ToolFlowDirection.SOURCE,
+    "worklink_attention_ack": ToolFlowDirection.SINK,
     "request_mimir_update": ToolFlowDirection.SINK,
     "web_search": ToolFlowDirection.BOTH,
     "fetch_url": ToolFlowDirection.BOTH,
@@ -508,6 +511,8 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "saga_record_skill_learning": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "worklink_run": CapabilityTier.CODE_EXECUTION,
+    "worklink_attention_inspect": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_attention_ack": CapabilityTier.SCOPE_CONTAINED,
     "spawn_open_code": CapabilityTier.CODE_EXECUTION,
     "fetch_url": CapabilityTier.UNBOUNDED,
     "web_search": CapabilityTier.UNBOUNDED,
@@ -7472,7 +7477,11 @@ class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
     _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
-    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run"}
+    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {
+        "worklink_run",
+        "worklink_attention_inspect",
+        "worklink_attention_ack",
+    }
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
@@ -9224,6 +9233,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "execute": "shell",
     "web_search": "web",
     "worklink_run": "worklink",
+    "worklink_attention_inspect": "worklink",
     "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
     "pr_files": "repository",
@@ -9291,6 +9301,7 @@ _NON_INGESTING_RESULT_TOOLS = frozenset({
     "fetch_url",
     # Delivery and queue mutations return acknowledgements only.
     "operator_alert",
+    "worklink_attention_ack",
     "send_message",
     "react",
     "defer_injected_message",
@@ -9334,6 +9345,7 @@ _REPOSITORY_RESULT_TOOLS = frozenset({
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
 _READ_BACKEND_RESULT_TOOLS = frozenset({
+    "worklink_attention_inspect",
     "pr_job_log",
     "Read",
     "Glob",
@@ -10290,6 +10302,7 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 
 # Executable capabilities and information-flow metadata are one policy.
 _OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "worklink_attention_inspect": "worklink",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
     "bash_jobs_list": "shell_jobs",
@@ -10346,6 +10359,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "operator_alert": "notification",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
+    "worklink_attention_ack": "worklink_attention_ledger",
     "react": "message",
     "web_search": "network",
     "fetch_url": "network",

@@ -13,7 +13,7 @@ API is the flat ``mimir.tools`` namespace.
 
 from .memory import memory_get, memory_query, set_memory_client
 from .store import memory_store
-from .operator_alert import operator_alert, set_operator_alert_dependencies
+from .operator_alert import deliver_operator_alert, operator_alert, set_operator_alert_dependencies
 from .extra import (
     file_search,
     get_turn,
@@ -52,6 +52,8 @@ from .registry import (
     set_scheduler,
     set_spawn_config,
     spawn_open_code,
+    worklink_attention_ack,
+    worklink_attention_inspect,
     worklink_run,
 )
 from .web import (
@@ -114,6 +116,7 @@ __all__ = [
     "shell_exec",
     "send_message",
     "operator_alert",
+    "deliver_operator_alert",
     "react",
     "fetch_channel_history",
     "list_channels",
@@ -199,6 +202,8 @@ __all__ = [
     "set_arbiter",
     # Worklink in-turn dispatch (#444)
     "worklink_run",
+    "worklink_attention_inspect",
+    "worklink_attention_ack",
     # Aggregate
     "all_mimir_tools",
 ]

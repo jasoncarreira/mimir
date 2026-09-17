@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-RUN_STATE_VERSION = 2
+RUN_STATE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,11 @@ class WorklinkRunState:
     process_start_ticks: int | None = None
     shim_pid: int | None = None
     phase: str = "spawned"
+    autonomous: bool = False
+    execution_id: str | None = None
+    launch_id: str | None = None
+    claim_identity: dict[str, Any] | None = None
+    invocation_id: str | None = None
     version: int = RUN_STATE_VERSION
     test_env: dict[str, str] = field(default_factory=dict)
 
@@ -80,7 +85,7 @@ class WorklinkRunState:
         if not isinstance(data, dict):
             raise TypeError("worklink run state must be a JSON object")
         version = int(data.get("version") or 1)
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ValueError("unsupported worklink run state version")
         identifier = str(data["handle_identifier"])
         shim_pid = int(data["shim_pid"]) if data.get("shim_pid") is not None else None
@@ -97,7 +102,7 @@ class WorklinkRunState:
                 except ValueError as exc:
                     raise ValueError("worker run state requires a canonical UUIDv4 handle") from exc
                 if (
-                    version != 2
+                    version not in {2, 3}
                     or str(parsed) != identifier
                     or shim_pid <= 0
                     or ticks is None
@@ -125,7 +130,12 @@ class WorklinkRunState:
             process_start_ticks=ticks,
             shim_pid=shim_pid,
             phase=phase,
-            version=version,
+            autonomous=data.get("autonomous") is True,
+            execution_id=str(data["execution_id"]) if data.get("execution_id") else None,
+            launch_id=str(data["launch_id"]) if data.get("launch_id") else None,
+            claim_identity=dict(data["claim_identity"]) if isinstance(data.get("claim_identity"), dict) else None,
+            invocation_id=str(data["invocation_id"]) if data.get("invocation_id") else None,
+            version=RUN_STATE_VERSION,
             test_env=dict(data.get("test_env", {})),
         )
 
@@ -163,12 +173,38 @@ def load_run_state(home: Path, issue_id: int) -> WorklinkRunState | None:
         return None
 
 
+def load_run_state_strict(home: Path, issue_id: int) -> WorklinkRunState | None:
+    path = run_state_path(home, issue_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("worklink run state is unreadable") from exc
+    try:
+        state = WorklinkRunState.from_json(data)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("worklink run state is malformed") from exc
+    if state.issue_id != issue_id:
+        raise ValueError("worklink run state identity mismatch")
+    return state
+
+
 def clear_run_state(home: Path, issue_id: int) -> None:
     """Best-effort delete of an issue's run state (no-op if already gone)."""
     try:
         run_state_path(home, issue_id).unlink()
     except OSError:
         return
+
+
+def clear_run_state_strict(home: Path, issue_id: int) -> None:
+    try:
+        run_state_path(home, issue_id).unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise OSError("worklink run state could not be removed") from exc
 
 
 def list_run_states(home: Path) -> list[WorklinkRunState]:
@@ -302,6 +338,22 @@ def process_identity_verified(state: WorklinkRunState) -> bool:
     if pid is None:
         return False
     return process_start_ticks(pid) == state.process_start_ticks and process_is_alive(state)
+
+
+def process_is_verified_dead(state: WorklinkRunState) -> bool:
+    pid = _state_pid(state)
+    if pid is None or state.process_start_ticks is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    observed = process_start_ticks(pid)
+    return process_is_zombie(pid) or (
+        observed is not None and observed != state.process_start_ticks
+    )
 
 
 def elapsed_seconds(state: WorklinkRunState, *, now: datetime | None = None) -> float:

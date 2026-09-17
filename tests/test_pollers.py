@@ -701,6 +701,7 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
         "social-cli-feed",
         "social-cli-notifications",
         "worklink-ready-queue",
+        "worklink-attention",
         "worklink-tool-pins",
     }
     entries = [
@@ -714,7 +715,7 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
         entry["name"]
         for entry in entries
         if entry["authority"].get("saga_full_corpus_read") is True
-    } == expected
+    } == expected - {"worklink-attention"}
 
 
 def test_session_boundary_poller_can_end_session_without_companions(tmp_path: Path) -> None:
@@ -4876,7 +4877,7 @@ def test_worklink_receipt_pruning_validates_complete_state(home: Path, worklink_
     path = state / failures.STATE_FILE
     ledger = json.loads(path.read_text())
     if invalid == "version":
-        ledger["version"] = 2
+        ledger["version"] = 3
     elif invalid == "issues":
         ledger["issues"] = []
     elif invalid == "entry-type":

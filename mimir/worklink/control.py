@@ -41,6 +41,55 @@ EventLogger = Callable[..., None]
 _CHAINLINK_COMMAND_TIMEOUT_SECONDS = 10
 
 
+def reconcile_attention_accounting(
+    home: Path,
+    *,
+    claims_factory: Callable[[str], Any] | None = None,
+    limit: int = 32,
+) -> dict[str, int]:
+    from .claims import ChainlinkClaims, ClaimRecord
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        mark_attention_settlement,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    state = load_failure_state(state_dir)
+    pending: list[tuple[int, str, dict[str, Any]]] = []
+    for raw_issue, issue in state["issues"].items():
+        if not isinstance(issue, dict):
+            continue
+        for occurrence_id, occurrence in issue.get("occurrences", {}).items():
+            if isinstance(occurrence, dict) and occurrence.get("settlement") == "pending":
+                pending.append((int(raw_issue), str(occurrence_id), occurrence))
+    pending.sort(key=lambda item: str(item[2].get("created_at") or ""))
+    summary = {"examined": 0, "applied": 0, "pending": 0}
+    for issue_id, occurrence_id, occurrence in pending[: max(0, min(limit, 32))]:
+        summary["examined"] += 1
+        claim_data = occurrence.get("claim")
+        if not isinstance(claim_data, dict):
+            summary["pending"] += 1
+            continue
+        try:
+            claim = ClaimRecord.from_payload(claim_data)
+            claims = (
+                claims_factory(claim.agent_id)
+                if claims_factory is not None
+                else ChainlinkClaims(agent_id=claim.agent_id, home_path=home)
+            )
+            applied = claims.mark_attempt_nonconsuming(claim, occurrence_id)
+        except Exception:
+            applied = False
+        if applied and mark_attention_settlement(
+            state_dir, issue_id, occurrence_id, "applied"
+        ):
+            summary["applied"] += 1
+        else:
+            summary["pending"] += 1
+    return summary
+
+
 @dataclass(frozen=True)
 class WorklinkStatus:
     issue_id: int
