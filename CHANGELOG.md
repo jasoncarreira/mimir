@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.8.9 so exact-match
+  admission permits the planning-review policy fix and stricter review acceptance
+  checks. Keep runtime, image, drift-detection, and documentation pins in lockstep.
 - Upgrade `feature-factory` and `opencode-feature-factory` from 0.8.5 to 0.8.7,
   reconciling the autonomous-mode prose with the publication block it contradicted.
   0.8.5's executable path already selected ready-for-review publication for
