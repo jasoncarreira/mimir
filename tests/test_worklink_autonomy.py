@@ -13,6 +13,7 @@ import ast
 from dataclasses import replace
 import importlib.util
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -900,6 +901,26 @@ def test_factory_cap_defaults_and_falls_back_to_one(
 def test_factory_cap_accepts_positive_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "3")
     assert autonomy.factory_max_concurrent() == 3
+
+
+def test_unusable_factory_cap_warns_instead_of_degrading_silently(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same contract as the retry budget: a set-but-unusable value is announced."""
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_CONCURRENT", "lots")
+    with caplog.at_level(logging.WARNING, logger="mimir.worklink.autonomy"):
+        assert autonomy.factory_max_concurrent() == 1
+    assert any("MIMIR_FACTORY_MAX_CONCURRENT" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_absent_factory_cap_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The discriminating half: unset is ordinary and must not warn."""
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_CONCURRENT", raising=False)
+    with caplog.at_level(logging.WARNING, logger="mimir.worklink.autonomy"):
+        assert autonomy.factory_max_concurrent() == 1
+    assert not caplog.records, caplog.text
 
 
 def _seed_factory_run(child: Path, issue_id: int, status: str) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -1287,3 +1288,57 @@ async def test_launch_child_environment_carries_the_publishing_identity(
         assert captured["env"][FACTORY_PUBLISHING_IDENTITY_ENV] == "mimir-carreira"
     finally:
         await compute.cleanup(handle)
+
+
+@pytest.mark.parametrize(
+    ("configured", "reason_fragment"),
+    [
+        ("eight", "not an ASCII decimal integer"),
+        ("8 ", "not an ASCII decimal integer"),
+        ("0", "zero"),
+        ("9007199254740992", "above the maximum"),
+    ],
+)
+def test_unusable_factory_retry_budget_warns_instead_of_degrading_silently(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    configured: str,
+    reason_fragment: str,
+) -> None:
+    """A budget the operator SET but this cannot use must not fall back quietly.
+
+    The value is frozen into run state at ``factory init``, so a silent fallback
+    is not discoverable until a slice exhausts the wrong budget — by which point
+    the run cannot be corrected. This cost a container recreate, a sandbox
+    deletion and four build attempts on chainlink #1762 before anyone noticed,
+    because every check short of the live launch argv reported the intended value.
+    """
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", configured)
+    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("MIMIR_FACTORY_MAX_RETRIES" in m for m in messages), caplog.text
+    assert any(reason_fragment in m for m in messages), caplog.text
+
+
+def test_absent_factory_retry_budget_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unset is the ordinary case and must stay quiet.
+
+    This is the discriminating half: a warning that fires on every resolution
+    would satisfy the test above while telling an operator nothing.
+    """
+    monkeypatch.delenv("MIMIR_FACTORY_MAX_RETRIES", raising=False)
+    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == _DEFAULT_FACTORY_MAX_RETRIES
+    assert not caplog.records, caplog.text
+
+
+def test_usable_factory_retry_budget_is_silent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("MIMIR_FACTORY_MAX_RETRIES", "8")
+    with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
+        assert _factory_max_retries() == 8
+    assert not caplog.records, caplog.text
