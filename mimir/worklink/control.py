@@ -623,7 +623,7 @@ def reconcile_run_states(
                             reason=publication_reason,
                             checkout=Path(state.checkout) if state.checkout else None,
                             branch=state.branch,
-                            claim_record=claim,
+                            prior_claim=claim,
                             unpublished_commits=publication_outcome == "determined-unpublished",
                         ),
                         reservation,
@@ -646,7 +646,7 @@ def reconcile_run_states(
                         WorklinkRunResult(
                             state.issue_id, state.attempt, "failed", reason=reason,
                             checkout=Path(state.checkout) if state.checkout else None,
-                            branch=state.branch, claim_record=claim, target_label=target,
+                            branch=state.branch, prior_claim=claim, target_label=target,
                         ),
                         reservation,
                         source=source,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 import importlib
 import json
@@ -22,6 +23,9 @@ from mimir.worklink.attention import (
     AttentionSnapshot,
     Settlement,
     _SOURCE_POLICIES,
+    _exact_evidence,
+    _rearmed,
+    _source_clearance,
     classify_attention,
 )
 from mimir.worklink.dispatch_failures import (
@@ -153,8 +157,12 @@ def _attention_record(source: AttentionSource) -> AttentionRecord:
             else AttentionOutcome.STARTED if lifecycle
             else AttentionOutcome.INFRASTRUCTURE_FAILURE
         ),
-        accounting_basis=AccountingBasis.PRECLAIM,
-        attempt_consumed=None if lifecycle else False,
+        accounting_basis=(
+            AccountingBasis.VERIFIED_COMPLETION
+            if kind is AttentionKind.FACTORY_SUCCEEDED
+            else AccountingBasis.PRECLAIM
+        ),
+        attempt_consumed=True if kind is AttentionKind.FACTORY_SUCCEEDED else None if lifecycle else False,
         settlement=Settlement.NOT_NEEDED,
         error_signature="signature",
         attempt=1,
@@ -168,6 +176,137 @@ def _attention_record(source: AttentionSource) -> AttentionRecord:
         pr_head="abc",
         inhibited=not lifecycle,
     )
+
+
+def test_publication_clearance_requires_complete_exact_execution_identity():
+    record = replace(
+        _attention_record(AttentionSource.LEAF_PUBLICATION_EVIDENCE),
+        refs={"branch": "feature/17"},
+    )
+    incomplete = {
+        "status": "completed",
+        "branch": "feature/17",
+        "pr_url": record.pr_url,
+        "head_sha": record.pr_head,
+    }
+    exact = {**incomplete, "issue": 17, "attempt": 1}
+
+    assert _exact_evidence(record, incomplete) is Resolution.UNRESOLVED
+    assert _exact_evidence(record, {**exact, "attempt": 2}) is Resolution.UNRESOLVED
+    assert _exact_evidence(record, exact) is Resolution.RESOLVED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        AttentionSource.EPIC_REPOSITORY,
+        AttentionSource.EPIC_COMPUTE,
+        AttentionSource.EPIC_BASE,
+    ],
+)
+def test_repository_compute_and_base_clear_only_from_their_current_predicate(source):
+    record = _attention_record(source)
+    unrelated_factory = {
+        "run_id": "other",
+        "issue_id": record.issue_id,
+        "attempt": record.attempt,
+        "execution_id": record.execution_id,
+    }
+
+    assert _source_clearance(
+        record,
+        {"factory": unrelated_factory, "source_state": {"predicate_matches": False}},
+        {"worklink:in-progress"},
+        (),
+        True,
+    ) is Resolution.UNRESOLVED
+    assert _source_clearance(
+        record,
+        {"factory": unrelated_factory, "source_state": {"predicate_matches": True}},
+        {"worklink:in-progress"},
+        (),
+        True,
+    ) is Resolution.RESOLVED
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        AttentionSource.EPIC_CONTROLLER_RELOAD,
+        AttentionSource.EPIC_DRIVER_LOCK_SAVE,
+        AttentionSource.FACTORY_SUCCESS,
+    ],
+)
+def test_factory_clearance_requires_exact_identity_and_original_predicate(source):
+    record = replace(_attention_record(source), run_id="chainlink-17")
+    factory = {
+        "run_id": record.run_id,
+        "issue_id": record.issue_id,
+        "attempt": record.attempt,
+        "execution_id": record.execution_id,
+        "controller_phase": "parked",
+        "controller_error": "saved refusal",
+        "status": "completed",
+    }
+
+    assert _source_clearance(
+        record,
+        {"factory": factory, "source_state": {"original_predicate_resolved": False}},
+        {"worklink:review"},
+        (),
+        True,
+    ) is Resolution.UNRESOLVED
+    assert _source_clearance(
+        record,
+        {"factory": factory, "source_state": {"original_predicate_resolved": True}},
+        {"worklink:review"},
+        (),
+        True,
+    ) is Resolution.RESOLVED
+
+
+def test_orphan_label_uncertainty_requires_a_fresh_nonblocked_lifecycle():
+    record = _attention_record(AttentionSource.ORPHAN_LABELS_UNKNOWN)
+
+    assert _source_clearance(
+        record, {"issue": object()}, {"worklink:blocked"}, (), True,
+    ) is Resolution.UNRESOLVED
+    assert _source_clearance(
+        record, {"issue": object()}, {"worklink:ready"}, (), True,
+    ) is Resolution.RESOLVED
+
+
+def test_rearm_requires_a_witness_later_than_the_occurrence_baseline():
+    baseline = {
+        "issue_id": 17,
+        "attempt": 1,
+        "agent_id": "manual",
+        "claimed_at": "2026-09-17T00:00:00+00:00",
+    }
+    record = replace(
+        _attention_record(AttentionSource.LEAF_CLAIM),
+        reset_generation_baseline=3,
+        ready_cycle_baseline=5,
+        manual_claim_baseline=baseline,
+    )
+    claims = {
+        "reset_generation": 3,
+        "ready_cycle_generation": 5,
+        "latest": baseline,
+    }
+
+    assert _rearmed(record, {"labels": ["worklink:blocked"]}, claims) is Resolution.UNRESOLVED
+    assert _rearmed(
+        record, {"labels": ["worklink:blocked"]}, {**claims, "reset_generation": 4},
+    ) is Resolution.RESOLVED
+    assert _rearmed(
+        record, {"labels": ["worklink:blocked"]}, {**claims, "ready_cycle_generation": 6},
+    ) is Resolution.RESOLVED
+    assert _rearmed(
+        record,
+        {"labels": ["worklink:blocked"]},
+        {**claims, "latest": {**baseline, "claimed_at": "2026-09-18T00:00:00+00:00"}},
+    ) is Resolution.RESOLVED
 
 
 def test_every_production_source_declares_clearance_predicates():
@@ -208,6 +347,46 @@ async def test_resolved_operator_ack_is_noop_without_delivery(tmp_path, monkeypa
     assert result["disposition"] == "noop_resolved"
     stored = load_failure_state(state_dir)["issues"]["17"]["occurrences"][record.occurrence_id]
     assert stored["handling_disposition"] == "noop_resolved"
+
+
+@pytest.mark.asyncio
+async def test_identical_committed_ack_repeats_without_send(tmp_path, monkeypatch):
+    from mimir.tools import registry
+    from mimir.worklink.dispatch_failures import get_attention_record
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    record = _attention_record(AttentionSource.LEAF_CLAIM)
+    reservation = reserve_execution(
+        state_dir, issue_id=17, source="leaf_claim", operation_stage="terminal",
+        execution_id=record.execution_id,
+    )
+    promote_reservation(state_dir, 17, reservation["reservation_id"], record)
+
+    def inspect(home, issue_id, signature, occurrence_id, _readers):
+        current = get_attention_record(home, issue_id, signature, occurrence_id)
+        return AttentionSnapshot(current, Resolution.RESOLVED, {}, {})
+
+    monkeypatch.setattr(registry, "_worklink_attention_context", lambda *args: _ack_context(tmp_path))
+    monkeypatch.setattr("mimir.worklink.attention.inspect_attention", inspect)
+    alert_module = importlib.import_module("mimir.tools.operator_alert")
+    monkeypatch.setattr(
+        alert_module,
+        "deliver_operator_alert",
+        lambda *args, **kwargs: pytest.fail("committed noop acknowledgement sent an alert"),
+    )
+
+    first = json.loads(await registry.worklink_attention_ack.coroutine(
+        17, "signature", record.occurrence_id, "noop_resolved", ""
+    ))
+    second = json.loads(await registry.worklink_attention_ack.coroutine(
+        17, "signature", record.occurrence_id, "noop_resolved", ""
+    ))
+    assert first == second == {
+        "disposition": "noop_resolved",
+        "issue_id": 17,
+        "occurrence_id": record.occurrence_id,
+        "status": "handled",
+    }
 
 
 @pytest.mark.asyncio

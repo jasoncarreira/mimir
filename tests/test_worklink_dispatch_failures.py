@@ -114,10 +114,20 @@ def test_promoted_replay_returns_frozen_primary(tmp_path):
     with pytest.raises(FailureStateError, match="replay identity mismatch"):
         promote_reservation(
             tmp_path, 17, reservation["reservation_id"],
-            replace(_record(reason="second"), outcome=AttentionOutcome.BLOCKED),
+            replace(
+                _record(reason="second"),
+                outcome=AttentionOutcome.BLOCKED,
+                accounting_basis=AccountingBasis.LEAF_EXECUTION,
+                attempt_consumed=True,
+                settlement=Settlement.NOT_NEEDED,
+            ),
+        )
+    with pytest.raises(FailureStateError, match="replay identity mismatch"):
+        promote_reservation(
+            tmp_path, 17, reservation["reservation_id"], _record(reason="second")
         )
     replay = promote_reservation(
-        tmp_path, 17, reservation["reservation_id"], _record(reason="second")
+        tmp_path, 17, reservation["reservation_id"], _record(reason="first")
     )
     assert replay == first
     assert replay["reason"] == "first"
@@ -214,6 +224,77 @@ def test_strict_state_rejects_corrupt_occurrence_without_overwrite(tmp_path):
             tmp_path, issue_id=17, source="leaf_claim", operation_stage="claim"
         )
     assert path.read_bytes() == original
+
+
+def test_v2_loader_rejects_non_native_and_crosslinked_corruption(tmp_path):
+    reservation = reserve_execution(
+        tmp_path, issue_id=17, source="leaf_claim", operation_stage="claim",
+        execution_id="execution",
+    )
+    promote_reservation(tmp_path, 17, reservation["reservation_id"], _record())
+    path = tmp_path / "dispatch_failures.json"
+    valid = json.loads(path.read_text(encoding="utf-8"))
+
+    variants = []
+    for revision in ("1", True, -1):
+        payload = json.loads(json.dumps(valid))
+        payload["revision"] = revision
+        variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    del payload["issues"]["17"]["occurrences"]["occurrence"]["schema_version"]
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["schema_version"] = "2"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["kind"] = "factory_started"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["cause"] = 1
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["refs"] = {"log": False}
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["outcome"] = "blocked"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["reservations"][reservation["reservation_id"]][
+        "promoted_occurrence_id"
+    ] = "missing"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["execution_id"] = "foreign"
+    variants.append(payload)
+
+    for corrupt in variants:
+        path.write_text(json.dumps(corrupt), encoding="utf-8")
+        original = path.read_bytes()
+        with pytest.raises(FailureStateError):
+            load_failure_state(tmp_path)
+        with pytest.raises(FailureStateError):
+            reserve_execution(
+                tmp_path, issue_id=17, source="leaf_claim", operation_stage="claim"
+            )
+        assert path.read_bytes() == original
+
+
+def test_v2_loader_requires_exclusion_closure_witness(tmp_path):
+    reservation = reserve_execution(
+        tmp_path, issue_id=17, source="leaf_claim", operation_stage="claim",
+        execution_id="execution",
+    )
+    close_reservation_excluded(
+        tmp_path, 17, reservation["reservation_id"], witness="benign refusal"
+    )
+    path = tmp_path / "dispatch_failures.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    del payload["issues"]["17"]["reservations"][reservation["reservation_id"]][
+        "exclusion_witness"
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(FailureStateError, match="exclusion witness"):
+        load_failure_state(tmp_path)
 
 
 def test_concurrent_reservations_and_promotions_keep_complete_pairs(tmp_path):

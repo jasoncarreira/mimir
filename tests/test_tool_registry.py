@@ -1866,3 +1866,62 @@ def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
             "client_provider",
         ),
     }
+
+
+def test_attention_production_claim_reader_exposes_later_rearm_witnesses(
+    tmp_path, monkeypatch,
+) -> None:
+    import json
+    import subprocess
+    from datetime import UTC, datetime
+
+    from mimir.tools import registry
+    from mimir.worklink.claims import CLAIM_RESET_PREFIX, ClaimRecord
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        reserve_execution,
+        save_failure_state,
+    )
+    from mimir.worklink.orchestrator import ChainlinkIssueReader
+
+    claim = ClaimRecord(17, 2, "operator", datetime.now(UTC))
+    issue = SimpleNamespace(
+        issue_id=17,
+        labels={"worklink:ready"},
+        comments=[CLAIM_RESET_PREFIX + '{"reason":"retry"}', claim.to_comment()],
+    )
+    monkeypatch.setattr(ChainlinkIssueReader, "read", lambda self, issue_id: issue)
+
+    def run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, json.dumps({"locks": []}), "")
+
+    monkeypatch.setattr(registry.subprocess, "run", run)
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reserve_execution(
+        state_dir,
+        issue_id=17,
+        source="leaf_claim",
+        operation_stage="claim",
+        execution_id="reader-execution",
+    )
+    state = load_failure_state(state_dir)
+    state["issues"]["17"]["ready_cycle_generation"] = 4
+    state["issues"]["17"]["manual_claim_witness"] = {
+        "issue_id": 17,
+        "attempt": 2,
+        "agent_id": "operator",
+        "claimed_at": claim.claimed_at.isoformat(),
+    }
+    save_failure_state(state_dir, state)
+
+    observed = registry._attention_readers(tmp_path).claims(17)
+    assert observed["lock_absent"] is True
+    assert observed["reset_generation"] == 1
+    assert observed["ready_cycle_generation"] == 4
+    assert observed["latest"].issue_id == claim.issue_id
+    assert observed["latest"].attempt == claim.attempt
+    assert observed["latest"].agent_id == claim.agent_id
+    assert observed["latest"].claimed_at == claim.claimed_at
+    assert observed["latest"].generation == 1
+    assert observed["manual_claim_witness"] == state["issues"]["17"]["manual_claim_witness"]

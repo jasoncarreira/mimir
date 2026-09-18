@@ -50,6 +50,7 @@ from .claims import (
     ChainlinkClaims,
     ClaimRecord,
     WORKLINK_EPIC_LABEL,
+    claim_reset_generation,
     claim_records_from_comments,
 )
 from .evidence import (
@@ -210,6 +211,10 @@ class WorklinkRunResult:
     evidence_quality: str | None = None
     target_label: str | None = None
     terminal_transition_applied: bool = True
+    repo_path: Path | None = None
+    repository: str | None = None
+    compute_name: str | None = None
+    base_ref: str | None = None
 
 
 @dataclass
@@ -225,6 +230,11 @@ class _TerminalClaimRelease:
     retain_for_recovery: bool = False
     label_transition_applied: bool = False
     attention_occurrence_id: str | None = None
+    state_clear_source: str = "leaf_completed_state_clear"
+    state_clear_result: Any = None
+    attention_reservation: dict[str, Any] | None = None
+    failure_reason: str = "Chainlink lock release failed"
+    failure_source: str = "leaf_release"
 
     def __call__(self) -> bool:
         if self.attention_occurrence_id is not None:
@@ -249,6 +259,31 @@ class _TerminalClaimRelease:
                 claim_record=self.claim_record,
                 trigger_ready_scan=self.trigger_ready_scan,
             )
+        except _RunStateClearError as exc:
+            self.failure_reason = str(exc)
+            self.failure_source = self.state_clear_source
+            created = False
+            if self.attention_occurrence_id is None and self.state_clear_result is not None:
+                record = _record_attention_result(
+                    self.home,
+                    self.state_clear_result,
+                    self.attention_reservation,
+                    source=self.state_clear_source,
+                )
+                self.attention_occurrence_id = record.occurrence_id
+                created = True
+            if self.attention_occurrence_id is not None and not created:
+                from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+                append_secondary_fault(
+                    dispatch_failure_state_dir(self.home),
+                    self.issue_id,
+                    self.attention_occurrence_id,
+                    source=self.state_clear_source,
+                    cause="reconcile_failed",
+                    reason=str(exc),
+                )
+            self.confirmed = False
         except Exception:
             self.confirmed = False
         if not self.confirmed:
@@ -264,6 +299,10 @@ class _TerminalClaimRelease:
 
 class WorklinkError(RuntimeError):
     """Base error for operator-facing Worklink failures."""
+
+
+class _RunStateClearError(WorklinkError, OSError):
+    pass
 
 
 class _AttentionBoundaryError(WorklinkError):
@@ -666,6 +705,7 @@ class WorklinkRunner:
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        _checkpoint_attention_rearm_baseline(self.home, reservation, issue.comments)
         try:
             validate_leaf(issue)
         except LeafValidationError as exc:
@@ -753,7 +793,11 @@ class WorklinkRunner:
                     compute_backend=compute.name,
                 )
                 return promote(
-                    WorklinkRunResult(issue.issue_id, None, "refused", reason=reason),
+                    WorklinkRunResult(
+                        issue.issue_id, None, "refused", reason=reason,
+                        repo_path=self.repo, repository=repo_slug,
+                        compute_name=compute.name,
+                    ),
                     "leaf_compute",
                 )
 
@@ -956,6 +1000,10 @@ class WorklinkRunner:
                     attention_source="leaf_checkout",
                     claim_record=record,
                     claim_manager=claims,
+                    target_label=claims.terminal_target_label(
+                        status="failed", review_ready=False,
+                        attempt=record.budget_attempt or record.attempt,
+                    ) if autonomous else None,
                 ), "leaf_checkout")
                 claims.transition_issue(
                     issue.issue_id,
@@ -1165,6 +1213,13 @@ class WorklinkRunner:
                     attempt=record.budget_attempt or record.attempt,
                     reason=str(exc),
                 )
+                if autonomous and not claims.terminal_labels_confirmed(
+                    issue.issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=record.budget_attempt or record.attempt,
+                ):
+                    raise WorklinkError("terminal labels were not confirmed")
                 transition_applied = True
                 terminal_release.label_transition_applied = True
                 terminal_release.retain_for_recovery = False
@@ -1575,7 +1630,15 @@ class WorklinkRunner:
             claim_manager=claims,
             normalized_leaf_result=not bool(compute_result.launch_error and not validation.review_ready),
             launch_error=bool(compute_result.launch_error and not validation.review_ready),
+            target_label=claims.terminal_target_label(
+                status=transition_status,
+                review_ready=validation.review_ready,
+                attempt=claim_record.budget_attempt or attempt,
+            ) if autonomous else None,
         )
+        if autonomous:
+            terminal_release.state_clear_result = terminal
+            terminal_release.attention_reservation = attention_reservation
         attention_record = None
         if autonomous and (primary_source is not None or secondary_faults):
             attention_record = _record_attention_result(
@@ -1590,6 +1653,16 @@ class WorklinkRunner:
             nonlocal attention_record
             if not autonomous:
                 return
+            if attention_record is None and terminal_release.attention_occurrence_id is not None:
+                from .attention import AttentionRecord
+                from .dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+                payload = load_failure_state(
+                    dispatch_failure_state_dir(self.home)
+                )["issues"][str(issue.issue_id)]["occurrences"][
+                    terminal_release.attention_occurrence_id
+                ]
+                attention_record = AttentionRecord.from_json(payload)
             if attention_record is None:
                 attention_record = _record_attention_result(
                     self.home, terminal, attention_reservation, source="leaf_postclaim"
@@ -1615,7 +1688,7 @@ class WorklinkRunner:
                     attempt=claim_record.budget_attempt or attempt,
                     reason=transition_reason,
                 )
-                if attention_record is not None and not claims.terminal_labels_confirmed(
+                if autonomous and not claims.terminal_labels_confirmed(
                     issue.issue_id,
                     status=transition_status,
                     review_ready=validation.review_ready,
@@ -1656,18 +1729,19 @@ class WorklinkRunner:
                 log_transition()
         if transition_applied and not terminal_release():
             append_terminal_fault(
-                "leaf_release", "reconcile_failed", "claim release was not confirmed"
+                terminal_release.failure_source,
+                "reconcile_failed",
+                terminal_release.failure_reason,
             )
-            return WorklinkRunResult(
-                issue.issue_id,
-                attempt,
-                "failed",
-                review_ready=validation.review_ready,
-                pr_url=pr_url,
-                evidence_path=evidence_path,
-                checkout=lease.path,
-                branch=lease.branch,
-                reason="terminal recovery incomplete: Chainlink lock release failed",
+            return replace(
+                terminal,
+                status="failed",
+                reason=f"terminal recovery incomplete: {terminal_release.failure_reason}",
+                attention_source=(
+                    attention_record.source.value
+                    if attention_record is not None else terminal_release.failure_source
+                ),
+                attention_occurrence_id=terminal_release.attention_occurrence_id,
             )
         cleanup_error = None
         if publication is None:
@@ -2085,6 +2159,7 @@ class WorklinkRunner:
 
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
         issue = issue_reader.read(issue_id)
+        _checkpoint_attention_rearm_baseline(self.home, attention_reservation, issue.comments)
         if "worklink:epic" not in issue.labels:
             _log_event(
                 "worklink_epic_refused",
@@ -2109,10 +2184,18 @@ class WorklinkRunner:
         repo_url = _repo_remote_url(self.repo, runner=runner)
         repo_slug = _repo_slug_from_url(repo_url)
         if repo_slug is None:
-            return promote(WorklinkRunResult(issue_id, None, "failed", reason="factory repository must have a canonical GitHub origin"), "epic_repository")
+            return promote(WorklinkRunResult(
+                issue_id, None, "failed",
+                reason="factory repository must have a canonical GitHub origin",
+                repo_path=self.repo,
+            ), "epic_repository")
         compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
         if compute.name != "local_subprocess":
-            return promote(WorklinkRunResult(issue_id, None, "failed", reason="factory runs require local_subprocess supervision"), "epic_compute")
+            return promote(WorklinkRunResult(
+                issue_id, None, "failed",
+                reason="factory runs require local_subprocess supervision",
+                repo_path=self.repo, repository=repo_slug, compute_name=compute.name,
+            ), "epic_compute")
         if isinstance(compute, LocalSubprocessComputeBackend):
             runner = _factory_git_runner(runner)
         if autonomous:
@@ -2126,7 +2209,10 @@ class WorklinkRunner:
                     compute_backend=compute.name,
                     reason=reason,
                 )
-                return promote(WorklinkRunResult(issue_id, None, "refused", reason=reason), "epic_compute")
+                return promote(WorklinkRunResult(
+                    issue_id, None, "refused", reason=reason,
+                    repo_path=self.repo, repository=repo_slug, compute_name=compute.name,
+                ), "epic_compute")
         try:
             launcher = selected.admit()
         except Exception as exc:
@@ -2169,6 +2255,10 @@ class WorklinkRunner:
                 None,
                 "refused",
                 reason=reason,
+                repo_path=self.repo,
+                repository=repo_slug,
+                compute_name=compute.name,
+                base_ref=base,
             ), "epic_base")
         test_cmd = (
             repository_config.test_command
@@ -2547,6 +2637,10 @@ class WorklinkRunner:
                     run_id=current.run_id if current is not None else run_id,
                     launch_id=current.launch_id if current is not None else None,
                     evidence_quality="unavailable" if reload_error is not None else None,
+                    target_label=claims.terminal_target_label(
+                        status="failed", review_ready=False,
+                        attempt=claim_record.budget_attempt or claim_record.attempt,
+                    ) if autonomous else None,
                     attention_secondary_faults=(
                         ({"source": boundary_source, "cause": "controller_failed", "reason": original_reason},)
                         if boundary_source in cleanup_sources else ()
@@ -2603,7 +2697,7 @@ class WorklinkRunner:
                     attempt=claim_record.budget_attempt or claim_record.attempt,
                     reason=reason,
                 )
-                if not claims.terminal_labels_confirmed(
+                if autonomous and not claims.terminal_labels_confirmed(
                     issue_id, status="failed", review_ready=False,
                     attempt=claim_record.budget_attempt or claim_record.attempt,
                 ):
@@ -3195,6 +3289,10 @@ class WorklinkRunner:
                 controller_error=factory_record.controller_error,
                 run_id=factory_record.run_id,
                 launch_id=factory_record.launch_id,
+                target_label=claims.terminal_target_label(
+                    status="blocked", review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                ) if autonomous else None,
             ), "factory_needs_human")
             try:
                 claims.transition_issue(
@@ -3247,6 +3345,10 @@ class WorklinkRunner:
                 controller_error=factory_record.controller_error,
                 run_id=factory_record.run_id,
                 launch_id=factory_record.launch_id,
+                target_label=claims.terminal_target_label(
+                    status="blocked", review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                ) if autonomous else None,
             ), source)
             try:
                 claims.transition_issue(
@@ -3310,6 +3412,10 @@ class WorklinkRunner:
                     controller_error=factory_record.controller_error,
                     run_id=factory_record.run_id,
                     launch_id=factory_record.launch_id,
+                    target_label=claims.terminal_target_label(
+                        status="blocked", review_ready=False,
+                        attempt=claim_record.budget_attempt or claim_record.attempt,
+                    ) if autonomous else None,
                 ),
                 "factory_completion_verify",
             )
@@ -3357,6 +3463,10 @@ class WorklinkRunner:
             controller_error=factory_record.controller_error,
             run_id=factory_record.run_id,
             launch_id=factory_record.launch_id,
+            target_label=claims.terminal_target_label(
+                status="review", review_ready=True,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+            ) if autonomous else None,
         ), "factory_success", success=True)
         try:
             claims.transition_issue(
@@ -4044,7 +4154,10 @@ def _release_issue_and_clear_run_state(
         return False
     try:
         if completed_state is not None:
-            clear_run_state_strict(home, issue_id, expected=completed_state)
+            try:
+                clear_run_state_strict(home, issue_id, expected=completed_state)
+            except OSError as exc:
+                raise _RunStateClearError(str(exc)) from exc
     finally:
         if trigger_ready_scan:
             _trigger_ready_scan_after_release(home)
@@ -4211,6 +4324,53 @@ def _attention_protocol_value(name: str) -> str | None:
     return os.environ.get(name)
 
 
+def _checkpoint_attention_rearm_baseline(
+    home: Path,
+    reservation: dict[str, Any] | None,
+    comments: Sequence[str],
+) -> None:
+    if reservation is None:
+        return
+    from .dispatch_failures import (
+        checkpoint_reservation,
+        close_reservation_excluded,
+        dispatch_failure_state_dir,
+        load_failure_state,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    entry = load_failure_state(state_dir)["issues"].get(str(reservation["issue_id"]), {})
+    records = claim_records_from_comments(comments)
+    latest = max(
+        (item for item in records if item.issue_id == reservation["issue_id"]),
+        key=lambda item: (item.generation, item.attempt, item.heartbeat_at or item.claimed_at),
+        default=None,
+    )
+    baseline = {
+        "reset_generation": claim_reset_generation(comments),
+        "ready_cycle_generation": entry.get("ready_cycle_generation", 0),
+        "manual_claim": (
+            {
+                "issue_id": latest.issue_id,
+                "attempt": latest.attempt,
+                "agent_id": latest.agent_id,
+                "claimed_at": latest.claimed_at.isoformat(),
+            }
+            if latest is not None else None
+        ),
+    }
+    observations = dict(reservation.get("observations") or {})
+    observations["rearm_baseline"] = baseline
+    updated = checkpoint_reservation(
+        state_dir,
+        int(reservation["issue_id"]),
+        str(reservation["reservation_id"]),
+        observations=observations,
+    )
+    reservation.clear()
+    reservation.update(updated)
+
+
 def _close_attention_excluded(
     home: Path,
     issue_id: int,
@@ -4256,6 +4416,96 @@ def _attention_occurrence_identity(
     return uuid.uuid5(uuid.NAMESPACE_URL, identity).hex
 
 
+def _accepted_evidence_quality(
+    home: Path,
+    result: WorklinkRunResult,
+    factory_status: Any,
+    *,
+    valid_rows: Callable[[Any, str], bool],
+):
+    from .attention import EvidenceQuality
+
+    if result.evidence_path is not None:
+        try:
+            path = result.evidence_path
+            allowed = (home / "state" / "worklink").resolve()
+            resolved = path.resolve(strict=True)
+            if path.is_symlink() or not resolved.is_relative_to(allowed):
+                return EvidenceQuality.FOREIGN
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return EvidenceQuality.MISSING
+        except OSError:
+            return EvidenceQuality.UNAVAILABLE
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return EvidenceQuality.MALFORMED
+        if not isinstance(payload, Mapping):
+            return EvidenceQuality.MALFORMED
+        if type(payload.get("issue")) is not int or payload["issue"] != result.issue_id:
+            return EvidenceQuality.FOREIGN
+        if (
+            type(payload.get("attempt")) is not int
+            or payload["attempt"] != result.attempt
+            or not isinstance(payload.get("branch"), str)
+            or payload["branch"] != result.branch
+        ):
+            return EvidenceQuality.STALE
+        status = payload.get("status")
+        if status not in {"completed", "blocked", "failed"}:
+            return EvidenceQuality.MALFORMED
+        if status != "completed":
+            return EvidenceQuality.EMPTY
+        if result.pr_url is not None and (
+            payload.get("pr_url") != result.pr_url
+            or not isinstance(result.pr_head, str)
+            or not result.pr_head
+            or payload.get("head_sha") != result.pr_head
+        ):
+            return EvidenceQuality.STALE
+        return EvidenceQuality.VALID
+    if factory_status is None:
+        if result.evidence_quality is not None:
+            return EvidenceQuality(result.evidence_quality)
+        return EvidenceQuality.MISSING
+    field = lambda name: (
+        factory_status.get(name)
+        if isinstance(factory_status, Mapping)
+        else getattr(factory_status, name, None)
+    )
+    pr_url = field("pr_url")
+    steps = field("steps")
+    slices = field("slices")
+    valid = field("valid")
+    if valid is not None and valid is not True:
+        return EvidenceQuality.MALFORMED
+    status_run_id = field("run_id")
+    if result.run_id is not None and status_run_id != result.run_id:
+        return EvidenceQuality.FOREIGN
+    if pr_url is not None:
+        if result.pr_url != pr_url:
+            return EvidenceQuality.STALE
+        return (
+            EvidenceQuality.VALID
+            if (
+                isinstance(pr_url, str)
+                and bool(pr_url.strip())
+                and result.pr_state in {"OPEN", "MERGED"}
+                and isinstance(result.pr_head, str)
+                and bool(result.pr_head)
+            )
+            else EvidenceQuality.MALFORMED
+        )
+    if steps is None and slices is None:
+        return EvidenceQuality.NULL
+    if steps not in (None, []) and not valid_rows(steps, "agent"):
+        return EvidenceQuality.MALFORMED
+    if slices not in (None, []) and not valid_rows(slices, "id"):
+        return EvidenceQuality.MALFORMED
+    if valid_rows(steps, "agent") or valid_rows(slices, "id"):
+        return EvidenceQuality.VALID
+    return EvidenceQuality.EMPTY
+
+
 def _record_attention_result(
     home: Path,
     result: WorklinkRunResult,
@@ -4277,10 +4527,13 @@ def _record_attention_result(
         EvidenceQuality,
         Settlement,
         ValidationDetail,
+        _valid_factory_rows,
         classify_attention,
     )
     from .dispatch_failures import (
+        append_secondary_fault,
         checkpoint_reservation,
+        close_reservation_excluded,
         dispatch_failure_state_dir,
         error_signature,
         load_failure_state,
@@ -4298,11 +4551,61 @@ def _record_attention_result(
             source=source,
             operation_stage="terminal",
         )
+    elif reservation.get("source") != source:
+        carried = {
+            name: reservation.get(name)
+            for name in (
+                "prepared_claim", "confirmed_claim", "claim_binding_state", "observations",
+                "run_id", "launch_id",
+            )
+        }
+        close_reservation_excluded(
+            state_dir,
+            result.issue_id,
+            str(reservation["reservation_id"]),
+            witness=f"delegated to exact boundary {source}",
+        )
+        exact_reservation_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{reservation['execution_id']}:{source}:terminal",
+        ).hex
+        reservation = reserve_execution(
+            state_dir,
+            issue_id=result.issue_id,
+            source=source,
+            operation_stage="terminal",
+            execution_id=str(reservation["execution_id"]),
+            run_id=carried["run_id"],
+            launch_id=carried["launch_id"],
+            invocation_id=reservation.get("invocation_id"),
+            reservation_id=exact_reservation_id,
+        )
+        updates = {
+            key: value
+            for key, value in carried.items()
+            if key in {"prepared_claim", "confirmed_claim", "claim_binding_state", "observations"}
+            and value is not None and value != "none"
+        }
+        if updates:
+            reservation = checkpoint_reservation(
+                state_dir,
+                result.issue_id,
+                exact_reservation_id,
+                **updates,
+            )
     current_issue = load_failure_state(state_dir)["issues"].get(str(result.issue_id), {})
     current_reservation = current_issue.get("reservations", {}).get(
         str(reservation["reservation_id"])
     ) if isinstance(current_issue, Mapping) else None
     closed = isinstance(current_reservation, Mapping) and current_reservation.get("closure") == "promoted"
+    observations = (
+        current_reservation.get("observations", {})
+        if isinstance(current_reservation, Mapping) else {}
+    )
+    rearm_baseline = (
+        observations.get("rearm_baseline", {})
+        if isinstance(observations, Mapping) else {}
+    )
     claim = result.claim_record
     if claim is None:
         claim_payload = reservation.get("confirmed_claim") or reservation.get("prepared_claim")
@@ -4329,18 +4632,21 @@ def _record_attention_result(
             operation_stage="terminal",
         )
     factory_status = result.accepted_factory_status or result.factory_status
-    if result.evidence_quality is not None:
-        evidence_quality = EvidenceQuality(result.evidence_quality)
-    elif result.evidence_path is not None:
-        evidence_quality = EvidenceQuality.VALID
-    elif factory_status is None:
-        evidence_quality = EvidenceQuality.MISSING
-    elif any((factory_status.pr_url, factory_status.steps, factory_status.slices)):
-        evidence_quality = EvidenceQuality.VALID
-    elif factory_status.steps is None and factory_status.slices is None:
-        evidence_quality = EvidenceQuality.NULL
-    else:
-        evidence_quality = EvidenceQuality.EMPTY
+    evidence_quality = _accepted_evidence_quality(
+        home,
+        result,
+        factory_status,
+        valid_rows=_valid_factory_rows,
+    )
+    accepted_factory_status = (
+        factory_status
+        if evidence_quality in {
+            EvidenceQuality.VALID,
+            EvidenceQuality.NULL,
+            EvidenceQuality.EMPTY,
+        }
+        else None
+    )
     primary = {
         "partial": AttentionOutcome.PARTIAL,
         "needs-human": AttentionOutcome.NEEDS_HUMAN,
@@ -4355,8 +4661,11 @@ def _record_attention_result(
         kind=kind,
         primary_outcome=primary,
         original_result_status=result.status,
-        factory_status=factory_status,
-        accepted_factory_status=result.accepted_factory_status,
+        factory_status=accepted_factory_status,
+        accepted_factory_status=(
+            accepted_factory_status
+            if result.accepted_factory_status is not None else None
+        ),
         verified_completion=lifecycle_success,
         normalized_leaf_result=result.normalized_leaf_result,
         launch_error=result.launch_error,
@@ -4437,6 +4746,10 @@ def _record_attention_result(
             "preserved_ref": result.preserved_ref,
             "preservation_error": result.preservation_error,
             "target_label": result.target_label,
+            "repo": str(result.repo_path) if result.repo_path else None,
+            "repository": result.repository,
+            "compute_name": result.compute_name,
+            "base_ref": result.base_ref,
             "log": os.environ.get("WORKLINK_RUN_LOG"),
         },
         factory_projection=factory_status.to_json() if factory_status is not None else None,
@@ -4453,24 +4766,60 @@ def _record_attention_result(
             "leaf_gate_missing": ValidationDetail.GATE_COMMAND_NOT_FOUND,
             "leaf_output_overflow": ValidationDetail.OUTPUT_OVERFLOW,
         }.get(source),
+        reset_generation_baseline=(
+            rearm_baseline.get("reset_generation", 0)
+            if type(rearm_baseline.get("reset_generation", 0)) is int else 0
+        ),
+        ready_cycle_baseline=(
+            rearm_baseline.get("ready_cycle_generation", 0)
+            if type(rearm_baseline.get("ready_cycle_generation", 0)) is int else 0
+        ),
+        manual_claim_baseline=(
+            dict(rearm_baseline["manual_claim"])
+            if isinstance(rearm_baseline.get("manual_claim"), Mapping) else None
+        ),
     )
-    promote_reservation(
+    promoted = promote_reservation(
         state_dir,
         result.issue_id,
         str(reservation["reservation_id"]),
         record,
     )
-    if accounting.settlement is Settlement.PENDING and claim is not None:
+    record = AttentionRecord.from_json(promoted)
+    claim = record.claim
+    if record.settlement is Settlement.PENDING and claim is not None:
         claims = result.claim_manager or ChainlinkClaims(
             agent_id=claim.agent_id,
             runner=_list_runner(_runner_for_home(home, "chainlink")),
             home_path=home,
             max_attempts=WorklinkConfig.load(home / "worklink.yaml").defaults.max_claim_attempts,
         )
-        if claims.mark_attempt_nonconsuming(claim, occurrence_id):
-            mark_attention_settlement(
-                state_dir, result.issue_id, occurrence_id, Settlement.APPLIED.value
+        try:
+            marked = claims.mark_attempt_nonconsuming(claim, occurrence_id)
+        except Exception as exc:
+            append_secondary_fault(
+                state_dir,
+                result.issue_id,
+                occurrence_id,
+                source=source,
+                cause="reconcile_failed",
+                reason=f"nonconsumption marker unavailable: {exc}",
             )
+        else:
+            if marked:
+                try:
+                    mark_attention_settlement(
+                        state_dir, result.issue_id, occurrence_id, Settlement.APPLIED.value
+                    )
+                except Exception as exc:
+                    append_secondary_fault(
+                        state_dir,
+                        result.issue_id,
+                        occurrence_id,
+                        source=source,
+                        cause="reconcile_failed",
+                        reason=f"settlement commit unavailable: {exc}",
+                    )
     return record
 
 
@@ -4617,7 +4966,7 @@ def run_worklink(
             source="leaf_template" if isinstance(exc, LeafValidationError) else "leaf_run_boundary",
         )
         raise
-    if result.status == "failed":
+    if result.status == "failed" and result.attention_occurrence_id is None:
         _record_run_failure(
             home=home,
             issue_id=issue_id,
@@ -4630,6 +4979,16 @@ def run_worklink(
             reservation=reservation,
             source=result.attention_source
             or ("leaf_work_failed" if result.attempt is not None else "leaf_run_boundary"),
+        )
+    elif result.status == "failed" and autonomous:
+        _log_event(
+            "worklink_run_failed",
+            issue_id=issue_id,
+            attempt=result.attempt,
+            attempt_consumed=None,
+            exit_status=1,
+            terminal_error=result.reason or "Worklink run failed",
+            occurrence_id=result.attention_occurrence_id,
         )
     elif autonomous and result.status in {"blocked"} and result.attention_occurrence_id is None:
         _record_attention_result(
@@ -4662,7 +5021,7 @@ def _record_run_failure(
     reservation: dict[str, Any] | None = None,
     source: str = "leaf_run_boundary",
 ) -> None:
-    from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
+    from .dispatch_failures import dispatch_failure_state_dir, terminal_error
 
     safe_error = terminal_error(error)
     _log_event(
@@ -4702,16 +5061,6 @@ def _record_run_failure(
             preservation_error=preservation_error,
         )
         _record_attention_result(home, result, reservation, source=source)
-        record_failure(
-            dispatch_failure_state_dir(home),
-            issue_id=issue_id,
-            attempt=attempt,
-            exit_status=exit_status,
-            error=error,
-            log_path=os.environ.get("WORKLINK_RUN_LOG"),
-            preserved_ref=preserved_ref,
-            preservation_error=preservation_error,
-        )
 
 
 def _record_run_success(home: Path, issue_id: int) -> None:
@@ -4765,7 +5114,7 @@ def run_worklink_epic(
             source="epic_run_boundary",
         )
         raise
-    if result.status == "failed":
+    if result.status == "failed" and result.attention_occurrence_id is None:
         _record_run_failure(
             home=home,
             issue_id=issue_id,
@@ -4777,6 +5126,16 @@ def run_worklink_epic(
             preservation_error=result.preservation_error,
             reservation=reservation,
             source=result.attention_source or "epic_controller",
+        )
+    elif result.status == "failed" and autonomous:
+        _log_event(
+            "worklink_run_failed",
+            issue_id=issue_id,
+            attempt=result.attempt,
+            attempt_consumed=None,
+            exit_status=1,
+            terminal_error=result.reason or "Worklink epic run failed",
+            occurrence_id=result.attention_occurrence_id,
         )
     elif autonomous and result.status in {"blocked", "partial", "needs-human"} and result.attention_occurrence_id is None:
         _record_attention_result(

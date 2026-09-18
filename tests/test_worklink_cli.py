@@ -1153,6 +1153,12 @@ def test_autonomous_reconcile_records_the_exact_failed_boundary(
         _state(tmp_path, 13, 999_999_997, ticks=1, started_at=now),
         autonomous=True,
         execution_id="execution-13",
+        claim_identity={
+            "issue_id": 13,
+            "attempt": 2,
+            "agent_id": "prior-controller",
+            "claimed_at": now.isoformat(),
+        },
     )
     save_run_state(tmp_path, state)
     labels = {"worklink:in-progress"}
@@ -1206,6 +1212,10 @@ def test_autonomous_reconcile_records_the_exact_failed_boundary(
     occurrence = occurrences[0]
     assert occurrence["source"] == expected_source.value
     assert occurrence["inhibited"] is True
+    assert occurrence["claim_relation"] == "related_prior_claim"
+    assert occurrence["claim"] is None
+    assert occurrence["prior_claim"] == state.claim_identity
+    assert occurrence["settlement"] == "not_needed"
     assert load_run_state(tmp_path, 13) == state
 
     target = occurrence["refs"].get("target_label") or "worklink:ready"
@@ -1235,9 +1245,12 @@ def test_autonomous_reconcile_records_the_exact_failed_boundary(
             claims=lambda _issue: {
                 "lock_absent": positive,
                 "locks": [] if positive else [13],
-                "attempts_used": 0,
-                "max_attempts": 3,
-            },
+                    "attempts_used": 0,
+                    "max_attempts": 3,
+                    "reset_generation": occurrence["reset_generation_baseline"],
+                    "ready_cycle_generation": occurrence["ready_cycle_baseline"],
+                    "latest": occurrence["manual_claim_baseline"],
+                },
             run_state=lambda _issue: (
                 None if positive and expected_source is AttentionSource.ORPHAN_STATE_UPDATE
                 else state

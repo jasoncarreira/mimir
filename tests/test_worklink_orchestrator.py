@@ -2762,6 +2762,51 @@ def test_release_notification_follows_state_clear_and_survives_clear_failure(
     assert events == ["release_issue", "clear_run_state", "worklink_slot_released"]
 
 
+def test_strict_completed_state_clear_failure_uses_its_exact_attention_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+    )
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    _, runner = _orchestrator_runner(repo, worktree)
+    monkeypatch.setattr(
+        orchestrator,
+        "clear_run_state_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("state clear failed")),
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", test_command="echo ok", autonomous=True,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.attention_source == "leaf_completed_state_clear"
+    assert result.attention_occurrence_id
+    occurrence = load_failure_state(
+        dispatch_failure_state_dir(tmp_path)
+    )["issues"]["441"]["occurrences"][result.attention_occurrence_id]
+    assert occurrence["source"] == "leaf_completed_state_clear"
+    assert occurrence["original_result_status"] == "completed"
+    assert occurrence["secondary_faults"] == [{
+        "source": "leaf_completed_state_clear",
+        "cause": "reconcile_failed",
+        "reason": "state clear failed",
+    }]
+
+
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
@@ -6522,6 +6567,176 @@ def test_factory_status_binding_allows_null_base_before_completion(
     observed = record.observed(status, datetime.now(UTC).isoformat())
     assert observed.status is not None
     assert observed.status.pr_base is None
+
+
+def test_execution_local_evidence_quality_rejects_bad_and_stale_files(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.attention import EvidenceQuality, _valid_factory_rows
+
+    evidence_dir = tmp_path / "state" / "worklink"
+    evidence_dir.mkdir(parents=True)
+    path = evidence_dir / "evidence.json"
+    result = orchestrator.WorklinkRunResult(
+        17,
+        2,
+        "failed",
+        evidence_path=path,
+        branch="feature/17",
+        pr_url="https://github.com/owner/repo/pull/17",
+        pr_head="a" * 40,
+    )
+
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, None, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.MISSING
+    path.write_text("not-json", encoding="utf-8")
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, None, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.MALFORMED
+    path.write_text(json.dumps({
+        "issue": 17,
+        "attempt": 1,
+        "branch": "feature/17",
+        "status": "completed",
+        "pr_url": result.pr_url,
+        "head_sha": result.pr_head,
+    }), encoding="utf-8")
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, None, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.STALE
+    path.write_text(json.dumps({
+        "issue": 17,
+        "attempt": 2,
+        "branch": "feature/17",
+        "status": "failed",
+        "pr_url": result.pr_url,
+        "head_sha": result.pr_head,
+    }), encoding="utf-8")
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, None, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.EMPTY
+    path.write_text(json.dumps({
+        "issue": 17,
+        "attempt": 2,
+        "branch": "feature/17",
+        "status": "completed",
+        "pr_url": result.pr_url,
+        "head_sha": result.pr_head,
+    }), encoding="utf-8")
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, None, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.VALID
+
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path,
+        replace(result, evidence_path=foreign),
+        None,
+        valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.FOREIGN
+
+
+def test_accepted_factory_observation_survives_a_later_read_failure(tmp_path: Path) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.attention import EvidenceQuality, _valid_factory_rows
+
+    accepted = {
+        "status": "blocked",
+        "pr_url": None,
+        "steps": [{"agent": "build", "status": "completed", "attempts": 1}],
+        "slices": None,
+    }
+    result = orchestrator.WorklinkRunResult(
+        17,
+        1,
+        "blocked",
+        accepted_factory_status=accepted,
+        evidence_quality="unavailable",
+    )
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path, result, accepted, valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.VALID
+
+    malformed_pr = {**accepted, "pr_url": "https://github.com/owner/repo/pull/17"}
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path,
+        replace(result, pr_url=malformed_pr["pr_url"]),
+        malformed_pr,
+        valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.MALFORMED
+    assert orchestrator._accepted_evidence_quality(
+        tmp_path,
+        replace(
+            result,
+            pr_url=malformed_pr["pr_url"],
+            pr_state="OPEN",
+            pr_head="a" * 40,
+        ),
+        malformed_pr,
+        valid_rows=_valid_factory_rows,
+    ) is EvidenceQuality.VALID
+
+
+def test_settlement_failure_resumes_the_promoted_occurrence_without_repromotion(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        reserve_execution,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_execution(
+        state_dir,
+        issue_id=17,
+        source="leaf_launch",
+        operation_stage="terminal",
+        execution_id="settlement-execution",
+    )
+    claim = ClaimRecord(17, 1, "agent", datetime.now(UTC))
+
+    class Claims:
+        calls = 0
+
+        def mark_attempt_nonconsuming(self, record: ClaimRecord, occurrence_id: str) -> bool:
+            assert record == claim
+            assert occurrence_id
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("comment read unavailable")
+            return True
+
+    claims = Claims()
+    result = orchestrator.WorklinkRunResult(
+        17,
+        1,
+        "failed",
+        reason="worker disappeared before accepted evidence",
+        claim_record=claim,
+        claim_manager=claims,
+    )
+
+    first = orchestrator._record_attention_result(
+        tmp_path, result, reservation, source="leaf_launch",
+    )
+    issue = load_failure_state(state_dir)["issues"]["17"]
+    assert list(issue["occurrences"]) == [first.occurrence_id]
+    assert issue["occurrences"][first.occurrence_id]["settlement"] == "pending"
+    assert issue["occurrences"][first.occurrence_id]["secondary_faults"]
+
+    second = orchestrator._record_attention_result(
+        tmp_path, result, reservation, source="leaf_launch",
+    )
+    issue = load_failure_state(state_dir)["issues"]["17"]
+    assert second.occurrence_id == first.occurrence_id
+    assert list(issue["occurrences"]) == [first.occurrence_id]
+    assert issue["occurrences"][first.occurrence_id]["settlement"] == "applied"
+    assert len(issue["occurrences"][first.occurrence_id]["secondary_faults"]) == 1
 
 
 def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) -> None:

@@ -7726,6 +7726,9 @@ async def test_installed_attention_poller_event_can_ack_bound_occurrence(
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.models import TurnContext
     from mimir.tools import registry
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
     from mimir.worklink.attention import (
         AccountingBasis,
         AttentionCause,
@@ -7782,38 +7785,67 @@ async def test_installed_attention_poller_event_can_ack_bound_occurrence(
     snapshot = AttentionSnapshot(record, Resolution.RESOLVED, {}, {})
     monkeypatch.setattr("mimir.worklink.attention.inspect_attention", lambda *args: snapshot)
     monkeypatch.setenv("MIMIR_HOME", str(home))
-    results = []
+    events: list[AgentEvent] = []
 
     async def enqueue(event: AgentEvent) -> bool:
-        auth = create_auth_context(
-            event,
-            enforce=True,
-            ifc_labels=event.ifc_labels,
-        )
-        turn = TurnContext(
-            turn_id="installed-turn",
-            session_id=event.channel_id,
-            trigger=event.trigger,
-            channel_id=event.channel_id,
-            started_at=0,
-            auth_context=auth,
-        )
-        token = set_current_turn(turn)
-        try:
-            item = event.extra["items"][0]
-            results.append(json.loads(await registry.worklink_attention_ack.coroutine(
-                item["issue_id"],
-                item["signature"],
-                item["occurrence_id"],
-                "operator_required",
-                "already resolved",
-            )))
-        finally:
-            reset_current_turn(token)
+        events.append(event)
         return True
 
     assert await run_poller(config, enqueue=enqueue, home=home) == 1
-    assert results == [{
+    assert len(events) == 1
+    event = events[0]
+    item = event.extra["items"][0]
+    class ToolCallingFakeModel(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):  # noqa: ARG002
+            return self
+
+    model = ToolCallingFakeModel(messages=iter([
+        AIMessage(content="", tool_calls=[{
+            "id": "inspect-call",
+            "name": "worklink_attention_inspect",
+            "args": {
+                "issue_id": item["issue_id"],
+                "signature": item["signature"],
+                "occurrence_id": item["occurrence_id"],
+            },
+        }]),
+        AIMessage(content="", tool_calls=[{
+            "id": "ack-call",
+            "name": "worklink_attention_ack",
+            "args": {
+                "issue_id": item["issue_id"],
+                "signature": item["signature"],
+                "occurrence_id": item["occurrence_id"],
+                "disposition": "noop_resolved",
+                "note": "",
+            },
+        }]),
+        AIMessage(content="handled"),
+    ]))
+    graph = create_agent(
+        model,
+        tools=[registry.worklink_attention_inspect, registry.worklink_attention_ack],
+    )
+    auth = create_auth_context(event, enforce=True, ifc_labels=event.ifc_labels)
+    turn = TurnContext(
+        turn_id="installed-turn",
+        session_id=event.channel_id,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        started_at=0,
+        auth_context=auth,
+    )
+    token = set_current_turn(turn)
+    try:
+        model_result = await graph.ainvoke({"messages": [HumanMessage(content=event.content)]})
+    finally:
+        reset_current_turn(token)
+    tool_results = [
+        json.loads(message.content)
+        for message in model_result["messages"]
+        if isinstance(message, ToolMessage) and message.name == "worklink_attention_ack"
+    ]
+    assert tool_results == [{
         "disposition": "noop_resolved",
         "issue_id": 29,
         "occurrence_id": "installed-poller-occurrence",

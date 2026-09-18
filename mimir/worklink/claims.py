@@ -391,6 +391,10 @@ def claim_records_from_comments(comments: Iterable[str]) -> list[ClaimRecord]:
     return _scan_claim_comments(comments)[0]
 
 
+def claim_reset_generation(comments: Iterable[str]) -> int:
+    return _scan_claim_comments(comments)[1]
+
+
 def _matching_nonconsuming_marker(
     comments: Iterable[str], expected: AttemptNonconsumingRecord
 ) -> bool:
@@ -841,13 +845,23 @@ class ChainlinkClaims:
         attempt: int | None,
     ) -> bool:
         labels = self._issue_labels(issue_id, strict=True)
-        if review_ready:
-            target = "worklink:review"
-        elif status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
-            target = "worklink:blocked"
-        else:
-            target = "worklink:ready"
+        target = self.terminal_target_label(
+            status=status, review_ready=review_ready, attempt=attempt
+        )
         return target in labels and "worklink:in-progress" not in labels
+
+    def terminal_target_label(
+        self,
+        *,
+        status: str,
+        review_ready: bool,
+        attempt: int | None,
+    ) -> str:
+        if review_ready:
+            return "worklink:review"
+        if status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
+            return "worklink:blocked"
+        return "worklink:ready"
 
     def release_owned_claims_for_shutdown(
         self,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -315,6 +315,23 @@ def _outcome_for_status(status: object) -> AttentionOutcome | None:
     }.get(normalized)
 
 
+def _valid_claim_payload(value: Mapping[str, Any], issue_id: int) -> bool:
+    if (
+        value.get("issue_id") != issue_id
+        or type(value.get("attempt")) is not int
+        or value["attempt"] <= 0
+        or not isinstance(value.get("agent_id"), str)
+        or not value["agent_id"]
+        or not isinstance(value.get("claimed_at"), str)
+    ):
+        return False
+    try:
+        datetime.fromisoformat(value["claimed_at"])
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class AttentionRecord:
     occurrence_id: str
@@ -360,10 +377,18 @@ class AttentionRecord:
     retirement: RecoveryRetirement | None = None
     validation_detail: ValidationDetail | None = None
     publication_state: PublicationState = PublicationState.READY
+    reset_generation_baseline: int = 0
+    ready_cycle_baseline: int = 0
+    manual_claim_baseline: Mapping[str, Any] | None = None
     schema_version: int = ATTENTION_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
-        if self.schema_version != ATTENTION_SCHEMA_VERSION or self.issue_id <= 0:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != ATTENTION_SCHEMA_VERSION
+            or type(self.issue_id) is not int
+            or self.issue_id <= 0
+        ):
             raise ValueError("invalid attention record identity")
         if not self.autonomous:
             raise ValueError("attention records require autonomous provenance")
@@ -392,6 +417,29 @@ class AttentionRecord:
         lifecycle = self.kind is not AttentionKind.ATTENTION
         if lifecycle and self.outcome not in {AttentionOutcome.STARTED, AttentionOutcome.SUCCEEDED}:
             raise ValueError("attention kind and outcome are inconsistent")
+        lifecycle_sources = {
+            AttentionSource.FACTORY_INITIAL_START,
+            AttentionSource.FACTORY_RECOVERY_START,
+            AttentionSource.FACTORY_SUCCESS,
+        }
+        if (self.source in lifecycle_sources) is not lifecycle:
+            raise ValueError("attention source and kind are inconsistent")
+        if self.kind is AttentionKind.FACTORY_STARTED and (
+            self.source not in {
+                AttentionSource.FACTORY_INITIAL_START,
+                AttentionSource.FACTORY_RECOVERY_START,
+            }
+            or self.outcome is not AttentionOutcome.STARTED
+            or self.accounting_basis is not AccountingBasis.PRECLAIM
+        ):
+            raise ValueError("invalid factory start record")
+        if self.kind is AttentionKind.FACTORY_SUCCEEDED and (
+            self.source is not AttentionSource.FACTORY_SUCCESS
+            or self.outcome is not AttentionOutcome.SUCCEEDED
+            or self.accounting_basis is not AccountingBasis.VERIFIED_COMPLETION
+            or self.attempt_consumed is not True
+        ):
+            raise ValueError("invalid factory success record")
         if not lifecycle and self.outcome is AttentionOutcome.STARTED:
             raise ValueError("terminal attention cannot be a start record")
         if lifecycle and (
@@ -402,6 +450,53 @@ class AttentionRecord:
             raise ValueError("invalid lifecycle accounting")
         if self.kind is AttentionKind.ATTENTION and self.attempt_consumed is None:
             raise ValueError("terminal attention requires a consumption decision")
+        terminal_accounting = {
+            AttentionOutcome.INFRASTRUCTURE_FAILURE: {
+                AccountingBasis.PRECLAIM,
+                AccountingBasis.INFRASTRUCTURE,
+            },
+            AttentionOutcome.ATTEMPTS_EXHAUSTED: {AccountingBasis.EXHAUSTION},
+            AttentionOutcome.PARTIAL: {AccountingBasis.FACTORY_PARTIAL},
+            AttentionOutcome.SUCCEEDED: {
+                AccountingBasis.VERIFIED_COMPLETION,
+                AccountingBasis.FACTORY_PR,
+                AccountingBasis.FACTORY_STEPS,
+                AccountingBasis.FACTORY_SLICES,
+                AccountingBasis.LEAF_EXECUTION,
+            },
+            AttentionOutcome.BLOCKED: {
+                AccountingBasis.FACTORY_PR,
+                AccountingBasis.FACTORY_STEPS,
+                AccountingBasis.FACTORY_SLICES,
+                AccountingBasis.LEAF_EXECUTION,
+                AccountingBasis.UNPUBLISHED_COMMITS,
+            },
+            AttentionOutcome.NEEDS_HUMAN: {
+                AccountingBasis.FACTORY_PR,
+                AccountingBasis.FACTORY_STEPS,
+                AccountingBasis.FACTORY_SLICES,
+                AccountingBasis.LEAF_EXECUTION,
+                AccountingBasis.UNPUBLISHED_COMMITS,
+            },
+            AttentionOutcome.GENUINE_FAILURE: {
+                AccountingBasis.FACTORY_PR,
+                AccountingBasis.FACTORY_STEPS,
+                AccountingBasis.FACTORY_SLICES,
+                AccountingBasis.LEAF_EXECUTION,
+                AccountingBasis.UNPUBLISHED_COMMITS,
+            },
+        }
+        if self.kind is AttentionKind.ATTENTION and (
+            self.outcome not in terminal_accounting
+            or self.accounting_basis not in terminal_accounting[self.outcome]
+            or self.attempt_consumed is not (
+                self.outcome not in {
+                    AttentionOutcome.INFRASTRUCTURE_FAILURE,
+                    AttentionOutcome.ATTEMPTS_EXHAUSTED,
+                }
+            )
+        ):
+            raise ValueError("attention outcome and accounting are inconsistent")
         if self.settlement in {Settlement.PENDING, Settlement.APPLIED} and (
             self.claim_relation is not ClaimRelation.CURRENT_CLAIM
             or self.attempt_consumed is not False
@@ -412,6 +507,17 @@ class AttentionRecord:
         if not self.error_signature or not self.created_at:
             raise ValueError("attention signature and timestamp are required")
         datetime.fromisoformat(self.created_at)
+        if (
+            type(self.reset_generation_baseline) is not int
+            or self.reset_generation_baseline < 0
+            or type(self.ready_cycle_baseline) is not int
+            or self.ready_cycle_baseline < 0
+        ):
+            raise ValueError("invalid attention rearm baseline")
+        if self.manual_claim_baseline is not None and not _valid_claim_payload(
+            self.manual_claim_baseline, self.issue_id
+        ):
+            raise ValueError("invalid attention manual claim baseline")
         for fault in self.secondary_faults:
             if not isinstance(fault, Mapping) or not isinstance(fault.get("reason"), str):
                 raise ValueError("invalid attention secondary fault")
@@ -454,9 +560,70 @@ class AttentionRecord:
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any], *, legacy: bool = False) -> AttentionRecord:
+        if not isinstance(value, Mapping):
+            raise TypeError("attention record must be an object")
+        if not legacy:
+            required = {item.name for item in dataclass_fields(cls)}
+            missing = required - set(value)
+            if missing:
+                raise ValueError(f"attention record fields are incomplete: {sorted(missing)}")
+            if type(value["schema_version"]) is not int or value["schema_version"] != ATTENTION_SCHEMA_VERSION:
+                raise ValueError("invalid attention schema version")
+            if type(value["issue_id"]) is not int or type(value["attempt_consumed"]) not in {bool, type(None)}:
+                raise TypeError("invalid attention scalar type")
+            if value["cause"] is not None and not isinstance(value["cause"], str):
+                raise TypeError("attention cause must be a string or null")
+            for name in (
+                "occurrence_id", "delivery_key", "kind", "execution_id", "source",
+                "outcome", "accounting_basis", "settlement", "error_signature",
+                "reason", "evidence_quality", "claim_relation", "claim_binding_state",
+                "created_at", "publication_state",
+            ):
+                if not isinstance(value[name], str):
+                    raise TypeError(f"attention {name} must be a string")
+            for name in (
+                "run_id", "launch_id", "original_result_status", "original_factory_status",
+                "controller_phase", "controller_error", "pr_url", "pr_state", "pr_head",
+                "next", "delivered_at", "handled_at", "handling_disposition", "retirement",
+                "validation_detail", "primary_source",
+            ):
+                if value[name] is not None and not isinstance(value[name], str):
+                    raise TypeError(f"attention {name} must be a string or null")
+            if value["attempt"] is not None and type(value["attempt"]) is not int:
+                raise TypeError("attention attempt must be an integer or null")
+            for name in ("next_present", "autonomous", "inhibited"):
+                if type(value[name]) is not bool:
+                    raise TypeError(f"attention {name} must be boolean")
+            for name in ("reset_generation_baseline", "ready_cycle_baseline"):
+                if type(value[name]) is not int:
+                    raise TypeError(f"attention {name} must be an integer")
+            if not isinstance(value["secondary_faults"], (list, tuple)):
+                raise TypeError("attention secondary_faults must be an array")
+            if not isinstance(value["refs"], Mapping):
+                raise TypeError("attention refs must be an object")
+            if any(
+                not isinstance(key, str)
+                or item is not None and not isinstance(item, str)
+                for key, item in value["refs"].items()
+            ):
+                raise TypeError("attention refs must contain string or null values")
+            if value["factory_projection"] is not None and not isinstance(value["factory_projection"], Mapping):
+                raise TypeError("attention factory_projection must be an object or null")
         claim_data = value.get("claim")
+        if not legacy and claim_data is not None and not isinstance(claim_data, Mapping):
+            raise TypeError("attention claim must be an object or null")
+        if not legacy and isinstance(claim_data, Mapping) and not _valid_claim_payload(
+            claim_data, value["issue_id"]
+        ):
+            raise ValueError("attention claim identity is invalid")
         claim = ClaimRecord.from_payload(dict(claim_data)) if isinstance(claim_data, Mapping) else None
         prior_claim_data = value.get("prior_claim")
+        if not legacy and prior_claim_data is not None and not isinstance(prior_claim_data, Mapping):
+            raise TypeError("attention prior_claim must be an object or null")
+        if not legacy and isinstance(prior_claim_data, Mapping) and not _valid_claim_payload(
+            prior_claim_data, value["issue_id"]
+        ):
+            raise ValueError("attention prior claim identity is invalid")
         prior_claim = ClaimRecord.from_payload(dict(prior_claim_data)) if isinstance(prior_claim_data, Mapping) else None
         source = AttentionSource.LEGACY_V1 if legacy else AttentionSource(str(value["source"]))
         cause = AttentionCause.LEGACY_UNKNOWN if legacy else AttentionCause(str(value["cause"])) if value.get("cause") else None
@@ -464,25 +631,25 @@ class AttentionRecord:
         fields = {
             "occurrence_id": str(value["occurrence_id"]),
             "delivery_key": str(value["delivery_key"]),
-            "kind": AttentionKind(str(value.get("kind") or AttentionKind.ATTENTION)),
+            "kind": AttentionKind(str(value["kind"] if not legacy else value.get("kind") or AttentionKind.ATTENTION)),
             "issue_id": int(value["issue_id"]),
-            "execution_id": str(value.get("execution_id") or value["occurrence_id"]),
+            "execution_id": str(value["execution_id"] if not legacy else value.get("execution_id") or value["occurrence_id"]),
             "source": source,
-            "outcome": AttentionOutcome(str(value.get("outcome") or AttentionOutcome.LEGACY_UNKNOWN)),
-            "accounting_basis": AccountingBasis(str(value.get("accounting_basis") or AccountingBasis.LEGACY_UNKNOWN)),
+            "outcome": AttentionOutcome(str(value["outcome"] if not legacy else value.get("outcome") or AttentionOutcome.LEGACY_UNKNOWN)),
+            "accounting_basis": AccountingBasis(str(value["accounting_basis"] if not legacy else value.get("accounting_basis") or AccountingBasis.LEGACY_UNKNOWN)),
             "attempt_consumed": value.get("attempt_consumed"),
-            "settlement": Settlement(str(value.get("settlement") or Settlement.NOT_NEEDED)),
+            "settlement": Settlement(str(value["settlement"] if not legacy else value.get("settlement") or Settlement.NOT_NEEDED)),
             "cause": cause,
             "run_id": value.get("run_id"),
             "launch_id": value.get("launch_id"),
             "claim": claim,
             "prior_claim": prior_claim,
-            "claim_relation": ClaimRelation(str(value.get("claim_relation") or ClaimRelation.NONE)),
-            "claim_binding_state": ClaimBindingState(str(value.get("claim_binding_state") or ClaimBindingState.NONE)),
+            "claim_relation": ClaimRelation(str(value["claim_relation"] if not legacy else value.get("claim_relation") or ClaimRelation.NONE)),
+            "claim_binding_state": ClaimBindingState(str(value["claim_binding_state"] if not legacy else value.get("claim_binding_state") or ClaimBindingState.NONE)),
             "error_signature": str(value.get("error_signature") or value.get("signature") or ""),
             "attempt": int(value["attempt"]) if value.get("attempt") is not None else None,
             "reason": str(value.get("reason") or value.get("terminal_error") or ""),
-            "evidence_quality": EvidenceQuality(str(value.get("evidence_quality") or EvidenceQuality.VALID)),
+            "evidence_quality": EvidenceQuality(str(value["evidence_quality"] if not legacy else value.get("evidence_quality") or EvidenceQuality.MISSING)),
             "original_result_status": value.get("original_result_status"),
             "original_factory_status": value.get("original_factory_status"),
             "primary_source": AttentionSource(str(value["primary_source"])) if value.get("primary_source") else None,
@@ -505,7 +672,10 @@ class AttentionRecord:
             "retirement": RecoveryRetirement(str(value["retirement"])) if value.get("retirement") else None,
             "validation_detail": ValidationDetail(str(value["validation_detail"])) if value.get("validation_detail") else None,
             "publication_state": PublicationState(str(value.get("publication_state") or PublicationState.READY)),
-            "schema_version": ATTENTION_SCHEMA_VERSION,
+            "reset_generation_baseline": value.get("reset_generation_baseline", 0),
+            "ready_cycle_baseline": value.get("ready_cycle_baseline", 0),
+            "manual_claim_baseline": value.get("manual_claim_baseline"),
+            "schema_version": value.get("schema_version", ATTENTION_SCHEMA_VERSION),
         }
         for name, item in fields.items():
             object.__setattr__(record, name, item)
@@ -523,6 +693,7 @@ class AttentionReaders:
     process: Callable[[Any], Any]
     evidence: Callable[[AttentionRecord], Any]
     pull_request: Callable[[str], Any]
+    source_state: Callable[[AttentionRecord], Any] = lambda _record: None
 
 
 @dataclass(frozen=True)
@@ -589,10 +760,10 @@ _SOURCE_POLICIES: dict[AttentionSource, tuple[str, ...]] = {
     AttentionSource.LEAF_PUBLICATION_FENCE: ("disarmed", "superseded", "publication_resolved"),
     AttentionSource.LEAF_PUBLICATION_PUSH: ("disarmed", "superseded", "publication_resolved"),
     AttentionSource.LEAF_PUBLICATION_PR: ("disarmed", "superseded", "publication_resolved"),
-    AttentionSource.LEAF_PUBLICATION_EVIDENCE: ("source_clear", "disarmed", "superseded"),
+    AttentionSource.LEAF_PUBLICATION_EVIDENCE: ("source_clear", "publication_resolved", "disarmed", "superseded"),
     AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
     AttentionSource.LEAF_EVIDENCE_COMMENT: ("source_clear", "disarmed", "superseded", "publication_resolved"),
-    AttentionSource.LEAF_COMPLETED_STATE_CLEAR: ("source_clear", "superseded"),
+    AttentionSource.LEAF_COMPLETED_STATE_CLEAR: ("source_clear", "publication_resolved", "superseded"),
     AttentionSource.EPIC_LABEL: ("source_clear", "disarmed", "superseded"),
     AttentionSource.EPIC_TEMPLATE: ("source_clear", "disarmed", "superseded"),
     AttentionSource.EPIC_BACKEND: ("disarmed", "superseded"),
@@ -673,6 +844,7 @@ def inspect_attention(
         ("run_state", readers.run_state, (issue_id,)),
         ("factory", readers.factory_record, (record.run_id, issue_id)),
         ("evidence", readers.evidence, (record,)),
+        ("source_state", readers.source_state, (record,)),
     ):
         try:
             values[name] = _invoke(reader, *args)
@@ -781,14 +953,10 @@ def _superseded(record: AttentionRecord, claims: Any, process_dead: bool | None)
 
 
 def _publication(record: AttentionRecord, evidence: Any, readers: AttentionReaders, errors: list[str]) -> Resolution:
-    if not isinstance(evidence, Mapping) or evidence.get("status") != "completed":
-        return Resolution.UNKNOWN if evidence is None else Resolution.UNRESOLVED
-    if evidence.get("issue") not in {None, record.issue_id} or evidence.get("attempt") not in {None, record.attempt}:
-        return Resolution.UNKNOWN
-    expected_branch = record.refs.get("branch")
-    if expected_branch and evidence.get("branch") not in {None, expected_branch}:
-        return Resolution.UNKNOWN
-    url = evidence.get("pr_url") or record.pr_url
+    exact = _exact_evidence(record, evidence)
+    if exact is not Resolution.RESOLVED:
+        return exact
+    url = record.pr_url
     if not isinstance(url, str) or not url:
         return Resolution.UNRESOLVED
     try:
@@ -798,13 +966,62 @@ def _publication(record: AttentionRecord, evidence: Any, readers: AttentionReade
         return Resolution.UNKNOWN
     state = pr.get("state") if isinstance(pr, Mapping) else None
     head = pr.get("headRefOid") if isinstance(pr, Mapping) else None
-    expected = evidence.get("head") or evidence.get("head_sha") or record.pr_head
-    return _tri(state in {"OPEN", "MERGED"} and isinstance(expected, str) and head == expected)
+    return _tri(state in {"OPEN", "MERGED"} and head == record.pr_head)
+
+
+def _exact_evidence(record: AttentionRecord, evidence: Any) -> Resolution:
+    if evidence is None:
+        return Resolution.UNKNOWN
+    if not isinstance(evidence, Mapping):
+        return Resolution.UNKNOWN
+    branch = record.refs.get("branch")
+    if (
+        record.attempt is None
+        or not isinstance(branch, str)
+        or not branch
+        or not isinstance(record.pr_url, str)
+        or not record.pr_url
+        or not isinstance(record.pr_head, str)
+        or not record.pr_head
+    ):
+        return Resolution.UNRESOLVED
+    return _tri(
+        evidence.get("status") == "completed"
+        and type(evidence.get("issue")) is int
+        and evidence["issue"] == record.issue_id
+        and type(evidence.get("attempt")) is int
+        and evidence["attempt"] == record.attempt
+        and evidence.get("branch") == branch
+        and evidence.get("pr_url") == record.pr_url
+        and evidence.get("head_sha") == record.pr_head
+    )
+
+
+def _factory_identity(record: AttentionRecord, factory: Any) -> bool | None:
+    if factory is None:
+        return None
+    field = lambda name: (
+        factory.get(name) if isinstance(factory, Mapping) else getattr(factory, name, None)
+    )
+    if record.run_id is None or field("run_id") != record.run_id:
+        return False
+    if field("issue_id") != record.issue_id:
+        return False
+    if record.attempt is not None and field("attempt") != record.attempt:
+        return False
+    if record.execution_id and field("execution_id") != record.execution_id:
+        return False
+    if record.launch_id is not None and field("launch_id") != record.launch_id:
+        return False
+    return True
 
 
 def _factory_advanced(record: AttentionRecord, factory: Any, process_dead: bool | None) -> Resolution:
-    if factory is None:
+    identity = _factory_identity(record, factory)
+    if identity is None:
         return Resolution.UNKNOWN
+    if not identity:
+        return Resolution.UNRESOLVED
     status = getattr(factory, "status", None)
     attempt = getattr(factory, "attempt", None)
     if isinstance(factory, Mapping):
@@ -813,12 +1030,13 @@ def _factory_advanced(record: AttentionRecord, factory: Any, process_dead: bool 
         run_id = factory.get("run_id")
     else:
         run_id = getattr(factory, "run_id", None)
-    if record.run_id is not None and run_id != record.run_id:
-        return Resolution.UNKNOWN
     if status is not None and not isinstance(status, str):
         status = getattr(status, "status", None)
     advanced = type(attempt) is int and record.attempt is not None and attempt > record.attempt
-    advanced = advanced or status in {"completed", "review_ready"}
+    advanced = advanced or (
+        status in {"completed", "review_ready"}
+        and record.original_factory_status not in {"completed", "review_ready"}
+    )
     return _tri(bool(advanced and process_dead is True), process_dead is None)
 
 
@@ -832,13 +1050,44 @@ def _budget_available(claims: Any) -> Resolution:
 
 
 def _rearmed(record: AttentionRecord, issue: Any, claims: Any) -> Resolution:
-    if isinstance(claims, Mapping) and claims.get("explicit_claim_after") is True:
+    if not isinstance(claims, Mapping):
+        return Resolution.UNKNOWN
+    reset_generation = claims.get("reset_generation")
+    ready_cycle_generation = claims.get("ready_cycle_generation")
+    latest = claims.get("latest")
+    latest_payload = (
+        {
+            "issue_id": latest.issue_id,
+            "attempt": latest.attempt,
+            "agent_id": latest.agent_id,
+            "claimed_at": latest.claimed_at.isoformat(),
+        }
+        if isinstance(latest, ClaimRecord)
+        else dict(latest) if isinstance(latest, Mapping) else None
+    )
+    current_claim = (
+        {
+            "issue_id": record.claim.issue_id,
+            "attempt": record.claim.attempt,
+            "agent_id": record.claim.agent_id,
+            "claimed_at": record.claim.claimed_at.isoformat(),
+        }
+        if record.claim is not None else None
+    )
+    if type(reset_generation) is int and reset_generation > record.reset_generation_baseline:
+        return Resolution.RESOLVED
+    if type(ready_cycle_generation) is int and ready_cycle_generation > record.ready_cycle_baseline:
+        return Resolution.RESOLVED
+    if (
+        latest_payload is not None
+        and latest_payload != record.manual_claim_baseline
+        and latest_payload != current_claim
+    ):
         return Resolution.RESOLVED
     labels = _labels(issue)
     if labels is None:
         return Resolution.UNKNOWN
-    witnessed = isinstance(claims, Mapping) and (claims.get("ready_removed_after") is True or claims.get("honored_reset_after") is True)
-    return _tri("worklink:ready" in labels and witnessed)
+    return Resolution.UNRESOLVED
 
 
 def _source_clearance(
@@ -852,6 +1101,8 @@ def _source_clearance(
     run_state = values.get("run_state")
     factory = values.get("factory")
     evidence = values.get("evidence")
+    claims = values.get("claims")
+    source_state = values.get("source_state")
     if record.source is AttentionSource.TEMPLATE_UNREADY:
         return _tri(labels is not None and "worklink:ready" not in labels, labels is None)
     if record.source is AttentionSource.TEMPLATE_BLOCK_LABEL:
@@ -865,7 +1116,15 @@ def _source_clearance(
     if record.source in {AttentionSource.EPIC_CANCEL, AttentionSource.STARTUP_LEAF_SPAWN}:
         return _tri(process_dead is True, process_dead is None)
     if record.source is AttentionSource.EPIC_RETAINED_ISSUE_RELOAD:
-        return _tri(labels is not None, "issue" not in values)
+        original_resolved = (
+            source_state.get("original_predicate_resolved")
+            if isinstance(source_state, Mapping) else None
+        )
+        return _tri(
+            labels is not None and original_resolved is True,
+            "issue" not in values or "source_state" not in values
+            or not isinstance(original_resolved, bool),
+        )
     if record.source in {AttentionSource.LEAF_TEMPLATE, AttentionSource.EPIC_TEMPLATE}:
         try:
             from .orchestrator import LeafValidationError, validate_leaf
@@ -877,23 +1136,47 @@ def _source_clearance(
             return Resolution.UNKNOWN
         return Resolution.RESOLVED
     if record.source in {
-        AttentionSource.DETACHED_SPAWN, AttentionSource.LEAF_COMPUTE,
+        AttentionSource.DETACHED_SPAWN,
         AttentionSource.LEAF_RUNSTATE_SAVE, AttentionSource.STARTUP_RUN_RECORD_READ,
     }:
-        execution = run_state.get("execution_id") if isinstance(run_state, Mapping) else getattr(run_state, "execution_id", None)
-        return _tri(execution == record.execution_id, "run_state" not in values)
+        field = lambda name: (
+            run_state.get(name) if isinstance(run_state, Mapping) else getattr(run_state, name, None)
+        )
+        exact = (
+            run_state is not None
+            and field("issue_id") == record.issue_id
+            and field("execution_id") == record.execution_id
+            and (record.attempt is None or field("attempt") == record.attempt)
+            and (record.launch_id is None or field("launch_id") == record.launch_id)
+        )
+        return _tri(exact, "run_state" not in values)
+    if record.source is AttentionSource.LEAF_COMPUTE:
+        exact = (
+            source_state.get("predicate_matches")
+            if isinstance(source_state, Mapping) else None
+        )
+        return _tri(exact is True, "source_state" not in values or not isinstance(exact, bool))
     if record.source in {
         AttentionSource.LEAF_PUBLICATION_EVIDENCE,
         AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE,
     }:
-        exact = isinstance(evidence, Mapping) and evidence.get("status") == "completed" and evidence.get("issue") in {None, record.issue_id} and evidence.get("attempt") in {None, record.attempt}
-        return _tri(exact, "evidence" not in values)
+        return _exact_evidence(record, evidence)
     if record.source in {
         AttentionSource.LEAF_COMPLETED_STATE_CLEAR, AttentionSource.ORPHAN_STATE_UPDATE,
     }:
         target = record.refs.get("target_label")
-        exact = run_state is None and (target is None or labels is not None and target in labels)
-        return _tri(exact, "run_state" not in values or target is not None and labels is None)
+        exact = (
+            run_state is None
+            and isinstance(target, str)
+            and labels is not None
+            and target in labels
+            and "worklink:in-progress" not in labels
+            and _lock_absent(claims) is True
+        )
+        return _tri(
+            exact,
+            "run_state" not in values or labels is None or _lock_absent(claims) is None,
+        )
     if record.source in {
         AttentionSource.EPIC_CONTROLLER_RELOAD,
         AttentionSource.EPIC_DRIVER_LOCK_SAVE,
@@ -904,27 +1187,45 @@ def _source_clearance(
         AttentionSource.FACTORY_RECOVERY_START,
         AttentionSource.FACTORY_SUCCESS,
     }:
-        run_id = factory.get("run_id") if isinstance(factory, Mapping) else getattr(factory, "run_id", None)
-        launch_id = factory.get("launch_id") if isinstance(factory, Mapping) else getattr(factory, "launch_id", None)
-        exact = record.run_id is not None and run_id == record.run_id and (
-            record.launch_id is None or launch_id == record.launch_id
-        )
+        exact = _factory_identity(record, factory) is True
         if exact and record.source is AttentionSource.EPIC_ERROR_SAVE:
             phase = factory.get("controller_phase") if isinstance(factory, Mapping) else getattr(factory, "controller_phase", None)
             exact = phase in {"failed", "parked", "terminal", "stopped"}
         if exact and record.source is AttentionSource.EPIC_TRANSCRIPT_SAVE:
             transcript = factory.get("transcript") if isinstance(factory, Mapping) else getattr(factory, "transcript", None)
             exact = isinstance(transcript, str) and bool(transcript)
-        return _tri(exact, "factory" not in values)
+        original_required = record.source in {
+            AttentionSource.EPIC_CONTROLLER_RELOAD,
+            AttentionSource.EPIC_DRIVER_LOCK_SAVE,
+            AttentionSource.FACTORY_SUCCESS,
+        }
+        if exact and original_required:
+            exact = (
+                isinstance(source_state, Mapping)
+                and source_state.get("original_predicate_resolved") is True
+            )
+        return _tri(
+            exact,
+            "factory" not in values or original_required and "source_state" not in values,
+        )
     if record.source is AttentionSource.EPIC_LABEL:
         return _tri(labels is not None and "worklink:epic" in labels, labels is None)
     if record.source is AttentionSource.ORPHAN_LABELS_UNKNOWN:
-        return _tri(labels is not None, "issue" not in values)
+        return _tri(
+            labels is not None
+            and "worklink:blocked" not in labels
+            and bool(labels.intersection({"worklink:ready", "worklink:in-progress"})),
+            "issue" not in values,
+        )
     if record.source in {
         AttentionSource.EPIC_REPOSITORY, AttentionSource.EPIC_COMPUTE,
         AttentionSource.EPIC_BASE,
     }:
-        return _tri(factory is not None and process_dead is True, "factory" not in values or process_dead is None)
+        exact = (
+            source_state.get("predicate_matches")
+            if isinstance(source_state, Mapping) else None
+        )
+        return _tri(exact is True, "source_state" not in values or not isinstance(exact, bool))
     if record.source is AttentionSource.EPIC_PRESERVATION:
         return _tri(bool(record.refs.get("preserved_ref")))
     if record.source is AttentionSource.ORPHAN_UNPUBLISHED:

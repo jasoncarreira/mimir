@@ -2055,6 +2055,7 @@ def test_poller_inhibits_failed_issue_without_delivering_legacy_alert(
     }
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         state["issues"]["201"] = {
+            "issue_id": 201,
             "active": True, "signature": alert["error_signature"],
             "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
         }
@@ -2116,6 +2117,7 @@ def test_poller_reports_scan_when_budget_is_insufficient_without_legacy_alert(
     }
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         state["issues"]["201"] = {
+            "issue_id": 201,
             "active": True, "signature": alert["error_signature"],
             "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
         }
@@ -2221,6 +2223,7 @@ def test_poller_skips_legacy_alert_ack_and_keeps_continuation_path(
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         for alert in (first, second):
             state["issues"][str(alert["issue_id"])] = {
+                "issue_id": alert["issue_id"],
                 "active": True, "signature": alert["error_signature"],
                 "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
             }

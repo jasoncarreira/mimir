@@ -3006,7 +3006,12 @@ def _worklink_attention_context(issue_id: int, signature: str, occurrence_id: st
 
 def _attention_readers(home: Path):
     from ..worklink.attention import AttentionReaders
-    from ..worklink.claims import ChainlinkClaims, claim_records_from_comments
+    from ..worklink.claims import (
+        ChainlinkClaims,
+        claim_records_from_comments,
+        claim_reset_generation,
+    )
+    from ..worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
     from ..worklink.factory_state import (
         factory_process_is_verified_dead,
         load_factory_record,
@@ -3042,12 +3047,18 @@ def _attention_readers(home: Path):
             lock_ids.add(issue_id)
         records = [record for record in claim_records_from_comments(issue.comments) if record.issue_id == issue_id]
         latest = max(records, key=lambda item: (item.generation, item.attempt, item.claimed_at)) if records else None
+        entry = load_failure_state(dispatch_failure_state_dir(home))["issues"].get(
+            str(issue_id), {}
+        )
         return {
             "locks": sorted(lock_ids),
             "lock_absent": issue_id not in lock_ids,
             "latest": latest,
             "attempts_used": claims.attempts_used(issue.comments),
             "max_attempts": claims.max_attempts,
+            "reset_generation": claim_reset_generation(issue.comments),
+            "ready_cycle_generation": entry.get("ready_cycle_generation", 0),
+            "manual_claim_witness": entry.get("manual_claim_witness"),
         }
 
     def read_factory(run_id: str | None, issue_id: int):
@@ -3085,6 +3096,80 @@ def _attention_readers(home: Path):
             raise RuntimeError("pull request read unavailable")
         return json.loads(result.stdout)
 
+    def read_source_state(record):
+        from ..worklink.attention import AttentionSource
+        from ..worklink.backends.registry import BackendRegistry, WorklinkConfig
+        from ..worklink.orchestrator import _repo_slug_from_url
+
+        if record.source in {
+            AttentionSource.LEAF_COMPUTE,
+            AttentionSource.EPIC_REPOSITORY,
+            AttentionSource.EPIC_COMPUTE,
+            AttentionSource.EPIC_BASE,
+        }:
+            raw_repo = record.refs.get("repo")
+            if not isinstance(raw_repo, str) or not raw_repo:
+                raise ValueError("attention repository binding is missing")
+            repo = Path(raw_repo).resolve(strict=True)
+            remote = run(["git", "-C", str(repo), "config", "--get", "remote.origin.url"])
+            if remote.returncode != 0:
+                raise RuntimeError("repository origin is unavailable")
+            repo_slug = _repo_slug_from_url(remote.stdout.strip())
+            if record.source is AttentionSource.EPIC_REPOSITORY:
+                return {"predicate_matches": repo_slug is not None}
+            issue = read_issue(record.issue_id)
+            config = WorklinkConfig.load(home / "worklink.yaml")
+            compute = BackendRegistry(config).select_compute(
+                labels=issue.labels, repo=repo_slug
+            )
+            if record.source in {AttentionSource.LEAF_COMPUTE, AttentionSource.EPIC_COMPUTE}:
+                allowed, _reason = config.autonomous_compute_allowed(
+                    compute.name, compute.capabilities()
+                )
+                return {
+                    "predicate_matches": compute.name == "local_subprocess"
+                    and allowed
+                }
+            base = record.refs.get("base_ref")
+            if not isinstance(base, str) or not base:
+                raise ValueError("attention base binding is missing")
+            branch = run([
+                "git", "-C", str(repo), "ls-remote", "--exit-code", "origin",
+                f"refs/heads/{base.removeprefix('origin/')}",
+            ])
+            return {"predicate_matches": branch.returncode == 0}
+
+        if record.source in {
+            AttentionSource.EPIC_RETAINED_ISSUE_RELOAD,
+            AttentionSource.EPIC_CONTROLLER_RELOAD,
+            AttentionSource.EPIC_DRIVER_LOCK_SAVE,
+            AttentionSource.FACTORY_SUCCESS,
+        }:
+            factory = read_factory(record.run_id, record.issue_id)
+            if factory is None:
+                return {"original_predicate_resolved": False}
+            status = getattr(factory, "status", None)
+            status_value = getattr(status, "status", status)
+            phase = getattr(factory, "controller_phase", None)
+            if record.source is AttentionSource.EPIC_RETAINED_ISSUE_RELOAD:
+                labels = set(read_issue(record.issue_id).labels)
+                resolved = (
+                    "worklink:blocked" in labels
+                    or status_value in {"completed", "review_ready"}
+                )
+            elif record.source is AttentionSource.EPIC_CONTROLLER_RELOAD:
+                resolved = (
+                    phase != record.controller_phase
+                    or status_value in {"completed", "review_ready"}
+                )
+            elif record.source is AttentionSource.EPIC_DRIVER_LOCK_SAVE:
+                resolved = phase == "parked" and bool(getattr(factory, "controller_error", None))
+            else:
+                labels = set(read_issue(record.issue_id).labels)
+                resolved = status_value in {"completed", "review_ready"} and "worklink:review" in labels
+            return {"original_predicate_resolved": resolved}
+        return {}
+
     return AttentionReaders(
         issue=read_issue,
         claims=read_claims,
@@ -3093,6 +3178,7 @@ def _attention_readers(home: Path):
         process=read_process,
         evidence=read_evidence,
         pull_request=read_pr,
+        source_state=read_source_state,
     )
 @tool
 async def worklink_attention_inspect(
