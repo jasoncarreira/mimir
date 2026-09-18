@@ -508,15 +508,20 @@ def report_retained_factory_records(
         if factory_process_is_verified_dead(record):
             from .attention import ReconcileFacts
             from .dispatch_failures import (
-                active_reservation_id,
                 dispatch_failure_state_dir,
                 record_attention,
+                recovery_reservation_id,
                 reservation_claim,
             )
 
             state_dir = dispatch_failure_state_dir(home)
-            reservation_id = active_reservation_id(
-                state_dir, issue_id=record.issue_id, target="factory"
+            reservation_id = recovery_reservation_id(
+                state_dir,
+                issue_id=record.issue_id,
+                target="factory",
+                run_id=record.run_id,
+                sandbox=record.sandbox,
+                claim_attempt=record.attempt,
             )
             if reservation_id is not None:
                 claim = reservation_claim(

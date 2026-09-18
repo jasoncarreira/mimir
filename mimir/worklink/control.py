@@ -427,13 +427,18 @@ def reconcile_run_states(
             labels_unknown = False
             is_epic = False
             from .dispatch_failures import (
-                active_reservation_id,
                 dispatch_failure_state_dir,
+                recovery_reservation_id,
             )
 
             outcome_state_dir = dispatch_failure_state_dir(home)
-            reservation_id = active_reservation_id(
-                outcome_state_dir, issue_id=state.issue_id, target="leaf"
+            reservation_id = recovery_reservation_id(
+                outcome_state_dir,
+                issue_id=state.issue_id,
+                target="leaf",
+                run_id=None,
+                sandbox=None,
+                claim_attempt=state.attempt,
             )
             if would_rearm:
                 labels_by_issue, label_errors = _worklink_issue_labels(

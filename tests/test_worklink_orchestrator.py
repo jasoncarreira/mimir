@@ -880,6 +880,38 @@ def test_manual_success_clears_autonomous_failure_ledger(
     assert not (tmp_path / "ambient-state").exists()
 
 
+def test_originating_boundary_error_survives_ledger_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.dispatch_failures as ledger
+    import mimir.worklink.orchestrator as orchestrator
+
+    reservation = ledger.reserve_dispatch(
+        ledger.dispatch_failure_state_dir(tmp_path),
+        issue_id=441,
+        target="leaf",
+        autonomous=True,
+    )
+    sentinel = RuntimeError("originating repository failure")
+    monkeypatch.setattr(
+        ledger,
+        "issue_dispatch_disposition",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("ledger unavailable")),
+    )
+    with pytest.raises(RuntimeError) as raised:
+        with orchestrator._typed_outcome_boundary(
+            home=tmp_path,
+            issue_id=441,
+            reservation_id=reservation,
+            source="leaf_issue_read",
+            cause="read_failed",
+            operation="issue_read",
+        ):
+            raise sentinel
+    assert raised.value is sentinel
+    assert any("ledger unavailable" in note for note in sentinel.__notes__)
+
+
 @pytest.mark.parametrize("epic", [False, True], ids=["leaf", "factory"])
 @pytest.mark.parametrize(
     ("reason", "status"),
@@ -938,7 +970,8 @@ def test_claim_refusal_dispatch_failure_accounting(
         orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
     )
     state_dir = dispatch_failure_state_dir(tmp_path)
-    for consecutive in (1, 2, 3):
+    recurrences = (1,) if reason == "claim_contention_exhausted" else (1, 2, 3)
+    for consecutive in recurrences:
         if epic:
             result = run_worklink_epic(home=tmp_path, repo=repo, issue_id=441, autonomous=True)
         else:
@@ -4985,11 +5018,27 @@ def _run_factory_preflight_case(
     for key, value in (credentials or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
-    monkeypatch.setattr(
-        orchestrator.ChainlinkClaims,
-        "claim_issue",
-        lambda self, *args, **kwargs: ClaimResult(True, claim),
-    )
+    def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
+        reservation_id = kwargs.get("reservation_id")
+        if isinstance(reservation_id, str):
+            from mimir.worklink.attention import ClaimIdentity
+            from mimir.worklink.dispatch_failures import bind_claim, dispatch_failure_state_dir
+
+            bind_claim(
+                dispatch_failure_state_dir(tmp_path),
+                issue_id=700,
+                reservation_id=reservation_id,
+                claim=ClaimIdentity(
+                    claim.issue_id,
+                    claim.attempt,
+                    claim.agent_id,
+                    claim.claimed_at.isoformat(),
+                ),
+                confirmed=False,
+            )
+        return ClaimResult(True, claim)
+
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
     )
@@ -5874,6 +5923,23 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
 
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         kwargs["before_claim"]()
+        reservation_id = kwargs.get("reservation_id")
+        if isinstance(reservation_id, str):
+            from mimir.worklink.attention import ClaimIdentity
+            from mimir.worklink.dispatch_failures import bind_claim, dispatch_failure_state_dir
+
+            bind_claim(
+                dispatch_failure_state_dir(tmp_path),
+                issue_id=700,
+                reservation_id=reservation_id,
+                claim=ClaimIdentity(
+                    claim.issue_id,
+                    claim.attempt,
+                    claim.agent_id,
+                    claim.claimed_at.isoformat(),
+                ),
+                confirmed=False,
+            )
         return ClaimResult(True, claim)
 
     monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)

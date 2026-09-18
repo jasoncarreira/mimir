@@ -15,6 +15,7 @@ from mimir.worklink.factory_state import (
     FactoryRunRecord,
     archive_factory_record,
     factory_manifest_candidates,
+    immutable_factory_snapshot,
     load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
@@ -111,6 +112,30 @@ def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -
     assert persisted["gates"] == status.gates
     assert persisted["validator"] == status.validator
     assert persisted["next_action"] == status.next_action
+
+
+def test_immutable_snapshot_precedes_observed_error_clearing(tmp_path: Path) -> None:
+    original = replace(record(tmp_path), controller_error="retained controller failure")
+    assert original.status is not None
+    terminal = replace(
+        original.status,
+        status="partial",
+        steps=({"agent": "spec", "status": "rejected", "attempts": 2},),
+        slices=({"id": "build", "status": "merged", "attempts": 1},),
+        next="resume:spec",
+        next_present=True,
+    )
+    pre_observed = replace(original, status=terminal)
+    snapshot = immutable_factory_snapshot(pre_observed, read_result="captured")
+    observed = original.observed(terminal, "2026-09-18T00:00:00+00:00")
+
+    assert observed.controller_error is None
+    assert snapshot.controller_error == "retained controller failure"
+    assert snapshot.status == "partial"
+    assert snapshot.steps == terminal.steps
+    assert snapshot.slices == terminal.slices
+    assert snapshot.next == "resume:spec"
+    assert snapshot.next_present is True
 
 
 def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(

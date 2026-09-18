@@ -2940,12 +2940,15 @@ async def worklink_run(
     from ..worklink.dispatch_failures import (
         dispatch_failure_state_dir,
         issue_dispatch_disposition,
+        issue_retry_after,
     )
 
-    if issue_dispatch_disposition(
-        dispatch_failure_state_dir(home), int(issue_id)
-    ) == "stop":
+    outcome_dir = dispatch_failure_state_dir(home)
+    if issue_dispatch_disposition(outcome_dir, int(issue_id)) == "stop":
         return "worklink_run skipped: terminal outcome requires operator attention."
+    retry_after = issue_retry_after(outcome_dir, int(issue_id))
+    if retry_after is not None and datetime.now(timezone.utc) < retry_after:
+        return f"worklink_run skipped: transient retry is not due before {retry_after.isoformat()}."
 
     # 3) Dispatch via the deterministic core executor. ``run_worklink`` is
     #    synchronous (and opens its own event loop), so run it off the agent's

@@ -47,7 +47,7 @@ from mimir.worklink.continuation import consume_worklink_budget_continuations
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
     RESERVATION_ENV,
-    active_reservation_id,
+    authorized_retry_reservation_id,
     bind_reservation_owner,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
@@ -343,16 +343,18 @@ def _dispatch(
 ) -> bool:
     effective_coding_enabled = coding_enabled()
     target = "factory" if item.mode == "epic" else "leaf"
-    reservation_id = active_reservation_id(
+    reservation_id = authorized_retry_reservation_id(
         state_dir, issue_id=item.issue_id, target=target
-    ) or reserve_dispatch(
-        state_dir,
-        issue_id=item.issue_id,
-        target=target,
-        autonomous=True,
-        owner_pid=os.getpid(),
-        owner_start_ticks=_process_start_ticks(os.getpid()),
     )
+    if reservation_id is None:
+        reservation_id = reserve_dispatch(
+            state_dir,
+            issue_id=item.issue_id,
+            target=target,
+            autonomous=True,
+            owner_pid=os.getpid(),
+            owner_start_ticks=_process_start_ticks(os.getpid()),
+        )
     argv = [
         *run_bin,
         "worklink",

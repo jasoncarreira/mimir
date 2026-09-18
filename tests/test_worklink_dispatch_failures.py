@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from mimir.worklink.attention import (
 )
 from mimir.worklink.dispatch_failures import (
     FailureStateError,
+    authorized_retry_reservation_id,
     active_reservation_id,
+    bind_claim,
     confirm_claim_and_start,
     load_outcome_state,
     occurrence_identity,
@@ -22,8 +25,10 @@ from mimir.worklink.dispatch_failures import (
     record_attention,
     reserve_dispatch,
     issue_dispatch_disposition,
+    mark_claim_absent,
     record_contention_recurrence,
     reservation_from_environment,
+    validate_claim_retry_authorization,
 )
 
 
@@ -45,10 +50,14 @@ def test_prepared_refusal_can_later_activate_with_same_identity(tmp_path: Path) 
         cause=AttentionCause.CONTENTION_EXHAUSTED,
         facts=ClaimFacts(None, None, "contention"),
         disposition="transient_retry",
+        retry_after="2026-09-18T00:00:00+00:00",
     )
 
     # A bounded transient refusal is an immutable occurrence, but its prepared
     # reservation remains the identity used by the authorized later attempt.
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim(), confirmed=False
+    )
     started = confirm_claim_and_start(
         state_dir, issue_id=42, reservation_id=reservation, claim=claim()
     )
@@ -64,6 +73,9 @@ def test_claim_settlement_is_exactly_once_and_proof_controls_consumption(
     state_dir = tmp_path / "ledger"
     reservation = reserve_dispatch(
         state_dir, issue_id=42, target="leaf", autonomous=True
+    )
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim(), confirmed=False
     )
     confirm_claim_and_start(
         state_dir, issue_id=42, reservation_id=reservation, claim=claim()
@@ -216,3 +228,157 @@ def test_contention_recurrence_is_30_120_then_stop_and_success_only_reset(
     assert record_contention_recurrence(
         state_dir, issue_id=42, signature="same", now=now
     ) == first
+
+
+def test_unconfirmed_and_strictly_absent_claims_cannot_settle(tmp_path: Path) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    identity = claim()
+    bind_claim(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        claim=identity,
+        confirmed=False,
+    )
+    with pytest.raises(FailureStateError, match="unconfirmed claim"):
+        record_attention(
+            state_dir,
+            issue_id=42,
+            reservation_id=reservation,
+            source=AttentionSource.CLAIM_COMMENT,
+            cause=AttentionCause.CLAIM_PUBLICATION_FAILED,
+            facts=ClaimFacts(identity, None, "ambiguous", history_read="error"),
+            claim=identity,
+        )
+    mark_claim_absent(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        claim=identity,
+    )
+    occurrence = record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        source=AttentionSource.CLAIM_COMMENT,
+        cause=AttentionCause.CLAIM_PUBLICATION_FAILED,
+        facts=ClaimFacts(identity, None, "absent", history_read="exact"),
+    )
+    state = load_outcome_state(state_dir)
+    current = state["issues"]["42"]["reservations"][reservation]
+    assert current["claim_state"] == "absent"
+    assert state["issues"]["42"]["settlements"] == {}
+    assert occurrence["accounting"] == {
+        "scope": "no_new_claim", "claim": None, "consumed": False,
+        "settlement_key": None,
+    }
+
+
+def test_retry_deadline_requires_the_exact_prepared_reservation(tmp_path: Path) -> None:
+    state_dir = tmp_path / "ledger"
+    now = datetime(2026, 9, 18, tzinfo=UTC)
+    retry = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=retry,
+        source=AttentionSource.CLAIM_CONTENTION,
+        cause=AttentionCause.CONTENTION_EXHAUSTED,
+        facts=ClaimFacts(None, None, "contention"),
+        disposition="transient_retry",
+        retry_after=(now + timedelta(seconds=30)).isoformat(),
+        now=now,
+    )
+    fresh = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    with pytest.raises(FailureStateError, match="reuse"):
+        validate_claim_retry_authorization(
+            state_dir,
+            issue_id=42,
+            reservation_id=fresh,
+            target="leaf",
+            now=now + timedelta(seconds=31),
+        )
+    with pytest.raises(FailureStateError, match="not due"):
+        authorized_retry_reservation_id(
+            state_dir, issue_id=42, target="leaf", now=now
+        )
+    assert authorized_retry_reservation_id(
+        state_dir, issue_id=42, target="leaf", now=now + timedelta(seconds=31)
+    ) == retry
+
+
+def test_positive_leaf_proof_reads_bytes_and_rejects_tampering(tmp_path: Path) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    identity = claim()
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity, confirmed=False
+    )
+    confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity
+    )
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps({"issue": 42, "status": "blocked"}), encoding="utf-8")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    evidence.write_text(json.dumps({"issue": 42, "status": "failed"}), encoding="utf-8")
+    with pytest.raises(FailureStateError, match="hash mismatch"):
+        record_attention(
+            state_dir,
+            issue_id=42,
+            reservation_id=reservation,
+            source=AttentionSource.LEAF_BACKEND_OUTCOME,
+            cause=AttentionCause.BACKEND_BLOCKED,
+            facts={
+                "type": "leaf", "backend": "fake", "checkout": str(tmp_path),
+                "base": "main", "branch": "issue/42-a1", "isolated": True,
+                "compute_result": "blocked", "backend_status": "blocked",
+                "validation_reason_codes": [], "evidence_id": str(evidence.resolve()),
+                "evidence_sha256": digest, "pr_url": None, "head_sha": None,
+            },
+            claim=identity,
+            proof_ids=(f"leaf_outcome:{digest}",),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda state, reservation: state["issues"]["42"]["reservations"][reservation].update(
+                state="terminal"
+            ),
+            id="terminal-running-operation",
+        ),
+        pytest.param(
+            lambda state, reservation: state["issues"]["42"]["occurrences"][
+                next(iter(state["issues"]["42"]["occurrences"]))
+            ]["accounting"].update(consumed=True),
+            id="uncharged-occurrence-consumed",
+        ),
+        pytest.param(
+            lambda state, reservation: state["issues"]["42"]["reservations"][reservation].update(
+                disposition="success"
+            ),
+            id="success-without-witness",
+        ),
+    ],
+)
+def test_cross_record_illegal_combinations_fail_closed(
+    tmp_path: Path, mutate: object
+) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    identity = claim()
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity, confirmed=False
+    )
+    confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity
+    )
+    path = state_dir / "dispatch_failures.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    mutate(state, reservation)  # type: ignore[operator]
+    path.write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(FailureStateError):
+        load_outcome_state(state_dir)

@@ -1020,9 +1020,9 @@ def reattach_inflight_worklink_runs(
     from .worklink.attention import AttentionCause, AttentionSource, LaunchFacts
     from .worklink.dispatch_failures import (
         RESERVATION_ENV,
-        active_reservation_id,
         bind_reservation_owner,
         dispatch_failure_state_dir,
+        recovery_reservation_id,
         record_attention,
     )
 
@@ -1083,14 +1083,20 @@ def reattach_inflight_worklink_runs(
             # persistent remote substrate it cannot be reattached by a new one.
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
-        reservation_id = active_reservation_id(
-            dispatch_failure_state_dir(home), issue_id=state.issue_id, target="leaf"
+        reservation_id = recovery_reservation_id(
+            dispatch_failure_state_dir(home),
+            issue_id=state.issue_id,
+            target="leaf",
+            run_id=None,
+            sandbox=None,
+            claim_attempt=state.attempt,
         )
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:
             log_fh: Any = log_path.open("ab")
         except OSError:
             log_fh = subprocess.DEVNULL
+        process: Any = None
         try:
             process = spawn(
                 argv,
@@ -1113,7 +1119,12 @@ def reattach_inflight_worklink_runs(
                     start_ticks=process_start_ticks(child_pid),
                     recovery=True,
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
+            if process is not None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
             if reservation_id is not None:
                 record_attention(
                     dispatch_failure_state_dir(home),
@@ -1149,8 +1160,13 @@ def reattach_inflight_worklink_runs(
                     pass
         dispatched.append(state.issue_id)
     for record in factory_records:
-        reservation_id = active_reservation_id(
-            dispatch_failure_state_dir(home), issue_id=record.issue_id, target="factory"
+        reservation_id = recovery_reservation_id(
+            dispatch_failure_state_dir(home),
+            issue_id=record.issue_id,
+            target="factory",
+            run_id=record.run_id,
+            sandbox=record.sandbox,
+            claim_attempt=record.attempt,
         )
         argv = [
             *run_bin,
@@ -1168,6 +1184,7 @@ def reattach_inflight_worklink_runs(
             log_fh = log_path.open("ab")
         except OSError:
             log_fh = subprocess.DEVNULL
+        process = None
         try:
             process = spawn(
                 argv,
@@ -1190,7 +1207,12 @@ def reattach_inflight_worklink_runs(
                     start_ticks=process_start_ticks(child_pid),
                     recovery=True,
                 )
-        except (OSError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
+            if process is not None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
             if reservation_id is not None:
                 record_attention(
                     dispatch_failure_state_dir(home),

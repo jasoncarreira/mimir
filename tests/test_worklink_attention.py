@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -26,9 +27,11 @@ from mimir.worklink.attention import (
     validate_occurrence_contract,
 )
 from mimir.worklink.dispatch_failures import (
+    bind_claim,
     confirm_claim_and_start,
     dispatch_failure_state_dir,
     record_attention,
+    record_success_witness,
     reserve_dispatch,
 )
 
@@ -39,10 +42,11 @@ def test_source_contract_is_closed() -> None:
 
 
 def test_start_is_never_diagnosis_or_consumption() -> None:
-    claim = ClaimIdentity(42, 1, "agent", "now")
+    timestamp = "2026-09-18T00:00:00+00:00"
+    claim = ClaimIdentity(42, 1, "agent", timestamp)
     facts = {
         "type": "lifecycle_start", "target": "leaf", "claim": claim.to_json(),
-        "admitted_at": "now", "run_id": None, "sandbox": None,
+        "admitted_at": timestamp, "run_id": None, "sandbox": None,
         "admission": "confirmed_claim",
     }
     validate_occurrence_contract(
@@ -104,6 +108,31 @@ def test_each_source_clearance_requires_all_strict_readers(source: AttentionSour
         assert inspection.result.value == "read_error"
 
 
+@pytest.mark.parametrize("source", list(AttentionSource))
+def test_each_source_has_positive_and_negative_clearance_semantics(
+    source: AttentionSource,
+) -> None:
+    required = clearance_requirements(source)
+    kind = (
+        "start" if source.value.endswith("_start")
+        else "success" if source.value.endswith("_success")
+        else "legacy_attention" if source == AttentionSource.LEGACY_V1
+        else "attention"
+    )
+    occurrence = {"source": source.value, "kind": kind}
+    passing = {reader: "pass" for reader in required}
+    positive = inspect_clearance(occurrence, passing)
+    assert positive.result.value == (
+        "current" if kind in {"start", "success"} else "resolved"
+    )
+    blocked = dict(passing)
+    blocked[required[0]] = "blocked"
+    negative = inspect_clearance(occurrence, blocked)
+    assert negative.result.value == (
+        "changed" if kind in {"start", "success"} else "unresolved"
+    )
+
+
 def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
     tmp_path: Path,
 ) -> None:
@@ -112,18 +141,19 @@ def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
         state_dir, issue_id=42, target="leaf", autonomous=True
     )
     claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim, confirmed=False
+    )
     confirm_claim_and_start(
         state_dir, issue_id=42, reservation_id=reservation, claim=claim
     )
-    evidence = tmp_path / "evidence.json"
-    payload = {
+    blocked_evidence = tmp_path / "blocked-evidence.json"
+    blocked_payload = {
         "issue_id": 42,
-        "status": "completed",
-        "head_sha": "a" * 40,
-        "pr_url": "https://github.com/o/r/pull/1",
+        "status": "blocked",
     }
-    evidence.write_text(json.dumps(payload), encoding="utf-8")
-    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    blocked_evidence.write_text(json.dumps(blocked_payload), encoding="utf-8")
+    blocked_digest = hashlib.sha256(blocked_evidence.read_bytes()).hexdigest()
     occurrence = record_attention(
         state_dir,
         issue_id=42,
@@ -134,12 +164,37 @@ def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
             "type": "leaf", "backend": "fake", "checkout": str(tmp_path),
             "base": "main", "branch": "issue/42-a1", "isolated": True,
             "compute_result": "blocked", "backend_status": "blocked",
-            "validation_reason_codes": [], "evidence_id": str(evidence),
-            "evidence_sha256": digest,
-            "pr_url": "https://github.com/o/r/pull/1", "head_sha": "a" * 40,
+            "validation_reason_codes": [], "evidence_id": str(blocked_evidence),
+            "evidence_sha256": blocked_digest,
+            "pr_url": None, "head_sha": None,
         },
         claim=claim,
-        proof_ids=(f"leaf_outcome:{digest}",),
+        proof_ids=(f"leaf_outcome:{blocked_digest}",),
+    )
+    evidence = tmp_path / "completed-evidence.json"
+    payload = {
+        "issue_id": 42,
+        "status": "completed",
+        "branch": "issue/42-a2",
+        "head_sha": "a" * 40,
+        "pr_url": "https://github.com/o/r/pull/1",
+    }
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    record_success_witness(
+        state_dir,
+        issue_id=42,
+        target="leaf",
+        origin="manual",
+        claim=None,
+        run_id=None,
+        sandbox=None,
+        completed_at="2026-09-18T01:00:00+00:00",
+        evidence_path=str(evidence.resolve()),
+        evidence_sha256=digest,
+        branch="issue/42-a2",
+        head_sha="a" * 40,
+        pr_url="https://github.com/o/r/pull/1",
     )
 
     def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -167,6 +222,13 @@ def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
     assert inspection.result.value == "resolved"
     assert inspection.read_errors == ()
 
+    evidence.write_text(json.dumps({**payload, "head_sha": "b" * 40}), encoding="utf-8")
+    tampered = rehydrate_attention(
+        tmp_path, occurrence["delivery_key"].rsplit(":", 1)[-1], runner=runner
+    )
+    assert tampered.result.value == "read_error"
+    assert ReaderCode.EVIDENCE in tampered.read_errors
+
 
 def test_rehydration_preserves_each_real_reader_error(tmp_path: Path) -> None:
     state_dir = dispatch_failure_state_dir(tmp_path)
@@ -174,6 +236,9 @@ def test_rehydration_preserves_each_real_reader_error(tmp_path: Path) -> None:
         state_dir, issue_id=42, target="leaf", autonomous=True
     )
     claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim, confirmed=False
+    )
     start = confirm_claim_and_start(
         state_dir, issue_id=42, reservation_id=reservation, claim=claim
     )
@@ -189,3 +254,38 @@ def test_rehydration_preserves_each_real_reader_error(tmp_path: Path) -> None:
         ReaderCode.CHAINLINK_LOCKS,
     }
     assert inspection.result.value == "read_error"
+
+
+def test_live_start_owner_and_own_lock_remain_current(tmp_path: Path) -> None:
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir,
+        issue_id=42,
+        target="leaf",
+        autonomous=True,
+        owner_pid=os.getpid(),
+        owner_start_ticks=None,
+    )
+    claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim, confirmed=False
+    )
+    start = confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"id": 42, "labels": ["worklink:in-progress"], "comments": []}), ""
+            )
+        if argv[:3] == ["chainlink", "locks", "list"]:
+            return subprocess.CompletedProcess(argv, 0, '{"locks":[{"issue_id":42}]}', "")
+        raise AssertionError(argv)
+
+    inspection = rehydrate_attention(
+        tmp_path, start["delivery_key"].rsplit(":", 1)[-1], runner=runner
+    )
+    assert inspection.result.value == "current"
+    assert inspection.current_state == "active"
+    assert inspection.read_errors == ()

@@ -393,6 +393,7 @@ class ChainlinkClaims:
             return_code: int | None = None,
             disposition: str = "stop",
             retry_after: str | None = None,
+            history_read: str | None = None,
         ) -> None:
             if reservation_id is None:
                 return
@@ -414,8 +415,9 @@ class ChainlinkClaims:
                     result=result,
                     return_code=return_code,
                     mutation_stage=mutation_stage,
+                    history_read=history_read,
                 ),
-                claim=identity,
+                claim=identity if result == "confirmed" else None,
                 disposition=disposition,
                 retry_after=retry_after,
             )
@@ -431,12 +433,21 @@ class ChainlinkClaims:
             from .dispatch_failures import (
                 dispatch_failure_state_dir,
                 issue_dispatch_disposition,
+                validate_claim_retry_authorization,
             )
 
-            if issue_dispatch_disposition(
-                dispatch_failure_state_dir(claim_home), issue_id
-            ) == "stop":
+            outcome_dir = dispatch_failure_state_dir(claim_home)
+            if issue_dispatch_disposition(outcome_dir, issue_id) == "stop":
                 return ClaimResult(False, reason="terminal_attention_stop")
+            try:
+                validate_claim_retry_authorization(
+                    outcome_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    now=self.clock(),
+                )
+            except Exception:
+                return ClaimResult(False, reason="transient_retry_not_authorized")
         if claim_home is not None:
             intent_path = claim_home / "state" / "worklink" / "publications" / f"{issue_id}.json"
             # Presence, not parseability, is the publication fence. Do not park
@@ -643,6 +654,7 @@ class ChainlinkClaims:
             self._run("issue", "comment", str(issue_id), record.to_comment())
         except Exception as publication_error:
             exact = False
+            history_error: Exception | None = None
             if reservation_id is not None and claim_identity is not None:
                 try:
                     history = self._issue_comments(issue_id, strict=True)
@@ -658,30 +670,97 @@ class ChainlinkClaims:
                             claim=claim_identity,
                             confirmed=True,
                         )
-                except Exception as history_error:
-                    raise RuntimeError(
-                        "claim publication outcome is ambiguous; strict history unavailable"
-                    ) from history_error
+                    else:
+                        from .dispatch_failures import mark_claim_absent
+
+                        mark_claim_absent(
+                            state_dir,
+                            issue_id=issue_id,
+                            reservation_id=reservation_id,
+                            claim=claim_identity,
+                        )
+                except Exception as exc:
+                    history_error = exc
             source = {
                 "unready": "claim_unready",
                 "inprogress": "claim_inprogress",
                 "comment": "claim_comment",
             }[mutation_stage]
-            record_claim_outcome(
-                source,
-                "claim_publication_failed",
-                "confirmed" if exact else "absent",
-                identity=claim_identity,
-                mutation_stage=mutation_stage,
-            )
-            self.release_issue(issue_id)
+            try:
+                record_claim_outcome(
+                    source,
+                    "claim_publication_failed",
+                    "confirmed" if exact else "ambiguous" if history_error else "absent",
+                    identity=claim_identity,
+                    mutation_stage=mutation_stage,
+                    history_read=(
+                        type(history_error).__name__ if history_error is not None else "exact"
+                    ),
+                )
+            except Exception as accounting_error:
+                publication_error.add_note(
+                    f"claim outcome accounting failed: {type(accounting_error).__name__}: "
+                    f"{accounting_error}"
+                )
+            try:
+                self.release_issue(issue_id)
+            except Exception as release_error:
+                publication_error.add_note(
+                    f"claim release failed: {type(release_error).__name__}: {release_error}"
+                )
             raise publication_error
         if reservation_id is not None and claim_identity is not None:
-            history = self._issue_comments(issue_id, strict=True)
+            try:
+                history = self._issue_comments(issue_id, strict=True)
+            except Exception as history_error:
+                try:
+                    record_claim_outcome(
+                        "claim_comment",
+                        "claim_publication_failed",
+                        "ambiguous",
+                        identity=claim_identity,
+                        mutation_stage="comment",
+                        history_read=type(history_error).__name__,
+                    )
+                except Exception as accounting_error:
+                    history_error.add_note(
+                        f"claim outcome accounting failed: {type(accounting_error).__name__}: "
+                        f"{accounting_error}"
+                    )
+                raise
             if not any(
                 candidate == record for candidate in claim_records_from_comments(history)
             ):
-                raise RuntimeError("claim publication was not confirmed by strict history")
+                from .dispatch_failures import mark_claim_absent
+
+                mark_claim_absent(
+                    state_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    claim=claim_identity,
+                )
+                error = RuntimeError("claim publication was not confirmed by strict history")
+                try:
+                    record_claim_outcome(
+                        "claim_comment",
+                        "claim_publication_failed",
+                        "absent",
+                        identity=claim_identity,
+                        mutation_stage="comment",
+                        history_read="exact",
+                    )
+                except Exception as accounting_error:
+                    error.add_note(
+                        f"claim outcome accounting failed: {type(accounting_error).__name__}: "
+                        f"{accounting_error}"
+                    )
+                try:
+                    self.release_issue(issue_id)
+                except Exception as release_error:
+                    error.add_note(
+                        f"claim release failed: {type(release_error).__name__}: {release_error}"
+                    )
+                raise error
             bind_claim(
                 state_dir,
                 issue_id=issue_id,

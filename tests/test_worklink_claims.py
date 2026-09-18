@@ -217,6 +217,84 @@ def test_missing_home_path_emits_serialization_unavailable(caplog: pytest.LogCap
     assert "Worklink claim serialization unavailable" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("history_outcome", "expected_state", "settled"),
+    [
+        ("confirmed", "settled", True),
+        ("absent", "absent", False),
+        ("error", "intent", False),
+    ],
+)
+def test_claim_publication_preserves_exact_confirmed_absent_and_ambiguous_states(
+    tmp_path: Path,
+    history_outcome: str,
+    expected_state: str,
+    settled: bool,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_outcome_state,
+        reserve_dispatch,
+    )
+
+    history: list[str] = []
+    publication_started = False
+    sentinel = RuntimeError("comment transport failed after mutation")
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal publication_started
+        call = list(args)
+        if call[1:3] == ["issue", "show"]:
+            if publication_started and history_outcome == "error":
+                return subprocess.CompletedProcess(call, 1, "", "tracker unavailable")
+            return subprocess.CompletedProcess(
+                call,
+                0,
+                json.dumps({"labels": ["worklink:ready"], "comments": history}),
+                "",
+            )
+        if call[1:3] == ["issue", "comment"]:
+            publication_started = True
+            if history_outcome == "confirmed":
+                history.append(call[-1])
+            raise sentinel
+        return completed(call)
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=1700, target="leaf", autonomous=True
+    )
+    claims = ChainlinkClaims(
+        agent_id="worker",
+        home_path=tmp_path,
+        runner=runner,
+        clock=lambda: datetime(2026, 9, 18, tzinfo=UTC),
+    )
+    with pytest.raises(RuntimeError) as raised:
+        claims.claim_issue(
+            1700,
+            labels=["worklink:ready"],
+            reservation_id=reservation,
+        )
+    assert raised.value is sentinel
+    state = load_outcome_state(state_dir)
+    issue = state["issues"]["1700"]
+    current = issue["reservations"][reservation]
+    assert current["claim_state"] == expected_state
+    assert bool(issue["settlements"]) is settled
+    occurrence = next(
+        occurrence
+        for occurrence in issue["occurrences"].values()
+        if occurrence["source"] == "claim_comment"
+    )
+    assert occurrence["facts"]["result"] == (
+        "ambiguous" if history_outcome == "error" else history_outcome
+    )
+    assert occurrence["facts"]["history_read"] == (
+        "RuntimeError" if history_outcome == "error" else "exact"
+    )
+
+
 def test_claim_contention_retries_with_backoff_and_emits_outcomes(tmp_path: Path) -> None:
     claim_calls = 0
     sleeps: list[float] = []

@@ -273,6 +273,11 @@ def _validate_v2(state: Mapping[str, object]) -> None:
             raise FailureStateError("outcome ledger legacy row is invalid")
         for reservation_id, reservation in issue["reservations"].items():
             _validate_reservation(reservation_id, reservation, int(issue_key))
+        sequences = [item["sequence"] for item in issue["reservations"].values()]
+        if len(sequences) != len(set(sequences)) or any(
+            sequence >= issue["next_sequence"] for sequence in sequences
+        ):
+            raise FailureStateError("reservation sequences are inconsistent")
         for key, settlement in issue["settlements"].items():
             _validate_settlement(key, settlement, int(issue_key), issue)
         for occurrence_id, occurrence in issue["occurrences"].items():
@@ -289,6 +294,13 @@ def _validate_v2(state: Mapping[str, object]) -> None:
                 or recurrence["disposition"] not in {"transient_retry", "stop"}
             ):
                 raise FailureStateError("contention recurrence is invalid")
+            if _parse_required_time(recurrence["last_at"]) is None:
+                raise FailureStateError("contention recurrence time is invalid")
+            if recurrence["disposition"] == "transient_retry":
+                if _parse_required_time(recurrence["retry_after"]) is None:
+                    raise FailureStateError("contention retry deadline is invalid")
+            elif recurrence["retry_after"] is not None:
+                raise FailureStateError("stopped contention carries a retry deadline")
         for settlement in issue["settlements"].values():
             reservation = issue["reservations"][settlement["reservation_id"]]
             if reservation["binding"]["claim"] != settlement["claim"]:
@@ -305,6 +317,43 @@ def _validate_v2(state: Mapping[str, object]) -> None:
                 witness_id = occurrence["facts"]["witness_id"]
                 if witness_id not in issue["success_witnesses"]:
                     raise FailureStateError("success occurrence witness is absent")
+                witness = issue["success_witnesses"][witness_id]
+                reservation = issue["reservations"][occurrence["reservation_id"]]
+                if (
+                    witness["origin"] != "autonomous"
+                    or witness["target"] != reservation["target"]
+                    or witness["claim"] != reservation["binding"]["claim"]
+                    or witness["run_id"] != reservation["binding"]["run_id"]
+                    or witness["sandbox"] != reservation["binding"]["sandbox"]
+                    or occurrence["facts"]["evidence_sha256"]
+                    != witness["evidence_sha256"]
+                ):
+                    raise FailureStateError("success occurrence witness binding is invalid")
+            reservation = issue["reservations"][occurrence["reservation_id"]]
+            operation = reservation["operations"][occurrence["operation_id"]]
+            linked = issue["occurrences"].get(operation["occurrence_id"])
+            if linked is None or linked["operation_id"] != occurrence["operation_id"]:
+                raise FailureStateError("operation occurrence linkage is invalid")
+        for reservation_id, reservation in issue["reservations"].items():
+            if reservation["state"] == "terminal" and any(
+                operation["state"] == "running"
+                for operation in reservation["operations"].values()
+            ):
+                raise FailureStateError("terminal reservation retains a running operation")
+            lifecycle_id = reservation["lifecycle_operation_id"]
+            lifecycle = reservation["operations"].get(lifecycle_id)
+            start_id = occurrence_identity(reservation_id, lifecycle_id, "start")
+            success_id = occurrence_identity(reservation_id, lifecycle_id, "terminal")
+            if reservation["state"] == "active" and (
+                lifecycle is None or start_id not in issue["occurrences"]
+            ):
+                raise FailureStateError("active reservation lacks its START occurrence")
+            if reservation["disposition"] == "success" and (
+                reservation["state"] != "terminal"
+                or success_id not in issue["occurrences"]
+                or issue["occurrences"][success_id]["kind"] != "success"
+            ):
+                raise FailureStateError("successful reservation lacks its success occurrence")
 
 
 def _validate_reservation(reservation_id: object, value: object, issue_id: int) -> None:
@@ -324,6 +373,13 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
         raise FailureStateError("reservation claim state is invalid")
     if value["disposition"] not in {"pending", "success", "stop", "transient_retry"}:
         raise FailureStateError("reservation disposition is invalid")
+    legal_dispositions = {
+        "prepared": {"pending", "transient_retry"},
+        "active": {"pending"},
+        "terminal": {"success", "stop"},
+    }
+    if value["disposition"] not in legal_dispositions[value["state"]]:
+        raise FailureStateError("reservation state and disposition are inconsistent")
     if not isinstance(value["operations"], dict) or not isinstance(value["positive_proofs"], list):
         raise FailureStateError("reservation operations/proofs are invalid")
     if not all(
@@ -342,7 +398,10 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
     if owner is not None and (
         not isinstance(owner, dict) or set(owner) != {"pid", "start_ticks"}
         or type(owner["pid"]) is not int or owner["pid"] <= 0
-        or (owner["start_ticks"] is not None and type(owner["start_ticks"]) is not int)
+        or (
+            owner["start_ticks"] is not None
+            and (type(owner["start_ticks"]) is not int or owner["start_ticks"] <= 0)
+        )
     ):
         raise FailureStateError("reservation owner is invalid")
     binding = value["binding"]
@@ -353,19 +412,47 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
             ClaimIdentity.from_json(binding["claim"])
         except AttentionSchemaError as exc:
             raise FailureStateError(str(exc)) from exc
+    for field in ("run_id", "sandbox"):
+        if binding[field] is not None and (
+            not isinstance(binding[field], str)
+            or not binding[field]
+            or "\x00" in binding[field]
+            or len(binding[field].encode()) > 4096
+        ):
+            raise FailureStateError(f"reservation {field} binding is invalid")
+    if binding["sandbox"] is not None and not Path(binding["sandbox"]).is_absolute():
+        raise FailureStateError("reservation sandbox binding must be absolute")
     if value["claim_state"] == "none" and binding["claim"] is not None:
         raise FailureStateError("unclaimed reservation carries a claim")
     if value["claim_state"] in {"intent", "confirmed", "settled"} and binding["claim"] is None:
         raise FailureStateError("claimed reservation has no claim identity")
     if value["state"] == "active" and value["claim_state"] != "confirmed":
         raise FailureStateError("active reservation claim is not confirmed")
+    if value["claim_state"] == "absent" and value["state"] == "active":
+        raise FailureStateError("absent claim cannot own active work")
+    if value["claim_state"] == "settled" and value["state"] != "terminal":
+        raise FailureStateError("settled claim reservation is not terminal")
+    retry_after = value["retry_after"]
+    if value["disposition"] == "transient_retry":
+        if value["state"] != "prepared" or _parse_required_time(retry_after) is None:
+            raise FailureStateError("transient retry reservation lacks a deadline")
+    elif retry_after is not None:
+        raise FailureStateError("non-retry reservation carries a retry deadline")
     lifecycle = value["lifecycle_operation_id"]
-    if lifecycle is not None and lifecycle not in value["operations"]:
+    if not isinstance(lifecycle, str) or not lifecycle:
         raise FailureStateError("reservation lifecycle operation is invalid")
     for operation_id, operation in value["operations"].items():
-        if not isinstance(operation_id, str) or not isinstance(operation, dict) or set(operation) != {
+        if (
+            not isinstance(operation_id, str)
+            or (
+                operation_id not in {value["lifecycle_operation_id"], "legacy-v1"}
+                and re.fullmatch(r"op-[1-9][0-9]*", operation_id) is None
+            )
+            or not isinstance(operation, dict)
+            or set(operation) != {
             "source", "owner", "state", "started_at", "finished_at", "occurrence_id",
-        }:
+            }
+        ):
             raise FailureStateError("operation fields are invalid")
         try:
             AttentionSource(operation["source"])
@@ -373,6 +460,23 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
             raise FailureStateError("operation source is invalid") from exc
         if operation["state"] not in {"running", "finished"}:
             raise FailureStateError("operation state is invalid")
+        operation_owner = operation["owner"]
+        if operation_owner is not None and (
+            not isinstance(operation_owner, dict)
+            or set(operation_owner) != {"pid", "start_ticks"}
+            or type(operation_owner["pid"]) is not int
+            or operation_owner["pid"] <= 0
+            or (
+                operation_owner["start_ticks"] is not None
+                and (
+                    type(operation_owner["start_ticks"]) is not int
+                    or operation_owner["start_ticks"] <= 0
+                )
+            )
+        ):
+            raise FailureStateError("operation owner is invalid")
+        if _parse_required_time(operation["started_at"]) is None:
+            raise FailureStateError("operation start time is invalid")
         if operation["state"] == "running" and (
             operation["finished_at"] is not None
             or operation["occurrence_id"] is not None
@@ -383,6 +487,10 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
             or not isinstance(operation["occurrence_id"], str)
         ):
             raise FailureStateError("finished operation lacks terminal fields")
+        if operation["state"] == "finished" and _parse_required_time(
+            operation["finished_at"]
+        ) is None:
+            raise FailureStateError("operation finish time is invalid")
 
 
 def _validate_settlement(key: object, value: object, issue_id: int, issue: Mapping[str, Any]) -> None:
@@ -406,6 +514,8 @@ def _validate_settlement(key: object, value: object, issue_id: int, issue: Mappi
         raise FailureStateError("settlement consumption lacks positive proof")
     if not value["consumed"] and value["basis"] != "no_work":
         raise FailureStateError("nonconsuming settlement basis is invalid")
+    if _parse_required_time(value["settled_at"]) is None:
+        raise FailureStateError("settlement time is invalid")
 
 
 def _validate_occurrence(key: object, value: object, issue_id: int, issue: Mapping[str, Any]) -> None:
@@ -436,6 +546,34 @@ def _validate_occurrence(key: object, value: object, issue_id: int, issue: Mappi
             raise FailureStateError("bound occurrence settlement is absent")
     if value["delivery_key"] != f"worklink-attention:{issue_id}:{key}":
         raise FailureStateError("occurrence delivery key is invalid")
+    if _parse_required_time(value["created_at"]) is None:
+        raise FailureStateError("occurrence creation time is invalid")
+    if value["facts"].get("type") == "factory" and value["facts"].get("issue_id") != issue_id:
+        raise FailureStateError("factory occurrence issue mismatch")
+    if value["facts"].get("type") == "lifecycle_start":
+        if value["facts"]["claim"] != reservation["binding"]["claim"]:
+            raise FailureStateError("START facts do not match reservation claim")
+        if value["facts"].get("run_id") != reservation["binding"]["run_id"] or value[
+            "facts"
+        ].get("sandbox") != reservation["binding"]["sandbox"]:
+            raise FailureStateError("START facts do not match reservation binding")
+    operation = reservation["operations"][value["operation_id"]]
+    if operation["source"] != value["source"] and not (
+        value["kind"] == "success"
+        and operation["source"] in {"leaf_start", "factory_start"}
+    ):
+        raise FailureStateError("occurrence source does not match its operation")
+    if accounting.scope == AccountingScope.BOUND_CLAIM:
+        settlement = issue["settlements"][accounting.settlement_key]
+        if (
+            accounting.claim.to_json() != settlement["claim"]
+            or accounting.consumed != settlement["consumed"]
+            or value["reservation_id"] != settlement["reservation_id"]
+            or list(value["proof_ids"]) != settlement["proof_ids"]
+        ):
+            raise FailureStateError("occurrence accounting does not match settlement")
+    elif accounting.scope == AccountingScope.NO_NEW_CLAIM and value["proof_ids"]:
+        raise FailureStateError("unclaimed occurrence cannot carry work proof")
     execution = value["execution"]
     if execution is not None:
         if not isinstance(execution, dict) or set(execution) != {
@@ -453,6 +591,39 @@ def _validate_occurrence(key: object, value: object, issue_id: int, issue: Mappi
             raise FailureStateError("occurrence execution park reason is invalid")
         if execution["state"] == "parked" and execution["park_reason"] is None:
             raise FailureStateError("parked occurrence execution needs a reason")
+        if execution["state"] != "parked" and execution["park_reason"] is not None:
+            raise FailureStateError("non-parked execution carries a park reason")
+        for field in ("event_source_id", "turn_id", "inspection_id"):
+            if (
+                not isinstance(execution[field], str)
+                or not execution[field]
+                or "\x00" in execution[field]
+                or len(execution[field].encode()) > 1024
+            ):
+                raise FailureStateError(f"occurrence execution {field} is invalid")
+        if execution["event_source_id"] != value["delivery_key"]:
+            raise FailureStateError("execution source does not match occurrence delivery")
+        if not isinstance(execution["inspection"], dict):
+            raise FailureStateError("occurrence execution inspection is invalid")
+        inspection_hash = hashlib.sha256(
+            json.dumps(
+                execution["inspection"], sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if execution["inspection_sha256"] != inspection_hash:
+            raise FailureStateError("occurrence execution inspection hash mismatch")
+        execution_owner = execution["owner"]
+        if (
+            not isinstance(execution_owner, dict)
+            or set(execution_owner) != {"pid", "start_ticks"}
+            or type(execution_owner["pid"]) is not int
+            or execution_owner["pid"] <= 0
+            or (
+                execution_owner["start_ticks"] is not None
+                and type(execution_owner["start_ticks"]) is not int
+            )
+        ):
+            raise FailureStateError("occurrence execution owner is invalid")
     handling = value["handling"]
     if handling is not None:
         if execution is None or execution["state"] != "recorded":
@@ -473,6 +644,17 @@ def _validate_occurrence(key: object, value: object, issue_id: int, issue: Mappi
             raise FailureStateError("occurrence handling result is invalid for kind")
         if not isinstance(handling["report"], str) or not handling["report"].strip():
             raise FailureStateError("occurrence handling report is blank")
+        if any(
+            handling[field] != execution[field]
+            for field in ("event_source_id", "turn_id", "inspection_id")
+        ):
+            raise FailureStateError("handling correlation does not match execution")
+        if not isinstance(handling["record_sha256"], str) or re.fullmatch(
+            r"[0-9a-f]{64}", handling["record_sha256"]
+        ) is None:
+            raise FailureStateError("handling durable record hash is invalid")
+        if _parse_required_time(handling["handled_at"]) is None:
+            raise FailureStateError("handling timestamp is invalid")
 
 
 def _validate_witness(key: object, value: object, issue_id: int) -> None:
@@ -499,6 +681,37 @@ def _validate_witness(key: object, value: object, issue_id: int) -> None:
         raise FailureStateError("success witness next presence is contradictory")
     if value["origin"] == "manual" and value["claim"] is not None:
         raise FailureStateError("manual success witness cannot claim autonomous work")
+    if value["origin"] == "autonomous" and value["claim"] is None:
+        raise FailureStateError("autonomous success witness lacks its claim")
+    if value["claim"] is not None:
+        try:
+            claim = ClaimIdentity.from_json(value["claim"])
+        except AttentionSchemaError as exc:
+            raise FailureStateError(str(exc)) from exc
+        if claim.issue_id != issue_id:
+            raise FailureStateError("success witness claim issue mismatch")
+    for field in ("completed_at", "observed_at"):
+        if _parse_required_time(value[field]) is None:
+            raise FailureStateError(f"success witness {field} is invalid")
+    for field in ("branch", "head_sha"):
+        if not isinstance(value[field], str) or not value[field] or "\x00" in value[field]:
+            raise FailureStateError(f"success witness {field} is invalid")
+    if re.fullmatch(r"[0-9a-f]{40,64}", value["head_sha"]) is None:
+        raise FailureStateError("success witness head is invalid")
+    if value["target"] == "leaf" and (
+        value["run_id"] is not None
+        or value["sandbox"] is not None
+        or value["next"] is not None
+        or value["next_present"] is not False
+    ):
+        raise FailureStateError("leaf success witness carries factory binding")
+    if value["target"] == "factory" and value["origin"] == "autonomous" and (
+        not isinstance(value["run_id"], str)
+        or not value["run_id"]
+        or not isinstance(value["sandbox"], str)
+        or not Path(value["sandbox"]).is_absolute()
+    ):
+        raise FailureStateError("factory success witness binding is invalid")
 
 
 def _migrate_v1(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -522,8 +735,8 @@ def _migrate_v1(state: Mapping[str, Any]) -> dict[str, Any]:
                                    "finished_at": row.get("failed_at") or now,
                                    "occurrence_id": occurrence_id}
                 },
-                "positive_proofs": [], "disposition": "stop", "retry_after": row.get("retry_after"),
-                "lifecycle_operation_id": None,
+                "positive_proofs": [], "disposition": "stop", "retry_after": None,
+                "lifecycle_operation_id": "lifecycle",
             }
             facts = {
                 "type": "legacy", "original_key": issue_key,
@@ -574,21 +787,10 @@ def reserve_dispatch(
         if owner_pid is not None:
             owner = {"pid": owner_pid, "start_ticks": owner_start_ticks}
         lifecycle_operation_id = "lifecycle"
-        lifecycle_source = "leaf_start" if target_value == "leaf" else "factory_start"
-        prepared_at = datetime.now(UTC).isoformat()
         issue["reservations"][reservation_id] = {
             "sequence": issue["next_sequence"], "issue_id": issue_id, "target": target_value,
             "autonomous": autonomous, "state": "prepared", "owner": owner,
-            "binding": normalized_binding, "claim_state": "none", "operations": {
-                lifecycle_operation_id: {
-                    "source": lifecycle_source,
-                    "owner": owner,
-                    "state": "running",
-                    "started_at": prepared_at,
-                    "finished_at": None,
-                    "occurrence_id": None,
-                }
-            },
+            "binding": normalized_binding, "claim_state": "none", "operations": {},
             "positive_proofs": [], "disposition": "pending", "retry_after": None,
             "lifecycle_operation_id": lifecycle_operation_id,
         }
@@ -619,7 +821,32 @@ def reservation_from_environment(
                 raise FailureStateError("inherited reservation is not autonomous")
             if reservation["state"] == "terminal":
                 raise FailureStateError("terminal reservation cannot be inherited")
+            if reservation["disposition"] == "transient_retry":
+                deadline = parse_time(reservation["retry_after"])
+                if deadline is None or datetime.now(UTC) < deadline:
+                    raise FailureStateError("inherited transient retry is not due")
+        bind_reservation_owner(
+            state_dir,
+            issue_id=issue_id,
+            reservation_id=inherited,
+            pid=os.getpid(),
+            start_ticks=_process_start_ticks(os.getpid()),
+            recovery=True,
+        )
         return inherited
+    retry_id = authorized_retry_reservation_id(
+        state_dir, issue_id=issue_id, target=target
+    )
+    if retry_id is not None:
+        bind_reservation_owner(
+            state_dir,
+            issue_id=issue_id,
+            reservation_id=retry_id,
+            pid=os.getpid(),
+            start_ticks=_process_start_ticks(os.getpid()),
+            recovery=True,
+        )
+        return retry_id
     return reserve_dispatch(
         state_dir,
         issue_id=issue_id,
@@ -649,15 +876,10 @@ def bind_reservation_owner(
         owner = {"pid": pid, "start_ticks": start_ticks}
         existing = reservation["owner"]
         if existing is not None and existing != owner:
-            lifecycle = reservation["operations"].get(
-                reservation["lifecycle_operation_id"]
-            )
             fresh_handoff = (
                 reservation["state"] == "prepared"
                 and reservation["disposition"] == "pending"
-                and len(reservation["operations"]) == 1
-                and lifecycle is not None
-                and lifecycle["state"] == "running"
+                and not reservation["operations"]
             )
             retry_handoff = (
                 reservation["state"] == "prepared"
@@ -712,8 +934,30 @@ def bind_claim(
             raise FailureStateError("reservation cannot bind a different claim")
         if reservation["state"] == "terminal":
             raise FailureStateError("terminal reservation cannot bind a claim")
+        current = reservation["claim_state"]
+        if confirmed:
+            if current not in {"intent", "confirmed"}:
+                raise FailureStateError("claim confirmation is not valid from current state")
+        elif current not in {"none", "intent"}:
+            raise FailureStateError("claim intent is not valid from current state")
         reservation["binding"]["claim"] = claim.to_json()
         reservation["claim_state"] = "confirmed" if confirmed else "intent"
+
+
+def mark_claim_absent(
+    state_dir: Path, *, issue_id: int, reservation_id: str, claim: ClaimIdentity
+) -> None:
+    """Record a strict history negative without forgiving or settling the intent."""
+    with outcome_state_transaction(state_dir) as state:
+        reservation = _reservation(state, issue_id, reservation_id)
+        if reservation["state"] == "terminal":
+            raise FailureStateError("terminal reservation cannot change claim state")
+        if (
+            reservation["claim_state"] != "intent"
+            or reservation["binding"]["claim"] != claim.to_json()
+        ):
+            raise FailureStateError("only the exact pending claim intent can be absent")
+        reservation["claim_state"] = "absent"
 
 
 def confirm_claim_and_start(
@@ -739,17 +983,33 @@ def confirm_claim_and_start(
                 raise FailureStateError(f"reservation {name} binding changed")
             if supplied is not None:
                 reservation["binding"][name] = supplied
+        if reservation["claim_state"] not in {"intent", "confirmed"}:
+            raise FailureStateError("claim cannot activate from current state")
+        if reservation["disposition"] == "transient_retry":
+            deadline = parse_time(reservation["retry_after"])
+            if deadline is None or (now or datetime.now(UTC)) < deadline:
+                raise FailureStateError("transient retry cannot activate before its deadline")
+            reservation["disposition"] = "pending"
+            reservation["retry_after"] = None
         reservation["binding"]["claim"] = claim.to_json()
         reservation["claim_state"] = "confirmed"
         lifecycle_operation_id = reservation["lifecycle_operation_id"]
-        operation = reservation["operations"][lifecycle_operation_id]
-        if operation["occurrence_id"] is not None:
+        operation = reservation["operations"].get(lifecycle_operation_id)
+        if operation is not None and operation["occurrence_id"] is not None:
             return issue["occurrences"][operation["occurrence_id"]]
         if reservation["state"] == "terminal":
             raise FailureStateError("terminal reservation cannot reactivate")
         reservation["state"] = "active"
         operation_id = lifecycle_operation_id
         source = AttentionSource.LEAF_START if reservation["target"] == "leaf" else AttentionSource.FACTORY_START
+        reservation["operations"][operation_id] = {
+            "source": source.value,
+            "owner": reservation["owner"],
+            "state": "running",
+            "started_at": timestamp,
+            "finished_at": None,
+            "occurrence_id": None,
+        }
         facts = facts_to_json(LifecycleStartFacts(
             target=AttentionTarget(reservation["target"]), claim=claim,
             admitted_at=timestamp, run_id=run_id, sandbox=sandbox,
@@ -783,6 +1043,7 @@ def record_attention(
             source_value,
             facts_json,
             proof_ids,
+            issue_id=issue_id,
             retained=tuple(reservation["positive_proofs"]),
         )
         if deferred:
@@ -790,6 +1051,11 @@ def record_attention(
         elif claim is None:
             accounting = Accounting(AccountingScope.NO_NEW_CLAIM, None, False, None)
         else:
+            if (
+                reservation["claim_state"] not in {"confirmed", "settled"}
+                or reservation["binding"]["claim"] != claim.to_json()
+            ):
+                raise FailureStateError("unconfirmed claim cannot be settled")
             settlement = issue["settlements"].get(claim.key)
             if settlement is None:
                 settlement = _settle(
@@ -827,6 +1093,7 @@ def _validate_positive_proof_evidence(
     facts: Mapping[str, object],
     proof_ids: tuple[str, ...],
     *,
+    issue_id: int,
     retained: tuple[str, ...],
 ) -> None:
     if not proof_ids:
@@ -846,6 +1113,36 @@ def _validate_positive_proof_evidence(
             or not SOURCE_RULES[source].work_capable
         ):
             raise FailureStateError("leaf work proof does not match terminal evidence")
+        path = Path(evidence_path)
+        try:
+            value = path.lstat()
+            if (
+                stat.S_ISLNK(value.st_mode)
+                or not stat.S_ISREG(value.st_mode)
+                or value.st_size > 4 * 1024 * 1024
+            ):
+                raise FailureStateError("leaf work proof is not a bounded regular file")
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise FailureStateError("leaf work proof cannot be read") from exc
+        if hashlib.sha256(raw).hexdigest() != evidence_hash:
+            raise FailureStateError("leaf work proof hash mismatch")
+        try:
+            evidence = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=_json_no_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FailureStateError("leaf work proof is malformed") from exc
+        if not isinstance(evidence, dict):
+            raise FailureStateError("leaf work proof must be an object")
+        evidence_issue = evidence.get("issue", evidence.get("issue_id"))
+        if evidence_issue != issue_id or evidence.get("status") not in {
+            "completed", "blocked", "failed"
+        }:
+            raise FailureStateError("leaf work proof is not a matching terminal outcome")
+        expected_status = facts.get("backend_status") or facts.get("compute_result")
+        if expected_status not in {None, evidence.get("status")}:
+            raise FailureStateError("leaf work proof status contradicts occurrence facts")
+        if evidence.get("launch_error") is not None or evidence.get("status") == "launch_error":
+            raise FailureStateError("launch failure is not positive work proof")
         return
     if facts.get("type") == "factory":
         from .attention import FactorySnapshot, positive_factory_proofs
@@ -875,13 +1172,35 @@ def record_success_witness(
     evidence_file = Path(evidence_path)
     try:
         value = evidence_file.lstat()
-        if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+        if (
+            stat.S_ISLNK(value.st_mode)
+            or not stat.S_ISREG(value.st_mode)
+            or value.st_size > 4 * 1024 * 1024
+        ):
             raise FailureStateError("success evidence is not a regular file")
-        observed_hash = hashlib.sha256(evidence_file.read_bytes()).hexdigest()
+        evidence_bytes = evidence_file.read_bytes()
+        observed_hash = hashlib.sha256(evidence_bytes).hexdigest()
     except OSError as exc:
         raise FailureStateError("success evidence cannot be read") from exc
     if observed_hash != evidence_sha256:
         raise FailureStateError("success evidence hash mismatch")
+    try:
+        evidence = json.loads(
+            evidence_bytes.decode("utf-8", "strict"), object_pairs_hook=_json_no_duplicates
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FailureStateError("success evidence is malformed") from exc
+    if not isinstance(evidence, dict):
+        raise FailureStateError("success evidence must be an object")
+    evidence_issue = evidence.get("issue", evidence.get("issue_id"))
+    if evidence_issue != issue_id or evidence.get("status") != "completed":
+        raise FailureStateError("success evidence is not a matching completion")
+    for field, expected in (("branch", branch), ("head_sha", head_sha)):
+        observed = evidence.get(field)
+        if observed is not None and observed != expected:
+            raise FailureStateError(f"success evidence {field} mismatch")
+    if evidence.get("pr_url") is not None and evidence.get("pr_url") != pr_url:
+        raise FailureStateError("success evidence PR mismatch")
     if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:
         raise FailureStateError("success witness head is invalid")
     if not branch or len(branch.encode()) > 1024 or "\x00" in branch:
@@ -908,6 +1227,17 @@ def record_success_witness(
         if origin != "autonomous" or reservation_id is None or claim is None:
             raise FailureStateError("autonomous success requires reservation and claim")
         reservation = _reservation(state, issue_id, reservation_id)
+        if (
+            reservation["claim_state"] != "confirmed"
+            or reservation["binding"]["claim"] != claim.to_json()
+        ):
+            raise FailureStateError("success requires the confirmed original claim")
+        if reservation["target"] != target_value.value:
+            raise FailureStateError("success target does not match reservation")
+        if reservation["binding"]["run_id"] != run_id:
+            raise FailureStateError("success run binding mismatch")
+        if reservation["binding"]["sandbox"] != sandbox:
+            raise FailureStateError("success sandbox binding mismatch")
         if reservation["state"] == "terminal" and reservation["disposition"] == "success":
             lifecycle = reservation["lifecycle_operation_id"]
             terminal_id = occurrence_identity(reservation_id, lifecycle, "terminal")
@@ -1077,6 +1407,41 @@ def active_reservation_id(
     return max(candidates)[1] if candidates else None
 
 
+def recovery_reservation_id(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    target: AttentionTarget | str,
+    run_id: str | None,
+    sandbox: str | None,
+    claim_attempt: int,
+) -> str | None:
+    """Resolve startup recovery only from the complete persisted work binding."""
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if not issue:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for reservation_id, reservation in issue["reservations"].items():
+        binding = reservation["binding"]
+        claim = binding["claim"]
+        if (
+            reservation["target"] != AttentionTarget(target).value
+            or reservation["autonomous"] is not True
+            or reservation["state"] not in {"prepared", "active"}
+            or not isinstance(claim, dict)
+            or claim.get("issue_id") != issue_id
+            or claim.get("attempt") != claim_attempt
+            or binding["run_id"] != run_id
+            or binding["sandbox"] != sandbox
+        ):
+            continue
+        candidates.append((reservation["sequence"], reservation_id))
+    if len(candidates) > 1:
+        raise FailureStateError("recovery binding is ambiguous")
+    return candidates[0][1] if candidates else None
+
+
 def issue_retry_after(state_dir: Path, issue_id: int) -> datetime | None:
     state = load_outcome_state(state_dir)
     issue = state["issues"].get(str(issue_id))
@@ -1091,6 +1456,75 @@ def issue_retry_after(state_dir: Path, issue_id: int) -> datetime | None:
     ]
     parsed = [item for item in values if item is not None]
     return max(parsed) if parsed else None
+
+
+def authorized_retry_reservation_id(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    target: AttentionTarget | str,
+    now: datetime | None = None,
+) -> str | None:
+    """Return only the due prepared reservation authorized by contention policy."""
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if not issue:
+        return None
+    target_value = AttentionTarget(target).value
+    candidates = sorted(
+        (
+            (reservation["sequence"], reservation_id, reservation)
+            for reservation_id, reservation in issue["reservations"].items()
+            if reservation["target"] == target_value
+            and reservation["autonomous"] is True
+            and reservation["state"] == "prepared"
+            and reservation["disposition"] == "transient_retry"
+        ),
+        reverse=True,
+    )
+    if not candidates:
+        return None
+    _sequence, reservation_id, reservation = candidates[0]
+    deadline = parse_time(reservation["retry_after"])
+    if deadline is None:
+        raise FailureStateError("prepared retry has no valid deadline")
+    instant = now or datetime.now(UTC)
+    if instant < deadline:
+        raise FailureStateError(f"transient retry is not due before {deadline.isoformat()}")
+    owner = reservation["owner"]
+    if owner is not None and owner.get("pid") != os.getpid() and not _owner_verified_dead(owner):
+        raise FailureStateError("prepared retry owner is live or unknown")
+    return reservation_id
+
+
+def validate_claim_retry_authorization(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    reservation_id: str,
+    target: AttentionTarget | str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Prevent fresh reservations from bypassing a retained retry identity/deadline."""
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if not issue:
+        return
+    retained = [
+        (candidate_id, reservation)
+        for candidate_id, reservation in issue["reservations"].items()
+        if (target is None or reservation["target"] == AttentionTarget(target).value)
+        and reservation["state"] == "prepared"
+        and reservation["disposition"] == "transient_retry"
+    ]
+    if not retained:
+        return
+    candidate_id, reservation = max(retained, key=lambda item: item[1]["sequence"])
+    if candidate_id != reservation_id:
+        raise FailureStateError("transient retry must reuse its prepared reservation")
+    deadline = parse_time(reservation["retry_after"])
+    if deadline is None or (now or datetime.now(UTC)) < deadline:
+        raise FailureStateError("transient retry deadline has not elapsed")
 
 
 def pending_attention(state_dir: Path) -> list[dict[str, Any]]:
@@ -1122,6 +1556,12 @@ def _settle(
     issue: dict[str, Any], reservation_id: str, claim: ClaimIdentity,
     proof_ids: tuple[str, ...], operation_id: str, settled_at: str,
 ) -> dict[str, Any]:
+    reservation = issue["reservations"].get(reservation_id)
+    if reservation is None or (
+        reservation["claim_state"] != "confirmed"
+        or reservation["binding"]["claim"] != claim.to_json()
+    ):
+        raise FailureStateError("only a confirmed exact claim can be settled")
     proofs = list(dict.fromkeys(proof_ids))
     settlement = {
         "claim": claim.to_json(), "reservation_id": reservation_id,
@@ -1399,3 +1839,16 @@ def parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _parse_required_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value or "\x00" in value or len(value) > 128:
+        return None
+    parsed = parse_time(value)
+    if parsed is None:
+        return None
+    try:
+        original = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if original.tzinfo is not None else None

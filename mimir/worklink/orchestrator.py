@@ -2263,6 +2263,10 @@ class WorklinkRunner:
             candidates = load_factory_records_for_issue(self.home, issue_id)
             if not candidates:
                 return
+            if len(candidates) != 1:
+                raise FactoryRecoveryBlocked(
+                    candidates[0], "retained factory binding is ambiguous"
+                )
             candidate = candidates[0]
             try:
                 _verify_factory_recovery_target(
@@ -2275,7 +2279,8 @@ class WorklinkRunner:
                     command_runner=runner,
                 )
             except WorklinkError as exc:
-                _record_factory_stage_failure(
+                _record_factory_failure_preserving(
+                    exc,
                     home=self.home,
                     issue_id=issue_id,
                     reservation_id=reservation_id,
@@ -2284,7 +2289,6 @@ class WorklinkRunner:
                     cause="recovery_binding_invalid",
                     record=candidate,
                     checkout=Path(candidate.sandbox),
-                    error=exc,
                 )
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
             retained = candidate
@@ -2516,21 +2520,50 @@ class WorklinkRunner:
         except Exception as exc:
             original_reason = str(exc)
             try:
+                from .dispatch_failures import dispatch_failure_state_dir, reservation_binding
+
+                binding = (
+                    reservation_binding(
+                        dispatch_failure_state_dir(self.home),
+                        issue_id=issue_id,
+                        reservation_id=reservation_id,
+                    )
+                    if reservation_id is not None
+                    else None
+                ) or {}
                 records = load_factory_records_for_issue(self.home, issue_id)
-                current = records[0] if records else None
+                exact = [
+                    candidate
+                    for candidate in records
+                    if candidate.attempt == claim_record.attempt
+                    and candidate.run_id == (
+                        binding.get("run_id") if reservation_id is not None else run_id
+                    )
+                    and (
+                        reservation_id is None
+                        or candidate.sandbox == binding.get("sandbox")
+                    )
+                ]
+                current = exact[0] if len(exact) == 1 else None
             except Exception:
                 current = None
-            _record_factory_stage_failure(
-                home=self.home,
-                issue_id=issue_id,
-                reservation_id=reservation_id,
-                claim_record=claim_record,
-                source=factory_stage[0],
-                cause=factory_stage[1],
-                record=current,
-                checkout=lease.path if lease is not None else None,
-                error=exc,
-            )
+            try:
+                _record_factory_stage_failure(
+                    home=self.home,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    claim_record=claim_record,
+                    source=factory_stage[0],
+                    cause=factory_stage[1],
+                    record=current,
+                    checkout=lease.path if lease is not None else None,
+                    error=exc,
+                )
+            except BaseException as accounting_error:
+                exc.add_note(
+                    f"factory outcome recording failed: {type(accounting_error).__name__}: "
+                    f"{accounting_error}"
+                )
             preserved_ref, preservation_error = _preserve_failed_factory_run(
                 home=self.home,
                 trusted_repo=self.repo,
@@ -2898,6 +2931,11 @@ class WorklinkRunner:
         cancel_attempted = False
         wait_result: ComputeResult | None = None
         supervision_stage = ("factory_wait_start", "supervision_failed")
+        from .factory_state import immutable_factory_snapshot
+
+        factory_snapshot: object = immutable_factory_snapshot(
+            factory_record, read_result="retained"
+        )
 
         def retain_result(result: ComputeResult | None, outcome: str) -> None:
             nonlocal factory_record, supervision_stage
@@ -2995,9 +3033,13 @@ class WorklinkRunner:
                     supervision_stage = (
                         "factory_observation_save", "state_write_failed"
                     )
+                    observed_record = replace(factory_record, status=status)
+                    factory_snapshot = immutable_factory_snapshot(
+                        observed_record, read_result="captured"
+                    )
                     _retain_factory_observation(
                         self.home,
-                        replace(factory_record, status=status),
+                        observed_record,
                         self.outcome_reservation_id,
                     )
                     factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
@@ -3046,6 +3088,7 @@ class WorklinkRunner:
                             test_cmd=test_cmd,
                             runner=runner,
                             started_at=started_at,
+                            terminal_snapshot=factory_snapshot,
                         )
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
@@ -3063,19 +3106,42 @@ class WorklinkRunner:
                     detail = result.stderr.strip() or result.stdout.strip()
                     if _factory_lock_refusal(result):
                         reason = "factory driver did not acquire the retained run lock"
+                        _record_factory_stage_failure(
+                            home=self.home,
+                            issue_id=issue.issue_id,
+                            reservation_id=self.outcome_reservation_id,
+                            claim_record=claim_record,
+                            source="factory_driver_exit",
+                            cause="unfinished_exit",
+                            record=factory_record,
+                            checkout=Path(factory_record.sandbox),
+                            error=WorklinkError(reason),
+                            snapshot=factory_snapshot,
+                        )
                         factory_record = replace(
                             factory_record,
                             controller_phase="parked",
                             controller_error=_factory_controller_error(reason),
                         )
                         save_factory_record(self.home, factory_record)
-                        claims.transition_issue(
-                            issue.issue_id,
-                            status="blocked",
-                            review_ready=False,
-                            attempt=claim_record.budget_attempt or claim_record.attempt,
-                            reason=f"{reason}; retained sandbox: {factory_record.sandbox}",
-                        )
+                        try:
+                            claims.transition_issue(
+                                issue.issue_id,
+                                status="blocked",
+                                review_ready=False,
+                                attempt=claim_record.budget_attempt or claim_record.attempt,
+                                reason=f"{reason}; retained sandbox: {factory_record.sandbox}",
+                            )
+                        except Exception:
+                            _record_factory_terminal_outcome(
+                                home=self.home,
+                                reservation_id=self.outcome_reservation_id,
+                                claim_record=claim_record,
+                                record=factory_record,
+                                source="factory_terminal_labels",
+                                cause="terminal_routing_failed",
+                            )
+                            raise
                         _log_event(
                             "worklink_factory_lock_refused",
                             issue_id=issue.issue_id,
@@ -3106,7 +3172,8 @@ class WorklinkRunner:
                 await asyncio.sleep(poll_delay)
                 status = None
         except Exception as exc:
-            _record_factory_stage_failure(
+            _record_factory_failure_preserving(
+                exc,
                 home=self.home,
                 issue_id=issue.issue_id,
                 reservation_id=self.outcome_reservation_id,
@@ -3115,7 +3182,7 @@ class WorklinkRunner:
                 cause=supervision_stage[1],
                 record=factory_record,
                 checkout=Path(factory_record.sandbox),
-                error=exc,
+                snapshot=factory_snapshot,
             )
             raise
         finally:
@@ -3135,7 +3202,8 @@ class WorklinkRunner:
                 try:
                     await compute.cleanup(handle)
                 except Exception as exc:
-                    _record_factory_stage_failure(
+                    _record_factory_failure_preserving(
+                        exc,
                         home=self.home,
                         issue_id=issue.issue_id,
                         reservation_id=self.outcome_reservation_id,
@@ -3144,7 +3212,6 @@ class WorklinkRunner:
                         cause="cleanup_failed",
                         record=factory_record,
                         checkout=Path(factory_record.sandbox),
-                        error=exc,
                         allow_after_stop=True,
                     )
                     raise
@@ -3161,6 +3228,7 @@ class WorklinkRunner:
         test_cmd: str,
         runner: Runner,
         started_at: datetime,
+        terminal_snapshot: object | None = None,
     ) -> WorklinkRunResult:
         status = factory_record.status
         if status is None:
@@ -3178,14 +3246,27 @@ class WorklinkRunner:
                 record=factory_record,
                 source="factory_parked",
                 cause="needs_human",
+                snapshot=terminal_snapshot,
             )
-            claims.transition_issue(
-                issue.issue_id,
-                status="blocked",
-                review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=park_report,
-            )
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=park_report,
+                )
+            except Exception:
+                _record_factory_terminal_outcome(
+                    home=self.home,
+                    reservation_id=self.outcome_reservation_id,
+                    claim_record=claim_record,
+                    record=factory_record,
+                    source="factory_terminal_labels",
+                    cause="terminal_routing_failed",
+                    snapshot=terminal_snapshot,
+                )
+                raise
             result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
@@ -3215,14 +3296,27 @@ class WorklinkRunner:
                 record=factory_record,
                 source=("factory_partial" if status.status == "partial" else "factory_blocked"),
                 cause=status.status,
+                snapshot=terminal_snapshot,
             )
-            claims.transition_issue(
-                issue.issue_id,
-                status="blocked",
-                review_ready=False,
-                attempt=claim_record.budget_attempt or claim_record.attempt,
-                reason=f"factory status: {status.status}",
-            )
+            try:
+                claims.transition_issue(
+                    issue.issue_id,
+                    status="blocked",
+                    review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=f"factory status: {status.status}",
+                )
+            except Exception:
+                _record_factory_terminal_outcome(
+                    home=self.home,
+                    reservation_id=self.outcome_reservation_id,
+                    claim_record=claim_record,
+                    record=factory_record,
+                    source="factory_terminal_labels",
+                    cause="terminal_routing_failed",
+                    snapshot=terminal_snapshot,
+                )
+                raise
             result = WorklinkRunResult(
                 issue.issue_id,
                 factory_record.attempt,
@@ -3263,12 +3357,24 @@ class WorklinkRunner:
                 started_at=started_at,
                 runner=runner,
             )
-        claims.transition_issue(
-            issue.issue_id,
-            status="review",
-            review_ready=True,
-            attempt=claim_record.budget_attempt or claim_record.attempt,
-        )
+        try:
+            claims.transition_issue(
+                issue.issue_id,
+                status="review",
+                review_ready=True,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+            )
+        except Exception:
+            _record_factory_terminal_outcome(
+                home=self.home,
+                reservation_id=self.outcome_reservation_id,
+                claim_record=claim_record,
+                record=factory_record,
+                source="factory_terminal_labels",
+                cause="terminal_routing_failed",
+                snapshot=terminal_snapshot,
+            )
+            raise
         result = WorklinkRunResult(
             issue.issue_id,
             factory_record.attempt,
@@ -4292,7 +4398,15 @@ def _typed_outcome_boundary(
             )
 
             state_dir = dispatch_failure_state_dir(home)
-            if issue_dispatch_disposition(state_dir, issue_id) not in {"stop", "success"}:
+            try:
+                terminal_disposition = issue_dispatch_disposition(state_dir, issue_id)
+            except BaseException as accounting_error:
+                exc.add_note(
+                    f"outcome disposition read failed: {type(accounting_error).__name__}: "
+                    f"{accounting_error}"
+                )
+                raise exc
+            if terminal_disposition not in {"stop", "success"}:
                 rule = SOURCE_RULES[AttentionSource(source)]
                 if rule.fact_type == "input":
                     facts: object = InputFacts(
@@ -4366,25 +4480,32 @@ def _typed_outcome_boundary(
                     if claim_record is not None
                     else None
                 )
-                proofs = (
-                    retained_positive_proofs(
+                try:
+                    proofs = (
+                        retained_positive_proofs(
+                            state_dir,
+                            issue_id=issue_id,
+                            reservation_id=reservation_id,
+                        )
+                        if rule.work_capable and claim is not None
+                        else ()
+                    )
+                    record_attention(
                         state_dir,
                         issue_id=issue_id,
                         reservation_id=reservation_id,
+                        source=source,
+                        cause=cause,
+                        facts=facts,
+                        claim=claim,
+                        proof_ids=proofs,
                     )
-                    if rule.work_capable and claim is not None
-                    else ()
-                )
-                record_attention(
-                    state_dir,
-                    issue_id=issue_id,
-                    reservation_id=reservation_id,
-                    source=source,
-                    cause=cause,
-                    facts=facts,
-                    claim=claim,
-                    proof_ids=proofs,
-                )
+                except BaseException as accounting_error:
+                    exc.add_note(
+                        f"outcome recording failed: {type(accounting_error).__name__}: "
+                        f"{accounting_error}"
+                    )
+                    raise exc
         raise
 
 
@@ -4475,6 +4596,7 @@ def _record_factory_stage_failure(
     checkout: Path | None,
     error: BaseException,
     allow_after_stop: bool = False,
+    snapshot: object | None = None,
 ) -> None:
     if reservation_id is None:
         return
@@ -4528,6 +4650,8 @@ def _record_factory_stage_failure(
             automatic_handling_stage=source,
             automatic_handling_result=type(error).__name__,
         )
+    elif snapshot is not None:
+        facts = snapshot
     elif record is not None:
         facts = immutable_factory_snapshot(record, read_result=type(error).__name__)
     else:
@@ -4566,6 +4690,17 @@ def _record_factory_stage_failure(
     )
 
 
+def _record_factory_failure_preserving(error: BaseException, **kwargs: object) -> None:
+    """Attach accounting failure diagnostics without replacing the originating error."""
+    try:
+        _record_factory_stage_failure(error=error, **kwargs)  # type: ignore[arg-type]
+    except BaseException as accounting_error:
+        error.add_note(
+            f"factory outcome recording failed: {type(accounting_error).__name__}: "
+            f"{accounting_error}"
+        )
+
+
 def _record_factory_terminal_outcome(
     *,
     home: Path,
@@ -4574,13 +4709,27 @@ def _record_factory_terminal_outcome(
     record: FactoryRunRecord | None,
     source: str,
     cause: str,
+    snapshot: object | None = None,
 ) -> None:
     if reservation_id is None:
         return
     if record is None:
         try:
-            records = load_factory_records_for_issue(home, claim_record.issue_id)
-            record = records[0] if records else None
+            from .dispatch_failures import dispatch_failure_state_dir, reservation_binding
+
+            binding = reservation_binding(
+                dispatch_failure_state_dir(home),
+                issue_id=claim_record.issue_id,
+                reservation_id=reservation_id,
+            ) or {}
+            records = [
+                candidate
+                for candidate in load_factory_records_for_issue(home, claim_record.issue_id)
+                if candidate.attempt == claim_record.attempt
+                and candidate.run_id == binding.get("run_id")
+                and candidate.sandbox == binding.get("sandbox")
+            ]
+            record = records[0] if len(records) == 1 else None
         except Exception:
             record = None
     _record_factory_stage_failure(
@@ -4594,6 +4743,7 @@ def _record_factory_terminal_outcome(
         checkout=Path(record.sandbox) if record is not None else None,
         error=WorklinkError(cause),
         allow_after_stop=source in {"factory_terminal_release", "factory_terminal_labels"},
+        snapshot=snapshot,
     )
 
 
@@ -4799,7 +4949,7 @@ def _record_run_failure(
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
             )
-        except OSError:
+        except Exception:
             pass
 
 
