@@ -37,6 +37,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -342,4 +343,42 @@ def test_installed_poller_entrypoint_can_resolve_mimir(
         f"needs _ensure_mimir_import_path(), AND its manifest must pass "
         f"MIMIR_SOURCE_DIR so the helper can locate an editable checkout.\n"
         f"{proc.stderr[-900:]}"
+    )
+
+
+def test_ready_queue_pass_env_carries_every_factory_env_var_mimir_reads() -> None:
+    """A factory knob mimir reads must survive the poller's env allowlist.
+
+    ``pass_env`` is an exact-name allowlist, so a documented environment knob is
+    silently inert for autonomous dispatch unless it is listed here. That is not
+    theoretical: ``MIMIR_FACTORY_MAX_RETRIES`` was documented, parsed, and
+    honoured by ``_factory_max_retries()``, yet absent from this list, so the
+    controller the ready-queue poller spawns never saw it and every factory run
+    initialised at the default budget. Verifying the value in an interactive
+    shell proved nothing, because that shell is not the process that composes the
+    launch argv.
+
+    Deriving the expected set from source rather than hard-coding it means a
+    knob added later is covered without anyone remembering this file exists.
+    """
+    root = Path(__file__).resolve().parents[1] / "mimir"
+    read_from_env: set[str] = set()
+    for path in root.rglob("*.py"):
+        for match in re.finditer(r'"(MIMIR_FACTORY_[A-Z_]+)"', path.read_text(encoding="utf-8")):
+            read_from_env.add(match.group(1))
+    assert read_from_env, "no MIMIR_FACTORY_* names found; the scan is broken, not the config"
+
+    manifest = json.loads(
+        (root / "optional-skills" / "chainlink-orchestrator" / "pollers.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    entries = manifest if isinstance(manifest, list) else manifest.get("pollers", [])
+    ready_queue = next(e for e in entries if e.get("name") == "worklink-ready-queue")
+    allowed = set(ready_queue["pass_env"])
+
+    missing = sorted(read_from_env - allowed)
+    assert not missing, (
+        "worklink-ready-queue pass_env omits factory env vars that mimir reads, so they "
+        f"are inert for autonomous dispatch: {missing}"
     )
