@@ -382,3 +382,89 @@ def test_cross_record_illegal_combinations_fail_closed(
     path.write_text(json.dumps(state), encoding="utf-8")
     with pytest.raises(FailureStateError):
         load_outcome_state(state_dir)
+
+
+def test_absent_claim_without_its_retained_identity_fails_closed(tmp_path: Path) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    path = state_dir / "dispatch_failures.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["issues"]["42"]["reservations"][reservation]["claim_state"] = "absent"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(FailureStateError, match="claim identity"):
+        load_outcome_state(state_dir)
+
+
+def test_settled_reservation_without_its_exact_settlement_fails_closed(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    identity = claim()
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity, confirmed=False
+    )
+    confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=identity
+    )
+    record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        source=AttentionSource.LEAF_BACKEND_OUTCOME,
+        cause=AttentionCause.BACKEND_FAILED,
+        facts={
+            "type": "leaf", "backend": "fake", "checkout": str(tmp_path),
+            "base": "main", "branch": "issue/42-a1", "isolated": True,
+            "compute_result": "failed", "backend_status": "failed",
+            "validation_reason_codes": [], "evidence_id": None,
+            "evidence_sha256": None, "pr_url": None, "head_sha": None,
+        },
+        claim=identity,
+    )
+    path = state_dir / "dispatch_failures.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["issues"]["42"]["settlements"].clear()
+    terminal = next(
+        occurrence
+        for occurrence in state["issues"]["42"]["occurrences"].values()
+        if occurrence["kind"] == "attention"
+    )
+    terminal["accounting"] = {
+        "scope": "no_new_claim",
+        "claim": None,
+        "consumed": False,
+        "settlement_key": None,
+    }
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(FailureStateError, match="exact settlement"):
+        load_outcome_state(state_dir)
+
+
+def test_finished_operation_without_its_exact_occurrence_fails_closed(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "ledger"
+    reservation = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        source=AttentionSource.CLAIM_COMMAND,
+        cause=AttentionCause.CLAIM_COMMAND_FAILED,
+        facts={
+            "type": "claim", "intended": None, "confirmed": None,
+            "result": "claim_failed", "lock_identity": None,
+            "command_operation": "locks claim", "return_code": 1,
+            "mutation_stage": None, "history_read": None,
+        },
+    )
+    path = state_dir / "dispatch_failures.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["issues"]["42"]["occurrences"].clear()
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with pytest.raises(FailureStateError, match="exact occurrence"):
+        load_outcome_state(state_dir)

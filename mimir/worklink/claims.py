@@ -422,13 +422,82 @@ class ChainlinkClaims:
                 retry_after=retry_after,
             )
 
+        claim_home = Path(home_path) if home_path is not None else self.home_path
+        if claim_home is not None and reservation_id is not None:
+            from .dispatch_failures import (
+                bind_claim,
+                dispatch_failure_state_dir,
+                mark_claim_absent,
+                reservation_claim_state,
+            )
+
+            state_dir = dispatch_failure_state_dir(claim_home)
+            claim_state, pending_identity = reservation_claim_state(
+                state_dir, issue_id=issue_id, reservation_id=reservation_id
+            )
+            if claim_state == "confirmed":
+                if pending_identity is None:
+                    raise RuntimeError("confirmed claim lost its exact identity")
+                return ClaimResult(
+                    True,
+                    record=ClaimRecord(
+                        issue_id=pending_identity.issue_id,
+                        attempt=pending_identity.attempt,
+                        agent_id=pending_identity.agent_id,
+                        claimed_at=_parse_dt(pending_identity.claimed_at),
+                    ),
+                )
+            if claim_state == "intent":
+                try:
+                    recovery_history = self._issue_comments(issue_id, strict=True)
+                except Exception:
+                    return ClaimResult(False, reason="claim_publication_ambiguous")
+                recovered = next(
+                    (
+                        candidate
+                        for candidate in claim_records_from_comments(recovery_history)
+                        if pending_identity is not None
+                        and candidate.issue_id == pending_identity.issue_id
+                        and candidate.attempt == pending_identity.attempt
+                        and candidate.agent_id == pending_identity.agent_id
+                        and candidate.claimed_at.isoformat() == pending_identity.claimed_at
+                    ),
+                    None,
+                )
+                if recovered is not None and pending_identity is not None:
+                    bind_claim(
+                        state_dir,
+                        issue_id=issue_id,
+                        reservation_id=reservation_id,
+                        claim=pending_identity,
+                        confirmed=True,
+                    )
+                    return ClaimResult(True, record=recovered)
+                if pending_identity is None:
+                    raise RuntimeError("claim intent lost its exact identity")
+                mark_claim_absent(
+                    state_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    claim=pending_identity,
+                )
+                record_claim_outcome(
+                    "claim_comment",
+                    "claim_publication_failed",
+                    "absent",
+                    identity=pending_identity,
+                    mutation_stage="comment",
+                    history_read="exact",
+                )
+                self.release_issue(issue_id)
+                return ClaimResult(False, reason="claim_publication_absent")
+
         label_set = self._issue_labels(issue_id)
         if labels is not None:
             label_set.update(labels)
         if "worklink:review" in label_set:
             return ClaimResult(False, reason="lifecycle_state_incompatible")
 
-        claim_home = Path(home_path) if home_path is not None else self.home_path
         if claim_home is not None and reservation_id is not None:
             from .dispatch_failures import (
                 dispatch_failure_state_dir,
@@ -696,18 +765,20 @@ class ChainlinkClaims:
                     history_read=(
                         type(history_error).__name__ if history_error is not None else "exact"
                     ),
+                    disposition="pending" if history_error is not None else "stop",
                 )
             except Exception as accounting_error:
                 publication_error.add_note(
                     f"claim outcome accounting failed: {type(accounting_error).__name__}: "
                     f"{accounting_error}"
                 )
-            try:
-                self.release_issue(issue_id)
-            except Exception as release_error:
-                publication_error.add_note(
-                    f"claim release failed: {type(release_error).__name__}: {release_error}"
-                )
+            if history_error is None:
+                try:
+                    self.release_issue(issue_id)
+                except Exception as release_error:
+                    publication_error.add_note(
+                        f"claim release failed: {type(release_error).__name__}: {release_error}"
+                    )
             raise publication_error
         if reservation_id is not None and claim_identity is not None:
             try:
@@ -721,6 +792,7 @@ class ChainlinkClaims:
                         identity=claim_identity,
                         mutation_stage="comment",
                         history_read=type(history_error).__name__,
+                        disposition="pending",
                     )
                 except Exception as accounting_error:
                     history_error.add_note(

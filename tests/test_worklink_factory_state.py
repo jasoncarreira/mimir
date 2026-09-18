@@ -10,6 +10,14 @@ import pytest
 
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.attention import ClaimIdentity
+from mimir.worklink.dispatch_failures import (
+    bind_claim,
+    confirm_claim_and_start,
+    dispatch_failure_state_dir,
+    load_outcome_state,
+    reserve_dispatch,
+)
 from mimir.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
@@ -75,6 +83,53 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert list_factory_records(tmp_path) == [expected]
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_retained_startup_observation_keeps_exact_reservation_recoverable(
+    tmp_path: Path,
+) -> None:
+    retained = record(tmp_path)
+    save_factory_record(tmp_path, retained)
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=retained.issue_id, target="factory", autonomous=True
+    )
+    claim = ClaimIdentity(
+        retained.issue_id, retained.attempt, "original-agent",
+        "2026-09-18T00:00:00+00:00",
+    )
+    bind_claim(
+        state_dir,
+        issue_id=retained.issue_id,
+        reservation_id=reservation,
+        claim=claim,
+        confirmed=False,
+    )
+    confirm_claim_and_start(
+        state_dir,
+        issue_id=retained.issue_id,
+        reservation_id=reservation,
+        claim=claim,
+        run_id=retained.run_id,
+        sandbox=retained.sandbox,
+    )
+
+    report_retained_factory_records(tmp_path, event_logger=lambda *args, **kwargs: None)
+    report_retained_factory_records(tmp_path, event_logger=lambda *args, **kwargs: None)
+
+    state = load_outcome_state(state_dir)
+    current = state["issues"][str(retained.issue_id)]["reservations"][reservation]
+    observations = [
+        occurrence
+        for occurrence in state["issues"][str(retained.issue_id)]["occurrences"].values()
+        if occurrence["source"] == "factory_startup_reconcile"
+    ]
+    assert current["state"] == "active"
+    assert current["claim_state"] == "confirmed"
+    assert current["disposition"] == "pending"
+    assert len(observations) == 1
+    assert observations[0]["accounting"]["scope"] == "deferred"
+    assert observations[0]["accounting"]["claim"] == claim.to_json()
 
 
 def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -> None:

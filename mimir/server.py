@@ -1022,7 +1022,8 @@ def reattach_inflight_worklink_runs(
         RESERVATION_ENV,
         bind_reservation_owner,
         dispatch_failure_state_dir,
-        recovery_reservation_id,
+        has_nonterminal_reservation,
+        recovery_reservation_binding,
         record_attention,
     )
 
@@ -1083,14 +1084,37 @@ def reattach_inflight_worklink_runs(
             # persistent remote substrate it cannot be reattached by a new one.
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
-        reservation_id = recovery_reservation_id(
-            dispatch_failure_state_dir(home),
-            issue_id=state.issue_id,
-            target="leaf",
-            run_id=None,
-            sandbox=None,
-            claim_attempt=state.attempt,
-        )
+        outcome_dir = dispatch_failure_state_dir(home)
+        try:
+            recovery_binding = recovery_reservation_binding(
+                outcome_dir,
+                issue_id=state.issue_id,
+                target="leaf",
+                run_id=None,
+                sandbox=None,
+                claim_attempt=state.attempt,
+            )
+        except Exception as exc:
+            failure = {
+                "issue_id": state.issue_id,
+                "reason": "reattach_binding_invalid",
+                "error": str(exc)[:500],
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
+            continue
+        if recovery_binding is None and has_nonterminal_reservation(
+            outcome_dir, issue_id=state.issue_id, target="leaf"
+        ):
+            failure = {
+                "issue_id": state.issue_id,
+                "reason": "reattach_binding_missing",
+                "error": "v2 work cannot recover with an empty reservation reference",
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
+            continue
+        reservation_id = recovery_binding[0] if recovery_binding is not None else None
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:
             log_fh: Any = log_path.open("ab")
@@ -1160,14 +1184,37 @@ def reattach_inflight_worklink_runs(
                     pass
         dispatched.append(state.issue_id)
     for record in factory_records:
-        reservation_id = recovery_reservation_id(
-            dispatch_failure_state_dir(home),
-            issue_id=record.issue_id,
-            target="factory",
-            run_id=record.run_id,
-            sandbox=record.sandbox,
-            claim_attempt=record.attempt,
-        )
+        outcome_dir = dispatch_failure_state_dir(home)
+        try:
+            recovery_binding = recovery_reservation_binding(
+                outcome_dir,
+                issue_id=record.issue_id,
+                target="factory",
+                run_id=record.run_id,
+                sandbox=record.sandbox,
+                claim_attempt=record.attempt,
+            )
+        except Exception as exc:
+            failure = {
+                "issue_id": record.issue_id,
+                "reason": "factory_recovery_binding_invalid",
+                "error": str(exc)[:500],
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
+            continue
+        if recovery_binding is None and has_nonterminal_reservation(
+            outcome_dir, issue_id=record.issue_id, target="factory"
+        ):
+            failure = {
+                "issue_id": record.issue_id,
+                "reason": "factory_recovery_binding_missing",
+                "error": "v2 factory work cannot recover with an empty reservation reference",
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
+            continue
+        reservation_id = recovery_binding[0] if recovery_binding is not None else None
         argv = [
             *run_bin,
             "worklink",

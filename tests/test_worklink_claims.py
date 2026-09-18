@@ -281,6 +281,8 @@ def test_claim_publication_preserves_exact_confirmed_absent_and_ambiguous_states
     issue = state["issues"]["1700"]
     current = issue["reservations"][reservation]
     assert current["claim_state"] == expected_state
+    assert current["state"] == ("prepared" if history_outcome == "error" else "terminal")
+    assert current["disposition"] == ("pending" if history_outcome == "error" else "stop")
     assert bool(issue["settlements"]) is settled
     occurrence = next(
         occurrence
@@ -293,6 +295,152 @@ def test_claim_publication_preserves_exact_confirmed_absent_and_ambiguous_states
     assert occurrence["facts"]["history_read"] == (
         "RuntimeError" if history_outcome == "error" else "exact"
     )
+
+
+@pytest.mark.parametrize("recovery", ["confirmed", "absent", "unresolved"])
+def test_pending_claim_intent_reconciles_without_a_fresh_claim(
+    tmp_path: Path, recovery: str
+) -> None:
+    from mimir.worklink.attention import ClaimIdentity
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_outcome_state,
+        reservation_claim,
+        reserve_dispatch,
+    )
+
+    issue_id = 1701
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=issue_id, target="leaf", autonomous=True
+    )
+    history: list[str] = []
+    history_available = False
+    publication_attempted = False
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal history_available, publication_attempted
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "show"]:
+            if publication_attempted and (not history_available or recovery == "unresolved"):
+                return subprocess.CompletedProcess(call, 1, "", "tracker unavailable")
+            return subprocess.CompletedProcess(
+                call, 0, json.dumps({"labels": [], "comments": history}), ""
+            )
+        if call[1:3] == ["issue", "comment"]:
+            publication_attempted = True
+            raise RuntimeError("comment response was ambiguous")
+        return completed(call)
+
+    claims = ChainlinkClaims(
+        agent_id="original-worker",
+        home_path=tmp_path,
+        runner=runner,
+        clock=lambda: datetime(2026, 9, 18, tzinfo=UTC),
+    )
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        claims.claim_issue(
+            issue_id,
+            labels=["worklink:ready"],
+            reservation_id=reservation,
+        )
+    identity = reservation_claim(
+        state_dir, issue_id=issue_id, reservation_id=reservation
+    )
+    assert isinstance(identity, ClaimIdentity)
+    if recovery == "confirmed":
+        history.append(
+            ClaimRecord(
+                identity.issue_id,
+                identity.attempt,
+                identity.agent_id,
+                datetime.fromisoformat(identity.claimed_at),
+            ).to_comment()
+        )
+    history_available = True
+    calls.clear()
+
+    result = claims.claim_issue(
+        issue_id,
+        labels=["worklink:ready"],
+        reservation_id=reservation,
+    )
+
+    current = load_outcome_state(state_dir)["issues"][str(issue_id)]["reservations"][reservation]
+    assert not any(call[1:3] == ["locks", "claim"] for call in calls)
+    if recovery == "confirmed":
+        assert result.claimed is True
+        assert result.record is not None
+        assert result.record.agent_id == identity.agent_id
+        assert result.record.claimed_at.isoformat() == identity.claimed_at
+        assert current["claim_state"] == "confirmed"
+        assert current["state"] == "prepared"
+        assert not any(call[1:3] == ["locks", "release"] for call in calls)
+    elif recovery == "absent":
+        assert result.reason == "claim_publication_absent"
+        assert current["claim_state"] == "absent"
+        assert current["state"] == "terminal"
+        assert current["disposition"] == "stop"
+        assert any(call[1:3] == ["locks", "release"] for call in calls)
+    else:
+        assert result.reason == "claim_publication_ambiguous"
+        assert current["claim_state"] == "intent"
+        assert current["state"] == "prepared"
+        assert current["disposition"] == "pending"
+        assert not any(call[1:3] == ["locks", "release"] for call in calls)
+
+
+def test_recovery_reuses_a_confirmed_original_claim_without_republication(
+    tmp_path: Path,
+) -> None:
+    from mimir.worklink.attention import ClaimIdentity
+    from mimir.worklink.dispatch_failures import (
+        bind_claim,
+        dispatch_failure_state_dir,
+        reserve_dispatch,
+    )
+
+    issue_id = 1702
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=issue_id, target="factory", autonomous=True
+    )
+    identity = ClaimIdentity(
+        issue_id, 4, "original-agent", "2026-09-17T23:59:00+00:00"
+    )
+    bind_claim(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        claim=identity,
+        confirmed=False,
+    )
+    bind_claim(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        claim=identity,
+        confirmed=True,
+    )
+    calls: list[list[str]] = []
+    claims = ChainlinkClaims(
+        agent_id="replacement-agent",
+        home_path=tmp_path,
+        runner=lambda args: calls.append(list(args)) or completed(args),
+    )
+
+    result = claims.claim_issue(issue_id, reservation_id=reservation)
+
+    assert result.claimed is True
+    assert result.record == ClaimRecord(
+        issue_id,
+        identity.attempt,
+        identity.agent_id,
+        datetime.fromisoformat(identity.claimed_at),
+    )
+    assert calls == []
 
 
 def test_claim_contention_retries_with_backoff_and_emits_outcomes(tmp_path: Path) -> None:

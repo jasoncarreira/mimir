@@ -1961,12 +1961,36 @@ class WorklinkRunner:
                 spec,
                 backend_config={**spec.backend_config, "test_env": dict(state.test_env)},
             )
-            claim_record = ClaimRecord(
-                issue_id=issue_id,
-                attempt=state.attempt,
-                agent_id=self.agent_id,
-                claimed_at=started,
-            )
+            if self.outcome_reservation_id is not None:
+                from .dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    reservation_claim,
+                )
+
+                original_claim = reservation_claim(
+                    dispatch_failure_state_dir(self.home),
+                    issue_id=issue_id,
+                    reservation_id=self.outcome_reservation_id,
+                )
+                if (
+                    original_claim is None
+                    or original_claim.issue_id != issue_id
+                    or original_claim.attempt != state.attempt
+                ):
+                    raise WorklinkError("reattach original claim binding is invalid")
+                claim_record = ClaimRecord(
+                    issue_id=original_claim.issue_id,
+                    attempt=original_claim.attempt,
+                    agent_id=original_claim.agent_id,
+                    claimed_at=datetime.fromisoformat(original_claim.claimed_at),
+                )
+            else:
+                claim_record = ClaimRecord(
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                    agent_id=self.agent_id,
+                    claimed_at=started,
+                )
             try:
                 with _typed_outcome_boundary(
                     home=self.home, issue_id=issue_id,
@@ -3496,12 +3520,25 @@ def _verify_factory_recovery_binding(
         command_runner=command_runner,
     )
     if claim_record.issue_id != issue.issue_id:
-        raise WorklinkError("factory recovery claim issue does not match")
+        raise FactoryRecoveryBindingError(
+            "claim_issue", "factory recovery claim issue does not match"
+        )
     if claim_record.agent_id != claims.agent_id or claims.agent_id != runner.agent_id:
-        raise WorklinkError("factory recovery claim owner does not match")
+        raise FactoryRecoveryBindingError(
+            "claim_owner", "factory recovery claim owner does not match"
+        )
     if not getattr(claims, "_lock_still_held_by")(claim_record):
-        raise WorklinkError("factory recovery claim is not retained")
+        raise FactoryRecoveryBindingError(
+            "claim_lock", "factory recovery claim is not retained"
+        )
     return sandbox
+
+
+class FactoryRecoveryBindingError(WorklinkError):
+    def __init__(self, member: str, message: str, *, reader_error: bool = False) -> None:
+        super().__init__(message)
+        self.member = member
+        self.reader_error = reader_error
 
 
 def _verify_factory_recovery_target(
@@ -3513,43 +3550,99 @@ def _verify_factory_recovery_target(
     repo_slug: str,
     base: str,
     command_runner: Runner,
+    member: str | None = None,
 ) -> Path:
-    if retained.issue_id != issue.issue_id or retained.run_id not in factory_record_run_ids(
+    if member in {None, "issue"} and (
+        retained.issue_id != issue.issue_id or retained.run_id not in factory_record_run_ids(
         issue.issue_id
-    ):
-        raise WorklinkError("retained factory issue identity does not match recovery request")
-    if retained.repository.lower() != repo_slug.lower():
-        raise WorklinkError("retained factory repository does not match recovery request")
-    current_repo_slug = _repo_slug_from_url(
-        _repo_remote_url(runner.repo, runner=command_runner)
-    )
-    if current_repo_slug is None or current_repo_slug.lower() != retained.repository.lower():
-        raise WorklinkError("factory recovery controller repository changed")
-    if retained.base_ref != base:
-        raise WorklinkError("retained factory base does not match recovery request")
-    if retained.launcher != str(launcher):
-        raise WorklinkError("retained factory launcher does not match recovery request")
-    if retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
-        raise WorklinkError("retained factory lifecycle is not recoverable")
-    if not retained.session:
-        raise WorklinkError("retained factory session is missing")
+    )):
+        raise FactoryRecoveryBindingError(
+            "issue", "retained factory issue identity does not match recovery request"
+        )
+    if member in {None, "repository"} and retained.repository.lower() != repo_slug.lower():
+        raise FactoryRecoveryBindingError(
+            "repository", "retained factory repository does not match recovery request"
+        )
+    if member in {None, "controller_repository"}:
+        current_repo_slug = _repo_slug_from_url(
+            _repo_remote_url(runner.repo, runner=command_runner)
+        )
+        if current_repo_slug is None or current_repo_slug.lower() != retained.repository.lower():
+            raise FactoryRecoveryBindingError(
+                "controller_repository", "factory recovery controller repository changed"
+            )
+    if member in {None, "base"} and retained.base_ref != base:
+        raise FactoryRecoveryBindingError(
+            "base", "retained factory base does not match recovery request"
+        )
+    if member in {None, "launcher"} and retained.launcher != str(launcher):
+        raise FactoryRecoveryBindingError(
+            "launcher", "retained factory launcher does not match recovery request"
+        )
+    if member in {None, "lifecycle"} and retained.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
+        raise FactoryRecoveryBindingError(
+            "lifecycle", "retained factory lifecycle is not recoverable"
+        )
+    if member in {None, "session"} and not retained.session:
+        raise FactoryRecoveryBindingError("session", "retained factory session is missing")
     sandbox = Path(retained.sandbox)
     from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
 
-    if sandbox.is_relative_to(WORKLINK_CHECKOUT_ROOT) and factory_checkout_for_path(sandbox) is None:
-        raise WorklinkError(
+    if (
+        member in {None, "ownership_boundary"}
+        and sandbox.is_relative_to(WORKLINK_CHECKOUT_ROOT)
+        and factory_checkout_for_path(sandbox) is None
+    ):
+        raise FactoryRecoveryBindingError(
+            "ownership_boundary",
             "legacy factory checkout has no private ownership-transfer boundary; "
             "retain it for offline migration, not privileged in-place normalization"
         )
-    if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
-        raise WorklinkError("retained factory sandbox is unavailable")
-    _verify_factory_checkout(
-        sandbox,
-        retained.branch,
-        retained.base_ref,
-        command_runner,
-        repository=retained.repository,
-    )
+    if member in {None, "sandbox"} and (
+        not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink()
+    ):
+        raise FactoryRecoveryBindingError(
+            "sandbox", "retained factory sandbox is unavailable"
+        )
+    checkout_members = {
+        "checkout_root", "git_directory", "checkout_repository", "branch",
+        "base_object", "head_object",
+    }
+    try:
+        if member is not None and member not in checkout_members:
+            return sandbox
+        _verify_factory_checkout(
+            sandbox,
+            retained.branch,
+            retained.base_ref,
+            command_runner,
+            repository=retained.repository,
+            member=member,
+        )
+    except WorklinkError as exc:
+        message = str(exc)
+        member = next(
+            name
+            for marker, name in (
+                ("checkout root", "checkout_root"),
+                ("git directory", "git_directory"),
+                ("not isolated", "git_directory"),
+                ("checkout repository", "checkout_repository"),
+                ("checkout branch", "branch"),
+                ("checkout base", "base_object"),
+                ("checkout HEAD", "head_object"),
+            )
+            if marker in message
+        )
+        raise FactoryRecoveryBindingError(
+            member,
+            message,
+            reader_error=(
+                message.startswith("cannot ")
+                or message.endswith(" is unavailable")
+                or message.endswith(" is invalid")
+            ),
+        ) from exc
     return sandbox
 
 
@@ -3649,7 +3742,7 @@ def _fixed_command(
     result = runner(list(args))
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
-        raise WorklinkError(detail or error)
+        raise WorklinkError(f"{error}: {detail}" if detail else error)
     return result
 
 
@@ -3660,51 +3753,58 @@ def _verify_factory_checkout(
     runner: Runner,
     *,
     repository: str | None = None,
+    member: str | None = None,
 ) -> str:
-    top = _fixed_command(
-        runner,
-        ["git", "-C", str(sandbox), "rev-parse", "--show-toplevel"],
-        error="cannot read factory checkout root",
-    ).stdout.strip()
-    try:
-        if Path(top).resolve(strict=True) != sandbox.resolve(strict=True):
-            raise WorklinkError("factory checkout root mismatch")
-    except OSError as exc:
-        raise WorklinkError("factory checkout root is unavailable") from exc
-    git_dir = _fixed_command(
-        runner,
-        ["git", "-C", str(sandbox), "rev-parse", "--absolute-git-dir"],
-        error="cannot read factory checkout git directory",
-    ).stdout.strip()
-    try:
-        if not Path(git_dir).resolve(strict=False).is_relative_to(sandbox.resolve(strict=True)):
-            raise WorklinkError("factory checkout is not isolated")
-    except OSError as exc:
-        raise WorklinkError("factory checkout git directory is unavailable") from exc
-    if repository is not None:
+    if member in {None, "checkout_root"}:
+        top = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "rev-parse", "--show-toplevel"],
+            error="cannot read factory checkout root",
+        ).stdout.strip()
+        try:
+            if Path(top).resolve(strict=True) != sandbox.resolve(strict=True):
+                raise WorklinkError("factory checkout root mismatch")
+        except OSError as exc:
+            raise WorklinkError("factory checkout root is unavailable") from exc
+    if member in {None, "git_directory"}:
+        git_dir = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "rev-parse", "--absolute-git-dir"],
+            error="cannot read factory checkout git directory",
+        ).stdout.strip()
+        try:
+            if not Path(git_dir).resolve(strict=False).is_relative_to(sandbox.resolve(strict=True)):
+                raise WorklinkError("factory checkout is not isolated")
+        except OSError as exc:
+            raise WorklinkError("factory checkout git directory is unavailable") from exc
+    if member in {None, "checkout_repository"} and repository is not None:
         if (_factory_checkout_repository(sandbox, runner) != repository.lower()):
             raise WorklinkError("factory checkout repository mismatch")
-    observed_branch = _fixed_command(
-        runner,
-        ["git", "-C", str(sandbox), "branch", "--show-current"],
-        error="cannot read factory checkout branch",
-    ).stdout.strip()
-    if observed_branch != branch:
-        raise WorklinkError("factory checkout branch mismatch")
-    base = _fixed_command(
-        runner,
-        ["git", "-C", str(sandbox), "rev-parse", "--verify", base_ref],
-        error="cannot resolve factory checkout base",
-    ).stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
-        raise WorklinkError("factory checkout base is invalid")
-    head = _fixed_command(
-        runner,
-        ["git", "-C", str(sandbox), "rev-parse", "HEAD"],
-        error="cannot read factory checkout HEAD",
-    ).stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
-        raise WorklinkError("factory checkout HEAD is invalid")
+    if member in {None, "branch"}:
+        observed_branch = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "branch", "--show-current"],
+            error="cannot read factory checkout branch",
+        ).stdout.strip()
+        if observed_branch != branch:
+            raise WorklinkError("factory checkout branch mismatch")
+    head = ""
+    if member in {None, "base_object"}:
+        base = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "rev-parse", "--verify", base_ref],
+            error="cannot resolve factory checkout base",
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
+            raise WorklinkError("factory checkout base is invalid")
+    if member in {None, "head_object"}:
+        head = _fixed_command(
+            runner,
+            ["git", "-C", str(sandbox), "rev-parse", "HEAD"],
+            error="cannot read factory checkout HEAD",
+        ).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            raise WorklinkError("factory checkout HEAD is invalid")
     return head
 
 
@@ -4653,7 +4753,13 @@ def _record_factory_stage_failure(
     elif snapshot is not None:
         facts = snapshot
     elif record is not None:
-        facts = immutable_factory_snapshot(record, read_result=type(error).__name__)
+        failed_member = getattr(error, "member", None)
+        read_result = (
+            f"failed:{failed_member}"
+            if isinstance(failed_member, str)
+            else type(error).__name__
+        )
+        facts = immutable_factory_snapshot(record, read_result=read_result)
     else:
         facts = FactorySnapshot(
             run_id=None, issue_id=issue_id,

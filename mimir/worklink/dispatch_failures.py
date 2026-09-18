@@ -354,6 +354,32 @@ def _validate_v2(state: Mapping[str, object]) -> None:
                 or issue["occurrences"][success_id]["kind"] != "success"
             ):
                 raise FailureStateError("successful reservation lacks its success occurrence")
+            if reservation["claim_state"] == "settled":
+                claim = ClaimIdentity.from_json(reservation["binding"]["claim"])
+                settlement = issue["settlements"].get(claim.key)
+                if (
+                    settlement is None
+                    or settlement["reservation_id"] != reservation_id
+                    or settlement["claim"] != reservation["binding"]["claim"]
+                ):
+                    raise FailureStateError("settled reservation lacks its exact settlement")
+            for operation_id, operation in reservation["operations"].items():
+                if operation["state"] != "finished":
+                    continue
+                linked = issue["occurrences"].get(operation["occurrence_id"])
+                if (
+                    linked is None
+                    or linked["reservation_id"] != reservation_id
+                    or linked["operation_id"] != operation_id
+                    or (
+                        linked["source"] != operation["source"]
+                        and not (
+                            linked["kind"] == "success"
+                            and operation["source"] in {"leaf_start", "factory_start"}
+                        )
+                    )
+                ):
+                    raise FailureStateError("finished operation lacks its exact occurrence")
 
 
 def _validate_reservation(reservation_id: object, value: object, issue_id: int) -> None:
@@ -424,7 +450,7 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
         raise FailureStateError("reservation sandbox binding must be absolute")
     if value["claim_state"] == "none" and binding["claim"] is not None:
         raise FailureStateError("unclaimed reservation carries a claim")
-    if value["claim_state"] in {"intent", "confirmed", "settled"} and binding["claim"] is None:
+    if value["claim_state"] in {"intent", "confirmed", "absent", "settled"} and binding["claim"] is None:
         raise FailureStateError("claimed reservation has no claim identity")
     if value["state"] == "active" and value["claim_state"] != "confirmed":
         raise FailureStateError("active reservation claim is not confirmed")
@@ -1080,9 +1106,13 @@ def record_attention(
                 *reservation["positive_proofs"], *proof_ids
             ]))
         if not deferred:
-            reservation["state"] = (
-                "prepared" if disposition == "transient_retry" else "terminal"
-            )
+            if disposition == "pending":
+                if reservation["state"] != "prepared":
+                    raise FailureStateError("only a prepared reservation can remain pending")
+            else:
+                reservation["state"] = (
+                    "prepared" if disposition == "transient_retry" else "terminal"
+                )
             reservation["disposition"] = disposition
             reservation["retry_after"] = retry_after
         return occurrence
@@ -1291,6 +1321,16 @@ def reservation_claim(
     return ClaimIdentity.from_json(raw) if raw is not None else None
 
 
+def reservation_claim_state(
+    state_dir: Path, *, issue_id: int, reservation_id: str
+) -> tuple[str, ClaimIdentity | None]:
+    state = load_outcome_state(state_dir)
+    reservation = _reservation(state, issue_id, reservation_id)
+    raw = reservation["binding"]["claim"]
+    claim = ClaimIdentity.from_json(raw) if raw is not None else None
+    return str(reservation["claim_state"]), claim
+
+
 def reservation_binding(
     state_dir: Path, *, issue_id: int, reservation_id: str
 ) -> Mapping[str, object] | None:
@@ -1416,12 +1456,32 @@ def recovery_reservation_id(
     sandbox: str | None,
     claim_attempt: int,
 ) -> str | None:
-    """Resolve startup recovery only from the complete persisted work binding."""
+    binding = recovery_reservation_binding(
+        state_dir,
+        issue_id=issue_id,
+        target=target,
+        run_id=run_id,
+        sandbox=sandbox,
+        claim_attempt=claim_attempt,
+    )
+    return binding[0] if binding is not None else None
+
+
+def recovery_reservation_binding(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    target: AttentionTarget | str,
+    run_id: str | None,
+    sandbox: str | None,
+    claim_attempt: int,
+) -> tuple[str, ClaimIdentity] | None:
+    """Resolve startup recovery to one reservation and its complete original claim."""
     state = load_outcome_state(state_dir)
     issue = state["issues"].get(str(issue_id))
     if not issue:
         return None
-    candidates: list[tuple[int, str]] = []
+    candidates: list[tuple[int, str, Mapping[str, object]]] = []
     for reservation_id, reservation in issue["reservations"].items():
         binding = reservation["binding"]
         claim = binding["claim"]
@@ -1429,17 +1489,38 @@ def recovery_reservation_id(
             reservation["target"] != AttentionTarget(target).value
             or reservation["autonomous"] is not True
             or reservation["state"] not in {"prepared", "active"}
-            or not isinstance(claim, dict)
-            or claim.get("issue_id") != issue_id
-            or claim.get("attempt") != claim_attempt
             or binding["run_id"] != run_id
             or binding["sandbox"] != sandbox
         ):
             continue
-        candidates.append((reservation["sequence"], reservation_id))
+        if not isinstance(claim, dict):
+            raise FailureStateError("recovery reservation lost its original claim")
+        candidates.append((reservation["sequence"], reservation_id, claim))
     if len(candidates) > 1:
         raise FailureStateError("recovery binding is ambiguous")
-    return candidates[0][1] if candidates else None
+    if not candidates:
+        return None
+    _sequence, reservation_id, raw_claim = candidates[0]
+    claim = ClaimIdentity.from_json(raw_claim)
+    if claim.issue_id != issue_id or claim.attempt != claim_attempt:
+        raise FailureStateError("recovery record does not match the original claim identity")
+    return reservation_id, claim
+
+
+def has_nonterminal_reservation(
+    state_dir: Path, *, issue_id: int, target: AttentionTarget | str
+) -> bool:
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if issue is None:
+        return False
+    target_value = AttentionTarget(target).value
+    return any(
+        reservation["target"] == target_value
+        and reservation["autonomous"] is True
+        and reservation["state"] in {"prepared", "active"}
+        for reservation in issue["reservations"].values()
+    )
 
 
 def issue_retry_after(state_dir: Path, issue_id: int) -> datetime | None:

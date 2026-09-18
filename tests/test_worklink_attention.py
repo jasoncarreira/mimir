@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -17,7 +18,9 @@ from mimir.worklink.attention import (
     AttentionSchemaError,
     AttentionSource,
     ClaimIdentity,
+    ClaimFacts,
     FactorySnapshot,
+    InputFacts,
     ReaderCode,
     SOURCE_RULES,
     clearance_requirements,
@@ -86,17 +89,11 @@ def test_factory_proofs_accept_completed_steps_not_gates_or_allocations() -> Non
     )
 
 
-@pytest.mark.parametrize("source", list(AttentionSource))
-def test_each_source_clearance_requires_all_strict_readers(source: AttentionSource) -> None:
-    required = clearance_requirements(source)
+def test_clearance_evaluator_requires_every_declared_reader() -> None:
+    required = clearance_requirements(AttentionSource.LEAF_BACKEND_OUTCOME)
     occurrence = {
-        "source": source.value,
-        "kind": (
-            "start" if source.value.endswith("_start")
-            else "success" if source.value.endswith("_success")
-            else "legacy_attention" if source == AttentionSource.LEGACY_V1
-            else "attention"
-        ),
+        "source": AttentionSource.LEAF_BACKEND_OUTCOME.value,
+        "kind": "attention",
     }
     passing = {reader: "pass" for reader in required}
     assert inspect_clearance(occurrence, passing).read_errors == ()
@@ -108,29 +105,19 @@ def test_each_source_clearance_requires_all_strict_readers(source: AttentionSour
         assert inspection.result.value == "read_error"
 
 
-@pytest.mark.parametrize("source", list(AttentionSource))
-def test_each_source_has_positive_and_negative_clearance_semantics(
-    source: AttentionSource,
-) -> None:
-    required = clearance_requirements(source)
-    kind = (
-        "start" if source.value.endswith("_start")
-        else "success" if source.value.endswith("_success")
-        else "legacy_attention" if source == AttentionSource.LEGACY_V1
-        else "attention"
-    )
-    occurrence = {"source": source.value, "kind": kind}
+def test_clearance_evaluator_distinguishes_positive_and_blocked_reads() -> None:
+    required = clearance_requirements(AttentionSource.LEAF_BACKEND_OUTCOME)
+    occurrence = {
+        "source": AttentionSource.LEAF_BACKEND_OUTCOME.value,
+        "kind": "attention",
+    }
     passing = {reader: "pass" for reader in required}
     positive = inspect_clearance(occurrence, passing)
-    assert positive.result.value == (
-        "current" if kind in {"start", "success"} else "resolved"
-    )
+    assert positive.result.value == "resolved"
     blocked = dict(passing)
     blocked[required[0]] = "blocked"
     negative = inspect_clearance(occurrence, blocked)
-    assert negative.result.value == (
-        "changed" if kind in {"start", "success"} else "unresolved"
-    )
+    assert negative.result.value == "unresolved"
 
 
 def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
@@ -256,6 +243,89 @@ def test_rehydration_preserves_each_real_reader_error(tmp_path: Path) -> None:
     assert inspection.result.value == "read_error"
 
 
+def test_factory_rehydration_uses_the_returned_exact_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir.worklink.backends.feature_factory import (
+        FeatureFactoryBackend,
+        parse_factory_status,
+    )
+    from mimir.worklink.compute import LaunchHandle
+    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+
+    sandbox = tmp_path / "chainlink-42"
+    sandbox.mkdir()
+    status = parse_factory_status({
+        "run_id": "chainlink-42",
+        "valid": True,
+        "sandbox_path": str(sandbox),
+        "status": "running",
+        "mode": "autonomous",
+        "branch": "epic/42",
+        "pr_base": "main",
+        "pr_draft": False,
+        "lock": "fresh",
+        "dead_lock": False,
+        "lock_session": "session-42",
+        "gates": {},
+        "steps": [],
+        "slices": [],
+        "pr_url": None,
+        "next": "implementation",
+    })
+    save_factory_record(tmp_path, FactoryRunRecord(
+        run_id="chainlink-42",
+        issue_id=42,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/42",
+        launcher="/tmp/factory.js",
+        sandbox=str(sandbox),
+        session="session-42",
+        handle=LaunchHandle("local_subprocess", "999999", 1),
+        status=status,
+        observed_at="2026-09-18T00:00:00+00:00",
+        controller_phase="running",
+    ))
+    monkeypatch.setattr(
+        FeatureFactoryBackend,
+        "status",
+        lambda self, run_id, **kwargs: status,
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=42, target="factory", autonomous=True
+    )
+    claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    bind_claim(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim, confirmed=False
+    )
+    start = confirm_claim_and_start(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        claim=claim,
+        run_id="chainlink-42",
+        sandbox=str(sandbox),
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"id": 42, "labels": [], "comments": []}), ""
+            )
+        if argv[:3] == ["chainlink", "locks", "list"]:
+            return subprocess.CompletedProcess(argv, 0, '{"locks":[]}', "")
+        raise AssertionError(argv)
+
+    inspection = rehydrate_attention(
+        tmp_path, start["delivery_key"].rsplit(":", 1)[-1], runner=runner
+    )
+
+    assert ReaderCode.FACTORY_STATUS not in inspection.read_errors
+
+
 def test_live_start_owner_and_own_lock_remain_current(tmp_path: Path) -> None:
     state_dir = dispatch_failure_state_dir(tmp_path)
     reservation = reserve_dispatch(
@@ -289,3 +359,168 @@ def test_live_start_owner_and_own_lock_remain_current(tmp_path: Path) -> None:
     assert inspection.result.value == "current"
     assert inspection.current_state == "active"
     assert inspection.read_errors == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        AttentionSource.LEAF_BACKEND,
+        AttentionSource.LEAF_COMPUTE,
+        AttentionSource.FACTORY_INTERLOCK,
+        AttentionSource.FACTORY_BACKEND,
+        AttentionSource.FACTORY_COMPUTE,
+        AttentionSource.FACTORY_LAUNCHER,
+        AttentionSource.FACTORY_BASE_LOOKUP,
+        AttentionSource.FACTORY_WORK_ITEM,
+        AttentionSource.CLAIM_COMMAND,
+        AttentionSource.CLAIM_GUARD,
+        AttentionSource.CLAIM_STEAL,
+        AttentionSource.CLAIM_CAPACITY_READ,
+        AttentionSource.CLAIM_UNREADY,
+        AttentionSource.CLAIM_INPROGRESS,
+        AttentionSource.CLAIM_COMMENT,
+        AttentionSource.CLAIM_CONTENTION,
+    ],
+    ids=lambda source: source.value,
+)
+def test_named_validator_rehydrates_through_its_read_only_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: AttentionSource,
+) -> None:
+    from mimir.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir.worklink.claims import ClaimRecord
+
+    issue_id = 42
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setattr(
+        FeatureFactoryBackend, "admit", lambda self: Path("/opt/factory.js")
+    )
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  test_command: uv run pytest\n", encoding="utf-8"
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    target = "factory" if source.value.startswith("factory_") else "leaf"
+    reservation = reserve_dispatch(
+        state_dir, issue_id=issue_id, target=target, autonomous=True
+    )
+    intended = ClaimIdentity(
+        issue_id, 1, "agent", "2026-09-18T00:00:00+00:00"
+    )
+    if SOURCE_RULES[source].fact_type == "claim":
+        facts: object = ClaimFacts(
+            intended if source == AttentionSource.CLAIM_COMMENT else None,
+            None,
+            "blocked",
+            mutation_stage="comment" if source == AttentionSource.CLAIM_COMMENT else None,
+        )
+    else:
+        facts = InputFacts(validator=source.value, result="blocked")
+    cause = next(iter(SOURCE_RULES[source].causes))
+    occurrence = record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        source=source,
+        cause=cause,
+        facts=facts,
+    )
+    labels = ["worklink:epic"]
+    if source == AttentionSource.CLAIM_INPROGRESS:
+        labels.append("worklink:in-progress")
+    comments = []
+    if source == AttentionSource.CLAIM_COMMENT:
+        comments.append(
+            ClaimRecord(
+                intended.issue_id,
+                intended.attempt,
+                intended.agent_id,
+                datetime.fromisoformat(intended.claimed_at),
+            ).to_comment()
+        )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "id": issue_id,
+                    "title": "Build the epic",
+                    "description": "Target branch: main\n\nAcceptance criteria:\n- ship it",
+                    "labels": labels,
+                    "comments": comments,
+                }),
+                "",
+            )
+        if argv[:3] == ["chainlink", "locks", "list"]:
+            return subprocess.CompletedProcess(argv, 0, '{"locks":[]}', "")
+        if argv[:2] == ["git", "-C"] and "ls-remote" in argv:
+            return subprocess.CompletedProcess(argv, 0, "a" * 40 + "\n", "")
+        raise AssertionError(argv)
+
+    inspection = rehydrate_attention(
+        tmp_path,
+        occurrence["delivery_key"].rsplit(":", 1)[-1],
+        runner=runner,
+    )
+
+    assert inspection.result.value == "resolved"
+    assert inspection.read_errors == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        AttentionSource.FACTORY_BASE_LOOKUP,
+        AttentionSource.CLAIM_COMMAND,
+        AttentionSource.CLAIM_STEAL,
+        AttentionSource.CLAIM_CAPACITY_READ,
+        AttentionSource.CLAIM_CONTENTION,
+    ],
+    ids=lambda source: source.value,
+)
+def test_named_validator_preserves_its_external_reader_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: AttentionSource
+) -> None:
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  test_command: uv run pytest\n", encoding="utf-8"
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir,
+        issue_id=43,
+        target="factory" if source.value.startswith("factory_") else "leaf",
+        autonomous=True,
+    )
+    occurrence = record_attention(
+        state_dir,
+        issue_id=43,
+        reservation_id=reservation,
+        source=source,
+        cause=next(iter(SOURCE_RULES[source].causes)),
+        facts=(
+            InputFacts(validator=source.value, result="blocked")
+            if SOURCE_RULES[source].fact_type == "input"
+            else ClaimFacts(None, None, "blocked")
+        ),
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"id": 43, "labels": [], "comments": []}), ""
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "reader unavailable")
+
+    inspection = rehydrate_attention(
+        tmp_path,
+        occurrence["delivery_key"].rsplit(":", 1)[-1],
+        runner=runner,
+    )
+
+    assert inspection.result.value == "read_error"
+    assert ReaderCode.VALIDATOR in inspection.read_errors

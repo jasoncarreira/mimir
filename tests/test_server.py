@@ -97,6 +97,105 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     assert spawned[0][:4] == ["mimir", "worklink", "run-epic", "700"]
 
 
+def test_server_factory_recovery_reuses_exact_reservation_and_cleans_up_bind_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir.worklink.attention import ClaimIdentity
+    import mimir.worklink.control as control
+    from mimir.worklink.dispatch_failures import (
+        RESERVATION_ENV,
+        bind_claim,
+        confirm_claim_and_start,
+        dispatch_failure_state_dir,
+        load_outcome_state,
+        reserve_dispatch,
+    )
+    import mimir.worklink.dispatch_failures as dispatch_failures
+    import mimir.worklink.factory_state as factory_state
+
+    issue_id = 701
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-701"
+    record = factory_state.FactoryRunRecord(
+        run_id="chainlink-701",
+        issue_id=issue_id,
+        attempt=3,
+        repository="owner/repo",
+        base_ref="main",
+        branch="epic/701",
+        launcher="/opt/factory.js",
+        sandbox=str(sandbox),
+        session="retained-session",
+        handle=None,
+        observed_at=None,
+        controller_phase="running",
+        status=None,
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=issue_id, target="factory", autonomous=True
+    )
+    identity = ClaimIdentity(
+        issue_id, 3, "original-agent", "2026-09-18T00:00:00+00:00"
+    )
+    bind_claim(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        claim=identity,
+        confirmed=False,
+    )
+    confirm_claim_and_start(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        claim=identity,
+        run_id=record.run_id,
+        sandbox=record.sandbox,
+    )
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
+    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+
+    bound: list[tuple[int, str]] = []
+
+    def fail_owner_binding(
+        state_dir: Path, *, issue_id: int, reservation_id: str, **kwargs: object
+    ) -> None:
+        bound.append((issue_id, reservation_id))
+        raise OSError("owner binding failed")
+
+    monkeypatch.setattr(dispatch_failures, "bind_reservation_owner", fail_owner_binding)
+
+    class Spawned:
+        pid = os.getpid()
+
+        def __init__(self) -> None:
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    process = Spawned()
+    spawn_env: dict[str, str] = {}
+
+    def popen(argv: list[str], **kwargs: object) -> Spawned:
+        spawn_env.update(kwargs["env"])  # type: ignore[arg-type]
+        return process
+
+    dispatched = reattach_inflight_worklink_runs(tmp_path, popen=popen)
+
+    assert dispatched == []
+    assert spawn_env[RESERVATION_ENV] == reservation
+    assert bound == [(issue_id, reservation)]
+    assert process.terminated is True
+    current = load_outcome_state(state_dir)["issues"][str(issue_id)]["reservations"][reservation]
+    assert current["binding"]["claim"] == identity.to_json()
+    assert current["claim_state"] == "confirmed"
+    assert current["state"] == "terminal"
+
+
 def _production_call_sites(call_name: str) -> set[str]:
     root = Path(__file__).resolve().parent.parent
     sites: set[str] = set()

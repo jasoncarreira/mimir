@@ -487,7 +487,10 @@ def rehydrate_attention(
                     sandbox=Path(record.sandbox),
                     launcher=record.launcher,
                 )
-                if status.run_id != record.run_id or status.sandbox_path != record.sandbox:
+                if (
+                    factory_status.run_id != record.run_id
+                    or factory_status.sandbox_path != record.sandbox
+                ):
                     raise RuntimeError("factory status binding mismatch")
             verdicts[ReaderCode.FACTORY_STATUS] = (
                 "pass" if exact_factory_record is not None else "blocked"
@@ -579,6 +582,8 @@ def rehydrate_attention(
                     facts=occurrence["facts"],
                     tracker=tracker,
                     factory_record=exact_factory_record,
+                    binding=binding,
+                    runner=run,
                 )
         except Exception:
             verdicts[ReaderCode.VALIDATOR] = "error"
@@ -733,6 +738,8 @@ def _run_internal_validator(
     facts: object,
     tracker: Mapping[str, object] | None,
     factory_record: object | None,
+    binding: Mapping[str, object],
+    runner: Any,
 ) -> str:
     """Run the finite read-only validator assigned to a validator source."""
     if SOURCE_RULES[source].clearance != ClearancePolicy.VALIDATOR or not isinstance(facts, dict):
@@ -756,7 +763,9 @@ def _run_internal_validator(
             branch = target_branch_from_description(str(tracker["description"]))
         return "pass" if isinstance(branch, str) and branch.strip() else "blocked"
     if source in {AttentionSource.FACTORY_RETAINED_BINDING, AttentionSource.FACTORY_RECOVERY_BINDING}:
-        return "pass" if factory_record is not None else "blocked"
+        return _validate_retained_factory_binding(
+            home, facts, tracker, factory_record, binding, runner
+        )
     if source in {
         AttentionSource.QUEUE_LEAF_SPAWN,
         AttentionSource.QUEUE_FACTORY_SPAWN,
@@ -801,11 +810,239 @@ def _run_internal_validator(
         checkout = facts.get("checkout")
         isolated = facts.get("isolated")
         return "pass" if isolated is True and isinstance(checkout, str) and Path(checkout).is_dir() else "blocked"
-    # Claim and selection validators rely on the required tracker and both
-    # ownership inventories read by this inspection.  A successful structured
-    # tracker projection proves the named read boundary is available; conflicts
-    # remain represented by the owner/lock readers and cannot be cleared here.
-    return "pass" if tracker is not None else "blocked"
+    if source in {
+        AttentionSource.LEAF_BACKEND,
+        AttentionSource.LEAF_COMPUTE,
+        AttentionSource.FACTORY_BACKEND,
+        AttentionSource.FACTORY_COMPUTE,
+        AttentionSource.FACTORY_LAUNCHER,
+    }:
+        from .backends.feature_factory import FactoryContractError, FeatureFactoryBackend
+        from .backends.registry import BackendRegistry, WorklinkConfig
+
+        try:
+            config = WorklinkConfig.load(home / "worklink.yaml")
+            registry = BackendRegistry(config)
+            labels = set(tracker.get("labels", ())) if tracker is not None else set()
+            if source == AttentionSource.LEAF_BACKEND:
+                registry.select(labels=labels, repo=config.repository)
+            elif source == AttentionSource.LEAF_COMPUTE:
+                registry.select_compute(labels=labels, repo=config.repository)
+            elif source == AttentionSource.FACTORY_BACKEND:
+                if not isinstance(registry.get("feature_factory"), FeatureFactoryBackend):
+                    return "blocked"
+            elif source == AttentionSource.FACTORY_COMPUTE:
+                if registry.select_compute(labels=labels, repo=config.repository).name != "local_subprocess":
+                    return "blocked"
+            else:
+                backend = registry.get("feature_factory")
+                if not isinstance(backend, FeatureFactoryBackend):
+                    return "blocked"
+                backend.admit()
+        except (FactoryContractError, KeyError, ValueError):
+            return "blocked"
+        return "pass"
+    if source == AttentionSource.FACTORY_INTERLOCK:
+        from .factory_state import factory_checkout_interlock
+
+        with factory_checkout_interlock(home) as acquired:
+            return "pass" if acquired else "blocked"
+    if source == AttentionSource.FACTORY_BASE_LOOKUP:
+        from .backends.registry import WorklinkConfig
+        from .planning import target_branch_from_description
+
+        config = WorklinkConfig.load(home / "worklink.yaml")
+        description = tracker.get("description") if tracker is not None else None
+        base = (
+            target_branch_from_description(description)
+            if isinstance(description, str)
+            else None
+        ) or config.defaults.base_branch
+        repo = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+        if not repo:
+            return "blocked"
+        result = runner([
+            "git", "-C", repo, "ls-remote", "--exit-code", "origin",
+            f"refs/heads/{base.removeprefix('origin/')}",
+        ])
+        if result.returncode == 2:
+            return "blocked"
+        if result.returncode != 0:
+            raise RuntimeError("factory base lookup failed")
+        return "pass"
+    if source == AttentionSource.FACTORY_WORK_ITEM:
+        if tracker is None:
+            return "blocked"
+        from .orchestrator import (
+            IssueContext,
+            WorklinkError,
+            _validate_epic_work_item,
+            render_work_item,
+        )
+
+        issue = IssueContext(
+            issue_id=int(tracker.get("id", tracker.get("number", 0))),
+            title=str(tracker.get("title", "")),
+            description=str(tracker.get("description", "")),
+            labels=set(tracker.get("labels", ())),
+            comments=tuple(str(item) for item in tracker.get("comments", ())),
+        )
+        try:
+            _validate_epic_work_item(render_work_item(issue), issue.issue_id)
+        except (ValueError, WorklinkError):
+            return "blocked"
+        return "pass"
+    if source == AttentionSource.CLAIM_GUARD:
+        return "pass" if tracker is not None else "blocked"
+    if source in {
+        AttentionSource.CLAIM_COMMAND,
+        AttentionSource.CLAIM_STEAL,
+        AttentionSource.CLAIM_CAPACITY_READ,
+        AttentionSource.CLAIM_CONTENTION,
+    }:
+        result = runner(["chainlink", "locks", "list", "--json"])
+        if result.returncode != 0:
+            raise RuntimeError("claim validator lock inventory failed")
+        _strict_lock_ids(json.loads(result.stdout or "{}"))
+        return "pass"
+    if source in {
+        AttentionSource.CLAIM_UNREADY,
+        AttentionSource.CLAIM_INPROGRESS,
+        AttentionSource.CLAIM_COMMENT,
+    }:
+        if tracker is None:
+            return "blocked"
+        labels = set(tracker.get("labels", ()))
+        if source == AttentionSource.CLAIM_UNREADY:
+            return "pass" if "worklink:ready" not in labels else "blocked"
+        if source == AttentionSource.CLAIM_INPROGRESS:
+            return "pass" if "worklink:in-progress" in labels else "blocked"
+        intended = facts.get("intended")
+        if not isinstance(intended, dict):
+            return "blocked"
+        from .claims import claim_records_from_comments
+
+        expected = ClaimIdentity.from_json(intended)
+        comments = tuple(str(item) for item in tracker.get("comments", ()))
+        return "pass" if any(
+            record.issue_id == expected.issue_id
+            and record.attempt == expected.attempt
+            and record.agent_id == expected.agent_id
+            and record.claimed_at.isoformat() == expected.claimed_at
+            for record in claim_records_from_comments(comments)
+        ) else "blocked"
+    raise RuntimeError(f"no read-only validator implemented for {source.value}")
+
+
+_RETAINED_BINDING_MEMBERS = frozenset({
+    "issue", "repository", "controller_repository", "base", "launcher", "lifecycle",
+    "session", "ownership_boundary", "sandbox", "checkout_root", "git_directory",
+    "checkout_repository", "branch", "base_object", "head_object", "claim_issue",
+    "claim_owner", "claim_lock",
+})
+
+
+def _validate_retained_factory_binding(
+    home: Path,
+    facts: Mapping[str, object],
+    tracker: Mapping[str, object] | None,
+    factory_record: object | None,
+    binding: Mapping[str, object],
+    runner: Any,
+) -> str:
+    read_result = facts.get("read_result")
+    if not isinstance(read_result, str) or not read_result.startswith("failed:"):
+        raise RuntimeError("retained binding occurrence lacks its failed member")
+    member = read_result.removeprefix("failed:")
+    if member not in _RETAINED_BINDING_MEMBERS:
+        raise RuntimeError("retained binding member is unknown")
+    if tracker is None or factory_record is None:
+        return "blocked"
+    from .orchestrator import (
+        IssueContext,
+        WorklinkRunner,
+        FactoryRecoveryBindingError,
+        _list_runner,
+        _repo_remote_url,
+        _repo_slug_from_url,
+        _verify_factory_recovery_target,
+    )
+    repo_value = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
+    repo = Path(repo_value) if repo_value else home
+    issue = IssueContext(
+        issue_id=int(tracker.get("id", tracker.get("number", 0))),
+        title=str(tracker.get("title", "")),
+        description=str(tracker.get("description", "")),
+        labels=set(tracker.get("labels", ())),
+        comments=tuple(str(item) for item in tracker.get("comments", ())),
+    )
+    if not member.startswith("claim_"):
+        if member in {"repository", "controller_repository"} and not repo_value:
+            return "blocked"
+        launcher = Path(getattr(factory_record, "launcher"))
+        repo_slug = str(getattr(factory_record, "repository"))
+        base = str(getattr(factory_record, "base_ref"))
+        if member == "launcher":
+            from .backends.feature_factory import FeatureFactoryBackend
+            from .backends.registry import BackendRegistry, WorklinkConfig
+
+            backend = BackendRegistry(WorklinkConfig.load(home / "worklink.yaml")).get(
+                "feature_factory"
+            )
+            if not isinstance(backend, FeatureFactoryBackend):
+                return "blocked"
+            launcher = backend.admit()
+        elif member == "repository":
+            observed_slug = _repo_slug_from_url(_repo_remote_url(repo, runner=runner))
+            if observed_slug is None:
+                return "blocked"
+            repo_slug = observed_slug
+        elif member == "base":
+            from .backends.registry import WorklinkConfig
+            from .planning import target_branch_from_description
+
+            config = WorklinkConfig.load(home / "worklink.yaml")
+            base = target_branch_from_description(issue.description) or config.defaults.base_branch
+        try:
+            _verify_factory_recovery_target(
+                runner=WorklinkRunner(home=home, repo=repo, runner=runner),
+                issue=issue,
+                retained=factory_record,
+                launcher=launcher,
+                repo_slug=repo_slug,
+                base=base,
+                command_runner=runner,
+                member=member,
+            )
+        except FactoryRecoveryBindingError as exc:
+            if exc.reader_error:
+                raise
+            return "blocked"
+    else:
+        raw_claim = binding.get("claim")
+        if not isinstance(raw_claim, dict):
+            return "blocked"
+        claim = ClaimIdentity.from_json(raw_claim)
+        if member == "claim_issue":
+            return "pass" if claim.issue_id == issue.issue_id else "blocked"
+        from .claims import ChainlinkClaims, ClaimRecord
+
+        configured_runner = WorklinkRunner(home=home, repo=repo, runner=runner)
+        if member == "claim_owner":
+            return "pass" if claim.agent_id == configured_runner.agent_id else "blocked"
+        claims = ChainlinkClaims(
+            agent_id=configured_runner.agent_id,
+            runner=_list_runner(runner),
+            home_path=home,
+        )
+        retained_claim = ClaimRecord(
+            issue_id=claim.issue_id,
+            attempt=claim.attempt,
+            agent_id=claim.agent_id,
+            claimed_at=datetime.fromisoformat(claim.claimed_at),
+        )
+        return "pass" if getattr(claims, "_lock_still_held_by")(retained_claim) else "blocked"
+    return "pass"
 
 
 def _strict_subprocess_runner(home: Path) -> Any:

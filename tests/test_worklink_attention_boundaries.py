@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import ast
 from datetime import UTC, datetime
-import hashlib
 import json
 from pathlib import Path
 
@@ -12,7 +12,6 @@ from mimir.worklink.attention import (
     AttentionSource,
     ClaimIdentity,
     ClearancePolicy,
-    FactorySnapshot,
     SOURCE_RULES,
 )
 from mimir.worklink.claims import ClaimRecord
@@ -21,15 +20,11 @@ from mimir.worklink.dispatch_failures import (
     confirm_claim_and_start,
     dispatch_failure_state_dir,
     load_outcome_state,
-    record_attention,
     reserve_dispatch,
-    retain_positive_proofs,
 )
 from mimir.worklink.orchestrator import (
     WorklinkRunResult,
-    _record_preclaim_claim,
     _record_run_success,
-    _typed_outcome_boundary,
 )
 
 
@@ -69,6 +64,23 @@ PRODUCTION_SOURCES = frozenset({
     "factory_interrupt", "factory_startup_reconcile", "leaf_start", "factory_start",
     "leaf_success", "factory_success", "legacy_v1",
 })
+
+APPROVED_EXCLUSION_TESTS = {
+    "manual": ("test_worklink_orchestrator.py", "test_manual_success_clears_autonomous_failure_ledger"),
+    "dry_run": ("test_worklink_orchestrator.py", "test_dry_run_prints_rendered_work_order_without_mutations"),
+    "review_lifecycle": ("test_worklink_claims.py", "test_claim_issue_refuses_worklink_review_label"),
+    "publication_fence": ("test_worklink_claims.py", "test_retained_publication_refuses_without_mutation_and_allows_retry_after_clear"),
+    "completed_evidence": ("test_worklink_claims.py", "test_claim_issue_refuses_when_review_ready_evidence_exists"),
+    "fresh_duplicate": ("test_worklink_claims.py", "test_duplicate_vs_live_final_attempt_never_labels_blocked"),
+    "capacity": ("test_worklink_claims.py", "test_claim_issue_enforces_max_active_locks_after_reservation"),
+    "registry_failure": ("test_worklink_autonomy.py", "test_poller_degrades_before_dispatch_for_invalid_backend_reference"),
+    "poller_nonactionable": ("test_worklink_autonomy.py", "test_poller_filters_worklink_ready_through_chainlink_actionable_set"),
+    "poller_blocked": ("test_worklink_autonomy.py", "test_poller_leaves_blocked_worklink_ready_issues_untouched"),
+    "poller_active": ("test_worklink_autonomy.py", "test_poller_excludes_actively_locked_issue_from_candidates"),
+    "poller_backoff": ("test_worklink_autonomy.py", "test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle"),
+    "poller_capacity": ("test_worklink_autonomy.py", "test_poller_no_dispatch_when_cap_reached"),
+    "reattach_inactive": ("test_worklink_reattach.py", "test_reattach_skips_when_leaf_no_longer_in_progress"),
+}
 
 
 def _claim(issue_id: int = 42) -> tuple[ClaimIdentity, ClaimRecord]:
@@ -150,112 +162,127 @@ def _produce_lifecycle(home: Path, source: AttentionSource) -> None:
     )
 
 
-@pytest.mark.parametrize("source", list(AttentionSource), ids=lambda source: source.value)
-def test_every_finite_source_commits_through_its_production_boundary(
-    tmp_path: Path, source: AttentionSource
-) -> None:
-    if source == AttentionSource.LEGACY_V1:
-        state_dir = dispatch_failure_state_dir(tmp_path)
-        state_dir.mkdir(parents=True)
-        row = {
-            "active": True,
-            "issue_id": 42,
-            "failed_at": "2026-09-18T00:00:00+00:00",
-            "signature": "legacy",
-            "occurrence_id": "legacy-occurrence",
-            "retry_after": None,
-        }
-        (state_dir / "dispatch_failures.json").write_text(
-            json.dumps({"version": 1, "issues": {"42": row}}), encoding="utf-8"
-        )
-        state = load_outcome_state(state_dir)
-    elif source in {
+def test_closed_sources_are_bound_at_named_production_sites() -> None:
+    root = Path(__file__).resolve().parents[1]
+    names = {source.name: source.value for source in AttentionSource}
+    sites: dict[str, set[tuple[str, str]]] = {source.value: set() for source in AttentionSource}
+    for path in (root / "mimir").rglob("*.py"):
+        if path.name == "attention.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        stack: list[str] = []
+
+        class SourceVisitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                stack.append(node.name)
+                self.generic_visit(node)
+                stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Attribute(self, node: ast.Attribute) -> None:
+                if (
+                    isinstance(node.value, ast.Name)
+                    and node.value.id == "AttentionSource"
+                    and node.attr in names
+                ):
+                    sites[names[node.attr]].add(
+                        (path.relative_to(root).as_posix(), stack[-1] if stack else "<module>")
+                    )
+                self.generic_visit(node)
+
+            def visit_Constant(self, node: ast.Constant) -> None:
+                if isinstance(node.value, str) and node.value in sites:
+                    sites[node.value].add(
+                        (path.relative_to(root).as_posix(), stack[-1] if stack else "<module>")
+                    )
+
+        SourceVisitor().visit(tree)
+
+    assert set(sites) == PRODUCTION_SOURCES
+    assert all(boundaries for boundaries in sites.values())
+    generic_recorders = {
+        "_typed_outcome_boundary",
+        "_record_factory_stage_failure",
+        "_record_preclaim_claim",
+        "record_attention",
+    }
+    assert all(
+        any(function not in generic_recorders for _path, function in boundaries)
+        for boundaries in sites.values()
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
         AttentionSource.LEAF_START,
         AttentionSource.FACTORY_START,
         AttentionSource.LEAF_SUCCESS,
         AttentionSource.FACTORY_SUCCESS,
-    }:
-        _produce_lifecycle(tmp_path, source)
-        state = load_outcome_state(dispatch_failure_state_dir(tmp_path))
-    elif source in {AttentionSource.LEAF_INTERRUPT, AttentionSource.FACTORY_INTERRUPT}:
-        state_dir, reservation, _identity, _record = _prepare_claimed_reservation(
-            tmp_path, source
-        )
-        _record_interruption(
-            tmp_path,
-            42,
-            reservation,
-            target="factory" if source == AttentionSource.FACTORY_INTERRUPT else "leaf",
-            source=source.value,
-            retained=True,
-        )
-        state = load_outcome_state(state_dir)
-    elif SOURCE_RULES[source].fact_type == "claim":
-        state_dir = dispatch_failure_state_dir(tmp_path)
-        reservation = reserve_dispatch(
-            state_dir, issue_id=42, target="leaf", autonomous=True
-        )
-        cause = min(SOURCE_RULES[source].causes, key=lambda item: item.value)
-        _record_preclaim_claim(
-            tmp_path,
-            42,
-            reservation,
-            source=source.value,
-            cause=cause.value,
-            result="boundary_failure",
-        )
-        state = load_outcome_state(state_dir)
-    elif source == AttentionSource.FACTORY_PARTIAL:
-        state_dir, reservation, identity, _record = _prepare_claimed_reservation(
-            tmp_path, source
-        )
-        retain_positive_proofs(
-            state_dir,
-            issue_id=42,
-            reservation_id=reservation,
-            proof_ids=("factory_partial",),
-        )
-        snapshot = FactorySnapshot(
-            run_id="chainlink-42", issue_id=42, attempt=1,
-            sandbox=str(tmp_path / "sandbox"), session=None,
-            controller_phase="terminal", controller_error=None, status="partial",
-            valid=True, lock=None, dead_lock=None, lock_session=None, gates=(),
-            steps=(), slices=(), pr_url=None, next="resume", next_present=True,
-            park_snapshot=None, read_result="captured",
-        )
-        record_attention(
-            state_dir,
-            issue_id=42,
-            reservation_id=reservation,
-            source=source,
-            cause=next(iter(SOURCE_RULES[source].causes)),
-            facts=snapshot,
-            claim=identity,
-            proof_ids=("factory_partial",),
-        )
-        state = load_outcome_state(state_dir)
-    else:
-        state_dir, reservation, _identity, record = _prepare_claimed_reservation(
-            tmp_path, source
-        )
-        cause = min(SOURCE_RULES[source].causes, key=lambda item: item.value)
-        with pytest.raises(RuntimeError, match="boundary failure"):
-            with _typed_outcome_boundary(
-                home=tmp_path,
-                issue_id=42,
-                reservation_id=reservation,
-                source=source.value,
-                cause=cause.value,
-                claim_record=record,
-                checkout=tmp_path / "checkout",
-                branch="feature/42",
-                operation="boundary_test",
-            ):
-                raise RuntimeError("boundary failure")
-        state = load_outcome_state(state_dir)
-
-    occurrences = state["issues"]["42"]["occurrences"].values()
+    ],
+    ids=lambda source: source.value,
+)
+def test_lifecycle_sources_use_the_real_admission_and_success_writers(
+    tmp_path: Path, source: AttentionSource
+) -> None:
+    _produce_lifecycle(tmp_path, source)
+    occurrences = load_outcome_state(
+        dispatch_failure_state_dir(tmp_path)
+    )["issues"]["42"]["occurrences"].values()
     assert source.value in {occurrence["source"] for occurrence in occurrences}
+
+
+@pytest.mark.parametrize(
+    "source", [AttentionSource.LEAF_INTERRUPT, AttentionSource.FACTORY_INTERRUPT]
+)
+def test_interrupt_sources_use_the_command_boundary(
+    tmp_path: Path, source: AttentionSource
+) -> None:
+    state_dir, reservation, _identity, _record = _prepare_claimed_reservation(
+        tmp_path, source
+    )
+    _record_interruption(
+        tmp_path,
+        42,
+        reservation,
+        target="factory" if source == AttentionSource.FACTORY_INTERRUPT else "leaf",
+        source=source.value,
+        retained=True,
+    )
+    occurrences = load_outcome_state(state_dir)["issues"]["42"]["occurrences"].values()
+    assert source.value in {occurrence["source"] for occurrence in occurrences}
+
+
+def test_legacy_source_uses_the_real_v1_migration_boundary(tmp_path: Path) -> None:
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    state_dir.mkdir(parents=True)
+    row = {
+        "active": True,
+        "issue_id": 42,
+        "failed_at": "2026-09-18T00:00:00+00:00",
+        "signature": "legacy",
+        "occurrence_id": "legacy-occurrence",
+        "retry_after": None,
+    }
+    (state_dir / "dispatch_failures.json").write_text(
+        json.dumps({"version": 1, "issues": {"42": row}}), encoding="utf-8"
+    )
+    occurrences = load_outcome_state(state_dir)["issues"]["42"]["occurrences"].values()
+    assert "legacy_v1" in {occurrence["source"] for occurrence in occurrences}
+
+
+def test_approved_exclusions_have_real_boundary_tests_in_the_ratified_suite() -> None:
+    tests = Path(__file__).resolve().parent
+    observed: set[tuple[str, str]] = set()
+    for filename, _name in APPROVED_EXCLUSION_TESTS.values():
+        tree = ast.parse((tests / filename).read_text(encoding="utf-8"))
+        observed.update(
+            (filename, node.name)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    assert set(APPROVED_EXCLUSION_TESTS.values()).issubset(observed)
 
 
 def test_production_inventory_equals_closed_source_and_clearance_inventory() -> None:

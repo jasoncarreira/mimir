@@ -509,13 +509,13 @@ def report_retained_factory_records(
             from .attention import ReconcileFacts
             from .dispatch_failures import (
                 dispatch_failure_state_dir,
+                load_outcome_state,
                 record_attention,
-                recovery_reservation_id,
-                reservation_claim,
+                recovery_reservation_binding,
             )
 
             state_dir = dispatch_failure_state_dir(home)
-            reservation_id = recovery_reservation_id(
+            binding = recovery_reservation_binding(
                 state_dir,
                 issue_id=record.issue_id,
                 target="factory",
@@ -523,30 +523,36 @@ def report_retained_factory_records(
                 sandbox=record.sandbox,
                 claim_attempt=record.attempt,
             )
-            if reservation_id is not None:
-                claim = reservation_claim(
-                    state_dir,
-                    issue_id=record.issue_id,
-                    reservation_id=reservation_id,
-                )
-                record_attention(
-                    state_dir,
-                    issue_id=record.issue_id,
-                    reservation_id=reservation_id,
-                    source="factory_startup_reconcile",
-                    cause="controller_lost",
-                    facts=ReconcileFacts(
-                        original_run_id=record.run_id,
-                        original_claim=claim,
-                        process_verdict="dead",
-                        lock_verdict="retained",
-                        publication_id=None,
-                        evidence_id=None,
-                        automatic_handling_stage="startup_report",
-                        automatic_handling_result=record.controller_phase,
-                    ),
-                    claim=claim,
-                )
+            if binding is None:
+                continue
+            reservation_id, claim = binding
+            state = load_outcome_state(state_dir)
+            occurrences = state["issues"][str(record.issue_id)]["occurrences"].values()
+            if any(
+                occurrence["reservation_id"] == reservation_id
+                and occurrence["source"] == "factory_startup_reconcile"
+                for occurrence in occurrences
+            ):
+                continue
+            record_attention(
+                state_dir,
+                issue_id=record.issue_id,
+                reservation_id=reservation_id,
+                source="factory_startup_reconcile",
+                cause="controller_lost",
+                facts=ReconcileFacts(
+                    original_run_id=record.run_id,
+                    original_claim=claim,
+                    process_verdict="dead",
+                    lock_verdict="retained",
+                    publication_id=None,
+                    evidence_id=None,
+                    automatic_handling_stage="startup_report",
+                    automatic_handling_result=record.controller_phase,
+                ),
+                claim=claim,
+                deferred=True,
+            )
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:
