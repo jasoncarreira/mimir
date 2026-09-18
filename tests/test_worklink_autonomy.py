@@ -1952,7 +1952,7 @@ def test_poller_dispatch_reports_and_propagates_coding_state(
     assert inherited == [configured if configured is not None else "<unset>"]
 
 
-def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
+def test_poller_failure_escalation_dedupes_and_legacy_attention_stops_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2051,7 +2051,7 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     state["issues"]["201"]["retry_after"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     save_failure_state(state_dir, state)
     recovered = _run_poller(tmp_path, env)
-    assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
+    assert not [e for e in recovered if e.get("signal") == "worklink_dispatched"]
 
 
 def test_poller_dispatches_only_after_failure_alert_is_durably_acked(

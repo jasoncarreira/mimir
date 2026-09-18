@@ -1021,6 +1021,7 @@ def reattach_inflight_worklink_runs(
     from .worklink.dispatch_failures import (
         RESERVATION_ENV,
         active_reservation_id,
+        bind_reservation_owner,
         dispatch_failure_state_dir,
         record_attention,
     )
@@ -1091,19 +1092,27 @@ def reattach_inflight_worklink_runs(
         except OSError:
             log_fh = subprocess.DEVNULL
         try:
-            spawn(
+            process = spawn(
                 argv,
                 cwd=repo,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
                 start_new_session=True,  # detach: survive this startup + outlive it
-                **(
-                    {"env": {**os.environ, RESERVATION_ENV: reservation_id}}
-                    if reservation_id is not None
-                    else {}
-                ),
+                env={**os.environ, RESERVATION_ENV: reservation_id or ""},
             )
+            child_pid = getattr(process, "pid", None)
+            if reservation_id is not None and type(child_pid) is int and child_pid > 0:
+                from .worklink.run_state import process_start_ticks
+
+                bind_reservation_owner(
+                    dispatch_failure_state_dir(home),
+                    issue_id=state.issue_id,
+                    reservation_id=reservation_id,
+                    pid=child_pid,
+                    start_ticks=process_start_ticks(child_pid),
+                    recovery=True,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             if reservation_id is not None:
                 record_attention(
@@ -1160,19 +1169,27 @@ def reattach_inflight_worklink_runs(
         except OSError:
             log_fh = subprocess.DEVNULL
         try:
-            spawn(
+            process = spawn(
                 argv,
                 cwd=repo,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
                 start_new_session=True,
-                **(
-                    {"env": {**os.environ, RESERVATION_ENV: reservation_id}}
-                    if reservation_id is not None
-                    else {}
-                ),
+                env={**os.environ, RESERVATION_ENV: reservation_id or ""},
             )
+            child_pid = getattr(process, "pid", None)
+            if reservation_id is not None and type(child_pid) is int and child_pid > 0:
+                from .worklink.run_state import process_start_ticks
+
+                bind_reservation_owner(
+                    dispatch_failure_state_dir(home),
+                    issue_id=record.issue_id,
+                    reservation_id=reservation_id,
+                    pid=child_pid,
+                    start_ticks=process_start_ticks(child_pid),
+                    recovery=True,
+                )
         except (OSError, subprocess.SubprocessError) as exc:
             if reservation_id is not None:
                 record_attention(

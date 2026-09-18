@@ -10,6 +10,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
+import re
+import json
+import os
+import stat
+import subprocess
 from typing import Any, Mapping
 
 
@@ -359,6 +364,316 @@ def inspect_clearance(
     )
 
 
+def rehydrate_attention(
+    home: Path,
+    occurrence_id: str,
+    *,
+    runner: Any = None,
+    validators: Mapping[AttentionSource, Any] | None = None,
+) -> ClearanceInspection:
+    """Strictly read all authorities needed to inspect one durable occurrence.
+
+    This is deliberately read-only.  It never labels, claims, resumes, pushes,
+    or publishes.  Every required authority is read even when an earlier
+    predicate is false, so absence is not inferred from a partial view.
+    """
+    from .dispatch_failures import dispatch_failure_state_dir, load_outcome_state
+
+    state = load_outcome_state(dispatch_failure_state_dir(home))
+    issue_id: int | None = None
+    occurrence: Mapping[str, object] | None = None
+    issue_state: Mapping[str, Any] | None = None
+    for key, candidate in state["issues"].items():
+        found = candidate["occurrences"].get(occurrence_id)
+        if found is not None:
+            issue_id = int(key)
+            occurrence = found
+            issue_state = candidate
+            break
+    if issue_id is None or occurrence is None or issue_state is None:
+        raise AttentionSchemaError("attention occurrence does not exist")
+
+    source = AttentionSource(occurrence["source"])
+    kind = AttentionKind(occurrence["kind"])
+    required = clearance_requirements(source)
+    run = runner or _strict_subprocess_runner(home)
+    verdicts: dict[ReaderCode, str] = {}
+
+    tracker: Mapping[str, object] | None = None
+    try:
+        response = run(["chainlink", "issue", "show", str(issue_id), "--json"])
+        if response.returncode != 0:
+            raise RuntimeError("tracker read failed")
+        value = json.loads(response.stdout or "{}")
+        if (
+            not isinstance(value, dict)
+            or int(value.get("id", value.get("number", 0))) != issue_id
+            or not isinstance(value.get("labels", []), list)
+            or not isinstance(value.get("comments", []), list)
+        ):
+            raise RuntimeError("tracker projection is invalid")
+        tracker = value
+        verdicts[ReaderCode.TRACKER] = "pass"
+    except Exception:
+        verdicts[ReaderCode.TRACKER] = "error"
+
+    live_leaf = False
+    leaf_state = None
+    try:
+        leaf_state = _strict_leaf_record(home, issue_id)
+        if leaf_state is not None:
+            from .run_state import process_is_alive
+
+            live_leaf = process_is_alive(leaf_state)
+        verdicts[ReaderCode.LEAF_RECORD] = "pass"
+        verdicts[ReaderCode.LEAF_PROCESS] = "blocked" if live_leaf else "pass"
+    except Exception:
+        verdicts[ReaderCode.LEAF_RECORD] = "error"
+        verdicts[ReaderCode.LEAF_PROCESS] = "error"
+
+    factory_records: list[Any] = []
+    live_factory = False
+    try:
+        from .factory_state import (
+            factory_process_is_alive,
+            load_factory_records_for_issue,
+        )
+
+        factory_records = load_factory_records_for_issue(home, issue_id)
+        live_factory = any(factory_process_is_alive(record) for record in factory_records)
+        verdicts[ReaderCode.FACTORY_RECORD] = "pass"
+        verdicts[ReaderCode.FACTORY_PROCESS] = "blocked" if live_factory else "pass"
+    except Exception:
+        verdicts[ReaderCode.FACTORY_RECORD] = "error"
+        verdicts[ReaderCode.FACTORY_PROCESS] = "error"
+
+    factory_status = factory_records[0].status if factory_records else None
+    if ReaderCode.FACTORY_STATUS in required:
+        try:
+            if factory_records:
+                from .backends.feature_factory import FeatureFactoryBackend
+                from .backends.registry import BackendRegistry, WorklinkConfig
+
+                backend = BackendRegistry(WorklinkConfig.load(home / "worklink.yaml")).get(
+                    "feature_factory"
+                )
+                if not isinstance(backend, FeatureFactoryBackend):
+                    raise RuntimeError("factory backend is unavailable")
+                record = factory_records[0]
+                factory_status = backend.status(
+                    record.run_id,
+                    sandbox=Path(record.sandbox),
+                    launcher=record.launcher,
+                )
+            verdicts[ReaderCode.FACTORY_STATUS] = "pass"
+        except Exception:
+            verdicts[ReaderCode.FACTORY_STATUS] = "error"
+
+    # Both owner inventories are mandatory before claiming that no executor or
+    # lock conflicts with clearance.
+    try:
+        owner_conflict = live_leaf or live_factory
+        verdicts[ReaderCode.CLAIM_OWNERS] = "blocked" if owner_conflict else "pass"
+    except Exception:
+        verdicts[ReaderCode.CLAIM_OWNERS] = "error"
+    try:
+        response = run(["chainlink", "locks", "list", "--json"])
+        if response.returncode != 0:
+            raise RuntimeError("lock inventory failed")
+        lock_data = json.loads(response.stdout or "{}")
+        lock_ids = _strict_lock_ids(lock_data)
+        verdicts[ReaderCode.CHAINLINK_LOCKS] = (
+            "blocked" if issue_id in lock_ids else "pass"
+        )
+    except Exception:
+        verdicts[ReaderCode.CHAINLINK_LOCKS] = "error"
+
+    evidence: Mapping[str, object] | None = None
+    evidence_path = _occurrence_evidence_path(occurrence, issue_state)
+    try:
+        if evidence_path is not None:
+            evidence = _read_strict_json(evidence_path)
+            if int(evidence.get("issue_id", 0)) != issue_id:
+                raise RuntimeError("evidence issue mismatch")
+        verdicts[ReaderCode.EVIDENCE] = (
+            "pass"
+            if _evidence_is_success(evidence)
+            or (evidence is None and kind == AttentionKind.START)
+            or (evidence is None and SOURCE_RULES[source].clearance == ClearancePolicy.VALIDATOR)
+            else "blocked"
+        )
+    except Exception:
+        verdicts[ReaderCode.EVIDENCE] = "error"
+
+    pr_url = (
+        str(evidence.get("pr_url"))
+        if evidence is not None and evidence.get("pr_url")
+        else _occurrence_pr_url(occurrence, issue_state)
+    )
+    try:
+        if pr_url is None:
+            if evidence is not None and evidence.get("pr_url") is not None:
+                raise RuntimeError("evidence PR is malformed")
+            verdicts[ReaderCode.PULL_REQUEST] = "pass"
+        else:
+            response = run([
+                "gh", "pr", "view", pr_url,
+                "--json", "state,headRefOid,baseRefName,url",
+            ])
+            if response.returncode != 0:
+                raise RuntimeError("pull request read failed")
+            pr = json.loads(response.stdout or "{}")
+            expected_head = evidence.get("head_sha") if evidence else None
+            if (
+                not isinstance(pr, dict)
+                or pr.get("url") != pr_url
+                or pr.get("state") not in {"OPEN", "MERGED"}
+                or (expected_head is not None and pr.get("headRefOid") != expected_head)
+            ):
+                verdicts[ReaderCode.PULL_REQUEST] = "blocked"
+            else:
+                verdicts[ReaderCode.PULL_REQUEST] = "pass"
+    except Exception:
+        verdicts[ReaderCode.PULL_REQUEST] = "error"
+
+    if ReaderCode.VALIDATOR in required:
+        validator = (validators or {}).get(source)
+        if validator is None:
+            verdicts[ReaderCode.VALIDATOR] = "error"
+        else:
+            try:
+                verdicts[ReaderCode.VALIDATOR] = (
+                    "pass" if validator(dict(occurrence["facts"])) else "blocked"
+                )
+            except Exception:
+                verdicts[ReaderCode.VALIDATOR] = "error"
+
+    reservation = issue_state["reservations"][occurrence["reservation_id"]]
+    witness_id = None
+    if kind == AttentionKind.START:
+        if reservation["state"] == "active":
+            lifecycle = "current"
+        elif reservation["disposition"] == "success":
+            lifecycle = "superseded"
+        else:
+            lifecycle = "changed"
+        for reader in required:
+            if verdicts.get(reader) not in {"error", "blocked"}:
+                verdicts[reader] = lifecycle
+    elif kind == AttentionKind.SUCCESS:
+        witness_id = str(occurrence["facts"]["witness_id"])
+        strict_success = (
+            witness_id in issue_state["success_witnesses"]
+            and verdicts.get(ReaderCode.EVIDENCE) == "pass"
+            and verdicts.get(ReaderCode.PULL_REQUEST) == "pass"
+        )
+        lifecycle = "current" if strict_success else "changed"
+        for reader in required:
+            if verdicts.get(reader) not in {"error", "blocked"}:
+                verdicts[reader] = lifecycle
+
+    return inspect_clearance(
+        occurrence,
+        verdicts,
+        witness_id=witness_id,
+    )
+
+
+def _strict_subprocess_runner(home: Path) -> Any:
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            argv,
+            cwd=home,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+
+    return run
+
+
+def _strict_leaf_record(home: Path, issue_id: int) -> Any:
+    from .run_state import WorklinkRunState, runs_dir
+
+    path = runs_dir(home) / f"{issue_id}.json"
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    payload = _read_strict_json(path)
+    state = WorklinkRunState.from_json(payload)
+    if state.issue_id != issue_id:
+        raise RuntimeError("leaf record identity mismatch")
+    return state
+
+
+def _read_strict_json(path: Path) -> Mapping[str, object]:
+    value = path.lstat()
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode) or value.st_size > 4 * 1024 * 1024:
+        raise RuntimeError("required JSON is not a bounded regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        raw = os.read(fd, 4 * 1024 * 1024 + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > 4 * 1024 * 1024 or b"\x00" in raw:
+        raise RuntimeError("required JSON exceeds bounds")
+    parsed = json.loads(raw.decode("utf-8", "strict"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("required JSON is not an object")
+    return parsed
+
+
+def _strict_lock_ids(value: object) -> set[int]:
+    rows = value.get("locks", value if isinstance(value, list) else None) if isinstance(value, dict) else value
+    if isinstance(rows, dict):
+        iterable = rows.items()
+    elif isinstance(rows, list):
+        iterable = enumerate(rows)
+    else:
+        raise RuntimeError("lock inventory is malformed")
+    result: set[int] = set()
+    for key, row in iterable:
+        raw = row.get("issue_id") if isinstance(row, dict) else key
+        if type(raw) not in {int, str}:
+            raise RuntimeError("lock identity is malformed")
+        result.add(int(raw))
+    return result
+
+
+def _occurrence_evidence_path(
+    occurrence: Mapping[str, object], issue_state: Mapping[str, Any]
+) -> Path | None:
+    facts = occurrence["facts"]
+    raw = facts.get("evidence_id") if isinstance(facts, dict) else None
+    if isinstance(raw, str) and Path(raw).is_absolute():
+        return Path(raw)
+    if occurrence["kind"] == "success" and isinstance(facts, dict):
+        raw = facts.get("evidence_path")
+        if isinstance(raw, str) and Path(raw).is_absolute():
+            return Path(raw)
+    return None
+
+
+def _occurrence_pr_url(
+    occurrence: Mapping[str, object], issue_state: Mapping[str, Any]
+) -> str | None:
+    facts = occurrence["facts"]
+    raw = facts.get("pr_url") if isinstance(facts, dict) else None
+    return raw if isinstance(raw, str) and raw.startswith("https://") else None
+
+
+def _evidence_is_success(evidence: Mapping[str, object] | None) -> bool:
+    return bool(
+        evidence is not None
+        and evidence.get("status") == "completed"
+        and isinstance(evidence.get("head_sha"), str)
+        and re.fullmatch(r"[0-9a-f]{40,64}", str(evidence["head_sha"]))
+    )
+
+
 @dataclass(frozen=True)
 class ClaimIdentity:
     issue_id: int
@@ -586,6 +901,25 @@ FACT_TYPES = {
     "lifecycle_success": LifecycleSuccessFacts,
 }
 
+_FACT_FIELDS = {
+    "input": {"type", "repository", "config", "inventory", "template", "issue_snapshot_sha256", "validator", "result"},
+    "claim": {"type", "intended", "confirmed", "result", "lock_identity", "command_operation", "return_code", "mutation_stage", "history_read"},
+    "launch": {"type", "executable", "compute", "checkout", "operation", "returned_handle", "pid", "start_ticks", "launch_result", "state_save_result"},
+    "leaf": {"type", "backend", "checkout", "base", "branch", "isolated", "compute_result", "backend_status", "validation_reason_codes", "evidence_id", "evidence_sha256", "pr_url", "head_sha"},
+    "factory": {"type", "run_id", "issue_id", "attempt", "sandbox", "session", "controller_phase", "controller_error", "status", "valid", "lock", "dead_lock", "lock_session", "gates", "steps", "slices", "pr_url", "next", "next_present", "park_snapshot", "read_result"},
+    "reconcile": {"type", "original_run_id", "original_claim", "process_verdict", "lock_verdict", "publication_id", "evidence_id", "automatic_handling_stage", "automatic_handling_result"},
+    "interrupt": {"type", "interrupted_source", "process_verdict", "handle_verdict", "retained_binding", "positive_proof_ids"},
+    "legacy": {"type", "original_key", "signature", "occurrence", "row"},
+    "lifecycle_start": {"type", "target", "claim", "admitted_at", "run_id", "sandbox", "admission"},
+    "lifecycle_success": {"type", "target", "witness_id", "completed_at", "evidence_path", "evidence_sha256", "branch", "head_sha", "pr_url", "run_id", "sandbox", "next", "next_present"},
+}
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_PROOF_ID = re.compile(
+    r"(?:leaf_outcome:[0-9a-f]{64}|factory_partial|factory_merged_slice:[0-9]+|"
+    r"factory_step:[0-9]+:(?:accepted|rejected):[1-9][0-9]*|"
+    r"(?:leaf|factory)_completion:[0-9a-f]{64})"
+)
+
 
 @dataclass(frozen=True)
 class SourceRule:
@@ -722,6 +1056,9 @@ def validate_occurrence_contract(
         raise AttentionSchemaError(
             f"{source.value} requires {rule.fact_type} facts, got {fact_type!r}"
         )
+    if set(facts) != _FACT_FIELDS[rule.fact_type]:
+        raise AttentionSchemaError(f"{rule.fact_type} facts fields are invalid")
+    _json_safe_mapping(facts, "facts")
     lifecycle_kind = (
         AttentionKind.START if source in {AttentionSource.LEAF_START, AttentionSource.FACTORY_START}
         else AttentionKind.SUCCESS if source in {AttentionSource.LEAF_SUCCESS, AttentionSource.FACTORY_SUCCESS}
@@ -746,8 +1083,25 @@ def validate_occurrence_contract(
         raise AttentionSchemaError("success requires a consuming original-work settlement")
     if accounting.consumed is True and not proof_ids:
         raise AttentionSchemaError("consumption requires positive proof")
+    if len(proof_ids) != len(set(proof_ids)) or not all(
+        isinstance(proof, str) and _PROOF_ID.fullmatch(proof) for proof in proof_ids
+    ):
+        raise AttentionSchemaError("positive proof ids are invalid")
     if source == AttentionSource.FACTORY_PARTIAL and accounting.consumed is not True:
         raise AttentionSchemaError("factory partial must consume its proven work claim")
+    if kind in {AttentionKind.START, AttentionKind.SUCCESS}:
+        expected_target = "leaf" if source.value.startswith("leaf_") else "factory"
+        target = facts.get("target")
+        target_value = target.value if isinstance(target, AttentionTarget) else target
+        if target_value != expected_target:
+            raise AttentionSchemaError("lifecycle source and target do not match")
+    if fact_type == "lifecycle_success":
+        if not isinstance(facts.get("evidence_path"), str) or not Path(str(facts["evidence_path"])).is_absolute():
+            raise AttentionSchemaError("lifecycle success evidence path is invalid")
+        if not isinstance(facts.get("evidence_sha256"), str) or _SHA256.fullmatch(str(facts["evidence_sha256"])) is None:
+            raise AttentionSchemaError("lifecycle success evidence hash is invalid")
+        if type(facts.get("next_present")) is not bool:
+            raise AttentionSchemaError("lifecycle success next presence is invalid")
 
 
 def facts_to_json(value: object) -> dict[str, object]:

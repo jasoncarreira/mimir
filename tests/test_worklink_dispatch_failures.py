@@ -21,6 +21,9 @@ from mimir.worklink.dispatch_failures import (
     pending_attention,
     record_attention,
     reserve_dispatch,
+    issue_dispatch_disposition,
+    record_contention_recurrence,
+    reservation_from_environment,
 )
 
 
@@ -79,7 +82,7 @@ def test_claim_settlement_is_exactly_once_and_proof_controls_consumption(
     assert settlement["consumed"] is False
     assert occurrence["accounting"]["settlement_key"] == claim().key
 
-    with pytest.raises(FailureStateError, match="conflicting settlement"):
+    with pytest.raises(FailureStateError, match="does not match terminal evidence"):
         record_attention(
             state_dir,
             issue_id=42,
@@ -147,3 +150,69 @@ def test_occurrence_identity_has_independent_lifecycle_slots() -> None:
     assert occurrence_identity(reservation, "op-1", "start") != occurrence_identity(
         reservation, "op-1", "terminal"
     )
+
+
+def test_unknown_inherited_reservation_refuses_and_empty_legacy_does_not_invent(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "ledger"
+    with pytest.raises(FailureStateError, match="does not exist"):
+        reservation_from_environment(
+            state_dir,
+            issue_id=42,
+            target="leaf",
+            autonomous=True,
+            environ={"MIMIR_WORKLINK_RESERVATION_ID": "fa21f7d8-7f41-4dd8-83a9-64be68f02889"},
+        )
+    assert reservation_from_environment(
+        state_dir,
+        issue_id=42,
+        target="leaf",
+        autonomous=True,
+        environ={"MIMIR_WORKLINK_RESERVATION_ID": ""},
+    ) is None
+    assert load_outcome_state(state_dir)["issues"] == {}
+
+
+def test_prepared_reservation_cannot_hide_prior_stop(tmp_path: Path) -> None:
+    state_dir = tmp_path / "ledger"
+    first = reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=first,
+        source=AttentionSource.CLAIM_COMMAND,
+        cause=AttentionCause.CLAIM_COMMAND_FAILED,
+        facts=ClaimFacts(None, None, "failed"),
+    )
+    reserve_dispatch(state_dir, issue_id=42, target="leaf", autonomous=True)
+    assert issue_dispatch_disposition(state_dir, 42) == "stop"
+
+
+def test_contention_recurrence_is_30_120_then_stop_and_success_only_reset(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "ledger"
+    now = datetime(2026, 9, 18, tzinfo=UTC)
+    first = record_contention_recurrence(
+        state_dir, issue_id=42, signature="same", now=now
+    )
+    second = record_contention_recurrence(
+        state_dir, issue_id=42, signature="same", now=now
+    )
+    third = record_contention_recurrence(
+        state_dir, issue_id=42, signature="same", now=now
+    )
+    assert first == ("transient_retry", "2026-09-18T00:00:30+00:00")
+    assert second == ("transient_retry", "2026-09-18T00:02:00+00:00")
+    assert third == ("stop", None)
+    record_contention_recurrence(
+        state_dir,
+        issue_id=42,
+        signature="same",
+        verified_work_success=True,
+        now=now,
+    )
+    assert record_contention_recurrence(
+        state_dir, issue_id=42, signature="same", now=now
+    ) == first

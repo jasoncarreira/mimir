@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
+import json
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -18,7 +22,14 @@ from mimir.worklink.attention import (
     clearance_requirements,
     inspect_clearance,
     positive_factory_proofs,
+    rehydrate_attention,
     validate_occurrence_contract,
+)
+from mimir.worklink.dispatch_failures import (
+    confirm_claim_and_start,
+    dispatch_failure_state_dir,
+    record_attention,
+    reserve_dispatch,
 )
 
 
@@ -91,3 +102,90 @@ def test_each_source_clearance_requires_all_strict_readers(source: AttentionSour
         inspection = inspect_clearance(occurrence, failed)
         assert inspection.read_errors == (reader,)
         assert inspection.result.value == "read_error"
+
+
+def test_rehydration_reads_tracker_locks_evidence_and_pr_from_real_boundaries(
+    tmp_path: Path,
+) -> None:
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=42, target="leaf", autonomous=True
+    )
+    claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim
+    )
+    evidence = tmp_path / "evidence.json"
+    payload = {
+        "issue_id": 42,
+        "status": "completed",
+        "head_sha": "a" * 40,
+        "pr_url": "https://github.com/o/r/pull/1",
+    }
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    occurrence = record_attention(
+        state_dir,
+        issue_id=42,
+        reservation_id=reservation,
+        source=AttentionSource.LEAF_BACKEND_OUTCOME,
+        cause=AttentionCause.BACKEND_BLOCKED,
+        facts={
+            "type": "leaf", "backend": "fake", "checkout": str(tmp_path),
+            "base": "main", "branch": "issue/42-a1", "isolated": True,
+            "compute_result": "blocked", "backend_status": "blocked",
+            "validation_reason_codes": [], "evidence_id": str(evidence),
+            "evidence_sha256": digest,
+            "pr_url": "https://github.com/o/r/pull/1", "head_sha": "a" * 40,
+        },
+        claim=claim,
+        proof_ids=(f"leaf_outcome:{digest}",),
+    )
+
+    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"id": 42, "labels": [], "comments": []}), ""
+            )
+        if argv[:3] == ["chainlink", "locks", "list"]:
+            return subprocess.CompletedProcess(argv, 0, '{"locks":[]}', "")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "OPEN", "headRefOid": "a" * 40,
+                    "baseRefName": "main", "url": "https://github.com/o/r/pull/1",
+                }),
+                "",
+            )
+        raise AssertionError(argv)
+
+    inspection = rehydrate_attention(
+        tmp_path, occurrence["delivery_key"].rsplit(":", 1)[-1], runner=runner
+    )
+    assert inspection.result.value == "resolved"
+    assert inspection.read_errors == ()
+
+
+def test_rehydration_preserves_each_real_reader_error(tmp_path: Path) -> None:
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=42, target="leaf", autonomous=True
+    )
+    claim = ClaimIdentity(42, 1, "agent", "2026-09-18T00:00:00+00:00")
+    start = confirm_claim_and_start(
+        state_dir, issue_id=42, reservation_id=reservation, claim=claim
+    )
+
+    def failed(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, "", "failed")
+
+    inspection = rehydrate_attention(
+        tmp_path, start["delivery_key"].rsplit(":", 1)[-1], runner=failed
+    )
+    assert set(inspection.read_errors) == {
+        ReaderCode.TRACKER,
+        ReaderCode.CHAINLINK_LOCKS,
+    }
+    assert inspection.result.value == "read_error"

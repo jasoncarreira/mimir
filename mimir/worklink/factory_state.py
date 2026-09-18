@@ -505,6 +505,43 @@ def report_retained_factory_records(
             sandbox=record.sandbox,
             reason="factory handoff has not archived and verified the control plane",
         )
+        if factory_process_is_verified_dead(record):
+            from .attention import ReconcileFacts
+            from .dispatch_failures import (
+                active_reservation_id,
+                dispatch_failure_state_dir,
+                record_attention,
+                reservation_claim,
+            )
+
+            state_dir = dispatch_failure_state_dir(home)
+            reservation_id = active_reservation_id(
+                state_dir, issue_id=record.issue_id, target="factory"
+            )
+            if reservation_id is not None:
+                claim = reservation_claim(
+                    state_dir,
+                    issue_id=record.issue_id,
+                    reservation_id=reservation_id,
+                )
+                record_attention(
+                    state_dir,
+                    issue_id=record.issue_id,
+                    reservation_id=reservation_id,
+                    source="factory_startup_reconcile",
+                    cause="controller_lost",
+                    facts=ReconcileFacts(
+                        original_run_id=record.run_id,
+                        original_claim=claim,
+                        process_verdict="dead",
+                        lock_verdict="retained",
+                        publication_id=None,
+                        evidence_id=None,
+                        automatic_handling_stage="startup_report",
+                        automatic_handling_result=record.controller_phase,
+                    ),
+                    claim=claim,
+                )
 
 
 def factory_process_is_alive(record: FactoryRunRecord) -> bool:

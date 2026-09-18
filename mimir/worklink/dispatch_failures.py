@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import uuid
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from .attention import (
     AttentionTarget,
     ClaimIdentity,
     SettlementBasis,
+    SOURCE_RULES,
     facts_to_json,
     validate_occurrence_contract,
 )
@@ -287,6 +289,22 @@ def _validate_v2(state: Mapping[str, object]) -> None:
                 or recurrence["disposition"] not in {"transient_retry", "stop"}
             ):
                 raise FailureStateError("contention recurrence is invalid")
+        for settlement in issue["settlements"].values():
+            reservation = issue["reservations"][settlement["reservation_id"]]
+            if reservation["binding"]["claim"] != settlement["claim"]:
+                raise FailureStateError("settlement does not match reservation claim")
+            if reservation["claim_state"] != "settled":
+                raise FailureStateError("settlement reservation claim is not settled")
+            operation = reservation["operations"].get(settlement["terminal_operation_id"])
+            if operation is None or operation["state"] != "finished":
+                raise FailureStateError("settlement terminal operation is invalid")
+            if not set(settlement["proof_ids"]).issubset(reservation["positive_proofs"]):
+                raise FailureStateError("settlement proof was not retained by reservation")
+        for occurrence in issue["occurrences"].values():
+            if occurrence["kind"] == "success":
+                witness_id = occurrence["facts"]["witness_id"]
+                if witness_id not in issue["success_witnesses"]:
+                    raise FailureStateError("success occurrence witness is absent")
 
 
 def _validate_reservation(reservation_id: object, value: object, issue_id: int) -> None:
@@ -308,7 +326,17 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
         raise FailureStateError("reservation disposition is invalid")
     if not isinstance(value["operations"], dict) or not isinstance(value["positive_proofs"], list):
         raise FailureStateError("reservation operations/proofs are invalid")
-    if not all(isinstance(proof, str) and proof for proof in value["positive_proofs"]):
+    if not all(
+        isinstance(proof, str)
+        and re.fullmatch(
+            r"(?:leaf_outcome:[0-9a-f]{64}|factory_partial|"
+            r"factory_merged_slice:[0-9]+|factory_step:[0-9]+:"
+            r"(?:accepted|rejected):[1-9][0-9]*|"
+            r"(?:leaf|factory)_completion:[0-9a-f]{64})",
+            proof,
+        )
+        for proof in value["positive_proofs"]
+    ):
         raise FailureStateError("reservation proof is invalid")
     owner = value["owner"]
     if owner is not None and (
@@ -325,6 +353,12 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
             ClaimIdentity.from_json(binding["claim"])
         except AttentionSchemaError as exc:
             raise FailureStateError(str(exc)) from exc
+    if value["claim_state"] == "none" and binding["claim"] is not None:
+        raise FailureStateError("unclaimed reservation carries a claim")
+    if value["claim_state"] in {"intent", "confirmed", "settled"} and binding["claim"] is None:
+        raise FailureStateError("claimed reservation has no claim identity")
+    if value["state"] == "active" and value["claim_state"] != "confirmed":
+        raise FailureStateError("active reservation claim is not confirmed")
     lifecycle = value["lifecycle_operation_id"]
     if lifecycle is not None and lifecycle not in value["operations"]:
         raise FailureStateError("reservation lifecycle operation is invalid")
@@ -339,6 +373,16 @@ def _validate_reservation(reservation_id: object, value: object, issue_id: int) 
             raise FailureStateError("operation source is invalid") from exc
         if operation["state"] not in {"running", "finished"}:
             raise FailureStateError("operation state is invalid")
+        if operation["state"] == "running" and (
+            operation["finished_at"] is not None
+            or operation["occurrence_id"] is not None
+        ):
+            raise FailureStateError("running operation has terminal fields")
+        if operation["state"] == "finished" and (
+            not isinstance(operation["finished_at"], str)
+            or not isinstance(operation["occurrence_id"], str)
+        ):
+            raise FailureStateError("finished operation lacks terminal fields")
 
 
 def _validate_settlement(key: object, value: object, issue_id: int, issue: Mapping[str, Any]) -> None:
@@ -360,6 +404,8 @@ def _validate_settlement(key: object, value: object, issue_id: int, issue: Mappi
         raise FailureStateError("settlement proofs are invalid")
     if value["consumed"] != bool(proofs) or (value["consumed"] and value["basis"] != "positive_work"):
         raise FailureStateError("settlement consumption lacks positive proof")
+    if not value["consumed"] and value["basis"] != "no_work":
+        raise FailureStateError("nonconsuming settlement basis is invalid")
 
 
 def _validate_occurrence(key: object, value: object, issue_id: int, issue: Mapping[str, Any]) -> None:
@@ -445,6 +491,14 @@ def _validate_witness(key: object, value: object, issue_id: int) -> None:
         raise FailureStateError("success witness evidence path is invalid")
     if success_witness_identity(value) != key:
         raise FailureStateError("success witness digest is invalid")
+    if not isinstance(value["evidence_sha256"], str) or not re.fullmatch(
+        r"[0-9a-f]{64}", value["evidence_sha256"]
+    ):
+        raise FailureStateError("success witness evidence hash is invalid")
+    if value["next"] is not None and value["next_present"] is not True:
+        raise FailureStateError("success witness next presence is contradictory")
+    if value["origin"] == "manual" and value["claim"] is not None:
+        raise FailureStateError("manual success witness cannot claim autonomous work")
 
 
 def _migrate_v1(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -519,12 +573,24 @@ def reserve_dispatch(
         owner = None
         if owner_pid is not None:
             owner = {"pid": owner_pid, "start_ticks": owner_start_ticks}
+        lifecycle_operation_id = "lifecycle"
+        lifecycle_source = "leaf_start" if target_value == "leaf" else "factory_start"
+        prepared_at = datetime.now(UTC).isoformat()
         issue["reservations"][reservation_id] = {
             "sequence": issue["next_sequence"], "issue_id": issue_id, "target": target_value,
             "autonomous": autonomous, "state": "prepared", "owner": owner,
-            "binding": normalized_binding, "claim_state": "none", "operations": {},
+            "binding": normalized_binding, "claim_state": "none", "operations": {
+                lifecycle_operation_id: {
+                    "source": lifecycle_source,
+                    "owner": owner,
+                    "state": "running",
+                    "started_at": prepared_at,
+                    "finished_at": None,
+                    "occurrence_id": None,
+                }
+            },
             "positive_proofs": [], "disposition": "pending", "retry_after": None,
-            "lifecycle_operation_id": None,
+            "lifecycle_operation_id": lifecycle_operation_id,
         }
         issue["next_sequence"] += 1
     return reservation_id
@@ -536,11 +602,103 @@ def reservation_from_environment(
 ) -> str | None:
     if not autonomous:
         return None
-    inherited = environ.get(RESERVATION_ENV)
+    if RESERVATION_ENV in environ:
+        inherited = environ[RESERVATION_ENV]
+        # Startup recovery for a pre-v2 run deliberately carries an empty
+        # private reference.  It remains autonomous for policy purposes, but it
+        # must not manufacture provenance for work the ledger never reserved.
+        if not inherited:
+            return None
+        if not _is_uuid(inherited):
+            raise FailureStateError("inherited reservation id is invalid")
+        with outcome_state_transaction(state_dir) as state:
+            reservation = _reservation(state, issue_id, inherited)
+            if reservation["target"] != AttentionTarget(target).value:
+                raise FailureStateError("inherited reservation target mismatch")
+            if reservation["autonomous"] is not True:
+                raise FailureStateError("inherited reservation is not autonomous")
+            if reservation["state"] == "terminal":
+                raise FailureStateError("terminal reservation cannot be inherited")
+        return inherited
     return reserve_dispatch(
-        state_dir, issue_id=issue_id, target=target, autonomous=True,
-        reservation_id=inherited, owner_pid=os.getpid(),
+        state_dir,
+        issue_id=issue_id,
+        target=target,
+        autonomous=True,
+        owner_pid=os.getpid(),
+        owner_start_ticks=_process_start_ticks(os.getpid()),
     )
+
+
+def bind_reservation_owner(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    reservation_id: str,
+    pid: int,
+    start_ticks: int | None,
+    recovery: bool = False,
+) -> None:
+    """Bind a prepared launch to the exact spawned process without guessing."""
+    if pid <= 0:
+        raise FailureStateError("reservation owner pid is invalid")
+    with outcome_state_transaction(state_dir) as state:
+        reservation = _reservation(state, issue_id, reservation_id)
+        if reservation["state"] == "terminal":
+            raise FailureStateError("terminal reservation cannot acquire an owner")
+        owner = {"pid": pid, "start_ticks": start_ticks}
+        existing = reservation["owner"]
+        if existing is not None and existing != owner:
+            lifecycle = reservation["operations"].get(
+                reservation["lifecycle_operation_id"]
+            )
+            fresh_handoff = (
+                reservation["state"] == "prepared"
+                and reservation["disposition"] == "pending"
+                and len(reservation["operations"]) == 1
+                and lifecycle is not None
+                and lifecycle["state"] == "running"
+            )
+            retry_handoff = (
+                reservation["state"] == "prepared"
+                and reservation["disposition"] == "transient_retry"
+                and _owner_verified_dead(existing)
+            )
+            recovery_handoff = recovery and _owner_verified_dead(existing)
+            # A fresh prepared poller owner may hand off once to its child; a
+            # bounded transient retry may hand off again only after verified
+            # death of the prior child.
+            if (
+                reservation["operations"]
+                and not fresh_handoff
+                and not retry_handoff
+                and not recovery_handoff
+            ) or existing["pid"] == pid:
+                raise FailureStateError("reservation owner changed")
+        reservation["owner"] = owner
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return int(fields[21]) if len(fields) > 21 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _owner_verified_dead(owner: Mapping[str, object]) -> bool:
+    pid = owner.get("pid")
+    expected = owner.get("start_ticks")
+    if type(pid) is not int or type(expected) is not int:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    observed = _process_start_ticks(pid)
+    return observed is not None and observed != expected
 
 
 def bind_claim(
@@ -575,15 +733,22 @@ def confirm_claim_and_start(
         existing_claim = reservation["binding"]["claim"]
         if existing_claim is not None and existing_claim != claim.to_json():
             raise FailureStateError("reservation claim confirmation conflicts")
-        reservation["binding"] = {"run_id": run_id, "sandbox": sandbox, "claim": claim.to_json()}
+        for name, supplied in (("run_id", run_id), ("sandbox", sandbox)):
+            existing = reservation["binding"][name]
+            if existing is not None and supplied != existing:
+                raise FailureStateError(f"reservation {name} binding changed")
+            if supplied is not None:
+                reservation["binding"][name] = supplied
+        reservation["binding"]["claim"] = claim.to_json()
         reservation["claim_state"] = "confirmed"
-        if reservation["lifecycle_operation_id"] is not None:
-            operation = reservation["operations"][reservation["lifecycle_operation_id"]]
+        lifecycle_operation_id = reservation["lifecycle_operation_id"]
+        operation = reservation["operations"][lifecycle_operation_id]
+        if operation["occurrence_id"] is not None:
             return issue["occurrences"][operation["occurrence_id"]]
         if reservation["state"] == "terminal":
             raise FailureStateError("terminal reservation cannot reactivate")
         reservation["state"] = "active"
-        operation_id = _next_operation_id(reservation)
+        operation_id = lifecycle_operation_id
         source = AttentionSource.LEAF_START if reservation["target"] == "leaf" else AttentionSource.FACTORY_START
         facts = facts_to_json(LifecycleStartFacts(
             target=AttentionTarget(reservation["target"]), claim=claim,
@@ -595,7 +760,6 @@ def confirm_claim_and_start(
             accounting=Accounting(AccountingScope.NO_NEW_CLAIM, None, None, None),
             proof_ids=(), created_at=timestamp,
         )
-        reservation["lifecycle_operation_id"] = operation_id
         return occurrence
 
 
@@ -604,6 +768,7 @@ def record_attention(
     source: AttentionSource | str, cause: AttentionCause | str, facts: object,
     claim: ClaimIdentity | None = None, proof_ids: tuple[str, ...] = (),
     deferred: bool = False, disposition: str = "stop", now: datetime | None = None,
+    retry_after: str | None = None,
 ) -> dict[str, Any]:
     """Freeze one originating failure and its exact claim settlement atomically."""
     source_value = AttentionSource(source)
@@ -614,12 +779,27 @@ def record_attention(
         issue = state["issues"].get(str(issue_id))
         reservation = _reservation(state, issue_id, reservation_id)
         operation_id = _next_operation_id(reservation)
+        _validate_positive_proof_evidence(
+            source_value,
+            facts_json,
+            proof_ids,
+            retained=tuple(reservation["positive_proofs"]),
+        )
         if deferred:
             accounting = Accounting(AccountingScope.DEFERRED, claim, None, None)
         elif claim is None:
             accounting = Accounting(AccountingScope.NO_NEW_CLAIM, None, False, None)
         else:
-            settlement = _settle(issue, reservation_id, claim, proof_ids, operation_id, timestamp)
+            settlement = issue["settlements"].get(claim.key)
+            if settlement is None:
+                settlement = _settle(
+                    issue, reservation_id, claim, proof_ids, operation_id, timestamp
+                )
+            else:
+                # Settlement is immutable.  Later routing/recovery occurrences
+                # reference the original accounting rather than upgrading it
+                # from newly observed evidence.
+                proof_ids = tuple(settlement["proof_ids"])
             accounting = Accounting(
                 AccountingScope.BOUND_CLAIM, claim, settlement["consumed"], claim.key
             )
@@ -638,7 +818,47 @@ def record_attention(
                 "prepared" if disposition == "transient_retry" else "terminal"
             )
             reservation["disposition"] = disposition
+            reservation["retry_after"] = retry_after
         return occurrence
+
+
+def _validate_positive_proof_evidence(
+    source: AttentionSource,
+    facts: Mapping[str, object],
+    proof_ids: tuple[str, ...],
+    *,
+    retained: tuple[str, ...],
+) -> None:
+    if not proof_ids:
+        return
+    if SOURCE_RULES[source].work_capable and set(proof_ids).issubset(retained):
+        return
+    if facts.get("type") == "leaf":
+        evidence_hash = facts.get("evidence_sha256")
+        evidence_path = facts.get("evidence_id")
+        expected = f"leaf_outcome:{evidence_hash}"
+        if (
+            proof_ids != (expected,)
+            or not isinstance(evidence_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", evidence_hash) is None
+            or not isinstance(evidence_path, str)
+            or not Path(evidence_path).is_absolute()
+            or not SOURCE_RULES[source].work_capable
+        ):
+            raise FailureStateError("leaf work proof does not match terminal evidence")
+        return
+    if facts.get("type") == "factory":
+        from .attention import FactorySnapshot, positive_factory_proofs
+
+        # Reconstruct only the fields used by the structured proof derivation.
+        snapshot = FactorySnapshot(
+            **{key: value for key, value in facts.items() if key != "type"}  # type: ignore[arg-type]
+        )
+        allowed = {*retained, *positive_factory_proofs(snapshot)}
+        if not set(proof_ids).issubset(allowed):
+            raise FailureStateError("factory work proof is not present in structured history")
+        return
+    raise FailureStateError("source facts cannot carry positive work proof")
 
 
 def record_success_witness(
@@ -646,18 +866,35 @@ def record_success_witness(
     claim: ClaimIdentity | None, run_id: str | None, sandbox: str | None,
     completed_at: str, evidence_path: str, evidence_sha256: str, branch: str,
     head_sha: str, pr_url: str | None, next_value: str | None = None,
+    next_present: bool | None = None,
     reservation_id: str | None = None, proof_ids: tuple[str, ...] = (),
     observed_at: str | None = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Persist a verified completion; manual completions never produce prompts."""
     target_value = AttentionTarget(target)
+    evidence_file = Path(evidence_path)
+    try:
+        value = evidence_file.lstat()
+        if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode):
+            raise FailureStateError("success evidence is not a regular file")
+        observed_hash = hashlib.sha256(evidence_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise FailureStateError("success evidence cannot be read") from exc
+    if observed_hash != evidence_sha256:
+        raise FailureStateError("success evidence hash mismatch")
+    if re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:
+        raise FailureStateError("success witness head is invalid")
+    if not branch or len(branch.encode()) > 1024 or "\x00" in branch:
+        raise FailureStateError("success witness branch is invalid")
+    if pr_url is not None and not pr_url.startswith("https://"):
+        raise FailureStateError("success witness PR URL is invalid")
     witness = {
         "issue_id": issue_id, "target": target_value.value, "origin": origin,
         "claim": claim.to_json() if claim else None, "run_id": run_id, "sandbox": sandbox,
         "completed_at": completed_at, "observed_at": observed_at or datetime.now(UTC).isoformat(),
         "evidence_path": evidence_path, "evidence_sha256": evidence_sha256,
         "branch": branch, "head_sha": head_sha, "pr_url": pr_url, "next": next_value,
-        "next_present": next_value is not None,
+        "next_present": next_value is not None if next_present is None else next_present,
     }
     witness_id = success_witness_identity(witness)
     with outcome_state_transaction(state_dir) as state:
@@ -687,7 +924,8 @@ def record_success_witness(
             target=target_value, witness_id=witness_id, completed_at=completed_at,
             evidence_path=evidence_path, evidence_sha256=evidence_sha256, branch=branch,
             head_sha=head_sha, pr_url=pr_url, run_id=run_id, sandbox=sandbox,
-            next=next_value, next_present=next_value is not None,
+            next=next_value,
+            next_present=witness["next_present"],
         ))
         occurrence = _commit_occurrence(
             issue, reservation_id, operation_id,
@@ -732,6 +970,49 @@ def reservation_binding(
     return dict(reservation["binding"]) if reservation else None
 
 
+def retain_positive_proofs(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    reservation_id: str,
+    proof_ids: tuple[str, ...],
+) -> None:
+    """Monotonically retain structured proofs before projections are replaced."""
+    if not all(
+        proof.startswith(("factory_step:", "factory_merged_slice:", "factory_partial"))
+        for proof in proof_ids
+    ):
+        raise FailureStateError("factory proof kind is invalid")
+    with outcome_state_transaction(state_dir) as state:
+        reservation = _reservation(state, issue_id, reservation_id)
+        reservation["positive_proofs"] = list(
+            dict.fromkeys([*reservation["positive_proofs"], *proof_ids])
+        )
+
+
+def retained_positive_proofs(
+    state_dir: Path, *, issue_id: int, reservation_id: str
+) -> tuple[str, ...]:
+    state = load_outcome_state(state_dir)
+    reservation = _reservation(state, issue_id, reservation_id)
+    return tuple(reservation["positive_proofs"])
+
+
+def reservation_has_source(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    reservation_id: str,
+    sources: frozenset[str],
+) -> bool:
+    state = load_outcome_state(state_dir)
+    reservation = _reservation(state, issue_id, reservation_id)
+    return any(
+        operation["source"] in sources
+        for operation in reservation["operations"].values()
+    )
+
+
 def nonconsuming_claim_keys(state_dir: Path, issue_id: int) -> set[str]:
     state = load_outcome_state(state_dir)
     if state.get("version") != SCHEMA_VERSION:
@@ -743,15 +1024,37 @@ def nonconsuming_claim_keys(state_dir: Path, issue_id: int) -> set[str]:
 
 
 def issue_dispatch_disposition(state_dir: Path, issue_id: int) -> str | None:
-    """Return the newest terminal autonomous disposition for rearm guards."""
+    """Return the effective terminal disposition for every admission guard.
+
+    A later prepared reservation cannot hide an earlier stop.  Only a verified
+    success terminal that is causally newer clears prior stops.
+    """
     state = load_outcome_state(state_dir)
     if state.get("version") != SCHEMA_VERSION:
         return None
     issue = state["issues"].get(str(issue_id))
     if not issue or not issue["reservations"]:
         return None
-    newest = max(issue["reservations"].values(), key=lambda item: item["sequence"])
-    return newest["disposition"] if newest["state"] == "terminal" else None
+    terminal = sorted(
+        (
+            reservation
+            for reservation in issue["reservations"].values()
+            if reservation["state"] == "terminal"
+        ),
+        key=lambda item: item["sequence"],
+    )
+    if not terminal:
+        return None
+    latest_success = max(
+        (item["sequence"] for item in terminal if item["disposition"] == "success"),
+        default=0,
+    )
+    if any(
+        item["disposition"] == "stop" and item["sequence"] > latest_success
+        for item in terminal
+    ):
+        return "stop"
+    return terminal[-1]["disposition"]
 
 
 def active_reservation_id(
@@ -772,6 +1075,22 @@ def active_reservation_id(
         and value["state"] in {"prepared", "active"}
     ]
     return max(candidates)[1] if candidates else None
+
+
+def issue_retry_after(state_dir: Path, issue_id: int) -> datetime | None:
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if not issue:
+        return None
+    values = [
+        parse_time(item["retry_after"])
+        for item in issue["reservations"].values()
+        if item["state"] == "prepared"
+        and item["disposition"] == "transient_retry"
+        and item["retry_after"] is not None
+    ]
+    parsed = [item for item in values if item is not None]
+    return max(parsed) if parsed else None
 
 
 def pending_attention(state_dir: Path) -> list[dict[str, Any]]:
@@ -851,8 +1170,14 @@ def _commit_occurrence(
     if operation is not None and operation != operation_value:
         # START and success deliberately share the lifecycle operation.  Preserve
         # the operation's START identity while allowing its terminal slot.
-        if not (kind == AttentionKind.SUCCESS and operation["source"] in {"leaf_start", "factory_start"}):
+        if not (
+            kind in {AttentionKind.START, AttentionKind.SUCCESS}
+            and operation["source"] in {"leaf_start", "factory_start"}
+            and operation["state"] in {"running", "finished"}
+        ):
             raise FailureStateError("operation was already committed")
+        if kind == AttentionKind.START:
+            reservation["operations"][operation_id] = operation_value
     else:
         reservation["operations"][operation_id] = operation_value
     issue["occurrences"][occurrence_id] = occurrence
@@ -933,6 +1258,13 @@ def record_contention_recurrence(
         return disposition, retry_after
 
 
+def clear_contention_after_verified_success(state_dir: Path, issue_id: int) -> None:
+    with outcome_state_transaction(state_dir) as state:
+        issue = state["issues"].get(str(issue_id))
+        if issue is not None:
+            issue["contention"] = {}
+
+
 # Version-1 telemetry compatibility.  These functions remain for the ready queue
 # during the serial delivery rollout.  They operate on ``legacy`` when the ledger
 # has already migrated and never suppress a v2 attention occurrence.
@@ -1007,9 +1339,9 @@ def pending_failure_alerts(
             issue_id = entry.get("issue_id")
             if type(issue_id) is not int:
                 continue
-            retry_after = parse_time(entry.get("retry_after"))
-            if retry_after is not None and now < retry_after:
-                backed_off.add(issue_id)
+            # A terminal failure never becomes dispatchable merely because a
+            # legacy telemetry backoff timestamp elapsed.
+            backed_off.add(issue_id)
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
             notified = list(notified) if isinstance(notified, list) else []

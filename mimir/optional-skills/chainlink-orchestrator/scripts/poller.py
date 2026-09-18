@@ -47,11 +47,15 @@ from mimir.worklink.continuation import consume_worklink_budget_continuations
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
     RESERVATION_ENV,
+    active_reservation_id,
+    bind_reservation_owner,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
     failure_state_transaction,
     mark_failure_notified,
     pending_failure_alerts,
+    issue_dispatch_disposition,
+    issue_retry_after,
     record_attention,
     reserve_dispatch,
 )
@@ -339,11 +343,15 @@ def _dispatch(
 ) -> bool:
     effective_coding_enabled = coding_enabled()
     target = "factory" if item.mode == "epic" else "leaf"
-    reservation_id = reserve_dispatch(
+    reservation_id = active_reservation_id(
+        state_dir, issue_id=item.issue_id, target=target
+    ) or reserve_dispatch(
         state_dir,
         issue_id=item.issue_id,
         target=target,
         autonomous=True,
+        owner_pid=os.getpid(),
+        owner_start_ticks=_process_start_ticks(os.getpid()),
     )
     argv = [
         *run_bin,
@@ -362,7 +370,7 @@ def _dispatch(
     except OSError:
         log_fh = subprocess.DEVNULL
     try:
-        subprocess.Popen(
+        process = subprocess.Popen(
             argv,
             cwd=repo,
             env={
@@ -376,6 +384,15 @@ def _dispatch(
             stderr=log_fh,
             start_new_session=True,
         )
+        child_pid = getattr(process, "pid", None)
+        if type(child_pid) is int and child_pid > 0:
+            bind_reservation_owner(
+                state_dir,
+                issue_id=item.issue_id,
+                reservation_id=reservation_id,
+                pid=child_pid,
+                start_ticks=_process_start_ticks(child_pid),
+            )
     except (OSError, subprocess.SubprocessError) as exc:
         record_attention(
             state_dir,
@@ -428,6 +445,14 @@ def _dispatch(
         }
     )
     return True
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+        return int(fields[21]) if len(fields) > 21 else None
+    except (OSError, ValueError):
+        return None
 
 
 def _deliver_failure_alerts(
@@ -591,7 +616,16 @@ def main() -> int:
         epic_ids,
     ) = ready_result
     actionable_epic_count = len(epic_ids)
-    dispatch_ready = [item for item in ready if item.issue_id not in backed_off_ids]
+    dispatch_ready = [
+        item
+        for item in ready
+        if item.issue_id not in backed_off_ids
+        and issue_dispatch_disposition(state_dir, item.issue_id) != "stop"
+        and not (
+            (retry_after := issue_retry_after(state_dir, item.issue_id)) is not None
+            and time.time() < retry_after.timestamp()
+        )
+    ]
     leaf_cap = _configured_cap(home)
     factory_cap = factory_max_concurrent()
     active = len(scope_active_worklink_lock_ids(active_lock_ids, exclude_ids=epic_ids))

@@ -158,7 +158,11 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
     reservation_id = _prepare_autonomous_reservation(
-        home, args.issue_id, target="leaf", autonomous=args.autonomous and not args.dry_run
+        home,
+        args.issue_id,
+        target="leaf",
+        autonomous=args.autonomous and not args.dry_run,
+        recovery=args.reattach,
     )
     try:
         repo = _resolve_worklink_repo(args.repo)
@@ -182,7 +186,13 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         pass
     try:
         if args.reattach:
-            result = run_worklink_reattach(home=home, repo=repo, issue_id=args.issue_id)
+            result = run_worklink_reattach(
+                home=home,
+                repo=repo,
+                issue_id=args.issue_id,
+                autonomous=args.autonomous,
+                reservation_id=reservation_id,
+            )
         else:
             result = run_worklink(
                 home=home,
@@ -399,7 +409,12 @@ def _resolve_worklink_repo(explicit: Path | None) -> Path:
 
 
 def _prepare_autonomous_reservation(
-    home: Path, issue_id: int, *, target: str, autonomous: bool
+    home: Path,
+    issue_id: int,
+    *,
+    target: str,
+    autonomous: bool,
+    recovery: bool = False,
 ) -> str | None:
     """Validate or allocate the private causal identity before repository IO."""
     if not autonomous:
@@ -410,15 +425,19 @@ def _prepare_autonomous_reservation(
         reservation_from_environment,
     )
 
+    if recovery and RESERVATION_ENV not in os.environ:
+        return None
     reservation_id = reservation_from_environment(
         dispatch_failure_state_dir(home),
         issue_id=issue_id,
         target=target,
         autonomous=True,
     )
-    if reservation_id is None:  # pragma: no cover - autonomous guarantees a value.
+    legacy_recovery = RESERVATION_ENV in os.environ and not os.environ[RESERVATION_ENV]
+    if reservation_id is None and not recovery and not legacy_recovery:
         raise RuntimeError("autonomous Worklink reservation was not created")
-    os.environ[RESERVATION_ENV] = reservation_id
+    if reservation_id is not None:
+        os.environ[RESERVATION_ENV] = reservation_id
     return reservation_id
 
 

@@ -365,6 +365,7 @@ class ChainlinkClaims:
         active_label: str | None = None,
         exclude_active_label: str | None = None,
         before_claim: Callable[[], None] | None = None,
+        reservation_id: str | None = None,
     ) -> ClaimResult:
         """Claim ``issue_id`` if its lifecycle, evidence, attempts, and cap allow it.
 
@@ -382,6 +383,43 @@ class ChainlinkClaims:
         legitimate reattach scenarios.
         """
         comments = list(comments)
+        def record_claim_outcome(
+            source: str,
+            cause: str,
+            result: str,
+            *,
+            identity: object | None = None,
+            mutation_stage: str | None = None,
+            return_code: int | None = None,
+            disposition: str = "stop",
+            retry_after: str | None = None,
+        ) -> None:
+            if reservation_id is None:
+                return
+            effective_home = Path(home_path) if home_path is not None else getattr(self, "home_path", None)
+            if effective_home is None:
+                raise RuntimeError("autonomous claim accounting requires canonical home")
+            from .attention import ClaimFacts
+            from .dispatch_failures import dispatch_failure_state_dir, record_attention
+
+            record_attention(
+                dispatch_failure_state_dir(effective_home),
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                source=source,
+                cause=cause,
+                facts=ClaimFacts(
+                    intended=identity,
+                    confirmed=identity if result == "confirmed" else None,
+                    result=result,
+                    return_code=return_code,
+                    mutation_stage=mutation_stage,
+                ),
+                claim=identity,
+                disposition=disposition,
+                retry_after=retry_after,
+            )
+
         label_set = self._issue_labels(issue_id)
         if labels is not None:
             label_set.update(labels)
@@ -389,6 +427,16 @@ class ChainlinkClaims:
             return ClaimResult(False, reason="lifecycle_state_incompatible")
 
         claim_home = Path(home_path) if home_path is not None else self.home_path
+        if claim_home is not None and reservation_id is not None:
+            from .dispatch_failures import (
+                dispatch_failure_state_dir,
+                issue_dispatch_disposition,
+            )
+
+            if issue_dispatch_disposition(
+                dispatch_failure_state_dir(claim_home), issue_id
+            ) == "stop":
+                return ClaimResult(False, reason="terminal_attention_stop")
         if claim_home is not None:
             intent_path = claim_home / "state" / "worklink" / "publications" / f"{issue_id}.json"
             # Presence, not parseability, is the publication fence. Do not park
@@ -426,8 +474,33 @@ class ChainlinkClaims:
                 issue_id, home_path=claim_home, before_claim=before_claim
             )
         except _ChainlinkContentionExhausted:
+            if reservation_id is not None and claim_home is not None:
+                from .dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    error_signature,
+                    record_contention_recurrence,
+                )
+
+                disposition, retry_after = record_contention_recurrence(
+                    dispatch_failure_state_dir(claim_home),
+                    issue_id=issue_id,
+                    signature=error_signature("claim_contention_exhausted"),
+                )
+                record_claim_outcome(
+                    "claim_contention",
+                    "contention_exhausted",
+                    "contention_exhausted",
+                    disposition=disposition,
+                    retry_after=retry_after,
+                )
             return ClaimResult(False, reason="claim_contention_exhausted")
         if lock.returncode != 0:
+            record_claim_outcome(
+                "claim_command",
+                "claim_command_failed",
+                "claim_failed",
+                return_code=lock.returncode,
+            )
             return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
         if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
             # chainlink #822: the chainlink CLI treats a same-agent re-claim as
@@ -452,6 +525,9 @@ class ChainlinkClaims:
                         issue_id=issue_id,
                         error=f"{type(exc).__name__}: {exc}"[:500],
                     )
+                record_claim_outcome(
+                    "claim_guard", "owner_read_failed", "history_read_failed"
+                )
                 return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
@@ -472,6 +548,14 @@ class ChainlinkClaims:
                 guard_outcome=guard_outcome,
                 result=steal,
             )
+            if steal.returncode != 0:
+                record_claim_outcome(
+                    "claim_steal",
+                    "steal_failed",
+                    "steal_failed",
+                    return_code=steal.returncode,
+                )
+                return ClaimResult(False, reason="steal_failed")
 
         # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
         # guard — a duplicate bouncing off a LIVE final-attempt run must yield
@@ -483,6 +567,9 @@ class ChainlinkClaims:
         if attempts_used >= self.max_attempts:
             self.release_issue(issue_id)
             self._attempts_exhausted(issue_id, attempts_used)
+            record_claim_outcome(
+                "claim_budget", "attempts_exhausted", "attempts_exhausted"
+            )
             return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
         if max_active_locks is not None:
@@ -494,6 +581,11 @@ class ChainlinkClaims:
                 active = len(active_ids)
             except Exception:
                 self.release_issue(issue_id)
+                record_claim_outcome(
+                    "claim_capacity_read",
+                    "lock_inventory_failed",
+                    "lock_inventory_failed",
+                )
                 raise
             if active > max_active_locks:
                 self.release_issue(issue_id)
@@ -518,49 +610,45 @@ class ChainlinkClaims:
             claimed_at=self.clock(),
             budget_attempt=attempts_used + 1,
         )
-        reservation_id: str | None = None
         claim_identity = None
-        if claim_home is not None:
+        if claim_home is not None and reservation_id is not None:
             from .attention import ClaimIdentity
             from .dispatch_failures import (
-                active_reservation_id,
                 bind_claim,
                 dispatch_failure_state_dir,
             )
 
             state_dir = dispatch_failure_state_dir(claim_home)
-            for target in ("leaf", "factory"):
-                reservation_id = active_reservation_id(
-                    state_dir, issue_id=issue_id, target=target
-                )
-                if reservation_id is not None:
-                    break
-            if reservation_id is not None:
-                claim_identity = ClaimIdentity(
-                    issue_id=record.issue_id,
-                    attempt=record.attempt,
-                    agent_id=record.agent_id,
-                    claimed_at=record.claimed_at.isoformat(),
-                )
-                bind_claim(
-                    state_dir,
-                    issue_id=issue_id,
-                    reservation_id=reservation_id,
-                    claim=claim_identity,
-                    confirmed=False,
-                )
+            claim_identity = ClaimIdentity(
+                issue_id=record.issue_id,
+                attempt=record.attempt,
+                agent_id=record.agent_id,
+                claimed_at=record.claimed_at.isoformat(),
+            )
+            bind_claim(
+                state_dir,
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                claim=claim_identity,
+                confirmed=False,
+            )
+        mutation_stage = "unready"
         try:
-            self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+            unready = self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+            if unready.returncode != 0:
+                raise RuntimeError("ready label removal failed")
+            mutation_stage = "inprogress"
             self._run("issue", "label", str(issue_id), "worklink:in-progress")
+            mutation_stage = "comment"
             self._run("issue", "comment", str(issue_id), record.to_comment())
-        except Exception:
+        except Exception as publication_error:
+            exact = False
             if reservation_id is not None and claim_identity is not None:
                 try:
+                    history = self._issue_comments(issue_id, strict=True)
                     exact = any(
                         candidate == record
-                        for candidate in claim_records_from_comments(
-                            self._issue_comments(issue_id, strict=True)
-                        )
+                        for candidate in claim_records_from_comments(history)
                     )
                     if exact:
                         bind_claim(
@@ -570,11 +658,30 @@ class ChainlinkClaims:
                             claim=claim_identity,
                             confirmed=True,
                         )
-                except Exception:
-                    pass
+                except Exception as history_error:
+                    raise RuntimeError(
+                        "claim publication outcome is ambiguous; strict history unavailable"
+                    ) from history_error
+            source = {
+                "unready": "claim_unready",
+                "inprogress": "claim_inprogress",
+                "comment": "claim_comment",
+            }[mutation_stage]
+            record_claim_outcome(
+                source,
+                "claim_publication_failed",
+                "confirmed" if exact else "absent",
+                identity=claim_identity,
+                mutation_stage=mutation_stage,
+            )
             self.release_issue(issue_id)
-            raise
+            raise publication_error
         if reservation_id is not None and claim_identity is not None:
+            history = self._issue_comments(issue_id, strict=True)
+            if not any(
+                candidate == record for candidate in claim_records_from_comments(history)
+            ):
+                raise RuntimeError("claim publication was not confirmed by strict history")
             bind_claim(
                 state_dir,
                 issue_id=issue_id,
@@ -759,6 +866,30 @@ class ChainlinkClaims:
                     if latest is None or _claim_is_newer(record, latest):
                         latest = record
                 if latest is None or latest.agent_id != self.agent_id:
+                    continue
+
+                terminal_stop = False
+                if self.home_path is not None:
+                    from .dispatch_failures import (
+                        dispatch_failure_state_dir,
+                        issue_dispatch_disposition,
+                    )
+
+                    terminal_stop = issue_dispatch_disposition(
+                        dispatch_failure_state_dir(self.home_path), issue_id
+                    ) == "stop"
+                if terminal_stop:
+                    lock = self._run("locks", "release", str(issue_id), check=False)
+                    if lock.returncode != 0:
+                        raise RuntimeError(
+                            (lock.stderr or lock.stdout).strip()
+                            or "chainlink lock release failed"
+                        )
+                    self._run(
+                        "issue", "unlabel", str(issue_id), "worklink:in-progress",
+                        check=False,
+                    )
+                    self._run("issue", "label", str(issue_id), "worklink:blocked")
                     continue
 
                 abort = ShutdownAbortRecord(

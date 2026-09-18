@@ -1163,6 +1163,7 @@ def _orchestrator_runner(
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
+    issue_payload = json.loads(issue_json)
 
     def runner(
         args: Sequence[str] | str,
@@ -1177,7 +1178,7 @@ def _orchestrator_runner(
         if checkout_result is not None:
             return checkout_result
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
-            return cp(args, stdout=issue_json)
+            return cp(args, stdout=json.dumps(issue_payload))
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
@@ -1187,6 +1188,7 @@ def _orchestrator_runner(
                 stderr="release denied\n" if release_returncode else "",
             )
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            issue_payload.setdefault("comments", []).append(args[4])
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
             return cp(args)
@@ -6178,6 +6180,8 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
     assert result.reason == "concurrency cap reached (1/1 active claims)"
     before_claim = observed[0].pop("before_claim")
     assert callable(before_claim)
+    reservation_id = observed[0].pop("reservation_id", None)
+    assert (reservation_id is not None) is autonomous
     assert observed == [{
         "labels": {"worklink", "worklink:epic", "worklink:ready"},
         "max_active_locks": 1,

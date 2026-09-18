@@ -180,6 +180,7 @@ class WorklinkRunResult:
     preserved_ref: str | None = None
     preservation_error: str | None = None
     next: str | None = None
+    next_present: bool = False
 
 
 @dataclass
@@ -716,29 +717,36 @@ class WorklinkRunner:
 
         def record_claiming() -> None:
             nonlocal claiming_state_written
-            existing = load_run_state(self.home, issue.issue_id)
-            if existing is not None and process_is_alive(existing):
-                raise WorklinkError(f"live run state already exists for issue {issue.issue_id}")
-            save_run_state(
-                self.home,
-                WorklinkRunState(
-                    issue_id=issue.issue_id,
-                    attempt=predicted_attempt,
-                    backend=selected_name,
-                    compute_name=compute.name,
-                    handle_substrate="controller",
-                    handle_identifier=str(os.getpid()),
-                    branch="",
-                    base_ref=base,
-                    local_base=base,
-                    repo=str(self.repo),
-                    repo_url=repo_url,
-                    test_command=test_cmd,
-                    started_at=datetime.now(UTC).isoformat(),
-                    process_start_ticks=process_start_ticks(os.getpid()),
-                    phase="claiming",
-                ),
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=reservation_id, source="leaf_claim_preparation",
+                cause="state_write_failed", operation="claim_preparation",
+            ):
+                existing = load_run_state(self.home, issue.issue_id)
+                if existing is not None and process_is_alive(existing):
+                    raise WorklinkError(
+                        f"live run state already exists for issue {issue.issue_id}"
+                    )
+                save_run_state(
+                    self.home,
+                    WorklinkRunState(
+                        issue_id=issue.issue_id,
+                        attempt=predicted_attempt,
+                        backend=selected_name,
+                        compute_name=compute.name,
+                        handle_substrate="controller",
+                        handle_identifier=str(os.getpid()),
+                        branch="",
+                        base_ref=base,
+                        local_base=base,
+                        repo=str(self.repo),
+                        repo_url=repo_url,
+                        test_command=test_cmd,
+                        started_at=datetime.now(UTC).isoformat(),
+                        process_start_ticks=process_start_ticks(os.getpid()),
+                        phase="claiming",
+                    ),
+                )
             claiming_state_written = True
 
         try:
@@ -749,6 +757,7 @@ class WorklinkRunner:
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
                 exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
+                **({"reservation_id": reservation_id} if reservation_id is not None else {}),
             )
         except Exception:
             if claiming_state_written:
@@ -758,6 +767,12 @@ class WorklinkRunner:
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
             _log_event("worklink_attempts_exhausted", issue_id=issue.issue_id)
+            _record_claim_refusal_outcome(
+                self.home,
+                issue.issue_id,
+                reservation_id,
+                reason="attempts_exhausted",
+            )
             return WorklinkRunResult(issue.issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
             if claiming_state_written:
@@ -765,6 +780,12 @@ class WorklinkRunner:
             _log_event(
                 "worklink_claim_failed",
                 issue_id=issue.issue_id,
+                reason=claim.reason or "claim_failed",
+            )
+            _record_claim_refusal_outcome(
+                self.home,
+                issue.issue_id,
+                reservation_id,
                 reason=claim.reason or "claim_failed",
             )
             return WorklinkRunResult(
@@ -798,39 +819,59 @@ class WorklinkRunner:
         delete_authorized_checkout = False
         executor_report_dir: Path | None = None
         try:
-            lease = _create_backend_checkout(
-                self.repo,
+            with _typed_outcome_boundary(
+                home=self.home,
                 issue_id=issue.issue_id,
-                attempt=record.attempt,
-                base=base,
-                backend=backend,
-                base_fetch=config.defaults.base_fetch,
-                event_logger=_log_event,
-                runner=_list_runner(runner),
-                worker_eligible=worker_uid_drop,
-            )
+                reservation_id=reservation_id,
+                source="leaf_checkout_create",
+                cause="checkout_failed",
+                claim_record=record,
+                operation="create_checkout",
+            ):
+                lease = _create_backend_checkout(
+                    self.repo,
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    base=base,
+                    backend=backend,
+                    base_fetch=config.defaults.base_fetch,
+                    event_logger=_log_event,
+                    runner=_list_runner(runner),
+                    worker_eligible=worker_uid_drop,
+                )
             if worker_uid_drop:
                 if not isinstance(compute, LocalSubprocessComputeBackend):
                     raise WorklinkError("worker uid drop requires local subprocess compute")
                 compute = LocalSubprocessComputeBackend.for_path_checkout(
                     get_identities().worklink_uid
                 )
-                checkout_fd = os.open(
-                    lease.path,
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | os.O_CLOEXEC
-                    | getattr(os, "O_NOFOLLOW", 0),
-                )
-                try:
-                    publication = ControllerGitPublication.capture(
-                        checkout_fd,
-                        self.repo,
-                        lease.branch,
-                        self.home / "state" / "worklink" / "publication",
+                with _typed_outcome_boundary(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    reservation_id=reservation_id,
+                    source="leaf_publication_capture",
+                    cause="publication_boundary_failed",
+                    claim_record=record,
+                    checkout=lease.path,
+                    branch=lease.branch,
+                    operation="capture_publication",
+                ):
+                    checkout_fd = os.open(
+                        lease.path,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | os.O_CLOEXEC
+                        | getattr(os, "O_NOFOLLOW", 0),
                     )
-                finally:
-                    os.close(checkout_fd)
+                    try:
+                        publication = ControllerGitPublication.capture(
+                            checkout_fd,
+                            self.repo,
+                            lease.branch,
+                            self.home / "state" / "worklink" / "publication",
+                        )
+                    finally:
+                        os.close(checkout_fd)
             if not lease.isolated_checkout:
                 _log_event(
                     "worklink_unsafe_backend_checkout",
@@ -838,6 +879,17 @@ class WorklinkRunner:
                     attempt=record.attempt,
                     backend=selected_name,
                     compute_backend=compute.name,
+                )
+                _record_direct_leaf_outcome(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    reservation_id=reservation_id,
+                    claim_record=record,
+                    source="leaf_checkout_isolation",
+                    cause="unsafe_checkout",
+                    checkout=lease.path,
+                    branch=lease.branch,
+                    reason="not_isolated",
                 )
                 return WorklinkRunResult(
                     issue.issue_id,
@@ -849,13 +901,26 @@ class WorklinkRunner:
                         "(chainlink #517/#1019)"
                     ),
                 )
-            root_dirty_before = _dirty_paths(self.repo, runner=runner)
-            prompt = render_work_order(
-                issue,
-                template_path=template_path,
-                backend_name=selected_name,
-                test_command=test_cmd,
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=reservation_id, source="leaf_dirty_snapshot",
+                cause="checkout_read_failed", claim_record=record,
+                checkout=lease.path, branch=lease.branch,
+            ):
+                root_dirty_before = _dirty_paths(self.repo, runner=runner)
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=reservation_id, source="leaf_prompt",
+                cause="prompt_render_failed", claim_record=record,
+                checkout=lease.path, branch=lease.branch,
+                operation="render_prompt",
+            ):
+                prompt = render_work_order(
+                    issue,
+                    template_path=template_path,
+                    backend_name=selected_name,
+                    test_command=test_cmd,
+                )
             order = WorkOrder(
                 issue_id=issue.issue_id,
                 checkout=lease.path,
@@ -866,17 +931,31 @@ class WorklinkRunner:
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
             started = datetime.now(UTC)
-            spec = backend.work_spec(
-                order,
-                attempt=record.attempt,
-                repo_url=repo_url,
-                base_ref=lease.base_ref,
-                branch=lease.branch,
-                test_command=test_cmd,
-            )
-            executor_report_dir = _make_executor_report_dir(
-                issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=reservation_id, source="leaf_work_spec",
+                cause="work_spec_failed", claim_record=record,
+                checkout=lease.path, branch=lease.branch,
+                operation="work_spec",
+            ):
+                spec = backend.work_spec(
+                    order,
+                    attempt=record.attempt,
+                    repo_url=repo_url,
+                    base_ref=lease.base_ref,
+                    branch=lease.branch,
+                    test_command=test_cmd,
+                )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=reservation_id, source="leaf_report_setup",
+                cause="report_setup_failed", claim_record=record,
+                checkout=lease.path, branch=lease.branch,
+                operation="report_setup",
+            ):
+                executor_report_dir = _make_executor_report_dir(
+                    issue.issue_id, record.attempt, worker_uid_drop=worker_uid_drop
+                )
             report_env = pytest_report_environment(
                 test_cmd,
                 executor_report_dir,
@@ -904,24 +983,38 @@ class WorklinkRunner:
             async def invoke_backend() -> ComputeResult:
                 handle = None
                 try:
-                    handle = await compute.launch(spec)
+                    with _typed_outcome_boundary(
+                        home=self.home, issue_id=issue.issue_id,
+                        reservation_id=reservation_id, source="leaf_compute_launch",
+                        cause="launch_failed", claim_record=record,
+                        checkout=lease.path, branch=lease.branch,
+                        operation="compute_launch",
+                    ):
+                        handle = await compute.launch(spec)
                     # Atomically replace the provisional controller record with
                     # the real cancellable worker handle immediately after spawn.
                     try:
-                        _persist_run_state(
-                            self.home,
-                            issue=issue,
-                            attempt=record.attempt,
-                            backend_name=selected_name,
-                            compute=compute,
-                            handle=handle,
-                            lease=lease,
-                            repo=self.repo,
-                            repo_url=repo_url,
-                            test_command=test_cmd,
-                            started_at=started,
-                            test_env=spec.backend_config.get("test_env", {}),
-                        )
+                        with _typed_outcome_boundary(
+                            home=self.home, issue_id=issue.issue_id,
+                            reservation_id=reservation_id, source="leaf_handle_save",
+                            cause="state_write_failed", claim_record=record,
+                            checkout=lease.path, branch=lease.branch,
+                            operation="save_handle",
+                        ):
+                            _persist_run_state(
+                                self.home,
+                                issue=issue,
+                                attempt=record.attempt,
+                                backend_name=selected_name,
+                                compute=compute,
+                                handle=handle,
+                                lease=lease,
+                                repo=self.repo,
+                                repo_url=repo_url,
+                                test_command=test_cmd,
+                                started_at=started,
+                                test_env=spec.backend_config.get("test_env", {}),
+                            )
                     except OSError as exc:
                         _log_event(
                             "worklink_run_state_persist_failed",
@@ -930,11 +1023,18 @@ class WorklinkRunner:
                         )
                         await compute.cancel(handle)
                         raise
-                    return await _heartbeat_while(
-                        compute.wait(handle, spec.timeout_s),
-                        claims=claims,
-                        record=record,
-                    )
+                    with _typed_outcome_boundary(
+                        home=self.home, issue_id=issue.issue_id,
+                        reservation_id=reservation_id, source="leaf_compute_wait",
+                        cause="worker_failed", claim_record=record,
+                        checkout=lease.path, branch=lease.branch,
+                        operation="compute_wait",
+                    ):
+                        return await _heartbeat_while(
+                            compute.wait(handle, spec.timeout_s),
+                            claims=claims,
+                            record=record,
+                        )
                 except ComputeLaunchError as exc:
                     return ComputeResult(
                         exit_code=-1,
@@ -1110,16 +1210,37 @@ class WorklinkRunner:
         them is how ``compute_result`` was obtained (launch+wait vs. wait on a
         persisted handle)."""
         selected_name = backend.name
-        raw = await backend.interpret(order, compute_result)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=outcome_reservation_id, source="leaf_interpret",
+            cause="interpretation_failed", claim_record=claim_record,
+            checkout=lease.path, branch=lease.branch,
+            operation="interpret",
+        ):
+            raw = await backend.interpret(order, compute_result)
         executor_tests: TestResult | None = None
         if executor_report_dir is not None:
-            executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=outcome_reservation_id, source="leaf_test_report",
+                cause="evidence_read_failed", claim_record=claim_record,
+                checkout=lease.path, branch=lease.branch,
+                operation="test_report",
+            ):
+                executor_tests = read_pytest_result(test_cmd or "", executor_report_dir)
             _remove_executor_report_dir_best_effort(
                 executor_report_dir,
                 issue_id=issue.issue_id,
                 attempt=attempt,
             )
-        pr_body_section = _read_pr_body_section(lease.path)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=outcome_reservation_id, source="leaf_pr_body",
+            cause="evidence_read_failed", claim_record=claim_record,
+            checkout=lease.path, branch=lease.branch,
+            operation="pr_body",
+        ):
+            pr_body_section = _read_pr_body_section(lease.path)
         invocation_model = spec.backend_config.get("model")
         executor_failed = raw.exit_code != 0
         # A backend may report failure without the executor process exiting
@@ -1160,29 +1281,36 @@ class WorklinkRunner:
         # compute substrate. Its capabilities declare shared_filesystem=True, so
         # the controller runs the diff/test re-derivation itself (no remote-fetch
         # gate, no folded trusted-test job).
-        validation = await observe_evidence(
-            issue=issue.issue_id,
-            attempt=attempt,
-            backend=selected_name,
-            branch=lease.branch,
-            checkout=lease.path,
-            started_at=started,
-            base_ref=lease.local_base or lease.base_ref,
-            backend_status=raw.backend_status,
-            test_command=test_cmd,
-            transcript=str(raw.transcript_path) if raw.transcript_path else None,
-            gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
-            blocked_reason=raw.blocked_reason,
-            model=invocation_model,
-            failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
-            executor_tests=executor_tests,
-            skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
-            runner=runner,
-            safe_git=publication,
-            work_spec=spec,
-            compute=compute,
-            on_gate_launch=persist_gate_handle,
-        )
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=outcome_reservation_id, source="leaf_gate",
+            cause="validation_failed", claim_record=claim_record,
+            checkout=lease.path, branch=lease.branch,
+            operation="evidence_gate",
+        ):
+            validation = await observe_evidence(
+                issue=issue.issue_id,
+                attempt=attempt,
+                backend=selected_name,
+                branch=lease.branch,
+                checkout=lease.path,
+                started_at=started,
+                base_ref=lease.local_base or lease.base_ref,
+                backend_status=raw.backend_status,
+                test_command=test_cmd,
+                transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
+                blocked_reason=raw.blocked_reason,
+                model=invocation_model,
+                failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+                executor_tests=executor_tests,
+                skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
+                runner=runner,
+                safe_git=publication,
+                work_spec=spec,
+                compute=compute,
+                on_gate_launch=persist_gate_handle,
+            )
         validation = _with_outside_checkout_detection(
             validation,
             issue=issue.issue_id,
@@ -1192,7 +1320,14 @@ class WorklinkRunner:
             runner=runner,
             root_dirty_before=root_dirty_before,
         )
-        evidence_path = _write_evidence(self.home, validation.evidence)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=outcome_reservation_id, source="leaf_evidence_write",
+            cause="evidence_write_failed", claim_record=claim_record,
+            checkout=lease.path, branch=lease.branch,
+            operation="evidence_write",
+        ):
+            evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             try:
                 _commit_checkout_changes(
@@ -1200,6 +1335,18 @@ class WorklinkRunner:
                 )
                 _ensure_clean_checkout(lease.path, runner=runner, publication=publication)
             except Exception as exc:
+                _record_direct_leaf_outcome(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    reservation_id=outcome_reservation_id,
+                    claim_record=claim_record,
+                    source="leaf_commit",
+                    cause="publication_failed",
+                    checkout=lease.path,
+                    branch=lease.branch,
+                    reason=type(exc).__name__,
+                    evidence_path=evidence_path,
+                )
                 validation = _publication_failed_validation(
                     validation,
                     step="commit",
@@ -1209,7 +1356,14 @@ class WorklinkRunner:
                 )
             else:
                 first_tests = validation.evidence.tests
-                validation = await observe_evidence(
+                with _typed_outcome_boundary(
+                    home=self.home, issue_id=issue.issue_id,
+                    reservation_id=outcome_reservation_id, source="leaf_regate",
+                    cause="validation_failed", claim_record=claim_record,
+                    checkout=lease.path, branch=lease.branch,
+                    operation="post_commit_gate",
+                ):
+                    validation = await observe_evidence(
                     issue=issue.issue_id,
                     attempt=attempt,
                     backend=selected_name,
@@ -1232,8 +1386,8 @@ class WorklinkRunner:
                     safe_git=publication,
                     work_spec=spec,
                     compute=compute,
-                    on_gate_launch=persist_gate_handle,
-                )
+                        on_gate_launch=persist_gate_handle,
+                    )
                 if first_tests is not None and first_tests.flaky_tests:
                     tests = validation.evidence.tests
                     if tests is not None:
@@ -1262,7 +1416,14 @@ class WorklinkRunner:
                     runner=runner,
                     root_dirty_before=root_dirty_before,
                 )
-            evidence_path = _write_evidence(self.home, validation.evidence)
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=outcome_reservation_id, source="leaf_evidence_write",
+                cause="evidence_write_failed", claim_record=claim_record,
+                checkout=lease.path, branch=lease.branch,
+                operation="regate_evidence_write",
+            ):
+                evidence_path = _write_evidence(self.home, validation.evidence)
         if validation.review_ready:
             # chainlink #518: push from the checkout that OWNS the attempt
             # branch, not the parent repo. With the isolated-checkout shape
@@ -1290,6 +1451,29 @@ class WorklinkRunner:
                     evidence_path = _write_evidence(self.home, validation.evidence)
                     intent.completed = True
             except Exception as exc:
+                source = {
+                    "fence": "leaf_publication_fence",
+                    "push": "leaf_push",
+                    "pull request": "leaf_pr_open",
+                    "completed evidence": "leaf_evidence_write",
+                }[step]
+                cause = (
+                    "evidence_write_failed"
+                    if step == "completed evidence"
+                    else "publication_failed"
+                )
+                _record_direct_leaf_outcome(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    reservation_id=outcome_reservation_id,
+                    claim_record=claim_record,
+                    source=source,
+                    cause=cause,
+                    checkout=lease.path,
+                    branch=lease.branch,
+                    reason=type(exc).__name__,
+                    evidence_path=evidence_path,
+                )
                 validation = _publication_failed_validation(
                     validation, step=step, error=exc,
                     issue_id=issue.issue_id, attempt=attempt,
@@ -1343,7 +1527,14 @@ class WorklinkRunner:
             run_bookkeeping("evidence comment", comment_evidence)
             run_bookkeeping("evidence event", log_evidence)
         else:
-            comment_evidence()
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=outcome_reservation_id,
+                source="leaf_evidence_comment", cause="bookkeeping_failed",
+                claim_record=claim_record, checkout=lease.path,
+                branch=lease.branch, operation="evidence_comment",
+            ):
+                comment_evidence()
             log_evidence()
         transition_status = (
             "blocked"
@@ -1394,6 +1585,18 @@ class WorklinkRunner:
                 )
             except Exception as exc:
                 transition_error = str(exc)
+                _record_direct_leaf_outcome(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    reservation_id=outcome_reservation_id,
+                    claim_record=claim_record,
+                    source="leaf_terminal_labels",
+                    cause="terminal_routing_failed",
+                    checkout=lease.path,
+                    branch=lease.branch,
+                    reason=type(exc).__name__,
+                    evidence_path=evidence_path,
+                )
                 raise
             transition_applied = True
             terminal_release.label_transition_applied = True
@@ -1422,6 +1625,18 @@ class WorklinkRunner:
                 # emit it without turning a failed mutation into a successful run.
                 log_transition()
         if transition_applied and not terminal_release():
+            _record_direct_leaf_outcome(
+                home=self.home,
+                issue_id=issue.issue_id,
+                reservation_id=outcome_reservation_id,
+                claim_record=claim_record,
+                source="leaf_terminal_release",
+                cause="terminal_routing_failed",
+                checkout=lease.path,
+                branch=lease.branch,
+                reason="release_failed",
+                evidence_path=evidence_path,
+            )
             return WorklinkRunResult(
                 issue.issue_id,
                 attempt,
@@ -1476,8 +1691,19 @@ class WorklinkRunner:
         server-side reconcile API stay stable for older deployments that may
         still hold a ``<home>/state/worklink/runs/<id>.json`` from a prior
         docker-sibling / ecs-runtask run."""
+        state_path = self.home / "state" / "worklink" / "runs" / f"{issue_id}.json"
+        state_present = state_path.exists() or state_path.is_symlink()
         state = load_run_state(self.home, issue_id)
         if state is None:
+            _record_reconcile_outcome(
+                home=self.home,
+                issue_id=issue_id,
+                reservation_id=self.outcome_reservation_id,
+                source="reattach_state",
+                cause="state_unreadable" if state_present else "state_missing",
+                stage="state_read",
+                result="unreadable" if state_present else "missing",
+            )
             return WorklinkRunResult(issue_id, None, "failed", reason="reattach: no run state")
 
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
@@ -1511,6 +1737,21 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
+            _record_reconcile_outcome(
+                home=self.home,
+                issue_id=issue_id,
+                reservation_id=self.outcome_reservation_id,
+                source="reattach_shim",
+                cause=(
+                    "cleanup_failed"
+                    if "cleanup failed" in reason
+                    else "identity_stale"
+                    if "stale" in reason
+                    else "worker_interrupted"
+                ),
+                stage="shim_reconcile",
+                result=reason,
+            )
             if terminal_release():
                 claims.transition_issue(
                     issue_id,
@@ -1564,6 +1805,15 @@ class WorklinkRunner:
                         attempt=state.attempt,
                     )
                 elif restored_review:
+                    _record_reconcile_outcome(
+                        home=self.home,
+                        issue_id=issue_id,
+                        reservation_id=self.outcome_reservation_id,
+                        source="reattach_pr",
+                        cause="terminal_routing_failed",
+                        stage="release",
+                        result="release_failed",
+                    )
                     return WorklinkRunResult(
                         issue_id,
                         state.attempt,
@@ -1611,11 +1861,21 @@ class WorklinkRunner:
             backend = registry.get(state.backend)
             compute = registry.get_compute(state.compute_name)
         except (KeyError, ValueError) as exc:
+            _record_direct_reattach_leaf(
+                self.home, issue_id, self.outcome_reservation_id, state,
+                source="reattach_backend", cause="backend_unavailable",
+                reason=type(exc).__name__,
+            )
             _log_event("worklink_reattach_failed", issue_id=issue_id, reason=str(exc))
             clear_run_state(self.home, issue_id)
             return WorklinkRunResult(issue_id, state.attempt, "failed", reason=f"reattach: {exc}")
         if not compute.capabilities().persistent_after_disconnect:
             # Defensive: only persistent substrates are ever persisted.
+            _record_direct_reattach_leaf(
+                self.home, issue_id, self.outcome_reservation_id, state,
+                source="reattach_compute", cause="not_resumable",
+                reason="not_persistent",
+            )
             clear_run_state(self.home, issue_id)
             return WorklinkRunResult(
                 issue_id, state.attempt, "failed", reason="reattach: compute not resumable"
@@ -1627,7 +1887,13 @@ class WorklinkRunner:
             state.process_start_ticks,
             state.shim_pid,
         )
-        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue_id,
+            reservation_id=self.outcome_reservation_id, source="reattach_issue",
+            cause="read_failed", checkout=Path(state.checkout) if state.checkout else None,
+            branch=state.branch, operation="issue_read",
+        ):
+            issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
         test_cmd = state.test_command
         _log_event(
             "worklink_reattach",
@@ -1639,22 +1905,34 @@ class WorklinkRunner:
 
         lease: CheckoutLease | None = None
         try:
-            lease = _create_observation_worktree(
-                self.repo,
-                issue_id=issue_id,
-                attempt=state.attempt,
-                base=state.base_ref,
-                local_base=state.local_base,
-                branch=state.branch,
-                runner=_list_runner(runner),
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue_id,
+                reservation_id=self.outcome_reservation_id, source="reattach_checkout",
+                cause="checkout_failed", checkout=Path(state.checkout) if state.checkout else None,
+                branch=state.branch, operation="observation_checkout",
+            ):
+                lease = _create_observation_worktree(
+                    self.repo,
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                    base=state.base_ref,
+                    local_base=state.local_base,
+                    branch=state.branch,
+                    runner=_list_runner(runner),
+                )
             started = _parse_chainlink_datetime(state.started_at) or datetime.now(UTC)
-            prompt = render_work_order(
-                issue,
-                template_path=_template_path(self.home),
-                backend_name=backend.name,
-                test_command=test_cmd or "",
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue_id,
+                reservation_id=self.outcome_reservation_id, source="reattach_prompt",
+                cause="prompt_render_failed", checkout=lease.path,
+                branch=state.branch, operation="render_prompt",
+            ):
+                prompt = render_work_order(
+                    issue,
+                    template_path=_template_path(self.home),
+                    backend_name=backend.name,
+                    test_command=test_cmd or "",
+                )
             order = WorkOrder(
                 issue_id=issue_id,
                 checkout=lease.path,
@@ -1664,14 +1942,20 @@ class WorklinkRunner:
                 env={"MIMIR_HOME": str(self.home)},
                 transcript_root=self.home / "state" / "worklink" / "transcripts",
             )
-            spec = backend.work_spec(
-                order,
-                attempt=state.attempt,
-                repo_url=state.repo_url,
-                base_ref=state.local_base or state.base_ref,
-                branch=state.branch,
-                test_command=test_cmd or "",
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue_id,
+                reservation_id=self.outcome_reservation_id, source="reattach_spec",
+                cause="work_spec_failed", checkout=lease.path,
+                branch=state.branch, operation="work_spec",
+            ):
+                spec = backend.work_spec(
+                    order,
+                    attempt=state.attempt,
+                    repo_url=state.repo_url,
+                    base_ref=state.local_base or state.base_ref,
+                    branch=state.branch,
+                    test_command=test_cmd or "",
+                )
             # Recovery records the original selection, not current backend defaults.
             spec = replace(
                 spec,
@@ -1684,11 +1968,18 @@ class WorklinkRunner:
                 claimed_at=started,
             )
             try:
-                compute_result = await _heartbeat_while(
-                    compute.wait(handle, config.defaults.timeout_s),
-                    claims=claims,
-                    record=claim_record,
-                )
+                with _typed_outcome_boundary(
+                    home=self.home, issue_id=issue_id,
+                    reservation_id=self.outcome_reservation_id, source="reattach_wait",
+                    cause="worker_failed", claim_record=claim_record,
+                    checkout=lease.path, branch=state.branch,
+                    operation="worker_wait",
+                ):
+                    compute_result = await _heartbeat_while(
+                        compute.wait(handle, config.defaults.timeout_s),
+                        claims=claims,
+                        record=claim_record,
+                    )
             finally:
                 await compute.cleanup(handle)
             if _reattach_worker_lost(compute_result):
@@ -1730,6 +2021,7 @@ class WorklinkRunner:
                     root_dirty_before=(),
                     runner=runner,
                     terminal_release=terminal_release,
+                    outcome_reservation_id=self.outcome_reservation_id,
                 ),
                 claims=claims,
                 record=claim_record,
@@ -1952,8 +2244,13 @@ class WorklinkRunner:
             max_attempts=config.defaults.max_claim_attempts,
         )
         issue = issue_reader.read(issue_id)
-        work_item_json = render_work_item(issue)
-        run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue_id, reservation_id=reservation_id,
+            source="factory_work_item", cause="work_item_invalid",
+            operation="work_item",
+        ):
+            work_item_json = render_work_item(issue)
+            run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
         retained: FactoryRunRecord | None = None
 
         class FactoryRecoveryBlocked(WorklinkError):
@@ -1978,6 +2275,17 @@ class WorklinkRunner:
                     command_runner=runner,
                 )
             except WorklinkError as exc:
+                _record_factory_stage_failure(
+                    home=self.home,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    claim_record=None,
+                    source="factory_retained_binding",
+                    cause="recovery_binding_invalid",
+                    record=candidate,
+                    checkout=Path(candidate.sandbox),
+                    error=exc,
+                )
                 raise FactoryRecoveryBlocked(candidate, str(exc)) from exc
             retained = candidate
 
@@ -1989,6 +2297,7 @@ class WorklinkRunner:
                 max_active_locks=factory_max_concurrent(),
                 active_label=WORKLINK_EPIC_LABEL,
                 before_claim=prepare_factory_claim,
+                **({"reservation_id": reservation_id} if reservation_id is not None else {}),
             )
         except FactoryRecoveryBlocked as exc:
             reason = f"retained factory sandbox {exc.record.sandbox}: {exc}"
@@ -2024,6 +2333,12 @@ class WorklinkRunner:
                 issue_id=issue_id,
                 reason="attempts_exhausted",
             )
+            _record_claim_refusal_outcome(
+                self.home,
+                issue_id,
+                reservation_id,
+                reason="attempts_exhausted",
+            )
             return WorklinkRunResult(issue_id, None, "blocked", reason="attempts_exhausted")
         if not claim.claimed or claim.record is None:
             reason = claim.reason or "claim_failed"
@@ -2032,19 +2347,16 @@ class WorklinkRunner:
                 issue_id=issue_id,
                 reason=reason,
             )
+            _record_claim_refusal_outcome(
+                self.home,
+                issue_id,
+                reservation_id,
+                reason=reason,
+            )
             return WorklinkRunResult(
                 issue_id, None, _claim_refusal_status(reason), reason=reason
             )
         claim_record = claim.record
-        if reservation_id is not None:
-            _record_lifecycle_start(
-                self.home,
-                issue_id=issue_id,
-                reservation_id=reservation_id,
-                record=claim_record,
-                run_id=run_id,
-                sandbox=retained.sandbox if retained is not None else None,
-            )
         _log_event(
             "worklink_claimed",
             issue_id=issue_id,
@@ -2052,8 +2364,20 @@ class WorklinkRunner:
             backend=selected.name,
         )
         lease: CheckoutLease | None = None
+        factory_stage = (
+            "factory_recovery_binding", "recovery_binding_invalid"
+        ) if retained is not None else ("factory_checkout", "checkout_failed")
         try:
             if retained is not None:
+                if reservation_id is not None:
+                    _record_lifecycle_start(
+                        self.home,
+                        issue_id=issue_id,
+                        reservation_id=reservation_id,
+                        record=claim_record,
+                        run_id=run_id,
+                        sandbox=retained.sandbox,
+                    )
                 result = await self._recover_factory_070(
                     issue=issue,
                     claim_record=claim_record,
@@ -2068,6 +2392,7 @@ class WorklinkRunner:
                     runner=runner,
                 )
             else:
+                factory_stage = ("factory_checkout", "checkout_failed")
                 lease = _create_backend_checkout(
                     self.repo,
                     issue_id=issue_id,
@@ -2079,12 +2404,16 @@ class WorklinkRunner:
                     runner=_list_runner(runner),
                     worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
                 )
+                factory_stage = ("factory_git_identity", "identity_unavailable")
                 git_name, git_email = _read_checkout_git_identity(lease.path, runner)
+                factory_stage = ("factory_publishing_identity", "identity_unavailable")
                 publishing_identity, publishing_identity_source = (
                     _read_factory_publishing_identity(self.repo)
                 )
+                factory_stage = ("factory_credential", "identity_unavailable")
                 github_token, github_env = _resolve_factory_github_credential(os.environ)
                 try:
+                    factory_stage = ("factory_identity_verify", "identity_mismatch")
                     GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
                 except GitHubIdentityVerificationError as exc:
                     raise WorklinkError(
@@ -2120,6 +2449,7 @@ class WorklinkRunner:
                     },
                     transcript_root=self.home / "state" / "worklink" / "transcripts",
                 )
+                factory_stage = ("factory_spec", "work_spec_failed")
                 spec = selected.work_spec(
                     order,
                     attempt=claim_record.attempt,
@@ -2128,6 +2458,7 @@ class WorklinkRunner:
                     branch=f"feature/{run_id}",
                     test_command=test_cmd,
                 )
+                factory_stage = ("factory_launch_binding", "recovery_binding_invalid")
                 _require_factory_launch_binding(spec, run_id, publishing_identity)
                 factory_record = FactoryRunRecord(
                     run_id=run_id,
@@ -2145,18 +2476,32 @@ class WorklinkRunner:
                     controller_phase="running",
                     transcript=None,
                 )
+                if reservation_id is not None:
+                    _record_lifecycle_start(
+                        self.home,
+                        issue_id=issue_id,
+                        reservation_id=reservation_id,
+                        record=claim_record,
+                        run_id=run_id,
+                        sandbox=factory_record.sandbox,
+                    )
+                factory_stage = ("factory_sandbox", "sandbox_failed")
                 _create_factory_sandbox(factory_record, lease)
+                factory_stage = ("factory_permissions", "permissions_failed")
                 _prepare_factory_sandbox_permissions(
                     lease.path / ".factory-sandboxes",
                     worker_uid_drop=isinstance(compute, LocalSubprocessComputeBackend),
                 )
+                factory_stage = ("factory_launch", "launch_failed")
                 handle = await compute.launch(spec)
                 factory_record = replace(factory_record, handle=handle)
                 try:
+                    factory_stage = ("factory_handle_save", "state_write_failed")
                     save_factory_record(self.home, factory_record)
                 except BaseException:
                     await _cancel_and_cleanup_factory_handle(compute, handle)
                     raise
+                factory_stage = ("factory_wait_start", "supervision_failed")
                 result = await self._supervise_factory_070(
                     issue=issue,
                     claim_record=claim_record,
@@ -2175,6 +2520,17 @@ class WorklinkRunner:
                 current = records[0] if records else None
             except Exception:
                 current = None
+            _record_factory_stage_failure(
+                home=self.home,
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                claim_record=claim_record,
+                source=factory_stage[0],
+                cause=factory_stage[1],
+                record=current,
+                checkout=lease.path if lease is not None else None,
+                error=exc,
+            )
             preserved_ref, preservation_error = _preserve_failed_factory_run(
                 home=self.home,
                 trusted_repo=self.repo,
@@ -2237,6 +2593,14 @@ class WorklinkRunner:
                 trigger_ready_scan=autonomous,
             )
         if not released:
+            _record_factory_terminal_outcome(
+                home=self.home,
+                reservation_id=reservation_id,
+                claim_record=claim_record,
+                record=None,
+                source="factory_terminal_release",
+                cause="terminal_routing_failed",
+            )
             reason = "terminal recovery incomplete: Chainlink lock release failed"
             if result.reason:
                 reason = f"{result.reason}; {reason}"
@@ -2269,7 +2633,15 @@ class WorklinkRunner:
             base=base,
             command_runner=runner,
         )
-        pre = backend.status(retained.run_id, sandbox=sandbox, launcher=retained.launcher)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_recovery_status", cause="recovery_state_invalid",
+            claim_record=claim_record, checkout=sandbox,
+            branch=retained.branch, factory_record=retained,
+            operation="recovery_status",
+        ):
+            pre = backend.status(retained.run_id, sandbox=sandbox, launcher=retained.launcher)
         _require_factory_status(pre, retained)
         historical_result = _opaque_json_bytes(pre.terminal_result)
         if retained.controller_phase == "terminal" and not pre.is_terminal:
@@ -2288,6 +2660,11 @@ class WorklinkRunner:
                     await _cancel_and_cleanup_factory_handle(compute, retained.handle)
                 elif not factory_process_is_verified_dead(retained):
                     raise WorklinkError("factory terminal process identity cannot be verified")
+            _retain_factory_observation(
+                self.home,
+                replace(retained, status=pre),
+                self.outcome_reservation_id,
+            )
             retained = retained.observed(pre, datetime.now(UTC).isoformat())
             save_factory_record(self.home, retained)
             return await self._finish_factory_070(
@@ -2309,27 +2686,43 @@ class WorklinkRunner:
             raise WorklinkError("factory recovery cannot verify the retained process is dead")
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
-            backend.lock(
-                retained.run_id,
-                "steal",
-                session=session,
-                sandbox=sandbox,
-                launcher=retained.launcher,
-            )
-            locked = backend.status(
-                retained.run_id, sandbox=sandbox, launcher=retained.launcher
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=self.outcome_reservation_id,
+                source="factory_recovery_lock", cause="lock_reconciliation_failed",
+                claim_record=claim_record, checkout=sandbox,
+                branch=retained.branch, factory_record=retained,
+                operation="steal_lock",
+            ):
+                backend.lock(
+                    retained.run_id,
+                    "steal",
+                    session=session,
+                    sandbox=sandbox,
+                    launcher=retained.launcher,
+                )
+                locked = backend.status(
+                    retained.run_id, sandbox=sandbox, launcher=retained.launcher
+                )
         elif pre.lock == "absent":
-            backend.lock(
-                retained.run_id,
-                "claim",
-                session=session,
-                sandbox=sandbox,
-                launcher=retained.launcher,
-            )
-            locked = backend.status(
-                retained.run_id, sandbox=sandbox, launcher=retained.launcher
-            )
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=self.outcome_reservation_id,
+                source="factory_recovery_lock", cause="lock_reconciliation_failed",
+                claim_record=claim_record, checkout=sandbox,
+                branch=retained.branch, factory_record=retained,
+                operation="claim_lock",
+            ):
+                backend.lock(
+                    retained.run_id,
+                    "claim",
+                    session=session,
+                    sandbox=sandbox,
+                    launcher=retained.launcher,
+                )
+                locked = backend.status(
+                    retained.run_id, sandbox=sandbox, launcher=retained.launcher
+                )
         else:
             locked = pre
         _require_factory_status(locked, retained)
@@ -2340,12 +2733,20 @@ class WorklinkRunner:
             or _opaque_json_bytes(locked.terminal_result) != historical_result
         ):
             raise WorklinkError("factory recovery lock reconciliation failed")
-        resumed = backend.resume(
-            retained.run_id,
-            session=session,
-            sandbox=sandbox,
-            launcher=retained.launcher,
-        )
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_resume", cause="resume_failed",
+            claim_record=claim_record, checkout=sandbox,
+            branch=retained.branch, factory_record=retained,
+            operation="resume",
+        ):
+            resumed = backend.resume(
+                retained.run_id,
+                session=session,
+                sandbox=sandbox,
+                launcher=retained.launcher,
+            )
         _require_factory_status(resumed, retained)
         if (
             resumed.status != "running"
@@ -2376,27 +2777,56 @@ class WorklinkRunner:
             env={"MIMIR_HOME": str(self.home)},
             transcript_root=self.home / "state" / "worklink" / "transcripts",
         )
-        recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_recovery_repository", cause="repository_changed",
+            claim_record=claim_record, checkout=sandbox,
+            branch=retained.branch, factory_record=retained,
+            operation="repository",
+        ):
+            recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
         if (
             _factory_checkout_repository(sandbox, runner) or ""
         ).lower() != retained.repository.lower():
             raise WorklinkError("factory recovery sandbox repository changed before launch")
-        spec = backend.work_spec(
-            order,
-            attempt=retained.attempt,
-            repo_url=recovery_repo_url,
-            base_ref=retained.base_ref,
-            branch=retained.branch,
-            test_command=test_cmd,
-            session=session,
-            run_id=retained.run_id,
-        )
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_recovery_spec", cause="work_spec_failed",
+            claim_record=claim_record, checkout=sandbox,
+            branch=retained.branch, factory_record=retained,
+            operation="work_spec",
+        ):
+            spec = backend.work_spec(
+                order,
+                attempt=retained.attempt,
+                repo_url=recovery_repo_url,
+                base_ref=retained.base_ref,
+                branch=retained.branch,
+                test_command=test_cmd,
+                session=session,
+                run_id=retained.run_id,
+            )
         if isinstance(compute, LocalSubprocessComputeBackend):
             # Authorization stays at the original inner checkout; --dir still
             # selects the retained sandbox validated above. Session data is
             # attempt-scoped as on the initial launch.
             spec = replace(spec, local_checkout=sandbox.parent.parent)
-        handle = await compute.launch(spec)
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_recovery_launch", cause="launch_failed",
+            claim_record=claim_record, checkout=sandbox,
+            branch=retained.branch, factory_record=retained,
+            operation="recovery_launch",
+        ):
+            handle = await compute.launch(spec)
+        _retain_factory_observation(
+            self.home,
+            replace(retained, status=resumed),
+            self.outcome_reservation_id,
+        )
         relaunched = replace(
             retained.observed(resumed, datetime.now(UTC).isoformat()),
             handle=handle,
@@ -2404,7 +2834,15 @@ class WorklinkRunner:
             transcript=None,
         )
         try:
-            save_factory_record(self.home, relaunched)
+            with _typed_outcome_boundary(
+                home=self.home, issue_id=issue.issue_id,
+                reservation_id=self.outcome_reservation_id,
+                source="factory_recovery_save", cause="state_write_failed",
+                claim_record=claim_record, checkout=sandbox,
+                branch=retained.branch, factory_record=relaunched,
+                operation="recovery_save",
+            ):
+                save_factory_record(self.home, relaunched)
         except BaseException:
             await _cancel_and_cleanup_factory_handle(compute, handle)
             raise
@@ -2459,15 +2897,17 @@ class WorklinkRunner:
         failed = True
         cancel_attempted = False
         wait_result: ComputeResult | None = None
+        supervision_stage = ("factory_wait_start", "supervision_failed")
 
         def retain_result(result: ComputeResult | None, outcome: str) -> None:
-            nonlocal factory_record
+            nonlocal factory_record, supervision_stage
             if factory_record.transcript is not None:
                 return
             path = transcript_path(
                 self.home / "state" / "worklink" / "transcripts",
                 issue.issue_id,
             )
+            supervision_stage = ("factory_transcript", "transcript_failed")
             write_transcript(
                 path,
                 command=() if result is None else result.command,
@@ -2500,9 +2940,14 @@ class WorklinkRunner:
                     remaining = startup_deadline - loop.time() if last_status is None else deadline - loop.time()
                     if remaining <= 0:
                         if last_status is None:
+                            supervision_stage = (
+                                "factory_startup_deadline", "startup_timeout"
+                            )
                             raise WorklinkError("factory never initialised before startup deadline")
+                        supervision_stage = ("factory_run_deadline", "run_timeout")
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                     try:
+                        supervision_stage = ("factory_status_read", "status_read_failed")
                         status = await asyncio.wait_for(
                             asyncio.to_thread(
                                 backend.status,
@@ -2514,9 +2959,13 @@ class WorklinkRunner:
                         )
                     except TimeoutError as exc:
                         if last_status is None:
+                            supervision_stage = (
+                                "factory_startup_deadline", "startup_timeout"
+                            )
                             raise WorklinkError(
                                 "factory never initialised before startup deadline"
                             ) from exc
+                        supervision_stage = ("factory_run_deadline", "run_timeout")
                         raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)") from exc
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
@@ -2525,8 +2974,14 @@ class WorklinkRunner:
                 )
                 if pre_manifest:
                     if loop.time() >= startup_deadline:
+                        supervision_stage = (
+                            "factory_startup_deadline", "startup_timeout"
+                        )
                         raise WorklinkError("factory never initialised before startup deadline")
                 else:
+                    supervision_stage = (
+                        "factory_status_binding", "status_binding_invalid"
+                    )
                     _require_factory_status(status, factory_record)
                     if status != last_status:
                         last_status = status
@@ -2535,7 +2990,16 @@ class WorklinkRunner:
                         None,
                         factory_record.session,
                     }:
+                        supervision_stage = ("factory_owner", "owner_changed")
                         raise WorklinkError("factory lock owner changed")
+                    supervision_stage = (
+                        "factory_observation_save", "state_write_failed"
+                    )
+                    _retain_factory_observation(
+                        self.home,
+                        replace(factory_record, status=status),
+                        self.outcome_reservation_id,
+                    )
                     factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
                     phase = (
                         "parked"
@@ -2545,6 +3009,7 @@ class WorklinkRunner:
                     factory_record = replace(factory_record, controller_phase=phase)
                     save_factory_record(self.home, factory_record)
                     if status.lock == "fresh" and factory_record.session == status.lock_session:
+                        supervision_stage = ("factory_heartbeat", "heartbeat_failed")
                         await asyncio.to_thread(
                             backend.heartbeat,
                             factory_record.run_id,
@@ -2563,6 +3028,9 @@ class WorklinkRunner:
                     if status.is_terminal or status.is_parked:
                         if not wait_task.done():
                             await cancel_once()
+                            supervision_stage = (
+                                "factory_wait_drain", "result_unavailable"
+                            )
                             wait_result = await _finish_factory_wait_task(wait_task)
                         else:
                             wait_result = await wait_task
@@ -2581,6 +3049,9 @@ class WorklinkRunner:
                         )
                 if wait_task.done() or not compute.job_alive(handle):
                     try:
+                        supervision_stage = (
+                            "factory_wait_drain", "result_unavailable"
+                        )
                         result = await asyncio.wait_for(asyncio.shield(wait_task), timeout=5)
                         wait_result = result
                     except TimeoutError as exc:
@@ -2588,6 +3059,7 @@ class WorklinkRunner:
                             "OpenCode process stopped without a drainable supervision result"
                         ) from exc
                     retain_result(result, "failed")
+                    supervision_stage = ("factory_driver_exit", "unfinished_exit")
                     detail = result.stderr.strip() or result.stdout.strip()
                     if _factory_lock_refusal(result):
                         reason = "factory driver did not acquire the retained run lock"
@@ -2625,6 +3097,7 @@ class WorklinkRunner:
                         f"OpenCode process exited while factory status was running{suffix}"
                     )
                 if loop.time() >= deadline:
+                    supervision_stage = ("factory_run_deadline", "run_timeout")
                     raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
@@ -2632,6 +3105,19 @@ class WorklinkRunner:
                     poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
                 await asyncio.sleep(poll_delay)
                 status = None
+        except Exception as exc:
+            _record_factory_stage_failure(
+                home=self.home,
+                issue_id=issue.issue_id,
+                reservation_id=self.outcome_reservation_id,
+                claim_record=claim_record,
+                source=supervision_stage[0],
+                cause=supervision_stage[1],
+                record=factory_record,
+                checkout=Path(factory_record.sandbox),
+                error=exc,
+            )
+            raise
         finally:
             try:
                 if failed and not wait_task.done():
@@ -2646,7 +3132,22 @@ class WorklinkRunner:
                         wait_result = drained[0]
                     retain_result(wait_result, "refused" if failed else "completed")
             finally:
-                await compute.cleanup(handle)
+                try:
+                    await compute.cleanup(handle)
+                except Exception as exc:
+                    _record_factory_stage_failure(
+                        home=self.home,
+                        issue_id=issue.issue_id,
+                        reservation_id=self.outcome_reservation_id,
+                        claim_record=claim_record,
+                        source="factory_cleanup",
+                        cause="cleanup_failed",
+                        record=factory_record,
+                        checkout=Path(factory_record.sandbox),
+                        error=exc,
+                        allow_after_stop=True,
+                    )
+                    raise
 
     async def _finish_factory_070(
         self,
@@ -2670,6 +3171,14 @@ class WorklinkRunner:
                 if status.park_snapshot is not None
                 else "factory run is parked; no control-plane snapshot published"
             )
+            _record_factory_terminal_outcome(
+                home=self.home,
+                reservation_id=self.outcome_reservation_id,
+                claim_record=claim_record,
+                record=factory_record,
+                source="factory_parked",
+                cause="needs_human",
+            )
             claims.transition_issue(
                 issue.issue_id,
                 status="blocked",
@@ -2685,6 +3194,7 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=park_report,
                 next=status.next,
+                next_present=status.next_present,
             )
             _log_event(
                 "worklink_transition",
@@ -2698,6 +3208,14 @@ class WorklinkRunner:
             )
             return result
         if status.status in {"blocked", "partial"}:
+            _record_factory_terminal_outcome(
+                home=self.home,
+                reservation_id=self.outcome_reservation_id,
+                claim_record=claim_record,
+                record=factory_record,
+                source=("factory_partial" if status.status == "partial" else "factory_blocked"),
+                cause=status.status,
+            )
             claims.transition_issue(
                 issue.issue_id,
                 status="blocked",
@@ -2714,6 +3232,7 @@ class WorklinkRunner:
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
                 next=status.next,
+                next_present=status.next_present,
             )
             _log_event(
                 "worklink_transition",
@@ -2725,17 +3244,25 @@ class WorklinkRunner:
                 reason=result.reason,
             )
             return result
-        evidence_path, pr_url = await _verify_factory_completion(
-            home=self.home,
-            issue=issue,
-            record=factory_record,
-            test_command=test_cmd,
-            gate_rerun_max_failures=WorklinkConfig.load(
-                self.home / "worklink.yaml"
-            ).defaults.gate_rerun_max_failures,
-            started_at=started_at,
-            runner=runner,
-        )
+        with _typed_outcome_boundary(
+            home=self.home, issue_id=issue.issue_id,
+            reservation_id=self.outcome_reservation_id,
+            source="factory_completion_verify", cause="completion_invalid",
+            claim_record=claim_record, checkout=Path(factory_record.sandbox),
+            branch=factory_record.branch, factory_record=factory_record,
+            operation="completion_verify",
+        ):
+            evidence_path, pr_url = await _verify_factory_completion(
+                home=self.home,
+                issue=issue,
+                record=factory_record,
+                test_command=test_cmd,
+                gate_rerun_max_failures=WorklinkConfig.load(
+                    self.home / "worklink.yaml"
+                ).defaults.gate_rerun_max_failures,
+                started_at=started_at,
+                runner=runner,
+            )
         claims.transition_issue(
             issue.issue_id,
             status="review",
@@ -2752,6 +3279,7 @@ class WorklinkRunner:
             checkout=Path(factory_record.sandbox),
             branch=factory_record.branch,
             next=status.next,
+            next_present=status.next_present,
         )
         _log_event(
             "worklink_transition",
@@ -3550,6 +4078,7 @@ def _outcome_reservation(
     if not autonomous:
         return None
     from .dispatch_failures import (
+        RESERVATION_ENV,
         dispatch_failure_state_dir,
         reservation_from_environment,
     )
@@ -3560,7 +4089,9 @@ def _outcome_reservation(
         target=target,
         autonomous=True,
     )
-    if reservation_id is None:  # pragma: no cover - autonomous guarantees a value.
+    if reservation_id is None and not (
+        RESERVATION_ENV in os.environ and not os.environ[RESERVATION_ENV]
+    ):
         raise WorklinkError("autonomous outcome reservation was not created")
     return reservation_id
 
@@ -3605,10 +4136,18 @@ def _record_preclaim_input(
     if reservation_id is None:
         return
     from .attention import InputFacts
-    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+        record_attention,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    if issue_dispatch_disposition(state_dir, issue_id) in {"stop", "success"}:
+        return
 
     record_attention(
-        dispatch_failure_state_dir(home),
+        state_dir,
         issue_id=issue_id,
         reservation_id=reservation_id,
         source=source,
@@ -3638,6 +4177,519 @@ def _record_preclaim_claim(
         source=source,
         cause=cause,
         facts=ClaimFacts(None, None, result),
+    )
+
+
+def _record_claim_refusal_outcome(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    *,
+    reason: str,
+) -> None:
+    if reservation_id is None:
+        return
+    benign = {
+        "duplicate_run_live",
+        "lifecycle_state_incompatible",
+        "review_ready_evidence_exists",
+        "publication_intent_exists",
+    }
+    if reason in benign or reason.startswith("concurrency cap reached ("):
+        return
+    from .attention import AttentionCause, AttentionSource, ClaimFacts
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        error_signature,
+        record_attention,
+        record_contention_recurrence,
+        reservation_has_source,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    if reservation_has_source(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        sources=frozenset({
+            "claim_command", "claim_guard", "claim_steal", "claim_budget",
+            "claim_capacity_read", "claim_unready", "claim_inprogress",
+            "claim_comment", "claim_contention",
+        }),
+    ):
+        return
+    if reason == "claim_contention_exhausted":
+        disposition, retry_after = record_contention_recurrence(
+            state_dir,
+            issue_id=issue_id,
+            signature=error_signature(reason),
+        )
+        source = AttentionSource.CLAIM_CONTENTION
+        cause = AttentionCause.CONTENTION_EXHAUSTED
+    elif reason == "attempts_exhausted":
+        disposition, retry_after = "stop", None
+        source = AttentionSource.CLAIM_BUDGET
+        cause = AttentionCause.ATTEMPTS_EXHAUSTED
+    elif reason.startswith("claim_guard_"):
+        disposition, retry_after = "stop", None
+        source = AttentionSource.CLAIM_GUARD
+        cause = AttentionCause.OWNER_READ_FAILED
+    else:
+        disposition, retry_after = "stop", None
+        source = AttentionSource.CLAIM_COMMAND
+        cause = AttentionCause.CLAIM_COMMAND_FAILED
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=ClaimFacts(
+            intended=None,
+            confirmed=None,
+            result=reason,
+            command_operation="claim",
+        ),
+        disposition=disposition,
+        retry_after=retry_after,
+    )
+
+
+@contextmanager
+def _typed_outcome_boundary(
+    *,
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    source: str,
+    cause: str,
+    claim_record: ClaimRecord | None = None,
+    checkout: Path | None = None,
+    branch: str | None = None,
+    operation: str | None = None,
+    factory_record: FactoryRunRecord | None = None,
+) -> Iterator[None]:
+    """Record the exact originating operation when a real boundary raises."""
+    try:
+        yield
+    except Exception as exc:
+        if reservation_id is not None:
+            from .attention import (
+                ClaimIdentity,
+                InputFacts,
+                LaunchFacts,
+                LeafFacts,
+                FactorySnapshot,
+                ReconcileFacts,
+                SOURCE_RULES,
+                AttentionSource,
+            )
+            from .dispatch_failures import (
+                dispatch_failure_state_dir,
+                issue_dispatch_disposition,
+                record_attention,
+                retained_positive_proofs,
+            )
+
+            state_dir = dispatch_failure_state_dir(home)
+            if issue_dispatch_disposition(state_dir, issue_id) not in {"stop", "success"}:
+                rule = SOURCE_RULES[AttentionSource(source)]
+                if rule.fact_type == "input":
+                    facts: object = InputFacts(
+                        validator=operation or source,
+                        result=type(exc).__name__,
+                    )
+                elif rule.fact_type == "launch":
+                    facts = LaunchFacts(
+                        executable=None,
+                        compute=None,
+                        checkout=str(checkout) if checkout else None,
+                        operation=operation or source,
+                        returned_handle=None,
+                        pid=None,
+                        start_ticks=None,
+                        launch_result=type(exc).__name__,
+                        state_save_result=None,
+                    )
+                elif rule.fact_type == "factory":
+                    if factory_record is not None:
+                        from .factory_state import immutable_factory_snapshot
+
+                        facts = immutable_factory_snapshot(
+                            factory_record, read_result=type(exc).__name__
+                        )
+                    else:
+                        facts = FactorySnapshot(
+                            run_id=None, issue_id=issue_id,
+                            attempt=claim_record.attempt if claim_record else None,
+                            sandbox=str(checkout) if checkout else None,
+                            session=None, controller_phase="failed",
+                            controller_error=None, status=None, valid=None,
+                            lock=None, dead_lock=None, lock_session=None,
+                            gates=(), steps=(), slices=(), pr_url=None,
+                            next=None, next_present=False, park_snapshot=None,
+                            read_result=type(exc).__name__,
+                        )
+                elif rule.fact_type == "reconcile":
+                    facts = ReconcileFacts(
+                        original_run_id=factory_record.run_id if factory_record else None,
+                        original_claim=None,
+                        process_verdict="unknown",
+                        lock_verdict="unknown",
+                        publication_id=None,
+                        evidence_id=None,
+                        automatic_handling_stage=operation or source,
+                        automatic_handling_result=type(exc).__name__,
+                    )
+                else:
+                    facts = LeafFacts(
+                        backend=None,
+                        checkout=str(checkout) if checkout else None,
+                        base=None,
+                        branch=branch,
+                        isolated=None,
+                        compute_result=type(exc).__name__,
+                        backend_status=None,
+                        validation_reason_codes=(),
+                        evidence_id=None,
+                        evidence_sha256=None,
+                        pr_url=None,
+                        head_sha=None,
+                    )
+                claim = (
+                    ClaimIdentity(
+                        issue_id=claim_record.issue_id,
+                        attempt=claim_record.attempt,
+                        agent_id=claim_record.agent_id,
+                        claimed_at=claim_record.claimed_at.isoformat(),
+                    )
+                    if claim_record is not None
+                    else None
+                )
+                proofs = (
+                    retained_positive_proofs(
+                        state_dir,
+                        issue_id=issue_id,
+                        reservation_id=reservation_id,
+                    )
+                    if rule.work_capable and claim is not None
+                    else ()
+                )
+                record_attention(
+                    state_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    source=source,
+                    cause=cause,
+                    facts=facts,
+                    claim=claim,
+                    proof_ids=proofs,
+                )
+        raise
+
+
+def _record_direct_leaf_outcome(
+    *,
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    claim_record: ClaimRecord,
+    source: str,
+    cause: str,
+    checkout: Path | None,
+    branch: str | None,
+    reason: str,
+    evidence_path: Path | None = None,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import (
+        AttentionSource,
+        ClaimIdentity,
+        LeafFacts,
+        ReconcileFacts,
+        SOURCE_RULES,
+    )
+    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+
+    evidence_sha = _file_sha256(evidence_path)
+    claim = ClaimIdentity(
+        issue_id=claim_record.issue_id,
+        attempt=claim_record.attempt,
+        agent_id=claim_record.agent_id,
+        claimed_at=claim_record.claimed_at.isoformat(),
+    )
+    source_value = AttentionSource(source)
+    facts: object
+    if SOURCE_RULES[source_value].fact_type == "reconcile":
+        facts = ReconcileFacts(
+            original_run_id=None,
+            original_claim=claim,
+            process_verdict="finished",
+            lock_verdict=reason,
+            publication_id=branch,
+            evidence_id=str(evidence_path) if evidence_path else None,
+            automatic_handling_stage=source,
+            automatic_handling_result=reason,
+        )
+    else:
+        facts = LeafFacts(
+            backend=None,
+            checkout=str(checkout) if checkout else None,
+            base=None,
+            branch=branch,
+            isolated=False,
+            compute_result=reason,
+            backend_status=None,
+            validation_reason_codes=(reason,),
+            evidence_id=str(evidence_path.resolve()) if evidence_path else None,
+            evidence_sha256=evidence_sha,
+            pr_url=None,
+            head_sha=None,
+        )
+    record_attention(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=facts,
+        claim=claim,
+        proof_ids=(
+            ()
+            if SOURCE_RULES[source_value].fact_type == "reconcile"
+            else ((f"leaf_outcome:{evidence_sha}",) if evidence_sha else ())
+        ),
+    )
+
+
+def _record_factory_stage_failure(
+    *,
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    claim_record: ClaimRecord | None,
+    source: str,
+    cause: str,
+    record: FactoryRunRecord | None,
+    checkout: Path | None,
+    error: BaseException,
+    allow_after_stop: bool = False,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import (
+        AttentionSource,
+        ClaimIdentity,
+        FactorySnapshot,
+        LaunchFacts,
+        ReconcileFacts,
+        SOURCE_RULES,
+    )
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+        record_attention,
+        retained_positive_proofs,
+    )
+    from .factory_state import immutable_factory_snapshot
+
+    state_dir = dispatch_failure_state_dir(home)
+    if not allow_after_stop and issue_dispatch_disposition(
+        state_dir, issue_id
+    ) in {"stop", "success"}:
+        return
+    source_value = AttentionSource(source)
+    if SOURCE_RULES[source_value].fact_type == "launch":
+        facts: object = LaunchFacts(
+            executable=None,
+            compute="local_subprocess",
+            checkout=str(checkout) if checkout else None,
+            operation=source,
+            returned_handle=None,
+            pid=None,
+            start_ticks=None,
+            launch_result=type(error).__name__,
+            state_save_result=None,
+        )
+    elif SOURCE_RULES[source_value].fact_type == "reconcile":
+        facts = ReconcileFacts(
+            original_run_id=record.run_id if record else None,
+            original_claim=ClaimIdentity(
+                issue_id=claim_record.issue_id,
+                attempt=claim_record.attempt,
+                agent_id=claim_record.agent_id,
+                claimed_at=claim_record.claimed_at.isoformat(),
+            ),
+            process_verdict="unknown",
+            lock_verdict="release_failed",
+            publication_id=None,
+            evidence_id=None,
+            automatic_handling_stage=source,
+            automatic_handling_result=type(error).__name__,
+        )
+    elif record is not None:
+        facts = immutable_factory_snapshot(record, read_result=type(error).__name__)
+    else:
+        facts = FactorySnapshot(
+            run_id=None, issue_id=issue_id,
+            attempt=claim_record.attempt if claim_record else None,
+            sandbox=str(checkout) if checkout else None, session=None,
+            controller_phase="failed", controller_error=None, status=None,
+            valid=None, lock=None, dead_lock=None, lock_session=None,
+            gates=(), steps=(), slices=(), pr_url=None, next=None,
+            next_present=False, park_snapshot=None,
+            read_result=type(error).__name__,
+        )
+    proofs = retained_positive_proofs(
+        state_dir, issue_id=issue_id, reservation_id=reservation_id
+    )
+    claim = (
+        ClaimIdentity(
+            issue_id=claim_record.issue_id,
+            attempt=claim_record.attempt,
+            agent_id=claim_record.agent_id,
+            claimed_at=claim_record.claimed_at.isoformat(),
+        )
+        if claim_record is not None
+        else None
+    )
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=facts,
+        claim=claim,
+        proof_ids=proofs,
+    )
+
+
+def _record_factory_terminal_outcome(
+    *,
+    home: Path,
+    reservation_id: str | None,
+    claim_record: ClaimRecord,
+    record: FactoryRunRecord | None,
+    source: str,
+    cause: str,
+) -> None:
+    if reservation_id is None:
+        return
+    if record is None:
+        try:
+            records = load_factory_records_for_issue(home, claim_record.issue_id)
+            record = records[0] if records else None
+        except Exception:
+            record = None
+    _record_factory_stage_failure(
+        home=home,
+        issue_id=claim_record.issue_id,
+        reservation_id=reservation_id,
+        claim_record=claim_record,
+        source=source,
+        cause=cause,
+        record=record,
+        checkout=Path(record.sandbox) if record is not None else None,
+        error=WorklinkError(cause),
+        allow_after_stop=source in {"factory_terminal_release", "factory_terminal_labels"},
+    )
+
+
+def _record_reconcile_outcome(
+    *,
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    source: str,
+    cause: str,
+    stage: str,
+    result: str,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import ReconcileFacts
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_attention,
+        reservation_binding,
+        reservation_claim,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    binding = reservation_binding(
+        state_dir, issue_id=issue_id, reservation_id=reservation_id
+    ) or {}
+    claim = reservation_claim(
+        state_dir, issue_id=issue_id, reservation_id=reservation_id
+    )
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=ReconcileFacts(
+            original_run_id=(
+                str(binding["run_id"]) if binding.get("run_id") is not None else None
+            ),
+            original_claim=claim,
+            process_verdict="unknown",
+            lock_verdict="unknown",
+            publication_id=None,
+            evidence_id=None,
+            automatic_handling_stage=stage,
+            automatic_handling_result=result,
+        ),
+        claim=claim,
+        deferred=False,
+    )
+
+
+def _record_direct_reattach_leaf(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    state: WorklinkRunState,
+    *,
+    source: str,
+    cause: str,
+    reason: str,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import LeafFacts
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_attention,
+        reservation_claim,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=LeafFacts(
+            backend=state.backend,
+            checkout=state.checkout,
+            base=state.base_ref,
+            branch=state.branch,
+            isolated=None,
+            compute_result=reason,
+            backend_status=None,
+            validation_reason_codes=(),
+            evidence_id=None,
+            evidence_sha256=None,
+            pr_url=None,
+            head_sha=None,
+        ),
+        claim=reservation_claim(
+            state_dir, issue_id=issue_id, reservation_id=reservation_id
+        ),
     )
 
 
@@ -3772,6 +4824,8 @@ def _record_typed_terminal(
         dispatch_failure_state_dir,
         issue_dispatch_disposition,
         record_attention,
+        retained_positive_proofs,
+        reservation_binding,
         reservation_claim,
     )
 
@@ -3787,7 +4841,7 @@ def _record_typed_terminal(
             else AttentionSource.FACTORY_DRIVER_EXIT
             if result.status == "failed"
             else AttentionSource.FACTORY_PARKED
-            if result.status == "parked"
+            if result.status in {"parked", "needs-human"}
             else AttentionSource.FACTORY_BLOCKED
         )
         cause = (
@@ -3796,7 +4850,7 @@ def _record_typed_terminal(
             else AttentionCause.UNFINISHED_EXIT
             if result.status == "failed"
             else AttentionCause.NEEDS_HUMAN
-            if result.status == "parked"
+            if result.status in {"parked", "needs-human"}
             else AttentionCause.BLOCKED
         )
         facts: object = FactorySnapshot(
@@ -3808,7 +4862,7 @@ def _record_typed_terminal(
             controller_phase="terminal",
             controller_error=result.reason,
             status=result.status,
-            valid=True,
+            valid=None,
             lock=None,
             dead_lock=None,
             lock_session=None,
@@ -3817,9 +4871,9 @@ def _record_typed_terminal(
             slices=(),
             pr_url=result.pr_url,
             next=result.next,
-            next_present=result.next is not None,
+            next_present=result.next_present,
             park_snapshot=None,
-            read_result="captured",
+            read_result="unavailable",
         )
         try:
             from .factory_state import (
@@ -3827,16 +4881,35 @@ def _record_typed_terminal(
                 load_factory_records_for_issue,
             )
 
-            records = load_factory_records_for_issue(home, issue_id)
-            if records:
+            binding = reservation_binding(
+                state_dir, issue_id=issue_id, reservation_id=reservation_id
+            ) or {}
+            records = [
+                record
+                for record in load_factory_records_for_issue(home, issue_id)
+                if (binding.get("run_id") is None or record.run_id == binding["run_id"])
+                and (
+                    binding.get("sandbox") is None
+                    or record.sandbox == binding["sandbox"]
+                )
+            ]
+            if len(records) == 1:
                 facts = immutable_factory_snapshot(records[0], read_result="captured")
         except Exception:
             # The terminal occurrence must preserve the originating result; a
             # later strict inspection reports the record read failure.
             pass
         proofs = positive_factory_proofs(facts)
-        if is_partial and "factory_partial" not in proofs:
-            proofs = (*proofs, "factory_partial")
+        proofs = tuple(
+            dict.fromkeys([
+                *retained_positive_proofs(
+                    state_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                ),
+                *proofs,
+            ])
+        )
     else:
         source = AttentionSource.LEAF_BACKEND_OUTCOME
         cause = (
@@ -3844,11 +4917,8 @@ def _record_typed_terminal(
             if result.status == "blocked"
             else AttentionCause.BACKEND_FAILED
         )
-        proofs = (
-            (f"leaf_outcome:{result.evidence_path}",)
-            if result.evidence_path is not None
-            else ()
-        )
+        evidence_sha = _file_sha256(result.evidence_path)
+        proofs = ((f"leaf_outcome:{evidence_sha}",) if evidence_sha is not None else ())
         facts = LeafFacts(
             backend=None,
             checkout=str(result.checkout) if result.checkout else None,
@@ -3859,7 +4929,7 @@ def _record_typed_terminal(
             backend_status=result.status,
             validation_reason_codes=(),
             evidence_id=str(result.evidence_path) if result.evidence_path else None,
-            evidence_sha256=_file_sha256(result.evidence_path),
+            evidence_sha256=evidence_sha,
             pr_url=result.pr_url,
             head_sha=None,
         )
@@ -3873,6 +4943,31 @@ def _record_typed_terminal(
         claim=claim,
         proof_ids=proofs,
     )
+
+
+def _retain_factory_observation(
+    home: Path,
+    record: FactoryRunRecord,
+    reservation_id: str | None,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import positive_factory_proofs
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        retain_positive_proofs,
+    )
+    from .factory_state import immutable_factory_snapshot
+
+    snapshot = immutable_factory_snapshot(record, read_result="captured")
+    proofs = positive_factory_proofs(snapshot)
+    if proofs:
+        retain_positive_proofs(
+            dispatch_failure_state_dir(home),
+            issue_id=record.issue_id,
+            reservation_id=reservation_id,
+            proof_ids=proofs,
+        )
 
 
 def _record_leaf_outcome_before_routing(
@@ -3889,14 +4984,21 @@ def _record_leaf_outcome_before_routing(
     pr_url: str | None,
 ) -> None:
     from .attention import AttentionCause, AttentionSource, ClaimIdentity, LeafFacts
-    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+        record_attention,
+    )
 
+    state_dir = dispatch_failure_state_dir(home)
+    if issue_dispatch_disposition(state_dir, issue.issue_id) in {"stop", "success"}:
+        return
     evidence_sha = _file_sha256(evidence_path)
     proof_ids = (
         (f"leaf_outcome:{evidence_sha}",) if evidence_sha is not None else ()
     )
     record_attention(
-        dispatch_failure_state_dir(home),
+        state_dir,
         issue_id=issue.issue_id,
         reservation_id=reservation_id,
         source=AttentionSource.LEAF_BACKEND_OUTCOME,
@@ -3938,6 +5040,7 @@ def _record_run_success(
     target: str = "leaf",
 ) -> None:
     from .dispatch_failures import (
+        clear_contention_after_verified_success,
         dispatch_failure_state_dir,
         record_success,
         record_success_witness,
@@ -3948,10 +5051,45 @@ def _record_run_success(
     try:
         state_dir = dispatch_failure_state_dir(home)
         record_success(state_dir, issue_id)
-        if reservation_id is None or result is None or result.evidence_path is None:
+        if result is None or result.evidence_path is None:
             return
         evidence_sha = _file_sha256(result.evidence_path)
         if evidence_sha is None or result.branch is None:
+            return
+        head_sha = evidence_sha
+        try:
+            payload = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("head_sha"), str):
+                head_sha = payload["head_sha"]
+        except (OSError, json.JSONDecodeError):
+            return
+        if reservation_id is None:
+            record_success_witness(
+                state_dir,
+                issue_id=issue_id,
+                target=target,
+                origin="manual",
+                claim=None,
+                run_id=(
+                    str(payload["run_id"])
+                    if isinstance(payload, dict) and payload.get("run_id") is not None
+                    else None
+                ),
+                sandbox=(
+                    str(payload["sandbox"])
+                    if isinstance(payload, dict) and payload.get("sandbox") is not None
+                    else None
+                ),
+                completed_at=datetime.now(UTC).isoformat(),
+                evidence_path=str(result.evidence_path.resolve()),
+                evidence_sha256=evidence_sha,
+                branch=result.branch,
+                head_sha=head_sha,
+                pr_url=result.pr_url,
+                next_value=result.next,
+                next_present=result.next_present,
+            )
+            clear_contention_after_verified_success(state_dir, issue_id)
             return
         claim = reservation_claim(
             state_dir, issue_id=issue_id, reservation_id=reservation_id
@@ -3961,13 +5099,6 @@ def _record_run_success(
         binding = reservation_binding(
             state_dir, issue_id=issue_id, reservation_id=reservation_id
         ) or {}
-        head_sha = evidence_sha
-        try:
-            payload = json.loads(result.evidence_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and isinstance(payload.get("head_sha"), str):
-                head_sha = payload["head_sha"]
-        except (OSError, json.JSONDecodeError):
-            return
         record_success_witness(
             state_dir,
             issue_id=issue_id,
@@ -3989,9 +5120,11 @@ def _record_run_success(
             head_sha=head_sha,
             pr_url=result.pr_url,
             next_value=result.next,
+            next_present=result.next_present,
             reservation_id=reservation_id,
             proof_ids=(f"{target}_completion:{evidence_sha}",),
         )
+        clear_contention_after_verified_success(state_dir, issue_id)
     except OSError:
         pass
 
@@ -4007,16 +5140,51 @@ def _file_sha256(path: Path | None) -> str | None:
 
 def _trigger_ready_scan_after_release(home: Path) -> None:
     """Signal the ready queue only after Chainlink confirmed a slot release."""
+    # The poller performs the issue-specific terminal-disposition check before
+    # dispatch.  This notification is only a scan wakeup and grants no retry.
     from ..poller_triggers import notify_poller
 
     notify_poller(home, "worklink-ready-queue", reason="worklink_slot_released")
 
 
 def run_worklink_reattach(
-    *, home: Path, repo: Path, issue_id: int
+    *,
+    home: Path,
+    repo: Path,
+    issue_id: int,
+    autonomous: bool = False,
+    reservation_id: str | None = None,
 ) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
-    return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
+    if autonomous and reservation_id is None:
+        # Legacy recovery remains functional but cannot fabricate an autonomous
+        # typed occurrence for a reservation that never existed.
+        reservation_id = None
+    result = asyncio.run(
+        WorklinkRunner(
+            home=home,
+            repo=repo,
+            outcome_reservation_id=reservation_id,
+        ).reattach(issue_id)
+    )
+    if reservation_id is not None:
+        if result.status == "completed":
+            _record_run_success(
+                home,
+                issue_id,
+                reservation_id=reservation_id,
+                result=result,
+                target="leaf",
+            )
+        elif result.status in {"failed", "blocked"}:
+            _record_typed_terminal(
+                home=home,
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                target="leaf",
+                result=result,
+            )
+    return result
 
 
 def run_worklink_epic(
@@ -4066,7 +5234,7 @@ def run_worklink_epic(
             target="factory",
             result=result,
         )
-    elif result.status in {"blocked", "parked", "partial"}:
+    elif result.status in {"blocked", "parked", "needs-human", "partial"}:
         _record_typed_terminal(
             home=home,
             issue_id=issue_id,

@@ -2937,6 +2937,16 @@ async def worklink_run(
     if not cc.allowed:
         return f"worklink_run skipped: {cc.reason} — try again when a slot frees."
 
+    from ..worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+    )
+
+    if issue_dispatch_disposition(
+        dispatch_failure_state_dir(home), int(issue_id)
+    ) == "stop":
+        return "worklink_run skipped: terminal outcome requires operator attention."
+
     # 3) Dispatch via the deterministic core executor. ``run_worklink`` is
     #    synchronous (and opens its own event loop), so run it off the agent's
     #    loop in a worker thread.

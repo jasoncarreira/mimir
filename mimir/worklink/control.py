@@ -426,6 +426,15 @@ def reconcile_run_states(
             )
             labels_unknown = False
             is_epic = False
+            from .dispatch_failures import (
+                active_reservation_id,
+                dispatch_failure_state_dir,
+            )
+
+            outcome_state_dir = dispatch_failure_state_dir(home)
+            reservation_id = active_reservation_id(
+                outcome_state_dir, issue_id=state.issue_id, target="leaf"
+            )
             if would_rearm:
                 labels_by_issue, label_errors = _worklink_issue_labels(
                     run, chainlink_bin, {state.issue_id}
@@ -440,6 +449,8 @@ def reconcile_run_states(
                 or (publication_outcome == "undetermined" and checkout_exists)
                 else "worklink:ready"
             )
+            if reservation_id is not None:
+                target = "worklink:blocked"
             if target == "worklink:ready":
                 from .dispatch_failures import (
                     dispatch_failure_state_dir,
@@ -502,6 +513,33 @@ def reconcile_run_states(
                 continue
 
             clear_run_state(home, state.issue_id)
+            if reservation_id is not None:
+                from .attention import ReconcileFacts
+                from .dispatch_failures import record_attention, reservation_claim
+
+                claim = reservation_claim(
+                    outcome_state_dir,
+                    issue_id=state.issue_id,
+                    reservation_id=reservation_id,
+                )
+                record_attention(
+                    outcome_state_dir,
+                    issue_id=state.issue_id,
+                    reservation_id=reservation_id,
+                    source="leaf_startup_reconcile",
+                    cause="controller_lost",
+                    facts=ReconcileFacts(
+                        original_run_id=None,
+                        original_claim=claim,
+                        process_verdict="dead",
+                        lock_verdict="released",
+                        publication_id=state.branch,
+                        evidence_id=None,
+                        automatic_handling_stage="startup_reconcile",
+                        automatic_handling_result=target,
+                    ),
+                    claim=claim,
+                )
             _emit_reconcile_event(
                 event_logger,
                 "worklink_run_orphaned",
