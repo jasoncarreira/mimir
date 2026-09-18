@@ -362,10 +362,17 @@ def test_ready_queue_pass_env_carries_every_factory_env_var_mimir_reads() -> Non
     knob added later is covered without anyone remembering this file exists.
     """
     root = Path(__file__).resolve().parents[1] / "mimir"
+    name = re.compile(r"MIMIR_FACTORY_[A-Z0-9_]+\Z")
     read_from_env: set[str] = set()
     for path in root.rglob("*.py"):
-        for match in re.finditer(r'"(MIMIR_FACTORY_[A-Z_]+)"', path.read_text(encoding="utf-8")):
-            read_from_env.add(match.group(1))
+        # Parse rather than grep: a regex over source text is quote-style dependent,
+        # so a name written with single quotes or containing a digit would be missed
+        # and this test would report green on exactly the omission it exists to catch.
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if name.match(node.value):
+                    read_from_env.add(node.value)
     assert read_from_env, "no MIMIR_FACTORY_* names found; the scan is broken, not the config"
 
     manifest = json.loads(
