@@ -2,10 +2,16 @@
 
 ## Disposition
 
-Unreproduced on 2026-09-18 at `afdfe2bace38f1a478bc91a43d1df73f4ddad109`.
-Neither a production defect nor a test-construction artifact was established.
+The initial local investigation on 2026-09-18 at
+`afdfe2bace38f1a478bc91a43d1df73f4ddad109` did not reproduce the SIGSEGV.
+Subsequently, reviewer inspection of hosted artifact `10532233754` resolved the
+truncation question: the original `.stacks` file is incomplete, not merely its
+log rendering. Dump/shutdown overlap is established by that supplied evidence;
+whether the dump caused the SIGSEGV or was interrupted by it remains open.
+Neither a production defect nor a causal test-construction defect is established.
 No production code, assertion, timeout, exit contract, or diagnostic was changed.
-This is an investigation record, not a claim that the crash is fixed.
+This is an updated investigation record, not a claim that the crash is fixed
+or that the requested causal investigation is complete.
 
 ## Signal and exit path
 
@@ -77,13 +83,29 @@ Independent pytest checks, each including all eight variants:
   emit an unrelated subprocess-transport `Event loop is closed` warning; its
   presence alone does not link that warning to a child SIGSEGV.
 
+### Follow-up validation (artifact-evidence correction)
+
+The scoped contained runner used CPython 3.11.15 and completed
+`tests/test_acp_shutdown.py`: **207 passed**, 18 warnings, 32.60 seconds.
+This preserves all eight matrix variants and both child-signal diagnostic cases;
+it is not additional evidence that the hosted 3.12.13 fault is fixed.
+
+The full-suite attempt returned runner code `tests_failed` / exit 1, but exposed
+only progress through 36%, with no completed test counts, failure names, or
+tracebacks. Its output paths were empty. Full-suite completion cannot be
+verified from that result: it is neither a clean suite nor a diagnosed test
+failure. CI remains the full-suite validation surface for this documentation
+correction; the initial investigation's completed counts above are historical,
+not substituted for this attempt.
+
 ## Stack capture and remaining evidence
 
 `tests/test_acp_shutdown.py:39-46` writes periodic native faulthandler dumps to
 `.stacks`, starting before signal installation. Its interval equals the product
 watchdog interval but their start times differ. No synchronization requires a
-dump to finish before exit. An interrupted dump is possible, but neither a
-dump/exit overlap nor a faulthandler-caused fault was established here.
+dump to finish before exit. The reviewer-supplied artifact evidence below
+establishes overlap with shutdown and an interrupted dump. It does not establish
+that faulthandler caused the fault, or that the real `os._exit` was entered.
 
 The matrix uses `-X faulthandler` at `1509-1512`, which separately directs fatal
 diagnostics to stderr. At `1526-1528` it waits for `communicate()` before reporting.
@@ -92,14 +114,73 @@ this is not a live-file snapshot race in the matrix's parent. A final file can
 nevertheless be incomplete if its writer dies mid-dump. The timeout reporter at
 `184-200`, unlike this exit reporter, can read a still-running child's file.
 
-The original raw CI log and artifact contents could not be obtained: log
-endpoints returned HTTP 403 and artifact download returned HTTP 401; `gh` was
-denied by tool permissions. Run `35308316963`, job `105485062376`, has artifact
-`10532233754` named `pytest-evidence-pytest-worker-uid-3.12-35308316963-1`.
-**Whether the reported cutoff is in the original `.stacks` file or only log
-transport/rendering remains unresolved.** The source has no reporting length
-limit, but that alone cannot resolve the distinction. No speculative capture
-change was made.
+The initial investigation could not obtain the original raw CI log or artifact:
+log endpoints returned HTTP 403 and artifact download returned HTTP 401; `gh`
+was denied by tool permissions. Run `35308316963`, job `105485062376`, has
+artifact `10532233754` named
+`pytest-evidence-pytest-worker-uid-3.12-35308316963-1`. Those access failures are
+historical limitations, not an outstanding truncation question.
+
+### Artifact evidence supplied after the initial investigation
+
+Source: Jason Carreira's review `5244619087` on PR #2107, 2026-09-18,
+https://github.com/jasoncarreira/mimir/pull/2107#pullrequestreview-5244619087.
+He downloaded the artifact; the following is attributed to that inspection,
+not a claim that this follow-up independently downloaded its bytes.
+
+- Failing `popen-gw2/test_blocked_main_signal_deliv3`: progress records
+  `child-started`, `install-enter`, `handlers-installed`, `watchdog-start-enter`,
+  `watchdog-start-returned`, `watchdog-fired`, and `force-exit-enter`.
+  `.wakeup` contains `0o017` (SIGTERM); `.diagnostics` confirms the watchdog's
+  5.0-second timed wait. `.stacks` is 204 bytes and ends at the bare `File `
+  token. Its last complete frame is `threading.py`, line 0, in `__exit__`.
+- Passing sibling journal variants `...deliv1` and `...deliv5` have 2957-byte
+  dumps and also record `signal-enter:15`. Their dumps show real line numbers,
+  including line 359 in `wait` and line 655 in `wait`.
+
+This resolves the capture question: the writer died mid-dump, leaving a partial
+file. Dump/exit overlap in the sense of a dump active during shutdown is now
+established. `line 0` is not a usable Python source location and cannot identify
+the native instruction that faulted.
+
+The missing Python signal marker is consistent with the intentionally blocked
+worker-delivery variant, not independently a defect: the unchanged matrix at
+1534-1536 explicitly requires no `signal-enter:` or `signal-dispatch:` for
+`delivery == "worker"`. Main remains in untimed `libc.recv(..., MSG_WAITALL)`;
+C-level delivery and watchdog activation do not require Python handler dispatch.
+The passing siblings exercise different delivery variants, so they are useful
+capture comparisons, not a controlled experiment on the cause of SIGSEGV.
+
+### Narrower causal question: diagnostic cause or diagnostic victim?
+
+The remaining hypothesis is that the test-only periodic faulthandler thread
+races frame/thread changes during forced shutdown. If demonstrated, the repair
+belongs to test construction, not `_ShutdownHooks`. Source inspection narrows
+but does not decide that hypothesis:
+
+- The periodic dump is armed before handler installation; equal five-second
+  intervals do not synchronize it with the later production timer.
+- The observed `force-exit-enter` is before the call to the production method.
+  The production method checks `signum` and `_failure_detail` before calling
+  the patched `os._exit`; the patch first records `exit-dispatch`. That marker
+  is absent. A theory requiring the *real* exit syscall to have already begun
+  is therefore not established by this trace.
+- A partial dump can be the victim of a fatal fault elsewhere, or the dump's
+  native frame walk can itself fault. Both explain these artifacts. Neither
+  the short file nor a line-0 Python frame selects between them.
+
+The discriminating next evidence is a native faulting instruction/backtrace
+with all threads from hosted CPython 3.12.13 (including its exact build and
+architecture), alongside the unchanged matrix's side files. Locate whether
+SIGSEGV originated in the periodic dump's frame walk, another thread's runtime
+operation, or a signal handler. Then test that specific mechanism with a
+controlled overlap reproducer and a targeted synchronization change. A passing
+run after disabling periodic dumps would only be correlation, especially given
+the existing 160/160 baseline; it is not sufficient justification to remove
+them. No such native trace or controlled causal reproduction is available in
+this follow-up, so the dump remains enabled and no speculative fix is claimed.
+The causal investigation remains unfinished; this update closes only the stale
+artifact/disposition claims.
 
 For a future occurrence, retain the byte-for-byte `child-progress`, `.wakeup`,
 `.diagnostics`, `.stacks`, child stdout/stderr, and raw job log, rather than just
