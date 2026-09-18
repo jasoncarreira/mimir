@@ -631,18 +631,40 @@ while True: time.sleep(1)
         reader.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{"methodId":"mimir-web-key"}}\n')
     output = io.BytesIO()
     transport = type("Transport", (), {"close": lambda self: None})()
-    monkeypatch.setattr("mimir.acp.ssh.open_stdio", lambda target: asyncio.sleep(0, result=(reader, Output(target), transport)))
+    parent_ready = asyncio.Event()
+    release_pipes = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    connect_read_pipe = loop.connect_read_pipe
+
+    async def delayed_pipe(*args, **kwargs):
+        result = await connect_read_pipe(*args, **kwargs)
+        # Hold real subprocess setup after fork, while the child can publish
+        # readiness. Cancelling here makes asyncio kill it without SIGTERM.
+        await release_pipes.wait()
+        return result
+
+    async def open_stdio(target):
+        # No yield: the proxy enters its cleanup-owning try/finally before
+        # the test can resume. Child readiness alone does not establish this.
+        parent_ready.set()
+        return reader, Output(target), transport
+
+    monkeypatch.setattr(loop, "connect_read_pipe", delayed_pipe)
+    monkeypatch.setattr("mimir.acp.ssh.open_stdio", open_stdio)
     # Readiness and teardown share one whole-protocol hang ceiling.
     async with asyncio.timeout(120):
         task = asyncio.create_task(run_ssh_proxy(profile, "secret", output, _ssh_path=ssh, _environment={"PATH": os.environ.get("PATH", ""), "MARKER": str(marker)}))
         try:
             while not Path(str(marker) + ".ready").exists():
                 await asyncio.sleep(0.01)
+            release_pipes.set()
+            await asyncio.wait_for(parent_ready.wait(), 10)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert marker.read_text() == "terminated"
         finally:
+            release_pipes.set()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
