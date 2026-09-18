@@ -98,14 +98,30 @@ def worklink_priority(home: Path) -> str:
 
 
 def factory_max_concurrent() -> int:
+    """Resolve the factory concurrency cap, saying so when a set value is unusable.
+
+    Same contract as ``_factory_max_retries``: absent is ordinary and silent, but a
+    value the operator set and this cannot use is announced rather than degrading
+    quietly into the default.
+    """
     raw = os.environ.get("MIMIR_FACTORY_MAX_CONCURRENT")
     if raw is None:
         return FACTORY_MAX_CONCURRENT_DEFAULT
+
+    def _unusable(reason: str) -> int:
+        log.warning(
+            "MIMIR_FACTORY_MAX_CONCURRENT=%r is %s; using the default cap %d.",
+            raw,
+            reason,
+            FACTORY_MAX_CONCURRENT_DEFAULT,
+        )
+        return FACTORY_MAX_CONCURRENT_DEFAULT
+
     try:
         parsed = int(raw)
     except ValueError:
-        return FACTORY_MAX_CONCURRENT_DEFAULT
-    return parsed if parsed > 0 else FACTORY_MAX_CONCURRENT_DEFAULT
+        return _unusable("not an integer")
+    return parsed if parsed > 0 else _unusable("not a positive integer")
 
 
 def worklink_repo() -> str:

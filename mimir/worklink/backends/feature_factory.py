@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -57,6 +58,8 @@ _FACTORY_PERMISSION = json.dumps(
     {"read": {".env": "deny", "**/.env": "deny", "**/.env.*": "deny"}},
     separators=(",", ":"),
 )
+log = logging.getLogger(__name__)
+
 _DEFAULT_FACTORY_MAX_RETRIES = 5
 _MAX_FACTORY_MAX_RETRIES = 9_007_199_254_740_991
 _FACTORY_MAX_RETRIES_ENV = "MIMIR_FACTORY_MAX_RETRIES"
@@ -69,18 +72,40 @@ Runner = Callable[..., subprocess.CompletedProcess[Any]]
 
 
 def _factory_max_retries(environ: Mapping[str, str] | None = None) -> int:
+    """Resolve the factory retry budget, saying so when a set value is unusable.
+
+    Absent is the ordinary case and stays silent. A value that IS set but cannot
+    be used is a misconfiguration the operator meant to take effect, so it warns
+    rather than degrading quietly: the budget is frozen into run state at
+    ``factory init`` and cannot be corrected on a running epic, so a silent
+    fallback is not discovered until a slice exhausts the wrong budget.
+    """
     source = os.environ if environ is None else environ
     raw = source.get(_FACTORY_MAX_RETRIES_ENV)
-    if raw is None or _ASCII_DECIMAL.fullmatch(raw) is None:
+    if raw is None:
         return _DEFAULT_FACTORY_MAX_RETRIES
+
+    def _unusable(reason: str) -> int:
+        log.warning(
+            "%s=%r is %s; using the default retry budget %d. The budget is frozen at "
+            "factory init, so a run launched now cannot be corrected later.",
+            _FACTORY_MAX_RETRIES_ENV,
+            raw,
+            reason,
+            _DEFAULT_FACTORY_MAX_RETRIES,
+        )
+        return _DEFAULT_FACTORY_MAX_RETRIES
+
+    if _ASCII_DECIMAL.fullmatch(raw) is None:
+        return _unusable("not an ASCII decimal integer")
     normalized = raw.lstrip("0")
     if not normalized:
-        return _DEFAULT_FACTORY_MAX_RETRIES
+        return _unusable("zero, which is not a usable retry budget")
     maximum = str(_MAX_FACTORY_MAX_RETRIES)
     if len(normalized) > len(maximum) or (
         len(normalized) == len(maximum) and normalized > maximum
     ):
-        return _DEFAULT_FACTORY_MAX_RETRIES
+        return _unusable(f"above the maximum {_MAX_FACTORY_MAX_RETRIES}")
     return int(normalized)
 
 
@@ -715,6 +740,9 @@ class FeatureFactoryBackend:
         if session is not None and (not session.strip() or "\x00" in session):
             raise FactoryContractError("factory launch session is invalid")
         retries = _factory_max_retries()
+        # The budget is frozen into run state by ``factory init``, so record what
+        # this launch actually resolved rather than what the environment intended.
+        log.info("factory launch %s: retry budget %d", run_id, retries)
         # feature-factory 0.7.5 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
         session_args = ("--session", session) if session is not None else ()
