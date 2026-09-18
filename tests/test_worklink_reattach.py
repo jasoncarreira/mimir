@@ -765,6 +765,57 @@ def test_reattach_inflight_noop_without_repo(tmp_path: Path, monkeypatch) -> Non
     assert spawned == []
 
 
+def test_startup_leaf_spawn_failure_uses_exact_retained_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mimir import server
+    from mimir.worklink.attention import ClaimIdentity
+    from mimir.worklink.dispatch_failures import (
+        bind_claim,
+        confirm_claim_and_start,
+        dispatch_failure_state_dir,
+        load_outcome_state,
+        reserve_dispatch,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _save_inflight_state(tmp_path, repo, issue_id=4242, job="retained-job")
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=4242, target="leaf", autonomous=True
+    )
+    claim = ClaimIdentity(4242, 1, "worker", "2026-09-18T00:00:00+00:00")
+    bind_claim(
+        state_dir,
+        issue_id=4242,
+        reservation_id=reservation,
+        claim=claim,
+        confirmed=False,
+    )
+    confirm_claim_and_start(
+        state_dir, issue_id=4242, reservation_id=reservation, claim=claim
+    )
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    dispatched = server.reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn refused")),
+        event_logger=lambda *args, **kwargs: None,
+    )
+    assert dispatched == []
+    state = load_outcome_state(state_dir)
+    current = state["issues"]["4242"]["reservations"][reservation]
+    assert current["binding"]["claim"] == claim.to_json()
+    occurrence = next(
+        occurrence
+        for occurrence in state["issues"]["4242"]["occurrences"].values()
+        if occurrence["source"] == "startup_leaf_spawn"
+    )
+    assert occurrence["cause"] == "spawn_failed"
+    assert occurrence["reservation_id"] == reservation
+
+
 def _factory_restart_record(
     home: Path,
     *,

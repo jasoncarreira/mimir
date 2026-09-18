@@ -1135,7 +1135,7 @@ def reattach_inflight_worklink_runs(
                     facts=LaunchFacts(
                         executable=run_bin[0] if run_bin else None,
                         compute=state.compute_name,
-                        checkout=state.checkout,
+                        checkout=state.checkout or None,
                         operation="reattach",
                         returned_handle=False,
                         pid=None,

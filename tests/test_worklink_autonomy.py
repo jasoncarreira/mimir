@@ -1758,6 +1758,47 @@ def _load_poller_module():
     return module
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_source"),
+    [("leaf", "queue_leaf_spawn"), ("epic", "queue_factory_spawn")],
+)
+def test_ready_queue_spawn_failure_commits_exact_source_at_real_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_source: str,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_outcome_state,
+    )
+
+    poller = _load_poller_module()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    monkeypatch.setattr(
+        poller.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn refused")),
+    )
+    assert poller._dispatch(
+        item=poller.DispatchItem(1700, mode),
+        home=tmp_path,
+        repo=str(repo),
+        state_dir=state_dir,
+        run_bin=["mimir"],
+        active=0,
+        leaf_cap=1,
+        factory_cap=1,
+    ) is False
+    state = load_outcome_state(state_dir)
+    occurrences = state["issues"]["1700"]["occurrences"].values()
+    occurrence = next(item for item in occurrences if item["source"] == expected_source)
+    assert occurrence["cause"] == "spawn_failed"
+    assert occurrence["accounting"]["scope"] == "no_new_claim"
+
+
 def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     env = {k: v for k, v in os.environ.items() if k not in {
         "WORKLINK_REPO", "WORKLINK_RUN_BIN", "WORKLINK_MAX_CONCURRENT", "CHAINLINK_BIN",
