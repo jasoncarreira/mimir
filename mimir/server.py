@@ -1010,6 +1010,7 @@ def reattach_inflight_worklink_runs(
     import subprocess
 
     from .event_logger import log_event_sync
+    from .worklink.claims import ClaimRecord
     from .worklink.control import (
         _promote_reserved_execution,
         _raw_reserved_execution,
@@ -1031,6 +1032,12 @@ def reattach_inflight_worklink_runs(
             event_callback(event, **payload)
         except Exception:  # noqa: BLE001 - telemetry cannot block startup recovery
             pass
+
+    def prior_claim(payload: Any) -> ClaimRecord | None:
+        try:
+            return ClaimRecord.from_payload(payload) if isinstance(payload, dict) else None
+        except (KeyError, TypeError, ValueError):
+            return None
     # Local workers cannot survive a restart. Reap their records first, even on
     # homes without a configured reattach repository; malformed records emit an
     # event and never abort startup.
@@ -1169,6 +1176,7 @@ def reattach_inflight_worklink_runs(
                         reason=str(exc),
                         checkout=Path(state.checkout) if state.checkout else None,
                         branch=state.branch or None,
+                        prior_claim=prior_claim(state.claim_identity),
                         attention_source="startup_leaf_spawn",
                     ),
                     reservation,
@@ -1244,6 +1252,9 @@ def reattach_inflight_worklink_runs(
                         reason=str(exc),
                         checkout=Path(record.sandbox),
                         branch=record.branch,
+                        run_id=record.run_id,
+                        launch_id=record.launch_id,
+                        prior_claim=prior_claim(record.claim_identity),
                         attention_source="startup_factory_spawn",
                     ),
                     reservation,

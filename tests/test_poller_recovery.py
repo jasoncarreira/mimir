@@ -170,6 +170,77 @@ async def test_attention_prepare_serializes_concurrent_state_updates(tmp_path: P
     assert all(entry["pending_enqueue"] is True for entry in state["inflight"].values())
 
 
+async def test_attention_reconcile_preserves_entry_prepared_while_enqueue_waits(tmp_path: Path):
+    persist_dir = tmp_path / "state" / "pollers" / "worklink-attention"
+    first = _attention_event("source-first", "occurrence-first")
+    second = _attention_event("source-second", "occurrence-second")
+    _attention_occurrence(tmp_path, "occurrence-first", "execution-first")
+    _attention_occurrence(tmp_path, "occurrence-second", "execution-second")
+    assert await poller_recovery.prepare_attention_event(tmp_path, persist_dir, first)
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def enqueue(_event):
+        entered.set()
+        await resume.wait()
+        return True
+
+    task = asyncio.create_task(poller_recovery.reconcile_failed_turns(
+        persist_dir=persist_dir,
+        events_path=tmp_path / "events.jsonl",
+        poller_name="worklink-attention",
+        channel_id="poller:worklink-attention",
+        enqueue=enqueue,
+        recover_failed_turns=False,
+        service_principal="poller:worklink-attention",
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    assert await poller_recovery.prepare_attention_event(tmp_path, persist_dir, second)
+    resume.set()
+    summary = await task
+
+    state = poller_recovery._read_attention_state(persist_dir)
+    assert summary["reenqueued"] == 1
+    assert set(state["inflight"]) == {"source-first", "source-second"}
+    assert state["inflight"]["source-second"]["pending_enqueue"] is True
+
+
+async def test_attention_reconcile_defers_when_same_entry_changes(tmp_path: Path):
+    persist_dir = tmp_path / "state" / "pollers" / "worklink-attention"
+    event = _attention_event("source-first", "occurrence-first")
+    _attention_occurrence(tmp_path, "occurrence-first", "execution-first")
+    assert await poller_recovery.prepare_attention_event(tmp_path, persist_dir, event)
+    entered = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def enqueue(_event):
+        entered.set()
+        await resume.wait()
+        return True
+
+    task = asyncio.create_task(poller_recovery.reconcile_failed_turns(
+        persist_dir=persist_dir,
+        events_path=tmp_path / "events.jsonl",
+        poller_name="worklink-attention",
+        channel_id="poller:worklink-attention",
+        enqueue=enqueue,
+        recover_failed_turns=False,
+        service_principal="poller:worklink-attention",
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    accepted_at = datetime.now(tz=timezone.utc).isoformat()
+    await poller_recovery.commit_attention_event_accepted(
+        persist_dir, event, enqueued_at=accepted_at
+    )
+    resume.set()
+    summary = await task
+
+    entry = poller_recovery._read_attention_state(persist_dir)["inflight"]["source-first"]
+    assert summary["deferred"] >= 1
+    assert entry["enqueued_at"] == accepted_at
+    assert "pending_enqueue" not in entry
+
+
 async def test_attention_unrecoverable_stash_is_retained_when_retirement_is_impossible(
     tmp_path: Path,
 ):

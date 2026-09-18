@@ -111,9 +111,13 @@ def test_promoted_replay_returns_frozen_primary(tmp_path):
         execution_id="execution",
     )
     first = promote_reservation(tmp_path, 17, reservation["reservation_id"], _record(reason="first"))
+    with pytest.raises(FailureStateError, match="replay identity mismatch"):
+        promote_reservation(
+            tmp_path, 17, reservation["reservation_id"],
+            replace(_record(reason="second"), outcome=AttentionOutcome.BLOCKED),
+        )
     replay = promote_reservation(
-        tmp_path, 17, reservation["reservation_id"],
-        replace(_record(reason="second"), outcome=AttentionOutcome.BLOCKED),
+        tmp_path, 17, reservation["reservation_id"], _record(reason="second")
     )
     assert replay == first
     assert replay["reason"] == "first"

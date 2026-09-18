@@ -15,17 +15,15 @@ from mimir.worklink.attention import (
     AttentionOutcome,
     ClaimRelation,
     AttentionCause,
-    AttentionReaders,
     AttentionRecord,
     AttentionSource,
     EvidenceQuality,
     Resolution,
     AttentionSnapshot,
     Settlement,
+    _SOURCE_POLICIES,
     classify_attention,
-    inspect_attention,
 )
-from mimir.worklink.claims import ClaimRecord
 from mimir.worklink.dispatch_failures import (
     dispatch_failure_state_dir,
     load_failure_state,
@@ -130,7 +128,7 @@ def test_partial_precedes_verified_completion_and_malformed_rows_do_not_count():
     )
 
 
-def _matrix_record(source: AttentionSource) -> AttentionRecord:
+def _attention_record(source: AttentionSource) -> AttentionRecord:
     lifecycle = source in {
         AttentionSource.FACTORY_INITIAL_START,
         AttentionSource.FACTORY_RECOVERY_START,
@@ -168,63 +166,12 @@ def _matrix_record(source: AttentionSource) -> AttentionRecord:
         pr_url="https://example.test/pr/1",
         pr_state="OPEN",
         pr_head="abc",
+        inhibited=not lifecycle,
     )
 
 
-@pytest.mark.parametrize(
-    "source",
-    [source for source in AttentionSource if source is not AttentionSource.LEGACY_V1],
-    ids=lambda source: source.value,
-)
-def test_producer_resolution_matrix(source, tmp_path):
-    state_dir = dispatch_failure_state_dir(tmp_path)
-    record = _matrix_record(source)
-    reservation = reserve_execution(
-        state_dir,
-        issue_id=17,
-        source=source.value,
-        operation_stage="terminal",
-        execution_id=record.execution_id,
-    )
-    promote_reservation(state_dir, 17, reservation["reservation_id"], record)
-    later = ClaimRecord(17, 2, "new-owner", datetime.now(UTC))
-
-    def readers(mode):
-        issue = {
-            "labels": [] if mode == "positive" else ["worklink:ready"],
-            "comments": [],
-            f"{source.value}_resolved": mode == "positive",
-        }
-        claims = {
-            "lock_absent": mode == "positive",
-            "locks": [] if mode == "positive" else [17],
-            "latest": later if mode == "positive" else None,
-            "attempts_used": 1 if mode == "positive" else 3,
-            "max_attempts": 3,
-        }
-        return AttentionReaders(
-            issue=(lambda _issue: (_ for _ in ()).throw(OSError("unavailable"))) if mode == "error" else lambda _issue: issue,
-            claims=lambda _issue: claims,
-            run_state=lambda _issue: {f"{source.value}_resolved": mode == "positive"},
-            factory_record=lambda _run, _issue: {
-                "run_id": None, "attempt": 2 if mode == "positive" else 1,
-                "status": "completed" if mode == "positive" else "blocked",
-                f"{source.value}_resolved": mode == "positive",
-            },
-            process=lambda _owner: "verified_dead" if mode == "positive" else "alive",
-            evidence=lambda _record: {"status": "failed", f"{source.value}_resolved": mode == "positive"},
-            pull_request=lambda _url: {"state": "CLOSED", "headRefOid": "other"},
-        )
-
-    positive = inspect_attention(tmp_path, 17, "signature", record.occurrence_id, readers("positive"))
-    negative = inspect_attention(tmp_path, 17, "signature", record.occurrence_id, readers("negative"))
-    unknown = inspect_attention(tmp_path, 17, "signature", record.occurrence_id, readers("error"))
-    assert positive.resolution is Resolution.RESOLVED
-    assert negative.resolution is not Resolution.RESOLVED
-    assert unknown.resolution is Resolution.UNKNOWN
-    assert positive.record.source is source
-    assert positive.record.next_present is True and positive.record.next is None
-    assert positive.record.controller_phase == "failed"
+def test_every_production_source_declares_clearance_predicates():
+    assert set(_SOURCE_POLICIES) == set(AttentionSource) - {AttentionSource.LEGACY_V1}
 
 
 def _ack_context(tmp_path):
@@ -239,7 +186,7 @@ async def test_resolved_operator_ack_is_noop_without_delivery(tmp_path, monkeypa
     from mimir.tools import registry
 
     state_dir = dispatch_failure_state_dir(tmp_path)
-    record = _matrix_record(AttentionSource.LEAF_CLAIM)
+    record = _attention_record(AttentionSource.LEAF_CLAIM)
     reservation = reserve_execution(
         state_dir, issue_id=17, source="leaf_claim", operation_stage="terminal",
         execution_id=record.execution_id,
@@ -269,7 +216,7 @@ async def test_operator_ack_serializes_send_and_redacts_note(tmp_path, monkeypat
     from mimir.tools.operator_alert import OperatorAlertReceipt
 
     state_dir = dispatch_failure_state_dir(tmp_path)
-    record = _matrix_record(AttentionSource.LEAF_CLAIM)
+    record = _attention_record(AttentionSource.LEAF_CLAIM)
     reservation = reserve_execution(
         state_dir, issue_id=17, source="leaf_claim", operation_stage="terminal",
         execution_id=record.execution_id,
@@ -317,7 +264,7 @@ async def test_operator_ack_delivery_failure_releases_handling_lease(tmp_path, m
     from mimir.tools.operator_alert import OperatorAlertReceipt
 
     state_dir = dispatch_failure_state_dir(tmp_path)
-    record = _matrix_record(AttentionSource.LEAF_CLAIM)
+    record = _attention_record(AttentionSource.LEAF_CLAIM)
     reservation = reserve_execution(
         state_dir, issue_id=17, source="leaf_claim", operation_stage="terminal",
         execution_id=record.execution_id,

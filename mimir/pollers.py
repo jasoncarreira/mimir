@@ -268,6 +268,46 @@ def _prune_worklink_delivery_receipts(
                     if re.fullmatch(r"[0-9a-f]{64}", entry.name)
                     and entry.is_file(follow_symlinks=False)
                 }
+            recovery_live = set()
+            if poller_name == "worklink-attention":
+                recovery_lock_fd = os.open(
+                    ".recovery.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                    0o600, dir_fd=receipt_root_fd,
+                )
+                stack.callback(os.close, recovery_lock_fd)
+                try:
+                    fcntl.flock(recovery_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                try:
+                    recovery_fd = os.open(
+                        ".recovery.json", os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=receipt_root_fd,
+                    )
+                except FileNotFoundError:
+                    recovery = {"inflight": {}}
+                except OSError:
+                    return
+                else:
+                    try:
+                        with os.fdopen(recovery_fd, encoding="utf-8") as handle:
+                            recovery = json.load(handle)
+                    except (OSError, json.JSONDecodeError):
+                        return
+                if not isinstance(recovery, dict) or not isinstance(recovery.get("inflight"), dict):
+                    return
+                for item in recovery["inflight"].values():
+                    if not isinstance(item, dict) or not isinstance(item.get("event"), dict):
+                        return
+                    extra = item["event"].get("extra")
+                    entries = extra.get("items") if isinstance(extra, dict) else None
+                    if not (
+                        isinstance(entries, list) and len(entries) == 1
+                        and isinstance(entries[0], dict)
+                        and isinstance(entries[0].get("delivery_key"), str)
+                    ):
+                        return
+                    recovery_live.add(hashlib.sha256(entries[0]["delivery_key"].encode()).hexdigest())
             lock_fd = os.open(
                 f"{STATE_FILE}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
                 0o600, dir_fd=ledger_fd,
@@ -287,7 +327,7 @@ def _prune_worklink_delivery_receipts(
                 if (not isinstance(state, dict) or state.get("version") not in {1, 2}
                         or not isinstance(state.get("issues"), dict)):
                     return
-                live = set()
+                live = set(recovery_live)
                 for entry in state["issues"].values():
                     if not isinstance(entry, dict):
                         return

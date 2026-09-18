@@ -140,11 +140,22 @@ def save_failure_state(state_dir: Path, state: dict[str, Any]) -> None:
     normalized = _normalize_state(state)
     normalized["revision"] = int(normalized.get("revision", 0)) + 1
     atomic_write_json(state_dir / STATE_FILE, normalized, mode=0o600)
-    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.fsync(directory_fd)
+        directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        if load_failure_state(state_dir) != normalized:
+            raise
+        directory_fd = None
+    try:
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                if load_failure_state(state_dir) != normalized:
+                    raise
     finally:
-        os.close(directory_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
     state.clear()
     state.update(normalized)
 
@@ -196,6 +207,22 @@ def _validate_reservation(reservation_id: str, value: Any) -> None:
         raise FailureStateError(f"execution reservation {reservation_id} issue is invalid")
     if not isinstance(value.get("execution_id"), str) or not value["execution_id"]:
         raise FailureStateError(f"execution reservation {reservation_id} execution is invalid")
+    if value.get("autonomous") is not True:
+        raise FailureStateError(f"execution reservation {reservation_id} provenance is invalid")
+    if not isinstance(value.get("operation_stage"), str) or not value["operation_stage"].strip():
+        raise FailureStateError(f"execution reservation {reservation_id} stage is invalid")
+    for name in ("created_at", "updated_at"):
+        if parse_time(value.get(name)) is None:
+            raise FailureStateError(f"execution reservation {reservation_id} timestamp is invalid")
+    if value["state"] == "closed" and parse_time(value.get("closed_at")) is None:
+        raise FailureStateError(f"execution reservation {reservation_id} closure time is invalid")
+    for name in ("run_id", "launch_id", "invocation_id"):
+        if value.get(name) is not None and (
+            not isinstance(value[name], str) or not value[name]
+        ):
+            raise FailureStateError(f"execution reservation {reservation_id} binding is invalid")
+    if not isinstance(value.get("observations"), dict):
+        raise FailureStateError(f"execution reservation {reservation_id} observations are invalid")
     try:
         AttentionSource(str(value.get("source")))
     except ValueError as exc:
@@ -227,6 +254,21 @@ def _valid_claim(value: Any, issue_id: int) -> bool:
 def _validate_occurrence(issue_key: str, occurrence_id: str, value: Any, *, legacy: bool) -> None:
     if not isinstance(value, dict) or value.get("occurrence_id") != occurrence_id:
         raise FailureStateError(f"attention occurrence {occurrence_id} is invalid")
+    if not legacy:
+        required = {
+            "schema_version", "kind", "source", "issue_id", "execution_id",
+            "outcome", "accounting_basis", "attempt_consumed", "settlement",
+            "error_signature", "occurrence_id", "delivery_key", "autonomous",
+            "inhibited", "created_at", "publication_state",
+        }
+        if not required.issubset(value):
+            raise FailureStateError(f"attention occurrence {occurrence_id} fields are incomplete")
+        if type(value["issue_id"]) is not int or value["issue_id"] <= 0:
+            raise FailureStateError(f"attention occurrence {occurrence_id} issue is invalid")
+        if type(value["autonomous"]) is not bool or type(value["inhibited"]) is not bool:
+            raise FailureStateError(f"attention occurrence {occurrence_id} flags are invalid")
+        if type(value["attempt_consumed"]) is not bool and value["attempt_consumed"] is not None:
+            raise FailureStateError(f"attention occurrence {occurrence_id} accounting is invalid")
     try:
         record = AttentionRecord.from_json(value, legacy=legacy)
     except (KeyError, TypeError, ValueError) as exc:
@@ -354,7 +396,7 @@ def promote_reservation(state_dir: Path, issue_id: int, reservation_id: str, rec
         entry["occurrences"][record.occurrence_id] = payload
         now = datetime.now(UTC).isoformat()
         reservation.update(state="closed", closure="promoted", promoted_occurrence_id=record.occurrence_id, closed_at=now, updated_at=now)
-        entry["inhibited"] = record.inhibited
+        entry["inhibited"] = entry.get("inhibited") is True or record.inhibited
         _set_compatibility_fields(entry, payload)
     return payload
 
@@ -363,7 +405,13 @@ def _validate_replay(existing: Any, record: AttentionRecord) -> None:
     if not isinstance(existing, dict):
         raise FailureStateError("attention occurrence replay is missing")
     frozen = AttentionRecord.from_json(existing, legacy=existing.get("source") == "legacy_v1")
-    identity = ("issue_id", "execution_id", "occurrence_id", "delivery_key", "source", "kind", "primary_source")
+    identity = (
+        "issue_id", "execution_id", "occurrence_id", "delivery_key", "source",
+        "kind", "primary_source", "outcome", "accounting_basis",
+        "attempt_consumed", "settlement", "claim", "prior_claim", "claim_relation",
+        "claim_binding_state", "evidence_quality", "run_id", "launch_id", "attempt",
+        "original_result_status", "original_factory_status", "validation_detail",
+    )
     if any(getattr(frozen, name) != getattr(record, name) for name in identity):
         raise FailureStateError("attention occurrence replay identity mismatch")
 
@@ -562,14 +610,20 @@ def issue_has_unsettled_attention(state_dir: Path, issue_id: int) -> bool:
         for reservation in entry.get("reservations", {}).values()
     ):
         return True
-    return any(
-        isinstance(occurrence, dict)
-        and (
-            occurrence.get("settlement") == "pending"
-            or occurrence.get("inhibited") is True
-            and not occurrence.get("handled_at")
-        )
+    return entry.get("inhibited") is True or any(
+        isinstance(occurrence, dict) and occurrence.get("settlement") == "pending"
         for occurrence in entry.get("occurrences", {}).values()
+    )
+
+
+def attention_terminal_ready(state_dir: Path, issue_id: int, occurrence_id: str) -> bool:
+    state = load_failure_state(state_dir)
+    entry = state["issues"].get(str(issue_id))
+    occurrence = entry.get("occurrences", {}).get(occurrence_id) if isinstance(entry, dict) else None
+    return bool(
+        isinstance(occurrence, dict)
+        and occurrence.get("inhibited") is True
+        and occurrence.get("settlement") in {"applied", "not_needed"}
     )
 
 
@@ -589,7 +643,7 @@ def observe_rearm_state(
             if not ready:
                 entry["rearm_observation"] = "disarmed"
                 continue
-            if entry.get("rearm_observation") == "disarmed":
+            if entry.get("rearm_observation") == "disarmed" and not _has_pending_settlement(entry):
                 entry["inhibited"] = False
                 entry["rearm_observation"] = "ready_after_disarmed"
                 entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
@@ -598,11 +652,13 @@ def observe_rearm_state(
 
 
 def observe_reset_rearm(state_dir: Path, issue_id: int, reset_generation: int) -> bool:
+    if str(issue_id) not in load_failure_state(state_dir)["issues"]:
+        return False
     with failure_state_transaction(state_dir) as state:
         entry = _issue(state, issue_id)
         prior = entry.get("reset_generation")
         entry["reset_generation"] = reset_generation
-        if type(prior) is int and reset_generation > prior and entry.get("inhibited") is True:
+        if reset_generation > (prior if type(prior) is int else 0) and entry.get("inhibited") is True and not _has_pending_settlement(entry):
             entry["inhibited"] = False
             entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
             return True
@@ -612,16 +668,25 @@ def observe_reset_rearm(state_dir: Path, issue_id: int, reset_generation: int) -
 def observe_manual_claim_rearm(state_dir: Path, issue_id: int, claim_identity: Mapping[str, Any]) -> bool:
     if not _valid_claim(claim_identity, issue_id):
         raise ValueError("manual rearm requires an exact claim identity")
+    if str(issue_id) not in load_failure_state(state_dir)["issues"]:
+        return False
     with failure_state_transaction(state_dir) as state:
         entry = _issue(state, issue_id)
         prior = entry.get("manual_claim_witness")
         witness = dict(claim_identity)
         entry["manual_claim_witness"] = witness
-        if prior != witness and entry.get("inhibited") is True:
+        if prior != witness and entry.get("inhibited") is True and not _has_pending_settlement(entry):
             entry["inhibited"] = False
             entry["arming_generation"] = int(entry.get("arming_generation", 0)) + 1
             return True
         return False
+
+
+def _has_pending_settlement(entry: Mapping[str, Any]) -> bool:
+    return any(
+        isinstance(item, Mapping) and item.get("settlement") == "pending"
+        for item in entry.get("occurrences", {}).values()
+    )
 
 
 def is_transient_contention(error: str) -> bool:

@@ -26,6 +26,7 @@ from .run_state import (
     WorklinkRunState,
     clear_orphan_block_record,
     clear_run_state,
+    clear_run_state_strict,
     elapsed_seconds,
     list_run_states,
     load_run_state,
@@ -596,12 +597,14 @@ def reconcile_run_states(
                 from .claims import ClaimRecord
                 from .orchestrator import (
                     WorklinkRunResult,
+                    _attention_occurrence_identity,
+                    _close_attention_excluded,
                     _record_attention_result,
                     _reserve_attention_execution,
                 )
 
                 reservation = _reserve_attention_execution(
-                    home, state.issue_id, primary_source or "orphan_state_update",
+                    home, state.issue_id, primary_source or "orphan_lock_release",
                     autonomous=True,
                 )
                 claim = None
@@ -627,26 +630,45 @@ def reconcile_run_states(
                         source=primary_source,
                     )
                     occurrence_id = record.occurrence_id
-            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
-            if release.returncode != 0:
-                if state.autonomous and occurrence_id is None:
+
+            def record_fault(source: str, reason: str) -> None:
+                nonlocal occurrence_id
+                if occurrence_id is not None:
+                    from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
+
+                    append_secondary_fault(
+                        dispatch_failure_state_dir(home), state.issue_id, occurrence_id,
+                        source=source, cause="reconcile_failed", reason=reason,
+                    )
+                elif state.autonomous:
                     record = _record_attention_result(
                         home,
                         WorklinkRunResult(
-                            state.issue_id, state.attempt, "failed",
-                            reason="lock release failed",
+                            state.issue_id, state.attempt, "failed", reason=reason,
                             checkout=Path(state.checkout) if state.checkout else None,
-                            branch=state.branch,
-                            claim_record=claim,
+                            branch=state.branch, claim_record=claim, target_label=target,
                         ),
                         reservation,
-                        source="orphan_lock_release",
+                        source=source,
                     )
                     occurrence_id = record.occurrence_id
+
+            def advance(source: str, witness: str) -> None:
+                nonlocal reservation
+                if not state.autonomous or occurrence_id is not None:
+                    return
+                _close_attention_excluded(home, state.issue_id, reservation, witness)
+                reservation = _reserve_attention_execution(
+                    home, state.issue_id, source, autonomous=True
+                )
+            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
+            if release.returncode != 0:
+                record_fault("orphan_lock_release", "lock release failed")
                 _emit_orphan_reconcile_failed(
                     event_logger, state, "lock_release_failed", release
                 )
                 continue
+            advance("orphan_comment", "orphan lock released")
             comment_text = _orphan_reconcile_comment(
                 state,
                 publication_outcome=publication_outcome,
@@ -655,22 +677,25 @@ def reconcile_run_states(
                 is_epic=is_epic,
                 labels_unknown=labels_unknown,
             )
+            comment_occurrence = occurrence_id
+            if comment_occurrence is None and state.autonomous:
+                comment_occurrence = _attention_occurrence_identity(
+                    reservation, "orphan_comment", claim.attempt if claim else None
+                )
+            if comment_occurrence:
+                comment_text += f" WORKLINK_ATTENTION:{comment_occurrence}"
             comment = run(
                 [chainlink_bin, "issue", "comment", str(state.issue_id), comment_text]
             )
             if comment.returncode != 0:
-                if occurrence_id:
-                    from .dispatch_failures import append_secondary_fault, dispatch_failure_state_dir
-
-                    append_secondary_fault(
-                        dispatch_failure_state_dir(home), state.issue_id, occurrence_id,
-                        source="orphan_comment", cause="reconcile_failed",
-                        reason=comment.stderr or comment.stdout or "comment failed",
-                    )
+                record_fault(
+                    "orphan_comment", comment.stderr or comment.stdout or "comment failed"
+                )
                 _emit_orphan_reconcile_failed(
                     event_logger, state, "orphan_comment_failed", comment
                 )
                 continue
+            advance("orphan_target_label", "orphan comment recorded")
             if target == "worklink:blocked":
                 save_orphan_block_record(
                     home,
@@ -687,10 +712,14 @@ def reconcile_run_states(
             )
             if label.returncode != 0:
                 clear_orphan_block_record(home, state.issue_id)
+                record_fault(
+                    "orphan_target_label", label.stderr or label.stdout or "target label failed"
+                )
                 _emit_orphan_reconcile_failed(
                     event_logger, state, f"{target}_label_failed", label
                 )
                 continue
+            advance("orphan_inprogress_unlabel", "orphan target label recorded")
             unlabel = run(
                 [
                     chainlink_bin,
@@ -701,15 +730,21 @@ def reconcile_run_states(
                 ]
             )
             if unlabel.returncode != 0:
+                record_fault(
+                    "orphan_inprogress_unlabel",
+                    unlabel.stderr or unlabel.stdout or "in-progress unlabel failed",
+                )
                 _emit_orphan_reconcile_failed(
                     event_logger, state, "in_progress_unlabel_failed", unlabel
                 )
                 continue
-
-            clear_run_state(home, state.issue_id)
+            advance("orphan_state_update", "orphan in-progress label removed")
+            try:
+                clear_run_state_strict(home, state.issue_id, expected=state)
+            except OSError as exc:
+                record_fault("orphan_state_update", str(exc))
+                continue
             if state.autonomous and occurrence_id is None:
-                from .orchestrator import _close_attention_excluded
-
                 _close_attention_excluded(
                     home, state.issue_id, reservation, "orphan reconciled without attention"
                 )

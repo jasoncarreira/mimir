@@ -13,9 +13,11 @@ worker reattach path.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import errno
+import fcntl
 import json
 import os
 import uuid
@@ -148,14 +150,31 @@ def run_state_path(home: Path, issue_id: int) -> Path:
     return runs_dir(home) / f"{issue_id}.json"
 
 
+@contextmanager
+def _run_state_lock(home: Path, issue_id: int):
+    directory = runs_dir(home)
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = os.open(
+        directory / f".{issue_id}.lock",
+        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def save_run_state(home: Path, state: WorklinkRunState) -> Path:
     """Persist ``state`` atomically (tmp + replace) so a crash mid-write can't
     leave a half-written file a startup reconcile would choke on."""
     path = run_state_path(home, state.issue_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(state.to_json(), indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    with _run_state_lock(home, state.issue_id):
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state.to_json(), indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
     clear_orphan_block_record(home, state.issue_id)
     return path
 
@@ -193,18 +212,29 @@ def load_run_state_strict(home: Path, issue_id: int) -> WorklinkRunState | None:
 def clear_run_state(home: Path, issue_id: int) -> None:
     """Best-effort delete of an issue's run state (no-op if already gone)."""
     try:
-        run_state_path(home, issue_id).unlink()
+        with _run_state_lock(home, issue_id):
+            run_state_path(home, issue_id).unlink()
     except OSError:
         return
 
 
-def clear_run_state_strict(home: Path, issue_id: int) -> None:
-    try:
-        run_state_path(home, issue_id).unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise OSError("worklink run state could not be removed") from exc
+def clear_run_state_strict(
+    home: Path,
+    issue_id: int,
+    *,
+    expected: WorklinkRunState | None = None,
+) -> None:
+    with _run_state_lock(home, issue_id):
+        if expected is not None:
+            current = load_run_state_strict(home, issue_id)
+            if current != expected:
+                raise OSError("worklink run state changed before removal")
+        try:
+            run_state_path(home, issue_id).unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise OSError("worklink run state could not be removed") from exc
 
 
 def list_run_states(home: Path) -> list[WorklinkRunState]:

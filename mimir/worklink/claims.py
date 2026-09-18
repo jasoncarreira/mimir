@@ -499,13 +499,19 @@ class ChainlinkClaims:
         legitimate reattach scenarios.
         """
         comments = list(comments)
+        claim_home = Path(home_path) if home_path is not None else self.home_path
+        if claim_home is not None:
+            from .dispatch_failures import dispatch_failure_state_dir, observe_reset_rearm
+
+            observe_reset_rearm(
+                dispatch_failure_state_dir(claim_home), issue_id, _scan_claim_comments(comments)[1]
+            )
         label_set = self._issue_labels(issue_id)
         if labels is not None:
             label_set.update(labels)
         if "worklink:review" in label_set:
             return ClaimResult(False, reason="lifecycle_state_incompatible", reason_code=ClaimReasonCode.LIFECYCLE_STATE_INCOMPATIBLE)
 
-        claim_home = Path(home_path) if home_path is not None else self.home_path
         if claim_home is not None:
             intent_path = claim_home / "state" / "worklink" / "publications" / f"{issue_id}.json"
             # Presence, not parseability, is the publication fence. Do not park
@@ -642,6 +648,17 @@ class ChainlinkClaims:
             self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
             self._run("issue", "label", str(issue_id), "worklink:in-progress")
             self._run("issue", "comment", str(issue_id), record.to_comment())
+            if claim_home is not None and on_record_prepared is None:
+                from .dispatch_failures import observe_manual_claim_rearm
+
+                observe_manual_claim_rearm(
+                    dispatch_failure_state_dir(claim_home), issue_id, {
+                        "issue_id": record.issue_id,
+                        "attempt": record.attempt,
+                        "agent_id": record.agent_id,
+                        "claimed_at": record.claimed_at.isoformat(),
+                    }
+                )
         except Exception:
             self.release_issue(issue_id)
             raise
@@ -793,6 +810,44 @@ class ChainlinkClaims:
         """Attempt to release ``issue_id`` and report whether Chainlink confirmed it."""
         result = self._run("locks", "release", str(issue_id), check=False)
         return result.returncode == 0
+
+    def release_exact_claim(self, record: ClaimRecord) -> bool:
+        records, generation = _scan_claim_comments(
+            self._issue_comments(record.issue_id, strict=True)
+        )
+        latest: ClaimRecord | None = None
+        for candidate in records:
+            if candidate.issue_id != record.issue_id:
+                continue
+            if latest is None or _claim_is_newer(candidate, latest):
+                latest = candidate
+        if latest is None or (
+            latest.generation != generation
+            or latest.attempt != record.attempt
+            or latest.agent_id != record.agent_id
+            or latest.claimed_at != record.claimed_at
+        ):
+            return False
+        if not self._lock_still_held_by(record):
+            return False
+        return self.release_issue(record.issue_id)
+
+    def terminal_labels_confirmed(
+        self,
+        issue_id: int,
+        *,
+        status: str,
+        review_ready: bool,
+        attempt: int | None,
+    ) -> bool:
+        labels = self._issue_labels(issue_id, strict=True)
+        if review_ready:
+            target = "worklink:review"
+        elif status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
+            target = "worklink:blocked"
+        else:
+            target = "worklink:ready"
+        return target in labels and "worklink:in-progress" not in labels
 
     def release_owned_claims_for_shutdown(
         self,

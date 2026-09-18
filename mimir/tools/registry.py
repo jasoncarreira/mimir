@@ -3162,6 +3162,8 @@ async def worklink_attention_ack(
         occurrence_id,
         _attention_readers(home),
     )
+    if snapshot.resolution is Resolution.RESOLVED and selected is HandlingDisposition.OPERATOR_REQUIRED:
+        selected = HandlingDisposition.NOOP_RESOLVED
     if snapshot.record.handled_at is not None:
         status = (
             "handled"
@@ -3179,8 +3181,6 @@ async def worklink_attention_ack(
             },
             sort_keys=True,
         )
-    if snapshot.resolution is Resolution.RESOLVED and selected is HandlingDisposition.OPERATOR_REQUIRED:
-        selected = HandlingDisposition.NOOP_RESOLVED
     if selected in {HandlingDisposition.NOOP_RESOLVED, HandlingDisposition.REMEDIATED} and snapshot.resolution is not Resolution.RESOLVED:
         raise ToolException("worklink attention ack refused: occurrence is not resolved")
     if selected is HandlingDisposition.OBSERVED and snapshot.record.kind is AttentionKind.ATTENTION:

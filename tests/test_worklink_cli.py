@@ -17,6 +17,12 @@ from mimir.worklink.orchestrator import WorklinkRunResult
 from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
 from mimir.worklink import autonomy
 from mimir.worklink.autonomy import check_concurrency
+from mimir.worklink.attention import (
+    AttentionReaders,
+    AttentionSource,
+    Resolution,
+    inspect_attention,
+)
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
@@ -1122,6 +1128,130 @@ def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("failed_step", "expected_source"),
+    [
+        ("lock", AttentionSource.ORPHAN_LOCK_RELEASE),
+        ("comment", AttentionSource.ORPHAN_COMMENT),
+        ("target_label", AttentionSource.ORPHAN_TARGET_LABEL),
+        ("inprogress_unlabel", AttentionSource.ORPHAN_INPROGRESS_UNLABEL),
+        ("state_update", AttentionSource.ORPHAN_STATE_UPDATE),
+    ],
+)
+def test_autonomous_reconcile_records_the_exact_failed_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_step: str,
+    expected_source: AttentionSource,
+) -> None:
+    import mimir.worklink.control as control
+
+    now = datetime.now(UTC)
+    state = replace(
+        _state(tmp_path, 13, 999_999_997, ticks=1, started_at=now),
+        autonomous=True,
+        execution_id="execution-13",
+    )
+    save_run_state(tmp_path, state)
+    labels = {"worklink:in-progress"}
+    comments: list[str] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        step = None
+        if args[1:3] == ["locks", "release"]:
+            step = "lock"
+        elif args[1:3] == ["issue", "comment"]:
+            step = "comment"
+        elif args[1:3] == ["issue", "label"]:
+            step = "target_label"
+        elif args[1:3] == ["issue", "unlabel"]:
+            step = "inprogress_unlabel"
+        if step == failed_step:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr=f"{step} failed")
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout=json.dumps({"labels": sorted(labels), "comments": comments}), stderr=""
+            )
+        if step == "comment":
+            comments.append(args[4])
+        elif step == "target_label":
+            labels.add(args[4])
+        elif step == "inprogress_unlabel":
+            labels.discard(args[4])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def git_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        stdout = "head\n" if args[3] == "rev-parse" else "0\n" if args[3] == "rev-list" else ""
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    if failed_step == "state_update":
+        monkeypatch.setattr(
+            control,
+            "clear_run_state_strict",
+            lambda *_, **__: (_ for _ in ()).throw(OSError("state update failed")),
+        )
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=git_runner,
+        now=now,
+    )
+
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["13"]
+    occurrences = list(entry["occurrences"].values())
+    assert len(occurrences) == 1
+    occurrence = occurrences[0]
+    assert occurrence["source"] == expected_source.value
+    assert occurrence["inhibited"] is True
+    assert load_run_state(tmp_path, 13) == state
+
+    target = occurrence["refs"].get("target_label") or "worklink:ready"
+    marker = f"WORKLINK_ATTENTION:{occurrence['occurrence_id']}"
+
+    def readers(mode: str) -> AttentionReaders:
+        if mode == "error":
+            def unavailable(*_args: object) -> object:
+                raise OSError("reader unavailable")
+
+            return AttentionReaders(
+                issue=unavailable,
+                claims=unavailable,
+                run_state=unavailable,
+                factory_record=unavailable,
+                process=unavailable,
+                evidence=unavailable,
+                pull_request=unavailable,
+            )
+        positive = mode == "positive"
+        issue = {
+            "labels": [target] if positive else ["worklink:in-progress"],
+            "comments": [marker] if positive else [],
+        }
+        return AttentionReaders(
+            issue=lambda _issue: issue,
+            claims=lambda _issue: {
+                "lock_absent": positive,
+                "locks": [] if positive else [13],
+                "attempts_used": 0,
+                "max_attempts": 3,
+            },
+            run_state=lambda _issue: (
+                None if positive and expected_source is AttentionSource.ORPHAN_STATE_UPDATE
+                else state
+            ),
+            factory_record=lambda _run, _issue: None,
+            process=lambda _owner: "verified_dead" if positive else "alive",
+            evidence=lambda _record: {},
+            pull_request=lambda _url: {},
+        )
+
+    identity = (13, occurrence["error_signature"], occurrence["occurrence_id"])
+    assert inspect_attention(tmp_path, *identity, readers("positive")).resolution is Resolution.RESOLVED
+    assert inspect_attention(tmp_path, *identity, readers("negative")).resolution is Resolution.UNRESOLVED
+    assert inspect_attention(tmp_path, *identity, readers("error")).resolution is Resolution.UNKNOWN
 
 
 @pytest.mark.parametrize("stale_leaf", [False, True])

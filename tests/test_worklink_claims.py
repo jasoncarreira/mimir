@@ -75,6 +75,46 @@ def test_claim_records_round_trip_and_next_attempt() -> None:
     assert claims.next_attempt(comments) == 3
 
 
+def test_release_exact_claim_releases_only_latest_owner() -> None:
+    claimed_at = datetime(2026, 6, 11, 5, tzinfo=UTC)
+    owned = ClaimRecord(439, 1, "mimir-a", claimed_at)
+    newer = ClaimRecord(439, 2, "mimir-b", claimed_at + timedelta(minutes=1))
+    comments = [owned.to_comment()]
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                call, 0, json.dumps({"labels": ["worklink:in-progress"], "comments": comments}), ""
+            )
+        if call[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                call, 0, json.dumps({"locks": [{"issue_id": 439}]}), ""
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner)
+    assert claims.release_exact_claim(owned) is True
+    assert ["chainlink", "locks", "release", "439"] in calls
+
+    calls.clear()
+    comments.append(newer.to_comment())
+    assert claims.release_exact_claim(owned) is False
+    assert ["chainlink", "locks", "release", "439"] not in calls
+
+
+def test_release_exact_claim_fails_closed_when_owner_cannot_be_read() -> None:
+    record = ClaimRecord(439, 1, "mimir-a", datetime(2026, 6, 11, 5, tzinfo=UTC))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(list(args), 1, "", "tracker unavailable")
+
+    with pytest.raises(RuntimeError, match="reading comments"):
+        ChainlinkClaims(agent_id="mimir-a", runner=runner).release_exact_claim(record)
+
+
 def test_claim_issue_records_attempt_and_labels_transition() -> None:
     calls: list[list[str]] = []
     sleeps: list[float] = []

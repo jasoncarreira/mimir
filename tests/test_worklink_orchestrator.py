@@ -1182,6 +1182,10 @@ def _orchestrator_runner(
 ):
     calls: list[Sequence[str] | str] = []
     commit_seen = False
+    lock_held = False
+    issue_payload = json.loads(issue_json)
+    labels = set(issue_payload.get("labels") or [])
+    comments = list(issue_payload.get("comments") or [])
 
     def runner(
         args: Sequence[str] | str,
@@ -1190,28 +1194,38 @@ def _orchestrator_runner(
         text: bool = True,
         timeout: float = 1800,
     ) -> subprocess.CompletedProcess:
-        nonlocal commit_seen
+        nonlocal commit_seen, lock_held
         calls.append(args)
         checkout_result = _isolated_checkout_result(args, repo, worktree)
         if checkout_result is not None:
             return checkout_result
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "441"]:
-            return cp(args, stdout=issue_json)
+            current = dict(issue_payload, labels=sorted(labels), comments=list(comments))
+            return cp(args, stdout=json.dumps(current))
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "claim"]:
+            lock_held = True
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "locks", "release"]:
+            if release_returncode == 0:
+                lock_held = False
             return cp(
                 args,
                 returncode=release_returncode,
                 stderr="release denied\n" if release_returncode else "",
             )
+        if args == ["chainlink", "locks", "list", "--json"]:
+            locks = [{"issue_id": 441}] if lock_held else []
+            return cp(args, stdout=json.dumps({"locks": locks}))
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "comment"]:
+            comments.append(args[4])
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "close"]:
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "label"]:
+            labels.add(args[4])
             return cp(args)
         if isinstance(args, list) and args[:3] == ["chainlink", "issue", "unlabel"]:
+            labels.discard(args[4])
             return cp(args)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
             return cp(args, stdout="git@github.com:jasoncarreira/mimir.git\n")
@@ -2431,9 +2445,12 @@ def test_published_transition_failure_is_reaped_to_review(
     assert "worklink:review" not in labels
     assert ("worklink:in-progress" in labels) == (failure_step == "unlabel")
     assert held is not release_first
-    assert load_run_state(tmp_path, 441) is None
+    retained_state = load_run_state(tmp_path, 441)
+    assert (retained_state is not None) is (not release_first)
     labels_before = labels.copy()
-    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == []
+    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == (
+        [retained_state] if retained_state is not None else []
+    )
     assert labels == labels_before
     assert held is not release_first
 
@@ -2478,7 +2495,7 @@ def test_published_transition_failure_is_reaped_to_review(
     assert claims.reap_home(ttl=timedelta(minutes=1)).reaped == records
     assert labels == {"worklink", "worklink:review"}
     assert not held
-    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == []
+    assert reconcile_run_states(tmp_path, runner=runner, git_runner=runner) == [retained_state]
     assert labels == {"worklink", "worklink:review"}
     assert sum(isinstance(c, list) and c[:3] == ["gh", "pr", "create"] for c in calls) == 1
     assert calls.index(["chainlink", "issue", "label", "441", "worklink:review"]) < calls.index(
@@ -2554,7 +2571,7 @@ def test_bounded_timeout_routes_failure_before_releasing_lock(tmp_path: Path) ->
     assert load_run_state(tmp_path, 441) is None
 
 
-def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_path: Path) -> None:
+def test_published_failed_lock_release_retains_recovery_run_state(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events = tmp_path / "logs" / "events.jsonl"
     logger = init_logger(events, session_id="test-worklink")
@@ -2572,7 +2589,7 @@ def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_pa
 
     assert result.status == "failed"
     assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
-    assert load_run_state(tmp_path, 441) is None
+    assert load_run_state(tmp_path, 441) is not None
     assert ["chainlink", "issue", "label", "441", "worklink:review"] in calls
     logger.flush_sync()
     records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
@@ -2590,7 +2607,7 @@ def test_published_failed_lock_release_is_logged_without_orphan_run_state(tmp_pa
     )
     assert recovery["lock_released"] is False
     assert recovery["label_transition_applied"] is True
-    assert recovery["state_retained"] is False
+    assert recovery["state_retained"] is True
     _reset_logger_for_tests()
 
 
@@ -2720,11 +2737,16 @@ def test_release_notification_follows_state_clear_and_survives_clear_failure(
     )
     monkeypatch.setattr(
         orchestrator,
-        "clear_run_state",
-        lambda home, issue_id: (
+        "clear_run_state_strict",
+        lambda home, issue_id, **_: (
             events.append("clear_run_state"),
             (_ for _ in ()).throw(OSError("state clear failed")),
         )[-1],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "load_run_state_strict",
+        lambda home, issue_id: SimpleNamespace(attempt=1),
     )
 
     class Claims:
@@ -5015,6 +5037,16 @@ def _run_factory_preflight_case(
         "release_issue",
         lambda *args, **kwargs: release_confirmed,
     )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "release_exact_claim",
+        lambda *args, **kwargs: release_confirmed,
+    )
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "mark_attempt_nonconsuming",
+        lambda *args, **kwargs: True,
+    )
 
     def create_checkout(*args: object, **kwargs: Any) -> CheckoutLease:
         if checkout_calls is not None:
@@ -5120,7 +5152,7 @@ def test_factory_launch_requires_confirmed_cleanup(
         return expected
 
     monkeypatch.setattr(
-        orchestrator, "clear_run_state", lambda home, issue_id: clears.append((home, issue_id))
+        orchestrator, "clear_run_state_strict", lambda home, issue_id, **_: clears.append((home, issue_id))
     )
     kwargs = dict(
         credentials={"GITHUB_TOKEN": "github-token"}, autonomous=True,
@@ -5148,7 +5180,7 @@ def test_factory_launch_requires_confirmed_cleanup(
             assert result.status == "failed"
             assert len(transitions) == 1
             assert transitions[0]["reason"] == original_reason
-    assert clears == ([(tmp_path, 700)] if release_confirmed else [])
+    assert clears == []
     assert signals == (["worklink_slot_released"] if release_confirmed else [])
 
 
@@ -5898,11 +5930,16 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         orchestrator.ChainlinkClaims, "release_issue", lambda *args, **kwargs: release_confirmed
     )
     monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "release_exact_claim",
+        lambda *args, **kwargs: release_confirmed,
+    )
+    monkeypatch.setattr(
         orchestrator.ChainlinkClaims, "transition_issue",
         lambda *args, **kwargs: transitions.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator, "clear_run_state", lambda home, issue_id: clears.append(issue_id)
+        orchestrator, "clear_run_state_strict", lambda home, issue_id, **_: clears.append(issue_id)
     )
     monkeypatch.setattr(
         orchestrator, "_trigger_ready_scan_after_release", lambda home: signals.append(home)
@@ -5923,7 +5960,7 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         reason="recovered completion; terminal recovery incomplete: Chainlink lock release failed",
     ))
     assert transitions == [{"status": "completed", "review_ready": True}]
-    assert clears == ([700] if release_confirmed else [])
+    assert clears == []
     assert signals == ([tmp_path] if release_confirmed else [])
 
 

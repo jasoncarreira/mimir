@@ -23,6 +23,7 @@ from mimir.worklink.orchestrator import WorklinkRunner
 from mimir.worklink.run_state import (
     WorklinkRunState,
     clear_run_state,
+    clear_run_state_strict,
     list_run_states,
     load_run_state,
     reattach_dispatch_argv,
@@ -259,6 +260,27 @@ def test_run_state_roundtrip(tmp_path: Path) -> None:
     assert list_run_states(tmp_path) == []
     # Clearing a missing state is a no-op, not an error.
     clear_run_state(tmp_path, 561)
+
+
+def test_strict_run_state_clear_does_not_delete_replacement(tmp_path: Path) -> None:
+    original = WorklinkRunState(
+        issue_id=561, attempt=1, backend="codex", compute_name="fake_persistent",
+        handle_substrate="fake_persistent", handle_identifier="old", branch="issue/561-a1",
+        base_ref="main", local_base="main", repo="/workspace/mimir", repo_url="",
+        test_command=None, started_at="2026-06-18T16:00:00+00:00",
+    )
+    replacement = WorklinkRunState(
+        issue_id=561, attempt=2, backend="codex", compute_name="fake_persistent",
+        handle_substrate="fake_persistent", handle_identifier="new", branch="issue/561-a2",
+        base_ref="main", local_base="main", repo="/workspace/mimir", repo_url="",
+        test_command=None, started_at="2026-06-18T17:00:00+00:00",
+    )
+    save_run_state(tmp_path, original)
+    save_run_state(tmp_path, replacement)
+
+    with pytest.raises(OSError, match="changed before removal"):
+        clear_run_state_strict(tmp_path, 561, expected=original)
+    assert load_run_state(tmp_path, 561) == replacement
 
 
 def test_list_run_states_skips_unparseable(tmp_path: Path) -> None:

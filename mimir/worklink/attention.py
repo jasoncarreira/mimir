@@ -379,6 +379,44 @@ class AttentionRecord:
             raise ValueError("current claim relation requires an exact claim")
         if self.claim_binding_state is ClaimBindingState.CONFIRMED and self.claim is None:
             raise ValueError("confirmed claim binding requires an exact claim")
+        if self.claim_relation is ClaimRelation.RELATED_PRIOR_CLAIM and self.prior_claim is None:
+            raise ValueError("prior claim relation requires an exact prior claim")
+        if self.claim_relation is ClaimRelation.NONE and (self.claim is not None or self.prior_claim is not None):
+            raise ValueError("unrelated attention cannot carry claims")
+        if self.claim is not None and self.claim.issue_id != self.issue_id:
+            raise ValueError("attention claim identity mismatch")
+        if self.prior_claim is not None and self.prior_claim.issue_id != self.issue_id:
+            raise ValueError("attention prior claim identity mismatch")
+        if type(self.attempt_consumed) is not bool and self.attempt_consumed is not None:
+            raise ValueError("invalid attempt consumption")
+        lifecycle = self.kind is not AttentionKind.ATTENTION
+        if lifecycle and self.outcome not in {AttentionOutcome.STARTED, AttentionOutcome.SUCCEEDED}:
+            raise ValueError("attention kind and outcome are inconsistent")
+        if not lifecycle and self.outcome is AttentionOutcome.STARTED:
+            raise ValueError("terminal attention cannot be a start record")
+        if lifecycle and (
+            self.settlement is not Settlement.NOT_NEEDED
+            or self.attempt_consumed is not None and self.kind is AttentionKind.FACTORY_STARTED
+            or self.inhibited
+        ):
+            raise ValueError("invalid lifecycle accounting")
+        if self.kind is AttentionKind.ATTENTION and self.attempt_consumed is None:
+            raise ValueError("terminal attention requires a consumption decision")
+        if self.settlement in {Settlement.PENDING, Settlement.APPLIED} and (
+            self.claim_relation is not ClaimRelation.CURRENT_CLAIM
+            or self.attempt_consumed is not False
+        ):
+            raise ValueError("settlement requires a nonconsuming current claim")
+        if self.primary_source is not None and self.primary_source is not self.source:
+            raise ValueError("attention primary source mismatch")
+        if not self.error_signature or not self.created_at:
+            raise ValueError("attention signature and timestamp are required")
+        datetime.fromisoformat(self.created_at)
+        for fault in self.secondary_faults:
+            if not isinstance(fault, Mapping) or not isinstance(fault.get("reason"), str):
+                raise ValueError("invalid attention secondary fault")
+            AttentionSource(str(fault.get("source")))
+            AttentionCause(str(fault.get("cause")))
 
     def to_json(self) -> dict[str, Any]:
         value = asdict(self)
@@ -810,6 +848,10 @@ def _source_clearance(
     comments: tuple[str, ...] | None,
     process_dead: bool | None,
 ) -> Resolution:
+    issue = values.get("issue")
+    run_state = values.get("run_state")
+    factory = values.get("factory")
+    evidence = values.get("evidence")
     if record.source is AttentionSource.TEMPLATE_UNREADY:
         return _tri(labels is not None and "worklink:ready" not in labels, labels is None)
     if record.source is AttentionSource.TEMPLATE_BLOCK_LABEL:
@@ -822,10 +864,71 @@ def _source_clearance(
         return _tri(labels is not None and isinstance(target, str) and target in labels and "worklink:in-progress" not in labels, labels is None or not isinstance(target, str))
     if record.source in {AttentionSource.EPIC_CANCEL, AttentionSource.STARTUP_LEAF_SPAWN}:
         return _tri(process_dead is True, process_dead is None)
-    key = f"{record.source.value}_resolved"
-    for value in values.values():
-        if isinstance(value, Mapping) and key in value:
-            return _tri(value[key] is True, not isinstance(value[key], bool))
+    if record.source is AttentionSource.EPIC_RETAINED_ISSUE_RELOAD:
+        return _tri(labels is not None, "issue" not in values)
+    if record.source in {AttentionSource.LEAF_TEMPLATE, AttentionSource.EPIC_TEMPLATE}:
+        try:
+            from .orchestrator import LeafValidationError, validate_leaf
+
+            validate_leaf(issue)
+        except (LeafValidationError, TypeError, ValueError):
+            return Resolution.UNRESOLVED
+        except Exception:
+            return Resolution.UNKNOWN
+        return Resolution.RESOLVED
+    if record.source in {
+        AttentionSource.DETACHED_SPAWN, AttentionSource.LEAF_COMPUTE,
+        AttentionSource.LEAF_RUNSTATE_SAVE, AttentionSource.STARTUP_RUN_RECORD_READ,
+    }:
+        execution = run_state.get("execution_id") if isinstance(run_state, Mapping) else getattr(run_state, "execution_id", None)
+        return _tri(execution == record.execution_id, "run_state" not in values)
+    if record.source in {
+        AttentionSource.LEAF_PUBLICATION_EVIDENCE,
+        AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE,
+    }:
+        exact = isinstance(evidence, Mapping) and evidence.get("status") == "completed" and evidence.get("issue") in {None, record.issue_id} and evidence.get("attempt") in {None, record.attempt}
+        return _tri(exact, "evidence" not in values)
+    if record.source in {
+        AttentionSource.LEAF_COMPLETED_STATE_CLEAR, AttentionSource.ORPHAN_STATE_UPDATE,
+    }:
+        target = record.refs.get("target_label")
+        exact = run_state is None and (target is None or labels is not None and target in labels)
+        return _tri(exact, "run_state" not in values or target is not None and labels is None)
+    if record.source in {
+        AttentionSource.EPIC_CONTROLLER_RELOAD,
+        AttentionSource.EPIC_DRIVER_LOCK_SAVE,
+        AttentionSource.EPIC_ERROR_SAVE,
+        AttentionSource.EPIC_TRANSCRIPT_SAVE,
+        AttentionSource.STARTUP_FACTORY_RECORD_READ,
+        AttentionSource.FACTORY_INITIAL_START,
+        AttentionSource.FACTORY_RECOVERY_START,
+        AttentionSource.FACTORY_SUCCESS,
+    }:
+        run_id = factory.get("run_id") if isinstance(factory, Mapping) else getattr(factory, "run_id", None)
+        launch_id = factory.get("launch_id") if isinstance(factory, Mapping) else getattr(factory, "launch_id", None)
+        exact = record.run_id is not None and run_id == record.run_id and (
+            record.launch_id is None or launch_id == record.launch_id
+        )
+        if exact and record.source is AttentionSource.EPIC_ERROR_SAVE:
+            phase = factory.get("controller_phase") if isinstance(factory, Mapping) else getattr(factory, "controller_phase", None)
+            exact = phase in {"failed", "parked", "terminal", "stopped"}
+        if exact and record.source is AttentionSource.EPIC_TRANSCRIPT_SAVE:
+            transcript = factory.get("transcript") if isinstance(factory, Mapping) else getattr(factory, "transcript", None)
+            exact = isinstance(transcript, str) and bool(transcript)
+        return _tri(exact, "factory" not in values)
+    if record.source is AttentionSource.EPIC_LABEL:
+        return _tri(labels is not None and "worklink:epic" in labels, labels is None)
+    if record.source is AttentionSource.ORPHAN_LABELS_UNKNOWN:
+        return _tri(labels is not None, "issue" not in values)
+    if record.source in {
+        AttentionSource.EPIC_REPOSITORY, AttentionSource.EPIC_COMPUTE,
+        AttentionSource.EPIC_BASE,
+    }:
+        return _tri(factory is not None and process_dead is True, "factory" not in values or process_dead is None)
+    if record.source is AttentionSource.EPIC_PRESERVATION:
+        return _tri(bool(record.refs.get("preserved_ref")))
+    if record.source is AttentionSource.ORPHAN_UNPUBLISHED:
+        return _tri(run_state is None and labels is not None and "worklink:blocked" not in labels, "run_state" not in values or labels is None)
     return Resolution.UNKNOWN
 
 

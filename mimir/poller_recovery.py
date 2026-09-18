@@ -51,6 +51,7 @@ Hardening (chainlink #305/#309/#310/#318/#329, 2026-06-01 review):
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import fcntl
 import json
 import logging
@@ -322,6 +323,29 @@ def _mutate_attention_state(persist_dir: Path, mutate: Callable[[dict], Any]) ->
         return result
 
 
+def _commit_attention_snapshot(persist_dir: Path, baseline: dict, desired: dict) -> None:
+    with _attention_state_lock(persist_dir):
+        current = _load_state(persist_dir)
+        if current.get("_unreadable_path"):
+            raise OSError("attention recovery state unavailable")
+        if current.get("last_reconciled") != baseline.get("last_reconciled"):
+            raise OSError("attention recovery watermark changed")
+        for source_id, old_entry in baseline["inflight"].items():
+            if current["inflight"].get(source_id) != old_entry:
+                raise OSError("attention recovery entry changed")
+            if source_id in desired["inflight"]:
+                current["inflight"][source_id] = desired["inflight"][source_id]
+            else:
+                current["inflight"].pop(source_id, None)
+        current["last_reconciled"] = desired["last_reconciled"]
+        _save_state_strict(persist_dir, current)
+        baseline.clear()
+        baseline.update(deepcopy(current))
+        desired["inflight"].clear()
+        desired["inflight"].update(deepcopy(current["inflight"]))
+        desired["last_reconciled"] = current["last_reconciled"]
+
+
 def _load_state(persist_dir: Path) -> dict:
     """Load ``{last_reconciled: iso, inflight: {source_id: {...}}}``.
 
@@ -464,7 +488,10 @@ async def stash_enqueued_event(
     """
     if not event.source_id:
         return
-    state = await asyncio.to_thread(_load_state, persist_dir)
+    attention = event.channel_id == "poller:worklink-attention"
+    state = await asyncio.to_thread(
+        _read_attention_state if attention else _load_state, persist_dir
+    )
     if pending_enqueue and event.source_id in state["inflight"]:
         return
     stashed_dt = _utc_now()
@@ -490,7 +517,15 @@ async def stash_enqueued_event(
             state["inflight"], event.channel_id.removeprefix("poller:"),
             event.channel_id,
         )
-    await asyncio.to_thread(_save_state, persist_dir, state)
+    if attention:
+        payload = state["inflight"][event.source_id]
+        await asyncio.to_thread(
+            _mutate_attention_state,
+            persist_dir,
+            lambda current: current["inflight"].setdefault(event.source_id, payload),
+        )
+    else:
+        await asyncio.to_thread(_save_state, persist_dir, state)
 
 
 async def _bound_pending_enqueue(
@@ -852,7 +887,11 @@ async def reconcile_failed_turns(
         "stale_dropped": 0,
         "unclean_reenqueued": 0,
     }
-    state = await asyncio.to_thread(_load_state, persist_dir)
+    attention = poller_name == "worklink-attention"
+    state = await asyncio.to_thread(
+        _read_attention_state if attention else _load_state, persist_dir
+    )
+    baseline = deepcopy(state) if attention else None
     summary["state_unreadable"] = state.get("_unreadable_path", "")
     inflight: dict = state["inflight"]
     now_dt = _utc_now()
@@ -901,11 +940,12 @@ async def reconcile_failed_turns(
     # a future timestamp).
     if not inflight:
         state["last_reconciled"] = now_iso
-        await asyncio.to_thread(
-            _save_state_strict if poller_name == "worklink-attention" else _save_state,
-            persist_dir,
-            state,
-        )
+        if attention:
+            await asyncio.to_thread(
+                _commit_attention_snapshot, persist_dir, baseline, state
+            )
+        else:
+            await asyncio.to_thread(_save_state, persist_dir, state)
         return summary
 
     watermark = state.get("last_reconciled", "")
@@ -1067,7 +1107,7 @@ async def reconcile_failed_turns(
                             entry["attempts"] = attempts
                             try:
                                 await asyncio.to_thread(
-                                    _save_state_strict, persist_dir, state
+                                    _commit_attention_snapshot, persist_dir, baseline, state
                                 )
                             except OSError:
                                 entry["attempts"] = prior_attempts
@@ -1093,7 +1133,7 @@ async def reconcile_failed_turns(
                                 entry["attempts"] = prior_attempts
                                 try:
                                     await asyncio.to_thread(
-                                        _save_state_strict, persist_dir, state
+                                        _commit_attention_snapshot, persist_dir, baseline, state
                                     )
                                 except OSError:
                                     summary["deferred"] += 1
@@ -1235,7 +1275,9 @@ async def reconcile_failed_turns(
             if poller_name == "worklink-attention" and not pending_enqueue:
                 entry["attempts"] = attempts
                 try:
-                    await asyncio.to_thread(_save_state_strict, persist_dir, state)
+                    await asyncio.to_thread(
+                        _commit_attention_snapshot, persist_dir, baseline, state
+                    )
                 except OSError:
                     entry["attempts"] = prior_attempts
                     summary["deferred"] += 1
@@ -1252,7 +1294,9 @@ async def reconcile_failed_turns(
                 if poller_name == "worklink-attention" and not pending_enqueue:
                     entry["attempts"] = prior_attempts
                     try:
-                        await asyncio.to_thread(_save_state_strict, persist_dir, state)
+                        await asyncio.to_thread(
+                            _commit_attention_snapshot, persist_dir, baseline, state
+                        )
                     except OSError:
                         pass
                 summary["deferred"] += 1
@@ -1278,9 +1322,13 @@ async def reconcile_failed_turns(
         # No outcomes seen → keep advancing so we don't rescan history; any
         # future outcome for an in-flight item has a later timestamp anyway.
         state["last_reconciled"] = watermark or now_iso
-    await asyncio.to_thread(
-        _save_state_strict if poller_name == "worklink-attention" else _save_state,
-        persist_dir,
-        state,
-    )
+    if attention:
+        try:
+            await asyncio.to_thread(
+                _commit_attention_snapshot, persist_dir, baseline, state
+            )
+        except OSError:
+            summary["deferred"] += 1
+    else:
+        await asyncio.to_thread(_save_state, persist_dir, state)
     return summary
