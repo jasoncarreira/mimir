@@ -1928,6 +1928,18 @@ async def test_stalled_read_peer_prompt_then_load_is_bounded(
     state = agent._sessions[session_id]
     monkeypatch.setattr(updates, "UPDATE_DELIVERY_TIMEOUT", 0.1)
 
+    delivery_ready = asyncio.Event()
+    start_delivery = asyncio.Event()
+    deliver = updates.UpdateClient.session_update
+
+    async def synchronized_delivery(sender: Any, session: str, update: Any) -> None:
+        if sender.peer is client and update.session_update == "tool_call":
+            delivery_ready.set()
+            await start_delivery.wait()
+        await deliver(sender, session, update)
+
+    monkeypatch.setattr(updates.UpdateClient, "session_update", synchronized_delivery)
+
     async def turn(event: Any, **kwargs: Any) -> None:
         core.bus.publish({
             "turn_id": kwargs["turn_id"], "channel_id": event.channel_id,
@@ -1944,6 +1956,11 @@ async def test_stalled_read_peer_prompt_then_load_is_bounded(
     prompting = asyncio.create_task(agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="first")]))
     loading = None
     try:
+        # Journal preparation and prompt startup are setup, not delivery latency.
+        # Rendezvous before arming the real delivery timeout and the entry guard;
+        # pytest's test timeout bounds setup if the tool update never arrives.
+        await delivery_ready.wait()
+        start_delivery.set()
         await asyncio.wait_for(entered.wait(), 2)
         active = state.active_prompt
         assert active is not None
