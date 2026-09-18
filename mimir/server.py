@@ -1022,7 +1022,7 @@ def reattach_inflight_worklink_runs(
         RESERVATION_ENV,
         bind_reservation_owner,
         dispatch_failure_state_dir,
-        has_nonterminal_reservation,
+        has_reservation_history,
         recovery_reservation_binding,
         record_attention,
     )
@@ -1103,7 +1103,7 @@ def reattach_inflight_worklink_runs(
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
             continue
-        if recovery_binding is None and has_nonterminal_reservation(
+        if recovery_binding is None and has_reservation_history(
             outcome_dir, issue_id=state.issue_id, target="leaf"
         ):
             failure = {
@@ -1203,7 +1203,7 @@ def reattach_inflight_worklink_runs(
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
             continue
-        if recovery_binding is None and has_nonterminal_reservation(
+        if recovery_binding is None and has_reservation_history(
             outcome_dir, issue_id=record.issue_id, target="factory"
         ):
             failure = {

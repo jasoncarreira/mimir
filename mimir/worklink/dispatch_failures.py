@@ -1523,6 +1523,21 @@ def has_nonterminal_reservation(
     )
 
 
+def has_reservation_history(
+    state_dir: Path, *, issue_id: int, target: AttentionTarget | str
+) -> bool:
+    """Return whether this issue/target has any v2 identity, including terminal work."""
+    state = load_outcome_state(state_dir)
+    issue = state["issues"].get(str(issue_id))
+    if issue is None:
+        return False
+    target_value = AttentionTarget(target).value
+    return any(
+        reservation["target"] == target_value
+        for reservation in issue["reservations"].values()
+    )
+
+
 def issue_retry_after(state_dir: Path, issue_id: int) -> datetime | None:
     state = load_outcome_state(state_dir)
     issue = state["issues"].get(str(issue_id))

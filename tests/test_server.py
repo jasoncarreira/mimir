@@ -196,6 +196,87 @@ def test_server_factory_recovery_reuses_exact_reservation_and_cleans_up_bind_fai
     assert current["state"] == "terminal"
 
 
+@pytest.mark.parametrize("target", ["leaf", "factory"])
+def test_server_refuses_empty_recovery_reference_for_terminal_v2_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    from mimir.worklink.attention import AttentionCause, AttentionSource, ClaimFacts
+    import mimir.worklink.control as control
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_attention,
+        reserve_dispatch,
+    )
+    import mimir.worklink.factory_state as factory_state
+    from mimir.worklink.run_state import WorklinkRunState
+
+    issue_id = 702 if target == "leaf" else 703
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    reservation = reserve_dispatch(
+        state_dir, issue_id=issue_id, target=target, autonomous=True
+    )
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation,
+        source=AttentionSource.CLAIM_COMMAND,
+        cause=AttentionCause.CLAIM_COMMAND_FAILED,
+        facts=ClaimFacts(None, None, "claim_failed", return_code=1),
+    )
+    leaf_state = WorklinkRunState(
+        issue_id=issue_id,
+        attempt=1,
+        backend="fake",
+        compute_name="fake_remote",
+        handle_substrate="fake_remote",
+        handle_identifier="job-retained",
+        branch=f"issue/{issue_id}-a1",
+        base_ref="main",
+        local_base="origin/main",
+        repo=str(tmp_path),
+        repo_url="git@github.com:owner/repo.git",
+        test_command="echo ok",
+        started_at="2026-09-18T00:00:00+00:00",
+    )
+    sandbox = tmp_path / ".factory-sandboxes" / f"chainlink-{issue_id}"
+    factory_record = factory_state.FactoryRunRecord(
+        run_id=f"chainlink-{issue_id}",
+        issue_id=issue_id,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch=f"epic/{issue_id}",
+        launcher="/opt/factory.js",
+        sandbox=str(sandbox),
+        session="retained-session",
+        handle=None,
+        observed_at=None,
+        controller_phase="running",
+        status=None,
+    )
+    monkeypatch.setenv("WORKLINK_REPO", str(tmp_path))
+    monkeypatch.setattr(
+        control,
+        "reconcile_run_states",
+        lambda *args, **kwargs: [leaf_state] if target == "leaf" else [],
+    )
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: [factory_record] if target == "factory" else [],
+    )
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+    spawned: list[list[str]] = []
+
+    dispatched = reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+    )
+
+    assert dispatched == []
+    assert spawned == []
+
+
 def _production_call_sites(call_name: str) -> set[str]:
     root = Path(__file__).resolve().parent.parent
     sites: set[str] = set()
