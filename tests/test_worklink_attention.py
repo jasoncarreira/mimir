@@ -515,32 +515,49 @@ def test_producer_resolution_matrix_executes_ready_occurrence_positive_negative_
     tmp_path, source,
 ):
     import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.factory_state import FactoryRunRecord
 
     state_dir = dispatch_failure_state_dir(tmp_path)
-    reservation = reserve_execution(
-        state_dir,
-        issue_id=17,
-        source=source.value,
-        operation_stage="terminal",
-        execution_id=f"execution-{source.value}",
-        run_id="chainlink-17" if source in {
-            AttentionSource.FACTORY_INITIAL_START,
-            AttentionSource.FACTORY_RECOVERY_START,
-            AttentionSource.FACTORY_SUCCESS,
-        } else None,
-        launch_id="launch-17" if source in {
-            AttentionSource.FACTORY_INITIAL_START,
-            AttentionSource.FACTORY_RECOVERY_START,
-            AttentionSource.FACTORY_SUCCESS,
-        } else None,
-    )
     if source in {
         AttentionSource.FACTORY_INITIAL_START,
         AttentionSource.FACTORY_RECOVERY_START,
     }:
-        record = _attention_record(source)
-        promote_reservation(state_dir, 17, reservation["reservation_id"], record)
+        sandbox = tmp_path / "chainlink-17"
+        sandbox.mkdir()
+        orchestrator._record_factory_started(
+            tmp_path,
+            FactoryRunRecord(
+                run_id="chainlink-17",
+                issue_id=17,
+                attempt=1,
+                repository="owner/repo",
+                base_ref="main",
+                branch="feature/17",
+                launcher="/opt/factory/factory.js",
+                sandbox=str(sandbox),
+                session=None,
+                handle=None,
+                status=None,
+                observed_at=None,
+                controller_phase="starting",
+                autonomous=True,
+                execution_id=f"execution-{source.value}",
+                launch_id="launch-17",
+            ),
+            recovery=source is AttentionSource.FACTORY_RECOVERY_START,
+        )
+        payload = next(iter(load_failure_state(state_dir)["issues"]["17"]["occurrences"].values()))
+        record = AttentionRecord.from_json(payload)
     else:
+        reservation = reserve_execution(
+            state_dir,
+            issue_id=17,
+            source=source.value,
+            operation_stage="terminal",
+            execution_id=f"execution-{source.value}",
+            run_id="chainlink-17" if source is AttentionSource.FACTORY_SUCCESS else None,
+            launch_id="launch-17" if source is AttentionSource.FACTORY_SUCCESS else None,
+        )
         record = orchestrator._record_attention_result(
             tmp_path,
             orchestrator.WorklinkRunResult(
