@@ -815,6 +815,28 @@ class ChainlinkClaims:
         result = self._run("locks", "release", str(issue_id), check=False)
         return result.returncode == 0
 
+    def claim_is_current(self, record: ClaimRecord) -> bool:
+        records, generation = _scan_claim_comments(
+            self._issue_comments(record.issue_id, strict=True)
+        )
+        latest = max(
+            (candidate for candidate in records if candidate.issue_id == record.issue_id),
+            key=lambda candidate: (
+                candidate.generation,
+                candidate.attempt,
+                candidate.heartbeat_at or candidate.claimed_at,
+            ),
+            default=None,
+        )
+        return bool(
+            latest is not None
+            and latest.generation == generation
+            and latest.attempt == record.attempt
+            and latest.agent_id == record.agent_id
+            and latest.claimed_at == record.claimed_at
+            and self._lock_still_held_by(record)
+        )
+
     def release_exact_claim(self, record: ClaimRecord) -> bool:
         records, generation = _scan_claim_comments(
             self._issue_comments(record.issue_id, strict=True)

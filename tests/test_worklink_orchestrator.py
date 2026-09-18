@@ -6659,7 +6659,6 @@ def test_accepted_factory_observation_survives_a_later_read_failure(tmp_path: Pa
     assert orchestrator._accepted_evidence_quality(
         tmp_path, result, accepted, valid_rows=_valid_factory_rows,
     ) is EvidenceQuality.VALID
-
     malformed_pr = {**accepted, "pr_url": "https://github.com/owner/repo/pull/17"}
     assert orchestrator._accepted_evidence_quality(
         tmp_path,
@@ -6679,6 +6678,80 @@ def test_accepted_factory_observation_survives_a_later_read_failure(tmp_path: Pa
         valid_rows=_valid_factory_rows,
     ) is EvidenceQuality.VALID
 
+
+@pytest.mark.parametrize(
+    ("status", "source", "expected_outcome", "expected_basis"),
+    [
+        ("needs-human", "factory_needs_human", "needs_human", "factory_pr"),
+        ("blocked", "factory_blocked", "blocked", "factory_pr"),
+        ("partial", "factory_partial", "partial", "factory_partial"),
+    ],
+)
+def test_factory_pr_accounting_uses_one_exact_accepted_observation(
+    tmp_path: Path,
+    status: str,
+    source: str,
+    expected_outcome: str,
+    expected_basis: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        reserve_execution,
+    )
+
+    class Claims:
+        def mark_attempt_nonconsuming(self, *args, **kwargs):
+            return False
+
+    claim = ClaimRecord(17, 1, "agent", datetime.now(UTC))
+    projection = {
+        "run_id": "chainlink-17",
+        "valid": True,
+        "status": status,
+        "pr_url": "https://github.com/owner/repo/pull/17",
+        "steps": None,
+        "slices": None,
+    }
+
+    def record(pr_state: str | None, suffix: str):
+        reservation = reserve_execution(
+            dispatch_failure_state_dir(tmp_path),
+            issue_id=17,
+            source=source,
+            operation_stage="terminal",
+            execution_id=f"factory-{suffix}",
+            run_id="chainlink-17",
+        )
+        return orchestrator._record_attention_result(
+            tmp_path,
+            orchestrator.WorklinkRunResult(
+                17,
+                1,
+                status,
+                pr_url=projection["pr_url"],
+                pr_state=pr_state,
+                pr_head="a" * 40 if pr_state else None,
+                reason=f"factory {status}",
+                claim_record=claim,
+                claim_manager=Claims(),
+                accepted_factory_status=projection,
+                run_id="chainlink-17",
+            ),
+            reservation,
+            source=source,
+        )
+
+    accepted = record("OPEN", "accepted")
+    rejected = record(None, "rejected")
+    assert accepted.outcome.value == expected_outcome
+    assert accepted.accounting_basis.value == expected_basis
+    assert accepted.attempt_consumed is True
+    assert accepted.settlement.value == "not_needed"
+    assert rejected.outcome.value == "infrastructure_failure"
+    assert rejected.accounting_basis.value == "infrastructure"
+    assert rejected.attempt_consumed is False
+    assert rejected.settlement.value == "pending"
 
 def test_settlement_failure_resumes_the_promoted_occurrence_without_repromotion(
     tmp_path: Path,
@@ -6737,6 +6810,155 @@ def test_settlement_failure_resumes_the_promoted_occurrence_without_repromotion(
     assert list(issue["occurrences"]) == [first.occurrence_id]
     assert issue["occurrences"][first.occurrence_id]["settlement"] == "applied"
     assert len(issue["occurrences"][first.occurrence_id]["secondary_faults"]) == 1
+
+
+def test_wrapper_reservation_replay_resumes_atomically_delegated_occurrence(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        reserve_execution,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    wrapper = reserve_execution(
+        state_dir,
+        issue_id=17,
+        source="leaf_run_boundary",
+        operation_stage="run",
+        execution_id="delegated-execution",
+    )
+    result = orchestrator.WorklinkRunResult(
+        17,
+        1,
+        "failed",
+        reason="launch failed",
+    )
+    first = orchestrator._record_attention_result(
+        tmp_path, result, wrapper, source="leaf_launch",
+    )
+    replay = orchestrator._record_attention_result(
+        tmp_path, result, wrapper, source="leaf_launch",
+    )
+    issue = load_failure_state(state_dir)["issues"]["17"]
+    assert replay == first
+    assert list(issue["occurrences"]) == [first.occurrence_id]
+    assert issue["reservations"][wrapper["reservation_id"]]["closure"] == "excluded"
+    delegated = [
+        item for key, item in issue["reservations"].items()
+        if key != wrapper["reservation_id"]
+    ]
+    assert len(delegated) == 1
+    assert delegated[0]["closure"] == "promoted"
+    assert delegated[0]["promoted_occurrence_id"] == first.occurrence_id
+
+
+def test_prepared_claim_is_not_confirmed_or_refunded_without_tracker_witness(
+    tmp_path: Path,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        checkpoint_reservation,
+        dispatch_failure_state_dir,
+        load_failure_state,
+        reserve_execution,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    prepared = ClaimRecord(17, 1, "agent", datetime.now(UTC))
+    reservation = reserve_execution(
+        state_dir,
+        issue_id=17,
+        source="leaf_launch",
+        operation_stage="claim",
+        execution_id="prepared-execution",
+    )
+    reservation = checkpoint_reservation(
+        state_dir,
+        17,
+        reservation["reservation_id"],
+        prepared_claim={
+            "issue_id": prepared.issue_id,
+            "attempt": prepared.attempt,
+            "agent_id": prepared.agent_id,
+            "claimed_at": prepared.claimed_at.isoformat(),
+        },
+        claim_binding_state="prepared",
+    )
+
+    class Claims:
+        def claim_is_current(self, record):
+            return False
+
+        def mark_attempt_nonconsuming(self, *args, **kwargs):
+            pytest.fail("an unconfirmed prepared claim was refunded")
+
+    record = orchestrator._record_attention_result(
+        tmp_path,
+        orchestrator.WorklinkRunResult(
+            17,
+            1,
+            "failed",
+            reason="launch response unavailable",
+            claim_manager=Claims(),
+        ),
+        reservation,
+        source="leaf_launch",
+    )
+
+    assert record.claim == prepared
+    assert record.claim_binding_state.value == "prepared"
+    assert record.claim_relation.value == "none"
+    assert record.settlement.value == "not_needed"
+    stored = load_failure_state(state_dir)["issues"]["17"]
+    assert stored["occurrences"][record.occurrence_id]["settlement"] == "not_needed"
+
+    confirmed_reservation = reserve_execution(
+        state_dir,
+        issue_id=18,
+        source="leaf_launch",
+        operation_stage="claim",
+        execution_id="confirmed-execution",
+    )
+    confirmed_claim = replace(prepared, issue_id=18)
+    confirmed_reservation = checkpoint_reservation(
+        state_dir,
+        18,
+        confirmed_reservation["reservation_id"],
+        prepared_claim={
+            "issue_id": 18,
+            "attempt": confirmed_claim.attempt,
+            "agent_id": confirmed_claim.agent_id,
+            "claimed_at": confirmed_claim.claimed_at.isoformat(),
+        },
+        claim_binding_state="prepared",
+    )
+
+    class ConfirmedClaims:
+        def claim_is_current(self, candidate):
+            return candidate == confirmed_claim
+
+        def mark_attempt_nonconsuming(self, *args, **kwargs):
+            return False
+
+    confirmed = orchestrator._record_attention_result(
+        tmp_path,
+        orchestrator.WorklinkRunResult(
+            18,
+            1,
+            "failed",
+            reason="launch response unavailable",
+            claim_manager=ConfirmedClaims(),
+        ),
+        confirmed_reservation,
+        source="leaf_launch",
+    )
+    assert confirmed.claim == confirmed_claim
+    assert confirmed.claim_binding_state.value == "confirmed"
+    assert confirmed.claim_relation.value == "current_claim"
+    assert confirmed.settlement.value == "pending"
 
 
 def test_factory_status_binding_rejects_populated_base_mismatch(tmp_path: Path) -> None:

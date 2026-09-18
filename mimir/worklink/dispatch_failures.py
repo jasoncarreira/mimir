@@ -129,6 +129,7 @@ def _normalize_issue(key: str, raw: Any, *, legacy: bool) -> dict[str, Any]:
         entry["manual_claim_witness"], int(key)
     ):
         raise FailureStateError(f"dispatch failure issue {key} manual witness is invalid")
+    _validate_compatibility_fields(key, entry)
     for reservation_id, reservation in reservations.items():
         _validate_reservation(str(reservation_id), reservation)
     for occurrence_id, occurrence in occurrences.items():
@@ -149,7 +150,93 @@ def _normalize_issue(key: str, raw: Any, *, legacy: bool) -> dict[str, Any]:
             raise FailureStateError(
                 f"execution reservation {reservation_id} promotion witness is invalid"
             )
+        binding = reservation["claim_binding_state"]
+        occurrence_claim = occurrence.get("claim")
+        expected_claim = (
+            reservation.get("confirmed_claim")
+            if binding == "confirmed"
+            else reservation.get("prepared_claim")
+            if binding == "prepared"
+            else None
+        )
+        if (
+            occurrence.get("claim_binding_state") != binding
+            or occurrence_claim != expected_claim
+            or binding == "confirmed"
+            and occurrence.get("claim_relation") != "current_claim"
+            or binding in {"none", "prepared"}
+            and occurrence.get("claim_relation") == "current_claim"
+        ):
+            raise FailureStateError(
+                f"execution reservation {reservation_id} claim witness is invalid"
+            )
     return entry
+
+
+def _validate_compatibility_fields(key: str, entry: Mapping[str, Any]) -> None:
+    if "active" in entry and type(entry["active"]) is not bool:
+        raise FailureStateError(f"dispatch failure issue {key} active flag is invalid")
+    if "attempt" in entry and entry["attempt"] is not None and (
+        type(entry["attempt"]) is not int or entry["attempt"] <= 0
+    ):
+        raise FailureStateError(f"dispatch failure issue {key} attempt is invalid")
+    if "attempt_consumed" in entry and type(entry["attempt_consumed"]) not in {
+        bool,
+        type(None),
+    }:
+        raise FailureStateError(f"dispatch failure issue {key} consumption is invalid")
+    if "exit_status" in entry and type(entry["exit_status"]) is not int:
+        raise FailureStateError(f"dispatch failure issue {key} exit status is invalid")
+    for name in (
+        "terminal_error",
+        "signature",
+        "occurrence_id",
+        "log_path",
+        "preserved_ref",
+        "preservation_error",
+    ):
+        if name in entry and entry[name] is not None and not isinstance(entry[name], str):
+            raise FailureStateError(f"dispatch failure issue {key} {name} is invalid")
+    for name in ("failed_at", "retry_after"):
+        if name in entry and entry[name] is not None and parse_time(entry[name]) is None:
+            raise FailureStateError(f"dispatch failure issue {key} {name} is invalid")
+    if "consecutive" in entry and (
+        type(entry["consecutive"]) is not int or entry["consecutive"] < 0
+    ):
+        raise FailureStateError(f"dispatch failure issue {key} recurrence is invalid")
+    notified = entry.get("notified_signatures")
+    if notified is not None and (
+        not isinstance(notified, list)
+        or len(notified) > MAX_NOTIFIED_SIGNATURES
+        or any(not isinstance(item, str) or not item for item in notified)
+    ):
+        raise FailureStateError(f"dispatch failure issue {key} notifications are invalid")
+    contention = entry.get("transient_contention")
+    if contention is not None and (
+        not isinstance(contention, dict)
+        or any(
+            not isinstance(name, str)
+            or not name
+            or type(count) is not int
+            or count < 0
+            for name, count in contention.items()
+        )
+    ):
+        raise FailureStateError(f"dispatch failure issue {key} contention is invalid")
+    for name in (
+        "transient_contention_observations",
+        "transient_retry_generation",
+    ):
+        if name in entry and entry[name] is not None and (
+            type(entry[name]) is not int or entry[name] < 0
+        ):
+            raise FailureStateError(f"dispatch failure issue {key} {name} is invalid")
+    if entry.get("rearm_observation") not in {
+        None,
+        "disarmed",
+        "ready_after_disarmed",
+    }:
+        raise FailureStateError(f"dispatch failure issue {key} rearm state is invalid")
 
 
 def _normalize_state(payload: Any) -> dict[str, Any]:
@@ -160,6 +247,8 @@ def _normalize_state(payload: Any) -> dict[str, Any]:
         raise FailureStateError("unsupported dispatch failure state version")
     result = dict(payload)
     result["version"] = STATE_VERSION
+    if version == STATE_VERSION and "revision" not in payload:
+        raise FailureStateError("dispatch failure state revision is missing")
     revision = payload.get("revision", 0)
     if type(revision) is not int or revision < 0:
         raise FailureStateError("dispatch failure state revision is invalid")
@@ -283,7 +372,9 @@ def _validate_reservation(reservation_id: str, value: Any) -> None:
     if not isinstance(value.get("observations"), dict):
         raise FailureStateError(f"execution reservation {reservation_id} observations are invalid")
     try:
-        AttentionSource(str(value.get("source")))
+        if not isinstance(value.get("source"), str):
+            raise ValueError
+        AttentionSource(value["source"])
     except ValueError as exc:
         raise FailureStateError(f"execution reservation {reservation_id} source is invalid") from exc
     if value.get("claim_binding_state") not in {"none", "prepared", "confirmed"}:
@@ -292,16 +383,26 @@ def _validate_reservation(reservation_id: str, value: Any) -> None:
         claim = value.get(name)
         if claim is not None and not _valid_claim(claim, value["issue_id"]):
             raise FailureStateError(f"execution reservation {reservation_id} {name} is invalid")
-    if value.get("claim_binding_state") == "prepared" and value.get("prepared_claim") is None:
-        raise FailureStateError(f"execution reservation {reservation_id} prepared claim is missing")
-    if value.get("claim_binding_state") == "confirmed" and value.get("confirmed_claim") is None:
-        raise FailureStateError(f"execution reservation {reservation_id} confirmed claim is missing")
+    binding = value["claim_binding_state"]
+    prepared = value.get("prepared_claim")
+    confirmed = value.get("confirmed_claim")
+    valid_claim_state = (
+        binding == "none" and prepared is None and confirmed is None
+        or binding == "prepared" and prepared is not None and confirmed is None
+        or binding == "confirmed"
+        and confirmed is not None
+        and (prepared is None or prepared == confirmed)
+    )
+    if not valid_claim_state:
+        raise FailureStateError(f"execution reservation {reservation_id} claim state is inconsistent")
 
 
 def _valid_claim(value: Any, issue_id: int) -> bool:
     return bool(
         isinstance(value, Mapping)
-        and value.get("issue_id") == issue_id
+        and set(value) == {"issue_id", "attempt", "agent_id", "claimed_at"}
+        and type(value.get("issue_id")) is int
+        and value["issue_id"] == issue_id
         and type(value.get("attempt")) is int
         and value["attempt"] > 0
         and isinstance(value.get("agent_id"), str)
@@ -336,6 +437,8 @@ def _validate_occurrence(issue_key: str, occurrence_id: str, value: Any, *, lega
         raise FailureStateError(f"attention occurrence {occurrence_id} delivery identity is invalid")
     if value.get("handled_at") is not None and value.get("handling_disposition") not in {item.value for item in HandlingDisposition}:
         raise FailureStateError(f"attention occurrence {occurrence_id} handling is invalid")
+    if (value.get("handled_at") is None) is not (value.get("handling_disposition") is None):
+        raise FailureStateError(f"attention occurrence {occurrence_id} handling is incomplete")
     lease = value.get("handling_lease")
     if lease is not None and (
         not isinstance(lease, dict)
@@ -345,6 +448,30 @@ def _validate_occurrence(issue_key: str, occurrence_id: str, value: Any, *, lega
         or parse_time(lease.get("expires_at")) is None
     ):
         raise FailureStateError(f"attention occurrence {occurrence_id} lease is invalid")
+    handling = value.get("handling")
+    if value.get("handled_at") is not None:
+        if not isinstance(handling, dict) or lease is not None or value.get("retirement") is not None:
+            raise FailureStateError(f"attention occurrence {occurrence_id} handled state is invalid")
+    elif handling is not None:
+        raise FailureStateError(f"attention occurrence {occurrence_id} handling metadata is invalid")
+    retired_at = value.get("retired_at")
+    if value.get("retirement") is not None:
+        if lease is not None or parse_time(retired_at) is None:
+            raise FailureStateError(f"attention occurrence {occurrence_id} retirement is invalid")
+    elif retired_at is not None:
+        raise FailureStateError(f"attention occurrence {occurrence_id} retirement time is invalid")
+    binding = value.get("delivery_binding")
+    if binding is not None and (
+        not isinstance(binding, dict)
+        or set(binding) != {"origin_ref", "channel_id"}
+        or not isinstance(binding.get("origin_ref"), str)
+        or not binding["origin_ref"]
+        or binding.get("channel_id") != "poller:worklink-attention"
+    ):
+        raise FailureStateError(f"attention occurrence {occurrence_id} delivery binding is invalid")
+    origin_ref = value.get("origin_ref")
+    if origin_ref is not None and (not isinstance(origin_ref, str) or not origin_ref):
+        raise FailureStateError(f"attention occurrence {occurrence_id} origin is invalid")
 
 
 def reserve_execution(
@@ -371,7 +498,17 @@ def reserve_execution(
         existing = entry["reservations"].get(reservation_id)
         if existing is not None:
             _validate_reservation(reservation_id, existing)
-            if existing.get("issue_id") != issue_id or existing.get("execution_id") != execution_id or existing.get("source") != source:
+            expected = {
+                "issue_id": issue_id,
+                "execution_id": execution_id,
+                "source": source,
+                "operation_stage": operation_stage,
+                "run_id": run_id,
+                "launch_id": launch_id,
+                "invocation_id": invocation_id,
+                "autonomous": True,
+            }
+            if any(existing.get(name) != value for name, value in expected.items()):
                 raise FailureStateError("execution reservation replay identity mismatch")
             return dict(existing)
         reservation = {
@@ -397,6 +534,77 @@ def reserve_execution(
         }
         entry["reservations"][reservation_id] = reservation
     return reservation
+
+
+def delegate_reservation(
+    state_dir: Path,
+    issue_id: int,
+    reservation_id: str,
+    *,
+    delegated_reservation_id: str,
+    source: str,
+    operation_stage: str,
+) -> dict[str, Any]:
+    """Atomically hand a wrapper reservation to one exact boundary source."""
+    with failure_state_transaction(state_dir) as state:
+        entry = _issue(state, issue_id)
+        original = entry["reservations"].get(reservation_id)
+        _validate_reservation(reservation_id, original)
+        delegated = entry["reservations"].get(delegated_reservation_id)
+        linkage = original.get("observations", {}).get("delegation")
+        expected_linkage = {
+            "reservation_id": delegated_reservation_id,
+            "source": source,
+            "operation_stage": operation_stage,
+        }
+        if original["state"] == "closed":
+            if (
+                original["closure"] != "excluded"
+                or linkage != expected_linkage
+                or delegated is None
+            ):
+                raise FailureStateError("execution reservation delegation mismatch")
+            _validate_reservation(delegated_reservation_id, delegated)
+            return dict(delegated)
+        if delegated is not None:
+            raise FailureStateError("delegated execution reservation already exists")
+        now = datetime.now(UTC).isoformat()
+        carried_observations = dict(original.get("observations") or {})
+        delegated = {
+            "reservation_id": delegated_reservation_id,
+            "execution_id": original["execution_id"],
+            "issue_id": issue_id,
+            "run_id": original.get("run_id"),
+            "launch_id": original.get("launch_id"),
+            "autonomous": True,
+            "invocation_id": original.get("invocation_id"),
+            "source": source,
+            "operation_stage": operation_stage,
+            "prepared_claim": original.get("prepared_claim"),
+            "confirmed_claim": original.get("confirmed_claim"),
+            "claim_binding_state": original.get("claim_binding_state"),
+            "observations": carried_observations,
+            "state": "reserved",
+            "closure": None,
+            "promoted_occurrence_id": None,
+            "created_at": now,
+            "updated_at": now,
+            "closed_at": None,
+        }
+        _validate_reservation(delegated_reservation_id, delegated)
+        original_observations = dict(carried_observations)
+        original_observations["delegation"] = expected_linkage
+        original.update(
+            observations=original_observations,
+            state="closed",
+            closure="excluded",
+            exclusion_witness=f"delegated to exact boundary {source}",
+            closed_at=now,
+            updated_at=now,
+        )
+        entry["reservations"][delegated_reservation_id] = delegated
+        result = dict(delegated)
+    return result
 
 
 def checkpoint_reservation(state_dir: Path, issue_id: int, reservation_id: str, **updates: Any) -> dict[str, Any]:

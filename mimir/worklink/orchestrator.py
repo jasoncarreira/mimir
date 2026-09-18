@@ -215,6 +215,7 @@ class WorklinkRunResult:
     repository: str | None = None
     compute_name: str | None = None
     base_ref: str | None = None
+    source_observations: Mapping[str, str | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -1637,6 +1638,12 @@ class WorklinkRunner:
             ) if autonomous else None,
         )
         if autonomous:
+            terminal = replace(
+                terminal,
+                source_observations=_run_state_source_observations(
+                    load_run_state_strict(self.home, issue.issue_id)
+                ),
+            )
             terminal_release.state_clear_result = terminal
             terminal_release.attention_reservation = attention_reservation
         attention_record = None
@@ -3248,6 +3255,10 @@ class WorklinkRunner:
         status = factory_record.status
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
+        observed_pr_state, observed_pr_head = (
+            _reattach_pr_state(status.pr_url, runner=runner)
+            if status.pr_url is not None else (None, None)
+        )
 
         def promote(result: WorklinkRunResult, source: str, *, success: bool = False) -> WorklinkRunResult:
             if not autonomous:
@@ -3275,6 +3286,9 @@ class WorklinkRunner:
                 issue.issue_id,
                 factory_record.attempt,
                 "needs-human",
+                pr_url=status.pr_url,
+                pr_state=observed_pr_state,
+                pr_head=observed_pr_head,
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
                 reason=park_report,
@@ -3331,6 +3345,8 @@ class WorklinkRunner:
                 factory_record.attempt,
                 status.status,
                 pr_url=status.pr_url,
+                pr_state=observed_pr_state,
+                pr_head=observed_pr_head,
                 checkout=Path(factory_record.sandbox),
                 branch=factory_record.branch,
                 reason=f"factory status: {status.status}",
@@ -3399,6 +3415,9 @@ class WorklinkRunner:
                     issue.issue_id,
                     factory_record.attempt,
                     "failed",
+                    pr_url=status.pr_url,
+                    pr_state=observed_pr_state,
+                    pr_head=observed_pr_head,
                     checkout=Path(factory_record.sandbox),
                     branch=factory_record.branch,
                     reason=str(exc),
@@ -4324,6 +4343,20 @@ def _attention_protocol_value(name: str) -> str | None:
     return os.environ.get(name)
 
 
+def _run_state_source_observations(state: WorklinkRunState | None) -> dict[str, str | None]:
+    if state is None:
+        return {}
+    return {
+        "owner_handle_substrate": state.handle_substrate,
+        "owner_handle_identifier": state.handle_identifier,
+        "owner_process_start_ticks": (
+            str(state.process_start_ticks) if state.process_start_ticks is not None else None
+        ),
+        "owner_shim_pid": str(state.shim_pid) if state.shim_pid is not None else None,
+        "local_base": state.local_base,
+    }
+
+
 def _checkpoint_attention_rearm_baseline(
     home: Path,
     reservation: dict[str, Any] | None,
@@ -4340,24 +4373,11 @@ def _checkpoint_attention_rearm_baseline(
 
     state_dir = dispatch_failure_state_dir(home)
     entry = load_failure_state(state_dir)["issues"].get(str(reservation["issue_id"]), {})
-    records = claim_records_from_comments(comments)
-    latest = max(
-        (item for item in records if item.issue_id == reservation["issue_id"]),
-        key=lambda item: (item.generation, item.attempt, item.heartbeat_at or item.claimed_at),
-        default=None,
-    )
+    manual_witness = entry.get("manual_claim_witness")
     baseline = {
         "reset_generation": claim_reset_generation(comments),
         "ready_cycle_generation": entry.get("ready_cycle_generation", 0),
-        "manual_claim": (
-            {
-                "issue_id": latest.issue_id,
-                "attempt": latest.attempt,
-                "agent_id": latest.agent_id,
-                "claimed_at": latest.claimed_at.isoformat(),
-            }
-            if latest is not None else None
-        ),
+        "manual_claim": dict(manual_witness) if isinstance(manual_witness, Mapping) else None,
     }
     observations = dict(reservation.get("observations") or {})
     observations["rearm_baseline"] = baseline
@@ -4533,7 +4553,7 @@ def _record_attention_result(
     from .dispatch_failures import (
         append_secondary_fault,
         checkpoint_reservation,
-        close_reservation_excluded,
+        delegate_reservation,
         dispatch_failure_state_dir,
         error_signature,
         load_failure_state,
@@ -4552,47 +4572,18 @@ def _record_attention_result(
             operation_stage="terminal",
         )
     elif reservation.get("source") != source:
-        carried = {
-            name: reservation.get(name)
-            for name in (
-                "prepared_claim", "confirmed_claim", "claim_binding_state", "observations",
-                "run_id", "launch_id",
-            )
-        }
-        close_reservation_excluded(
-            state_dir,
-            result.issue_id,
-            str(reservation["reservation_id"]),
-            witness=f"delegated to exact boundary {source}",
-        )
         exact_reservation_id = uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"{reservation['execution_id']}:{source}:terminal",
         ).hex
-        reservation = reserve_execution(
+        reservation = delegate_reservation(
             state_dir,
-            issue_id=result.issue_id,
+            result.issue_id,
+            str(reservation["reservation_id"]),
+            delegated_reservation_id=exact_reservation_id,
             source=source,
             operation_stage="terminal",
-            execution_id=str(reservation["execution_id"]),
-            run_id=carried["run_id"],
-            launch_id=carried["launch_id"],
-            invocation_id=reservation.get("invocation_id"),
-            reservation_id=exact_reservation_id,
         )
-        updates = {
-            key: value
-            for key, value in carried.items()
-            if key in {"prepared_claim", "confirmed_claim", "claim_binding_state", "observations"}
-            and value is not None and value != "none"
-        }
-        if updates:
-            reservation = checkpoint_reservation(
-                state_dir,
-                result.issue_id,
-                exact_reservation_id,
-                **updates,
-            )
     current_issue = load_failure_state(state_dir)["issues"].get(str(result.issue_id), {})
     current_reservation = current_issue.get("reservations", {}).get(
         str(reservation["reservation_id"])
@@ -4607,10 +4598,15 @@ def _record_attention_result(
         if isinstance(observations, Mapping) else {}
     )
     claim = result.claim_record
-    if claim is None:
-        claim_payload = reservation.get("confirmed_claim") or reservation.get("prepared_claim")
-        if isinstance(claim_payload, Mapping):
-            claim = ClaimRecord.from_payload(dict(claim_payload))
+    if claim is None and isinstance(reservation.get("confirmed_claim"), Mapping):
+        claim = ClaimRecord.from_payload(dict(reservation["confirmed_claim"]))
+    prepared_claim = None
+    if claim is None and isinstance(reservation.get("prepared_claim"), Mapping):
+        prepared_claim = ClaimRecord.from_payload(dict(reservation["prepared_claim"]))
+        claim_is_current = getattr(result.claim_manager, "claim_is_current", None)
+        if callable(claim_is_current) and claim_is_current(prepared_claim):
+            claim = prepared_claim
+            prepared_claim = None
     prior_claim = result.prior_claim
     claim_relation = (
         ClaimRelation.CURRENT_CLAIM if claim is not None
@@ -4709,6 +4705,17 @@ def _record_attention_result(
     reason = terminal_error(result.reason or result.status)
     signature = error_signature(reason)
     role = "success" if lifecycle_success else "terminal"
+    source_observations = dict(result.source_observations)
+    if (
+        result.preserved_ref is not None
+        and result.checkout is not None
+        and "preserved_head" not in source_observations
+    ):
+        observed_head = _run([
+            "git", "-C", str(result.checkout), "rev-parse", "--verify", "HEAD^{commit}",
+        ])
+        if observed_head.returncode == 0 and observed_head.stdout.strip():
+            source_observations["preserved_head"] = observed_head.stdout.strip().lower()
     occurrence_id = _attention_occurrence_identity(
         reservation, source, claim.attempt if claim is not None else None, role=role
     )
@@ -4718,7 +4725,11 @@ def _record_attention_result(
         kind=kind,
         cause=cause,
         issue_id=result.issue_id,
-        run_id=result.run_id or getattr(factory_status, "run_id", None),
+        run_id=result.run_id or (
+            factory_status.get("run_id")
+            if isinstance(factory_status, Mapping)
+            else getattr(factory_status, "run_id", None)
+        ),
         execution_id=str(reservation["execution_id"]),
         launch_id=result.launch_id,
         source=source_value,
@@ -4726,16 +4737,26 @@ def _record_attention_result(
         accounting_basis=accounting.basis,
         attempt_consumed=accounting.attempt_consumed,
         settlement=accounting.settlement,
-        claim=claim,
+        claim=claim or prepared_claim,
         prior_claim=prior_claim,
         claim_relation=claim_relation,
-        claim_binding_state=ClaimBindingState.CONFIRMED if claim is not None else ClaimBindingState.NONE,
+        claim_binding_state=(
+            ClaimBindingState.CONFIRMED
+            if claim is not None
+            else ClaimBindingState.PREPARED
+            if prepared_claim is not None
+            else ClaimBindingState.NONE
+        ),
         error_signature=signature,
         attempt=result.attempt,
         reason=reason,
         evidence_quality=accounting.evidence_quality,
         original_result_status=result.status,
-        original_factory_status=getattr(factory_status, "status", None),
+        original_factory_status=(
+            factory_status.get("status")
+            if isinstance(factory_status, Mapping)
+            else getattr(factory_status, "status", None)
+        ),
         primary_source=source_value,
         secondary_faults=result.attention_secondary_faults,
         refs={
@@ -4751,8 +4772,15 @@ def _record_attention_result(
             "compute_name": result.compute_name,
             "base_ref": result.base_ref,
             "log": os.environ.get("WORKLINK_RUN_LOG"),
+            **source_observations,
         },
-        factory_projection=factory_status.to_json() if factory_status is not None else None,
+        factory_projection=(
+            dict(factory_status)
+            if isinstance(factory_status, Mapping)
+            else factory_status.to_json()
+            if factory_status is not None
+            else None
+        ),
         controller_phase=result.controller_phase,
         controller_error=result.controller_error,
         pr_url=result.pr_url,
@@ -5982,7 +6010,7 @@ def _with_head_sha(
 
 
 def _reattach_pr_state(pr_url: str, *, runner: Runner) -> tuple[str | None, str | None]:
-    """Read PR state and head only on the cold restart-reconciliation path."""
+    """Read the current state and head for an accepted factory PR observation."""
     try:
         result = runner(["gh", "pr", "view", pr_url, "--json", "state,headRefOid"])
     except Exception:  # noqa: BLE001 - reconciliation must still release the claim.

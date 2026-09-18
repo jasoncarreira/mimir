@@ -1925,3 +1925,96 @@ def test_attention_production_claim_reader_exposes_later_rearm_witnesses(
     assert observed["latest"].claimed_at == claim.claimed_at
     assert observed["latest"].generation == 1
     assert observed["manual_claim_witness"] == state["issues"]["17"]["manual_claim_witness"]
+
+
+def test_attention_production_source_reader_checks_checkout_owner_and_preserved_ref(
+    tmp_path, monkeypatch,
+) -> None:
+    import subprocess
+
+    from mimir.tools import registry
+    from mimir.worklink import run_state
+    from mimir.worklink.attention import (
+        AccountingBasis,
+        AttentionCause,
+        AttentionKind,
+        AttentionOutcome,
+        AttentionRecord,
+        AttentionSource,
+        Settlement,
+    )
+
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "tracked.txt").write_text("content\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "initial"], check=True)
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", f"HEAD:{branch}"], check=True)
+    monkeypatch.setattr(run_state, "process_is_verified_dead", lambda owner: True)
+    readers = registry._attention_readers(tmp_path)
+
+    orphan = AttentionRecord(
+        occurrence_id="orphan",
+        delivery_key="worklink-attention:17:orphan-signature:orphan",
+        kind=AttentionKind.ATTENTION,
+        cause=AttentionCause.DETACHED_BLOCKED,
+        issue_id=17,
+        execution_id="orphan-execution",
+        source=AttentionSource.ORPHAN_AMBIGUOUS,
+        outcome=AttentionOutcome.INFRASTRUCTURE_FAILURE,
+        accounting_basis=AccountingBasis.PRECLAIM,
+        attempt_consumed=False,
+        settlement=Settlement.NOT_NEEDED,
+        error_signature="orphan-signature",
+        attempt=1,
+        refs={
+            "checkout": str(repo),
+            "branch": branch,
+            "local_base": "HEAD",
+            "owner_handle_identifier": "999999",
+            "owner_process_start_ticks": "1",
+            "owner_shim_pid": None,
+        },
+    )
+    assert readers.source_state(orphan) == {
+        "old_owner_verified_dead": True,
+        "publication_outcome": "determined-clean",
+    }
+
+    preserved = AttentionRecord(
+        occurrence_id="preserved",
+        delivery_key="worklink-attention:17:preserved-signature:preserved",
+        kind=AttentionKind.ATTENTION,
+        cause=AttentionCause.CONTROLLER_FAILED,
+        issue_id=17,
+        execution_id="preserved-execution",
+        source=AttentionSource.EPIC_PRESERVATION,
+        outcome=AttentionOutcome.INFRASTRUCTURE_FAILURE,
+        accounting_basis=AccountingBasis.INFRASTRUCTURE,
+        attempt_consumed=False,
+        settlement=Settlement.NOT_NEEDED,
+        error_signature="preserved-signature",
+        attempt=1,
+        refs={
+            "checkout": str(repo),
+            "preserved_ref": f"origin/{branch}",
+            "preserved_head": head,
+        },
+    )
+    assert readers.source_state(preserved) == {"preserved_ref_matches": True}
+    assert readers.source_state(
+        replace(preserved, refs={**preserved.refs, "preserved_head": "0" * 40})
+    ) == {"preserved_ref_matches": False}

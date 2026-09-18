@@ -601,6 +601,7 @@ def reconcile_run_states(
                     _close_attention_excluded,
                     _record_attention_result,
                     _reserve_attention_execution,
+                    _run_state_source_observations,
                 )
 
                 reservation = _reserve_attention_execution(
@@ -623,6 +624,8 @@ def reconcile_run_states(
                             reason=publication_reason,
                             checkout=Path(state.checkout) if state.checkout else None,
                             branch=state.branch,
+                            base_ref=state.local_base,
+                            source_observations=_run_state_source_observations(state),
                             prior_claim=claim,
                             unpublished_commits=publication_outcome == "determined-unpublished",
                         ),
@@ -646,7 +649,9 @@ def reconcile_run_states(
                         WorklinkRunResult(
                             state.issue_id, state.attempt, "failed", reason=reason,
                             checkout=Path(state.checkout) if state.checkout else None,
-                            branch=state.branch, prior_claim=claim, target_label=target,
+                            branch=state.branch, base_ref=state.local_base,
+                            source_observations=_run_state_source_observations(state),
+                            prior_claim=claim, target_label=target,
                         ),
                         reservation,
                         source=source,

@@ -21,6 +21,7 @@ from mimir.worklink.dispatch_failures import (
     FailureStateError,
     acquire_handling_lease,
     close_reservation_excluded,
+    delegate_reservation,
     issue_is_inhibited,
     load_failure_state,
     mark_attention_handled,
@@ -50,6 +51,70 @@ def test_reservation_exclusion_is_a_tombstone_without_occurrence(tmp_path):
     assert issue["reservations"][reservation["reservation_id"]]["closure"] == "excluded"
     assert issue["occurrences"] == {}
     assert pending_attention_records(tmp_path) == []
+
+
+EXHAUSTIVE_EXCLUSION_MATRIX = (
+    ("dependency_wait", "leaf_run_boundary"),
+    ("capacity_wait", "leaf_run_boundary"),
+    ("registry_concurrency", "leaf_run_boundary"),
+    ("arbiter_suppression", "leaf_run_boundary"),
+    ("poller_quota", "leaf_run_boundary"),
+    ("duplicate_run_live", "leaf_claim"),
+    ("lifecycle_state_incompatible", "leaf_claim"),
+    ("review_ready_evidence_exists", "leaf_claim"),
+    ("publication_intent_exists", "leaf_claim"),
+    ("concurrency_cap", "leaf_claim"),
+    ("checkout_interlock", "epic_factory_admit"),
+    ("persistent_block", "leaf_run_boundary"),
+    ("clean_or_missing_orphan", "orphan_ambiguous"),
+    ("unidentifiable_factory_inventory", "startup_factory_record_read"),
+    ("unidentifiable_run_record", "startup_run_record_read"),
+    ("legacy_or_manual_startup", "startup_run_record_read"),
+    ("manual_invocation", "leaf_run_boundary"),
+    ("reattach_invocation", "leaf_run_boundary"),
+    ("dry_run_invocation", "leaf_run_boundary"),
+    ("startup_no_repo", "startup_leaf_spawn"),
+    ("healthy_parked_terminal_startup", "startup_factory_spawn"),
+    ("evidence_event_telemetry", "leaf_completed_evidence_write"),
+    ("transition_event_telemetry", "leaf_transition"),
+    ("error_event_telemetry", "epic_error_transition"),
+    ("log_io", "detached_spawn"),
+    ("temporary_report", "leaf_postclaim"),
+    ("heartbeat_diagnostic", "epic_supervision"),
+    ("shutdown_marker", "leaf_run_boundary"),
+    ("ordinary_leaf_success", "leaf_postclaim"),
+    ("continuation_delivery", "leaf_run_boundary"),
+)
+
+
+@pytest.mark.parametrize(
+    ("surface", "source"),
+    EXHAUSTIVE_EXCLUSION_MATRIX,
+    ids=[item[0] for item in EXHAUSTIVE_EXCLUSION_MATRIX],
+)
+def test_exhaustive_exclusion_matrix_closes_without_occurrence_or_feature_accounting(
+    tmp_path, surface, source,
+):
+    reservation = reserve_execution(
+        tmp_path,
+        issue_id=17,
+        source=source,
+        operation_stage=surface,
+        execution_id=f"execution-{surface}",
+    )
+    close_reservation_excluded(
+        tmp_path,
+        17,
+        reservation["reservation_id"],
+        witness=surface,
+    )
+    issue = load_failure_state(tmp_path)["issues"]["17"]
+    stored = issue["reservations"][reservation["reservation_id"]]
+    assert stored["closure"] == "excluded"
+    assert stored["exclusion_witness"] == surface
+    assert issue["occurrences"] == {}
+    assert "attempt_consumed" not in issue
+    assert "settlement" not in issue
 
 
 def test_atomic_promotion_replays_same_occurrence(tmp_path):
@@ -84,6 +149,104 @@ def test_atomic_promotion_replays_same_occurrence(tmp_path):
     assert [item["occurrence_id"] for item in pending_attention_records(tmp_path)] == [
         "occurrence"
     ]
+
+
+def test_source_delegation_is_atomic_and_replays_from_the_wrapper(tmp_path, monkeypatch):
+    import mimir.worklink.dispatch_failures as failures
+
+    wrapper = reserve_execution(
+        tmp_path,
+        issue_id=17,
+        source="leaf_run_boundary",
+        operation_stage="run",
+        execution_id="execution",
+        run_id="run-17",
+        invocation_id="invocation-17",
+    )
+    original_save = failures.save_failure_state
+
+    def fail_save(*args, **kwargs):
+        raise OSError("replace unavailable")
+
+    monkeypatch.setattr(failures, "save_failure_state", fail_save)
+    with pytest.raises(OSError, match="replace unavailable"):
+        delegate_reservation(
+            tmp_path,
+            17,
+            wrapper["reservation_id"],
+            delegated_reservation_id="exact-reservation",
+            source="leaf_claim",
+            operation_stage="terminal",
+        )
+    monkeypatch.setattr(failures, "save_failure_state", original_save)
+    state = load_failure_state(tmp_path)
+    assert state["issues"]["17"]["reservations"][wrapper["reservation_id"]]["state"] == "reserved"
+    assert "exact-reservation" not in state["issues"]["17"]["reservations"]
+
+    exact = delegate_reservation(
+        tmp_path,
+        17,
+        wrapper["reservation_id"],
+        delegated_reservation_id="exact-reservation",
+        source="leaf_claim",
+        operation_stage="terminal",
+    )
+    replay = delegate_reservation(
+        tmp_path,
+        17,
+        wrapper["reservation_id"],
+        delegated_reservation_id="exact-reservation",
+        source="leaf_claim",
+        operation_stage="terminal",
+    )
+    assert replay == exact
+    promoted = promote_reservation(
+        tmp_path, 17, exact["reservation_id"], replace(_record(), run_id="run-17")
+    )
+    assert delegate_reservation(
+        tmp_path,
+        17,
+        wrapper["reservation_id"],
+        delegated_reservation_id="exact-reservation",
+        source="leaf_claim",
+        operation_stage="terminal",
+    )["promoted_occurrence_id"] == promoted["occurrence_id"]
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("operation_stage", "other"),
+        ("run_id", "other-run"),
+        ("launch_id", "other-launch"),
+        ("invocation_id", "other-invocation"),
+    ],
+)
+def test_reservation_replay_rejects_changed_bindings(tmp_path, change, value):
+    reservation = reserve_execution(
+        tmp_path,
+        issue_id=17,
+        source="leaf_claim",
+        operation_stage="claim",
+        execution_id="execution",
+        run_id="run",
+        launch_id="launch",
+        invocation_id="invocation",
+        reservation_id="stable",
+    )
+    arguments = {
+        "issue_id": 17,
+        "source": "leaf_claim",
+        "operation_stage": "claim",
+        "execution_id": "execution",
+        "run_id": "run",
+        "launch_id": "launch",
+        "invocation_id": "invocation",
+        "reservation_id": reservation["reservation_id"],
+    }
+    arguments[change] = value
+    with pytest.raises(FailureStateError, match="replay identity mismatch"):
+        reserve_execution(tmp_path, **arguments)
 
 
 def _record(issue_id: int = 17, **updates):
@@ -241,6 +404,9 @@ def test_v2_loader_rejects_non_native_and_crosslinked_corruption(tmp_path):
         payload["revision"] = revision
         variants.append(payload)
     payload = json.loads(json.dumps(valid))
+    del payload["revision"]
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
     del payload["issues"]["17"]["occurrences"]["occurrence"]["schema_version"]
     variants.append(payload)
     payload = json.loads(json.dumps(valid))
@@ -257,6 +423,28 @@ def test_v2_loader_rejects_non_native_and_crosslinked_corruption(tmp_path):
     variants.append(payload)
     payload = json.loads(json.dumps(valid))
     payload["issues"]["17"]["occurrences"]["occurrence"]["outcome"] = "blocked"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["claim_relation"] = "current_claim"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["claim_binding_state"] = "prepared"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["handled_at"] = "2026-09-18T00:00:00+00:00"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["handling_disposition"] = "observed"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["occurrences"]["occurrence"]["retirement"] = "retry_exhausted"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    payload["issues"]["17"]["active"] = "true"
+    variants.append(payload)
+    payload = json.loads(json.dumps(valid))
+    stored_reservation = payload["issues"]["17"]["reservations"][reservation["reservation_id"]]
+    stored_reservation["claim_binding_state"] = "prepared"
     variants.append(payload)
     payload = json.loads(json.dumps(valid))
     payload["issues"]["17"]["reservations"][reservation["reservation_id"]][

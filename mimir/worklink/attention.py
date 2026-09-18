@@ -132,6 +132,98 @@ class AttentionSource(StrEnum):
     LEGACY_V1 = "legacy_v1"
 
 
+def _expected_source_cause(source: AttentionSource) -> AttentionCause | None:
+    if source in {
+        AttentionSource.FACTORY_INITIAL_START,
+        AttentionSource.FACTORY_RECOVERY_START,
+        AttentionSource.FACTORY_SUCCESS,
+    }:
+        return None
+    groups = {
+        AttentionCause.LAUNCH_FAILED: {
+            AttentionSource.DETACHED_SPAWN,
+            AttentionSource.LEAF_LAUNCH,
+            AttentionSource.EPIC_LAUNCH,
+            AttentionSource.STARTUP_LEAF_SPAWN,
+            AttentionSource.STARTUP_FACTORY_SPAWN,
+        },
+        AttentionCause.TEMPLATE_BLOCKED: {
+            AttentionSource.LEAF_TEMPLATE,
+            AttentionSource.EPIC_TEMPLATE,
+        },
+        AttentionCause.ADMISSION_BLOCKED: {
+            AttentionSource.LEAF_COMPUTE,
+            AttentionSource.EPIC_LABEL,
+            AttentionSource.EPIC_BACKEND,
+            AttentionSource.EPIC_REPOSITORY,
+            AttentionSource.EPIC_COMPUTE,
+            AttentionSource.EPIC_FACTORY_ADMIT,
+            AttentionSource.EPIC_BASE,
+        },
+        AttentionCause.CLAIM_FAILED: {
+            AttentionSource.LEAF_CLAIM,
+            AttentionSource.EPIC_CLAIM,
+        },
+        AttentionCause.ATTEMPTS_EXHAUSTED: {
+            AttentionSource.LEAF_EXHAUSTION,
+            AttentionSource.EPIC_EXHAUSTION,
+        },
+        AttentionCause.CHECKOUT_UNSAFE: {AttentionSource.LEAF_CHECKOUT},
+        AttentionCause.BACKEND_BLOCKED: {AttentionSource.LEAF_BACKEND_BLOCKED},
+        AttentionCause.VALIDATION_BLOCKED: {
+            AttentionSource.LEAF_GATE_TIMEOUT,
+            AttentionSource.LEAF_GATE_MISSING,
+            AttentionSource.LEAF_OUTPUT_OVERFLOW,
+        },
+        AttentionCause.WORK_FAILED: {
+            AttentionSource.LEAF_WORK_FAILED,
+            AttentionSource.LEAF_PUBLICATION_FENCE,
+            AttentionSource.LEAF_PUBLICATION_PUSH,
+            AttentionSource.LEAF_PUBLICATION_PR,
+        },
+        AttentionCause.RECOVERY_BLOCKED: {
+            AttentionSource.EPIC_RETAINED_BIND,
+            AttentionSource.EPIC_RECOVERY,
+            AttentionSource.EPIC_DRIVER_LOCK,
+        },
+        AttentionCause.FACTORY_NEEDS_HUMAN: {AttentionSource.FACTORY_NEEDS_HUMAN},
+        AttentionCause.FACTORY_BLOCKED: {AttentionSource.FACTORY_BLOCKED},
+        AttentionCause.FACTORY_PARTIAL: {AttentionSource.FACTORY_PARTIAL},
+        AttentionCause.DETACHED_BLOCKED: {
+            AttentionSource.ORPHAN_UNPUBLISHED,
+            AttentionSource.ORPHAN_AMBIGUOUS,
+            AttentionSource.ORPHAN_EPIC,
+            AttentionSource.ORPHAN_LABELS_UNKNOWN,
+        },
+        AttentionCause.RECONCILE_FAILED: {
+            AttentionSource.TEMPLATE_UNREADY,
+            AttentionSource.TEMPLATE_BLOCK_LABEL,
+            AttentionSource.TEMPLATE_COMMENT,
+            AttentionSource.LEAF_TRANSITION,
+            AttentionSource.LEAF_RELEASE,
+            AttentionSource.LEAF_ERROR_TRANSITION,
+            AttentionSource.LEAF_PUBLICATION_EVIDENCE,
+            AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE,
+            AttentionSource.LEAF_EVIDENCE_COMMENT,
+            AttentionSource.LEAF_COMPLETED_STATE_CLEAR,
+            AttentionSource.EPIC_RETAINED_TRANSITION,
+            AttentionSource.EPIC_DRIVER_LOCK_TRANSITION,
+            AttentionSource.FACTORY_TERMINAL_TRANSITION,
+            AttentionSource.EPIC_ERROR_TRANSITION,
+            AttentionSource.EPIC_RELEASE,
+            AttentionSource.ORPHAN_LOCK_RELEASE,
+            AttentionSource.ORPHAN_COMMENT,
+            AttentionSource.ORPHAN_TARGET_LABEL,
+            AttentionSource.ORPHAN_INPROGRESS_UNLABEL,
+            AttentionSource.ORPHAN_STATE_UPDATE,
+        },
+    }
+    for cause, sources in groups.items():
+        if source in sources:
+            return cause
+    return AttentionCause.CONTROLLER_FAILED
+
+
 class AttentionOutcome(StrEnum):
     STARTED = "started"
     SUCCEEDED = "succeeded"
@@ -259,7 +351,7 @@ def classify_attention(facts: AttentionFacts) -> AccountingDecision:
         return AccountingDecision(AttentionOutcome.INFRASTRUCTURE_FAILURE, AccountingBasis.PRECLAIM, False, Settlement.NOT_NEEDED)
     status = facts.accepted_factory_status or facts.factory_status
     primary = facts.primary_outcome or _outcome_for_status(facts.original_result_status)
-    if primary is AttentionOutcome.PARTIAL:
+    if primary is AttentionOutcome.PARTIAL and status is not None:
         return AccountingDecision(primary, AccountingBasis.FACTORY_PARTIAL, True, Settlement.NOT_NEEDED)
     if facts.kind is AttentionKind.FACTORY_SUCCEEDED or facts.verified_completion:
         return AccountingDecision(AttentionOutcome.SUCCEEDED, AccountingBasis.VERIFIED_COMPLETION, True, Settlement.NOT_NEEDED)
@@ -317,7 +409,8 @@ def _outcome_for_status(status: object) -> AttentionOutcome | None:
 
 def _valid_claim_payload(value: Mapping[str, Any], issue_id: int) -> bool:
     if (
-        value.get("issue_id") != issue_id
+        set(value) != {"issue_id", "attempt", "agent_id", "claimed_at"}
+        or value.get("issue_id") != issue_id
         or type(value.get("attempt")) is not int
         or value["attempt"] <= 0
         or not isinstance(value.get("agent_id"), str)
@@ -396,22 +489,34 @@ class AttentionRecord:
             raise ValueError("attention records require a cause")
         if self.kind is not AttentionKind.ATTENTION and self.cause is not None:
             raise ValueError("lifecycle records cannot have a cause")
+        if self.source is not AttentionSource.LEGACY_V1 and self.cause is not _expected_source_cause(self.source):
+            raise ValueError("attention source and cause are inconsistent")
         if self.source is AttentionSource.LEGACY_V1 or self.cause is AttentionCause.LEGACY_UNKNOWN:
             raise ValueError("legacy identities cannot be produced")
         if not self.occurrence_id or not self.execution_id or not self.delivery_key:
             raise ValueError("attention record identifiers must be nonblank")
-        if self.claim_relation is ClaimRelation.CURRENT_CLAIM and self.claim is None:
-            raise ValueError("current claim relation requires an exact claim")
-        if self.claim_binding_state is ClaimBindingState.CONFIRMED and self.claim is None:
-            raise ValueError("confirmed claim binding requires an exact claim")
-        if self.claim_relation is ClaimRelation.RELATED_PRIOR_CLAIM and self.prior_claim is None:
-            raise ValueError("prior claim relation requires an exact prior claim")
-        if self.claim_relation is ClaimRelation.NONE and (self.claim is not None or self.prior_claim is not None):
-            raise ValueError("unrelated attention cannot carry claims")
+        claim_contract = {
+            (ClaimRelation.NONE, ClaimBindingState.NONE): (
+                self.claim is None and self.prior_claim is None
+            ),
+            (ClaimRelation.NONE, ClaimBindingState.PREPARED): (
+                self.claim is not None and self.prior_claim is None
+            ),
+            (ClaimRelation.CURRENT_CLAIM, ClaimBindingState.CONFIRMED): (
+                self.claim is not None and self.prior_claim is None
+            ),
+            (ClaimRelation.RELATED_PRIOR_CLAIM, ClaimBindingState.NONE): (
+                self.claim is None and self.prior_claim is not None
+            ),
+        }
+        if claim_contract.get((self.claim_relation, self.claim_binding_state)) is not True:
+            raise ValueError("attention claim relation and binding are inconsistent")
         if self.claim is not None and self.claim.issue_id != self.issue_id:
             raise ValueError("attention claim identity mismatch")
         if self.prior_claim is not None and self.prior_claim.issue_id != self.issue_id:
             raise ValueError("attention prior claim identity mismatch")
+        if self.claim is not None and self.attempt is not None and self.claim.attempt != self.attempt:
+            raise ValueError("attention claim attempt mismatch")
         if type(self.attempt_consumed) is not bool and self.attempt_consumed is not None:
             raise ValueError("invalid attempt consumption")
         lifecycle = self.kind is not AttentionKind.ATTENTION
@@ -448,6 +553,15 @@ class AttentionRecord:
             or self.inhibited
         ):
             raise ValueError("invalid lifecycle accounting")
+        if lifecycle and (
+            not isinstance(self.run_id, str)
+            or not self.run_id
+            or not isinstance(self.launch_id, str)
+            or not self.launch_id
+            or type(self.attempt) is not int
+            or self.attempt <= 0
+        ):
+            raise ValueError("lifecycle records require exact run and launch identity")
         if self.kind is AttentionKind.ATTENTION and self.attempt_consumed is None:
             raise ValueError("terminal attention requires a consumption decision")
         terminal_accounting = {
@@ -502,11 +616,38 @@ class AttentionRecord:
             or self.attempt_consumed is not False
         ):
             raise ValueError("settlement requires a nonconsuming current claim")
+        if (
+            self.claim_relation is ClaimRelation.CURRENT_CLAIM
+            and self.outcome is AttentionOutcome.INFRASTRUCTURE_FAILURE
+            and self.settlement not in {Settlement.PENDING, Settlement.APPLIED}
+        ):
+            raise ValueError("nonconsuming current claims require settlement")
         if self.primary_source is not None and self.primary_source is not self.source:
             raise ValueError("attention primary source mismatch")
         if not self.error_signature or not self.created_at:
             raise ValueError("attention signature and timestamp are required")
+        if any(
+            not isinstance(key, str)
+            or item is not None and not isinstance(item, str)
+            for key, item in self.refs.items()
+        ):
+            raise ValueError("attention refs must contain string or null values")
         datetime.fromisoformat(self.created_at)
+        for name, timestamp in (
+            ("delivered_at", self.delivered_at),
+            ("handled_at", self.handled_at),
+        ):
+            if timestamp is not None:
+                try:
+                    datetime.fromisoformat(timestamp)
+                except ValueError as exc:
+                    raise ValueError(f"invalid attention {name}") from exc
+        if (self.handled_at is None) is not (self.handling_disposition is None):
+            raise ValueError("attention handled state is inconsistent")
+        if self.handling_disposition is HandlingDisposition.OBSERVED and not lifecycle:
+            raise ValueError("observed disposition is lifecycle-only")
+        if self.retirement is not None and self.handled_at is not None:
+            raise ValueError("handled attention cannot be retired")
         if (
             type(self.reset_generation_baseline) is not int
             or self.reset_generation_baseline < 0
@@ -763,7 +904,7 @@ _SOURCE_POLICIES: dict[AttentionSource, tuple[str, ...]] = {
     AttentionSource.LEAF_PUBLICATION_EVIDENCE: ("source_clear", "publication_resolved", "disarmed", "superseded"),
     AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
     AttentionSource.LEAF_EVIDENCE_COMMENT: ("source_clear", "disarmed", "superseded", "publication_resolved"),
-    AttentionSource.LEAF_COMPLETED_STATE_CLEAR: ("source_clear", "publication_resolved", "superseded"),
+    AttentionSource.LEAF_COMPLETED_STATE_CLEAR: ("source_clear", "superseded"),
     AttentionSource.EPIC_LABEL: ("source_clear", "disarmed", "superseded"),
     AttentionSource.EPIC_TEMPLATE: ("source_clear", "disarmed", "superseded"),
     AttentionSource.EPIC_BACKEND: ("disarmed", "superseded"),
@@ -793,7 +934,7 @@ _SOURCE_POLICIES: dict[AttentionSource, tuple[str, ...]] = {
     AttentionSource.EPIC_ERROR_SAVE: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
     AttentionSource.EPIC_ERROR_TRANSITION: ("source_clear", "disarmed", "superseded", "publication_resolved"),
     AttentionSource.EPIC_CANCEL: ("source_clear", "superseded", "publication_resolved"),
-    AttentionSource.EPIC_WAIT_DRAIN: ("source_clear", "disarmed", "superseded", "factory_advanced", "publication_resolved"),
+    AttentionSource.EPIC_WAIT_DRAIN: ("disarmed", "superseded", "factory_advanced", "publication_resolved"),
     AttentionSource.EPIC_TRANSCRIPT_SAVE: ("source_clear", "disarmed", "superseded", "publication_resolved"),
     AttentionSource.EPIC_COMPUTE_CLEANUP: ("lock_and_owner_absent", "superseded", "publication_resolved"),
     AttentionSource.EPIC_RELEASE: ("lock_and_owner_absent", "superseded"),
@@ -873,6 +1014,7 @@ def inspect_attention(
     disarmed = _tri(no_lifecycle and lock_absent is True and process_dead is True, labels is None or lock_absent is None or process_dead is None)
     superseded = _superseded(record, claims, process_dead)
     publication = _publication(record, values.get("evidence"), readers, errors)
+    values["publication_resolution"] = publication
     factory = _factory_advanced(record, values.get("factory"), process_dead)
     budget = _budget_available(claims)
     rearmed = _rearmed(record, issue, claims)
@@ -1054,16 +1196,16 @@ def _rearmed(record: AttentionRecord, issue: Any, claims: Any) -> Resolution:
         return Resolution.UNKNOWN
     reset_generation = claims.get("reset_generation")
     ready_cycle_generation = claims.get("ready_cycle_generation")
-    latest = claims.get("latest")
-    latest_payload = (
+    manual_witness = claims.get("manual_claim_witness")
+    manual_payload = (
         {
-            "issue_id": latest.issue_id,
-            "attempt": latest.attempt,
-            "agent_id": latest.agent_id,
-            "claimed_at": latest.claimed_at.isoformat(),
+            "issue_id": manual_witness.issue_id,
+            "attempt": manual_witness.attempt,
+            "agent_id": manual_witness.agent_id,
+            "claimed_at": manual_witness.claimed_at.isoformat(),
         }
-        if isinstance(latest, ClaimRecord)
-        else dict(latest) if isinstance(latest, Mapping) else None
+        if isinstance(manual_witness, ClaimRecord)
+        else dict(manual_witness) if isinstance(manual_witness, Mapping) else None
     )
     current_claim = (
         {
@@ -1079,9 +1221,10 @@ def _rearmed(record: AttentionRecord, issue: Any, claims: Any) -> Resolution:
     if type(ready_cycle_generation) is int and ready_cycle_generation > record.ready_cycle_baseline:
         return Resolution.RESOLVED
     if (
-        latest_payload is not None
-        and latest_payload != record.manual_claim_baseline
-        and latest_payload != current_claim
+        manual_payload is not None
+        and _valid_claim_payload(manual_payload, record.issue_id)
+        and manual_payload != record.manual_claim_baseline
+        and manual_payload != current_claim
     ):
         return Resolution.RESOLVED
     labels = _labels(issue)
@@ -1161,9 +1304,32 @@ def _source_clearance(
         AttentionSource.LEAF_COMPLETED_EVIDENCE_WRITE,
     }:
         return _exact_evidence(record, evidence)
-    if record.source in {
-        AttentionSource.LEAF_COMPLETED_STATE_CLEAR, AttentionSource.ORPHAN_STATE_UPDATE,
-    }:
+    if record.source is AttentionSource.LEAF_COMPLETED_STATE_CLEAR:
+        target = record.refs.get("target_label")
+        owner_dead = (
+            source_state.get("old_owner_verified_dead")
+            if isinstance(source_state, Mapping) else None
+        )
+        publication = values.get("publication_resolution")
+        exact = (
+            run_state is None
+            and isinstance(target, str)
+            and labels is not None
+            and target in labels
+            and "worklink:in-progress" not in labels
+            and _lock_absent(claims) is True
+            and owner_dead is True
+            and publication is Resolution.RESOLVED
+        )
+        return _tri(
+            exact,
+            "run_state" not in values
+            or labels is None
+            or _lock_absent(claims) is None
+            or not isinstance(owner_dead, bool)
+            or publication is Resolution.UNKNOWN,
+        )
+    if record.source is AttentionSource.ORPHAN_STATE_UPDATE:
         target = record.refs.get("target_label")
         exact = (
             run_state is None
@@ -1227,9 +1393,37 @@ def _source_clearance(
         )
         return _tri(exact is True, "source_state" not in values or not isinstance(exact, bool))
     if record.source is AttentionSource.EPIC_PRESERVATION:
-        return _tri(bool(record.refs.get("preserved_ref")))
-    if record.source is AttentionSource.ORPHAN_UNPUBLISHED:
-        return _tri(run_state is None and labels is not None and "worklink:blocked" not in labels, "run_state" not in values or labels is None)
+        matches = (
+            source_state.get("preserved_ref_matches")
+            if isinstance(source_state, Mapping) else None
+        )
+        return _tri(matches is True, not isinstance(matches, bool))
+    if record.source in {
+        AttentionSource.ORPHAN_UNPUBLISHED,
+        AttentionSource.ORPHAN_AMBIGUOUS,
+    }:
+        outcome = (
+            source_state.get("publication_outcome")
+            if isinstance(source_state, Mapping) else None
+        )
+        owner_dead = (
+            source_state.get("old_owner_verified_dead")
+            if isinstance(source_state, Mapping) else None
+        )
+        exact = (
+            run_state is None
+            and labels is not None
+            and "worklink:blocked" not in labels
+            and outcome == "determined-clean"
+            and owner_dead is True
+        )
+        return _tri(
+            exact,
+            "run_state" not in values
+            or labels is None
+            or outcome is None
+            or not isinstance(owner_dead, bool),
+        )
     return Resolution.UNKNOWN
 
 

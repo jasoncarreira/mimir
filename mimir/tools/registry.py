@@ -3097,9 +3097,98 @@ def _attention_readers(home: Path):
         return json.loads(result.stdout)
 
     def read_source_state(record):
+        from types import SimpleNamespace
+
         from ..worklink.attention import AttentionSource
         from ..worklink.backends.registry import BackendRegistry, WorklinkConfig
         from ..worklink.orchestrator import _repo_slug_from_url
+
+        def old_owner_verified_dead():
+            identifier = record.refs.get("owner_handle_identifier")
+            ticks = record.refs.get("owner_process_start_ticks")
+            shim_pid = record.refs.get("owner_shim_pid")
+            if not isinstance(identifier, str) or not identifier or not isinstance(ticks, str):
+                return None
+            try:
+                parsed_ticks = int(ticks)
+                parsed_shim = int(shim_pid) if isinstance(shim_pid, str) else None
+            except ValueError:
+                return None
+            owner = SimpleNamespace(
+                handle_identifier=identifier,
+                process_start_ticks=parsed_ticks,
+                shim_pid=parsed_shim,
+            )
+            return process_is_verified_dead(owner)
+
+        def checkout_publication_outcome():
+            raw_checkout = record.refs.get("checkout")
+            branch = record.refs.get("branch")
+            local_base = record.refs.get("local_base") or record.refs.get("base_ref")
+            if not all(isinstance(item, str) and item for item in (raw_checkout, branch, local_base)):
+                return None
+            checkout = Path(raw_checkout).resolve(strict=True)
+            head = run(["git", "-C", str(checkout), "rev-parse", "HEAD"])
+            ahead = run([
+                "git", "-C", str(checkout), "rev-list", "--count",
+                f"{local_base}..HEAD",
+            ])
+            if head.returncode != 0 or ahead.returncode != 0 or not head.stdout.strip():
+                return None
+            try:
+                ahead_count = int(ahead.stdout.strip())
+            except ValueError:
+                return None
+            if ahead_count == 0:
+                return "determined-clean"
+            remote = run([
+                "git", "-C", str(checkout), "ls-remote", "--heads", "origin",
+                f"refs/heads/{branch}",
+            ])
+            if remote.returncode != 0:
+                return None
+            remote_sha = (remote.stdout.strip().split() or [""])[0].lower()
+            return (
+                "determined-clean"
+                if remote_sha == head.stdout.strip().lower()
+                else "determined-unpublished"
+            )
+
+        if record.source in {
+            AttentionSource.ORPHAN_UNPUBLISHED,
+            AttentionSource.ORPHAN_AMBIGUOUS,
+            AttentionSource.LEAF_COMPLETED_STATE_CLEAR,
+        }:
+            result = {"old_owner_verified_dead": old_owner_verified_dead()}
+            if record.source in {
+                AttentionSource.ORPHAN_UNPUBLISHED,
+                AttentionSource.ORPHAN_AMBIGUOUS,
+            }:
+                result["publication_outcome"] = checkout_publication_outcome()
+            return result
+
+        if record.source is AttentionSource.EPIC_PRESERVATION:
+            raw_checkout = record.refs.get("checkout")
+            preserved_ref = record.refs.get("preserved_ref")
+            preserved_head = record.refs.get("preserved_head")
+            if not all(
+                isinstance(item, str) and item
+                for item in (raw_checkout, preserved_ref, preserved_head)
+            ):
+                return {"preserved_ref_matches": False}
+            checkout = Path(raw_checkout).resolve(strict=True)
+            branch = preserved_ref.removeprefix("origin/")
+            observed = run([
+                "git", "-C", str(checkout), "ls-remote", "--heads", "origin",
+                f"refs/heads/{branch}",
+            ])
+            observed_head = (observed.stdout.strip().split() or [""])[0].lower()
+            return {
+                "preserved_ref_matches": (
+                    observed.returncode == 0
+                    and observed_head == preserved_head.lower()
+                )
+            }
 
         if record.source in {
             AttentionSource.LEAF_COMPUTE,
