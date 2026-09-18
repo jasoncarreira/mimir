@@ -1017,6 +1017,13 @@ def reattach_inflight_worklink_runs(
         report_retained_factory_records,
     )
     from .worklink.run_state import reattach_dispatch_argv
+    from .worklink.attention import AttentionCause, AttentionSource, LaunchFacts
+    from .worklink.dispatch_failures import (
+        RESERVATION_ENV,
+        active_reservation_id,
+        dispatch_failure_state_dir,
+        record_attention,
+    )
 
     spawn = popen or subprocess.Popen
     event_callback = event_logger or log_event_sync
@@ -1075,6 +1082,9 @@ def reattach_inflight_worklink_runs(
             # persistent remote substrate it cannot be reattached by a new one.
             continue
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
+        reservation_id = active_reservation_id(
+            dispatch_failure_state_dir(home), issue_id=state.issue_id, target="leaf"
+        )
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:
             log_fh: Any = log_path.open("ab")
@@ -1088,8 +1098,32 @@ def reattach_inflight_worklink_runs(
                 stdout=log_fh,
                 stderr=log_fh,
                 start_new_session=True,  # detach: survive this startup + outlive it
+                **(
+                    {"env": {**os.environ, RESERVATION_ENV: reservation_id}}
+                    if reservation_id is not None
+                    else {}
+                ),
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            if reservation_id is not None:
+                record_attention(
+                    dispatch_failure_state_dir(home),
+                    issue_id=state.issue_id,
+                    reservation_id=reservation_id,
+                    source=AttentionSource.STARTUP_LEAF_SPAWN,
+                    cause=AttentionCause.SPAWN_FAILED,
+                    facts=LaunchFacts(
+                        executable=run_bin[0] if run_bin else None,
+                        compute=state.compute_name,
+                        checkout=state.checkout,
+                        operation="reattach",
+                        returned_handle=False,
+                        pid=None,
+                        start_ticks=None,
+                        launch_result="spawn_failed",
+                        state_save_result="retained",
+                    ),
+                )
             failure = {
                 "issue_id": state.issue_id,
                 "reason": "reattach_spawn_failed",
@@ -1106,6 +1140,9 @@ def reattach_inflight_worklink_runs(
                     pass
         dispatched.append(state.issue_id)
     for record in factory_records:
+        reservation_id = active_reservation_id(
+            dispatch_failure_state_dir(home), issue_id=record.issue_id, target="factory"
+        )
         argv = [
             *run_bin,
             "worklink",
@@ -1130,8 +1167,32 @@ def reattach_inflight_worklink_runs(
                 stdout=log_fh,
                 stderr=log_fh,
                 start_new_session=True,
+                **(
+                    {"env": {**os.environ, RESERVATION_ENV: reservation_id}}
+                    if reservation_id is not None
+                    else {}
+                ),
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            if reservation_id is not None:
+                record_attention(
+                    dispatch_failure_state_dir(home),
+                    issue_id=record.issue_id,
+                    reservation_id=reservation_id,
+                    source=AttentionSource.STARTUP_FACTORY_SPAWN,
+                    cause=AttentionCause.SPAWN_FAILED,
+                    facts=LaunchFacts(
+                        executable=run_bin[0] if run_bin else None,
+                        compute="local_subprocess",
+                        checkout=record.sandbox,
+                        operation="factory_reattach",
+                        returned_handle=False,
+                        pid=None,
+                        start_ticks=None,
+                        launch_result="spawn_failed",
+                        state_save_result="retained",
+                    ),
+                )
             failure = {
                 "issue_id": record.issue_id,
                 "reason": "factory_recovery_spawn_failed",

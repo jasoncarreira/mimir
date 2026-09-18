@@ -440,6 +440,16 @@ def reconcile_run_states(
                 or (publication_outcome == "undetermined" and checkout_exists)
                 else "worklink:ready"
             )
+            if target == "worklink:ready":
+                from .dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    issue_dispatch_disposition,
+                )
+
+                if issue_dispatch_disposition(
+                    dispatch_failure_state_dir(home), state.issue_id
+                ) == "stop":
+                    target = "worklink:blocked"
             comment_text = _orphan_reconcile_comment(
                 state,
                 publication_outcome=publication_outcome,

@@ -157,9 +157,15 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return 1
 
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    reservation_id = _prepare_autonomous_reservation(
+        home, args.issue_id, target="leaf", autonomous=args.autonomous and not args.dry_run
+    )
     try:
         repo = _resolve_worklink_repo(args.repo)
     except RuntimeError as exc:
+        _record_repository_refusal(
+            home, args.issue_id, reservation_id, target="leaf", error=exc
+        )
         print(f"error: {exc}", file=sys.stderr)
         return 1
     os.environ["MIMIR_HOME"] = str(home)
@@ -205,6 +211,14 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
         try:
             state = load_run_state(home, args.issue_id)
+            _record_interruption(
+                home,
+                args.issue_id,
+                reservation_id,
+                target="leaf",
+                source="leaf_interrupt",
+                retained=state is not None,
+            )
             _record_run_failure(
                 home=home,
                 issue_id=args.issue_id,
@@ -317,9 +331,15 @@ def _format_elapsed(seconds: float) -> str:
 def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Handle the run-epic command for worklink:epic issues via feature-factory."""
     home = (args.home or Path(os.environ.get("MIMIR_HOME") or Path.cwd())).resolve()
+    reservation_id = _prepare_autonomous_reservation(
+        home, args.issue_id, target="factory", autonomous=args.autonomous
+    )
     try:
         repo = _resolve_worklink_repo(args.repo)
     except RuntimeError as exc:
+        _record_repository_refusal(
+            home, args.issue_id, reservation_id, target="factory", error=exc
+        )
         print(f"error: {exc}", file=sys.stderr)
         return 1
     os.environ["MIMIR_HOME"] = str(home)
@@ -345,6 +365,16 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except WorklinkError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except BaseException:
+        _record_interruption(
+            home,
+            args.issue_id,
+            reservation_id,
+            target="factory",
+            source="factory_interrupt",
+            retained=True,
+        )
+        raise
 
     print(
         f"worklink:epic #{result.issue_id} attempt {result.attempt}: {result.status}"
@@ -366,3 +396,93 @@ def _resolve_worklink_repo(explicit: Path | None) -> Path:
             "WORKLINK_REPO is required; provision a dedicated Worklink base repository or pass --repo"
         )
     return Path(configured).resolve()
+
+
+def _prepare_autonomous_reservation(
+    home: Path, issue_id: int, *, target: str, autonomous: bool
+) -> str | None:
+    """Validate or allocate the private causal identity before repository IO."""
+    if not autonomous:
+        return None
+    from ..worklink.dispatch_failures import (
+        RESERVATION_ENV,
+        dispatch_failure_state_dir,
+        reservation_from_environment,
+    )
+
+    reservation_id = reservation_from_environment(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        target=target,
+        autonomous=True,
+    )
+    if reservation_id is None:  # pragma: no cover - autonomous guarantees a value.
+        raise RuntimeError("autonomous Worklink reservation was not created")
+    os.environ[RESERVATION_ENV] = reservation_id
+    return reservation_id
+
+
+def _record_repository_refusal(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    *,
+    target: str,
+    error: BaseException,
+) -> None:
+    if reservation_id is None:
+        return
+    from ..worklink.attention import AttentionCause, AttentionSource, InputFacts
+    from ..worklink.dispatch_failures import dispatch_failure_state_dir, record_attention
+
+    record_attention(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=(
+            AttentionSource.FACTORY_CLI_REPOSITORY
+            if target == "factory"
+            else AttentionSource.LEAF_CLI_REPOSITORY
+        ),
+        cause=AttentionCause.REPOSITORY_UNAVAILABLE,
+        facts=InputFacts(repository=None, validator="worklink_repo", result=type(error).__name__),
+    )
+
+
+def _record_interruption(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    *,
+    target: str,
+    source: str,
+    retained: bool,
+) -> None:
+    if reservation_id is None:
+        return
+    from ..worklink.attention import InterruptFacts
+    from ..worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_attention,
+        reservation_claim,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause="interrupted",
+        facts=InterruptFacts(
+            interrupted_source=target,
+            process_verdict="unknown",
+            handle_verdict="retained" if retained else "absent",
+            retained_binding=retained,
+            positive_proof_ids=(),
+        ),
+        claim=reservation_claim(
+            state_dir, issue_id=issue_id, reservation_id=reservation_id
+        ),
+        deferred=retained,
+    )

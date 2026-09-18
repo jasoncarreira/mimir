@@ -1113,6 +1113,7 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
         "mimir/worklink/control.py",
         "mimir/worklink/run_state.py",
         "mimir/worklink/factory_state.py",
+        "mimir/worklink/attention.py",
         "mimir/worklink/checkout.py",
         "mimir/worklink/backends/feature_factory.py",
         "mimir/commands/worklink.py",
@@ -1127,7 +1128,7 @@ def test_migrated_factory_consumers_have_finite_legacy_free_inventory() -> None:
         "primary_factory",
         "has_concurrent_factory_session",
     )
-    assert len(consumers) == 12
+    assert len(consumers) == 13
     for relative in consumers:
         source = (root / relative).read_text(encoding="utf-8")
         assert all(token not in source for token in forbidden), relative

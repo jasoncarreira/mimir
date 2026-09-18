@@ -9,6 +9,7 @@ PR only after the evidence gate passes, then clean up and release the lock.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -566,6 +567,7 @@ class WorklinkRunner:
     )
     runner: Runner | None = None
     registry: BackendRegistry | None = None
+    outcome_reservation_id: str | None = None
 
     async def run(
         self,
@@ -577,11 +579,28 @@ class WorklinkRunner:
         base_branch: str | None = None,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
+        reservation_id = self.outcome_reservation_id or _outcome_reservation(
+            self.home, issue_id, target="leaf", autonomous=autonomous and not dry_run
+        )
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
-        issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        try:
+            issue = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner).read(issue_id)
+        except Exception as exc:
+            _record_preclaim_input(
+                self.home, issue_id, reservation_id,
+                source="leaf_issue_read", cause="read_failed",
+                validator="chainlink_issue", result=type(exc).__name__,
+            )
+            raise
         try:
             validate_leaf(issue)
         except LeafValidationError as exc:
+            _record_preclaim_input(
+                self.home, issue_id, reservation_id,
+                source=("leaf_target_branch" if "target branch" in str(exc).lower() else "leaf_template"),
+                cause=("invalid_target_branch" if "target branch" in str(exc).lower() else "template_missing"),
+                validator="leaf_contract", result="invalid",
+            )
             if not dry_run:
                 _demote_template_invalid_ready_leaf(
                     issue,
@@ -590,18 +609,38 @@ class WorklinkRunner:
                     chainlink_bin=self.chainlink_bin,
                 )
             raise
-        config = WorklinkConfig.load(self.home / "worklink.yaml")
-        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        try:
+            config = WorklinkConfig.load(self.home / "worklink.yaml")
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="leaf_config", cause="configuration_invalid", validator="worklink_config", result=type(exc).__name__)
+            raise
+        try:
+            inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="leaf_inventory", cause="configuration_invalid", validator="repository_inventory", result=type(exc).__name__)
+            raise
         registry = self.registry or BackendRegistry(config)
-        repo_url = _repo_remote_url(self.repo, runner=runner)
+        try:
+            repo_url = _repo_remote_url(self.repo, runner=runner)
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="leaf_repository", cause="configuration_invalid", validator="repository_origin", result=type(exc).__name__)
+            raise
         repo_slug = _repo_slug_from_url(repo_url)
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
-        backend = (
-            registry.get(backend_name)
-            if backend_name
-            else registry.select(labels=issue.labels, repo=repo_slug)
-        )
-        compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        try:
+            backend = (
+                registry.get(backend_name)
+                if backend_name
+                else registry.select(labels=issue.labels, repo=repo_slug)
+            )
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="leaf_backend", cause="configuration_invalid", validator="backend_selection", result=type(exc).__name__)
+            raise
+        try:
+            compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="leaf_compute", cause="configuration_invalid", validator="compute_selection", result=type(exc).__name__)
+            raise
         selected_name = backend.name
         worker_uid_drop = (
             coding_enabled()
@@ -733,6 +772,13 @@ class WorklinkRunner:
                 reason=claim.reason or "claim_failed"
             )
         record = claim.record
+        if reservation_id is not None:
+            _record_lifecycle_start(
+                self.home,
+                issue_id=issue.issue_id,
+                reservation_id=reservation_id,
+                record=record,
+            )
         terminal_release = _TerminalClaimRelease(
             claims,
             home=self.home,
@@ -931,6 +977,7 @@ class WorklinkRunner:
                     publication=publication,
                     executor_report_dir=executor_report_dir,
                     terminal_release=terminal_release,
+                    outcome_reservation_id=reservation_id,
                 ),
                 claims=claims,
                 record=record,
@@ -1053,6 +1100,7 @@ class WorklinkRunner:
         publication: ControllerGitPublication | None = None,
         executor_report_dir: Path | None = None,
         terminal_release: _TerminalClaimRelease,
+        outcome_reservation_id: str | None = None,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1311,6 +1359,20 @@ class WorklinkRunner:
         )
         transition_applied = False
         transition_error = None
+
+        if outcome_reservation_id is not None and not validation.review_ready:
+            _record_leaf_outcome_before_routing(
+                home=self.home,
+                issue=issue,
+                reservation_id=outcome_reservation_id,
+                claim_record=claim_record,
+                status=transition_status,
+                reason=transition_reason,
+                evidence_path=evidence_path,
+                checkout=lease.path,
+                branch=lease.branch,
+                pr_url=pr_url,
+            )
 
         # Keep the lock until routing succeeds, including through outer finally.
         terminal_release.retain_for_recovery = True
@@ -1720,14 +1782,29 @@ class WorklinkRunner:
         *,
         autonomous: bool,
     ) -> WorklinkRunResult:
+        reservation_id = self.outcome_reservation_id or _outcome_reservation(
+            self.home, issue_id, target="factory", autonomous=autonomous
+        )
         with factory_checkout_interlock(self.home) as acquired:
             if not acquired:
+                _record_preclaim_claim(
+                    self.home, issue_id, reservation_id,
+                    source="factory_interlock", cause="interlock_unavailable",
+                    result="unavailable",
+                )
                 return WorklinkRunResult(
                     issue_id, None, "refused", reason="factory checkout interlock unavailable"
                 )
             # Keep checkout protection even after the worker dies, until failure
             # preservation, terminal handling and claim cleanup have finished.
-            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+            bound_runner = (
+                self
+                if reservation_id == self.outcome_reservation_id
+                else replace(self, outcome_reservation_id=reservation_id)
+            )
+            return await bound_runner._run_factory_070_locked(
+                issue_id, autonomous=autonomous
+            )
 
     async def _run_factory_070_locked(
         self,
@@ -1737,28 +1814,59 @@ class WorklinkRunner:
     ) -> WorklinkRunResult:
         from .autonomy import factory_max_concurrent
 
+        reservation_id = self.outcome_reservation_id or _outcome_reservation(
+            self.home, issue_id, target="factory", autonomous=autonomous
+        )
         runner = self.runner or _runner_for_home(self.home, self.chainlink_bin)
         issue_reader = ChainlinkIssueReader(chainlink_bin=self.chainlink_bin, runner=runner)
-        issue = issue_reader.read(issue_id)
+        try:
+            issue = issue_reader.read(issue_id)
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_issue_read", cause="read_failed", validator="chainlink_issue", result=type(exc).__name__)
+            raise
         if "worklink:epic" not in issue.labels:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_issue_kind", cause="not_epic", validator="epic_label", result="not_epic")
             _log_event(
                 "worklink_epic_refused",
                 issue_id=issue_id,
                 reason="not an epic issue",
             )
             return WorklinkRunResult(issue_id, None, "failed", reason="not an epic issue")
-        validate_leaf(issue)
-        config = WorklinkConfig.load(self.home / "worklink.yaml")
+        try:
+            validate_leaf(issue)
+        except LeafValidationError as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_target_branch", cause="invalid_target_branch", validator="target_branch", result=type(exc).__name__)
+            raise
+        try:
+            config = WorklinkConfig.load(self.home / "worklink.yaml")
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_config", cause="configuration_invalid", validator="worklink_config", result=type(exc).__name__)
+            raise
         registry = self.registry or BackendRegistry(config)
-        selected = registry.get("feature_factory")
+        try:
+            selected = registry.get("feature_factory")
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_backend", cause="configuration_invalid", validator="backend_selection", result=type(exc).__name__)
+            raise
         if not isinstance(selected, FeatureFactoryBackend):
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_backend", cause="configuration_invalid", validator="backend_implementation", result="invalid")
             raise WorklinkError("feature_factory backend has an invalid implementation")
-        repo_url = _repo_remote_url(self.repo, runner=runner)
+        try:
+            repo_url = _repo_remote_url(self.repo, runner=runner)
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_repository", cause="configuration_invalid", validator="repository_origin", result=type(exc).__name__)
+            raise
         repo_slug = _repo_slug_from_url(repo_url)
         if repo_slug is None:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_repository", cause="configuration_invalid", validator="repository_origin", result="invalid")
             raise WorklinkError("factory repository must have a canonical GitHub origin")
-        compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        try:
+            compute = registry.select_compute(labels=issue.labels, repo=repo_slug)
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_compute", cause="configuration_invalid", validator="compute_selection", result=type(exc).__name__)
+            raise
         if compute.name != "local_subprocess":
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_compute", cause="configuration_invalid", validator="compute_selection", result="not_local_subprocess")
             raise WorklinkError("factory runs require local_subprocess supervision")
         if isinstance(compute, LocalSubprocessComputeBackend):
             runner = _factory_git_runner(runner)
@@ -1774,8 +1882,16 @@ class WorklinkRunner:
                     reason=reason,
                 )
                 return WorklinkRunResult(issue_id, None, "refused", reason=reason)
-        launcher = selected.admit()
-        inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        try:
+            launcher = selected.admit()
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_launcher", cause="launcher_unavailable", validator="factory_launcher", result=type(exc).__name__)
+            raise
+        try:
+            inventory = RepositoryInventory.load(self.home / "repositories.yaml")
+        except Exception as exc:
+            _record_preclaim_input(self.home, issue_id, reservation_id, source="factory_inventory", cause="configuration_invalid", validator="repository_inventory", result=type(exc).__name__)
+            raise
         repository_config = inventory.repository(repo_slug) if inventory.declared else None
         base = (
             target_branch_from_description(issue.description)
@@ -1806,6 +1922,15 @@ class WorklinkRunner:
                 "worklink_epic_refused",
                 issue_id=issue_id,
                 reason=reason,
+            )
+            _record_preclaim_input(
+                self.home,
+                issue_id,
+                reservation_id,
+                source="factory_base_lookup",
+                cause=("base_missing" if base_check.returncode == 2 else "base_read_failed"),
+                validator="git_ls_remote",
+                result=f"returncode_{base_check.returncode}",
             )
             return WorklinkRunResult(
                 issue_id,
@@ -1911,6 +2036,15 @@ class WorklinkRunner:
                 issue_id, None, _claim_refusal_status(reason), reason=reason
             )
         claim_record = claim.record
+        if reservation_id is not None:
+            _record_lifecycle_start(
+                self.home,
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                record=claim_record,
+                run_id=run_id,
+                sandbox=retained.sandbox if retained is not None else None,
+            )
         _log_event(
             "worklink_claimed",
             issue_id=issue_id,
@@ -3410,6 +3544,103 @@ def _claim_refusal_status(reason: str | None) -> str:
     return "failed"
 
 
+def _outcome_reservation(
+    home: Path, issue_id: int, *, target: str, autonomous: bool
+) -> str | None:
+    if not autonomous:
+        return None
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        reservation_from_environment,
+    )
+
+    reservation_id = reservation_from_environment(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        target=target,
+        autonomous=True,
+    )
+    if reservation_id is None:  # pragma: no cover - autonomous guarantees a value.
+        raise WorklinkError("autonomous outcome reservation was not created")
+    return reservation_id
+
+
+def _record_lifecycle_start(
+    home: Path,
+    *,
+    issue_id: int,
+    reservation_id: str,
+    record: ClaimRecord,
+    run_id: str | None = None,
+    sandbox: str | None = None,
+) -> None:
+    from .attention import ClaimIdentity
+    from .dispatch_failures import confirm_claim_and_start, dispatch_failure_state_dir
+
+    confirm_claim_and_start(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        claim=ClaimIdentity(
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            agent_id=record.agent_id,
+            claimed_at=record.claimed_at.isoformat(),
+        ),
+        run_id=run_id,
+        sandbox=sandbox,
+    )
+
+
+def _record_preclaim_input(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    *,
+    source: str,
+    cause: str,
+    validator: str,
+    result: str,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import InputFacts
+    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+
+    record_attention(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=InputFacts(validator=validator, result=result),
+    )
+
+
+def _record_preclaim_claim(
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    *,
+    source: str,
+    cause: str,
+    result: str,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import ClaimFacts
+    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+
+    record_attention(
+        dispatch_failure_state_dir(home),
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=ClaimFacts(None, None, result),
+    )
+
+
 def run_worklink(
     *,
     home: Path,
@@ -3421,9 +3652,14 @@ def run_worklink(
     base_branch: str | None = None,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    reservation_id = _outcome_reservation(
+        home, issue_id, target="leaf", autonomous=autonomous and not dry_run
+    )
     try:
         result = asyncio.run(
-            WorklinkRunner(home=home, repo=repo).run(
+            WorklinkRunner(
+                home=home, repo=repo, outcome_reservation_id=reservation_id
+            ).run(
                 issue_id,
                 backend_name=backend,
                 dry_run=dry_run,
@@ -3453,8 +3689,23 @@ def run_worklink(
             preserved_ref=result.preserved_ref,
             preservation_error=result.preservation_error,
         )
+        _record_typed_terminal(
+            home=home,
+            issue_id=issue_id,
+            reservation_id=reservation_id,
+            target="leaf",
+            result=result,
+        )
+    elif result.status == "blocked":
+        _record_typed_terminal(
+            home=home,
+            issue_id=issue_id,
+            reservation_id=reservation_id,
+            target="leaf",
+            result=result,
+        )
     elif result.status == "completed":
-        _record_run_success(home, issue_id)
+        _record_run_success(home, issue_id, reservation_id=reservation_id, result=result, target="leaf")
     # Parked and refused outcomes do not resolve or replace prior failure attention.
     # Leaving it active preserves backoff without inflating its consecutive count.
     return result
@@ -3500,13 +3751,258 @@ def _record_run_failure(
             pass
 
 
-def _record_run_success(home: Path, issue_id: int) -> None:
-    from .dispatch_failures import dispatch_failure_state_dir, record_success
+def _record_typed_terminal(
+    *,
+    home: Path,
+    issue_id: int,
+    reservation_id: str | None,
+    target: str,
+    result: WorklinkRunResult,
+) -> None:
+    if reservation_id is None:
+        return
+    from .attention import (
+        AttentionCause,
+        AttentionSource,
+        FactorySnapshot,
+        LeafFacts,
+        positive_factory_proofs,
+    )
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+        record_attention,
+        reservation_claim,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    if issue_dispatch_disposition(state_dir, issue_id) in {"stop", "success"}:
+        return
+    claim = reservation_claim(state_dir, issue_id=issue_id, reservation_id=reservation_id)
+    if target == "factory":
+        is_partial = result.status == "partial"
+        source = (
+            AttentionSource.FACTORY_PARTIAL
+            if is_partial
+            else AttentionSource.FACTORY_DRIVER_EXIT
+            if result.status == "failed"
+            else AttentionSource.FACTORY_PARKED
+            if result.status == "parked"
+            else AttentionSource.FACTORY_BLOCKED
+        )
+        cause = (
+            AttentionCause.PARTIAL
+            if is_partial
+            else AttentionCause.UNFINISHED_EXIT
+            if result.status == "failed"
+            else AttentionCause.NEEDS_HUMAN
+            if result.status == "parked"
+            else AttentionCause.BLOCKED
+        )
+        facts: object = FactorySnapshot(
+            run_id=None,
+            issue_id=issue_id,
+            attempt=result.attempt,
+            sandbox=str(result.checkout) if result.checkout else None,
+            session=None,
+            controller_phase="terminal",
+            controller_error=result.reason,
+            status=result.status,
+            valid=True,
+            lock=None,
+            dead_lock=None,
+            lock_session=None,
+            gates=(),
+            steps=(),
+            slices=(),
+            pr_url=result.pr_url,
+            next=result.next,
+            next_present=result.next is not None,
+            park_snapshot=None,
+            read_result="captured",
+        )
+        try:
+            from .factory_state import (
+                immutable_factory_snapshot,
+                load_factory_records_for_issue,
+            )
+
+            records = load_factory_records_for_issue(home, issue_id)
+            if records:
+                facts = immutable_factory_snapshot(records[0], read_result="captured")
+        except Exception:
+            # The terminal occurrence must preserve the originating result; a
+            # later strict inspection reports the record read failure.
+            pass
+        proofs = positive_factory_proofs(facts)
+        if is_partial and "factory_partial" not in proofs:
+            proofs = (*proofs, "factory_partial")
+    else:
+        source = AttentionSource.LEAF_BACKEND_OUTCOME
+        cause = (
+            AttentionCause.BACKEND_BLOCKED
+            if result.status == "blocked"
+            else AttentionCause.BACKEND_FAILED
+        )
+        proofs = (
+            (f"leaf_outcome:{result.evidence_path}",)
+            if result.evidence_path is not None
+            else ()
+        )
+        facts = LeafFacts(
+            backend=None,
+            checkout=str(result.checkout) if result.checkout else None,
+            base=None,
+            branch=result.branch,
+            isolated=result.checkout is not None,
+            compute_result=result.status,
+            backend_status=result.status,
+            validation_reason_codes=(),
+            evidence_id=str(result.evidence_path) if result.evidence_path else None,
+            evidence_sha256=_file_sha256(result.evidence_path),
+            pr_url=result.pr_url,
+            head_sha=None,
+        )
+    record_attention(
+        state_dir,
+        issue_id=issue_id,
+        reservation_id=reservation_id,
+        source=source,
+        cause=cause,
+        facts=facts,
+        claim=claim,
+        proof_ids=proofs,
+    )
+
+
+def _record_leaf_outcome_before_routing(
+    *,
+    home: Path,
+    issue: IssueContext,
+    reservation_id: str,
+    claim_record: ClaimRecord,
+    status: str,
+    reason: str | None,
+    evidence_path: Path,
+    checkout: Path,
+    branch: str,
+    pr_url: str | None,
+) -> None:
+    from .attention import AttentionCause, AttentionSource, ClaimIdentity, LeafFacts
+    from .dispatch_failures import dispatch_failure_state_dir, record_attention
+
+    evidence_sha = _file_sha256(evidence_path)
+    proof_ids = (
+        (f"leaf_outcome:{evidence_sha}",) if evidence_sha is not None else ()
+    )
+    record_attention(
+        dispatch_failure_state_dir(home),
+        issue_id=issue.issue_id,
+        reservation_id=reservation_id,
+        source=AttentionSource.LEAF_BACKEND_OUTCOME,
+        cause=(
+            AttentionCause.BACKEND_BLOCKED
+            if status == "blocked"
+            else AttentionCause.BACKEND_FAILED
+        ),
+        facts=LeafFacts(
+            backend=None,
+            checkout=str(checkout),
+            base=None,
+            branch=branch,
+            isolated=True,
+            compute_result=status,
+            backend_status=status,
+            validation_reason_codes=(reason,) if reason else (),
+            evidence_id=str(evidence_path),
+            evidence_sha256=evidence_sha,
+            pr_url=pr_url,
+            head_sha=None,
+        ),
+        claim=ClaimIdentity(
+            issue_id=claim_record.issue_id,
+            attempt=claim_record.attempt,
+            agent_id=claim_record.agent_id,
+            claimed_at=claim_record.claimed_at.isoformat(),
+        ),
+        proof_ids=proof_ids,
+    )
+
+
+def _record_run_success(
+    home: Path,
+    issue_id: int,
+    *,
+    reservation_id: str | None = None,
+    result: WorklinkRunResult | None = None,
+    target: str = "leaf",
+) -> None:
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_success,
+        record_success_witness,
+        reservation_binding,
+        reservation_claim,
+    )
 
     try:
-        record_success(dispatch_failure_state_dir(home), issue_id)
+        state_dir = dispatch_failure_state_dir(home)
+        record_success(state_dir, issue_id)
+        if reservation_id is None or result is None or result.evidence_path is None:
+            return
+        evidence_sha = _file_sha256(result.evidence_path)
+        if evidence_sha is None or result.branch is None:
+            return
+        claim = reservation_claim(
+            state_dir, issue_id=issue_id, reservation_id=reservation_id
+        )
+        if claim is None:
+            return
+        binding = reservation_binding(
+            state_dir, issue_id=issue_id, reservation_id=reservation_id
+        ) or {}
+        head_sha = evidence_sha
+        try:
+            payload = json.loads(result.evidence_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("head_sha"), str):
+                head_sha = payload["head_sha"]
+        except (OSError, json.JSONDecodeError):
+            return
+        record_success_witness(
+            state_dir,
+            issue_id=issue_id,
+            target=target,
+            origin="autonomous",
+            claim=claim,
+            run_id=(str(binding["run_id"]) if binding.get("run_id") is not None else None),
+            sandbox=(
+                str(binding["sandbox"])
+                if binding.get("sandbox") is not None
+                else str(result.checkout)
+                if target == "factory" and result.checkout
+                else None
+            ),
+            completed_at=datetime.now(UTC).isoformat(),
+            evidence_path=str(result.evidence_path.resolve()),
+            evidence_sha256=evidence_sha,
+            branch=result.branch,
+            head_sha=head_sha,
+            pr_url=result.pr_url,
+            next_value=result.next,
+            reservation_id=reservation_id,
+            proof_ids=(f"{target}_completion:{evidence_sha}",),
+        )
     except OSError:
         pass
+
+
+def _file_sha256(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _trigger_ready_scan_after_release(home: Path) -> None:
@@ -3530,9 +4026,14 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    reservation_id = _outcome_reservation(
+        home, issue_id, target="factory", autonomous=autonomous
+    )
     try:
         result = asyncio.run(
-            WorklinkRunner(home=home, repo=repo).run_epic(
+            WorklinkRunner(
+                home=home, repo=repo, outcome_reservation_id=reservation_id
+            ).run_epic(
                 issue_id,
                 autonomous=autonomous,
             )
@@ -3558,8 +4059,29 @@ def run_worklink_epic(
             preserved_ref=result.preserved_ref,
             preservation_error=result.preservation_error,
         )
+        _record_typed_terminal(
+            home=home,
+            issue_id=issue_id,
+            reservation_id=reservation_id,
+            target="factory",
+            result=result,
+        )
+    elif result.status in {"blocked", "parked", "partial"}:
+        _record_typed_terminal(
+            home=home,
+            issue_id=issue_id,
+            reservation_id=reservation_id,
+            target="factory",
+            result=result,
+        )
     elif result.status in {"completed", "review_ready"}:
-        _record_run_success(home, issue_id)
+        _record_run_success(
+            home,
+            issue_id,
+            reservation_id=reservation_id,
+            result=result,
+            target="factory",
+        )
     return result
 
 

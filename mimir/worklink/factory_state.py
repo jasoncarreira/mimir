@@ -211,6 +211,41 @@ class FactoryRunRecord:
         )
 
 
+def immutable_factory_snapshot(
+    record: FactoryRunRecord, *, read_result: str
+) -> Any:
+    """Copy structured controller state before ``observed`` clears its error."""
+    from .attention import FactorySnapshot
+
+    status = record.status
+    return FactorySnapshot(
+        run_id=record.run_id,
+        issue_id=record.issue_id,
+        attempt=record.attempt,
+        sandbox=record.sandbox,
+        session=record.session,
+        controller_phase=record.controller_phase,
+        controller_error=record.controller_error,
+        status=status.status if status is not None else None,
+        valid=status.valid if status is not None else None,
+        lock=status.lock if status is not None else None,
+        dead_lock=status.dead_lock if status is not None else None,
+        lock_session=status.lock_session if status is not None else None,
+        gates=((status.gates,) if status is not None and status.gates is not None else ()),
+        steps=(status.steps or ()) if status is not None else (),
+        slices=(status.slices or ()) if status is not None else (),
+        pr_url=status.pr_url if status is not None else None,
+        next=status.next if status is not None else None,
+        next_present=status.next_present if status is not None else False,
+        park_snapshot=(
+            {"value": status.park_snapshot}
+            if status is not None and status.park_snapshot is not None
+            else None
+        ),
+        read_result=read_result,
+    )
+
+
 def factory_records_dir(home: Path) -> Path:
     return home / "state" / "worklink" / "factory-runs"
 

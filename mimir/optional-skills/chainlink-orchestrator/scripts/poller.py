@@ -46,12 +46,16 @@ from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_loc
 from mimir.worklink.continuation import consume_worklink_budget_continuations
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
+    RESERVATION_ENV,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
     failure_state_transaction,
     mark_failure_notified,
     pending_failure_alerts,
+    record_attention,
+    reserve_dispatch,
 )
+from mimir.worklink.attention import AttentionCause, AttentionSource, LaunchFacts
 
 
 READY_LABEL = "worklink:ready"
@@ -334,6 +338,13 @@ def _dispatch(
     factory_cap: int,
 ) -> bool:
     effective_coding_enabled = coding_enabled()
+    target = "factory" if item.mode == "epic" else "leaf"
+    reservation_id = reserve_dispatch(
+        state_dir,
+        issue_id=item.issue_id,
+        target=target,
+        autonomous=True,
+    )
     argv = [
         *run_bin,
         "worklink",
@@ -358,6 +369,7 @@ def _dispatch(
                 **os.environ,
                 "STATE_DIR": str(state_dir),
                 "WORKLINK_RUN_LOG": str(log_path),
+                RESERVATION_ENV: reservation_id,
             },
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
@@ -365,6 +377,28 @@ def _dispatch(
             start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        record_attention(
+            state_dir,
+            issue_id=item.issue_id,
+            reservation_id=reservation_id,
+            source=(
+                AttentionSource.QUEUE_FACTORY_SPAWN
+                if item.mode == "epic"
+                else AttentionSource.QUEUE_LEAF_SPAWN
+            ),
+            cause=AttentionCause.SPAWN_FAILED,
+            facts=LaunchFacts(
+                executable=run_bin[0] if run_bin else None,
+                compute=None,
+                checkout=repo,
+                operation=item.command,
+                returned_handle=False,
+                pid=None,
+                start_ticks=None,
+                launch_result="spawn_failed",
+                state_save_result=None,
+            ),
+        )
         _emit(
             {
                 "signal": "worklink_dispatch_failed",
@@ -390,6 +424,7 @@ def _dispatch(
             "cap": leaf_cap,
             "factory_cap": factory_cap,
             "coding_enabled": effective_coding_enabled,
+            "reservation_id": reservation_id,
         }
     )
     return True
@@ -403,6 +438,9 @@ def _deliver_failure_alerts(
     """Emit alerts and wait for the framework's durable delivery barriers."""
     def still_pending(state, alert):
         entry = state["issues"].get(str(alert["issue_id"]))
+        if state.get("version") == 2 and isinstance(entry, dict):
+            legacy = entry.get("legacy")
+            entry = legacy.get("row") if isinstance(legacy, dict) else None
         return (
             isinstance(entry, dict)
             and entry.get("active") is True

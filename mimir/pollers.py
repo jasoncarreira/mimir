@@ -270,11 +270,29 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                 if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
                     return
                 state = json.load(handle)
-                if (not isinstance(state, dict) or state.get("version") != 1
+                if (not isinstance(state, dict) or state.get("version") not in {1, 2}
                         or not isinstance(state.get("issues"), dict)):
                     return
                 live = set()
-                for entry in state["issues"].values():
+                for issue_key, issue_state in state["issues"].items():
+                    if state["version"] == 2:
+                        if not isinstance(issue_state, dict):
+                            return
+                        occurrences = issue_state.get("occurrences")
+                        if not isinstance(occurrences, dict):
+                            return
+                        for occurrence in occurrences.values():
+                            if not isinstance(occurrence, dict):
+                                return
+                            delivery_key = occurrence.get("delivery_key")
+                            if occurrence.get("handling") is None and isinstance(delivery_key, str):
+                                live.add(hashlib.sha256(delivery_key.encode()).hexdigest())
+                        legacy = issue_state.get("legacy")
+                        entry = legacy.get("row") if isinstance(legacy, dict) else None
+                        if entry is None:
+                            continue
+                    else:
+                        entry = issue_state
                     if not isinstance(entry, dict):
                         return
                     issue = entry.get("issue_id")

@@ -518,13 +518,70 @@ class ChainlinkClaims:
             claimed_at=self.clock(),
             budget_attempt=attempts_used + 1,
         )
+        reservation_id: str | None = None
+        claim_identity = None
+        if claim_home is not None:
+            from .attention import ClaimIdentity
+            from .dispatch_failures import (
+                active_reservation_id,
+                bind_claim,
+                dispatch_failure_state_dir,
+            )
+
+            state_dir = dispatch_failure_state_dir(claim_home)
+            for target in ("leaf", "factory"):
+                reservation_id = active_reservation_id(
+                    state_dir, issue_id=issue_id, target=target
+                )
+                if reservation_id is not None:
+                    break
+            if reservation_id is not None:
+                claim_identity = ClaimIdentity(
+                    issue_id=record.issue_id,
+                    attempt=record.attempt,
+                    agent_id=record.agent_id,
+                    claimed_at=record.claimed_at.isoformat(),
+                )
+                bind_claim(
+                    state_dir,
+                    issue_id=issue_id,
+                    reservation_id=reservation_id,
+                    claim=claim_identity,
+                    confirmed=False,
+                )
         try:
             self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
             self._run("issue", "label", str(issue_id), "worklink:in-progress")
             self._run("issue", "comment", str(issue_id), record.to_comment())
         except Exception:
+            if reservation_id is not None and claim_identity is not None:
+                try:
+                    exact = any(
+                        candidate == record
+                        for candidate in claim_records_from_comments(
+                            self._issue_comments(issue_id, strict=True)
+                        )
+                    )
+                    if exact:
+                        bind_claim(
+                            state_dir,
+                            issue_id=issue_id,
+                            reservation_id=reservation_id,
+                            claim=claim_identity,
+                            confirmed=True,
+                        )
+                except Exception:
+                    pass
             self.release_issue(issue_id)
             raise
+        if reservation_id is not None and claim_identity is not None:
+            bind_claim(
+                state_dir,
+                issue_id=issue_id,
+                reservation_id=reservation_id,
+                claim=claim_identity,
+                confirmed=True,
+            )
         return ClaimResult(True, record=record)
 
     def _claim_lock_with_retry(
@@ -789,6 +846,19 @@ class ChainlinkClaims:
         reason: str | None = None,
     ) -> None:
         """Move Worklink labels after evidence validation."""
+        stop_required = False
+        if getattr(self, "home_path", None) is not None:
+            from .dispatch_failures import (
+                dispatch_failure_state_dir,
+                issue_dispatch_disposition,
+            )
+
+            stop_required = (
+                issue_dispatch_disposition(
+                    dispatch_failure_state_dir(self.home_path), issue_id
+                )
+                == "stop"
+            )
         self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
@@ -797,7 +867,9 @@ class ChainlinkClaims:
         if review_ready:
             self._run("issue", "label", str(issue_id), "worklink:review")
             return
-        if status == "blocked" or (attempt is not None and attempt >= self.max_attempts):
+        if stop_required or status == "blocked" or (
+            attempt is not None and attempt >= self.max_attempts
+        ):
             self._run("issue", "label", str(issue_id), "worklink:blocked")
         else:
             self._run("issue", "label", str(issue_id), "worklink:ready")
@@ -850,7 +922,28 @@ class ChainlinkClaims:
             for record in records
             if record.generation == generation
         }
-        return len(active_claims - forgiven)
+        nonconsuming: set[tuple[int, int, str, datetime]] = set()
+        if getattr(self, "home_path", None) is not None:
+            from .attention import ClaimIdentity
+            from .dispatch_failures import (
+                dispatch_failure_state_dir,
+                settlement_for_claim,
+            )
+
+            state_dir = dispatch_failure_state_dir(self.home_path)
+            for issue_id, attempt, agent_id, claimed_at in active_claims:
+                settlement = settlement_for_claim(
+                    state_dir,
+                    ClaimIdentity(
+                        issue_id=issue_id,
+                        attempt=attempt,
+                        agent_id=agent_id,
+                        claimed_at=claimed_at.isoformat(),
+                    ),
+                )
+                if settlement is not None and settlement.get("consumed") is False:
+                    nonconsuming.add((issue_id, attempt, agent_id, claimed_at))
+        return len(active_claims - forgiven - nonconsuming)
 
     def reap_stale_claims(
         self,
@@ -933,7 +1026,17 @@ class ChainlinkClaims:
                 continue
             self._run("locks", "release", str(record.issue_id), check=False)
             self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
-            if (record.budget_attempt or record.attempt) >= self.max_attempts:
+            stop_required = False
+            if self.home_path is not None:
+                from .dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    issue_dispatch_disposition,
+                )
+
+                stop_required = issue_dispatch_disposition(
+                    dispatch_failure_state_dir(self.home_path), record.issue_id
+                ) == "stop"
+            if stop_required or (record.budget_attempt or record.attempt) >= self.max_attempts:
                 self._run("issue", "label", str(record.issue_id), "worklink:blocked")
                 transition = "blocked"
             else:

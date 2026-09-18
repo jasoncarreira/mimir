@@ -270,7 +270,12 @@ _HOST_ONLY_ENV = frozenset(
 # Inheriting them is not merely noisy -- ``STATE_DIR`` is where
 # ``_record_run_failure`` writes dispatch failures, so a test running under an
 # inherited value writes into the live poller store.
-_POLLER_INJECTED_ENV = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
+_POLLER_INJECTED_ENV = frozenset({
+    "STATE_DIR",
+    "POLLER_NAME",
+    "MIMIR_HOME",
+    "MIMIR_WORKLINK_RESERVATION_ID",
+})
 
 
 @pytest.fixture(autouse=True, scope="session")

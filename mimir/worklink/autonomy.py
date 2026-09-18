@@ -326,6 +326,15 @@ def _clear_pruned_orphan_block(
         return True
     if latest_block != record.comment:
         return False
+    from .dispatch_failures import (
+        dispatch_failure_state_dir,
+        issue_dispatch_disposition,
+    )
+
+    if issue_dispatch_disposition(
+        dispatch_failure_state_dir(home), record.issue_id
+    ) == "stop":
+        return False
     unlabel = run(
         [chainlink_bin(), "issue", "unlabel", str(record.issue_id), "worklink:blocked"]
     )
