@@ -30,6 +30,7 @@ class FactoryReapRefused(RuntimeError):
 class _Adoptions:
     def __init__(self) -> None:
         self.seen: set[int] = set()
+        self.total = 0
         self.lost = 0
 
 
@@ -90,7 +91,12 @@ def _observe(channel: socket.socket, payload: int, adoptions: _Adoptions) -> lis
     for pid in children:
         if pid != payload and pid not in adoptions.seen:
             adoptions.seen.add(pid)
-            if not _send(channel, {"kind": "event", "event": "worklink_factory_orphan_adopted", "pid": pid}):
+            adoptions.total += 1
+            # Cumulative power-of-two samples bound traffic even across PID reuse.
+            if adoptions.total & (adoptions.total - 1):
+                continue
+            if not _send(channel, {"kind": "event", "event": "worklink_factory_orphan_adopted",
+                                   "pid": pid, "adopted_count": adoptions.total, "final": False}):
                 # Fail the run, not the reap loop. This sticky count survives
                 # reaping/PID reuse and cannot grow into an unbounded log queue.
                 adoptions.lost += 1
@@ -188,6 +194,10 @@ def supervise(channel: socket.socket, argv: list[str]) -> int:
                     exit_code = _teardown(channel, payload, adoptions)
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"[:500]
+            if adoptions.total:
+                if not _send(channel, {"kind": "event", "event": "worklink_factory_orphan_adopted",
+                                       "adopted_count": adoptions.total, "final": True}):
+                    adoptions.lost += 1
             if adoptions.lost:
                 loss = f"adoption event delivery failed: {adoptions.lost} event(s) lost"
                 error = f"{loss}; {error}" if error else loss

@@ -154,7 +154,7 @@ class WorkerProcess:
                     raise RuntimeError("worker executor returned an invalid event")
                 await safe_log_event(event, **{
                     key: value for key, value in response.items()
-                    if key in {"run_id", "issue_id", "attempt", "pid", "error"}
+                    if key in {"run_id", "issue_id", "attempt", "pid", "error", "adopted_count", "final"}
                 })
             if "error" in response:
                 raise RuntimeError(str(response["error"]))
