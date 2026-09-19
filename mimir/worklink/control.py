@@ -434,13 +434,6 @@ def reconcile_run_states(
             publication_outcome, publication_reason = _checkout_has_unpublished_commits(
                 state, run_git
             )
-            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
-            if release.returncode != 0:
-                _emit_orphan_reconcile_failed(
-                    event_logger, state, "lock_release_failed", release
-                )
-                continue
-
             checkout_exists = bool(state.checkout and Path(state.checkout).is_dir())
             would_rearm = publication_outcome != "determined-unpublished" and not (
                 publication_outcome == "undetermined" and checkout_exists
@@ -461,6 +454,39 @@ def reconcile_run_states(
                 or (publication_outcome == "undetermined" and checkout_exists)
                 else "worklink:ready"
             )
+            try:
+                from .dispatch_failures import dispatch_failure_state_dir, record_failure
+
+                record_failure(
+                    dispatch_failure_state_dir(home),
+                    issue_id=state.issue_id,
+                    attempt=state.attempt,
+                    exit_status=None,
+                    error=(
+                        "dead local Worklink controller requires recovery; "
+                        f"publication={publication_outcome}; target={target}"
+                    ),
+                    log_path=None,
+                    preserved_ref=state.branch or None,
+                    work_path=state.checkout or None,
+                )
+            except OSError as exc:
+                _emit_reconcile_event(
+                    event_logger,
+                    "worklink_run_orphan_incident_failed",
+                    issue_id=state.issue_id,
+                    attempt=state.attempt,
+                    checkout=state.checkout,
+                    error=str(exc),
+                    state_retained=True,
+                )
+                continue
+            release = run([chainlink_bin, "locks", "release", str(state.issue_id)])
+            if release.returncode != 0:
+                _emit_orphan_reconcile_failed(
+                    event_logger, state, "lock_release_failed", release
+                )
+                continue
             comment_text = _orphan_reconcile_comment(
                 state,
                 publication_outcome=publication_outcome,

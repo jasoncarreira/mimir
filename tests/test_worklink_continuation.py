@@ -238,6 +238,35 @@ def _make_record(
     )
 
 
+def test_incident_budget_failure_never_creates_continuation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    event = _make_event(
+        trigger="poller",
+        source="poller",
+        extra={
+            "poller_name": "worklink-ready-queue",
+            "items": [{
+                "issue_id": 740,
+                "error_signature": "deadbeef",
+                "failure_occurrence_id": "occurrence-1",
+                "delivery_key": "worklink-run-failure:740:deadbeef:occurrence-1",
+            }],
+        },
+    )
+
+    result = maybe_create_worklink_budget_continuation(
+        home=home,
+        event=event,
+        ctx=_make_ctx(event),
+        record=_make_record(event),
+        runner=lambda *_args, **_kwargs: pytest.fail("incident touched external recovery"),
+    )
+
+    assert result is None
+    assert not (home / "state" / "worklink" / "continuations").exists()
+
+
 def test_continuation_payload_captures_required_context(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()

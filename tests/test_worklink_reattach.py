@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import subprocess
 import pytest
@@ -14,7 +15,12 @@ from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-from mimir.worklink.orchestrator import WorklinkRunner
+from mimir.worklink.orchestrator import (
+    WorklinkRunResult,
+    WorklinkRunner,
+    run_worklink,
+    run_worklink_reattach,
+)
 from mimir.worklink.run_state import (
     WorklinkRunState,
     clear_run_state,
@@ -443,7 +449,10 @@ def test_reattach_ignores_archived_completed_evidence(tmp_path: Path) -> None:
     assert compute.waited == [LaunchHandle("fake_remote", "job-live")]
 
 
-def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None:
+@pytest.mark.parametrize("clear_fails", [False, True], ids=["clear", "clear-write-failure"])
+def test_reattach_waits_on_original_handle_and_resolves_startup_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clear_fails: bool,
+) -> None:
     """After the #832 substrate cleanup local_subprocess is the only Worklink
     compute substrate and never persists run state, so a *fresh* controller
     will never have something to reattach to. These tests pre-date #832 and
@@ -472,14 +481,48 @@ def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None
     registry = BackendRegistry(WorklinkConfig())
     registry.register(ReattachWriteBackend())
     registry.register_compute(compute)
-
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+    from mimir.worklink import orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
     )
 
-    assert result.status == "completed", (result.reason, calls)
-    assert result.review_ready is True
-    assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/777"
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    startup_incident = record_failure(
+        state_dir,
+        issue_id=issue_id,
+        attempt=1,
+        exit_status=1,
+        error="startup reattach spawn failed",
+        log_path="reattach-561.log",
+    )
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    if clear_fails:
+        import mimir.worklink.dispatch_failures as dispatch_failures
+
+        monkeypatch.setattr(
+            dispatch_failures,
+            "resolve_failure_if_current",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+    if clear_fails:
+        with pytest.raises(OSError, match="disk full"):
+            run_worklink_reattach(
+                home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+            )
+        result = None
+    else:
+        result = run_worklink_reattach(
+            home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+        )
+
+    if result is not None:
+        assert result.status == "completed", (result.reason, calls)
+        assert result.review_ready is True
+        assert result.pr_url == "https://github.com/jasoncarreira/mimir/pull/777"
     # It harvested the SURVIVING worker (reconstructed handle), not a new launch.
     assert compute.waited[0] == LaunchHandle("fake_remote", "job-orig")
     # No re-claim / attempt bump on resume.
@@ -489,15 +532,75 @@ def test_reattach_waits_on_surviving_worker_and_opens_pr(tmp_path: Path) -> None
     assert ["chainlink", "locks", "release", str(issue_id)] in calls
     # Run state cleared on terminal completion.
     assert load_run_state(tmp_path, issue_id) is None
+    assert load_failure_state(state_dir)["issues"][str(issue_id)]["active"] is clear_fails
+    if not clear_fails:
+        from mimir.models import AgentEvent
+        from mimir.pollers import _worklink_recovery_relevance_check
+
+        delivery_key = (
+            f"worklink-run-failure:{issue_id}:{startup_incident['signature']}:"
+            f"{startup_incident['occurrence_id']}"
+        )
+        queued_wake = AgentEvent(
+            trigger="poller",
+            channel_id="poller:worklink-ready-queue",
+            content="queued startup recovery wake",
+            source="poller",
+            source_id=delivery_key,
+            extra={
+                "poller_name": "worklink-ready-queue",
+                "items": [{
+                    "issue_id": issue_id,
+                    "error_signature": startup_incident["signature"],
+                    "failure_occurrence_id": startup_incident["occurrence_id"],
+                    "delivery_key": delivery_key,
+                }],
+            },
+        )
+        assert asyncio.run(
+            _worklink_recovery_relevance_check(state_dir)(queued_wake)
+        ) is False
 
 
-def test_reattach_worker_lost_redispatches_to_ready(tmp_path: Path) -> None:
+def test_reattach_worker_lost_is_durable_before_release_and_blocks_fresh_core(
+    tmp_path: Path,
+) -> None:
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
     repo = tmp_path / "repo"
     repo.mkdir()
     issue_id = 562
     _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-gone")
     calls: list = []
-    runner = _remote_runner(repo, calls, issue_id=issue_id, labels=["worklink:in-progress"])
+    base_runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+
+    def runner(args: Sequence[str] | str, **kwargs: object) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[1:3] == ["locks", "release"]:
+            incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+                str(issue_id)
+            ]
+            assert incident["active"] is True
+            concurrent: list[WorklinkRunResult] = []
+            import threading
+
+            thread = threading.Thread(
+                target=lambda: concurrent.append(
+                    run_worklink(
+                        home=tmp_path,
+                        repo=repo,
+                        issue_id=issue_id,
+                        autonomous=True,
+                    )
+                )
+            )
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+            assert concurrent[0].status == "refused"
+            assert concurrent[0].attempt is None
+        return base_runner(args, **kwargs)
     # Broker can no longer produce the result -> launch_error set.
     lost = ComputeResult(
         exit_code=-1, stdout="", stderr="broker gone", launch_error="broker wait failed"
@@ -508,7 +611,9 @@ def test_reattach_worker_lost_redispatches_to_ready(tmp_path: Path) -> None:
     registry.register_compute(compute)
 
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(issue_id)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).reattach(
+            issue_id, autonomous=True
+        )
     )
 
     assert result.status == "failed"
@@ -518,6 +623,437 @@ def test_reattach_worker_lost_redispatches_to_ready(tmp_path: Path) -> None:
     assert ["chainlink", "issue", "label", str(issue_id), "worklink:ready"] in calls
     assert not any(isinstance(a, list) and a[:3] == ["gh", "pr", "create"] for a in calls)
     assert load_run_state(tmp_path, issue_id) is None
+
+
+def test_sync_reattach_failed_result_keeps_primary_incident_when_release_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 563
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-original")
+    retained = load_run_state(tmp_path, issue_id)
+    assert retained is not None
+    retained = replace(retained, checkout=str(tmp_path / "retained-checkout"))
+    save_run_state(tmp_path, retained)
+    calls: list = []
+    base_runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+
+    def runner(
+        args: Sequence[str] | str, **kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[1:3] == ["locks", "release"]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="release failed")
+        return base_runner(args, **kwargs)
+
+    class FailureBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("failed\n", encoding="utf-8")
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "backend_error",
+                "retained backend failed",
+            )
+
+    compute = FakeRemoteCompute(
+        wait_result=ComputeResult(exit_code=0, stdout="ok", stderr="")
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FailureBackend())
+    registry.register_compute(compute)
+    writes: list[dict[str, object]] = []
+    ready_signals: list[str] = []
+    real_record = orchestrator._record_run_failure
+
+    def record_once(**fields: object) -> dict[str, object] | None:
+        incident = real_record(**fields)
+        assert incident is not None
+        writes.append(dict(incident))
+        return incident
+
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_once)
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: ready_signals.append(reason) or True,
+    )
+
+    result = run_worklink_reattach(
+        home=tmp_path,
+        repo=repo,
+        issue_id=issue_id,
+        autonomous=True,
+    )
+
+    assert result.status == "failed"
+    assert result.incident_recorded is True
+    assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
+    assert len(writes) == 1
+    [primary] = writes
+    assert load_run_state(tmp_path, issue_id) == retained
+    current = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+        str(issue_id)
+    ]
+    assert current["signature"] == primary["signature"]
+    assert current["occurrence_id"] == primary["occurrence_id"]
+    assert current["terminal_error"] == primary["terminal_error"]
+    assert current["terminal_error"] == "retained backend failed"
+    assert current["preserved_ref"] == retained.branch
+    assert current["work_path"] == primary["work_path"]
+    assert ready_signals == []
+    assert compute.launched == []
+    assert compute.waited == [LaunchHandle("fake_remote", "job-original")]
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "shim",
+        "shim-cleanup",
+        "lost-in-progress",
+        "lookup",
+        "nonresumable",
+        "worker-lost",
+        "exception",
+        "base-exception",
+    ],
+)
+@pytest.mark.parametrize("write_fails", [False, True], ids=["durable", "write-failure"])
+def test_autonomous_reattach_failure_branch_records_original_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str, write_fails: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 580
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="original-job")
+    retained = load_run_state(tmp_path, issue_id)
+    assert retained is not None
+    retained = replace(
+        retained,
+        checkout=str(tmp_path / "retained-checkout"),
+        **(
+            {
+                "handle_substrate": "local_subprocess",
+                "handle_identifier": "123e4567-e89b-42d3-a456-426614174000",
+                "shim_pid": 999_999_999,
+                "process_start_ticks": 1,
+            }
+            if branch in {"shim", "shim-cleanup"}
+            else {}
+        ),
+        **({"compute_name": "fake_local"} if branch == "nonresumable" else {}),
+    )
+    save_run_state(tmp_path, retained)
+    labels = [] if branch == "lost-in-progress" else ["worklink:in-progress"]
+    calls: list = []
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=labels)
+
+    def runner(
+        args: Sequence[str] | str, **kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and tuple(args[1:3]) in {
+            ("issue", "label"),
+            ("issue", "unlabel"),
+            ("locks", "release"),
+        }:
+            incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+                str(issue_id)
+            ]
+            assert incident["active"] is True
+        return base_runner(args, **kwargs)
+
+    registry = BackendRegistry(WorklinkConfig())
+    compute: FakeRemoteCompute | None = None
+
+    if branch != "lookup":
+        registry.register(FakeBackend())
+    if branch == "nonresumable":
+        registry.register_compute(FakeLocalCompute())
+    elif branch in {"worker-lost", "exception", "base-exception"}:
+        if branch == "worker-lost":
+            compute = FakeRemoteCompute(wait_result=ComputeResult(
+                exit_code=-1,
+                stdout="",
+                stderr="broker gone",
+                launch_error="broker wait failed",
+            ))
+        elif branch == "exception":
+            class ExceptionCompute(FakeRemoteCompute):
+                async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+                    raise RuntimeError("remote wait failed")
+
+            compute = ExceptionCompute()
+        else:
+            class InterruptCompute(FakeRemoteCompute):
+                async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+                    raise asyncio.CancelledError
+
+            compute = InterruptCompute()
+        registry.register_compute(compute)
+    elif branch not in {"shim", "shim-cleanup", "lost-in-progress"}:
+        compute = FakeRemoteCompute()
+        registry.register_compute(compute)
+
+    if branch == "shim":
+        monkeypatch.setattr(orchestrator, "process_is_alive", lambda state: False)
+    elif branch == "shim-cleanup":
+        monkeypatch.setattr(orchestrator, "process_is_alive", lambda state: True)
+
+        async def cleanup_failure(*args: object, **kwargs: object) -> None:
+            raise OSError("cleanup failed")
+
+        monkeypatch.setattr(
+            orchestrator.LocalSubprocessComputeBackend,
+            "cancel",
+            cleanup_failure,
+        )
+
+    real_record = orchestrator._record_run_failure
+    write_attempts = 0
+
+    def record_failure(**kwargs: object) -> dict[str, object] | None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_fails:
+            raise OSError("disk full")
+        return real_record(**kwargs)
+
+    real_clear = orchestrator.clear_run_state
+    clears: list[int] = []
+
+    def clear_after_incident(home: Path, selected_issue: int) -> None:
+        incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+            str(issue_id)
+        ]
+        assert incident["active"] is True
+        clears.append(selected_issue)
+        real_clear(home, selected_issue)
+
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_failure)
+    monkeypatch.setattr(orchestrator, "clear_run_state", clear_after_incident)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+
+    if branch == "base-exception":
+        with pytest.raises(asyncio.CancelledError):
+            run_worklink_reattach(
+                home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+            )
+    elif write_fails:
+        with pytest.raises(OSError, match="disk full"):
+            run_worklink_reattach(
+                home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+            )
+    else:
+        result = run_worklink_reattach(
+            home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+        )
+        assert result.status == "failed"
+
+    assert write_attempts == 1
+
+    assert not any(
+        isinstance(call, list) and call[1:3] == ["locks", "claim"]
+        for call in calls
+    )
+    if compute is not None:
+        assert compute.launched == []
+    if write_fails:
+        assert load_run_state(tmp_path, issue_id) == retained
+        assert clears == []
+        assert not any(
+            isinstance(call, list)
+            and tuple(call[1:3]) in {
+                ("issue", "label"),
+                ("issue", "unlabel"),
+                ("locks", "release"),
+            }
+            for call in calls
+        )
+        return
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+        str(issue_id)
+    ]
+    assert incident["active"] is True
+    assert incident["attempt"] == retained.attempt
+    assert incident["preserved_ref"] == retained.branch
+    assert incident["work_path"] == retained.checkout
+    assert retained.handle_identifier == (
+        "123e4567-e89b-42d3-a456-426614174000"
+        if branch in {"shim", "shim-cleanup"}
+        else "original-job"
+    )
+
+
+def test_reattach_incident_write_failure_preserves_claim_and_retained_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 562
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-gone")
+    calls: list = []
+    runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(FakeRemoteCompute(wait_result=ComputeResult(
+        exit_code=-1,
+        stdout="",
+        stderr="broker gone",
+        launch_error="broker wait failed",
+    )))
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_run_failure",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(
+            WorklinkRunner(
+                home=tmp_path, repo=repo, runner=runner, registry=registry
+            ).reattach(issue_id, autonomous=True)
+        )
+
+    assert load_run_state(tmp_path, issue_id) is not None
+    assert not any(
+        isinstance(call, list) and call[1:3] == ["locks", "release"]
+        for call in calls
+    )
+    assert not any(
+        isinstance(call, list) and call[1:3] in (["issue", "label"], ["issue", "unlabel"])
+        for call in calls
+    )
+
+
+def test_reattach_primary_incident_survives_secondary_transition_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink import orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 562
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="original-job")
+    calls: list = []
+    runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(FakeRemoteCompute(wait_result=ComputeResult(
+        exit_code=-1,
+        stdout="",
+        stderr="broker gone",
+        launch_error="broker wait failed",
+    )))
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(
+        orchestrator.ChainlinkClaims,
+        "transition_issue",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("secondary transition failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="secondary transition failed"):
+        run_worklink_reattach(
+            home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+        )
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+        str(issue_id)
+    ]
+    assert incident["active"] is True
+    assert incident["terminal_error"] == "reattach: worker lost after controller restart"
+    assert "secondary transition failed" not in incident["terminal_error"]
+
+
+def test_successful_reattach_cannot_resolve_newer_concurrent_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink import orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 562
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="original-job")
+    calls: list = []
+    runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    first = record_failure(
+        state_dir,
+        issue_id=issue_id,
+        attempt=1,
+        exit_status=1,
+        error="startup reattach failed",
+        log_path="reattach-562.log",
+    )
+
+    def create_newer_incident() -> None:
+        record_failure(
+            state_dir,
+            issue_id=issue_id,
+            attempt=1,
+            exit_status=1,
+            error="newer retained failure",
+            log_path="newer.log",
+        )
+
+    class ReattachWriteBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("hello\n", encoding="utf-8")
+            return await super().interpret(order, result)
+
+    compute = FakeRemoteCompute(on_wait=create_newer_incident)
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(ReattachWriteBackend())
+    registry.register_compute(compute)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+
+    result = run_worklink_reattach(
+        home=tmp_path,
+        repo=repo,
+        issue_id=issue_id,
+        autonomous=True,
+    )
+
+    current = load_failure_state(state_dir)["issues"]["562"]
+    assert result.status == "completed"
+    assert current["active"] is True
+    assert current["occurrence_id"] != first["occurrence_id"]
+    assert current["terminal_error"] == "newer retained failure"
+    assert compute.waited == [LaunchHandle("fake_remote", "original-job")]
 
 
 def test_reattach_skips_when_leaf_no_longer_in_progress(tmp_path: Path) -> None:

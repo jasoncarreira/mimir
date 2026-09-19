@@ -936,6 +936,54 @@ def _github_recovery_relevance_check(
     return check
 
 
+def _worklink_recovery_relevance_check(
+    persist_dir: Path,
+) -> poller_recovery.RelevanceFn:
+    """Validate the single incident identity immediately before execution."""
+    from .worklink.dispatch_failures import STATE_FILE
+
+    def current(event: AgentEvent) -> bool | None:
+        items = event.extra.get("items") if isinstance(event.extra, dict) else None
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            return None
+        item = items[0]
+        issue_id = item.get("issue_id")
+        signature = item.get("error_signature")
+        occurrence = item.get("failure_occurrence_id")
+        if (
+            not isinstance(issue_id, int)
+            or isinstance(issue_id, bool)
+            or not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence, str)
+            or not occurrence
+        ):
+            return None
+        try:
+            payload = json.loads((persist_dir / STATE_FILE).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("issues"), dict):
+            return None
+        entry = payload["issues"].get(str(issue_id))
+        if entry is None:
+            return False
+        if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
+            return None
+        return bool(
+            entry["active"]
+            and entry.get("signature") == signature
+            and entry.get("occurrence_id") == occurrence
+        )
+
+    async def check(event: AgentEvent) -> bool | None:
+        return await asyncio.to_thread(current, event)
+
+    return check
+
+
 # Pollers manifest schema version history:
 #
 #   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
@@ -2441,6 +2489,8 @@ async def run_poller(
             or os.environ.get("GITHUB_TOKEN", "")
         )
         if poller.name == "github-activity"
+        else _worklink_recovery_relevance_check(persist_dir)
+        if poller.name == "worklink-ready-queue"
         else None
     )
 
@@ -2448,6 +2498,20 @@ async def run_poller(
         if relevance_check is None:
             return await enqueue(event)
         return await enqueue(event, relevance_check=relevance_check)
+
+    async def enqueue_recovered(event: AgentEvent) -> bool:
+        accepted = await enqueue_for_delivery(event)
+        if accepted:
+            items = event.extra.get("items") if isinstance(event.extra, dict) else None
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        await asyncio.to_thread(
+                            _write_delivery_receipt,
+                            persist_dir,
+                            item.get("delivery_key"),
+                        )
+        return accepted
 
     # Lazy-create the persist dir on first use. Skill authors who
     # write a cursor file to STATE_DIR can rely on the dir existing.
@@ -2481,7 +2545,7 @@ async def run_poller(
                 channel_id=poller.channel_id(),
                 persist_dir=persist_dir,
                 events_path=_events_path,
-                enqueue=enqueue_for_delivery,
+                enqueue=enqueue_recovered,
                 service_principal=authority.canonical,
                 service_authority=authority,
                 recover_failed_turns=poller.recover_failed_turns,

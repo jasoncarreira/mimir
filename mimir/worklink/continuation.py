@@ -15,6 +15,7 @@ from .._atomic import atomic_write_json
 from ..access_control import HTTP_EVENT_INGRESS_EXTRA_KEY, authorize_action
 from ..models import AgentEvent, TurnContext, TurnRecord
 from .run_state import load_run_state, run_state_path
+from .dispatch_failures import is_dispatch_failure_intervention
 
 CONTINUATION_KIND = "worklink_tool_budget_continuation"
 CONTINUATION_VERSION = 1
@@ -161,6 +162,8 @@ def maybe_create_worklink_budget_continuation(
     Chainlink context could be inferred.
     """
 
+    if is_dispatch_failure_intervention(event):
+        return None
     if not getattr(ctx, "tool_call_budget_exhausted", False):
         return None
 
