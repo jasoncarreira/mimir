@@ -625,6 +625,97 @@ def test_reattach_worker_lost_is_durable_before_release_and_blocks_fresh_core(
     assert load_run_state(tmp_path, issue_id) is None
 
 
+def test_sync_reattach_failed_result_keeps_primary_incident_when_release_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 563
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-original")
+    retained = load_run_state(tmp_path, issue_id)
+    assert retained is not None
+    retained = replace(retained, checkout=str(tmp_path / "retained-checkout"))
+    save_run_state(tmp_path, retained)
+    calls: list = []
+    base_runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+
+    def runner(
+        args: Sequence[str] | str, **kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and args[1:3] == ["locks", "release"]:
+            calls.append(args)
+            return cp(args, returncode=1, stderr="release failed")
+        return base_runner(args, **kwargs)
+
+    class FailureBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            order.checkout.mkdir(parents=True, exist_ok=True)
+            (order.checkout / "changed.txt").write_text("failed\n", encoding="utf-8")
+            return RawResult(
+                1,
+                order.transcript_root / "fake.json",
+                "backend_error",
+                "retained backend failed",
+            )
+
+    compute = FakeRemoteCompute(
+        wait_result=ComputeResult(exit_code=0, stdout="ok", stderr="")
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FailureBackend())
+    registry.register_compute(compute)
+    writes: list[dict[str, object]] = []
+    ready_signals: list[str] = []
+    real_record = orchestrator._record_run_failure
+
+    def record_once(**fields: object) -> dict[str, object] | None:
+        incident = real_record(**fields)
+        assert incident is not None
+        writes.append(dict(incident))
+        return incident
+
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_once)
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: ready_signals.append(reason) or True,
+    )
+
+    result = run_worklink_reattach(
+        home=tmp_path,
+        repo=repo,
+        issue_id=issue_id,
+        autonomous=True,
+    )
+
+    assert result.status == "failed"
+    assert result.incident_recorded is True
+    assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
+    assert len(writes) == 1
+    [primary] = writes
+    assert load_run_state(tmp_path, issue_id) == retained
+    current = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+        str(issue_id)
+    ]
+    assert current["signature"] == primary["signature"]
+    assert current["occurrence_id"] == primary["occurrence_id"]
+    assert current["terminal_error"] == primary["terminal_error"]
+    assert current["terminal_error"] == "retained backend failed"
+    assert current["preserved_ref"] == retained.branch
+    assert current["work_path"] == primary["work_path"]
+    assert ready_signals == []
+    assert compute.launched == []
+    assert compute.waited == [LaunchHandle("fake_remote", "job-original")]
+
+
 @pytest.mark.parametrize(
     "branch",
     [

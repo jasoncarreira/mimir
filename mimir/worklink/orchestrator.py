@@ -1630,6 +1630,7 @@ class WorklinkRunner:
                 checkout=lease.path,
                 branch=lease.branch,
                 reason="terminal recovery incomplete: Chainlink lock release failed",
+                incident_recorded=incident_recorded,
             )
         cleanup_error = None
         if publication is None:

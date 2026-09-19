@@ -2692,6 +2692,68 @@ def test_unconfirmed_autonomous_release_does_not_trigger_ready_scan(
     assert signals == []
 
 
+def test_sync_leaf_failed_result_keeps_primary_incident_when_release_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.poller_triggers as poller_triggers
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree, release_returncode=1)
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+    )
+    registry = BackendRegistry(config)
+    registry.register(FakeBackend(status="backend_error"))
+    writes: list[dict[str, Any]] = []
+    ready_signals: list[str] = []
+    real_record = orchestrator._record_run_failure
+
+    def record_once(**fields: Any) -> dict[str, Any] | None:
+        incident = real_record(**fields)
+        assert incident is not None
+        writes.append(dict(incident))
+        return incident
+
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_once)
+    monkeypatch.setattr(
+        poller_triggers,
+        "notify_poller",
+        lambda home, poller, *, reason: ready_signals.append(reason) or True,
+    )
+
+    result = run_worklink(
+        home=tmp_path,
+        repo=repo,
+        issue_id=441,
+        backend="fake",
+        test_command="echo ok",
+        autonomous=True,
+    )
+
+    assert result.status == "failed"
+    assert result.incident_recorded is True
+    assert result.reason == "terminal recovery incomplete: Chainlink lock release failed"
+    assert len(writes) == 1
+    [primary] = writes
+    retained = load_run_state(tmp_path, 441)
+    assert retained is not None
+    current = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+    assert current["signature"] == primary["signature"]
+    assert current["occurrence_id"] == primary["occurrence_id"]
+    assert current["terminal_error"] == primary["terminal_error"]
+    assert current["preserved_ref"] == "issue/441-a1"
+    assert current["work_path"] == str(worktree)
+    assert "terminal recovery incomplete" not in current["terminal_error"]
+    assert ready_signals == []
+    assert ["chainlink", "locks", "release", "441"] in calls
+
+
 def test_claimed_blocked_leaf_releases_slot_and_triggers_ready_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
