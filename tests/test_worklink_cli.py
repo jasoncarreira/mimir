@@ -512,6 +512,132 @@ def test_factory_cli_interruption_records_once_with_all_retained_pointers(
     assert recorded[0]["exit_status"] == 130
 
 
+@pytest.mark.parametrize("kind", ["leaf", "factory"])
+def test_cli_owned_inner_interruption_does_not_fallback_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    import mimir.commands.worklink as worklink_cmd
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.backends.feature_factory import FeatureFactoryBackend
+    from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
+    from mimir.worklink.claims import ClaimRecord, ClaimResult
+    from mimir.worklink.compute import LocalSubprocessComputeBackend
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    home.mkdir()
+    repo.mkdir()
+    issue_id = 700 if kind == "factory" else 441
+    labels = ["worklink", "worklink:epic", "worklink:ready"] if kind == "factory" else [
+        "worklink",
+        "worklink:ready",
+    ]
+    issue = json.dumps({
+        "id": issue_id,
+        "title": "owned interruption",
+        "description": (
+            "Acceptance criteria:\n- [ ] do it\n\n"
+            "Review criteria:\n- reviewer checks it\n\n"
+            "Worklink notes:\n- Scope: test\n- Out of scope: none\n"
+            "- Suggested test command: pytest -q\n"
+        ),
+        "labels": labels,
+        "comments": [],
+    })
+
+    def runner(
+        args: list[str] | str, **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list) and args[:3] == ["chainlink", "issue", "show"]:
+            return subprocess.CompletedProcess(args, 0, issue, "")
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return subprocess.CompletedProcess(
+                args, 0, "git@github.com:owner/repo.git\n", ""
+            )
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+    )
+    compute = LocalSubprocessComputeBackend()
+    backend = SimpleNamespace(name="fake")
+    registry = SimpleNamespace(
+        get=lambda name: backend,
+        select=lambda **kwargs: backend,
+        select_compute=lambda **kwargs: compute,
+    )
+    claim = ClaimRecord(issue_id, 1, "agent", datetime.now(UTC))
+
+    def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
+        before_claim = kwargs.get("before_claim")
+        if callable(before_claim):
+            before_claim()
+        return ClaimResult(True, claim)
+
+    def interrupt_checkout(*args: object, **kwargs: object) -> object:
+        raise KeyboardInterrupt("owned inner stop")
+
+    real_record = orchestrator._record_run_failure
+    writes: list[dict[str, object]] = []
+
+    def record_once(**kwargs: object) -> dict[str, object] | None:
+        writes.append(kwargs)
+        return real_record(**kwargs)
+
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
+    monkeypatch.setattr(orchestrator, "_create_backend_checkout", interrupt_checkout)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_once)
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path("/factory.js"))
+
+    if kind == "leaf":
+        def owned_run(**kwargs: object) -> WorklinkRunResult:
+            return asyncio.run(
+                orchestrator.WorklinkRunner(
+                    home=home,
+                    repo=repo,
+                    runner=runner,
+                    registry=registry,
+                ).run(
+                    issue_id,
+                    backend_name="fake",
+                    autonomous=True,
+                )
+            )
+
+        monkeypatch.setattr(worklink_cmd, "run_worklink", owned_run)
+        argv = ["worklink", "run", str(issue_id)]
+    else:
+        def owned_epic(**kwargs: object) -> WorklinkRunResult:
+            return asyncio.run(
+                orchestrator.WorklinkRunner(
+                    home=home,
+                    repo=repo,
+                    runner=runner,
+                ).run_epic(issue_id, autonomous=True)
+            )
+
+        monkeypatch.setattr(worklink_cmd, "run_worklink_epic", owned_epic)
+        argv = ["worklink", "run-epic", str(issue_id)]
+
+    with pytest.raises(KeyboardInterrupt, match="owned inner stop"):
+        main([
+            *argv,
+            "--autonomous",
+            "--home",
+            str(home),
+            "--repo",
+            str(repo),
+        ])
+
+    assert len(writes) == 1
+    assert writes[0]["issue_id"] == issue_id
+    assert writes[0]["exit_status"] == 130
+
+
 def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     _state(

@@ -268,27 +268,87 @@ class FactoryRecoveryBlocked(WorklinkError):
 class _IncidentOwner:
     autonomous: bool
     pending: bool = True
-    owns_failure: bool = False
+    producer: str | None = None
+    terminal: bool = False
+    identity: tuple[str, str] | None = None
+    attempted: bool = False
     incident: Mapping[str, Any] | None = None
 
-    def record(self, **fields: Any) -> dict[str, Any] | None:
-        if self.autonomous:
-            self.owns_failure = True
+    @property
+    def owns_terminal_failure(self) -> bool:
+        return self.autonomous and self.terminal and self.identity is not None
+
+    def record(
+        self,
+        *,
+        producer: str,
+        terminal: bool = True,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        self.producer = producer
+        self.terminal = terminal
+        self.identity = None
+        self.incident = None
+        self.attempted = self.autonomous
         incident = _record_run_failure(**fields)
         if incident and incident.get("active") is True:
             self.incident = incident
+            self.identity = (
+                str(incident["signature"]),
+                str(incident["occurrence_id"]),
+            )
         return incident
 
+    def release(
+        self,
+        *,
+        producer: str,
+        identity: tuple[str, str],
+    ) -> None:
+        if self.producer == producer and self.identity == identity:
+            self.producer = None
+            self.terminal = False
+            self.identity = None
+            self.attempted = False
+            self.incident = None
+
     def bind(self, exc: BaseException) -> None:
+        if self.producer is None or not self.attempted:
+            return
         try:
-            setattr(exc, "_worklink_incident_owner", self)
+            setattr(
+                exc,
+                "_worklink_incident_owner",
+                (self, self.producer, self.identity),
+            )
         except Exception:
             pass
 
 
-def _exception_incident_owned(exc: BaseException) -> bool:
-    owner = getattr(exc, "_worklink_incident_owner", None)
-    return isinstance(owner, _IncidentOwner) and owner.owns_failure
+def _exception_incident_binding(
+    exc: BaseException,
+) -> tuple[_IncidentOwner, str, tuple[str, str] | None] | None:
+    binding = getattr(exc, "_worklink_incident_owner", None)
+    if not (
+        isinstance(binding, tuple)
+        and len(binding) == 3
+        and isinstance(binding[0], _IncidentOwner)
+        and isinstance(binding[1], str)
+        and (
+            binding[2] is None
+            or (
+                isinstance(binding[2], tuple)
+                and len(binding[2]) == 2
+                and all(isinstance(value, str) for value in binding[2])
+            )
+        )
+    ):
+        return None
+    return binding
+
+
+def _exception_incident_handled(exc: BaseException) -> bool:
+    return _exception_incident_binding(exc) is not None
 
 
 class LeafValidationError(WorklinkError):
@@ -1092,7 +1152,7 @@ class WorklinkRunner:
                     )
             return result
         except Exception as exc:
-            if incident_owner.owns_failure:
+            if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
             transition_applied = False
@@ -1101,6 +1161,7 @@ class WorklinkRunner:
             try:
                 try:
                     incident = incident_owner.record(
+                        producer="leaf_exception",
                         home=self.home,
                         issue_id=issue.issue_id,
                         attempt=record.attempt,
@@ -1125,7 +1186,10 @@ class WorklinkRunner:
                 terminal_release.retain_for_recovery = False
                 terminal_release()
             except Exception as transition_exc:
-                if incident_owner.owns_failure:
+                if (
+                    _exception_incident_handled(transition_exc)
+                    or incident_owner.owns_terminal_failure
+                ):
                     incident_owner.bind(transition_exc)
                     raise
                 transition_error = str(transition_exc)
@@ -1155,6 +1219,7 @@ class WorklinkRunner:
             terminal_release.retain_for_recovery = True
             try:
                 incident = incident_owner.record(
+                    producer="leaf_interruption",
                     home=self.home,
                     issue_id=issue.issue_id,
                     attempt=record.attempt,
@@ -1495,6 +1560,7 @@ class WorklinkRunner:
         if transition_status == "failed":
             try:
                 incident_owner.record(
+                    producer="leaf_result",
                     home=self.home,
                     issue_id=issue.issue_id,
                     attempt=attempt,
@@ -1637,6 +1703,7 @@ class WorklinkRunner:
         def fence_failure(reason: BaseException | str, *, exit_status: int | None = 1) -> None:
             try:
                 incident_owner.record(
+                    producer="reattach",
                     home=self.home,
                     issue_id=issue_id,
                     attempt=state.attempt,
@@ -1923,7 +1990,7 @@ class WorklinkRunner:
                 record=claim_record,
             )
         except Exception as exc:
-            if incident_owner.owns_failure:
+            if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
             fence_failure(f"reattach failed: {exc}")
@@ -1954,6 +2021,7 @@ class WorklinkRunner:
         except BaseException as exc:
             try:
                 incident = incident_owner.record(
+                    producer="reattach_interruption",
                     home=self.home,
                     issue_id=issue_id,
                     attempt=state.attempt,
@@ -2188,6 +2256,7 @@ class WorklinkRunner:
             )
             try:
                 incident_owner.record(
+                    producer="factory_recovery",
                     home=self.home,
                     issue_id=issue_id,
                     attempt=exc.record.attempt,
@@ -2369,7 +2438,7 @@ class WorklinkRunner:
         except Exception as exc:
             incident_owner = self._incident_owner
             assert incident_owner is not None
-            if incident_owner.owns_failure:
+            if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
             release_permitted = False
@@ -2400,6 +2469,7 @@ class WorklinkRunner:
                 )
             try:
                 incident = incident_owner.record(
+                    producer="factory_exception",
                     home=self.home,
                     issue_id=issue_id,
                     attempt=claim_record.attempt,
@@ -2465,6 +2535,7 @@ class WorklinkRunner:
                 records = load_factory_records_for_issue(self.home, issue_id)
                 current = records[0] if records else retained
                 incident = incident_owner.record(
+                    producer="factory_interruption",
                     home=self.home,
                     issue_id=issue_id,
                     attempt=claim_record.attempt,
@@ -2796,6 +2867,10 @@ class WorklinkRunner:
                     stale_failure[0],
                     stale_failure[1],
                 )
+                incident_owner.release(
+                    producer="factory_stall",
+                    identity=stale_failure,
+                )
                 stale_failure = None
 
         try:
@@ -2863,6 +2938,8 @@ class WorklinkRunner:
                         stale_episode += 1
                         try:
                             incident = incident_owner.record(
+                                producer="factory_stall",
+                                terminal=False,
                                 home=self.home,
                                 issue_id=issue.issue_id,
                                 attempt=factory_record.attempt,
@@ -3922,9 +3999,10 @@ def run_worklink(
             )
         )
     except Exception as exc:
-        if not incident_owner.owns_failure:
+        if not _exception_incident_handled(exc) and not incident_owner.owns_terminal_failure:
             state = load_run_state(home, issue_id)
             incident_owner.record(
+                producer="leaf_wrapper",
                 home=home,
                 issue_id=issue_id,
                 attempt=state.attempt if state is not None else None,
@@ -3936,8 +4014,9 @@ def run_worklink(
             )
         incident_owner.bind(exc)
         raise
-    if result.status == "failed" and not incident_owner.owns_failure:
+    if result.status == "failed" and not result.incident_recorded:
         incident_owner.record(
+            producer="leaf_wrapper",
             home=home,
             issue_id=issue_id,
             attempt=result.attempt,
@@ -4048,9 +4127,10 @@ def run_worklink_reattach(
             )
         )
     except BaseException as exc:
-        if not incident_owner.owns_failure:
+        if not _exception_incident_handled(exc) and not incident_owner.owns_terminal_failure:
             state = load_run_state(home, issue_id)
             incident_owner.record(
+                producer="reattach_wrapper",
                 home=home,
                 issue_id=issue_id,
                 attempt=state.attempt if state is not None else None,
@@ -4062,8 +4142,9 @@ def run_worklink_reattach(
             )
         incident_owner.bind(exc)
         raise
-    if result.status == "failed" and not incident_owner.owns_failure:
+    if result.status == "failed" and not result.incident_recorded:
         incident_owner.record(
+            producer="reattach_wrapper",
             home=home,
             issue_id=issue_id,
             attempt=result.attempt,
@@ -4113,13 +4194,14 @@ def run_worklink_epic(
             )
         )
     except Exception as exc:
-        if not incident_owner.owns_failure:
+        if not _exception_incident_handled(exc) and not incident_owner.owns_terminal_failure:
             try:
                 records = load_factory_records_for_issue(home, issue_id)
             except Exception:
                 records = []
             retained = records[0] if records else None
             incident_owner.record(
+                producer="factory_wrapper",
                 home=home,
                 issue_id=issue_id,
                 attempt=retained.attempt if retained is not None else None,
@@ -4133,13 +4215,14 @@ def run_worklink_epic(
             )
         incident_owner.bind(exc)
         raise
-    if result.status == "failed" and not incident_owner.owns_failure:
+    if result.status == "failed" and not result.incident_recorded:
         try:
             records = load_factory_records_for_issue(home, issue_id)
         except Exception:
             records = []
         retained = records[0] if records else None
         incident_owner.record(
+            producer="factory_wrapper",
             home=home,
             issue_id=issue_id,
             attempt=result.attempt,

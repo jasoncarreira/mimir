@@ -655,6 +655,8 @@ def test_malformed_epic_work_item_fails_before_claim_or_sandbox(
             return cp(args, stdout="git@github.com:owner/repo.git\n")
         return cp(args)
 
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
     monkeypatch.setattr(orchestrator, "render_work_item", lambda issue: '{"run_id":7}')
 
@@ -5079,6 +5081,9 @@ def _run_factory_preflight_case(
     release_confirmed: bool = True,
     terminal: Any = None,
     on_release: Callable[[], None] | None = None,
+    claim_calls: list[int] | None = None,
+    launch_calls: list[WorkSpec] | None = None,
+    sync_entrypoint: bool = False,
 ) -> tuple[object, list[WorkSpec], list[str], list[list[str]]]:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -5130,6 +5135,8 @@ def _run_factory_preflight_case(
                 return cp(args, result.returncode, result.stdout, result.stderr)
         return cp(args)
 
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+
     claim = ClaimRecord(700, 1, "agent", datetime.now(UTC))
     lease = CheckoutLease(
         issue_id=700,
@@ -5145,6 +5152,8 @@ def _run_factory_preflight_case(
 
     async def launch(self: object, spec: WorkSpec) -> LaunchHandle:
         launched.append(spec)
+        if launch_calls is not None:
+            launch_calls.append(spec)
         if outcome is None:
             raise RuntimeError("launch reached")
         return LaunchHandle("local_subprocess", "123", 456)
@@ -5169,11 +5178,15 @@ def _run_factory_preflight_case(
     for key, value in (credentials or {}).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(self.entrypoint))
-    monkeypatch.setattr(
-        orchestrator.ChainlinkClaims,
-        "claim_issue",
-        lambda self, *args, **kwargs: ClaimResult(True, claim),
-    )
+    def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
+        before_claim = kwargs.get("before_claim")
+        if callable(before_claim):
+            before_claim()
+        if claim_calls is not None:
+            claim_calls.append(claim.attempt)
+        return ClaimResult(True, claim)
+
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
     monkeypatch.setattr(
         orchestrator.ChainlinkClaims, "transition_issue", lambda *args, **kwargs: None
     )
@@ -5197,7 +5210,7 @@ def _run_factory_preflight_case(
     if outcome is not None:
         async def supervise(*args: object, **kwargs: object) -> object:
             if terminal is not None:
-                return await terminal(**kwargs)
+                return await terminal(_supervisor=args[0], **kwargs)
             if outcome == "post_merge_refusal":
                 current = kwargs["factory_record"]
                 assert isinstance(current, FactoryRunRecord)
@@ -5252,11 +5265,19 @@ def _run_factory_preflight_case(
             )
             or True,
         )
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
-            700, autonomous=autonomous
+    if sync_entrypoint:
+        result = run_worklink_epic(
+            home=tmp_path,
+            repo=repo,
+            issue_id=700,
+            autonomous=autonomous,
         )
-    )
+    else:
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
+                700, autonomous=autonomous
+            )
+        )
     return result, launched, verified_tokens, commands
 
 
@@ -5378,16 +5399,22 @@ def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_ad
     import mimir.worklink.orchestrator as orchestrator
 
     order_seen: list[str] = []
+    claim_calls: list[int] = []
+    checkout_calls: list[dict[str, Any]] = []
+    launch_calls: list[WorkSpec] = []
+    admission_home = tmp_path / "concurrent-home"
     real_record = orchestrator._record_run_failure
 
     def record_and_probe(**kwargs: object) -> dict[str, Any] | None:
         incident = real_record(**kwargs)
+        real_record(**{**kwargs, "home": admission_home})
         order_seen.append("incident")
+        before = (len(claim_calls), len(checkout_calls), len(launch_calls))
         concurrent: list[WorklinkRunResult] = []
         thread = threading.Thread(
             target=lambda: concurrent.append(
-                run_worklink(
-                    home=tmp_path,
+                run_worklink_epic(
+                    home=admission_home,
                     repo=tmp_path / "repo",
                     issue_id=700,
                     autonomous=True,
@@ -5400,6 +5427,7 @@ def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_ad
         [refused] = concurrent
         assert refused.status == "refused"
         assert refused.attempt is None
+        assert (len(claim_calls), len(checkout_calls), len(launch_calls)) == before
         return incident
 
     def release_after_incident() -> None:
@@ -5419,6 +5447,9 @@ def test_factory_failure_is_durable_before_release_and_blocks_concurrent_core_ad
         release_confirmed=True,
         terminal=terminal,
         on_release=release_after_incident,
+        claim_calls=claim_calls,
+        checkout_calls=checkout_calls,
+        launch_calls=launch_calls,
     )
     if interrupted:
         with pytest.raises(asyncio.CancelledError):
@@ -6222,11 +6253,19 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
         "session",
         "lifecycle",
         "checkout_root",
+        "checkout_root_command",
+        "checkout_root_unavailable",
         "checkout_isolation",
+        "checkout_git_dir_command",
+        "checkout_git_dir_unavailable",
         "checkout_repository",
+        "checkout_repository_command",
         "checkout_branch",
+        "checkout_branch_command",
         "checkout_base",
+        "checkout_base_command",
         "checkout_head",
+        "checkout_head_command",
     ],
 )
 def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
@@ -6316,9 +6355,13 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         if isinstance(args, list) and args[:3] == ["git", "-C", str(old_sandbox)]:
             operation = args[3:]
             if operation == ["rev-parse", "--show-toplevel"]:
+                if refusal == "checkout_root_command":
+                    return cp(args, returncode=1, stderr="cannot inspect root")
                 top = repo if refusal == "checkout_root" else old_sandbox
                 return cp(args, stdout=f"{top}\n")
             if operation == ["rev-parse", "--absolute-git-dir"]:
+                if refusal == "checkout_git_dir_command":
+                    return cp(args, returncode=1, stderr="cannot inspect git dir")
                 git_dir = (
                     tmp_path / "outside.git"
                     if refusal == "checkout_isolation"
@@ -6326,15 +6369,23 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
                 )
                 return cp(args, stdout=f"{git_dir}\n")
             if operation == ["config", "--get", "remote.origin.url"]:
+                if refusal == "checkout_repository_command":
+                    return cp(args, returncode=1, stderr="cannot inspect remote")
                 remote = "other/repo" if refusal == "checkout_repository" else "owner/repo"
                 return cp(args, stdout=f"git@github.com:{remote}.git\n")
             if operation == ["branch", "--show-current"]:
+                if refusal == "checkout_branch_command":
+                    return cp(args, returncode=1, stderr="cannot inspect branch")
                 branch = "other-branch" if refusal == "checkout_branch" else retained.branch
                 return cp(args, stdout=f"{branch}\n")
             if operation == ["rev-parse", "--verify", retained.base_ref]:
+                if refusal == "checkout_base_command":
+                    return cp(args, returncode=1, stderr="cannot inspect base")
                 value = "invalid" if refusal == "checkout_base" else "a" * 40
                 return cp(args, stdout=f"{value}\n")
             if operation == ["rev-parse", "HEAD"]:
+                if refusal == "checkout_head_command":
+                    return cp(args, returncode=1, stderr="cannot inspect HEAD")
                 value = "invalid" if refusal == "checkout_head" else "b" * 40
                 return cp(args, stdout=f"{value}\n")
         return cp(args)
@@ -6397,6 +6448,22 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", tmp_path)
         monkeypatch.setattr(worker_client, "factory_checkout_for_path", lambda path: None)
+    if refusal in {"checkout_root_unavailable", "checkout_git_dir_unavailable"}:
+        real_resolve = Path.resolve
+
+        def unavailable_resolve(
+            path: Path, strict: bool = False,
+        ) -> Path:
+            unavailable = (
+                old_sandbox
+                if refusal == "checkout_root_unavailable"
+                else old_sandbox / ".git"
+            )
+            if path == unavailable:
+                raise OSError("path resolution unavailable")
+            return real_resolve(path, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", unavailable_resolve)
 
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         kwargs["before_claim"]()
@@ -6478,11 +6545,19 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         "session": "retained factory session is missing",
         "lifecycle": "retained factory lifecycle is not recoverable",
         "checkout_root": "factory checkout root mismatch",
+        "checkout_root_command": "cannot inspect root",
+        "checkout_root_unavailable": "factory checkout root is unavailable",
         "checkout_isolation": "factory checkout is not isolated",
+        "checkout_git_dir_command": "cannot inspect git dir",
+        "checkout_git_dir_unavailable": "factory checkout git directory is unavailable",
         "checkout_repository": "factory checkout repository mismatch",
+        "checkout_repository_command": "factory checkout repository mismatch",
         "checkout_branch": "factory checkout branch mismatch",
+        "checkout_branch_command": "cannot inspect branch",
         "checkout_base": "factory checkout base is invalid",
+        "checkout_base_command": "cannot inspect base",
         "checkout_head": "factory checkout HEAD is invalid",
+        "checkout_head_command": "cannot inspect HEAD",
     }
     if transitions:
         assert expected_reasons[refusal] in str(transitions[0]["reason"])
@@ -7485,6 +7560,120 @@ def factory_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: clock.now)
     monkeypatch.setattr(orchestrator, "asyncio", local_asyncio)
     return clock
+
+
+@pytest.mark.parametrize("terminal", ["result", "exception", "timeout"])
+def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    terminal: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    original_supervise = WorklinkRunner._supervise_factory_070
+    real_sleep = asyncio.sleep
+    stopped = asyncio.Event()
+    status_calls = 0
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += max(delay, 1.1)
+        await real_sleep(0)
+
+    class Compute:
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=handle)
+
+        def job_alive(self, handle: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, handle: LaunchHandle) -> None:
+            stopped.set()
+
+        async def cleanup(self, handle: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 1
+
+        def __init__(self, record: FactoryRunRecord) -> None:
+            self.record = record
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal status_calls
+            status_calls += 1
+            running = replace(
+                _factory_lifecycle_status(Path(self.record.sandbox), status="running"),
+                run_id=self.record.run_id,
+                branch=self.record.branch,
+            )
+            if status_calls <= 2 or terminal == "timeout":
+                return running
+            if terminal == "exception":
+                raise WorklinkError("factory terminal exception")
+            if status_calls == 3:
+                return replace(running, next="review")
+            return replace(running, status="blocked")
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    async def supervise_actual(**kwargs: Any) -> WorklinkRunResult:
+        supervisor = kwargs.pop("_supervisor")
+        record = kwargs["factory_record"]
+        assert isinstance(supervisor, WorklinkRunner)
+        assert isinstance(record, FactoryRunRecord)
+        kwargs["backend"] = Backend(record)
+        kwargs["compute"] = Compute()
+        return await original_supervise(supervisor, **kwargs)
+
+    async def failed_result(
+        self: WorklinkRunner, **kwargs: object,
+    ) -> WorklinkRunResult:
+        record = kwargs["factory_record"]
+        assert isinstance(record, FactoryRunRecord)
+        return WorklinkRunResult(
+            700,
+            record.attempt,
+            "failed",
+            checkout=Path(record.sandbox),
+            branch=record.branch,
+            reason="factory terminal failed",
+        )
+
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(
+        orchestrator,
+        "_epic_run_timeout_s",
+        lambda: 2.5 if terminal == "timeout" else 10.0,
+    )
+    monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", failed_result)
+
+    result, _, _, _ = _run_factory_preflight_case(
+        tmp_path,
+        monkeypatch,
+        credentials={"GITHUB_TOKEN": "github-token"},
+        autonomous=True,
+        outcome="completed",
+        terminal=supervise_actual,
+        sync_entrypoint=True,
+    )
+
+    assert result.status == "failed"
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["active"] is True
+    assert incident["terminal_error"] != "factory status made no useful progress"
+    if terminal == "result":
+        assert incident["terminal_error"] == "factory terminal failed"
+        assert status_calls == 4
+    elif terminal == "exception":
+        assert "factory terminal exception" in incident["terminal_error"]
+        assert status_calls == 3
+    else:
+        assert "factory exceeded run timeout" in incident["terminal_error"]
 
 
 @pytest.mark.parametrize("ending", ["parked", "timeout", "newer-incident"])

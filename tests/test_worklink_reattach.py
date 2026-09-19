@@ -629,6 +629,7 @@ def test_reattach_worker_lost_is_durable_before_release_and_blocks_fresh_core(
     "branch",
     [
         "shim",
+        "shim-cleanup",
         "lost-in-progress",
         "lookup",
         "nonresumable",
@@ -637,8 +638,9 @@ def test_reattach_worker_lost_is_durable_before_release_and_blocks_fresh_core(
         "base-exception",
     ],
 )
+@pytest.mark.parametrize("write_fails", [False, True], ids=["durable", "write-failure"])
 def test_autonomous_reattach_failure_branch_records_original_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, branch: str, write_fails: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
     from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
@@ -659,7 +661,7 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
                 "shim_pid": 999_999_999,
                 "process_start_ticks": 1,
             }
-            if branch == "shim"
+            if branch in {"shim", "shim-cleanup"}
             else {}
         ),
         **({"compute_name": "fake_local"} if branch == "nonresumable" else {}),
@@ -667,8 +669,24 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
     save_run_state(tmp_path, retained)
     labels = [] if branch == "lost-in-progress" else ["worklink:in-progress"]
     calls: list = []
-    runner = _remote_runner(repo, calls, issue_id=issue_id, labels=labels)
+    base_runner = _remote_runner(repo, calls, issue_id=issue_id, labels=labels)
+
+    def runner(
+        args: Sequence[str] | str, **kwargs: object,
+    ) -> subprocess.CompletedProcess:
+        if isinstance(args, list) and tuple(args[1:3]) in {
+            ("issue", "label"),
+            ("issue", "unlabel"),
+            ("locks", "release"),
+        }:
+            incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+                str(issue_id)
+            ]
+            assert incident["active"] is True
+        return base_runner(args, **kwargs)
+
     registry = BackendRegistry(WorklinkConfig())
+    compute: FakeRemoteCompute | None = None
 
     if branch != "lookup":
         registry.register(FakeBackend())
@@ -676,7 +694,7 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
         registry.register_compute(FakeLocalCompute())
     elif branch in {"worker-lost", "exception", "base-exception"}:
         if branch == "worker-lost":
-            compute: FakeRemoteCompute = FakeRemoteCompute(wait_result=ComputeResult(
+            compute = FakeRemoteCompute(wait_result=ComputeResult(
                 exit_code=-1,
                 stdout="",
                 stderr="broker gone",
@@ -695,21 +713,87 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
 
             compute = InterruptCompute()
         registry.register_compute(compute)
-    elif branch not in {"shim", "lost-in-progress"}:
-        registry.register_compute(FakeRemoteCompute())
+    elif branch not in {"shim", "shim-cleanup", "lost-in-progress"}:
+        compute = FakeRemoteCompute()
+        registry.register_compute(compute)
 
     if branch == "shim":
         monkeypatch.setattr(orchestrator, "process_is_alive", lambda state: False)
+    elif branch == "shim-cleanup":
+        monkeypatch.setattr(orchestrator, "process_is_alive", lambda state: True)
 
-    invocation = WorklinkRunner(
-        home=tmp_path, repo=repo, runner=runner, registry=registry
-    ).reattach(issue_id, autonomous=True)
+        async def cleanup_failure(*args: object, **kwargs: object) -> None:
+            raise OSError("cleanup failed")
+
+        monkeypatch.setattr(
+            orchestrator.LocalSubprocessComputeBackend,
+            "cancel",
+            cleanup_failure,
+        )
+
+    real_record = orchestrator._record_run_failure
+    write_attempts = 0
+
+    def record_failure(**kwargs: object) -> dict[str, object] | None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_fails:
+            raise OSError("disk full")
+        return real_record(**kwargs)
+
+    real_clear = orchestrator.clear_run_state
+    clears: list[int] = []
+
+    def clear_after_incident(home: Path, selected_issue: int) -> None:
+        incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
+            str(issue_id)
+        ]
+        assert incident["active"] is True
+        clears.append(selected_issue)
+        real_clear(home, selected_issue)
+
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record_failure)
+    monkeypatch.setattr(orchestrator, "clear_run_state", clear_after_incident)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(orchestrator, "_runner_for_home", lambda *_: runner)
+
     if branch == "base-exception":
         with pytest.raises(asyncio.CancelledError):
-            asyncio.run(invocation)
+            run_worklink_reattach(
+                home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+            )
+    elif write_fails:
+        with pytest.raises(OSError, match="disk full"):
+            run_worklink_reattach(
+                home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+            )
     else:
-        result = asyncio.run(invocation)
+        result = run_worklink_reattach(
+            home=tmp_path, repo=repo, issue_id=issue_id, autonomous=True
+        )
         assert result.status == "failed"
+
+    assert write_attempts == 1
+
+    assert not any(
+        isinstance(call, list) and call[1:3] == ["locks", "claim"]
+        for call in calls
+    )
+    if compute is not None:
+        assert compute.launched == []
+    if write_fails:
+        assert load_run_state(tmp_path, issue_id) == retained
+        assert clears == []
+        assert not any(
+            isinstance(call, list)
+            and tuple(call[1:3]) in {
+                ("issue", "label"),
+                ("issue", "unlabel"),
+                ("locks", "release"),
+            }
+            for call in calls
+        )
+        return
 
     incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][
         str(issue_id)
@@ -720,7 +804,7 @@ def test_autonomous_reattach_failure_branch_records_original_identity(
     assert incident["work_path"] == retained.checkout
     assert retained.handle_identifier == (
         "123e4567-e89b-42d3-a456-426614174000"
-        if branch == "shim"
+        if branch in {"shim", "shim-cleanup"}
         else "original-job"
     )
 

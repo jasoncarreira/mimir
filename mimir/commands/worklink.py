@@ -206,14 +206,14 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return 1
     except BaseException as exc:
         from ..worklink.orchestrator import (
-            _exception_incident_owned,
+            _exception_incident_handled,
             _record_run_failure,
         )
         from ..worklink.run_state import load_run_state
 
         try:
             state = load_run_state(home, args.issue_id)
-            if not _exception_incident_owned(exc):
+            if not _exception_incident_handled(exc):
                 _record_run_failure(
                     home=home,
                     issue_id=args.issue_id,
@@ -359,13 +359,13 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except BaseException as exc:
         from ..worklink.factory_state import load_factory_records_for_issue
         from ..worklink.orchestrator import (
-            _exception_incident_owned,
+            _exception_incident_handled,
             _record_run_failure,
         )
 
         records = load_factory_records_for_issue(home, args.issue_id)
         retained = records[0] if records else None
-        if not _exception_incident_owned(exc):
+        if not _exception_incident_handled(exc):
             try:
                 _record_run_failure(
                     home=home,
