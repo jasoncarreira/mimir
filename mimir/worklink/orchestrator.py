@@ -179,6 +179,7 @@ class WorklinkRunResult:
     preserved_ref: str | None = None
     preservation_error: str | None = None
     next: str | None = None
+    incident_recorded: bool = False
 
 
 @dataclass
@@ -222,6 +223,18 @@ class _TerminalClaimRelease:
 
 class WorklinkError(RuntimeError):
     """Base error for operator-facing Worklink failures."""
+
+
+class _AutonomousAdmissionRefused(WorklinkError):
+    """Fresh autonomous work is fenced by durable incident state."""
+
+
+class FactoryRecoveryBlocked(WorklinkError):
+    """A retained factory run exists but cannot be safely rebound."""
+
+    def __init__(self, record: FactoryRunRecord, reason: str) -> None:
+        super().__init__(reason)
+        self.record = record
 
 
 class LeafValidationError(WorklinkError):
@@ -646,6 +659,31 @@ class WorklinkRunner:
             print(f"\nBase branch: {base} (checkout cut from it; PR targets it)")
             return WorklinkRunResult(issue.issue_id, None, "dry_run", dry_run=True)
 
+        if autonomous:
+            from .dispatch_failures import (
+                autonomous_dispatch_block_reason,
+                dispatch_failure_state_dir,
+            )
+
+            admission_reason = autonomous_dispatch_block_reason(
+                dispatch_failure_state_dir(self.home), issue.issue_id
+            )
+            retained_state = load_run_state(self.home, issue.issue_id)
+            if retained_state is not None:
+                admission_reason = (
+                    "a retained Worklink run requires explicit reattach; fresh autonomous "
+                    "dispatch is refused"
+                )
+            if admission_reason:
+                _log_event(
+                    "worklink_autonomous_refused",
+                    issue_id=issue.issue_id,
+                    reason=admission_reason,
+                )
+                return WorklinkRunResult(
+                    issue.issue_id, None, "refused", reason=admission_reason
+                )
+
         # Autonomy safety gate (#460): autonomous dispatch (poller / worklink_run
         # tool, which pass autonomous=True) refuses an unsandboxed compute
         # substrate unless the operator opted in. Decided here in core, before
@@ -677,6 +715,17 @@ class WorklinkRunner:
 
         def record_claiming() -> None:
             nonlocal claiming_state_written
+            if autonomous:
+                from .dispatch_failures import (
+                    autonomous_dispatch_block_reason,
+                    dispatch_failure_state_dir,
+                )
+
+                reason = autonomous_dispatch_block_reason(
+                    dispatch_failure_state_dir(self.home), issue.issue_id
+                )
+                if reason:
+                    raise _AutonomousAdmissionRefused(reason)
             existing = load_run_state(self.home, issue.issue_id)
             if existing is not None and process_is_alive(existing):
                 raise WorklinkError(f"live run state already exists for issue {issue.issue_id}")
@@ -711,6 +760,8 @@ class WorklinkRunner:
                 exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
             )
+        except _AutonomousAdmissionRefused as exc:
+            return WorklinkRunResult(issue.issue_id, None, "refused", reason=str(exc))
         except Exception:
             if claiming_state_written:
                 clear_run_state(self.home, issue.issue_id)
@@ -931,6 +982,7 @@ class WorklinkRunner:
                     publication=publication,
                     executor_report_dir=executor_report_dir,
                     terminal_release=terminal_release,
+                    autonomous=autonomous,
                 ),
                 claims=claims,
                 record=record,
@@ -963,6 +1015,15 @@ class WorklinkRunner:
             transition_error = None
             terminal_release.retain_for_recovery = True
             try:
+                _record_run_failure(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    error=exc,
+                    exit_status=1,
+                    autonomous=autonomous,
+                    work_path=str(lease.path) if lease else None,
+                )
                 claims.transition_issue(
                     issue.issue_id,
                     status="failed",
@@ -994,11 +1055,32 @@ class WorklinkRunner:
                 reason=str(exc),
                 checkout=lease.path if lease else None,
                 branch=lease.branch if lease else None,
+                incident_recorded=autonomous,
             )
         except BaseException as exc:
             # No terminal routing occurred. Keep both recovery handles, even
             # when the finally block below requests release after teardown.
             terminal_release.retain_for_recovery = True
+            try:
+                _record_run_failure(
+                    home=self.home,
+                    issue_id=issue.issue_id,
+                    attempt=record.attempt,
+                    error=exc,
+                    exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                    autonomous=autonomous,
+                    work_path=str(lease.path) if lease else None,
+                )
+                try:
+                    setattr(exc, "_worklink_incident_recorded", autonomous)
+                except Exception:
+                    pass
+            except OSError as write_exc:
+                _log_event(
+                    "worklink_dispatch_failure_state_error",
+                    issue_id=issue.issue_id,
+                    error=str(write_exc),
+                )
             _log_event(
                 "worklink_run_interrupted",
                 issue_id=issue.issue_id,
@@ -1053,6 +1135,7 @@ class WorklinkRunner:
         publication: ControllerGitPublication | None = None,
         executor_report_dir: Path | None = None,
         terminal_release: _TerminalClaimRelease,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         """Post-launch pipeline: interpret the worker result, observe evidence,
         open the PR on a passing gate, then transition + clean up.
@@ -1314,6 +1397,18 @@ class WorklinkRunner:
 
         # Keep the lock until routing succeeds, including through outer finally.
         terminal_release.retain_for_recovery = True
+        incident_recorded = False
+        if transition_status == "failed":
+            _record_run_failure(
+                home=self.home,
+                issue_id=issue.issue_id,
+                attempt=attempt,
+                error=transition_reason or "Worklink run failed",
+                exit_status=raw.exit_code if raw.exit_code != 0 else 1,
+                autonomous=autonomous,
+                work_path=str(lease.path),
+            )
+            incident_recorded = autonomous
         if pr_url:
             # Execution is finished and publication evidence is durable. Retire
             # the worker pointer so startup orphan reconciliation cannot demote
@@ -1400,9 +1495,12 @@ class WorklinkRunner:
                 else validation.evidence.blocked_reason if validation.status == "blocked"
                 else None
             ),
+            incident_recorded=incident_recorded,
         )
 
-    async def reattach(self, issue_id: int) -> WorklinkRunResult:
+    async def reattach(
+        self, issue_id: int, *, autonomous: bool = False
+    ) -> WorklinkRunResult:
         """Resume an in-flight run after a controller restart (#561).
 
         After the #832 substrate cleanup local_subprocess is the only Worklink
@@ -1434,6 +1532,19 @@ class WorklinkRunner:
             issue_id=issue_id,
             attempt=state.attempt,
         )
+        terminal_release.retain_for_recovery = True
+
+        def fence_failure(reason: BaseException | str, *, exit_status: int | None = 1) -> None:
+            _record_run_failure(
+                home=self.home,
+                issue_id=issue_id,
+                attempt=state.attempt,
+                error=reason,
+                exit_status=exit_status,
+                autonomous=autonomous,
+                preserved_ref=state.branch or None,
+                work_path=state.checkout or None,
+            )
         if state.shim_pid is not None:
             handle = LaunchHandle(
                 state.handle_substrate,
@@ -1449,14 +1560,17 @@ class WorklinkRunner:
                     await LocalSubprocessComputeBackend().cancel(handle)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 reason = f"reattach: worker cleanup failed: {exc}"
-            if terminal_release():
-                claims.transition_issue(
-                    issue_id,
-                    status="failed",
-                    review_ready=False,
-                    attempt=state.attempt,
-                    reason=reason,
-                )
+            fence_failure(reason)
+            claims.transition_issue(
+                issue_id,
+                status="failed",
+                review_ready=False,
+                attempt=state.attempt,
+                reason=reason,
+            )
+            terminal_release.label_transition_applied = True
+            terminal_release.retain_for_recovery = False
+            terminal_release()
             _log_event(
                 "worklink_reattach_cleanup",
                 issue_id=issue_id,
@@ -1470,6 +1584,7 @@ class WorklinkRunner:
                 checkout=Path(state.checkout) if state.checkout else None,
                 branch=state.branch,
                 reason=reason,
+                incident_recorded=autonomous,
             )
 
         review_ready = claims.review_ready_evidence(issue_id)
@@ -1494,6 +1609,7 @@ class WorklinkRunner:
                         ),
                 )
                 restored_review = pr_state == "OPEN"
+                terminal_release.retain_for_recovery = False
                 if restored_review and terminal_release():
                     claims.transition_issue(
                         issue_id,
@@ -1539,9 +1655,15 @@ class WorklinkRunner:
         # doesn't strand the worker.
         if not claims._issue_has_label(issue_id, "worklink:in-progress"):  # noqa: SLF001
             _log_event("worklink_reattach_skipped", issue_id=issue_id, reason="not_in_progress")
+            fence_failure("reattach: leaf no longer in-progress")
+            terminal_release.retain_for_recovery = False
             terminal_release()
             return WorklinkRunResult(
-                issue_id, state.attempt, "failed", reason="reattach: leaf no longer in-progress"
+                issue_id,
+                state.attempt,
+                "failed",
+                reason="reattach: leaf no longer in-progress",
+                incident_recorded=autonomous,
             )
 
         registry = self.registry or BackendRegistry(config)
@@ -1550,13 +1672,29 @@ class WorklinkRunner:
             compute = registry.get_compute(state.compute_name)
         except (KeyError, ValueError) as exc:
             _log_event("worklink_reattach_failed", issue_id=issue_id, reason=str(exc))
+            fence_failure(f"reattach: {exc}")
             clear_run_state(self.home, issue_id)
-            return WorklinkRunResult(issue_id, state.attempt, "failed", reason=f"reattach: {exc}")
+            terminal_release.retain_for_recovery = False
+            terminal_release()
+            return WorklinkRunResult(
+                issue_id,
+                state.attempt,
+                "failed",
+                reason=f"reattach: {exc}",
+                incident_recorded=autonomous,
+            )
         if not compute.capabilities().persistent_after_disconnect:
             # Defensive: only persistent substrates are ever persisted.
+            fence_failure("reattach: compute not resumable")
             clear_run_state(self.home, issue_id)
+            terminal_release.retain_for_recovery = False
+            terminal_release()
             return WorklinkRunResult(
-                issue_id, state.attempt, "failed", reason="reattach: compute not resumable"
+                issue_id,
+                state.attempt,
+                "failed",
+                reason="reattach: compute not resumable",
+                incident_recorded=autonomous,
             )
 
         handle = LaunchHandle(
@@ -1639,16 +1777,23 @@ class WorklinkRunner:
                     attempt=state.attempt,
                     error=(compute_result.launch_error or "")[:300],
                 )
-                if terminal_release():
-                    claims.transition_issue(
-                        issue_id,
-                        status="failed",
-                        review_ready=False,
-                        attempt=state.attempt,
-                        reason="reattach: worker lost after controller restart",
-                    )
+                fence_failure("reattach: worker lost after controller restart")
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=state.attempt,
+                    reason="reattach: worker lost after controller restart",
+                )
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
                 return WorklinkRunResult(
-                    issue_id, state.attempt, "failed", reason="reattach: worker lost"
+                    issue_id,
+                    state.attempt,
+                    "failed",
+                    reason="reattach: worker lost",
+                    incident_recorded=autonomous,
                 )
             return await _heartbeat_while(
                 self._finalize(
@@ -1668,28 +1813,60 @@ class WorklinkRunner:
                     root_dirty_before=(),
                     runner=runner,
                     terminal_release=terminal_release,
+                    autonomous=autonomous,
                 ),
                 claims=claims,
                 record=claim_record,
             )
         except Exception as exc:
-            if terminal_release():
-                try:
-                    claims.transition_issue(
-                        issue_id,
-                        status="failed",
-                        review_ready=False,
-                        attempt=state.attempt,
-                        reason=f"reattach failed: {exc}",
-                    )
-                except Exception:
-                    pass
+            fence_failure(f"reattach failed: {exc}")
+            try:
+                claims.transition_issue(
+                    issue_id,
+                    status="failed",
+                    review_ready=False,
+                    attempt=state.attempt,
+                    reason=f"reattach failed: {exc}",
+                )
+            except Exception:
+                pass
+            else:
+                terminal_release.label_transition_applied = True
+                terminal_release.retain_for_recovery = False
+                terminal_release()
             _log_event(
                 "worklink_reattach_failed", issue_id=issue_id, attempt=state.attempt, error=str(exc)
             )
             return WorklinkRunResult(
-                issue_id, state.attempt, "failed", reason=f"reattach failed: {exc}"
+                issue_id,
+                state.attempt,
+                "failed",
+                reason=f"reattach failed: {exc}",
+                incident_recorded=autonomous,
             )
+        except BaseException as exc:
+            try:
+                _record_run_failure(
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=state.attempt,
+                    error=exc,
+                    exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                    autonomous=autonomous,
+                    preserved_ref=state.branch or None,
+                    work_path=state.checkout or None,
+                )
+                try:
+                    setattr(exc, "_worklink_incident_recorded", autonomous)
+                except Exception:
+                    pass
+            except OSError as write_exc:
+                _log_event(
+                    "worklink_dispatch_failure_state_error",
+                    issue_id=issue_id,
+                    error=str(write_exc),
+                )
+            raise
         finally:
             try:
                 if lease is not None:
@@ -1830,16 +2007,41 @@ class WorklinkRunner:
         work_item_json = render_work_item(issue)
         run_id = _validate_epic_work_item(work_item_json, issue.issue_id)
         retained: FactoryRunRecord | None = None
+        initial_retained = load_factory_records_for_issue(self.home, issue_id)
+        if autonomous and not initial_retained:
+            from .dispatch_failures import (
+                autonomous_dispatch_block_reason,
+                dispatch_failure_state_dir,
+            )
 
-        class FactoryRecoveryBlocked(WorklinkError):
-            def __init__(self, record: FactoryRunRecord, reason: str) -> None:
-                super().__init__(reason)
-                self.record = record
+            admission_reason = autonomous_dispatch_block_reason(
+                dispatch_failure_state_dir(self.home), issue_id
+            )
+            if admission_reason:
+                return WorklinkRunResult(
+                    issue_id, None, "refused", reason=admission_reason
+                )
 
         def prepare_factory_claim() -> None:
             nonlocal retained
             candidates = load_factory_records_for_issue(self.home, issue_id)
             if not candidates:
+                if initial_retained:
+                    raise FactoryRecoveryBlocked(
+                        initial_retained[0],
+                        "retained factory recovery target disappeared before claim",
+                    )
+                if autonomous:
+                    from .dispatch_failures import (
+                        autonomous_dispatch_block_reason,
+                        dispatch_failure_state_dir,
+                    )
+
+                    reason = autonomous_dispatch_block_reason(
+                        dispatch_failure_state_dir(self.home), issue_id
+                    )
+                    if reason:
+                        raise _AutonomousAdmissionRefused(reason)
                 return
             candidate = candidates[0]
             try:
@@ -1865,6 +2067,8 @@ class WorklinkRunner:
                 active_label=WORKLINK_EPIC_LABEL,
                 before_claim=prepare_factory_claim,
             )
+        except _AutonomousAdmissionRefused as exc:
+            return WorklinkRunResult(issue_id, None, "refused", reason=str(exc))
         except FactoryRecoveryBlocked as exc:
             reason = f"retained factory sandbox {exc.record.sandbox}: {exc}"
             _log_event(
@@ -1873,6 +2077,16 @@ class WorklinkRunner:
                 attempt=exc.record.attempt,
                 sandbox=exc.record.sandbox,
                 reason=str(exc),
+            )
+            _record_run_failure(
+                home=self.home,
+                issue_id=issue_id,
+                attempt=exc.record.attempt,
+                error=reason,
+                exit_status=1,
+                autonomous=autonomous,
+                run_id=exc.record.run_id,
+                work_path=exc.record.sandbox,
             )
             current_issue = issue_reader.read(issue_id)
             if "worklink:in-progress" not in current_issue.labels:
@@ -1892,6 +2106,7 @@ class WorklinkRunner:
                 checkout=Path(exc.record.sandbox),
                 branch=exc.record.branch,
                 reason=reason,
+                incident_recorded=autonomous,
             )
         if claim.attempts_exhausted:
             _log_event(
@@ -1918,6 +2133,7 @@ class WorklinkRunner:
             backend=selected.name,
         )
         lease: CheckoutLease | None = None
+        release_permitted = True
         try:
             if retained is not None:
                 result = await self._recover_factory_070(
@@ -1932,6 +2148,7 @@ class WorklinkRunner:
                     base=base,
                     test_cmd=test_cmd,
                     runner=runner,
+                    autonomous=autonomous,
                 )
             else:
                 lease = _create_backend_checkout(
@@ -2033,8 +2250,10 @@ class WorklinkRunner:
                     test_cmd=test_cmd,
                     runner=runner,
                     started_at=datetime.now(UTC),
+                    autonomous=autonomous,
                 )
         except Exception as exc:
+            release_permitted = False
             original_reason = str(exc)
             try:
                 records = load_factory_records_for_issue(self.home, issue_id)
@@ -2060,6 +2279,20 @@ class WorklinkRunner:
                         controller_error=_factory_controller_error(reason),
                     ),
                 )
+            _record_run_failure(
+                home=self.home,
+                issue_id=issue_id,
+                attempt=claim_record.attempt,
+                error=reason,
+                exit_status=1,
+                autonomous=autonomous,
+                preserved_ref=preserved_ref,
+                preservation_error=preservation_error,
+                run_id=current.run_id if current is not None else run_id,
+                work_path=current.sandbox if current is not None else (
+                    str(lease.path) if lease is not None else None
+                ),
+            )
             claims.transition_issue(
                 issue_id,
                 status="failed",
@@ -2067,6 +2300,7 @@ class WorklinkRunner:
                 attempt=claim_record.budget_attempt or claim_record.attempt,
                 reason=reason,
             )
+            release_permitted = True
             _log_event(
                 "worklink_transition",
                 issue_id=issue_id,
@@ -2093,14 +2327,47 @@ class WorklinkRunner:
                 reason=reason,
                 preserved_ref=preserved_ref,
                 preservation_error=preservation_error,
+                incident_recorded=autonomous,
             )
+        except BaseException as exc:
+            release_permitted = False
+            try:
+                records = load_factory_records_for_issue(self.home, issue_id)
+                current = records[0] if records else retained
+                _record_run_failure(
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=claim_record.attempt,
+                    error=exc,
+                    exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                    autonomous=autonomous,
+                    run_id=current.run_id if current is not None else run_id,
+                    work_path=current.sandbox if current is not None else (
+                        str(lease.path) if lease is not None else None
+                    ),
+                )
+                try:
+                    setattr(exc, "_worklink_incident_recorded", autonomous)
+                except Exception:
+                    pass
+            except OSError as write_exc:
+                _log_event(
+                    "worklink_dispatch_failure_state_error",
+                    issue_id=issue_id,
+                    error=str(write_exc),
+                )
+            raise
         finally:
-            released = _release_issue_and_clear_run_state(
-                claims,
-                home=self.home,
-                issue_id=issue_id,
-                attempt=claim_record.attempt,
-                trigger_ready_scan=autonomous,
+            released = (
+                _release_issue_and_clear_run_state(
+                    claims,
+                    home=self.home,
+                    issue_id=issue_id,
+                    attempt=claim_record.attempt,
+                    trigger_ready_scan=autonomous,
+                )
+                if release_permitted
+                else False
             )
         if not released:
             reason = "terminal recovery incomplete: Chainlink lock release failed"
@@ -2123,6 +2390,7 @@ class WorklinkRunner:
         base: str,
         test_cmd: str,
         runner: Runner,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         sandbox = _verify_factory_recovery_binding(
             runner=self,
@@ -2285,6 +2553,7 @@ class WorklinkRunner:
             runner=runner,
             started_at=datetime.now(UTC),
             initial_status=resumed,
+            autonomous=autonomous,
         )
 
     async def _supervise_factory_070(
@@ -2300,6 +2569,7 @@ class WorklinkRunner:
         runner: Runner,
         started_at: datetime,
         initial_status: FactoryStatus | None = None,
+        autonomous: bool = False,
     ) -> WorklinkRunResult:
         handle = factory_record.handle
         if handle is None:
@@ -2314,6 +2584,7 @@ class WorklinkRunner:
         stale_started: float | None = None
         stale_started_at: str | None = None
         stale_episode = 0
+        stale_failure: tuple[str, str] | None = None
         try:
             wait_task = asyncio.create_task(
                 compute.wait(
@@ -2364,7 +2635,7 @@ class WorklinkRunner:
             await compute.cancel(handle)
 
         def end_stale_episode(reason: str) -> None:
-            nonlocal stale_started
+            nonlocal stale_started, stale_failure
             if stale_started is None:
                 return
             now = loop.time()
@@ -2381,6 +2652,19 @@ class WorklinkRunner:
                 end_reason=reason,
             )
             stale_started = None
+            if reason == "status_changed" and stale_failure is not None:
+                from .dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    resolve_failure_if_current,
+                )
+
+                resolve_failure_if_current(
+                    dispatch_failure_state_dir(self.home),
+                    issue.issue_id,
+                    stale_failure[0],
+                    stale_failure[1],
+                )
+                stale_failure = None
 
         try:
             while True:
@@ -2445,6 +2729,21 @@ class WorklinkRunner:
                         stale_started = loop.time()
                         stale_started_at = datetime.now(UTC).isoformat()
                         stale_episode += 1
+                        incident = _record_run_failure(
+                            home=self.home,
+                            issue_id=issue.issue_id,
+                            attempt=factory_record.attempt,
+                            error="factory status made no useful progress",
+                            exit_status=None,
+                            autonomous=autonomous,
+                            run_id=factory_record.run_id,
+                            work_path=factory_record.sandbox,
+                        )
+                        if incident is not None:
+                            stale_failure = (
+                                str(incident["signature"]),
+                                str(incident["occurrence_id"]),
+                            )
                         _log_event(
                             "worklink_factory_stale_status",
                             issue_id=issue.issue_id,
@@ -3477,7 +3776,7 @@ def run_worklink(
             autonomous=autonomous,
         )
         raise
-    if result.status == "failed":
+    if result.status == "failed" and not result.incident_recorded:
         _record_run_failure(
             home=home,
             issue_id=issue_id,
@@ -3501,11 +3800,13 @@ def _record_run_failure(
     issue_id: int,
     attempt: int | None,
     error: BaseException | str,
-    exit_status: int,
+    exit_status: int | None,
     autonomous: bool,
     preserved_ref: str | None = None,
     preservation_error: str | None = None,
-) -> None:
+    run_id: str | None = None,
+    work_path: str | None = None,
+) -> dict[str, Any] | None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
     safe_error = terminal_error(error)
@@ -3520,19 +3821,19 @@ def _record_run_failure(
         preservation_error=preservation_error,
     )
     if autonomous:
-        try:
-            record_failure(
-                dispatch_failure_state_dir(home),
-                issue_id=issue_id,
-                attempt=attempt,
-                exit_status=exit_status,
-                error=error,
-                log_path=os.environ.get("WORKLINK_RUN_LOG"),
-                preserved_ref=preserved_ref,
-                preservation_error=preservation_error,
-            )
-        except OSError:
-            pass
+        return record_failure(
+            dispatch_failure_state_dir(home),
+            issue_id=issue_id,
+            attempt=attempt,
+            exit_status=exit_status,
+            error=error,
+            log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            preserved_ref=preserved_ref,
+            preservation_error=preservation_error,
+            run_id=run_id,
+            work_path=work_path,
+        )
+    return None
 
 
 def _record_run_success(home: Path, issue_id: int) -> None:
@@ -3552,10 +3853,58 @@ def _trigger_ready_scan_after_release(home: Path) -> None:
 
 
 def run_worklink_reattach(
-    *, home: Path, repo: Path, issue_id: int
+    *, home: Path, repo: Path, issue_id: int, autonomous: bool = False
 ) -> WorklinkRunResult:
     """Resume one in-flight run after a controller restart (#561)."""
-    return asyncio.run(WorklinkRunner(home=home, repo=repo).reattach(issue_id))
+    from .dispatch_failures import (
+        current_failure_identity,
+        dispatch_failure_state_dir,
+        resolve_failure_if_current,
+    )
+
+    failure_state_dir = dispatch_failure_state_dir(home)
+    try:
+        captured_incident = current_failure_identity(failure_state_dir, issue_id)
+    except ValueError:
+        captured_incident = None
+    try:
+        result = asyncio.run(
+            WorklinkRunner(home=home, repo=repo).reattach(
+                issue_id, autonomous=autonomous
+            )
+        )
+    except BaseException as exc:
+        if not getattr(exc, "_worklink_incident_recorded", False):
+            state = load_run_state(home, issue_id)
+            _record_run_failure(
+                home=home,
+                issue_id=issue_id,
+                attempt=state.attempt if state is not None else None,
+                error=exc,
+                exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                autonomous=autonomous,
+                work_path=state.checkout if state is not None else None,
+            )
+        raise
+    if result.status == "failed" and not result.incident_recorded:
+        _record_run_failure(
+            home=home,
+            issue_id=issue_id,
+            attempt=result.attempt,
+            error=result.reason or "Worklink reattach failed",
+            exit_status=1,
+            autonomous=autonomous,
+            work_path=str(result.checkout) if result.checkout else None,
+        )
+        result = replace(result, incident_recorded=autonomous)
+    if result.status in {"completed", "review_ready"} and captured_incident is not None:
+        resolve_failure_if_current(
+            failure_state_dir,
+            issue_id,
+            captured_incident[0],
+            captured_incident[1],
+        )
+    return result
 
 
 def run_worklink_epic(
@@ -3565,6 +3914,17 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    from .dispatch_failures import (
+        current_failure_identity,
+        dispatch_failure_state_dir,
+        resolve_failure_if_current,
+    )
+
+    failure_state_dir = dispatch_failure_state_dir(home)
+    try:
+        captured_incident = current_failure_identity(failure_state_dir, issue_id)
+    except ValueError:
+        captured_incident = None
     try:
         result = asyncio.run(
             WorklinkRunner(home=home, repo=repo).run_epic(
@@ -3582,7 +3942,7 @@ def run_worklink_epic(
             autonomous=autonomous,
         )
         raise
-    if result.status == "failed":
+    if result.status == "failed" and not result.incident_recorded:
         _record_run_failure(
             home=home,
             issue_id=issue_id,
@@ -3594,7 +3954,15 @@ def run_worklink_epic(
             preservation_error=result.preservation_error,
         )
     elif result.status in {"completed", "review_ready"}:
-        _record_run_success(home, issue_id)
+        if captured_incident is None:
+            _record_run_success(home, issue_id)
+        else:
+            resolve_failure_if_current(
+                failure_state_dir,
+                issue_id,
+                captured_incident[0],
+                captured_incident[1],
+            )
     return result
 
 

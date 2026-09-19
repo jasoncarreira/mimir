@@ -858,6 +858,7 @@ class ChainlinkClaims:
         *,
         ttl: timedelta,
         release_only_issue_ids: Iterable[int] = (),
+        before_rearm: Callable[[ClaimRecord, str], None] | None = None,
     ) -> ReapResult:
         """Release stale claims and move the issue back to ready or blocked.
 
@@ -931,14 +932,26 @@ class ChainlinkClaims:
                 self._run("locks", "release", str(record.issue_id), check=False)
                 record_skip("in_progress_label_missing", record.issue_id)
                 continue
-            self._run("locks", "release", str(record.issue_id), check=False)
-            self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
             if (record.budget_attempt or record.attempt) >= self.max_attempts:
-                self._run("issue", "label", str(record.issue_id), "worklink:blocked")
                 transition = "blocked"
             else:
-                self._run("issue", "label", str(record.issue_id), "worklink:ready")
                 transition = "ready"
+            if before_rearm is not None:
+                try:
+                    before_rearm(record, transition)
+                except Exception as exc:
+                    record_skip("incident_record_failed", record.issue_id)
+                    if self.event_logger is not None:
+                        self.event_logger(
+                            "worklink_claim_reap_incident_failed",
+                            issue_id=record.issue_id,
+                            attempt=record.attempt,
+                            error=str(exc),
+                        )
+                    continue
+            self._run("locks", "release", str(record.issue_id), check=False)
+            self._run("issue", "unlabel", str(record.issue_id), "worklink:in-progress", check=False)
+            self._run("issue", "label", str(record.issue_id), f"worklink:{transition}")
             payload = {
                 "issue_id": record.issue_id,
                 "stale_agent_id": record.agent_id,
@@ -1260,7 +1273,12 @@ class ChainlinkClaims:
                     out.append(str(text))
         return out
 
-    def reap_home(self, *, ttl: timedelta) -> ReapResult:
+    def reap_home(
+        self,
+        *,
+        ttl: timedelta,
+        before_rearm: Callable[[ClaimRecord, str], None] | None = None,
+    ) -> ReapResult:
         """Discover ``worklink:in-progress`` issues, gather the latest claim
         record per issue from their comments, and reap any stale ones.
 
@@ -1306,7 +1324,10 @@ class ChainlinkClaims:
                 if current is None or _claim_is_newer(record, current):
                     latest[record.issue_id] = record
         result = self.reap_stale_claims(
-            latest.values(), ttl=ttl, release_only_issue_ids=release_only_ids,
+            latest.values(),
+            ttl=ttl,
+            release_only_issue_ids=release_only_ids,
+            before_rearm=before_rearm,
         )
         if not discovery_skipped:
             return result

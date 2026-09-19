@@ -945,10 +945,14 @@ def test_claim_refusal_dispatch_failure_accounting(
             result = run_worklink(
                 home=tmp_path, repo=repo, issue_id=441, backend="fake", autonomous=True
             )
-        assert result.status == status
-        assert result.reason == (reason or "claim_failed")
+        expected_status = status if consecutive == 1 or status == "refused" else "refused"
+        assert result.status == expected_status
+        if expected_status == "failed" or status == "refused":
+            assert result.reason == (reason or "claim_failed")
+        else:
+            assert "unresolved Worklink incident" in (result.reason or "")
         assert result.attempt is None
-        assert claim_calls == [441] * consecutive
+        assert claim_calls == [441] * (consecutive if status == "refused" else 1)
         issues = load_failure_state(state_dir)["issues"]
         if status == "refused":
             assert issues == {}
@@ -957,7 +961,7 @@ def test_claim_refusal_dispatch_failure_accounting(
         else:
             entry = issues["441"]
             assert entry["active"] is True
-            assert entry["consecutive"] == consecutive
+            assert entry["consecutive"] == 1
             assert entry["attempt"] is None
             assert entry["attempt_consumed"] is False
             assert entry["terminal_error"] == (reason or "claim_failed")
@@ -967,9 +971,11 @@ def test_claim_refusal_dispatch_failure_accounting(
             assert backed_off == {441}
             assert len(alerts) == 1
             assert alerts[0]["issue_id"] == 441
-            assert alerts[0]["signal"] == "worklink_run_failure_escalated"
+            assert "signal" not in alerts[0]
+            assert alerts[0]["prompt"].startswith("Worklink incident for issue 441")
+            assert alerts[0]["delivery_key"].startswith("worklink-run-failure:441:")
             assert alerts[0]["terminal_error"] == entry["terminal_error"]
-            assert sum(name == "worklink_run_failed" for name, _ in events) == consecutive
+            assert sum(name == "worklink_run_failed" for name, _ in events) == 1
 
     assert backend.orders == []
     assert not worktree.exists()
@@ -5129,8 +5135,16 @@ def test_factory_launch_requires_confirmed_cleanup(
             assert result.status == "failed"
             assert len(transitions) == 1
             assert transitions[0]["reason"] == original_reason
-    assert clears == ([(tmp_path, 700)] if release_confirmed else [])
-    assert signals == (["worklink_slot_released"] if release_confirmed else [])
+    assert clears == (
+        [(tmp_path, 700)]
+        if release_confirmed and completion != "cancelled"
+        else []
+    )
+    assert signals == (
+        ["worklink_slot_released"]
+        if release_confirmed and completion != "cancelled"
+        else []
+    )
 
 
 def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(

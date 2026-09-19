@@ -59,6 +59,7 @@ from .run_state import (
     clear_orphan_block_record,
     list_run_states,
     load_orphan_block_record,
+    load_run_state,
     list_orphan_block_records,
 )
 
@@ -415,7 +416,30 @@ def reap_stale_claims_for_home(
         ttl_s = exc.required_value
     ttl = timedelta(seconds=ttl_s)
     cl = claims or make_claims(home, agent_id=agent_id)
-    return cl.reap_home(ttl=ttl)
+
+    def record_reaped_incident(record: ClaimRecord, transition: str) -> None:
+        from .dispatch_failures import dispatch_failure_state_dir, record_failure
+
+        state = load_run_state(home, record.issue_id)
+        heartbeat = record.heartbeat_at or record.claimed_at
+        record_failure(
+            dispatch_failure_state_dir(home),
+            issue_id=record.issue_id,
+            attempt=record.attempt,
+            exit_status=None,
+            error=(
+                "stale autonomous claim reaped after heartbeat expiry; "
+                f"target worklink:{transition}"
+            ),
+            log_path=os.environ.get("WORKLINK_RUN_LOG"),
+            work_path=state.checkout if state is not None else None,
+            preserved_ref=state.branch if state is not None else None,
+            now=heartbeat.astimezone(timezone.utc),
+        )
+
+    if not isinstance(cl, ChainlinkClaims):
+        return cl.reap_home(ttl=ttl)
+    return cl.reap_home(ttl=ttl, before_rearm=record_reaped_incident)
 
 
 @dataclasses.dataclass(frozen=True)

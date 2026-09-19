@@ -1017,6 +1017,7 @@ def reattach_inflight_worklink_runs(
         report_retained_factory_records,
     )
     from .worklink.run_state import reattach_dispatch_argv
+    from .worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
 
     spawn = popen or subprocess.Popen
     event_callback = event_logger or log_event_sync
@@ -1090,6 +1091,16 @@ def reattach_inflight_worklink_runs(
                 start_new_session=True,  # detach: survive this startup + outlive it
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            record_failure(
+                dispatch_failure_state_dir(home),
+                issue_id=state.issue_id,
+                attempt=state.attempt,
+                exit_status=1,
+                error=f"retained Worklink reattach spawn failed: {exc}",
+                log_path=str(log_path),
+                preserved_ref=state.branch or None,
+                work_path=state.checkout or None,
+            )
             failure = {
                 "issue_id": state.issue_id,
                 "reason": "reattach_spawn_failed",
@@ -1132,6 +1143,20 @@ def reattach_inflight_worklink_runs(
                 start_new_session=True,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            record_failure(
+                dispatch_failure_state_dir(home),
+                issue_id=record.issue_id,
+                attempt=record.attempt,
+                exit_status=1,
+                error=(
+                    f"retained factory recovery spawn failed: {exc}; "
+                    f"transcript={record.transcript or '(none)'}"
+                ),
+                log_path=str(log_path),
+                preserved_ref=record.branch,
+                run_id=record.run_id,
+                work_path=record.sandbox,
+            )
             failure = {
                 "issue_id": record.issue_id,
                 "reason": "factory_recovery_spawn_failed",

@@ -1098,7 +1098,10 @@ def test_reconcile_lock_release_failure_retains_state_and_emits_actionable_event
         now=now,
     )
 
-    assert calls == [["chainlink", "locks", "release", "13"]]
+    assert calls == [
+        ["chainlink", "issue", "show", "13", "--json"],
+        ["chainlink", "locks", "release", "13"],
+    ]
     assert load_run_state(tmp_path, 13) is not None
     assert events == [
         (

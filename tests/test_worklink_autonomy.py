@@ -39,6 +39,7 @@ from mimir.worklink.factory_state import (
     save_factory_record,
 )
 from mimir.worklink.dispatch_failures import (
+    autonomous_dispatch_block_reason,
     dispatch_failure_state_dir,
     failure_state_transaction,
     load_failure_state,
@@ -46,6 +47,7 @@ from mimir.worklink.dispatch_failures import (
     pending_failure_alerts,
     record_failure,
     record_success,
+    resolve_failure_if_current,
     save_failure_state,
 )
 from mimir.pollers import _write_delivery_receipt
@@ -53,6 +55,57 @@ from mimir.pollers import _write_delivery_receipt
 
 def cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_incident_occurrence_is_stable_until_guarded_resolution(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first = record_failure(
+        state_dir,
+        issue_id=91,
+        attempt=2,
+        exit_status=1,
+        error="worker failed",
+        log_path="first.log",
+        preserved_ref="refs/heads/preserved",
+        work_path="/work/original",
+    )
+    mark_failure_notified(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    repeated = record_failure(
+        state_dir,
+        issue_id=91,
+        attempt=2,
+        exit_status=1,
+        error="worker failed",
+        log_path=None,
+    )
+
+    assert repeated["occurrence_id"] == first["occurrence_id"]
+    assert repeated["failed_at"] == first["failed_at"]
+    assert repeated["log_path"] == "first.log"
+    assert repeated["preserved_ref"] == "refs/heads/preserved"
+    assert repeated["work_path"] == "/work/original"
+    assert pending_failure_alerts(state_dir)[0] == {91}
+    assert pending_failure_alerts(state_dir)[1] == []
+    assert not resolve_failure_if_current(
+        state_dir, 91, first["signature"], "newer-occurrence"
+    )
+    assert resolve_failure_if_current(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    assert autonomous_dispatch_block_reason(state_dir, 91) is None
+
+
+def test_autonomous_admission_fails_closed_for_corrupt_incident_state(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "dispatch_failures.json").write_text("{", encoding="utf-8")
+
+    reason = autonomous_dispatch_block_reason(state_dir, 91)
+
+    assert reason is not None
+    assert "state unavailable" in reason
 
 
 class FakeChainlink:
@@ -2028,28 +2081,27 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     )
     assert failed.returncode == 1
     first = [json.loads(line) for line in failed.stdout.splitlines() if line.strip()]
-    alerts = [e for e in first if e.get("signal") == "worklink_run_failure_escalated"]
+    alerts = [e for e in first if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
     assert len(alerts) == 1
     assert alerts[0]["issue_id"] == 201
     assert alerts[0]["log"] == str(log_path)
     assert alerts[0]["terminal_error"] == "ValueError: bad config token=[REDACTED]"
-    assert alerts[0]["source_id"].endswith(alerts[0]["error_signature"])
+    assert alerts[0]["source_id"] == alerts[0]["delivery_key"]
+    assert "signal" not in alerts[0]
     assert alerts[0]["poller"] == "worklink-ready-queue"
     assert not [e for e in first if e.get("signal") == "worklink_dispatched"]
     assert not ambient_state_dir.exists()
     assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
 
     second = _run_poller(tmp_path, env)
-    retried = [e for e in second if e.get("signal") == "worklink_run_failure_escalated"]
+    retried = [e for e in second if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
     assert len(retried) == 1
     assert retried[0]["delivery_key"] == alerts[0]["delivery_key"]
-    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == [
-        retried[0]["error_signature"]
-    ]
+    assert load_failure_state(state_dir)["issues"]["201"]["notified_signatures"] == []
 
     _write_delivery_receipt(state_dir, alerts[0]["delivery_key"])
     delivered = _run_poller(tmp_path, env)
-    assert not [e for e in delivered if e.get("signal") == "worklink_run_failure_escalated"]
+    assert not [e for e in delivered if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")]
     assert not [e for e in second if e.get("signal") == "worklink_dispatched"]
 
     orchestrator._record_run_failure(
@@ -2062,7 +2114,7 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     )
     distinct = _run_poller(tmp_path, env)
     distinct_alerts = [
-        e for e in distinct if e.get("signal") == "worklink_run_failure_escalated"
+        e for e in distinct if str(e.get("delivery_key", "")).startswith("worklink-run-failure:")
     ]
     assert len(distinct_alerts) == 1
     assert distinct_alerts[0]["terminal_error"] == "RuntimeError: a distinct failure"
@@ -2071,6 +2123,7 @@ def test_poller_failure_escalation_dedupes_by_signature_and_recovers(
     state = load_failure_state(state_dir)
     state["issues"]["201"]["retry_after"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     save_failure_state(state_dir, state)
+    record_success(state_dir, 201)
     recovered = _run_poller(tmp_path, env)
     assert [e["issue_id"] for e in recovered if e.get("signal") == "worklink_dispatched"] == [201]
 
@@ -2088,7 +2141,7 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
     monkeypatch.setenv("WORKLINK_REPO", str(repo))
     poller = _load_poller_module()
     alert = {
-        "signal": "worklink_run_failure_escalated",
+        "prompt": "diagnose current incident",
         "issue_id": 201,
         "error_signature": "failed-201",
         "failure_occurrence_id": "occurrence-201",
@@ -2107,10 +2160,8 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
 
     def emit(event: dict) -> None:
         nonlocal receipt
-        if event.get("signal") == "worklink_run_failure_escalated":
+        if event.get("prompt"):
             order.append("alert-emitted")
-            assert event["delivery_barrier"] is True
-            receipt = True
 
     monkeypatch.setattr(poller, "_emit", emit)
     monkeypatch.setattr(
@@ -2147,6 +2198,9 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
     )
 
     assert poller.main() == 0
+    assert order == ["alert-emitted"]
+    receipt = True
+    assert poller.main() == 0
     assert order == [
         "alert-emitted",
         "alert-durably-acked",
@@ -2164,7 +2218,7 @@ def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     poller = _load_poller_module()
     alert = {
-        "signal": "worklink_run_failure_escalated",
+        "prompt": "diagnose current incident",
         "issue_id": 201,
         "error_signature": "failed-201",
         "failure_occurrence_id": "occurrence-201",
@@ -2195,8 +2249,6 @@ def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
     def emit(event: dict) -> None:
         nonlocal receipt
         events.append(event.copy())
-        if event.get("signal") == "worklink_run_failure_escalated":
-            receipt = True
 
     monkeypatch.setattr(poller, "_emit", emit)
     monkeypatch.setattr(poller, "delivery_receipt_exists", lambda _state, _key: receipt)
@@ -2209,12 +2261,10 @@ def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
     )
 
     assert poller.main() == 0
-    assert [event["signal"] for event in events] == [
-        "worklink_run_failure_escalated",
-        "worklink_ready_scan",
-    ]
+    assert events[0]["prompt"] == "diagnose current incident"
+    assert events[1]["signal"] == "worklink_ready_scan"
     assert events[-1]["dispatched"] == 0
-    assert "insufficient tick budget" in events[-1]["reason"]
+    assert "prompt emitted" in events[-1]["reason"]
 
 
 def test_epic_dispatch_backoff_prevents_attempt_each_poll_cycle(tmp_path: Path) -> None:
@@ -2264,13 +2314,13 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     poller = _load_poller_module()
     first = {
-        "signal": "worklink_run_failure_escalated",
+        "prompt": "first incident",
         "issue_id": 201,
         "error_signature": "first-signature",
         "failure_occurrence_id": "first-occurrence",
     }
     second = {
-        "signal": "worklink_run_failure_escalated",
+        "prompt": "second incident",
         "issue_id": 202,
         "error_signature": "second-signature",
         "failure_occurrence_id": "second-occurrence",
@@ -2305,13 +2355,11 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     monkeypatch.setattr(poller, "consume_worklink_budget_continuations", consume)
 
     assert poller.main() == 0
-    assert [event["signal"] for event in emitted] == [
-        "worklink_run_failure_escalated",
+    assert emitted[0]["prompt"] == "first incident"
+    assert [event["signal"] for event in emitted[1:]] == [
         "worklink_dispatch_failure_state_error",
-        "worklink_ready_scan",
     ]
     assert emitted[0]["delivery_key"].endswith("first-signature:first-occurrence")
-    assert "not acknowledged" in emitted[-1]["reason"]
     assert continuation_called is False
 
 

@@ -176,7 +176,12 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         pass
     try:
         if args.reattach:
-            result = run_worklink_reattach(home=home, repo=repo, issue_id=args.issue_id)
+            result = run_worklink_reattach(
+                home=home,
+                repo=repo,
+                issue_id=args.issue_id,
+                autonomous=args.autonomous,
+            )
         else:
             result = run_worklink(
                 home=home,
@@ -205,14 +210,16 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
         try:
             state = load_run_state(home, args.issue_id)
-            _record_run_failure(
-                home=home,
-                issue_id=args.issue_id,
-                attempt=state.attempt if state is not None else None,
-                error=exc,
-                exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
-                autonomous=args.autonomous,
-            )
+            if not getattr(exc, "_worklink_incident_recorded", False):
+                _record_run_failure(
+                    home=home,
+                    issue_id=args.issue_id,
+                    attempt=state.attempt if state is not None else None,
+                    error=exc,
+                    exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                    autonomous=args.autonomous,
+                    work_path=state.checkout if state is not None else None,
+                )
         finally:
             # Failure telemetry must never turn interruption into a normal exit.
             raise exc
@@ -345,6 +352,27 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except WorklinkError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except BaseException as exc:
+        from ..worklink.factory_state import load_factory_records_for_issue
+        from ..worklink.orchestrator import _record_run_failure
+
+        records = load_factory_records_for_issue(home, args.issue_id)
+        retained = records[0] if records else None
+        if not getattr(exc, "_worklink_incident_recorded", False):
+            try:
+                _record_run_failure(
+                    home=home,
+                    issue_id=args.issue_id,
+                    attempt=retained.attempt if retained is not None else None,
+                    error=exc,
+                    exit_status=130 if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)) else 1,
+                    autonomous=args.autonomous,
+                    run_id=retained.run_id if retained is not None else None,
+                    work_path=retained.sandbox if retained is not None else None,
+                )
+            except OSError:
+                pass
+        raise
 
     print(
         f"worklink:epic #{result.issue_id} attempt {result.attempt}: {result.status}"

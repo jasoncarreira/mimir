@@ -4574,7 +4574,7 @@ def test_worklink_receipt_pruning_preserves_barrier_crash_window_and_negative_co
     consumer = worklink_receipt_consumer
     emitted = []
     monkeypatch.setattr(consumer, "_emit", emitted.append)
-    budget = SimpleNamespace(hard_exhausted=lambda: True)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
     ledger = (state / failures.STATE_FILE).read_bytes()
     assert consumer._deliver_failure_alerts(state, failures.pending_failure_alerts(state)[1], budget)
     assert emitted == []
@@ -4586,7 +4586,8 @@ def test_worklink_receipt_pruning_preserves_barrier_crash_window_and_negative_co
     receipt.unlink()
     assert not consumer._deliver_failure_alerts(state, failures.pending_failure_alerts(state)[1], budget)
     assert len(emitted) == 1
-    assert emitted[0]["delivery_barrier"] is True
+    assert "delivery_barrier" not in emitted[0]
+    assert emitted[0]["prompt"].startswith("Worklink incident")
 
 
 @pytest.mark.parametrize("ancestor", ["state", "pollers", "worklink-ready-queue"])
@@ -4661,15 +4662,15 @@ def test_worklink_stale_alert_snapshot_not_reemitted_after_receipt_pruning(
     else:
         failures.record_success(state, 42)
     _prune_delivery_receipts(cfg, home)
-    assert not receipt.exists()
+    assert receipt.exists() is (transition == "same-signature")
     emitted = Mock()
     monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted)
-    budget = SimpleNamespace(hard_exhausted=lambda: pytest.fail("stale snapshot entered wait"))
+    budget = SimpleNamespace(hard_exhausted=lambda: pytest.fail("stale snapshot entered emit"))
     assert worklink_receipt_consumer._deliver_failure_alerts(state, snapshot, budget)
     emitted.assert_not_called()
 
 
-def test_worklink_emission_is_locked_but_wait_releases_lock_and_revalidates(
+def test_worklink_prompt_emission_is_locked_and_does_not_wait_for_receipt(
     home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch,
 ):
     failures, state, cfg, record = worklink_receipts
@@ -4685,24 +4686,11 @@ def test_worklink_emission_is_locked_but_wait_releases_lock_and_revalidates(
                 fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         emitted.append(alert)
 
-    def begin_wait():
-        # A competing process can acknowledge and prune between emission and
-        # the receipt check. The waiter must finish from the updated cursor.
-        with lock_path.open("a") as probe:
-            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _write_delivery_receipt(state, key)
-        failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
-        _prune_delivery_receipts(cfg, home)
-        assert not receipt.exists()
-        return False
-
     monkeypatch.setattr(worklink_receipt_consumer, "_emit", emit)
-    budget = SimpleNamespace(
-        hard_exhausted=begin_wait,
-        hard_remaining=lambda: pytest.fail("acknowledged cursor did not finish the wait"),
-    )
-    assert worklink_receipt_consumer._deliver_failure_alerts(state, alerts, budget)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
+    assert not worklink_receipt_consumer._deliver_failure_alerts(state, alerts, budget)
     assert len(emitted) == 1
+    assert not receipt.exists()
 
 
 @pytest.mark.parametrize("broken", [
@@ -4753,8 +4741,8 @@ def test_worklink_receipt_acknowledgement_failure_and_stale_occurrence_remain_sa
     home: Path, worklink_receipts, monkeypatch,
 ):
     failures, state, cfg, record = worklink_receipts
-    old, _, obsolete = record()
-    current, key, receipt = record()
+    old, _, obsolete = record(error="old failure")
+    current, key, receipt = record(error="current failure")
     failures.mark_failure_notified(state, 42, old["signature"], old["occurrence_id"])
     with monkeypatch.context() as patch:
         patch.setattr(failures, "save_failure_state", Mock(side_effect=OSError("disk full")))
