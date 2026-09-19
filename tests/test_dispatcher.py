@@ -258,6 +258,79 @@ async def test_poller_delivery_without_relevance_predicate_is_unchanged(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["resolved", "superseded"])
+async def test_worklink_incident_relevance_drops_stale_turn_before_model(
+    tmp_path: Path, transition: str,
+) -> None:
+    from mimir.pollers import _worklink_recovery_relevance_check
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        record_failure,
+        record_success,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    entry = record_failure(
+        state_dir,
+        issue_id=441,
+        attempt=1,
+        exit_status=1,
+        error="original failure",
+        log_path="run.log",
+    )
+    key = f"worklink-run-failure:441:{entry['signature']}:{entry['occurrence_id']}"
+    incident = AgentEvent(
+        trigger="poller",
+        channel_id="poller:worklink-ready-queue",
+        content="diagnose",
+        source="poller",
+        source_id=key,
+        extra={
+            "poller_name": "worklink-ready-queue",
+            "items": [{
+                "issue_id": 441,
+                "error_signature": entry["signature"],
+                "failure_occurrence_id": entry["occurrence_id"],
+                "delivery_key": key,
+            }],
+        },
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    delivered: list[str | None] = []
+
+    async def runner(event: AgentEvent) -> None:
+        delivered.append(event.source_id)
+        if event.source_id == "blocker":
+            entered.set()
+            await release.wait()
+
+    disp = Dispatcher(_make_config(tmp_path), runner)
+    blocker = replace(incident, source_id="blocker", content="hold")
+    assert await disp.enqueue(blocker)
+    await entered.wait()
+    assert await disp.enqueue(
+        incident,
+        relevance_check=_worklink_recovery_relevance_check(state_dir),
+    )
+    if transition == "resolved":
+        record_success(state_dir, 441)
+    else:
+        record_failure(
+            state_dir,
+            issue_id=441,
+            attempt=2,
+            exit_status=1,
+            error="newer failure",
+            log_path="newer.log",
+        )
+    release.set()
+    await disp.drain()
+
+    assert delivered == ["blocker"]
+
+
+@pytest.mark.asyncio
 async def test_separate_channels_run_concurrently(tmp_path: Path):
     cfg = _make_config(tmp_path)
     started = asyncio.Event()

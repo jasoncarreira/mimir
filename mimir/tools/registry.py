@@ -2878,8 +2878,11 @@ async def worklink_run(
       * Sheds under resource pressure — if the HomeostaticArbiter says the
         worklink priority can't fire (e.g. severity TIGHT), the dispatch is
         refused and you should try later. Use ``mimir worklink run`` to force.
-      * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
-        worklink.yaml, default 2) across all in-flight Worklink workers.
+       * Respects the concurrent-claim cap (``defaults.max_concurrent`` in
+         worklink.yaml, default 2) across all in-flight Worklink workers.
+      * Refuses fresh work while an unresolved incident or retained run exists.
+        Inspect the retained state and escalate when no authorized recovery is
+        available; do not use this fresh-run tool as incident recovery.
 
     Note: a leaf run is synchronous and can take minutes — pick small,
     well-scoped ready leaves. Per-issue exclusivity is guaranteed by the

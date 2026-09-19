@@ -51,6 +51,7 @@ from mimir.worklink.dispatch_failures import (
     failure_state_transaction,
     mark_failure_notified,
     pending_failure_alerts,
+    record_failure,
 )
 
 
@@ -365,6 +366,15 @@ def _dispatch(
             start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError) as exc:
+        record_failure(
+            state_dir,
+            issue_id=item.issue_id,
+            attempt=None,
+            exit_status=1,
+            error=f"detached {item.mode} dispatch failed: {exc}",
+            log_path=str(log_path),
+            work_path=repo,
+        )
         _emit(
             {
                 "signal": "worklink_dispatch_failed",
@@ -400,7 +410,7 @@ def _deliver_failure_alerts(
     alerts: list[dict[str, object]],
     tick_budget: TickBudget,
 ) -> bool:
-    """Emit alerts and wait for the framework's durable delivery barriers."""
+    """Offer prompt alerts; receipts are observed on a later poller tick."""
     def still_pending(state, alert):
         entry = state["issues"].get(str(alert["issue_id"]))
         return (
@@ -411,12 +421,12 @@ def _deliver_failure_alerts(
             and alert["error_signature"] not in (entry.get("notified_signatures") or [])
         )
 
-    pending: dict[str, dict[str, object]] = {}
+    emitted = False
     for alert in alerts:
-        delivery_key = (
+        delivery_key = str(alert.get("delivery_key") or (
             f"worklink-run-failure:{alert['issue_id']}:"
             f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
-        )
+        ))
         # The supplied alert list is only a snapshot. Revalidate under the
         # janitor/writer lock and keep it through receipt check and emission;
         # an acknowledged receipt may already have been reclaimed.
@@ -425,10 +435,11 @@ def _deliver_failure_alerts(
                 continue
             delivered = delivery_receipt_exists(state_dir, delivery_key)
             if not delivered:
+                if tick_budget.hard_exhausted():
+                    return False
                 alert["delivery_key"] = delivery_key
-                alert["delivery_barrier"] = True
                 _emit(alert)
-                pending[delivery_key] = alert
+                emitted = True
         if delivered:
             mark_failure_notified(
                 state_dir,
@@ -437,26 +448,7 @@ def _deliver_failure_alerts(
                 alert["failure_occurrence_id"],
             )
 
-    while pending and not tick_budget.hard_exhausted():
-        # Never hold the ledger lock while waiting for framework acknowledgement.
-        # Another consumer may acknowledge and prune before this waiter observes
-        # the receipt, so the cursor is also a terminal condition for the wait.
-        with failure_state_transaction(state_dir) as state:
-            acknowledged = [
-                key for key, alert in pending.items()
-                if not still_pending(state, alert) or delivery_receipt_exists(state_dir, key)
-            ]
-        for key in acknowledged:
-            alert = pending.pop(key)
-            mark_failure_notified(
-                state_dir,
-                int(alert["issue_id"]),
-                str(alert["error_signature"]),
-                alert["failure_occurrence_id"],
-            )
-        if pending:
-            time.sleep(min(0.05, max(0.0, tick_budget.hard_remaining())))
-    return not pending
+    return not emitted
 
 
 def main() -> int:
@@ -485,14 +477,13 @@ def main() -> int:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
         alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
     except OSError as exc:
-        backed_off_ids = set()
-        alerts_acknowledged = False
         _emit({"signal": "worklink_dispatch_failure_state_error", "reason": str(exc)})
+        return 0
     if not alerts_acknowledged:
         _emit(
             {
                 "signal": "worklink_ready_scan",
-                "reason": "failure alert delivery was not acknowledged before the tick deadline; skipping dispatch",
+                "reason": "failure incident prompt emitted; skipping dispatch",
                 "dispatched": 0,
             }
         )

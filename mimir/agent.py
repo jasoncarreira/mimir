@@ -154,6 +154,7 @@ from .worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
     maybe_create_worklink_budget_continuation,
 )
+from .worklink.dispatch_failures import is_dispatch_failure_intervention
 
 log = logging.getLogger(__name__)
 
@@ -2293,6 +2294,10 @@ class Agent:
         outer early-failure guard (crashes before the model loop) — which are
         disjoint via ``ctx.outcome_emitted``, so a failure notifies exactly
         once. Never raises."""
+        if ctx is not None and getattr(ctx, "deliver_failure_notice_attempted", False):
+            return
+        if ctx is not None:
+            ctx.deliver_failure_notice_attempted = True
         deliver = resolve_deliver_channel(
             (event.extra or {}).get("deliver"),
             getattr(self._config, "operator_alert_channel", ""),
@@ -3173,7 +3178,13 @@ class Agent:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
-                await self._post_deliver_failure(event, error, ctx)
+            if error or is_dispatch_failure_intervention(event):
+                failure_detail = (
+                    error
+                    or str(result_fields["result_subtype"] or result_fields["stop_reason"])
+                    or "incident intervention failed"
+                )
+                await self._post_deliver_failure(event, failure_detail, ctx)
         elif event.trigger == "poller":
             # Success counterpart to ``turn_failed`` for poller turns
             # (chainlink #262): records that this poller item's turn was
@@ -3400,7 +3411,7 @@ class Agent:
             **result_fields,
         )
         await self._turn_logger.write(record)
-        if ctx.tool_call_budget_exhausted:
+        if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
                 try:

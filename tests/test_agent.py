@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -439,6 +440,57 @@ class _ServicePrincipalToolProbeAgent(_FakeAgent):
             _handler,
         )
 
+        async for chunk in super().astream(
+            state, config=config, stream_mode=stream_mode,
+        ):
+            yield chunk
+
+
+class _WorklinkToolProbeAgent(_FakeAgent):
+    """Model-boundary double that executes the real Worklink tool middleware."""
+
+    def __init__(self, issue_id: int) -> None:
+        super().__init__([AIMessage(content="worklink tool probed")])
+        self.issue_id = issue_id
+        self.result: ToolMessage | None = None
+
+    async def astream(
+        self,
+        state: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context=None,
+        stream_mode: str = "values",
+    ):
+        from mimir._context import get_current_turn
+        from mimir.tools import registry
+
+        turn = get_current_turn()
+        assert turn is not None
+        gate = BudgetGateMiddleware()
+
+        async def handler(request: ToolCallRequest) -> ToolMessage:
+            content = await registry.worklink_run.ainvoke(request.tool_call["args"])
+            return ToolMessage(
+                content=content,
+                tool_call_id=request.tool_call["id"],
+                name="worklink_run",
+            )
+
+        self.result = await gate.awrap_tool_call(
+            ToolCallRequest(
+                tool_call={
+                    "name": "worklink_run",
+                    "args": {"issue_id": self.issue_id},
+                    "id": "tc-worklink-run",
+                    "type": "tool_call",
+                },
+                tool=registry.worklink_run,
+                state=None,
+                runtime=Runtime(context=turn.auth_context),
+            ),
+            handler,
+        )
         async for chunk in super().astream(
             state, config=config, stream_mode=stream_mode,
         ):
@@ -5560,6 +5612,9 @@ class _RecordingChannels:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
 
+    def find(self, channel_id: str) -> object:
+        return self
+
     async def send(self, channel_id, text, attachment_paths=None, *, final=True):
         self.sent.append((channel_id, text))
 
@@ -5615,6 +5670,214 @@ async def test_deliver_failure_notice_fires_on_early_phase_crash(
 
     notices = [(c, t) for c, t in chans.sent if c == "poller:px"]
     assert notices == [("poller:px", "⚠️ px failed: RuntimeError: early boom")]
+
+
+async def test_incident_budget_result_failure_sends_one_notice_without_continuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.agent as agent_mod
+    from mimir.access_control import CapabilityTier, build_trigger_service_principal
+
+    fake_model = _BudgetExhaustingAgent(
+        response_messages=[AIMessage(content="budget exhausted")]
+    )
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_model,
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    channels = _RecordingChannels()
+    agent._channels = channels  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        agent_mod,
+        "maybe_create_worklink_budget_continuation",
+        lambda **kwargs: pytest.fail("incident created a continuation"),
+    )
+    authority = build_trigger_service_principal(
+        canonical="poller:worklink-ready-queue",
+        trigger="poller",
+        profile="github",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("send_message", "operator_alert"),
+        creation_path="mimir/optional-skills/chainlink-orchestrator/pollers.json",
+    )
+    signature = "deadbeef"
+    occurrence = "occurrence-1"
+    delivery_key = f"worklink-run-failure:441:{signature}:{occurrence}"
+    event = AgentEvent(
+        trigger="poller",
+        channel_id=authority.canonical,
+        content="diagnose incident",
+        source="poller",
+        source_id=delivery_key,
+        service_principal=authority.canonical,
+        service_authority=authority,
+        extra={
+            "deliver": authority.canonical,
+            "poller_name": "worklink-ready-queue",
+            "items": [{
+                "issue_id": 441,
+                "error_signature": signature,
+                "failure_occurrence_id": occurrence,
+                "delivery_key": delivery_key,
+            }],
+        },
+    )
+
+    record = await agent.run_turn(event)
+
+    assert record.result_is_error is True
+    assert record.result_subtype == "tool_budget_exhausted"
+    assert len(fake_model.invocations) == 1
+    assert channels.sent == [(
+        authority.canonical,
+        "⚠️ worklink-ready-queue failed: tool_budget_exhausted",
+    )]
+    assert not (tmp_path / "state" / "worklink" / "continuations").exists()
+
+
+async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.agent as agent_mod
+    from mimir.dispatcher import Dispatcher
+    from mimir.pollers import discover_pollers, run_poller
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
+    )
+
+    home = tmp_path / "home"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    pollers = discover_pollers(
+        Path(__file__).parents[1] / "mimir" / "optional-skills",
+        state_root=state_root,
+    )
+    poller = next(item for item in pollers if item.name == "worklink-ready-queue")
+    incident_state_dir = dispatch_failure_state_dir(home)
+    incident = record_failure(
+        incident_state_dir,
+        issue_id=441,
+        attempt=2,
+        exit_status=1,
+        error="backend failed",
+        log_path=str(home / "state" / "worklink" / "runs" / "441.log"),
+        preserved_ref="issue/441-a2",
+        work_path=str(tmp_path / "retained-checkout"),
+    )
+    poller = replace(
+        poller,
+        deliver=poller.channel_id(),
+    )
+    fake_model = _BudgetExhaustingAgent(
+        response_messages=[AIMessage(content="budget exhausted")]
+    )
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_model,
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+    channels = _RecordingChannels()
+    agent._channels = channels  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        agent_mod,
+        "maybe_create_worklink_budget_continuation",
+        lambda **kwargs: pytest.fail("incident created a continuation"),
+    )
+    dispatcher = Dispatcher(_make_config(home), agent.run_turn)
+    agent._dispatcher = dispatcher
+
+    assert await run_poller(poller, enqueue=dispatcher.enqueue, home=home) == 1
+    await dispatcher.drain()
+
+    assert len(fake_model.invocations) == 1
+    assert len(channels.sent) == 1
+    assert load_failure_state(incident_state_dir)["issues"]["441"][
+        "occurrence_id"
+    ] == incident["occurrence_id"]
+    assert not (home / "state" / "worklink" / "continuations").exists()
+
+    assert await run_poller(poller, enqueue=dispatcher.enqueue, home=home) == 0
+    await dispatcher.drain()
+    assert len(fake_model.invocations) == 1
+    assert len(channels.sent) == 1
+
+
+@pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
+async def test_model_tool_middleware_reaches_core_refusal_after_stale_poller_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+) -> None:
+    from mimir.pollers import discover_pollers
+    from mimir.tools import registry
+    from mimir.worklink import autonomy
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+
+    home = tmp_path / "home"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    if enforced:
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    else:
+        monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    poller = next(
+        item
+        for item in discover_pollers(
+            Path(__file__).parents[1] / "mimir" / "optional-skills",
+            state_root=state_root,
+        )
+        if item.name == "worklink-ready-queue"
+    )
+    authority = poller.resolved_authority()
+    selected_before_incident = AgentEvent(
+        trigger="poller",
+        channel_id=authority.canonical,
+        content="ready issue 443 selected before the incident write",
+        source="poller",
+        service_principal=authority.canonical,
+        service_authority=authority,
+        extra={"poller_name": "worklink-ready-queue"},
+    )
+    # The poller selection is already represented by the event. The ledger wins
+    # the race before the model's real tool call reaches the core executor.
+    record_failure(
+        dispatch_failure_state_dir(home),
+        issue_id=443,
+        attempt=1,
+        exit_status=1,
+        error="retained recovery required",
+        log_path="run.log",
+    )
+    monkeypatch.setattr(
+        autonomy,
+        "check_concurrency",
+        lambda home, **kwargs: autonomy.ConcurrencyCheck(True, 0, 2),
+    )
+    registry.set_arbiter(None)
+    model = _WorklinkToolProbeAgent(443)
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=model,
+        fake_saga=_FakeSaga(query_hits=[]),
+    )
+
+    record = await agent.run_turn(selected_before_incident)
+
+    assert record.result_is_error is False
+    assert len(model.invocations) == 1
+    assert model.result is not None
+    assert model.result.status != "error"
+    assert "worklink_run #443: refused" in str(model.result.content)
+    assert "unresolved Worklink incident" in str(model.result.content)
 
 
 async def test_cross_channel_deliver_failure_notice_is_denied_under_enforcement(

@@ -5,6 +5,7 @@
       "command": "python3 scripts/poller.py",
       "cron": "*/10 * * * *",
       "priority": "normal",
+      "deliver": "OPERATOR_CHANNEL",
       "authority": {
         "profile": "github",
         "tier": "code-execution",
