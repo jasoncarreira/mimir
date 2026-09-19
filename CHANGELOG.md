@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.1, matching the
+  exact-match `FACTORY_VERSION` admission check. All three published packages
+  (`feature-factory`, `opencode-feature-factory`, `prime-agent-feature-factory`)
+  are 0.9.1, and the two adapter workflows are byte-identical to the canonical
+  one, verified from the published tarballs rather than the build log.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.0. The release
   removes the imported production-line ceiling that the factory's own brief
   imposed on projects, and adds `factory decide` plus workflow refresh on resume
