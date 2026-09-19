@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -26,10 +28,183 @@ from mimir.worklink.factory_state import (
 )
 from mimir.worklink.run_state import (
     WorklinkRunState,
+    load_run_state,
     process_is_alive,
     process_start_ticks,
     save_run_state,
 )
+
+
+def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:
+    record = FactoryRunRecord(
+        run_id=run_id, issue_id=700, attempt=2, repository="owner/repo",
+        base_ref="main", branch="epic/700", launcher="/opt/factory.js",
+        sandbox=str(home / run_id), session="session-1",
+        handle=LaunchHandle("local_subprocess", run_id, 99, 4321),
+        status=None, observed_at=None, controller_phase="running",
+    )
+    save_factory_record(home, record)
+    return record
+
+
+@pytest.fixture
+def claim_runner():
+    locks = {700}
+    labels = {"worklink:epic", "worklink:in-progress"}
+
+    def run(args):
+        if args == ["chainlink", "locks", "release", "700"]:
+            locks.remove(700)
+        else:
+            assert args == ["chainlink", "issue", "unlabel", "700", "worklink:in-progress"]
+            labels.remove("worklink:in-progress")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    return Mock(side_effect=run), locks, labels
+
+
+@pytest.mark.parametrize(
+    "ticks,observed,zombie,kill_error,dead",
+    [
+        pytest.param(99, 99, True, None, True, id="zombie"),
+        pytest.param(99, 100, False, None, True, id="mismatch"),
+        pytest.param(None, 99, False, None, False, id="null-ticks-live"),
+        pytest.param(None, None, False, ProcessLookupError(errno.ESRCH, "gone"), True,
+                     id="null-ticks-dead-esrch"),
+        pytest.param(99, None, False, None, False, id="unreadable-observed-ticks"),
+        pytest.param(99, None, False, ProcessLookupError(errno.ESRCH, "gone"), True,
+                     id="dead"),
+        pytest.param(99, 99, False, PermissionError(errno.EPERM, "denied"), False,
+                     id="permission-error"),
+    ],
+)
+def test_stop_rejected_factory_identity(
+    tmp_path, monkeypatch, claim_runner, ticks, observed, zombie, kill_error, dead,
+):
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+
+    record = _factory(tmp_path)
+    record = replace(record, handle=replace(record.handle, process_start_ticks=ticks))
+    save_factory_record(tmp_path, record)
+    save_run_state(tmp_path, WorklinkRunState(
+        issue_id=700, attempt=1, backend="feature_factory", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier="1234", process_start_ticks=1,
+        branch="epic/700", base_ref="main", local_base="main", repo=str(tmp_path),
+        repo_url="", test_command=None, started_at="2026-09-11T00:00:00+00:00",
+    ))
+    monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+    kill = Mock(side_effect=kill_error)
+    monkeypatch.setattr(factory_state.os, "kill", kill)
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: zombie)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: observed)
+    cancel = AsyncMock()
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    runner, locks, labels = claim_runner
+
+    result = stop_worklink(tmp_path, 700, runner=runner)
+
+    cancel.assert_not_called()
+    assert kill.call_args_list == [call(4321, 0), call(4321, 0)]
+    assert not result.stopped
+    assert result.reason and result.reason != "no live run"
+    assert f"factory {record.run_id} handle={record.handle}" in result.reason
+    assert "refusing to signal it" in result.reason
+    assert result.state_cleared and load_run_state(tmp_path, 700) is None
+    assert result.claim_released is dead and result.label_cleared is dead
+    saved = load_factory_record(tmp_path, record.run_id)
+    if dead:
+        assert "recorded process has exited; cleaning stale state" in result.reason
+        assert saved == replace(record, controller_phase="stopped", controller_error=(
+            result.reason.split("; recorded process has exited")[0]
+        ))
+        assert locks == set() and labels == {"worklink:epic"}
+    else:
+        assert "exit unverified; state and claim retained" in result.reason
+        assert saved == record
+        runner.assert_not_called()
+        assert locks == {700} and labels == {"worklink:epic", "worklink:in-progress"}
+
+
+@pytest.mark.parametrize("dead", [False, True], ids=["still-alive", "exited"])
+@pytest.mark.parametrize("error", [KeyError("missing job"), RuntimeError("offline"), OSError("failed")])
+def test_stop_factory_cancel_failure(tmp_path, monkeypatch, claim_runner, dead, error):
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+
+    record = _factory(tmp_path)
+    kill = Mock(side_effect=[None, ProcessLookupError(errno.ESRCH, "gone") if dead else None])
+    monkeypatch.setattr(factory_state.os, "kill", kill)
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: 99)
+    cancel = AsyncMock(side_effect=error)
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    runner, locks, labels = claim_runner
+
+    result = stop_worklink(tmp_path, 700, runner=runner)
+
+    cancel.assert_awaited_once_with(record.handle)
+    assert kill.call_args_list == [call(4321, 0), call(4321, 0)]
+    assert not result.stopped
+    problem = f"factory {record.run_id}: cancellation failed: {error}"
+    assert problem in result.reason and result.reason != "no live run"
+    assert result.claim_released is dead and result.label_cleared is dead
+    if dead:
+        assert "cleaning stale state" in result.reason
+        assert load_factory_record(tmp_path, record.run_id) == replace(
+            record, controller_phase="stopped", controller_error=problem,
+        )
+        assert locks == set() and labels == {"worklink:epic"}
+    else:
+        assert "exit unverified; state and claim retained" in result.reason
+        assert load_factory_record(tmp_path, record.run_id) == record
+        runner.assert_not_called()
+        assert locks == {700} and labels == {"worklink:epic", "worklink:in-progress"}
+
+
+@pytest.mark.parametrize("live_id", ["chainlink-700", "700"])
+@pytest.mark.parametrize("other", ["dead", "uncertain", "live"])
+def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, live_id, other):
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+
+    live = _factory(tmp_path, live_id)
+    other_id = "700" if live_id == "chainlink-700" else "chainlink-700"
+    second = replace(_factory(tmp_path, other_id), handle=LaunchHandle(
+        "local_subprocess", other_id, None if other == "uncertain" else 99, 4322,
+    ))
+    save_factory_record(tmp_path, second)
+    monkeypatch.setattr(factory_state.os, "kill", Mock())
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(factory_state, "process_start_ticks",
+                        lambda pid: 100 if pid == 4322 and other == "dead" else 99)
+    cancel = AsyncMock()
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    runner, locks, labels = claim_runner
+
+    result = stop_worklink(tmp_path, 700, runner=runner)
+
+    expected = [call(live.handle)] + ([call(second.handle)] if other == "live" else [])
+    cancel.assert_has_awaits(expected, any_order=True)
+    assert cancel.await_count == len(expected)
+    assert load_factory_record(tmp_path, live_id) == replace(live, controller_phase="stopped")
+    saved = load_factory_record(tmp_path, other_id)
+    assert saved.controller_phase == ("running" if other == "uncertain" else "stopped")
+    assert result.stopped is (other == "live")
+    assert result.claim_released is (other != "uncertain")
+    assert result.label_cleared is (other != "uncertain")
+    if other == "uncertain":
+        assert saved == second
+        assert "exit unverified; state and claim retained" in result.reason
+        runner.assert_not_called()
+        assert locks == {700} and labels == {"worklink:epic", "worklink:in-progress"}
+    else:
+        assert locks == set() and labels == {"worklink:epic"}
+        if other == "dead":
+            assert f"factory {other_id}" in result.reason
+            assert "cleaning stale state" in result.reason
+        else:
+            assert result.reason is None
 
 
 # Like the supervisor fixtures, register every generation and acknowledge
