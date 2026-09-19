@@ -1262,6 +1262,13 @@ def test_reap_for_home_uses_config_ttl(
     claims = ChainlinkClaims(agent_id="t", runner=fake)
     reaped = autonomy.reap_stale_claims_for_home(tmp_path, claims=claims)
     assert [r.issue_id for r in reaped.reaped] == [60]
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["60"]
+    assert incident["active"] is True
+    assert incident["attempt"] == 1
+    assert incident["exit_status"] is None
+    assert incident["terminal_error"] == (
+        "stale autonomous claim reaped after heartbeat expiry; target worklink:ready"
+    )
 
 
 @pytest.mark.parametrize(
