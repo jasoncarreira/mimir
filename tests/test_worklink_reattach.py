@@ -14,7 +14,7 @@ from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, WorklinkDefaults
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
-from mimir.worklink.orchestrator import WorklinkRunner
+from mimir.worklink.orchestrator import WorklinkRunResult, WorklinkRunner, run_worklink_reattach
 from mimir.worklink.run_state import (
     WorklinkRunState,
     clear_run_state,
@@ -518,6 +518,99 @@ def test_reattach_worker_lost_redispatches_to_ready(tmp_path: Path) -> None:
     assert ["chainlink", "issue", "label", str(issue_id), "worklink:ready"] in calls
     assert not any(isinstance(a, list) and a[:3] == ["gh", "pr", "create"] for a in calls)
     assert load_run_state(tmp_path, issue_id) is None
+
+
+def test_reattach_incident_write_failure_preserves_claim_and_retained_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    issue_id = 562
+    _save_inflight_state(tmp_path, repo, issue_id=issue_id, job="job-gone")
+    calls: list = []
+    runner = _remote_runner(
+        repo, calls, issue_id=issue_id, labels=["worklink:in-progress"]
+    )
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(FakeBackend())
+    registry.register_compute(FakeRemoteCompute(wait_result=ComputeResult(
+        exit_code=-1,
+        stdout="",
+        stderr="broker gone",
+        launch_error="broker wait failed",
+    )))
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_run_failure",
+        lambda **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        asyncio.run(
+            WorklinkRunner(
+                home=tmp_path, repo=repo, runner=runner, registry=registry
+            ).reattach(issue_id, autonomous=True)
+        )
+
+    assert load_run_state(tmp_path, issue_id) is not None
+    assert not any(
+        isinstance(call, list) and call[1:3] == ["locks", "release"]
+        for call in calls
+    )
+    assert not any(
+        isinstance(call, list) and call[1:3] in (["issue", "label"], ["issue", "unlabel"])
+        for call in calls
+    )
+
+
+def test_successful_reattach_cannot_resolve_newer_concurrent_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    first = record_failure(
+        state_dir,
+        issue_id=562,
+        attempt=1,
+        exit_status=1,
+        error="startup reattach failed",
+        log_path="reattach-562.log",
+    )
+
+    async def completed_with_race(
+        self: WorklinkRunner, issue_id: int, **kwargs: object
+    ) -> WorklinkRunResult:
+        record_failure(
+            state_dir,
+            issue_id=issue_id,
+            attempt=1,
+            exit_status=1,
+            error="newer retained failure",
+            log_path="newer.log",
+        )
+        return WorklinkRunResult(issue_id, 1, "completed")
+
+    monkeypatch.setattr(WorklinkRunner, "reattach", completed_with_race)
+
+    result = run_worklink_reattach(
+        home=tmp_path,
+        repo=tmp_path / "repo",
+        issue_id=562,
+        autonomous=True,
+    )
+
+    current = load_failure_state(state_dir)["issues"]["562"]
+    assert result.status == "completed"
+    assert current["active"] is True
+    assert current["occurrence_id"] != first["occurrence_id"]
+    assert current["terminal_error"] == "newer retained failure"
 
 
 def test_reattach_skips_when_leaf_no_longer_in_progress(tmp_path: Path) -> None:

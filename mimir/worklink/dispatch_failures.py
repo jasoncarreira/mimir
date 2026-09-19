@@ -187,6 +187,7 @@ def record_failure(
     preservation_error: str | None = None,
     run_id: str | None = None,
     work_path: str | None = None,
+    transcript_path: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
@@ -261,6 +262,11 @@ def record_failure(
             "work_path": redact_text(
                 work_path if work_path is not None else str(prior.get("work_path") or "")
             )[:1000] or None,
+            "transcript_path": redact_text(
+                transcript_path
+                if transcript_path is not None
+                else str(prior.get("transcript_path") or "")
+            )[:1000] or None,
             "notified_signatures": list(prior.get("notified_signatures") or [])[
                 -MAX_NOTIFIED_SIGNATURES:
             ] if same_occurrence else [],
@@ -288,10 +294,10 @@ def pending_failure_alerts(
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
             notified = list(notified) if isinstance(notified, list) else []
+            occurrence_id = str(entry.get("occurrence_id") or uuid.uuid4().hex)
+            if not entry.get("occurrence_id"):
+                entry["occurrence_id"] = occurrence_id
             if signature and signature not in notified:
-                occurrence_id = str(entry.get("occurrence_id") or uuid.uuid4().hex)
-                if not entry.get("occurrence_id"):
-                    entry["occurrence_id"] = occurrence_id
                 delivery_key = (
                     f"worklink-run-failure:{issue_id}:{signature}:{occurrence_id}"
                 )
@@ -318,6 +324,7 @@ def pending_failure_alerts(
                         f"Retained leaf record: {leaf_record}\n"
                         f"Retained factory record: {factory_record}\n"
                         f"Log: {entry.get('log_path') or '(none)'}\n"
+                        f"Transcript: {entry.get('transcript_path') or '(none)'}\n"
                         f"Work: {entry.get('work_path') or entry.get('preserved_ref') or '(none)'}"
                     ),
                     "source_id": delivery_key,
@@ -333,6 +340,7 @@ def pending_failure_alerts(
                     "preservation_error": entry.get("preservation_error"),
                     "run_id": entry.get("run_id"),
                     "work_path": entry.get("work_path"),
+                    "transcript": entry.get("transcript_path"),
                     "retry_after": entry.get("retry_after"),
                     "delivery_key": delivery_key,
                 })

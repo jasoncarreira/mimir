@@ -675,6 +675,50 @@ def test_reaper_blocks_after_max_attempts() -> None:
     assert ["chainlink", "issue", "label", "2", "worklink:ready"] not in calls
 
 
+def test_reaper_persists_incident_before_force_steal_and_write_failure_preserves_lock() -> None:
+    calls: list[list[str]] = []
+    now = datetime(2026, 9, 19, tzinfo=UTC)
+    stale = ClaimRecord(2, 1, "stale", now - timedelta(hours=3))
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        argv = list(args)
+        calls.append(argv)
+        if argv[1:3] == ["locks", "list"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"locks": {"2": {"issue_id": 2}}}), ""
+            )
+        if argv[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "labels": ["worklink:in-progress"],
+                    "comments": [stale.to_comment()],
+                }),
+                "",
+            )
+        return completed(argv)
+
+    claims = ChainlinkClaims(
+        agent_id="mimir-a", runner=runner, clock=lambda: now
+    )
+
+    def disk_failure(record: ClaimRecord, transition: str) -> None:
+        assert record == stale
+        assert transition == "ready"
+        assert not any(call[1:3] == ["locks", "steal"] for call in calls)
+        raise OSError("disk full")
+
+    result = claims.reap_stale_claims(
+        [stale], ttl=timedelta(hours=1), before_rearm=disk_failure
+    )
+
+    assert result.reaped == []
+    assert result.skipped == {"incident_record_failed": 1}
+    assert not any(call[1:3] in (["locks", "steal"], ["locks", "release"]) for call in calls)
+    assert not any(call[1:3] in (["issue", "label"], ["issue", "unlabel"]) for call in calls)
+
+
 @pytest.mark.parametrize(
     ("scenario", "reason", "event_type"),
     [

@@ -108,6 +108,26 @@ def test_autonomous_admission_fails_closed_for_corrupt_incident_state(tmp_path: 
     assert "state unavailable" in reason
 
 
+def test_acknowledged_legacy_active_incident_gets_stable_occurrence(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    with failure_state_transaction(state_dir) as state:
+        state["issues"]["91"] = {
+            "active": True,
+            "issue_id": 91,
+            "signature": "legacy-signature",
+            "notified_signatures": ["legacy-signature"],
+        }
+
+    blocked, alerts = pending_failure_alerts(state_dir)
+    migrated = load_failure_state(state_dir)["issues"]["91"]
+
+    assert blocked == {91}
+    assert alerts == []
+    assert migrated["notified_signatures"] == ["legacy-signature"]
+    assert isinstance(migrated["occurrence_id"], str)
+    assert migrated["occurrence_id"]
+
+
 class FakeChainlink:
     """Records chainlink invocations and answers from canned tables."""
 
@@ -1455,6 +1475,45 @@ async def test_worklink_run_dispatches_when_clear_using_worklink_repo(_tool_env)
     assert dispatched[0]["autonomous"] is True
     # the executor runs against WORKLINK_REPO, not the server process cwd
     assert dispatched[0]["repo"] == str(repo_dir)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforced", [False, True], ids=["advisory", "enforced"])
+async def test_worklink_run_tool_reaches_core_incident_admission_in_both_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforced: bool,
+) -> None:
+    from mimir.tools import registry
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+
+    _write_worklink_yaml(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    if enforced:
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    else:
+        monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    monkeypatch.setattr(
+        autonomy,
+        "check_concurrency",
+        lambda home, **kwargs: autonomy.ConcurrencyCheck(True, 0, 2),
+    )
+    registry.set_arbiter(None)
+    record_failure(
+        dispatch_failure_state_dir(tmp_path),
+        issue_id=443,
+        attempt=1,
+        exit_status=1,
+        error="retained recovery required",
+        log_path="run.log",
+    )
+
+    output = await registry.worklink_run.ainvoke({"issue_id": 443})
+
+    assert "worklink_run #443: refused" in output
+    assert "unresolved Worklink incident" in output
+    assert "attempt=" not in output
 
 
 @pytest.mark.asyncio

@@ -1088,6 +1088,7 @@ def reattach_inflight_worklink_runs(
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
+                env={**os.environ, "WORKLINK_RUN_LOG": str(log_path)},
                 start_new_session=True,  # detach: survive this startup + outlive it
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1140,6 +1141,7 @@ def reattach_inflight_worklink_runs(
                 stdin=subprocess.DEVNULL,
                 stdout=log_fh,
                 stderr=log_fh,
+                env={**os.environ, "WORKLINK_RUN_LOG": str(log_path)},
                 start_new_session=True,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1156,6 +1158,7 @@ def reattach_inflight_worklink_runs(
                 preserved_ref=record.branch,
                 run_id=record.run_id,
                 work_path=record.sandbox,
+                transcript_path=record.transcript,
             )
             failure = {
                 "issue_id": record.issue_id,

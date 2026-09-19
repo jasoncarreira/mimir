@@ -44,11 +44,12 @@ from mimir.worklink.factory_state import (
     load_factory_record,
     save_factory_record,
 )
-from mimir.worklink.run_state import load_run_state
+from mimir.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
 from mimir.worklink.orchestrator import (
     IssueContext,
     LeafValidationError,
     WorklinkError,
+    WorklinkRunResult,
     WorklinkRunner,
     _PR_BODY_SECTION_MAX_BYTES,
     _demote_template_invalid_ready_leaf,
@@ -199,6 +200,49 @@ def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
     assert recorded[0]["exit_status"] == 1
     assert recorded[0]["autonomous"] is True
     assert isinstance(recorded[0]["error"], RuntimeError)
+
+
+def test_factory_wrapper_does_not_overwrite_incident_owned_by_inner_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    async def fail_after_inner_record(
+        self: WorklinkRunner, issue_id: int, *, autonomous: bool = False
+    ) -> WorklinkRunResult:
+        incident = orchestrator._record_run_failure(
+            home=tmp_path,
+            issue_id=issue_id,
+            attempt=3,
+            error="primary factory failure",
+            exit_status=1,
+            autonomous=autonomous,
+            preserved_ref="feature/chainlink-700",
+            run_id="chainlink-700",
+            work_path="/retained/factory-sandbox",
+            transcript_path="/retained/transcript.json",
+        )
+        secondary = RuntimeError("secondary label routing failure")
+        orchestrator._mark_incident_owned(secondary, incident)
+        raise secondary
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", fail_after_inner_record)
+
+    with pytest.raises(RuntimeError, match="secondary label routing failure"):
+        run_worklink_epic(
+            home=tmp_path,
+            repo=tmp_path / "repo",
+            issue_id=700,
+            autonomous=True,
+        )
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["terminal_error"] == "primary factory failure"
+    assert incident["attempt"] == 3
+    assert incident["run_id"] == "chainlink-700"
+    assert incident["work_path"] == "/retained/factory-sandbox"
+    assert incident["transcript_path"] == "/retained/transcript.json"
 
 
 class FakeCompute:
@@ -783,6 +827,8 @@ def test_postclaim_failure_emits_same_failure_event(
             2,
             "failed",
             reason="backend exploded api_key=super-secret",
+            checkout=tmp_path / "retained-checkout",
+            branch="issue/441-a2",
             preserved_ref="origin/feature/chainlink-441",
         )
 
@@ -801,6 +847,7 @@ def test_postclaim_failure_emits_same_failure_event(
     assert entry["attempt"] == 2
     assert entry["terminal_error"] == "backend exploded api_key=[REDACTED]"
     assert entry["preserved_ref"] == "origin/feature/chainlink-441"
+    assert entry["work_path"] == str(tmp_path / "retained-checkout")
     from mimir.worklink.dispatch_failures import pending_failure_alerts
 
     _, alerts = pending_failure_alerts(state_dir)
@@ -2693,7 +2740,7 @@ def test_claimed_blocked_leaf_releases_slot_and_triggers_ready_scan(
     assert signals == ["worklink_slot_released"]
 
 
-def test_release_notification_follows_state_clear_and_survives_clear_failure(
+def test_release_notification_is_suppressed_when_state_clear_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import mimir.poller_triggers as poller_triggers
@@ -2724,7 +2771,7 @@ def test_release_notification_follows_state_clear_and_survives_clear_failure(
             Claims(), home=tmp_path, issue_id=441, attempt=1, trigger_ready_scan=True
         )
 
-    assert events == ["release_issue", "clear_run_state", "worklink_slot_released"]
+    assert events == ["release_issue", "clear_run_state"]
 
 
 def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: Path) -> None:
@@ -5922,7 +5969,19 @@ def test_factory_identity_preflight_is_not_repeated_for_retained_run(
     assert signals == ([tmp_path] if release_confirmed else [])
 
 
-@pytest.mark.parametrize("refusal", ["sandbox", "launcher", "base", "session", "lifecycle"])
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "issue",
+        "repository",
+        "controller_repository",
+        "sandbox",
+        "launcher",
+        "base",
+        "session",
+        "lifecycle",
+    ],
+)
 def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
@@ -5959,8 +6018,13 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
         observed_at=None,
         controller_phase="failed",
         controller_error="factory status missing field: branch",
+        transcript=str(tmp_path / "factory-transcript.json"),
     )
-    if refusal == "sandbox":
+    if refusal == "issue":
+        retained = replace(retained, issue_id=701, run_id="701", branch="issue/701-a1")
+    elif refusal == "repository":
+        retained = replace(retained, repository="other/repo")
+    elif refusal == "sandbox":
         old_sandbox.rmdir()
     elif refusal == "launcher":
         retained = replace(retained, launcher="/opt/old/factory.js")
@@ -5985,11 +6049,16 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     transitions: list[dict[str, object]] = []
     claimed_after_archive: list[bool] = []
     archive_events: list[tuple[str, dict[str, object]]] = []
+    remote_reads = 0
 
     def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        nonlocal remote_reads
         if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
             return cp(args, stdout=epic)
         if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            remote_reads += 1
+            if refusal == "controller_repository" and remote_reads > 1:
+                return cp(args, stdout="git@github.com:other/repo.git\n")
             return cp(args, stdout="git@github.com:owner/repo.git\n")
         return cp(args)
 
@@ -6029,6 +6098,19 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     monkeypatch.setattr(
         FeatureFactoryBackend, "admit", lambda self: Path("/opt/factory/bin/factory.js")
     )
+    monkeypatch.setattr(
+        WorklinkConfig,
+        "load",
+        lambda *_: WorklinkConfig(
+            defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+        ),
+    )
+    if refusal == "issue":
+        monkeypatch.setattr(
+            orchestrator,
+            "load_factory_records_for_issue",
+            lambda home, issue_id: [retained],
+        )
 
     def claim_issue(self: object, *args: object, **kwargs: object) -> ClaimResult:
         kwargs["before_claim"]()
@@ -6067,7 +6149,9 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     monkeypatch.setattr(WorklinkRunner, "_recover_factory_070", recover)
 
     result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(700)
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
+            700, autonomous=True
+        )
     )
 
     assert result.status == "blocked"
@@ -6076,13 +6160,16 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     assert len(transitions) == 1
     assert transitions[0]["status"] == "blocked"
     assert str(old_sandbox) in str(transitions[0]["reason"])
-    assert load_factory_record(tmp_path, "700") == retained
+    assert load_factory_record(tmp_path, retained.run_id) == retained
     assert load_factory_record(tmp_path, "chainlink-700") is None
     archives = list(
         (tmp_path / "state" / "worklink" / "factory-runs" / "archive").glob("*.json")
     )
     assert archives == []
     expected_reasons = {
+        "issue": "retained factory issue identity does not match recovery request",
+        "repository": "retained factory repository does not match recovery request",
+        "controller_repository": "factory recovery controller repository changed",
         "sandbox": "retained factory sandbox is unavailable",
         "launcher": "retained factory launcher does not match recovery request",
         "base": "retained factory base does not match recovery request",
@@ -6092,6 +6179,15 @@ def test_unbindable_factory_record_blocks_before_claim_and_is_preserved(
     assert expected_reasons[refusal] in str(transitions[0]["reason"])
     assert archive_events == []
     assert old_sandbox.is_dir() is (refusal != "sandbox")
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["active"] is True
+    assert incident["attempt"] == 1
+    assert incident["run_id"] == retained.run_id
+    assert incident["work_path"] == str(old_sandbox)
+    assert incident["preserved_ref"] == retained.branch
+    assert incident["transcript_path"] == str(tmp_path / "factory-transcript.json")
 
 
 def test_factory_launch_preflight_refuses_existing_run_sandbox(tmp_path: Path) -> None:
@@ -6141,6 +6237,246 @@ def test_factory_recovery_phases_are_explicit(phase: str) -> None:
 
     assert phase in orchestrator._RECOVERABLE_FACTORY_PHASES
     assert "stopped" not in orchestrator._RECOVERABLE_FACTORY_PHASES
+
+
+def test_autonomous_leaf_incident_fence_precedes_issue_reads_and_mutations(
+    tmp_path: Path,
+) -> None:
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+
+    record_failure(
+        dispatch_failure_state_dir(tmp_path),
+        issue_id=441,
+        attempt=1,
+        exit_status=1,
+        error="existing incident",
+        log_path="run.log",
+    )
+    calls: list[object] = []
+
+    def forbidden(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        raise AssertionError("autonomous refusal read or mutated Chainlink")
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", runner=forbidden).run(
+            441, autonomous=True
+        )
+    )
+
+    assert result.status == "refused"
+    assert result.attempt is None
+    assert calls == []
+
+
+def test_autonomous_leaf_refuses_unreadable_retained_record_before_issue_reads(
+    tmp_path: Path,
+) -> None:
+    from mimir.worklink.run_state import run_state_path
+
+    retained = run_state_path(tmp_path, 441)
+    retained.parent.mkdir(parents=True)
+    retained.write_text("not json", encoding="utf-8")
+    calls: list[object] = []
+
+    def forbidden(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        raise AssertionError("autonomous refusal read or mutated Chainlink")
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path / "repo", runner=forbidden).run(
+            441, autonomous=True
+        )
+    )
+
+    assert result.status == "refused"
+    assert result.attempt is None
+    assert retained.read_text(encoding="utf-8") == "not json"
+    assert calls == []
+
+
+def test_autonomous_leaf_before_claim_preserves_raced_dead_retained_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    calls, runner = _orchestrator_runner(repo, worktree)
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+    )
+    registry = BackendRegistry(config)
+    backend = FakeBackend()
+    registry.register(backend)
+    retained = WorklinkRunState(
+        issue_id=441,
+        attempt=7,
+        backend="fake",
+        compute_name="fake_compute",
+        handle_substrate="fake_compute",
+        handle_identifier="dead-job",
+        branch="issue/441-a7",
+        base_ref="main",
+        local_base="main",
+        repo=str(repo),
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        test_command="echo ok",
+        started_at=datetime.now(UTC).isoformat(),
+        checkout=str(tmp_path / "retained-checkout"),
+        phase="spawned",
+    )
+
+    def race_retained_state(
+        self: ChainlinkClaims, issue_id: int, *args: object, **kwargs: object
+    ) -> ClaimResult:
+        save_run_state(tmp_path, retained)
+        kwargs["before_claim"]()
+        raise AssertionError("before_claim should refuse")
+
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    monkeypatch.setattr(orchestrator, "BackendRegistry", lambda *_: registry)
+    monkeypatch.setattr(ChainlinkClaims, "claim_issue", race_retained_state)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+            441, backend_name="fake", autonomous=True
+        )
+    )
+
+    assert result.status == "refused"
+    assert load_run_state(tmp_path, 441) == retained
+    assert backend.orders == []
+    assert not worktree.exists()
+    assert not any(call[:3] == ["chainlink", "issue", "label"] for call in calls)
+
+
+def test_state_clear_failure_never_notifies_ready_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    scans: list[Path] = []
+    claims = SimpleNamespace(release_issue=lambda issue_id: True)
+    monkeypatch.setattr(
+        orchestrator,
+        "clear_run_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_trigger_ready_scan_after_release", scans.append
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        orchestrator._release_issue_and_clear_run_state(
+            claims,
+            home=tmp_path,
+            issue_id=441,
+            attempt=1,
+            trigger_ready_scan=True,
+        )
+
+    assert scans == []
+
+
+def test_silently_failed_state_clear_never_notifies_ready_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    state = WorklinkRunState(
+        issue_id=441,
+        attempt=1,
+        backend="fake",
+        compute_name="fake",
+        handle_substrate="fake",
+        handle_identifier="job",
+        branch="issue/441-a1",
+        base_ref="main",
+        local_base="main",
+        repo=str(tmp_path / "repo"),
+        repo_url="git@github.com:jasoncarreira/mimir.git",
+        test_command="echo ok",
+        started_at=datetime.now(UTC).isoformat(),
+    )
+    save_run_state(tmp_path, state)
+    scans: list[Path] = []
+    claims = SimpleNamespace(release_issue=lambda issue_id: True)
+    monkeypatch.setattr(orchestrator, "clear_run_state", lambda *_args: None)
+    monkeypatch.setattr(orchestrator, "_trigger_ready_scan_after_release", scans.append)
+
+    with pytest.raises(OSError, match="was not cleared"):
+        orchestrator._release_issue_and_clear_run_state(
+            claims,
+            home=tmp_path,
+            issue_id=441,
+            attempt=1,
+            trigger_ready_scan=True,
+        )
+
+    assert load_run_state(tmp_path, 441) == state
+    assert scans == []
+
+
+def test_autonomous_completion_does_not_clear_concurrent_newer_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
+    )
+
+    async def completed(self: WorklinkRunner, issue_id: int, **kwargs: object) -> WorklinkRunResult:
+        record_failure(
+            dispatch_failure_state_dir(tmp_path),
+            issue_id=issue_id,
+            attempt=9,
+            exit_status=1,
+            error="concurrent failure",
+            log_path="newer.log",
+        )
+        return WorklinkRunResult(issue_id, 8, "completed")
+
+    monkeypatch.setattr(WorklinkRunner, "run", completed)
+
+    result = run_worklink(
+        home=tmp_path, repo=tmp_path / "repo", issue_id=441, autonomous=True
+    )
+
+    assert result.status == "completed"
+    entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+    assert entry["active"] is True
+    assert entry["terminal_error"] == "concurrent failure"
+
+
+def test_manual_completion_keeps_existing_unconditional_success_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+        record_failure,
+    )
+
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    record_failure(
+        state_dir,
+        issue_id=441,
+        attempt=1,
+        exit_status=1,
+        error="old failure",
+        log_path=None,
+    )
+
+    async def completed(self: WorklinkRunner, issue_id: int, **kwargs: object) -> WorklinkRunResult:
+        return WorklinkRunResult(issue_id, 2, "completed")
+
+    monkeypatch.setattr(WorklinkRunner, "run", completed)
+    run_worklink(home=tmp_path, repo=tmp_path / "repo", issue_id=441)
+
+    assert load_failure_state(state_dir)["issues"]["441"]["active"] is False
 
 
 @pytest.mark.parametrize("autonomous", [False, True])

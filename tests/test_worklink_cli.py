@@ -410,6 +410,108 @@ def _state(
     return state
 
 
+def test_leaf_cli_interruption_records_once_with_retained_pointers_and_reraises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+    import mimir.worklink.orchestrator as orchestrator
+
+    state = _state(
+        tmp_path,
+        441,
+        999_999_999,
+        ticks=1,
+        started_at=datetime.now(UTC),
+    )
+    recorded: list[dict[str, object]] = []
+
+    def interrupted(**kwargs: object) -> WorklinkRunResult:
+        raise KeyboardInterrupt("operator stop")
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink", interrupted)
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_run_failure",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="operator stop"):
+        main([
+            "worklink",
+            "run",
+            "441",
+            "--autonomous",
+            "--home",
+            str(tmp_path),
+            "--repo",
+            str(tmp_path / "repo"),
+        ])
+
+    assert len(recorded) == 1
+    assert recorded[0]["attempt"] == state.attempt
+    assert recorded[0]["preserved_ref"] == state.branch
+    assert recorded[0]["work_path"] == state.checkout
+    assert recorded[0]["exit_status"] == 130
+
+
+def test_factory_cli_interruption_records_once_with_all_retained_pointers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-700"
+    sandbox.mkdir(parents=True)
+    retained = FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=3,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=None,
+        status=None,
+        observed_at=None,
+        controller_phase="running",
+        transcript=str(tmp_path / "transcript.json"),
+    )
+    save_factory_record(tmp_path, retained)
+    recorded: list[dict[str, object]] = []
+
+    def interrupted(**kwargs: object) -> WorklinkRunResult:
+        raise KeyboardInterrupt("operator stop")
+
+    monkeypatch.setattr(worklink_cmd, "run_worklink_epic", interrupted)
+    monkeypatch.setattr(
+        orchestrator,
+        "_record_run_failure",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="operator stop"):
+        main([
+            "worklink",
+            "run-epic",
+            "700",
+            "--autonomous",
+            "--home",
+            str(tmp_path),
+            "--repo",
+            str(tmp_path / "repo"),
+        ])
+
+    assert len(recorded) == 1
+    assert recorded[0]["attempt"] == retained.attempt
+    assert recorded[0]["preserved_ref"] == retained.branch
+    assert recorded[0]["run_id"] == retained.run_id
+    assert recorded[0]["work_path"] == retained.sandbox
+    assert recorded[0]["transcript_path"] == retained.transcript
+    assert recorded[0]["exit_status"] == 130
+
+
 def test_status_classifies_all_states_and_disagreements(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     _state(
@@ -771,6 +873,68 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
     rows = worklink_status(tmp_path, issue_ids=[11], runner=runner)
     assert rows[0].classification == "clean"
     assert rows[0].disagreement is None
+
+
+def test_orphan_incident_write_failure_preserves_claim_labels_and_run_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.dispatch_failures as dispatch_failures
+
+    now = datetime.now(UTC)
+    state = _state(
+        tmp_path, 11, 999_999_999, ticks=1, started_at=now - timedelta(seconds=90)
+    )
+    checkout = tmp_path / "checkout-11"
+    checkout.mkdir()
+    state = replace(state, checkout=str(checkout), local_base="base-sha")
+    save_run_state(tmp_path, state)
+    calls: list[list[str]] = []
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        if args[1:3] == ["issue", "show"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout='{"labels":["worklink:in-progress"]}', stderr=""
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    def git_runner(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[3:5] == ["rev-parse", "HEAD"]:
+            stdout = "head\n"
+        elif args[3:5] == ["rev-list", "--count"]:
+            stdout = "0\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        dispatch_failures,
+        "record_failure",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    reconcile_run_states(
+        tmp_path,
+        runner=runner,
+        git_runner=git_runner,
+        event_logger=lambda event, **payload: events.append((event, payload)),
+        now=now,
+    )
+
+    assert load_run_state(tmp_path, 11) == state
+    assert not any(call[1:3] == ["locks", "release"] for call in calls)
+    assert not any(call[1:3] in (["issue", "comment"], ["issue", "label"], ["issue", "unlabel"]) for call in calls)
+    assert events == [(
+        "worklink_run_orphan_incident_failed",
+        {
+            "issue_id": 11,
+            "attempt": state.attempt,
+            "checkout": str(checkout),
+            "error": "disk full",
+            "state_retained": True,
+        },
+    )]
 
 
 def test_reconcile_empty_orphan_returns_ready(tmp_path: Path) -> None:

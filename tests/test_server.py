@@ -86,15 +86,63 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
     monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
     monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
-    spawned: list[list[str]] = []
+    spawned: list[tuple[list[str], dict[str, Any]]] = []
 
     dispatched = reattach_inflight_worklink_runs(
         tmp_path,
-        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+        popen=lambda argv, **kwargs: spawned.append((list(argv), kwargs)) or object(),
     )
 
     assert dispatched == [700]
-    assert spawned[0][:4] == ["mimir", "worklink", "run-epic", "700"]
+    argv, kwargs = spawned[0]
+    assert argv[:4] == ["mimir", "worklink", "run-epic", "700"]
+    expected_log = tmp_path / "state" / "worklink" / "runs" / "factory-recover-700.log"
+    assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected_log)
+
+
+def test_server_factory_spawn_failure_records_all_recovery_pointers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    transcript = tmp_path / "factory-transcript.json"
+    record = factory_state.FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=3,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory.js",
+        sandbox=str(tmp_path / ".factory-sandboxes" / "chainlink-700"),
+        session="session-1",
+        handle=None,
+        observed_at=None,
+        controller_phase="running",
+        status=None,
+        transcript=str(transcript),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
+    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
+
+    def fail_spawn(argv: list[str], **kwargs: Any) -> object:
+        expected = tmp_path / "state" / "worklink" / "runs" / "factory-recover-700.log"
+        assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected)
+        raise OSError("spawn unavailable")
+
+    assert reattach_inflight_worklink_runs(tmp_path, popen=fail_spawn) == []
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["attempt"] == 3
+    assert incident["run_id"] == "chainlink-700"
+    assert incident["work_path"] == record.sandbox
+    assert incident["preserved_ref"] == record.branch
+    assert incident["transcript_path"] == str(transcript)
+    assert incident["log_path"].endswith("factory-recover-700.log")
 
 
 def _production_call_sites(call_name: str) -> set[str]:

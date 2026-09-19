@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -160,6 +162,88 @@ async def test_tainted_service_alert_uses_configured_destination_and_other_sinks
     assert cross_channel.status == "error"
     assert write.status == "error"
     assert denied_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_shipped_worklink_principal_can_use_real_operator_alert_sink(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.pollers import _parse_poller_authority
+
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "mimir"
+        / "optional-skills"
+        / "chainlink-orchestrator"
+        / "pollers.json"
+    )
+    entry = json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"][0]
+    persist_dir = tmp_path / "state" / "pollers" / entry["name"]
+    persist_dir.mkdir(parents=True)
+    authority = _parse_poller_authority(
+        entry["authority"],
+        name=entry["name"],
+        persist_dir=persist_dir,
+        state_root=persist_dir.parent,
+        manifest_path=manifest_path,
+    )
+    assert authority.canonical == "poller:worklink-ready-queue"
+    assert "operator_alert" in authority.capabilities
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "discord-operator")
+    channels = _Channels()
+    set_operator_alert_dependencies(
+        channels, SimpleNamespace(operator_alert_channel="discord-operator")
+    )
+    principal = f"service:{authority.canonical}"
+    labels = InformationFlowLabels().with_channel(authority.canonical).with_source(
+        SourceLabel(
+            principal=principal,
+            domain="channel",
+            resource_id=authority.canonical,
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=frozenset({principal}),
+            source_kind="service",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        )
+    )
+    event = AgentEvent(
+        trigger="poller",
+        channel_id=authority.canonical,
+        source="poller",
+        service_principal=authority.canonical,
+        service_authority=authority,
+    )
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
+    auth.ifc_state.merge(labels)
+    turn = TurnContext(
+        turn_id="worklink-operator-alert",
+        session_id=authority.canonical,
+        trigger="poller",
+        channel_id=authority.canonical,
+        started_at=time.monotonic(),
+        auth_context=auth,
+        ifc_labels=labels,
+        tool_call_budget=20,
+    )
+    token = set_current_turn(turn)
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        content = await operator_alert.coroutine(text=request.tool_call["args"]["text"])
+        return ToolMessage(content=content, tool_call_id=request.tool_call["id"])
+
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _request("operator_alert", auth, {"text": "factory recovery unsafe"}),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert result.status != "error"
+    assert channels.calls == [("discord-operator", "factory recovery unsafe", False)]
 
 
 @pytest.mark.asyncio

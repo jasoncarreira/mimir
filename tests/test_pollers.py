@@ -3027,7 +3027,7 @@ async def test_run_poller_recovers_unaccepted_events_by_default(
     persist_dir = tmp_path / "persist" / "x"
     _install_script(skill_dir, "poller.py", """
 import json
-print(json.dumps({"poller": "x", "prompt": "queue full"}))
+print(json.dumps({"poller": "x", "prompt": "queue full", "delivery_key": "incident:key"}))
 """)
     cfg = PollerConfig(
         name="x", command=f"{sys.executable} poller.py",
@@ -3051,6 +3051,8 @@ print(json.dumps({"poller": "x", "prompt": "queue full"}))
     assert entry["attempts"] == 0
     assert entry["event"]["content"] == "queue full"
     assert entry["event"]["service_principal"] == event.service_principal
+    receipt = persist_dir / ".delivery-receipts" / hashlib.sha256(b"incident:key").hexdigest()
+    assert not receipt.exists()
 
     _install_script(skill_dir, "poller.py", "pass\n")
     enq = _CapturingEnqueue()
@@ -3060,6 +3062,7 @@ print(json.dumps({"poller": "x", "prompt": "queue full"}))
     entry = poller_recovery._load_state(persist_dir)["inflight"][event.source_id]
     assert "pending_enqueue" not in entry
     assert entry["attempts"] == 0
+    assert receipt.exists()
 
 
 @pytest.mark.asyncio
