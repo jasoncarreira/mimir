@@ -5736,9 +5736,14 @@ async def test_incident_budget_result_failure_sends_one_notice_without_continuat
     assert not (tmp_path / "state" / "worklink" / "continuations").exists()
 
 
+@pytest.mark.parametrize("worker_environment", [False, True], ids=["default", "worker-path"])
 async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_environment: bool,
 ) -> None:
+    import os
+    import shlex
+    import sys
+
     import mimir.agent as agent_mod
     from mimir.dispatcher import Dispatcher
     from mimir.pollers import discover_pollers, run_poller
@@ -5766,6 +5771,11 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     retained_checkout = tmp_path / "retained-checkout"
     run_id = "chainlink-441-retained"
     preserved_ref = "issue/441-a2"
+    if worker_environment:
+        # Match CI's direct .venv/bin/python invocation without venv activation.
+        monkeypatch.setenv("PATH", os.defpath)
+        monkeypatch.setenv("HOME", "/nonexistent")
+        monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", "/tmp")
     reason = "backend failed after retained recovery"
     incident = record_failure(
         incident_state_dir,
@@ -5781,6 +5791,9 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     )
     poller = replace(
         poller,
+        # Exercise the real consumer in this test's dependency environment,
+        # not an unrelated system Python selected by the worker's PATH.
+        command=f"{shlex.quote(sys.executable)} scripts/poller.py",
         deliver=poller.channel_id(),
     )
     fake_model = _BudgetExhaustingAgent(
@@ -5806,7 +5819,8 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
         queued_events.append(event)
         return await dispatcher.enqueue(event, **kwargs)
 
-    assert await run_poller(poller, enqueue=capture_enqueue, home=home) == 1
+    emitted = await run_poller(poller, enqueue=capture_enqueue, home=home)
+    assert emitted == 1, (home / "logs" / "events.jsonl").read_text(encoding="utf-8")
     await dispatcher.drain()
 
     [queued] = queued_events

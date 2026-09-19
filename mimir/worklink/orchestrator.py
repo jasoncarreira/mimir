@@ -2437,12 +2437,14 @@ class WorklinkRunner:
                     autonomous=autonomous,
                 )
         except Exception as exc:
+            # A bound exception may represent a failed ledger write, not a
+            # durable incident. Retain the reservation before any early exit.
+            release_permitted = False
             incident_owner = self._incident_owner
             assert incident_owner is not None
             if _exception_incident_handled(exc) or incident_owner.owns_terminal_failure:
                 incident_owner.bind(exc)
                 raise
-            release_permitted = False
             original_reason = str(exc)
             try:
                 records = load_factory_records_for_issue(self.home, issue_id)

@@ -7738,6 +7738,100 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
         assert "factory exceeded run timeout" in incident["terminal_error"]
 
 
+def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    original_supervise = WorklinkRunner._supervise_factory_070
+    stopped = asyncio.Event()
+    writes: list[str] = []
+    lifecycle: list[str] = []
+    releases: list[str] = []
+    scans: list[str] = []
+    status_calls = 0
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += max(delay, 1.1)
+        await asyncio.sleep(0)
+
+    class Compute:
+        async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=handle)
+
+        def job_alive(self, handle: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, handle: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, handle: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 1
+
+        def __init__(self, record: FactoryRunRecord) -> None:
+            self.record = record
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal status_calls
+            status_calls += 1
+            return replace(
+                _factory_lifecycle_status(Path(self.record.sandbox), status="running"),
+                run_id=self.record.run_id,
+                branch=self.record.branch,
+            )
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    async def supervise_actual(**kwargs: Any) -> WorklinkRunResult:
+        supervisor = kwargs.pop("_supervisor")
+        kwargs["backend"] = Backend(kwargs["factory_record"])
+        kwargs["compute"] = Compute()
+        return await original_supervise(supervisor, **kwargs)
+
+    def disk_failure(**kwargs: Any) -> None:
+        writes.append(str(kwargs["error"]))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10.0)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", disk_failure)
+    monkeypatch.setattr(
+        orchestrator, "clear_run_state",
+        lambda *_args, **_kwargs: lifecycle.append("clear_run_state"),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        _run_factory_preflight_case(
+            tmp_path,
+            monkeypatch,
+            credentials={"GITHUB_TOKEN": "github-token"},
+            autonomous=True,
+            outcome="completed",
+            terminal=supervise_actual,
+            on_release=lambda: releases.append("release"),
+            release_signals=scans,
+        )
+
+    assert status_calls == 2
+    assert writes == ["factory status made no useful progress"]
+    assert lifecycle == ["cancel", "cleanup"]
+    assert releases == []
+    assert scans == []
+    retained = load_factory_record(tmp_path, "chainlink-700")
+    assert retained is not None
+    assert retained.transcript is not None
+    assert Path(retained.transcript).is_file()
+
+
 @pytest.mark.parametrize("ending", ["parked", "timeout", "newer-incident"])
 def test_factory_stale_status_events_are_bounded_per_episode(
     tmp_path: Path,
