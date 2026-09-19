@@ -1980,6 +1980,7 @@ async def test_worker_process_forwards_factory_events_to_owned_logger(tmp_path, 
                 "id": identifier, "status": "event", "event": name,
                 "run_id": identifier, "issue_id": 41, "attempt": 2, "pid": 456,
                 "error": "cleanup diagnostic", "untrusted_extra": "must not forward",
+                "adopted_count": 96000, "final": True,
             }).encode())
         packet = {"id": identifier, "status": "terminal", "exit_code": 37,
                   "timed_out": True, "output_overflow": True}
@@ -2014,7 +2015,60 @@ async def test_worker_process_forwards_factory_events_to_owned_logger(tmp_path, 
         assert record["attempt"] == 2
         assert record["pid"] == 456
         assert record["error"] == "cleanup diagnostic"
+        assert record["adopted_count"] == 96000
+        assert record["final"] is True
         assert "untrusted_extra" not in record
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux subreaper and SOCK_SEQPACKET")
+@pytest.mark.asyncio
+async def test_adoption_summary_real_supervisor_through_executor_to_event_log(
+    factory_request, tmp_path, monkeypatch,
+):
+    from mimir import event_logger
+
+    path = tmp_path / "events.jsonl"
+    logger = event_logger.EventLogger(path, session_id="adoption-transport")
+    monkeypatch.setattr(event_logger, "get_logger", lambda: logger)
+    # Bypass host identity/provisioning only; supervisor, both sockets, executor
+    # forwarding, client allowlist and persistent logging are production paths.
+    monkeypatch.setattr(worker_exec, "_open_factory_checkout", lambda request, **kw: os.open(
+        request["path"], os.O_RDONLY | os.O_DIRECTORY,
+    ))
+    monkeypatch.setattr(worker_exec, "_drop_factory", lambda fd, home: os.fchdir(fd))
+    monkeypatch.setattr(worker_exec.os, "chown", lambda *a: None)
+    factory_request["argv"] = [sys.executable, "-I", "-c", """
+import os, signal
+for _ in range(3):
+    if os.fork() == 0:
+        signal.pause()
+        os._exit(0)
+os._exit(37)
+"""]
+    controller, executor = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with controller, executor, (tmp_path / "out").open("w+b") as output:
+        controller.sendmsg(
+            [json.dumps(factory_request).encode()],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [output.fileno(), output.fileno()]))],
+        )
+        handler = asyncio.create_task(asyncio.to_thread(worker_exec.handle_connection, executor))
+        try:
+            started = json.loads(await asyncio.to_thread(controller.recv, 4096))
+            assert started["status"] == "started", started
+            process = WorkerProcess(factory_request["id"], started["pid"], controller)
+            assert await process.wait() == 37
+        finally:
+            controller.close()
+            await handler
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["type"] for r in records] == ["worklink_factory_orphan_adopted"] * 3
+    assert [r["adopted_count"] for r in records] == [1, 2, 3]
+    assert [r["final"] for r in records] == [False, False, True]
+    assert "pid" not in records[-1]
+    for record in records:
+        assert record["run_id"] == factory_request["id"]
+        assert record["issue_id"] == 41
+        assert record["attempt"] == 2
 
 
 def test_factory_stop_refuses_missing_monitor_acknowledgement(monkeypatch):

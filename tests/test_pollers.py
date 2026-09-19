@@ -132,6 +132,14 @@ def test_kill_process_group_does_not_signal_reaped_pid(monkeypatch):
     killpg.assert_not_called()
 
 
+@pytest.fixture(autouse=True)
+def poller_named_secrets(monkeypatch):
+    """Own named-secret audit state rather than inherit earlier tests' fires."""
+    seen = set()
+    monkeypatch.setattr("mimir.pollers._poller_named_secrets_seen", seen)
+    return seen
+
+
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
     """Standard MIMIR_HOME with logger initialized so log_event won't crash."""
@@ -6111,9 +6119,77 @@ print('{"poller": "x", "prompt": "ok"}')
     # Bare "key" is credential-shaped at the durable boundary, even when this
     # producer puts an environment variable name rather than its value there.
     assert passthrough_events[0].get("key") == "[REDACTED]"
+    assert passthrough_events[0]["poller"] == "x"
+    assert passthrough_events[0]["env_name"] == "GITHUB_TOKEN"
     # Value must NOT leak into the event payload.
     payload = json.dumps(passthrough_events[0])
     assert "ghp_secret_should_not_appear_in_event" not in payload
+
+
+@pytest.mark.asyncio
+async def test_run_poller_named_secret_audit_bounded_across_many_fires(
+    tmp_path: Path, home: Path, monkeypatch, poller_named_secrets,
+):
+    from mimir import pollers
+
+    audit_type = "poller_env_passthrough_named_secret"
+    audits = []
+    original_log_event = pollers.log_event
+
+    async def capture(event_type, **fields):
+        if event_type == audit_type:
+            audits.append((event_type, fields))
+        await original_log_event(event_type, **fields)
+
+    monkeypatch.setattr(pollers, "log_event", capture)
+    monkeypatch.setenv("AUDIT_TOKEN", "forwarded-secret")
+    skill_dir = tmp_path / "audit-skill"
+    _install_script(skill_dir, "poller.py", """
+import os
+assert os.environ['AUDIT_TOKEN'] == 'forwarded-secret'
+print('{"prompt": "ok"}')
+""")
+    cfg = PollerConfig(
+        name="audit-a", command=f"{sys.executable} poller.py",
+        cron="* * * * *", skill_dir=skill_dir,
+        pass_env=("AUDIT_TOKEN", "AUDIT_TOKEN"), env={},
+    )
+    enq = _CapturingEnqueue()
+    for _ in range(100):
+        # A fresh config models manifest reload without restarting the runner.
+        assert await run_poller(replace(cfg), enqueue=enq) == 1
+    assert len(enq.events) == 100
+    assert audits == [
+        (audit_type, {"poller": "audit-a", "key": "AUDIT_TOKEN", "env_name": "AUDIT_TOKEN"}),
+    ]
+    assert poller_named_secrets == {("audit-a", "AUDIT_TOKEN")}
+
+    assert await run_poller(replace(cfg, name="audit-b"), enqueue=enq) == 1
+    assert len(audits) == 2
+    monkeypatch.setenv("OTHER_TOKEN", "another-secret")
+    assert await run_poller(
+        replace(cfg, pass_env=(*cfg.pass_env, "OTHER_TOKEN")), enqueue=enq,
+    ) == 1
+    assert audits[-1] == (
+        audit_type, {"poller": "audit-a", "key": "OTHER_TOKEN", "env_name": "OTHER_TOKEN"},
+    )
+    assert len(audits) == 3
+    durable = [e for e in _read_events(home) if e.get("type") == audit_type]
+    assert len(durable) == 3
+    assert all(e["key"] == "[REDACTED]" for e in durable)
+    assert [(e["poller"], e["env_name"]) for e in durable] == [
+        ("audit-a", "AUDIT_TOKEN"),
+        ("audit-b", "AUDIT_TOKEN"),
+        ("audit-a", "OTHER_TOKEN"),
+    ]
+    for value in ("forwarded-secret", "another-secret"):
+        assert value not in json.dumps(durable)
+    assert "secret" not in json.dumps([fields for _, fields in audits])
+
+    # A new runner lifetime permits the first audit again.
+    monkeypatch.setattr(pollers, "_poller_named_secrets_seen", set())
+    assert await run_poller(cfg, enqueue=enq) == 1
+    assert len(audits) == 4
 
 
 # ─── chainlink #229: pass_env hard-deny on process-control vars ─────

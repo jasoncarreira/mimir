@@ -2311,6 +2311,9 @@ class WorklinkRunner:
         stale_after = _epic_stale_heartbeat_s()
         last_status: FactoryStatus | None = None
         last_change = loop.time()
+        stale_started: float | None = None
+        stale_started_at: str | None = None
+        stale_episode = 0
         try:
             wait_task = asyncio.create_task(
                 compute.wait(
@@ -2360,6 +2363,25 @@ class WorklinkRunner:
             cancel_attempted = True
             await compute.cancel(handle)
 
+        def end_stale_episode(reason: str) -> None:
+            nonlocal stale_started
+            if stale_started is None:
+                return
+            now = loop.time()
+            _log_event(
+                "worklink_factory_stale_status_ended",
+                issue_id=issue.issue_id,
+                attempt=factory_record.attempt,
+                run_id=factory_record.run_id,
+                stale_episode=stale_episode,
+                stale_started_at=stale_started_at,
+                diagnostic_after_s=stale_after,
+                unchanged_for_s=now - last_change,
+                stale_duration_s=now - stale_started,
+                end_reason=reason,
+            )
+            stale_started = None
+
         try:
             while True:
                 if status is None:
@@ -2395,6 +2417,7 @@ class WorklinkRunner:
                 else:
                     _require_factory_status(status, factory_record)
                     if status != last_status:
+                        end_stale_episode("status_changed")
                         last_status = status
                         last_change = loop.time()
                     if factory_record.session is not None and status.lock_session not in {
@@ -2418,11 +2441,20 @@ class WorklinkRunner:
                             sandbox=Path(factory_record.sandbox),
                             launcher=factory_record.launcher,
                         )
-                    if loop.time() - last_change >= stale_after:
+                    if stale_started is None and loop.time() - last_change >= stale_after:
+                        stale_started = loop.time()
+                        stale_started_at = datetime.now(UTC).isoformat()
+                        stale_episode += 1
                         _log_event(
                             "worklink_factory_stale_status",
                             issue_id=issue.issue_id,
+                            attempt=factory_record.attempt,
+                            run_id=factory_record.run_id,
+                            stale_episode=stale_episode,
+                            stale_started_at=stale_started_at,
                             diagnostic_after_s=stale_after,
+                            unchanged_for_s=stale_started - last_change,
+                            stale_duration_s=0.0,
                             lock=status.lock,
                             process_alive=compute.job_alive(handle),
                         )
@@ -2500,19 +2532,22 @@ class WorklinkRunner:
                 status = None
         finally:
             try:
-                if failed and not wait_task.done():
-                    try:
-                        await cancel_once()
-                    finally:
-                        wait_result = await _finish_factory_wait_task(wait_task)
-                        retain_result(wait_result, "refused")
-                elif wait_task.done():
-                    drained = await asyncio.gather(wait_task, return_exceptions=True)
-                    if wait_result is None and drained and isinstance(drained[0], ComputeResult):
-                        wait_result = drained[0]
-                    retain_result(wait_result, "refused" if failed else "completed")
+                end_stale_episode("supervision_ended")
             finally:
-                await compute.cleanup(handle)
+                try:
+                    if failed and not wait_task.done():
+                        try:
+                            await cancel_once()
+                        finally:
+                            wait_result = await _finish_factory_wait_task(wait_task)
+                            retain_result(wait_result, "refused")
+                    elif wait_task.done():
+                        drained = await asyncio.gather(wait_task, return_exceptions=True)
+                        if wait_result is None and drained and isinstance(drained[0], ComputeResult):
+                            wait_result = drained[0]
+                        retain_result(wait_result, "refused" if failed else "completed")
+                finally:
+                    await compute.cleanup(handle)
 
     async def _finish_factory_070(
         self,

@@ -426,6 +426,21 @@ _PROCESS_CONTROL_ENV_DENY = frozenset({
 })
 _POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
 
+# Runner-process lifetime, including manifest reloads; retain names, never values.
+_poller_named_secrets_seen: set[tuple[str, str]] = set()
+
+
+async def _log_poller_named_secret_once(*, poller: str, key: str) -> None:
+    identity = (poller, key)
+    if identity in _poller_named_secrets_seen:
+        return
+    # Claim before awaiting so overlapping fires cannot duplicate the audit.
+    _poller_named_secrets_seen.add(identity)
+    # The legacy "key" field is redacted by EventLogger; env_name is audit metadata.
+    await log_event(
+        "poller_env_passthrough_named_secret", poller=poller, key=key, env_name=key,
+    )
+
 
 def _extra_poller_env_allowlist() -> set[str]:
     return {
@@ -2569,8 +2584,7 @@ async def run_poller(
         if any(key.endswith(s) for s in _DENY_ENV_SUFFIXES) or any(
             key.startswith(p) for p in _DENY_ENV_PREFIXES
         ):
-            await log_event(
-                "poller_env_passthrough_named_secret",
+            await _log_poller_named_secret_once(
                 poller=poller.name,
                 key=key,
             )

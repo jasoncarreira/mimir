@@ -6825,6 +6825,124 @@ def factory_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return clock
 
 
+@pytest.mark.parametrize("ending", ["parked", "timeout"])
+def test_factory_stale_status_events_are_bounded_per_episode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    ending: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    lifecycle: list[str] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+    delays: list[float] = []
+    claim_heartbeats: list[ClaimRecord] = []
+    running = _factory_lifecycle_status(sandbox, status="running")
+    changed = replace(running, next="review")
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 1
+        status_calls = 0
+        heartbeat_calls = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            self.status_calls += 1
+            assert factory_clock.now <= 4000
+            if factory_clock.now == 4000 and ending == "parked":
+                return _factory_lifecycle_status(sandbox, status="needs-human")
+            return running if factory_clock.now < 2000 else changed
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            self.heartbeat_calls += 1
+
+    class Claims(_FactoryLifecycleClaims):
+        def heartbeat_issue(self, record: ClaimRecord) -> None:
+            claim_heartbeats.append(record)
+
+    async def advance(delay: float) -> None:
+        delays.append(delay)
+        factory_clock.now += delay
+        await asyncio.sleep(0)
+
+    monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", "4001" if ending == "parked" else "4000")
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setattr(orchestrator, "save_factory_record", lambda *args: None)
+    monkeypatch.setattr(
+        orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
+    )
+    backend = Backend()
+    with (
+        pytest.raises(WorklinkError, match="factory exceeded run timeout")
+        if ending == "timeout" else nullcontext()
+    ):
+        result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=Claims(),
+                backend=backend,
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+        assert result.status == "needs-human"
+
+    stale_events = [(name, fields) for name, fields in events if "stale_status" in name]
+    # Each episode has over a thousand stale polls, but only entry and end emit.
+    assert [name for name, _ in stale_events] == [
+        "worklink_factory_stale_status",
+        "worklink_factory_stale_status_ended",
+    ] * 2
+    for episode in (1, 2):
+        entry = stale_events[(episode - 1) * 2][1]
+        end = stale_events[(episode - 1) * 2 + 1][1]
+        for fields in (entry, end):
+            assert fields["issue_id"] == 700
+            assert fields["attempt"] == 1
+            assert fields["run_id"] == "700"
+            assert fields["stale_episode"] == episode
+            assert fields["diagnostic_after_s"] == 900
+        assert entry["lock"] == "fresh"
+        assert entry["process_alive"] is True
+        assert entry["unchanged_for_s"] == 900
+        assert entry["stale_duration_s"] == 0
+        assert end["unchanged_for_s"] == 2000
+        assert end["stale_duration_s"] == 1100
+        assert end["stale_started_at"] == entry["stale_started_at"]
+        assert datetime.fromisoformat(entry["stale_started_at"]).tzinfo == UTC
+        assert end["end_reason"] == (
+            "supervision_ended" if episode == 2 and ending == "timeout" else "status_changed"
+        )
+    assert backend.status_calls == backend.heartbeat_calls == (4001 if ending == "parked" else 4000)
+    assert delays == [1.0] * 4000
+    assert len(claim_heartbeats) == 4000
+    assert lifecycle == ["cancel", "cleanup"]
+
+
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
 def test_factory_supervision_cancels_and_cleans_on_every_failure(
     tmp_path: Path,

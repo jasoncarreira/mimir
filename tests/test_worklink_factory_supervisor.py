@@ -37,6 +37,21 @@ command = [sys.executable, "-I", source, str(child.fileno()), sys.executable, "-
 if mutate == "yes":
     wrapper = "import importlib.util,sys; s=importlib.util.spec_from_file_location('s',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); m._enable_subreaper=lambda:None; sys.exit(m.main(sys.argv[2:]))"
     command = [sys.executable, "-I", "-c", wrapper] + command[2:]
+if mode == "backpressure":
+    wrapper = """import importlib.util, sys
+s = importlib.util.spec_from_file_location('s', sys.argv[1])
+m = importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+send = m._send
+def full_send(channel, packet, **kwargs):
+    if packet.get('event') == 'worklink_factory_orphan_adopted':
+        while send(channel, {'kind': 'event', 'padding': 'x' * 1000}):
+            pass
+    return send(channel, packet, **kwargs)
+m._send = full_send
+sys.exit(m.main(sys.argv[2:]))
+"""
+    command = [sys.executable, '-I', '-c', wrapper] + command[2:]
 if mode == "live_reap":
     wrapper = """import importlib.util, sys
 s = importlib.util.spec_from_file_location('s', sys.argv[1])
@@ -238,7 +253,7 @@ def test_escaped_double_fork_is_adopted_and_reaped(tmp_path):
     assert result["result"] == 0
     assert result["events"][-1] == {"kind": "terminal", "exit_code": 0}
     assert any(e.get("event") == "worklink_factory_orphan_adopted"
-               and e["pid"] == result["pids"][-1] for e in result["events"])
+               and e.get("pid") == result["pids"][-1] for e in result["events"])
 
 
 def test_disabled_prctl_mutation_is_detected_and_fixture_reaps_leak(tmp_path):
@@ -415,14 +430,16 @@ def test_event_loss_survives_reaping_and_socket_recovery(monkeypatch):
         parent.setblocking(False)
         child.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
         assert supervisor.supervise(child, ["payload"]) == 1
-        packets = [json.loads(parent.recv(4096)) for _ in range(2)]
+        packets = [json.loads(parent.recv(4096)) for _ in range(3)]
     assert (42, signal.SIGKILL) in calls
     assert (43, signal.SIGKILL) in calls
     assert ("wait", 42) in calls and ("wait", 43) in calls
-    assert packets[0]["event"] == "worklink_factory_reap_refused"
-    assert packets[1]["kind"] == "terminal"
-    assert "adoption event delivery failed: 1 event(s) lost" in packets[1]["error"]
-    assert "exit_code" not in packets[1]
+    assert packets[0]["final"] is True
+    assert packets[0]["adopted_count"] == 1
+    assert packets[1]["event"] == "worklink_factory_reap_refused"
+    assert packets[2]["kind"] == "terminal"
+    assert "adoption event delivery failed: 1 event(s) lost" in packets[2]["error"]
+    assert "exit_code" not in packets[2]
 
 
 def test_failed_adoption_send_is_sticky_and_counted_once(monkeypatch):
@@ -435,6 +452,59 @@ def test_failed_adoption_send_is_sticky_and_counted_once(monkeypatch):
     adoptions.seen.discard(43)  # Reaped PID later reused for a new adoption.
     supervisor._observe(None, 42, adoptions)
     assert adoptions.lost == 2
+
+
+@pytest.mark.parametrize("total", [0, 1, 2, 96000])
+@pytest.mark.parametrize("ending", ["success", "reap_refused", "summary_lost"])
+def test_adoption_summary_bounds_many_occurrences(monkeypatch, total, ending):
+    packets = []
+    monkeypatch.setattr(supervisor, "_enable_subreaper", lambda: None)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *a, **kw: SimpleNamespace(pid=42))
+    monkeypatch.setattr(supervisor, "_children", lambda: [42])
+    monkeypatch.setattr(supervisor.os, "waitid", lambda *args: object())
+
+    def teardown(channel, payload, adoptions):
+        monkeypatch.setattr(supervisor, "_children", lambda: [42, 43])
+        for _ in range(total):
+            assert supervisor._observe(channel, payload.pid, adoptions) == [42, 43]
+            supervisor._observe(channel, payload.pid, adoptions)  # Same live PID is not new.
+            adoptions.seen.discard(43)  # Reaping permits the next occurrence to reuse it.
+        assert adoptions.total == total
+        if ending == "reap_refused":
+            raise supervisor.FactoryReapRefused("children survived the bounded teardown deadline")
+        return 37
+
+    def send(channel, packet, **kwargs):
+        packets.append(packet)
+        return not (ending == "summary_lost" and packet.get("final"))
+
+    monkeypatch.setattr(supervisor, "_teardown", teardown)
+    monkeypatch.setattr(supervisor, "_send", send)
+    failed = ending == "reap_refused" or (ending == "summary_lost" and total > 0)
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with parent, child:
+        assert supervisor.supervise(child, ["payload"]) == int(failed)
+    adoption = [p for p in packets if p.get("event") == "worklink_factory_orphan_adopted"]
+    assert [p["adopted_count"] for p in adoption if not p["final"]] == [
+        1 << bit for bit in range(total.bit_length())
+    ]
+    assert len(adoption) == total.bit_length() + bool(total)
+    if total:
+        assert adoption[-1] == {
+            "kind": "event", "event": "worklink_factory_orphan_adopted",
+            "adopted_count": total, "final": True,
+        }
+    if failed:
+        assert packets[-2]["event"] == "worklink_factory_reap_refused"
+        assert packets[-2]["error"] == packets[-1]["error"]
+        assert "exit_code" not in packets[-1]
+        if ending == "reap_refused":
+            assert packets[-1]["error"] == "FactoryReapRefused: children survived the bounded teardown deadline"
+        else:
+            assert packets[-1]["error"] == "adoption event delivery failed: 1 event(s) lost"
+    else:
+        assert packets[-1] == {"kind": "terminal", "exit_code": 37}
+        assert not any(p.get("event") == "worklink_factory_reap_refused" for p in packets)
 
 
 @pytest.mark.parametrize("group_id,expected", [(42, "group"), (17, "pid")])
