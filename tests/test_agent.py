@@ -5761,15 +5761,23 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     )
     poller = next(item for item in pollers if item.name == "worklink-ready-queue")
     incident_state_dir = dispatch_failure_state_dir(home)
+    log_path = home / "state" / "worklink" / "runs" / "441.log"
+    transcript_path = home / "state" / "worklink" / "transcripts" / "factory-441.json"
+    retained_checkout = tmp_path / "retained-checkout"
+    run_id = "chainlink-441-retained"
+    preserved_ref = "issue/441-a2"
+    reason = "backend failed after retained recovery"
     incident = record_failure(
         incident_state_dir,
         issue_id=441,
         attempt=2,
         exit_status=1,
-        error="backend failed",
-        log_path=str(home / "state" / "worklink" / "runs" / "441.log"),
-        preserved_ref="issue/441-a2",
-        work_path=str(tmp_path / "retained-checkout"),
+        error=reason,
+        log_path=str(log_path),
+        transcript_path=str(transcript_path),
+        preserved_ref=preserved_ref,
+        run_id=run_id,
+        work_path=str(retained_checkout),
     )
     poller = replace(
         poller,
@@ -5792,19 +5800,67 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     )
     dispatcher = Dispatcher(_make_config(home), agent.run_turn)
     agent._dispatcher = dispatcher
+    queued_events: list[AgentEvent] = []
 
-    assert await run_poller(poller, enqueue=dispatcher.enqueue, home=home) == 1
+    async def capture_enqueue(event: AgentEvent, **kwargs: Any) -> bool:
+        queued_events.append(event)
+        return await dispatcher.enqueue(event, **kwargs)
+
+    assert await run_poller(poller, enqueue=capture_enqueue, home=home) == 1
     await dispatcher.drain()
 
+    [queued] = queued_events
+    assert queued.channel_id == "poller:worklink-ready-queue"
+    [item] = queued.extra["items"]
+    assert item["issue_id"] == 441
+    assert item["run_id"] == run_id
+    assert item["terminal_error"] == reason
+    assert item["preserved_ref"] == preserved_ref
+    assert str(item["log"]).endswith("/state/worklink/runs/441.log")
+    assert str(item["transcript"]).endswith(
+        "/state/worklink/transcripts/factory-441.json"
+    )
+    assert str(item["work_path"]).endswith("/retained-checkout")
+    assert item["delivery_key"] == (
+        f"worklink-run-failure:441:{incident['signature']}:{incident['occurrence_id']}"
+    )
+
     assert len(fake_model.invocations) == 1
+    [input_message] = fake_model.invocations[0]["state"]["messages"]
+    assert isinstance(input_message, HumanMessage)
+    agent_input = str(input_message.content)
+    for pointer in (
+        "issue 441",
+        run_id,
+        reason,
+        "Log:",
+        "441.log",
+        "Transcript:",
+        "factory-441.json",
+        "Work:",
+        "retained-checkout",
+    ):
+        assert pointer in agent_input
+    assert (
+        "Read the current dispatch-failure ledger and retained leaf or factory state "
+        "before acting; if this occurrence is resolved or superseded, take no recovery action."
+    ) in agent_input
+    assert (
+        "never start fresh work, steal a live claim, or repeat a failed recovery"
+    ) in agent_input
+    assert (
+        "If state is uncertain or recovery is unavailable, unauthorized, unsafe, impossible, "
+        "or has already failed, call operator_alert"
+    ) in agent_input
     assert len(channels.sent) == 1
     assert load_failure_state(incident_state_dir)["issues"]["441"][
         "occurrence_id"
     ] == incident["occurrence_id"]
     assert not (home / "state" / "worklink" / "continuations").exists()
 
-    assert await run_poller(poller, enqueue=dispatcher.enqueue, home=home) == 0
+    assert await run_poller(poller, enqueue=capture_enqueue, home=home) == 0
     await dispatcher.drain()
+    assert queued_events == [queued]
     assert len(fake_model.invocations) == 1
     assert len(channels.sent) == 1
 
