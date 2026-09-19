@@ -238,11 +238,9 @@ async def test_t_ms_none_when_ctx_has_no_started_at():
         saga_session_id = None
         saga_calls: list = []  # type: ignore[var-annotated]
     ctx = _MinimalCtx()
-    # Skip the normal set_current_turn — go straight to the registry
-    # since _MinimalCtx isn't a real TurnContext. resolve_active_ctx's
-    # only-active-turn fallback (level 2) picks it up.
-    from mimir._context import _active_turns
-    _active_turns[ctx.turn_id] = ctx  # type: ignore[arg-type]
+    # Own the current context instead of relying on the process-wide registry
+    # containing no other active turns.
+    tok = set_current_turn(ctx)  # type: ignore[arg-type]
     try:
         inner = _FakeSaga()
         wrapped = RecordingSagaClient(inner)
@@ -250,7 +248,7 @@ async def test_t_ms_none_when_ctx_has_no_started_at():
         rec = ctx.saga_calls[0]
         assert rec.t_ms is None
     finally:
-        _active_turns.pop(ctx.turn_id, None)
+        reset_current_turn(tok)
 
 
 @pytest.mark.asyncio
