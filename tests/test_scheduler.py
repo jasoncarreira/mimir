@@ -3532,6 +3532,7 @@ async def test_scheduler_spawn_reports_background_task_failure(
 
 @pytest.mark.asyncio
 async def test_scheduler_loop_lag_monitor_logs_blocking_delay(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("mimir.scheduler.active_turn_snapshots", lambda **kwargs: [])
     logged: list[tuple[str, dict]] = []
     ticks = iter([0.0, 0.11, 0.34])
     # Loop-thread CPU mirrors wall-clock during the stall window (0.13s of CPU

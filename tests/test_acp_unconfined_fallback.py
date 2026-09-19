@@ -301,11 +301,14 @@ async def test_unconfined_shell_failure_and_timeout_label_mode(tmp_path, unavail
         failed = await provider._shell(session, "exit 3")
         assert failed["exitCode"] == 3 and failed["stderr"].startswith(UNCONFINED_WARNING)
         session.timeout_seconds = 1
+        previous_timers = len(execution_timers)
         source = "from pathlib import Path; import signal; Path('entered').touch(); signal.pause()"
         task = asyncio.create_task(provider._shell(
             session, f"exec {shlex.quote(sys.executable)} -c {shlex.quote(source)}",
         ))
-        while not (tmp_path / "entered").exists():
+        # Child readiness can precede the parent's return from subprocess spawn.
+        # Wait for this call's timeout, not the finished timeout from `exit 3`.
+        while not (tmp_path / "entered").exists() or len(execution_timers) == previous_timers:
             await asyncio.sleep(0)
         assert not task.done()
         execution_timers[-1].reschedule(0)

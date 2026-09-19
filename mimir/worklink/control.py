@@ -18,6 +18,7 @@ from .compute import LaunchHandle, LocalSubprocessComputeBackend
 from .factory_state import (
     archive_factory_record,
     factory_process_is_alive,
+    factory_process_is_verified_dead,
     load_factory_records_for_issue,
     save_factory_record,
 )
@@ -306,36 +307,56 @@ def stop_worklink(
             # leaf record must not hide a verified live factory handle.
             state = None
         if state is None:
-            factory = next(
-                (
-                    record
-                    for record in load_factory_records_for_issue(home, issue_id)
-                    if factory_process_is_alive(record) and record.handle is not None
-                ),
-                None,
-            )
-            if factory is None or factory.handle is None:
+            factories = load_factory_records_for_issue(home, issue_id)
+            if not factories:
                 return WorklinkStopResult(
                     issue_id, False, state_cleared=state_cleared, reason="no live run"
                 )
-            try:
-                asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))
-            except (KeyError, RuntimeError, OSError) as exc:
-                return WorklinkStopResult(issue_id, False, reason=str(exc))
-            save_factory_record(
-                home,
-                replace(factory, controller_phase="stopped", controller_error=None),
-            )
+            problems = []
+            uncertain = False
+            for factory in factories:
+                problem = None
+                if factory_process_is_alive(factory) and factory.handle is not None:
+                    try:
+                        asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))
+                    except (KeyError, RuntimeError, OSError) as exc:
+                        problem = f"factory {factory.run_id}: cancellation failed: {exc}"
+                else:
+                    problem = (
+                        f"factory {factory.run_id} handle={factory.handle}: "
+                        "live process identity could not be verified; refusing to signal it"
+                    )
+                if problem is not None:
+                    dead = factory_process_is_verified_dead(
+                        factory, allow_missing_start_ticks=True,
+                    )
+                    uncertain |= not dead
+                    problems.append(problem + (
+                        "; recorded process has exited; cleaning stale state"
+                        if dead else "; exit unverified; state and claim retained"
+                    ))
+                    if not dead:
+                        continue
+                save_factory_record(
+                    home,
+                    replace(factory, controller_phase="stopped", controller_error=problem),
+                )
+            if uncertain:
+                return WorklinkStopResult(
+                    issue_id, False, state_cleared=state_cleared,
+                    reason="; ".join(problems),
+                )
             release = run([chainlink_bin, "locks", "release", str(issue_id)])
             unlabel = run(
                 [chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"]
             )
             return WorklinkStopResult(
                 issue_id,
-                True,
+                not problems,
                 state_cleared=state_cleared,
                 claim_released=release.returncode == 0,
                 label_cleared=unlabel.returncode == 0,
+                reason="; ".join(problems) or None,
             )
         if state.phase != "spawned":
             return WorklinkStopResult(issue_id, False, reason="no live run")

@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import errno
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
@@ -1542,9 +1544,10 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
     import mimir.worklink.control as control
 
     monkeypatch.setattr(control, "load_run_state", lambda home, issue_id: None)
-    record = SimpleNamespace(handle=LaunchHandle("local_subprocess", "4321", 99))
+    record = SimpleNamespace(run_id="chainlink-700", handle=LaunchHandle("local_subprocess", "4321", 99))
     monkeypatch.setattr(control, "load_factory_records_for_issue", lambda home, issue_id: [record])
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: False)
+    monkeypatch.setattr(control, "factory_process_is_verified_dead", lambda record, **kwargs: False)
     monkeypatch.setattr(
         control.LocalSubprocessComputeBackend,
         "cancel",
@@ -1554,7 +1557,72 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
     result = stop_worklink(tmp_path, 700, runner=lambda args: subprocess.CompletedProcess(args, 0))
 
     assert not result.stopped
-    assert result.reason == "no live run"
+    assert result.reason != "no live run"
+    assert "factory chainlink-700" in result.reason
+    assert "refusing to signal it; exit unverified; state and claim retained" in result.reason
+
+
+@pytest.mark.parametrize(
+    "ticks,observed,zombie,kill_error,dead",
+    [
+        pytest.param(99, 99, True, None, True, id="zombie"),
+        pytest.param(99, 100, False, None, True, id="mismatch"),
+        pytest.param(None, 99, False, None, False, id="null-ticks-live"),
+        pytest.param(None, None, False, ProcessLookupError(errno.ESRCH, "gone"), True,
+                     id="null-ticks-dead-esrch"),
+        pytest.param(99, None, False, None, False, id="unreadable-observed-ticks"),
+        pytest.param(99, None, False, ProcessLookupError(errno.ESRCH, "gone"), True, id="dead"),
+        pytest.param(99, 99, False, PermissionError(errno.EPERM, "denied"), False,
+                     id="permission-error"),
+    ],
+)
+def test_stop_cli_reports_rejected_factory_identity(
+    tmp_path, monkeypatch, capsys, ticks, observed, zombie, kill_error, dead,
+):
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+
+    record = FactoryRunRecord(
+        run_id="chainlink-700", issue_id=700, attempt=2, repository="owner/repo",
+        base_ref="main", branch="epic/700", launcher="/opt/factory.js",
+        sandbox=str(tmp_path / "chainlink-700"), session="session-1",
+        handle=LaunchHandle("local_subprocess", "worker-job", ticks, 4321),
+        status=None, observed_at=None, controller_phase="running",
+    )
+    save_factory_record(tmp_path, record)
+    _state(tmp_path, 700, 1234, ticks=1, started_at=datetime.now(UTC))
+    monkeypatch.setattr(control, "process_is_alive", lambda state: False)
+    monkeypatch.setattr(factory_state.os, "kill", Mock(side_effect=kill_error))
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: zombie)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: observed)
+    cancel = AsyncMock()
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    runner = Mock(return_value=subprocess.CompletedProcess([], 0, stdout="", stderr=""))
+    monkeypatch.setattr(control, "_runner", lambda home, binary: runner)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["worklink", "stop", "700", "--home", str(tmp_path)])
+
+    assert exc.value.code == 1
+    output = capsys.readouterr().out
+    assert "worklink #700: nothing stopped (factory chainlink-700 handle=" in output
+    assert "live process identity could not be verified; refusing to signal it" in output
+    assert "no live run" not in output
+    cancel.assert_not_called()
+    assert load_run_state(tmp_path, 700) is None
+    if dead:
+        assert "recorded process has exited; cleaning stale state" in output
+        assert "stale run cleanup: state=cleared, claim=released, in-progress label=cleared" in output
+        assert load_factory_record(tmp_path, record.run_id).controller_phase == "stopped"
+        assert runner.call_args_list == [
+            call(["chainlink", "locks", "release", "700"]),
+            call(["chainlink", "issue", "unlabel", "700", "worklink:in-progress"]),
+        ]
+    else:
+        assert "exit unverified; state and claim retained" in output
+        assert "stale run cleanup:" not in output
+        assert load_factory_record(tmp_path, record.run_id) == record
+        runner.assert_not_called()
 
 
 def test_stop_cli_refuses_unverified_live_leaf(

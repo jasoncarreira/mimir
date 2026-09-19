@@ -491,12 +491,19 @@ def factory_process_is_alive(record: FactoryRunRecord) -> bool:
     return process_start_ticks(pid) == handle.process_start_ticks
 
 
-def factory_process_is_verified_dead(record: FactoryRunRecord) -> bool:
+def factory_process_is_verified_dead(
+    record: FactoryRunRecord, *, allow_missing_start_ticks: bool = False,
+) -> bool:
+    """Verify exit, optionally allowing legacy identities for operator cleanup.
+
+    Automatic recovery still requires a recorded birth marker. An operator can
+    clean a missing PID or zombie without one, but cannot infer PID reuse.
+    """
     handle = record.handle
     if (
         handle is None
         or handle.substrate != "local_subprocess"
-        or handle.process_start_ticks is None
+        or (handle.process_start_ticks is None and not allow_missing_start_ticks)
     ):
         return False
     pid = handle.shim_pid
@@ -513,5 +520,6 @@ def factory_process_is_verified_dead(record: FactoryRunRecord) -> bool:
         return False
     observed = process_start_ticks(pid)
     return process_is_zombie(pid) or (
-        observed is not None and observed != handle.process_start_ticks
+        handle.process_start_ticks is not None
+        and observed is not None and observed != handle.process_start_ticks
     )

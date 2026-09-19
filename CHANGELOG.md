@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.2, matching the
+  exact-match `FACTORY_VERSION` admission check. Both packages mimir installs are
+  published at 0.9.2; `prime-agent-feature-factory` remains at 0.9.1 and is not
+  installed or pinned here, so it does not gate this bump.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.1, matching the
   exact-match `FACTORY_VERSION` admission check. All three published packages
   (`feature-factory`, `opencode-feature-factory`, `prime-agent-feature-factory`)

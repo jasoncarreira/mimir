@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 
@@ -74,6 +76,153 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     assert list_factory_records(tmp_path) == [expected]
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
+
+
+@pytest.mark.parametrize(
+    "handle,kill_error,zombie,observed_ticks,expected",
+    [
+        pytest.param(None, None, False, 456, False, id="missing-handle"),
+        pytest.param(LaunchHandle("remote", "123", 456, 789), None, False, 456, False,
+                     id="wrong-substrate-with-shim-pid"),
+        pytest.param(LaunchHandle("local_subprocess", "unknown", 456), None, False, 456, False,
+                     id="unparseable-fallback-identifier"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789),
+                     ProcessLookupError(errno.ESRCH, "missing"), False, 456, False,
+                     id="kill-process-lookup-error"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789),
+                     PermissionError(errno.EPERM, "denied"), False, 456, False,
+                     id="kill-permission-error"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789),
+                     OSError(errno.EIO, "unavailable"), False, 456, False, id="kill-os-error"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789), None, True, 456, False,
+                     id="signalable-zombie"),
+        pytest.param(LaunchHandle("local_subprocess", "123", None, 789), None, False, 456, False,
+                     id="null-recorded-ticks"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789), None, False, 457, False,
+                     id="mismatched-observed-ticks"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789), None, False, None, False,
+                     id="unreadable-observed-ticks"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456, 789), None, False, 456, True,
+                     id="matching-shim-pid"),
+        pytest.param(LaunchHandle("local_subprocess", "123", 456), None, False, 456, True,
+                     id="numeric-fallback-identifier"),
+    ],
+)
+def test_factory_process_is_alive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handle: LaunchHandle | None,
+    kill_error: OSError | None,
+    zombie: bool,
+    observed_ticks: int | None,
+    expected: bool,
+) -> None:
+    import mimir.worklink.factory_state as factory_state
+
+    value = replace(record(tmp_path), handle=handle)
+    kill = Mock(side_effect=kill_error)
+    is_zombie = Mock(return_value=zombie)
+    start_ticks = Mock(return_value=observed_ticks)
+    monkeypatch.setattr(factory_state, "os", SimpleNamespace(kill=kill))
+    monkeypatch.setattr(factory_state, "process_is_zombie", is_zombie)
+    monkeypatch.setattr(factory_state, "process_start_ticks", start_ticks)
+
+    assert factory_state.factory_process_is_alive(value) is expected
+
+    if handle is None or handle.substrate != "local_subprocess" or handle.identifier == "unknown":
+        kill.assert_not_called()
+        is_zombie.assert_not_called()
+        start_ticks.assert_not_called()
+    else:
+        pid = handle.shim_pid if handle.shim_pid is not None else int(handle.identifier)
+        kill.assert_called_once_with(pid, 0)
+        if kill_error is not None:
+            is_zombie.assert_not_called()
+            start_ticks.assert_not_called()
+        else:
+            is_zombie.assert_called_once_with(pid)
+            if zombie or handle.process_start_ticks is None:
+                start_ticks.assert_not_called()
+            else:
+                start_ticks.assert_called_once_with(pid)
+
+
+@pytest.mark.parametrize("recorded_ticks", [None, 456], ids=["null-ticks", "recorded-ticks"])
+@pytest.mark.parametrize(
+    "kill_error,zombie,observed_ticks,expected_with_ticks,expected_without_ticks",
+    [
+        pytest.param(ProcessLookupError(errno.ESRCH, "missing"), False, None, True, True,
+                     id="esrch"),
+        pytest.param(None, True, None, True, True, id="signalable-zombie"),
+        pytest.param(None, False, 456, False, False, id="live-matching-ticks"),
+        pytest.param(None, False, None, False, False, id="unreadable-ticks"),
+        pytest.param(PermissionError(errno.EPERM, "denied"), False, 457, False, False,
+                     id="permission-error"),
+        pytest.param(OSError(errno.EIO, "unavailable"), False, 457, False, False,
+                     id="os-error"),
+        pytest.param(None, False, 457, True, False, id="mismatched-ticks"),
+    ],
+)
+def test_factory_process_is_verified_dead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_ticks: int | None,
+    kill_error: OSError | None,
+    zombie: bool,
+    observed_ticks: int | None,
+    expected_with_ticks: bool,
+    expected_without_ticks: bool,
+) -> None:
+    import mimir.worklink.factory_state as factory_state
+
+    value = replace(
+        record(tmp_path),
+        handle=LaunchHandle("local_subprocess", "123", recorded_ticks, 789),
+    )
+    kill = Mock(side_effect=kill_error)
+    is_zombie = Mock(return_value=zombie)
+    start_ticks = Mock(return_value=observed_ticks)
+    monkeypatch.setattr(factory_state, "os", SimpleNamespace(kill=kill))
+    monkeypatch.setattr(factory_state, "process_is_zombie", is_zombie)
+    monkeypatch.setattr(factory_state, "process_start_ticks", start_ticks)
+
+    expected = expected_without_ticks if recorded_ticks is None else expected_with_ticks
+    assert factory_state.factory_process_is_verified_dead(
+        value, allow_missing_start_ticks=True,
+    ) is expected
+    kill.assert_called_once_with(789, 0)
+    if kill_error is not None:
+        is_zombie.assert_not_called()
+        start_ticks.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "handle",
+    [
+        pytest.param(None, id="missing-handle"),
+        pytest.param(LaunchHandle("remote", "123", 456, 789), id="wrong-substrate"),
+        pytest.param(LaunchHandle("local_subprocess", "unknown", 456),
+                     id="invalid-fallback"),
+    ],
+)
+def test_verified_dead_operator_cleanup_rejects_invalid_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, handle: LaunchHandle | None,
+) -> None:
+    import mimir.worklink.factory_state as factory_state
+
+    kill = Mock()
+    start_ticks = Mock()
+    is_zombie = Mock()
+    monkeypatch.setattr(factory_state, "os", SimpleNamespace(kill=kill))
+    monkeypatch.setattr(factory_state, "process_start_ticks", start_ticks)
+    monkeypatch.setattr(factory_state, "process_is_zombie", is_zombie)
+
+    assert not factory_state.factory_process_is_verified_dead(
+        replace(record(tmp_path), handle=handle), allow_missing_start_ticks=True,
+    )
+    kill.assert_not_called()
+    start_ticks.assert_not_called()
+    is_zombie.assert_not_called()
 
 
 def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -> None:
