@@ -1920,6 +1920,49 @@ def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     return events
 
 
+def test_ready_dispatch_spawn_failure_records_intended_log_without_consuming_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poller = _load_poller_module()
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state_dir = dispatch_failure_state_dir(home)
+    state_dir.mkdir(parents=True)
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        poller.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("spawn unavailable")),
+    )
+    monkeypatch.setattr(poller, "_emit", emitted.append)
+
+    dispatched = poller._dispatch(
+        item=poller.DispatchItem(201, "leaf"),
+        home=home,
+        repo=str(repo),
+        state_dir=state_dir,
+        run_bin=["mimir"],
+        active=0,
+        leaf_cap=2,
+        factory_cap=1,
+    )
+
+    incident = load_failure_state(state_dir)["issues"]["201"]
+    assert dispatched is False
+    assert incident["active"] is True
+    assert incident["attempt"] is None
+    assert incident["attempt_consumed"] is False
+    assert incident["log_path"] == str(state_dir / "run-201.log")
+    assert incident["work_path"] == str(repo)
+    assert emitted == [{
+        "signal": "worklink_dispatch_failed",
+        "issue_id": 201,
+        "reason": "spawn unavailable",
+        "coding_enabled": poller.coding_enabled(),
+    }]
+
+
 @pytest.mark.skipif(not POLLER.exists(), reason="poller not present")
 def test_poller_reads_cap_from_worklink_yaml(tmp_path: Path) -> None:
     home = tmp_path / "home"

@@ -145,6 +145,52 @@ def test_server_factory_spawn_failure_records_all_recovery_pointers(
     assert incident["log_path"].endswith("factory-recover-700.log")
 
 
+def test_server_leaf_spawn_failure_records_retained_identity_and_actual_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.control as control
+    import mimir.worklink.factory_state as factory_state
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir.worklink.run_state import WorklinkRunState
+
+    state = WorklinkRunState(
+        issue_id=441,
+        attempt=4,
+        backend="fake",
+        compute_name="fake_remote",
+        handle_substrate="fake_remote",
+        handle_identifier="original-job",
+        branch="issue/441-a4",
+        base_ref="main",
+        local_base="origin/main",
+        repo="/workspace/mimir",
+        repo_url="git@github.com:owner/repo.git",
+        test_command="pytest -q",
+        started_at="2026-09-19T00:00:00+00:00",
+        checkout=str(tmp_path / "retained-checkout"),
+    )
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    monkeypatch.setattr(
+        control, "reconcile_run_states", lambda *args, **kwargs: [state]
+    )
+    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [])
+
+    def fail_spawn(argv: list[str], **kwargs: Any) -> object:
+        expected = tmp_path / "state" / "worklink" / "runs" / "reattach-441.log"
+        assert argv[:5] == ["mimir", "worklink", "run", "441", "--reattach"]
+        assert kwargs["env"]["WORKLINK_RUN_LOG"] == str(expected)
+        raise OSError("spawn unavailable")
+
+    assert reattach_inflight_worklink_runs(tmp_path, popen=fail_spawn) == []
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+    assert incident["attempt"] == state.attempt
+    assert incident["preserved_ref"] == state.branch
+    assert incident["work_path"] == state.checkout
+    assert incident["log_path"].endswith("reattach-441.log")
+
+
 def _production_call_sites(call_name: str) -> set[str]:
     root = Path(__file__).resolve().parent.parent
     sites: set[str] = set()

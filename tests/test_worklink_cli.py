@@ -801,6 +801,24 @@ def test_reconcile_releases_orphan_slot_routes_label_and_leaves_live_lock(
     def runner(args: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(list(args))
         if args[1:3] == ["locks", "release"]:
+            from mimir.worklink.dispatch_failures import (
+                dispatch_failure_state_dir,
+                load_failure_state,
+            )
+            from mimir.worklink.orchestrator import run_worklink
+
+            incident = load_failure_state(dispatch_failure_state_dir(tmp_path))[
+                "issues"
+            ]["11"]
+            assert incident["active"] is True
+            refused = run_worklink(
+                home=tmp_path,
+                repo=tmp_path / "repo",
+                issue_id=11,
+                autonomous=True,
+            )
+            assert refused.status == "refused"
+            assert refused.attempt is None
             locks.discard(int(args[3]))
         elif args[1:3] == ["locks", "list"]:
             return subprocess.CompletedProcess(
