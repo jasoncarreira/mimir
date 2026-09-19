@@ -1095,6 +1095,8 @@ class WorklinkRunner:
                 terminal_release.retain_for_recovery = False
                 terminal_release()
             except Exception as transition_exc:
+                if getattr(transition_exc, "_worklink_incident_owned", False):
+                    raise
                 transition_error = str(transition_exc)
             _log_event(
                 "worklink_transition",

@@ -3489,6 +3489,69 @@ def test_worklink_runner_backend_nonzero_transitions_failed_without_pr(tmp_path:
     assert ["chainlink", "locks", "release", "441"] in calls
 
 
+@pytest.mark.parametrize("failure_kind", ["result", "exception", "interruption"])
+def test_leaf_incident_write_failure_preserves_claim_and_retained_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+
+    class FailingBackend(FakeBackend):
+        async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+            if failure_kind == "exception":
+                raise RuntimeError("interpret exploded")
+            if failure_kind == "interruption":
+                raise KeyboardInterrupt("operator stop")
+            return await super().interpret(order, result)
+
+    config = WorklinkConfig(
+        defaults=WorklinkDefaults(allow_autonomous_local_subprocess=True)
+    )
+    registry = BackendRegistry(config)
+    registry.register(FailingBackend(status="backend_error"))
+    writes: list[int] = []
+
+    def disk_failure(**kwargs: object) -> None:
+        writes.append(int(kwargs["issue_id"]))
+        raise OSError("disk full")
+
+    monkeypatch.setattr(WorklinkConfig, "load", lambda *_: config)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", disk_failure)
+
+    run = WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+        441,
+        backend_name="fake",
+        test_command="echo ok",
+        autonomous=True,
+    )
+    if failure_kind == "interruption":
+        with pytest.raises(KeyboardInterrupt, match="operator stop"):
+            asyncio.run(run)
+    else:
+        with pytest.raises(OSError, match="disk full"):
+            asyncio.run(run)
+
+    assert writes == [441]
+    assert load_run_state(tmp_path, 441) is not None
+    assert not any(
+        isinstance(call, list) and call[1:3] == ["locks", "release"]
+        for call in calls
+    )
+    assert not any(
+        isinstance(call, list)
+        and (
+            call[1:3] == ["issue", "label"]
+            and call[-1] in {"worklink:ready", "worklink:blocked", "worklink:review"}
+            or call[1:3] == ["issue", "unlabel"]
+            and call[-1] == "worklink:in-progress"
+        )
+        for call in calls
+    )
+
+
 def test_part_a_backend_exception_failed_transition_reports_not_applied(tmp_path: Path) -> None:
     _reset_logger_for_tests()
     events_path = tmp_path / "logs" / "events.jsonl"
@@ -5192,6 +5255,47 @@ def test_factory_launch_requires_confirmed_cleanup(
         if release_confirmed and completion != "cancelled"
         else []
     )
+
+
+@pytest.mark.parametrize("interrupted", [False, True], ids=["failure", "interruption"])
+def test_factory_incident_write_failure_preserves_retained_run_without_rearm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    writes: list[int] = []
+    signals: list[str] = []
+
+    def disk_failure(**kwargs: object) -> None:
+        writes.append(int(kwargs["issue_id"]))
+        raise OSError("disk full")
+
+    async def terminal(**kwargs: object) -> object:
+        if interrupted:
+            raise asyncio.CancelledError
+        raise WorklinkError("factory supervision failed")
+
+    monkeypatch.setattr(orchestrator, "_record_run_failure", disk_failure)
+    kwargs = dict(
+        credentials={"GITHUB_TOKEN": "github-token"},
+        autonomous=True,
+        outcome="completed",
+        release_signals=signals,
+        release_confirmed=True,
+        terminal=terminal,
+    )
+    if interrupted:
+        with pytest.raises(asyncio.CancelledError):
+            _run_factory_preflight_case(tmp_path, monkeypatch, **kwargs)
+    else:
+        with pytest.raises(OSError, match="disk full"):
+            _run_factory_preflight_case(tmp_path, monkeypatch, **kwargs)
+
+    retained = load_factory_record(tmp_path, "chainlink-700")
+    assert retained is not None
+    assert retained.issue_id == 700
+    assert writes == [700]
+    assert signals == []
 
 
 def test_factory_initial_local_launch_provisions_worker_sandbox_permissions(
