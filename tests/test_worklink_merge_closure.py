@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 from typing import Sequence
 
 import pytest
 
 from mimir.worklink import merge_closure as closure
+from mimir.worklink import dispatch_failures
 from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
 
 
@@ -166,7 +169,11 @@ def test_canonical_historical_leaf_closes_audit_first(
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker, gh_runner=forge(issue_id), git_runner=git_runner(repo),
     ) == []
-    assert mutations == ["comment", "close", "unlabel"]
+    rerun_mutations = [
+        call[2] for call in tracker.calls
+        if call[1] == "issue" and call[2] in {"comment", "close", "unlabel"}
+    ]
+    assert rerun_mutations == ["comment", "close", "unlabel"]
 
 
 @pytest.mark.parametrize("body", [
@@ -402,3 +409,510 @@ def test_strict_tracker_snapshots() -> None:
         malformed.pop(field)
         with pytest.raises(closure.ClosureReadError):
             closure.parse_issue_snapshot(malformed, expected_issue_id=22)
+
+
+def _seed_intent(
+    home: Path,
+    issue_id: int,
+    evidence_path: Path,
+    *,
+    stage: str,
+    uncertainty: str | None = None,
+    finalized: bool = False,
+) -> tuple[str, str]:
+    source_digest = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+    identity = json.dumps([1, issue_id, "example/project", 42], separators=(",", ":"))
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    audit = (
+        f"WORKLINK_CLOSED v1 {key}\n"
+        f"Chainlink #{issue_id} complete via PR {PR_URL}.\n"
+        f"Merged at {MERGED_AT}; merge commit {MERGE_SHA}; completion base main."
+    )
+    entry = {
+        "intent_key": key,
+        "issue_id": issue_id,
+        "repository": "example/project",
+        "pr_number": 42,
+        "pr_url": PR_URL,
+        "base_ref": "main",
+        "merge_commit_sha": MERGE_SHA,
+        "merged_at": MERGED_AT,
+        "audit_text": audit,
+        "source_digests": [source_digest],
+        "stage": stage,
+        "result_finalized": finalized,
+    }
+    if uncertainty is not None:
+        entry["uncertainty"] = uncertainty
+    state_dir = dispatch_failure_state_dir(home)
+    with dispatch_failures.merge_reconciliation_transaction(state_dir) as reconciliations:
+        reconciliations["intents"][key] = entry
+    return key, audit
+
+
+@pytest.mark.parametrize(
+    ("stage", "initial_status", "marker", "uncertainty", "review_label", "actions", "result"),
+    [
+        ("discovered", "open", False, None, True, ["comment", "close", "unlabel"], True),
+        ("audit_started", "open", True, None, True, ["close", "unlabel"], True),
+        ("audit_started", "open", False, None, True, [], False),
+        ("audit_confirmed", "open", True, None, True, ["close", "unlabel"], True),
+        ("close_started", "open", True, None, True, [], False),
+        ("close_started", "closed", True, None, True, ["unlabel"], True),
+        ("closed_verified", "closed", True, None, True, ["unlabel"], True),
+        ("cleanup_pending", "closed", True, None, True, ["unlabel"], True),
+        ("cleanup_pending", "closed", True, None, False, [], True),
+        ("uncertain", "open", True, "audit_outcome_uncertain", True, ["close", "unlabel"], True),
+        ("uncertain", "closed", True, "close_outcome_uncertain", True, ["unlabel"], True),
+    ],
+)
+def test_intent_stage_and_external_call_crash_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    initial_status: str,
+    marker: bool,
+    uncertainty: str | None,
+    review_label: bool,
+    actions: list[str],
+    result: bool,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 30)
+    tracker = Tracker(30, labels={"worklink:review"} if review_label else {"done"})
+    _, audit = _seed_intent(
+        home, 30, path, stage=stage, uncertainty=uncertainty,
+    )
+    tracker.status = initial_status
+    if marker:
+        tracker.comments.append(audit)
+
+    outcomes = closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(30), git_runner=git_runner(repo),
+    )
+
+    actual_actions = [
+        call[2] for call in tracker.calls
+        if call[1] == "issue" and call[2] in {"comment", "close", "unlabel"}
+    ]
+    assert actual_actions == actions
+    assert bool(outcomes) is result
+    ledger = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]
+    persisted = next(iter(ledger["intents"].values()))
+    if result:
+        assert persisted["stage"] == "finalized"
+        assert persisted["result_finalized"] is True
+    elif stage in {"audit_started", "close_started"}:
+        assert persisted["stage"] == "uncertain"
+
+
+def test_finalized_tombstone_never_recloses_reopened_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 31)
+    tracker = Tracker(31)
+    _, audit = _seed_intent(home, 31, path, stage="finalized", finalized=True)
+    tracker.comments.append(audit)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(31), git_runner=git_runner(repo),
+    ) == []
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+
+
+def test_associated_non_review_candidate_is_visible_but_unrelated_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 32)
+    tracker = Tracker(32, labels={"triage"})
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(32), git_runner=git_runner(repo),
+    )
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "review_lifecycle_required"
+    ]
+
+
+@pytest.mark.parametrize("config", ["repositories", "worklink"])
+def test_malformed_yaml_records_trust_refusal_before_tracker_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    (home / f"{config}.yaml").write_text("broken: [", encoding="utf-8")
+    tracker = Tracker(33)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(33), git_runner=git_runner(repo),
+    ) == []
+    assert tracker.calls == []
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "repository_trust_failed"
+    ]
+
+
+@pytest.mark.parametrize("payload", [
+    {"issues": "not-a-list"},
+    [{}],
+    [{"id": 1, "number": 2}],
+    [{"id": 0}],
+])
+def test_malformed_open_inventory_is_visible_and_stops_before_issue_or_forge_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    calls = []
+
+    def tracker(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return cp(stdout=json.dumps(payload))
+
+    forge_called = False
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal forge_called
+        forge_called = True
+        return cp()
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git_runner(repo),
+    ) == []
+    assert len(calls) == 1
+    assert not forge_called
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "tracker_inventory_failed"
+    ]
+
+
+def test_malformed_issue_snapshot_is_visible_and_stops_before_forge_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 33)
+    tracker = Tracker(33)
+    original = tracker.__call__
+
+    def malformed(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            tracker.calls.append(list(args))
+            return cp(stdout=json.dumps({"id": 33, "labels": ["worklink:review"]}))
+        return original(args)
+
+    forge_called = False
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal forge_called
+        forge_called = True
+        return cp()
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=malformed, gh_runner=gh, git_runner=git_runner(repo),
+    ) == []
+    assert not forge_called
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert any(not entry["resolved"] for entry in notices.values())
+
+
+def test_already_closed_issue_without_intent_is_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 44)
+    tracker = Tracker(44)
+    tracker.status = "closed"
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(44), git_runner=git_runner(repo),
+    ) == []
+    assert len(tracker.calls) == 1
+
+
+@pytest.mark.parametrize("pr_state", ["open", "closed_unmerged"])
+def test_open_and_unmerged_reevaluation_resolve_superseded_notices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pr_state: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 34)
+    state_dir = dispatch_failure_state_dir(home)
+    old = dispatch_failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=34, repository="example/project", pr_url=PR_URL,
+        reason="old_refusal", detail="superseded",
+    )
+    tracker = Tracker(34)
+    gh = (
+        forge(34, state="open", merged=False)
+        if pr_state == "open" else forge(34, state="closed", merged=False)
+    )
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git_runner(repo),
+    )
+    notice = load_failure_state(state_dir)["merge_reconciliations"]["notices"][old["delivery_key"]]
+    assert notice["resolved"] is True
+    if pr_state == "closed_unmerged":
+        assert path.with_suffix(".json.closed-unmerged").exists()
+
+
+def test_changed_refusal_resolves_prior_and_keeps_current_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 35)
+    state_dir = dispatch_failure_state_dir(home)
+    old = dispatch_failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=35, repository="example/project", pr_url=PR_URL,
+        reason="old_refusal", detail="superseded",
+    )
+    tracker = Tracker(35, labels={"worklink:review", "worklink:epic"})
+    closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(35), git_runner=git_runner(repo),
+    )
+    notices = load_failure_state(state_dir)["merge_reconciliations"]["notices"]
+    assert notices[old["delivery_key"]]["resolved"] is True
+    current = [entry for entry in notices.values() if not entry["resolved"]]
+    assert [entry["reason"] for entry in current] == ["epic_not_leaf"]
+
+
+def test_merge_between_sweeps_is_reconciled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 36)
+    tracker = Tracker(36)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=forge(36, state="open", merged=False), git_runner=git_runner(repo),
+    ) == []
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(36), git_runner=git_runner(repo),
+    )] == [36]
+
+
+class FailingTracker(Tracker):
+    def __init__(self, *args, fail_action: str, raises: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fail_action = fail_action
+        self.raises = raises
+
+    def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        action = list(args)[2] if len(args) > 2 and list(args)[1] == "issue" else ""
+        if action == self.fail_action:
+            self.calls.append(list(args))
+            if self.raises:
+                raise OSError(f"{action} transport failed")
+            return cp(1, stderr=f"{action} failed")
+        return super().__call__(args)
+
+
+@pytest.mark.parametrize(("action", "raises"), [
+    ("comment", False), ("comment", True), ("close", False), ("close", True),
+])
+def test_comment_and_close_command_failures_become_uncertain_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str, raises: bool,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 37)
+    tracker = FailingTracker(37, fail_action=action, raises=raises)
+    for _ in range(2):
+        assert closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=forge(37), git_runner=git_runner(repo),
+        ) == []
+    calls = [call for call in tracker.calls if call[1:3] == ["issue", action]]
+    assert len(calls) == 1
+    entry = next(iter(load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["intents"].values()))
+    assert entry["stage"] == "uncertain"
+    expected = "audit_outcome_uncertain" if action == "comment" else "close_outcome_uncertain"
+    assert entry["uncertainty"] == expected
+
+
+def test_cleanup_failure_retries_only_while_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 38)
+    tracker = FailingTracker(38, fail_action="unlabel")
+    _, audit = _seed_intent(home, 38, path, stage="closed_verified")
+    tracker.status = "closed"
+    tracker.comments.append(audit)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(38), git_runner=git_runner(repo),
+    ) == []
+    tracker.fail_action = "never"
+    assert [item.issue_id for item in closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(38), git_runner=git_runner(repo),
+    )] == [38]
+    tracker.status = "open"
+    tracker.labels.add("worklink:review")
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(38), git_runner=git_runner(repo),
+    ) == []
+    assert len([call for call in tracker.calls if call[1:3] == ["issue", "unlabel"]]) == 2
+
+
+def test_forge_failure_is_visible_and_never_reaches_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 39)
+    tracker = Tracker(39)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker,
+        gh_runner=lambda args: cp(1, stderr="forge unavailable"),
+        git_runner=git_runner(repo),
+    ) == []
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert any(not entry["resolved"] for entry in notices.values())
+
+
+@pytest.mark.parametrize("defect", [
+    "issue", "repository", "number", "url", "base", "sha", "time", "digest",
+    "audit", "stage", "result", "uncertainty",
+])
+def test_semantically_corrupt_intent_halts_before_tracker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 40)
+    key, _ = _seed_intent(home, 40, path, stage="discovered")
+    state_dir = dispatch_failure_state_dir(home)
+    with dispatch_failures.failure_state_transaction(state_dir) as state:
+        entry = state["merge_reconciliations"]["intents"][key]
+        field, value = {
+            "issue": ("issue_id", 0),
+            "repository": ("repository", "Example/Project"),
+            "number": ("pr_number", 0),
+            "url": ("pr_url", PR_URL + "/extra"),
+            "base": ("base_ref", "bad base"),
+            "sha": ("merge_commit_sha", "not-a-sha"),
+            "time": ("merged_at", "2026-09-20T12:00:00"),
+            "digest": ("source_digests", ["bad"]),
+            "audit": ("audit_text", "wrong"),
+            "stage": ("stage", "invented"),
+            "result": ("result_finalized", True),
+            "uncertainty": ("uncertainty", "close_outcome_uncertain"),
+        }[defect]
+        entry[field] = value
+    tracker = Tracker(40)
+    with pytest.raises(OSError, match="merge reconciliation state unavailable"):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=forge(40), git_runner=git_runner(repo),
+        )
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+
+
+def test_ambiguous_unresolved_intents_halt_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 41)
+    key, _ = _seed_intent(home, 41, path, stage="discovered")
+    state_dir = dispatch_failure_state_dir(home)
+    with dispatch_failures.failure_state_transaction(state_dir) as state:
+        first = state["merge_reconciliations"]["intents"][key]
+        second = dict(first, pr_number=43, pr_url="https://github.com/example/project/pull/43")
+        identity = json.dumps([1, 41, "example/project", 43], separators=(",", ":"))
+        second_key = hashlib.sha256(identity.encode()).hexdigest()
+        second["intent_key"] = second_key
+        second["audit_text"] = (
+            f"WORKLINK_CLOSED v1 {second_key}\n"
+            f"Chainlink #41 complete via PR {second['pr_url']}.\n"
+            f"Merged at {MERGED_AT}; merge commit {MERGE_SHA}; completion base main."
+        )
+        state["merge_reconciliations"]["intents"][second_key] = second
+    tracker = Tracker(41)
+    with pytest.raises(OSError, match="ambiguous unresolved issue intent"):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=forge(41), git_runner=git_runner(repo),
+        )
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+
+
+def test_durability_failure_halts_before_external_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 42)
+    state_dir = dispatch_failure_state_dir(home)
+    dispatch_failures.pending_merge_reconciliation_notices(state_dir)
+    monkeypatch.setattr(
+        dispatch_failures, "_fsync_failure_state",
+        lambda state_dir: (_ for _ in ()).throw(OSError("fsync failed")),
+    )
+    tracker = Tracker(42)
+    with pytest.raises(OSError, match="fsync failed"):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=forge(42), git_runner=git_runner(repo),
+        )
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+
+
+@pytest.mark.parametrize("corruption", ["version", "json", "namespace"])
+def test_malformed_durability_halts_before_external_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 43)
+    state_dir = dispatch_failure_state_dir(home)
+    dispatch_failures.pending_merge_reconciliation_notices(state_dir)
+    if corruption == "json":
+        (state_dir / dispatch_failures.STATE_FILE).write_text("{", encoding="utf-8")
+    else:
+        with dispatch_failures.failure_state_transaction(state_dir) as state:
+            if corruption == "version":
+                state["version"] = 2
+            else:
+                state["merge_reconciliations"] = {"intents": [], "notices": {}}
+    tracker = Tracker(43)
+    with pytest.raises(OSError):
+        closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=forge(43), git_runner=git_runner(repo),
+        )
+    assert not [call for call in tracker.calls if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])]
+
+
+def test_overlapping_process_sweeps_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    journal = tmp_path / "journal"
+    script = r'''
+import os, subprocess, sys, time
+from pathlib import Path
+from mimir.worklink.merge_closure import reconcile_merged_leaves
+home, repo, journal = map(Path, sys.argv[1:])
+def cp(out=""):
+    return subprocess.CompletedProcess([], 0, out, "")
+def git(args):
+    if args[-2:] == ["rev-parse", "--show-toplevel"]:
+        with journal.open("a") as handle:
+            handle.write(f"start {os.getpid()}\n"); handle.flush(); os.fsync(handle.fileno())
+        time.sleep(.25)
+        with journal.open("a") as handle:
+            handle.write(f"end {os.getpid()}\n"); handle.flush(); os.fsync(handle.fileno())
+        return cp(str(repo) + "\n")
+    return cp("https://github.com/example/project.git\n")
+def chainlink(args):
+    return cp("[]")
+reconcile_merged_leaves(home, chainlink_runner=chainlink, gh_runner=lambda a: cp("{}"), git_runner=git)
+'''
+    env = {**os.environ, "WORKLINK_REPO": str(repo)}
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(home), str(repo), str(journal)],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(2)
+    ]
+    outputs = [process.communicate(timeout=20) for process in processes]
+    assert [(process.returncode, stderr) for process, (_, stderr) in zip(processes, outputs)] == [
+        (0, ""), (0, ""),
+    ]
+    events = journal.read_text(encoding="utf-8").splitlines()
+    assert [event.split()[0] for event in events] == ["start", "end", "start", "end"]
+    assert events[0].split()[1] == events[1].split()[1]
+    assert events[2].split()[1] == events[3].split()[1]
+    assert events[0].split()[1] != events[2].split()[1]

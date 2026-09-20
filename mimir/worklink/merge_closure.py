@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
+import yaml
+
 from ..redaction import redact_text
 from ..repository_config import RepositoryConfig, RepositoryInventory
 from .backends import WorklinkConfig
@@ -153,7 +155,7 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
     try:
         inventory = RepositoryInventory.load(inventory_path)
         selected = WorklinkConfig.load(home / "worklink.yaml").repository
-    except (OSError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         raise ClosureReadError(f"repository trust unavailable: {exc}") from exc
     if not inventory.declared or not selected:
         raise ClosureReadError("repository trust unavailable: Worklink repository is not declared")
@@ -317,7 +319,8 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     elif merged_at is not None or merge_sha is not None:
         raise ClosureReadError("unmerged PR snapshot contains merge identity")
     return PrSnapshot(
-        canonical_url, slug, number, body, state, merged, merged_at, merge_sha,
+        canonical_url, slug, number, body, state, merged, merged_at,
+        merge_sha.lower() if isinstance(merge_sha, str) else None,
         base_slug.lower(), base_ref,
     )
 
@@ -774,6 +777,10 @@ def reconcile_merged_leaves(
                     reason="tracker_inventory_failed", detail=str(exc),
                 )
             return []
+        if not dry_run:
+            resolve_merge_reconciliation_notices(
+                state_dir, issue_id=None, pr_url=None,
+            )
         pending = {} if dry_run else _pending_intents(state_dir)
         issue_ids = open_ids | {
             int(entry["issue_id"]) for entry in pending.values()
@@ -797,7 +804,14 @@ def reconcile_merged_leaves(
             try:
                 issue = _read_issue(issue_id, chainlink_runner)
                 if "worklink:review" not in issue.labels:
-                    continue
+                    association = discover_associations(home, issue)
+                    if association.pr_url is None and association.reason == "missing_pr_association":
+                        if not dry_run:
+                            resolve_merge_reconciliation_notices(
+                                state_dir, issue_id=issue_id, pr_url=None,
+                            )
+                        continue
+                    raise ClosureReadError("review_lifecycle_required")
                 if lifecycle_reason := _lifecycle_reason(issue):
                     raise ClosureReadError(lifecycle_reason)
                 association = discover_associations(home, issue)
@@ -809,9 +823,16 @@ def reconcile_merged_leaves(
                     issue=issue, pr=pr, repository=repository, association=association,
                 )
                 if reason == "pr_open":
+                    if not dry_run:
+                        resolve_merge_reconciliation_notices(
+                            state_dir, issue_id=issue_id, pr_url=pr.url,
+                        )
                     continue
                 if reason == "pr_closed_unmerged":
                     if not dry_run:
+                        resolve_merge_reconciliation_notices(
+                            state_dir, issue_id=issue_id, pr_url=pr.url,
+                        )
                         _archive_closed_unmerged(association)
                     continue
                 if reason:

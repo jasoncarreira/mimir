@@ -3344,7 +3344,7 @@ def test_close_merged_chainlinks_closed_unmerged_dry_run_keeps_evidence(tmp_path
     assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
 
 
-def test_close_merged_chainlinks_gh_failure_keeps_evidence(tmp_path: Path) -> None:
+def test_close_merged_chainlinks_missing_trust_keeps_evidence(tmp_path: Path) -> None:
     home = tmp_path / "home"
     evidence_dir = home / "state" / "worklink" / "evidence"
     evidence_dir.mkdir(parents=True)
