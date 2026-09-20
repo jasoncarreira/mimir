@@ -5,6 +5,7 @@ import os
 import stat
 import struct
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +14,131 @@ import pytest
 
 from mimir.contained_execution import CollectedExecutionResult
 from mimir.worklink import compute, worker_exec
+from mimir.worklink.safe_git import _git_credential_settings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", [None, "!gh auth git-credential", "!other-forge-helper"])
+async def test_factory_launch_uses_captured_trusted_scoped_helpers(
+    tmp_path, monkeypatch, caplog, helper,
+):
+    controller = tmp_path / "controller"
+    controller.mkdir()
+    monkeypatch.setenv("HOME", str(controller))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(controller / ".config"))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    # Production capture deliberately strips all GIT_* overrides before reading
+    # trusted configuration, including the NOSYSTEM override above. Isolate this
+    # fixture after that scrub so macOS's system osxkeychain helper cannot leak
+    # into the expected repo-local settings (especially the no-helper case).
+    from mimir.worklink import safe_git
+
+    capture_environment = safe_git._capture_environment
+    monkeypatch.setattr(safe_git, "_capture_environment", lambda: {
+        **capture_environment(),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    })
+    trusted = tmp_path / "trusted"
+    checkout = tmp_path / "checkout"
+    for repo in (trusted, checkout):
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    settings = () if helper is None else (
+        ("credential.https://github.com.helper", ""),
+        ("credential.https://github.com.helper", helper),
+        ("credential.https://other.example.helper", "!separate-host-helper"),
+    )
+    for key, value in settings:
+        subprocess.run(["git", "-C", str(trusted), "config", "--add", key, value], check=True)
+    captured = _git_credential_settings(trusted)
+    assert captured == settings
+    subprocess.run([
+        "git", "-C", str(checkout), "config", "credential.https://github.com.helper", "!untrusted",
+    ], check=True)
+    monkeypatch.setenv("GH_TOKEN", "test-token-must-stay-in-environment")
+    caplog.set_level("DEBUG")
+    worker_home = tmp_path / "worker-home"
+    worker_home.mkdir(mode=0o700)
+    observed = []
+
+    async def execute(command, capability, env, projections, **kwargs):
+        worker_exec._validate_environment(env)
+        worker_exec._project_home(worker_home, [
+            {"path": p.path, "document": p.document.decode()} for p in projections
+        ])
+        assert projections == []
+        assert "test-token-must-stay-in-environment" not in repr(command)
+        git_env = {**env, "HOME": str(worker_home), "GIT_CONFIG_NOSYSTEM": "1"}
+        # Query outside either repository, as a nested factory sandbox would:
+        # the helper must be available through the worker environment alone.
+        result = subprocess.run(
+            ["git", "config", "--get-regexp", r"^credential\.(.+\.)?helper$"],
+            cwd=worker_home, env=git_env, capture_output=True, text=True,
+        )
+        assert result.returncode == (0 if settings else 1)
+        assert result.stdout.splitlines() == [f"{key} {value}" for key, value in settings]
+        if helper is None:
+            assert "GIT_CONFIG_COUNT" not in env
+        else:
+            matched = subprocess.run(
+                ["git", "config", "--get-urlmatch", "credential.helper", "https://github.com/owner/repo"],
+                cwd=worker_home, env=git_env, capture_output=True, text=True, check=True,
+            )
+            assert matched.stdout.strip() == helper
+        observed.append(env)
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(compute, "execute_contained", execute)
+    backend = compute.LocalSubprocessComputeBackend(_worker_client=object())
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
+        rules=None, test_command="", backend="feature_factory", timeout_s=10,
+        local_checkout=checkout, local_argv=("python", "-c", "pass"),
+        factory_credential_settings=captured,
+    )
+    handle = await backend.launch(spec)
+    assert (await backend.wait(handle, 10)).exit_code == 0
+    await backend.cleanup(handle)
+    assert len(observed) == 1
+    assert list(worker_home.iterdir()) == []
+    assert stat.S_IMODE(worker_home.stat().st_mode) == 0o700
+    assert "test-token-must-stay-in-environment" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_factory_credentials_leave_enabled_leaf_environment_and_projections_unchanged(
+    tmp_path, monkeypatch,
+):
+    from mimir.worklink.worker_client import WorkerProjection
+
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    identifier = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    monkeypatch.setattr(compute.uuid, "uuid4", lambda: identifier)
+    projection = WorkerProjection(".config/opencode/opencode.json", b'{"model": "test"}')
+    spec = compute.WorkSpec(
+        issue_id=41, attempt=2, repo_url="", base_ref="", branch="", prompt="",
+        rules=None, test_command="", backend="opencode", timeout_s=10,
+        local_checkout=tmp_path, local_argv=("opencode", "run"),
+        backend_config={"worker_projections": (projection,)},
+    )
+    expected = compute._enabled_child_env(spec, identifier)
+    expected.pop("HOME")
+    observed = []
+
+    async def execute(command, capability, env, projections, **kwargs):
+        observed.append((env, projections))
+        capability._contained_started(SimpleNamespace(pid=None))
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(compute, "execute_contained", execute)
+    backend = compute.LocalSubprocessComputeBackend(_worker_uid=os.getuid(), _worker_client=object())
+    for settings in ((), (("credential.https://github.com.helper", "!trusted-helper"),)):
+        handle = await backend.launch(replace(spec, factory_credential_settings=settings))
+        assert (await backend.wait(handle, 10)).exit_code == 0
+        await backend.cleanup(handle)
+    assert observed == [(expected, [projection]), (expected, [projection])]
 
 
 @pytest.fixture
