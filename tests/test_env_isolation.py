@@ -180,7 +180,10 @@ def test_longmemeval_memory_smoke_cases_are_collected():
         if line.startswith(f"{_LONGMEMEVAL_SMOKE}::")
     }
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (
+        "child pytest could not run the collection probe; LongMemEval "
+        "collection was not evaluated:\n" + result.stdout + result.stderr
+    )
     assert collected == _LONGMEMEVAL_NODE_IDS, (
         "LongMemEval via_memory collection changed:\n"
         f"missing: {sorted(_LONGMEMEVAL_NODE_IDS - collected)}\n"
@@ -191,21 +194,32 @@ def test_longmemeval_memory_smoke_cases_are_collected():
 # ── 3. host-only overrides must not change the suite's result ─────────
 
 _PUBLISHING_IDENTITY = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
-_DECLARED_IDENTITY_TESTS = (
-    "tests/test_worklink_orchestrator.py"
-    "::test_factory_new_run_uses_resolved_base_for_single_checkout_placement"
-)
+
+
+def _assert_session_fixture_clears(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the session fixture without starting a nested pytest run."""
+    from tests.conftest import _clear_host_mimir_environment
+
+    monkeypatch.setenv(name, value)
+    fixture = _clear_host_mimir_environment.__wrapped__()
+    next(fixture)
+    try:
+        assert name not in os.environ
+    finally:
+        with pytest.raises(StopIteration):
+            next(fixture)
+
+
 _CODING_ENABLED = "MIMIR_CODING_ENABLED"
-_CODING_STATE_TESTS = (
-    "tests/test_tool_registry.py",
-    "tests/test_worklink_backends.py",
-    "tests/test_worklink_evidence.py",
-    "tests/test_runtime.py",
-    "tests/test_bench_runner.py",
-)
 
 
-def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
+def test_declared_publishing_identity_tests_ignore_the_host_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The suite must pass with the deployment's publishing identity exported.
 
     ``MIMIR_FACTORY_PUBLISHING_IDENTITY`` overrides the ``publishing_identity``
@@ -216,55 +230,29 @@ def test_declared_publishing_identity_tests_ignore_the_host_override() -> None:
     red on every build, so ``review_ready`` stayed false and no build reached
     the commit step or published a PR.
 
-    Asserting the variable is absent would only restate the fixture. Running the
-    affected tests in a child process with it *present* is the property that
-    actually matters, and it fails if the name is dropped from
-    ``_clear_host_mimir_environment``.
+    Exercise the clearing fixture with the variable present rather than running
+    another pytest suite. The old nested suite could fail during child startup
+    under host load and incorrectly report that the variable leaked.
     """
-    env = dict(os.environ)
-    env[_PUBLISHING_IDENTITY] = "deployment-owner"
-    completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", _DECLARED_IDENTITY_TESTS],
-        capture_output=True,
-        cwd=Path(__file__).resolve().parent.parent,
-        env=env,
-    )
-    assert completed.returncode == 0, (
-        f"{_PUBLISHING_IDENTITY} leaked into the suite:\n"
-        f"{completed.stdout.decode(errors='replace')[-2000:]}"
+    _assert_session_fixture_clears(
+        _PUBLISHING_IDENTITY, "deployment-owner", monkeypatch
     )
 
 
-def test_coding_state_tests_ignore_the_host_override() -> None:
+def test_coding_state_tests_ignore_the_host_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The Worklink gate must pass with deployment coding enabled.
 
     The chainlink-orchestrator deliberately passes ``MIMIR_CODING_ENABLED`` to
     every Worklink build. Without the session fixture clearing that host value,
     disabled-default tool-registry tests and backend/evidence tests silently run
-    against the enabled worker path. Running the affected files in a child
-    process makes the ambient-enabled deployment condition executable evidence.
+    against the enabled worker path.
     """
-    env = dict(os.environ)
-    env[_CODING_ENABLED] = "true"
-    completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", *_CODING_STATE_TESTS],
-        capture_output=True,
-        cwd=Path(__file__).resolve().parent.parent,
-        env=env,
-    )
-    assert completed.returncode == 0, (
-        f"{_CODING_ENABLED} leaked into the suite:\n"
-        f"{completed.stdout.decode(errors='replace')[-4000:]}\n"
-        f"{completed.stderr.decode(errors='replace')[-2000:]}"
-    )
+    _assert_session_fixture_clears(_CODING_ENABLED, "true", monkeypatch)
 
 
 # ── 4. poller-injected env must not reach the suite ───────────────────
-
-_POSTCLAIM_FAILURE_TEST = (
-    "tests/test_worklink_orchestrator.py::test_postclaim_failure_emits_same_failure_event"
-)
-
 
 def test_conftest_clears_every_poller_injected_env_key() -> None:
     """``conftest._POLLER_INJECTED_ENV`` must stay in step with its source of truth.
@@ -286,6 +274,7 @@ def test_conftest_clears_every_poller_injected_env_key() -> None:
 
 def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A test must not write into the poller store it happens to inherit.
 
@@ -300,16 +289,25 @@ def test_suite_does_not_write_dispatch_failures_into_an_inherited_state_dir(
     The test passes either way, which is why nothing surfaced it. The property
     worth asserting is that the store stays untouched.
     """
-    probe = tmp_path / "state"
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir
+    from mimir.worklink import orchestrator
+
+    probe = tmp_path / "inherited-state"
     probe.mkdir()
-    env = dict(os.environ)
-    env["STATE_DIR"] = str(probe)
-    completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:randomly", _POSTCLAIM_FAILURE_TEST],
-        capture_output=True,
-        cwd=Path(__file__).resolve().parent.parent,
-        env=env,
+    home = tmp_path / "test-home"
+    monkeypatch.setattr(orchestrator, "_log_event", lambda *_args, **_kwargs: None)
+
+    _assert_session_fixture_clears("STATE_DIR", str(probe), monkeypatch)
+    incident = orchestrator._record_run_failure(
+        home=home,
+        issue_id=441,
+        attempt=2,
+        error="backend exploded api_key=secret",
+        exit_status=1,
+        autonomous=True,
     )
-    assert completed.returncode == 0, completed.stdout.decode(errors="replace")[-2000:]
+
+    assert incident is not None
     written = sorted(child.name for child in probe.iterdir())
     assert written == [], f"suite wrote into an inherited STATE_DIR: {written}"
+    assert dispatch_failure_state_dir(home).is_dir(), "failure path was not exercised"

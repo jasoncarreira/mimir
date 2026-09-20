@@ -356,10 +356,10 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    from mimir import chainlink_board
+
     home = tmp_path / "home"
-    bin_dir = tmp_path / "bin"
     home.mkdir()
-    bin_dir.mkdir()
     evidence_dir = home / "state" / "worklink" / "evidence"
     evidence_dir.mkdir(parents=True)
     (home / "state" / "worklink" / "transcripts").mkdir(parents=True)
@@ -377,30 +377,38 @@ async def test_chainlink_board_parses_cli_json_and_worklink_evidence(
         }),
         encoding="utf-8",
     )
-    chainlink = bin_dir / "chainlink"
-    chainlink.write_text(
-        """#!/usr/bin/env python3
-import json, sys
-args = sys.argv[1:]
-if args == ["export", "--json"]:
-    print(json.dumps({"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [
+    export_payload = {"version": 1, "exported_at": "2026-06-18T03:00:00Z", "issues": [
         {"id": 524, "title": "Parent", "status": "open", "priority": "high", "labels": ["epic"], "parent_id": None, "description": "Parent description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T00:00:00Z"},
         {"id": 545, "title": "Board", "status": "open", "priority": "medium", "labels": ["worklink:review", "frontend"], "parent_id": 524, "description": "Board description", "comments": [], "created_at": "2026-06-17T00:00:00Z", "closed_at": None, "updated_at": "2026-06-18T01:00:00Z"},
-        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "parent_id": None, "description": "Prereq description", "comments": [], "created_at": "2026-06-16T00:00:00Z", "closed_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-17T00:00:00Z"}
-    ]}))
-elif args[:2] == ["issue", "show"] and args[2] == "545":
-    print(json.dumps({"id": 545, "blocked_by": [540], "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]}))
-elif args[:2] == ["issue", "show"] and args[2] == "524":
-    print(json.dumps({"id": 524, "subissues": [545]}))
-elif args[:2] == ["issue", "show"] and args[2] == "540":
-    print(json.dumps({"id": 540}))
-else:
-    raise SystemExit(2)
-""",
-        encoding="utf-8",
+        {"id": 540, "title": "Prereq", "status": "closed", "priority": "low", "labels": [], "parent_id": None, "description": "Prereq description", "comments": [], "created_at": "2026-06-16T00:00:00Z", "closed_at": "2026-06-17T00:00:00Z", "updated_at": "2026-06-17T00:00:00Z"},
+    ]}
+    detail_payloads = {
+        "545": {"id": 545, "blocked_by": [540], "description": "Acceptance criteria", "comments": [{"author": "mimir", "created_at": "2026-06-18T02:00:00Z", "body": "WORKLINK_EVIDENCE attached"}]},
+        "524": {"id": 524, "subissues": [545]},
+        "540": {"id": 540},
+    }
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def communicate(self):
+            return json.dumps(self.payload).encode(), b""
+
+    async def create_subprocess_exec(program, *args, **kwargs):
+        assert program == "chainlink"
+        assert kwargs["cwd"] == str(home)
+        payload = export_payload if args == ("export", "--json") else detail_payloads[args[2]]
+        return FakeProcess(payload)
+
+    # The original executable had to start another Python interpreter inside a
+    # five-second production timeout. Under host load that tested scheduling,
+    # not board parsing. This fake retains the byte-level JSON decode boundary.
+    monkeypatch.setattr(
+        chainlink_board.asyncio, "create_subprocess_exec", create_subprocess_exec
     )
-    chainlink.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
 
     payload = await build_chainlink_board_payload(home, issue=545)
 
