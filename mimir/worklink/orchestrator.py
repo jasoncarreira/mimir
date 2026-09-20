@@ -149,7 +149,12 @@ def _factory_startup_status_timeout_s() -> float:
         value = float(raw)
     except ValueError:
         value = None
-    if value is None or value <= 0:
+    # ``float`` accepts "nan" and "inf". A NaN deadline is never less than or
+    # equal to zero and every later comparison against it is False, so it
+    # silently disables the deadline; an infinite one reaches
+    # ``math.ceil(run_timeout + timeout)`` and raises OverflowError before
+    # supervision starts. Both must be rejected as unusable, not passed through.
+    if value is None or not math.isfinite(value) or value <= 0:
         _log_event(
             "worklink_factory_startup_timeout_unusable",
             variable=_FACTORY_STARTUP_STATUS_TIMEOUT_ENV,
@@ -2834,7 +2839,10 @@ class WorklinkRunner:
         loop = asyncio.get_running_loop()
         run_timeout = _epic_run_timeout_s()
         deadline = loop.time() + run_timeout
-        startup_deadline = min(deadline, loop.time() + _factory_startup_status_timeout_s())
+        # Resolve once per invocation: a second read could announce the same
+        # unusable setting twice and could disagree if the environment moved.
+        startup_timeout = _factory_startup_status_timeout_s()
+        startup_deadline = min(deadline, loop.time() + startup_timeout)
         stale_after = _epic_stale_heartbeat_s()
         last_status: FactoryStatus | None = None
         last_change = loop.time()
@@ -2846,7 +2854,7 @@ class WorklinkRunner:
             wait_task = asyncio.create_task(
                 compute.wait(
                     handle,
-                    max(1, math.ceil(run_timeout + _factory_startup_status_timeout_s())),
+                    max(1, math.ceil(run_timeout + startup_timeout)),
                 )
             )
         except BaseException:

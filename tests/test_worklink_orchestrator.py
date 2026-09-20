@@ -10689,6 +10689,12 @@ def test_worker_report_dir_failure_aborts_before_the_backend_launches(
         ("0", 300.0),
         ("-5", 300.0),
         ("soon", 300.0),
+        # float() accepts these; a NaN deadline compares False against every
+        # bound and silently disables the check, and an infinite one overflows
+        # math.ceil(run_timeout + timeout) before supervision begins.
+        ("nan", 300.0),
+        ("inf", 300.0),
+        ("-inf", 300.0),
     ],
 )
 def test_factory_startup_deadline_resolves_or_announces(
