@@ -539,8 +539,22 @@ def remediation_checkout_preflight(
     if snapshot.state != "open":
         return None, "pull request is closed or merged"
     if scope.event_type == "pr_ci_failure":
+        fresh = None
         if snapshot.head_sha.lower() != scope.observed_head_sha.lower():
-            return None, "pull request head was superseded"
+            cache = getattr(context, "server_discovered_pr_states", None)
+            if not isinstance(cache, ServerDiscoveredPRStates) or not cache.begin_remint(
+                repository, pull_request,
+            ):
+                return resolve_review_state_for_context(context, repository, pull_request), None
+            from ..access_control import create_server_discovered_heartbeat_scope
+
+            fresh_scope = create_server_discovered_heartbeat_scope(
+                repository, snapshot, event_type=scope.event_type,
+            )
+            if fresh_scope is None:
+                return None, "pull request head was superseded"
+            fresh = RepoReviewState(fresh_scope)
+            scope = fresh_scope
         try:
             checks = client.list_checks(scope)
         except ForgeError as exc:
@@ -553,6 +567,8 @@ def remediation_checkout_preflight(
             for check in checks
         ):
             return None, "pull request checks are no longer failing"
+        if fresh is not None:
+            return cache.remember_remint(original, fresh), None
         return original, None
     if snapshot.head_sha.lower() == scope.observed_head_sha.lower():
         return original, None

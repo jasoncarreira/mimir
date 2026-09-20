@@ -24,10 +24,11 @@ from mimir.models import (
     RepoPRActionScope,
     RepoPRScopeRegistry,
     RepoReviewState,
+    ServerDiscoveredPRStates,
     SourceLabel,
 )
 from mimir.forge import CheckProjection, ReviewProjection
-from mimir.tools.forge import set_forge_client
+from mimir.tools.forge import remediation_checkout_preflight, set_forge_client
 from mimir.tools.repo import (
     _enforcement_enabled,
     repo_checkout,
@@ -303,6 +304,135 @@ def test_ci_remediation_rechecks_live_state_before_checkout(
     )
 
     assert result == {"status": "stopped", "message": message}
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "startup_failure", "action_required"])
+def test_ci_superseded_head_remints_at_current_failing_head(monkeypatch, conclusion):
+    old = _scope(*RepoPRAction, provenance="poller_payload", event_type="pr_ci_failure")
+    context = _auth(old)
+    snapshot = _snapshot("c" * 40)
+    fresh_scope = replace(old, provenance="server_discovered", observed_head_sha=snapshot.head_sha)
+    minted = []
+    checked = []
+
+    def mint(repository, observed, *, event_type):
+        assert (repository, observed, event_type) == ("owner/repo", snapshot, "pr_ci_failure")
+        minted.append(observed)
+        return fresh_scope
+
+    def checks(scope):
+        checked.append(scope)
+        assert scope is fresh_scope
+        return (CheckProjection("tests", "completed", conclusion, "now", "now"),)
+
+    client = _CIRemediationForge(snapshot, conclusion)
+    monkeypatch.setattr(client, "list_checks", checks)
+    monkeypatch.setattr("mimir.access_control.create_server_discovered_heartbeat_scope", mint)
+    set_forge_client(client)
+    fresh, stopped = remediation_checkout_preflight(context, "owner/repo", 7)
+    assert stopped is None
+    assert fresh.action_scope is fresh_scope
+    assert fresh.action_scope.observed_head_sha == "c" * 40
+    assert context.server_discovered_pr_states.resolve("owner/repo", 7) is fresh
+    assert context.repo_pr_scope_registry.resolve("owner/repo", 7).action_scope is old
+    assert not context.server_discovered_pr_states.begin_remint("owner/repo", 7)
+    # A second observation cannot mint again, even if the provider advances again.
+    client.snapshots.append(_snapshot("d" * 40))
+    assert remediation_checkout_preflight(context, "owner/repo", 7) == (fresh, None)
+    assert minted == [snapshot]
+    assert checked == [fresh_scope]
+
+
+@pytest.mark.parametrize("state,authorized,status,conclusion,message", [
+    ("closed", True, "completed", "failure", "pull request is closed or merged"),
+    ("merged", True, "completed", "failure", "pull request is closed or merged"),
+    ("open", False, "completed", "failure", "pull request head was superseded"),
+    ("open", True, "completed", "success", "pull request checks are no longer failing"),
+    ("open", True, "in_progress", "failure", "pull request checks are no longer failing"),
+    ("open", True, "completed", "cancelled", "pull request checks are no longer failing"),
+    ("open", True, "completed", None, "pull request checks are no longer failing"),
+])
+def test_ci_superseded_head_preserves_stops(monkeypatch, state, authorized, status, conclusion, message):
+    old = _scope(*RepoPRAction, provenance="poller_payload", event_type="pr_ci_failure")
+    context = _auth(old)
+    snapshot = _snapshot("c" * 40, state=state)
+    fresh_scope = replace(old, provenance="server_discovered", observed_head_sha=snapshot.head_sha)
+    minted = []
+    checked = []
+
+    def mint(*args, **kwargs):
+        minted.append(snapshot)
+        return fresh_scope if authorized else None
+
+    def checks(scope):
+        assert scope is fresh_scope
+        checked.append(scope)
+        return (CheckProjection("tests", status, conclusion, "now", "now"),)
+
+    client = _CIRemediationForge(snapshot, conclusion)
+    monkeypatch.setattr(client, "list_checks", checks)
+    monkeypatch.setattr("mimir.access_control.create_server_discovered_heartbeat_scope", mint)
+    set_forge_client(client)
+    assert remediation_checkout_preflight(context, "owner/repo", 7) == (None, message)
+    assert len(minted) == int(state == "open")
+    assert len(checked) == int(state == "open" and authorized)
+    assert context.server_discovered_pr_states.resolve("owner/repo", 7) is None
+
+
+@pytest.mark.parametrize("event_type,provenance", [
+    (event, "poller_payload") for event in (
+        "pr_opened", "pr_review_comment", "pr_review", "pr_synchronize",
+        "pr_review_requested", "pr_mergeability_rebase", "pr_mergeability_conflicting",
+        "heartbeat_pr_maintenance", "unknown",
+    )
+] + [(event, "server_discovered") for event in ("pr_ci_failure", "pr_changes_requested_stale")])
+def test_remediation_preflight_does_not_refresh_other_scopes(monkeypatch, event_type, provenance):
+    scope = _scope(*RepoPRAction, event_type=event_type, provenance=provenance)
+    context = _auth(scope)
+    original = context.repo_pr_scope_registry.resolve("owner/repo", 7)
+    client = _RemediationForge(_snapshot("c" * 40))
+    set_forge_client(client)
+    monkeypatch.setattr("mimir.tools.forge.resolve_review_state_for_context", lambda *args: original)
+    assert remediation_checkout_preflight(context, "owner/repo", 7) == (original, None)
+    assert client.snapshot_calls == 0
+    assert context.server_discovered_pr_states.begin_remint("owner/repo", 7)
+
+
+@pytest.mark.parametrize("event_type", ["pr_ci_failure", "pr_changes_requested_stale"])
+def test_remember_remint_accepts_handled_remediation_events(event_type):
+    original = RepoReviewState(_scope(event_type=event_type, provenance="poller_payload"))
+    fresh = RepoReviewState(replace(original.action_scope, provenance="server_discovered", observed_head_sha="c" * 40))
+    cache = ServerDiscoveredPRStates()
+    assert cache.begin_remint("owner/repo", 7)
+    assert cache.remember_remint(original, fresh) is fresh
+    assert cache.resolve("owner/repo", 7) is fresh
+
+
+@pytest.mark.parametrize("invalid", ["repository", "number", "event_mismatch", "provenance", "unreserved",
+    "pr_opened", "pr_review_comment", "pr_review", "pr_synchronize", "pr_review_requested",
+    "pr_mergeability_rebase", "pr_mergeability_conflicting", "heartbeat_pr_maintenance", "unknown"])
+def test_remember_remint_rejects_invalid_authority(invalid):
+    original = RepoReviewState(_scope(event_type="pr_ci_failure", provenance="poller_payload"))
+    scope = replace(original.action_scope, provenance="server_discovered", observed_head_sha="c" * 40)
+    if invalid == "repository":
+        scope = replace(scope, canonical_repo="other/repo")
+    elif invalid == "number":
+        scope = replace(scope, pr_number=8)
+    elif invalid == "event_mismatch":
+        scope = replace(scope, event_type="pr_changes_requested_stale")
+    elif invalid == "provenance":
+        scope = replace(scope, provenance="poller_payload")
+    elif invalid != "unreserved":
+        original = RepoReviewState(replace(original.action_scope, event_type=invalid))
+        scope = replace(scope, event_type=invalid)
+    cache = ServerDiscoveredPRStates()
+    if invalid != "unreserved":
+        assert cache.begin_remint("owner/repo", 7)
+    with pytest.raises(ValueError, match="reminted review scope"):
+        cache.remember_remint(original, RepoReviewState(scope))
+    assert cache.review_states == ()
+
+
 def _remediation_runtime(monkeypatch: pytest.MonkeyPatch, client: _RemediationForge):
     old_scope = _scope(
         *RepoPRAction,
