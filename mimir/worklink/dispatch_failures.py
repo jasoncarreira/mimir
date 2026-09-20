@@ -181,6 +181,7 @@ def record_factory_transition(
     kind: Literal["factory_start", "factory_success"],
     issue_id: int,
     run_id: str,
+    issue_title: str = "",
     attempt: int,
     pr_url: str | None = None,
 ) -> dict[str, Any]:
@@ -192,6 +193,7 @@ def record_factory_transition(
         entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, {
             "kind": kind,
             "issue_id": issue_id,
+            "issue_title": issue_title,
             "run_id": run_id,
             "attempt": attempt,
             "pr_url": pr_url,

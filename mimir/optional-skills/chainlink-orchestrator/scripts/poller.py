@@ -423,7 +423,8 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
             )
             _emit({
                 "prompt": (
-                    f"Worklink factory {milestone} for issue {entry['issue_id']}. "
+                    f"Worklink factory {milestone} for issue {entry['issue_id']}"
+                    f": {entry.get('issue_title') or '(title unavailable)'}. "
                     f"{detail} Informational status update only.\n\n"
                     f"Kind: {entry['kind']}\n"
                     f"Run: {entry['run_id']}\n"
@@ -509,9 +510,9 @@ def main() -> int:
     state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _deliver_factory_transitions(state_dir, tick_budget)
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
         alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
+        _deliver_factory_transitions(state_dir, tick_budget)
     except OSError as exc:
         _emit({"signal": "worklink_dispatch_failure_state_error", "reason": str(exc)})
         return 0

@@ -4664,7 +4664,7 @@ def test_factory_transition_ledger_identity_and_immutability(worklink_receipts, 
     key = first["delivery_key"]
     assert key == "worklink-factory_start:42:run-42:1"
     assert first == {
-        **identity, "delivery_key": key, "pr_url": None, "notified": False,
+        **identity, "issue_title": "", "delivery_key": key, "pr_url": None, "notified": False,
     }
     with failures.failure_state_transaction(state) as ledger:
         ledger["factory_transitions"][key]["notified"] = True
@@ -4693,7 +4693,8 @@ async def test_factory_transition_prompt_handoff_and_acknowledgement(
     consumer = worklink_receipt_consumer
     pr_url = "https://github.com/example/repo/pull/42" if kind == "factory_success" else None
     entry = failures.record_factory_transition(
-        state, kind=kind, issue_id=42, run_id="run-42", attempt=2, pr_url=pr_url,
+        state, kind=kind, issue_id=42, issue_title="Ship factory milestones",
+        run_id="run-42", attempt=2, pr_url=pr_url,
     )
     key = entry["delivery_key"]
     consumer._deliver_factory_transitions(state, SimpleNamespace(hard_exhausted=lambda: False))
@@ -4706,7 +4707,8 @@ async def test_factory_transition_prompt_handoff_and_acknowledgement(
     assert offered == {
         "poller": failures.POLLER_NAME,
         "prompt": (
-            f"Worklink factory {milestone} for issue 42. {detail} Informational status update only.\n\n"
+            f"Worklink factory {milestone} for issue 42: Ship factory milestones. "
+            f"{detail} Informational status update only.\n\n"
             f"Kind: {kind}\nRun: run-42\nAttempt: 2\nPR: {pr_url or '(none)'}"
         ),
         "kind": kind, "issue_id": 42, "run_id": "run-42", "attempt": 2,
@@ -4741,7 +4743,8 @@ consumer['_deliver_factory_transitions'](Path(os.environ['STATE_DIR']), consumer
     # The existing GC removes the receipt after the child acknowledges it.
     assert not failures.delivery_receipt_exists(state, key)
     failures.record_factory_transition(
-        state, kind=kind, issue_id=42, run_id="run-42", attempt=2, pr_url=pr_url,
+        state, kind=kind, issue_id=42, issue_title="Ship factory milestones",
+        run_id="run-42", attempt=2, pr_url=pr_url,
     )
     assert await run_poller(cfg, enqueue=enqueue, home=home) == 0
     assert len(accepted.events) == 1
@@ -4769,11 +4772,12 @@ def test_factory_transition_main_delivers_without_ready_work(
     monkeypatch.setattr(consumer, "_dispatch", dispatch)
     assert consumer.main() == 0
     output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert output[0]["kind"] == "factory_start"
-    assert "prompt" in output[0] and "signal" not in output[0]
+    milestone = output[1] if incident else output[0]
+    assert milestone["kind"] == "factory_start"
+    assert "prompt" in milestone and "signal" not in milestone
     assert output[-1]["signal"] == "worklink_ready_scan"
     if incident:
-        assert output[1]["prompt"].startswith("Worklink incident")
+        assert output[0]["prompt"].startswith("Worklink incident")
         assert output[-1]["reason"] == "failure incident prompt emitted; skipping dispatch"
     else:
         assert output[-1]["ready_count"] == 0

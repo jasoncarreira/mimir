@@ -5354,19 +5354,20 @@ def test_factory_start_prompt_at_durable_launch(tmp_path, monkeypatch, autonomou
         ).values())
 
     async def terminal(**kwargs):
-        records = load_factory_records_for_issue(tmp_path, 700)
-        assert records[0].handle is not None
+        assert load_factory_record(tmp_path, "chainlink-700").handle is not None
         assert [entry["kind"] for entry in entries()] == (["factory_start"] if autonomous else [])
         return WorklinkRunResult(700, 1, "blocked")
 
-    _run_factory_preflight_case(
+    result, _, _, _ = _run_factory_preflight_case(
         tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
         autonomous=autonomous, outcome="blocked" if launched else None, terminal=terminal,
     )
+    assert result.status == ("blocked" if launched else "failed")
     assert [entry["kind"] for entry in entries()] == (
         ["factory_start"] if autonomous and launched else []
     )
     if autonomous and launched:
+        assert entries()[0]["issue_title"] == "epic"
         assert entries()[0]["issue_id"] == 700
         assert entries()[0]["attempt"] == 1
         assert entries()[0]["run_id"] == "chainlink-700"
@@ -5417,38 +5418,52 @@ def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autono
     )
     if autonomous and ending == "completed":
         assert entries[1] == {
-            "kind": "factory_success", "issue_id": 700, "run_id": "chainlink-700",
+            "kind": "factory_success", "issue_id": 700, "issue_title": "epic", "run_id": "chainlink-700",
             "attempt": 1, "pr_url": pr_url, "notified": False,
             "delivery_key": "worklink-factory_success:700:chainlink-700:1",
         }
 
 
-def test_factory_start_write_failure_cleans_up_launch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failed_kind", ["factory_start", "factory_success"])
+def test_factory_milestone_write_failure_preserves_result(tmp_path, monkeypatch, failed_kind):
     import mimir.worklink.orchestrator as orchestrator
     from mimir.worklink import dispatch_failures
 
     cleaned = []
+    logged = []
+    attempted = []
+    expected = WorklinkRunResult(700, 1, "review_ready", pr_url="https://github.com/owner/repo/pull/42")
+    record = dispatch_failures.record_factory_transition
 
     async def cleanup(compute, handle):
         cleaned.append(handle)
 
-    def fail(*args, **kwargs):
-        raise OSError("transition write failed")
+    def fail(state_dir, **kwargs):
+        attempted.append(kwargs["kind"])
+        if kwargs["kind"] == failed_kind:
+            raise OSError("transition write failed")
+        return record(state_dir, **kwargs)
 
-    def on_release():
-        assert cleaned
+    async def terminal(**kwargs):
+        assert not cleaned
+        assert load_factory_record(tmp_path, "chainlink-700").handle is not None
+        return expected
 
     monkeypatch.setattr(dispatch_failures, "record_factory_transition", fail)
     monkeypatch.setattr(orchestrator, "_cancel_and_cleanup_factory_handle", cleanup)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **kw: logged.append((event, kw)))
     result, launched, _, _ = _run_factory_preflight_case(
         tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
-        autonomous=True, outcome="completed",
-        on_release=on_release,
+        autonomous=True, outcome="completed", terminal=terminal,
     )
     assert len(launched) == 1
-    assert cleaned == [LaunchHandle("local_subprocess", "123", 456)]
-    assert result.status == "failed"
-    assert "transition write failed" in result.reason
+    assert cleaned == []
+    assert result is expected
+    assert attempted == ["factory_start", "factory_success"]
+    failures = [kw for event, kw in logged if event == "worklink_factory_milestone_write_failed"]
+    assert len(failures) == 1
+    assert failures[0]["kind"] == failed_kind
+    assert "transition write failed" in failures[0]["error"]
 
 
 @pytest.mark.parametrize("release_confirmed", [False, True])
@@ -9242,6 +9257,7 @@ def test_factory_recovery_launch_start(
     import mimir.worklink.dispatch_failures as failures
     import mimir.worklink.orchestrator as orchestrator
 
+    _configure_opencode_oauth(tmp_path, monkeypatch)
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
     pre = _factory_lifecycle_status(sandbox, status="needs-human")
@@ -9256,12 +9272,13 @@ def test_factory_recovery_launch_start(
     state_dir = failures.dispatch_failure_state_dir(tmp_path)
     key = "worklink-factory_start:700:700:3"
     expected = {
-        "kind": "factory_start", "issue_id": 700, "run_id": "700", "attempt": 3,
+        "kind": "factory_start", "issue_id": 700, "issue_title": "epic",
+        "run_id": "700", "attempt": 3,
         "pr_url": None, "delivery_key": key, "notified": existing_start,
     }
     if existing_start:
         failures.record_factory_transition(
-            state_dir, kind="factory_start", issue_id=700, run_id="700", attempt=3,
+            state_dir, kind="factory_start", issue_id=700, issue_title="epic", run_id="700", attempt=3,
         )
         with failures.failure_state_transaction(state_dir) as state:
             state["factory_transitions"][key]["notified"] = True
@@ -9295,7 +9312,9 @@ def test_factory_recovery_launch_start(
         assert kwargs["autonomous"] is autonomous
         assert load_factory_record(tmp_path, "700").handle == handle
         transitions = failures.load_failure_state(state_dir).get("factory_transitions", {})
-        assert transitions == ({key: expected} if autonomous or existing_start else {})
+        assert transitions == (
+            {key: expected} if (autonomous or existing_start) and write_failure != "transition" else {}
+        )
         return "supervised"
 
     def fail_write(*args: object, **kwargs: object) -> None:
@@ -9326,13 +9345,13 @@ def test_factory_recovery_launch_start(
         runner=lambda args: cp(args),
         autonomous=autonomous,
     )
-    if write_failure:
+    if write_failure == "record":
         with pytest.raises(OSError, match="recovery persistence failed"):
             asyncio.run(recovery)
         assert events == ["launch", "cancel", "cleanup"]
         assert not failures.load_failure_state(state_dir).get("factory_transitions")
         saved = load_factory_record(tmp_path, "700")
-        assert saved.handle == (handle if write_failure == "transition" else retained.handle)
+        assert saved.handle == retained.handle
     else:
         assert asyncio.run(recovery) == "supervised"
         assert events == ["launch", "supervise"]

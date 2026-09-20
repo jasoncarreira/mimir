@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 import unicodedata
 import warnings
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence
 
 from .._atomic import atomic_write_json
 from .._rmtree import rmtree_missing_ok
@@ -2421,16 +2421,14 @@ class WorklinkRunner:
                 factory_record = replace(factory_record, handle=handle)
                 try:
                     save_factory_record(self.home, factory_record)
-                    if autonomous:
-                        from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
-
-                        record_factory_transition(
-                            dispatch_failure_state_dir(self.home), kind="factory_start",
-                            issue_id=issue_id, run_id=run_id, attempt=claim_record.attempt,
-                        )
                 except BaseException:
                     await _cancel_and_cleanup_factory_handle(compute, handle)
                     raise
+                if autonomous:
+                    _record_factory_milestone(
+                        self.home, kind="factory_start", issue=issue,
+                        run_id=run_id, attempt=claim_record.attempt,
+                    )
                 result = await self._supervise_factory_070(
                     issue=issue,
                     claim_record=claim_record,
@@ -2585,11 +2583,9 @@ class WorklinkRunner:
                 reason = f"{result.reason}; {reason}"
             result = replace(result, status="failed", reason=reason)
         if autonomous and result.status == "review_ready":
-            from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
-
-            record_factory_transition(
-                dispatch_failure_state_dir(self.home), kind="factory_success",
-                issue_id=issue_id, run_id=retained.run_id if retained is not None else run_id,
+            _record_factory_milestone(
+                self.home, kind="factory_success", issue=issue,
+                run_id=retained.run_id if retained is not None else run_id,
                 attempt=result.attempt, pr_url=result.pr_url,
             )
         return result
@@ -2757,17 +2753,14 @@ class WorklinkRunner:
         )
         try:
             save_factory_record(self.home, relaunched)
-            if autonomous:
-                from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
-
-                record_factory_transition(
-                    dispatch_failure_state_dir(self.home), kind="factory_start",
-                    issue_id=retained.issue_id, run_id=retained.run_id,
-                    attempt=retained.attempt,
-                )
         except BaseException:
             await _cancel_and_cleanup_factory_handle(compute, handle)
             raise
+        if autonomous:
+            _record_factory_milestone(
+                self.home, kind="factory_start", issue=issue,
+                run_id=retained.run_id, attempt=retained.attempt,
+            )
         return await self._supervise_factory_070(
             issue=issue,
             claim_record=claim_record,
@@ -5206,6 +5199,36 @@ def _run(
 
         return run_gate(args, cwd=cwd, text=text, timeout=timeout)
     return subprocess.run(list(args), cwd=cwd, capture_output=True, text=text, check=False)
+
+
+def _record_factory_milestone(
+    home: Path,
+    *,
+    kind: Literal["factory_start", "factory_success"],
+    issue: IssueContext,
+    run_id: str,
+    attempt: int,
+    pr_url: str | None = None,
+) -> None:
+    """Informational delivery must not cancel work or replace its result."""
+    from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition, terminal_error
+
+    try:
+        record_factory_transition(
+            dispatch_failure_state_dir(home), kind=kind,
+            issue_id=issue.issue_id, issue_title=issue.title,
+            run_id=run_id, attempt=attempt, pr_url=pr_url,
+        )
+    except Exception as exc:
+        # The log sink may share the failed/full filesystem with the ledger.
+        try:
+            _log_event(
+                "worklink_factory_milestone_write_failed", kind=kind,
+                issue_id=issue.issue_id, run_id=run_id, attempt=attempt,
+                error=terminal_error(exc),
+            )
+        except Exception:
+            pass
 
 
 def _log_event(event_type: str, **payload: Any) -> None:
