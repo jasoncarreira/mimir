@@ -192,6 +192,32 @@ def test_completion_grammar_negative_variants(body: str) -> None:
     assert not closure.parse_completion_reference(body, expected_issue_id=1295).qualifies
 
 
+@pytest.mark.parametrize("refusal_word", ["stack", "stacked", "epic"])
+def test_stack_and_epic_body_language_refuses_at_reconciler_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal_word: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 1295)
+    tracker = Tracker(1295)
+    body = f"Closes chainlink #1295.\n\nThis {refusal_word} is ready."
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(1295, body=body),
+        git_runner=git_runner(repo),
+    ) == []
+
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "completion_body_contains_refusal_language"
+    ]
+
+
 @pytest.mark.parametrize("issue_id", HISTORICAL_IDS)
 def test_historical_ids_have_separate_noncompleting_variants(issue_id: int) -> None:
     decision = closure.parse_completion_reference(
@@ -207,6 +233,70 @@ def test_evidence_association_inventory_refuses_conflict(tmp_path: Path) -> None
     association = closure.discover_associations(tmp_path, issue)
     assert association.reason == "conflicting_pr_associations"
     assert association.pr_url is None
+
+
+@pytest.mark.parametrize("defect", [
+    "filename", "json", "issue", "attempt", "status", "url", "base",
+])
+def test_malformed_active_evidence_refuses_without_tracker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    path = evidence(home, 7)
+    if defect == "filename":
+        path.rename(path.with_name("7-not-an-attempt.json"))
+    elif defect == "json":
+        path.write_text("{", encoding="utf-8")
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        field, value = {
+            "issue": ("issue", 8),
+            "attempt": ("attempt", 2),
+            "status": ("status", "unknown"),
+            "url": ("pr_url", "https://github.com/example/project/pull/042"),
+            "base": ("base_ref", 42),
+        }[defect]
+        payload[field] = value
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    tracker = Tracker(7)
+    forge_called = False
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal forge_called
+        forge_called = True
+        return cp()
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git_runner(repo),
+    ) == []
+    assert not forge_called
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert len([entry for entry in notices.values() if not entry["resolved"]]) == 1
+
+
+def test_duplicate_active_evidence_with_same_url_remains_qualifying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    evidence(home, 8, attempt=1)
+    evidence(home, 8, attempt=2)
+    tracker = Tracker(8)
+
+    outcomes = closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(8), git_runner=git_runner(repo),
+    )
+
+    assert [outcome.issue_id for outcome in outcomes] == [8]
+    assert [
+        call[2] for call in tracker.calls
+        if call[1] == "issue" and call[2] in {"comment", "close", "unlabel"}
+    ] == ["comment", "close", "unlabel"]
 
 
 def test_comment_associations_are_discovery_not_authority(
@@ -320,6 +410,72 @@ def test_completion_base_not_evidence_base_and_repository_binding(
     ) == []
 
 
+@pytest.mark.parametrize("foreign_identity", ["pr_repository", "base_repository"])
+def test_foreign_pr_or_base_repository_refuses_without_tracker_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_identity: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 45
+    pr_slug = "foreign/project" if foreign_identity == "pr_repository" else "example/project"
+    base_slug = "foreign/project" if foreign_identity == "base_repository" else "example/project"
+    pr_url = f"https://github.com/{pr_slug}/pull/42"
+    evidence(home, issue_id, url=pr_url)
+    tracker = Tracker(issue_id)
+    payload = {
+        "number": 42,
+        "html_url": pr_url,
+        "body": f"Closes chainlink #{issue_id}.",
+        "state": "closed",
+        "merged": True,
+        "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": base_slug}, "ref": "main"},
+    }
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        assert list(args) == ["gh", "api", f"repos/{pr_slug}/pulls/42"]
+        return cp(stdout=json.dumps(payload))
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git_runner(repo),
+    ) == []
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "repository_identity_mismatch"
+    ]
+
+
+def test_local_origin_mismatch_records_trust_refusal_before_tracker_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    tracker = Tracker(46)
+
+    def wrong_origin(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[-2:] == ["rev-parse", "--show-toplevel"]:
+            return cp(stdout=f"{repo}\n")
+        if list(args)[-3:] == ["remote", "get-url", "origin"]:
+            return cp(stdout="https://github.com/other/project.git\n")
+        return cp(1)
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(46), git_runner=wrong_origin,
+    ) == []
+    assert tracker.calls == []
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "repository_trust_failed"
+    ]
+
+
 def test_parented_leaf_qualifies_and_epic_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -338,6 +494,37 @@ def test_parented_leaf_qualifies_and_epic_refuses(
     assert closure.reconcile_merged_leaves(
         home2, chainlink_runner=epic, gh_runner=forge(17), git_runner=git_runner(repo2),
     ) == []
+
+
+@pytest.mark.parametrize("label", [
+    "worklink:ready", "worklink:in-progress", "worklink:blocked",
+])
+def test_every_competing_lifecycle_label_refuses_before_forge_or_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    tracker = Tracker(47, labels={"worklink:review", label})
+    forge_called = False
+
+    def gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal forge_called
+        forge_called = True
+        return cp()
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=gh, git_runner=git_runner(repo),
+    ) == []
+    assert not forge_called
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        f"competing_lifecycle_label:{label}"
+    ]
 
 
 def test_dry_run_is_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -552,6 +739,57 @@ def test_malformed_yaml_records_trust_refusal_before_tracker_read(
     ]
 
 
+def test_non_finite_config_numeric_records_trust_refusal_before_tracker_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    (home / "worklink.yaml").write_text(
+        "repository: example/project\ndefaults:\n  timeout_s: .inf\n",
+        encoding="utf-8",
+    )
+    tracker = Tracker(48)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(48), git_runner=git_runner(repo),
+    ) == []
+    assert tracker.calls == []
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "repository_trust_failed"
+    ]
+
+
+@pytest.mark.parametrize("failure", [OSError("path unavailable"), RuntimeError("symlink loop")])
+def test_environment_repository_path_resolution_failure_is_durable_and_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    broken = tmp_path / "broken-environment-path"
+    monkeypatch.setenv("WORKLINK_REPO", str(broken))
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args, **kwargs):
+        if path == broken:
+            raise failure
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    tracker = Tracker(49)
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(49), git_runner=git_runner(repo),
+    ) == []
+    assert tracker.calls == []
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "repository_trust_failed"
+    ]
+
+
 @pytest.mark.parametrize("payload", [
     {"issues": "not-a-list"},
     [{}],
@@ -581,6 +819,28 @@ def test_malformed_open_inventory_is_visible_and_stops_before_issue_or_forge_rea
     assert len(calls) == 1
     assert not forge_called
     notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
+        "tracker_inventory_failed"
+    ]
+
+
+def test_non_finite_tracker_numeric_is_visible_and_stops_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    calls = []
+
+    def tracker(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return cp(stdout='[{"id": Infinity}]')
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(50), git_runner=git_runner(repo),
+    ) == []
+    assert len(calls) == 1
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
     assert [entry["reason"] for entry in notices.values() if not entry["resolved"]] == [
         "tracker_inventory_failed"
     ]

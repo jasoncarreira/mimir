@@ -321,11 +321,6 @@ def _validate_merge_reconciliations(value: Any) -> dict[str, dict[str, Any]]:
                     ) is not None
                 )
             )
-            or (
-                notice_repository is not None
-                and notice_url is not None
-                and not notice_url.startswith(f"https://github.com/{notice_repository}/pull/")
-            )
             or key != expected_notice_key
         ):
             raise OSError("merge reconciliation state unavailable: invalid notice")

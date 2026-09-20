@@ -131,7 +131,7 @@ def _positive_int(value: object, field: str) -> int:
         raise ClosureReadError(f"{field} must be a positive integer")
     try:
         parsed = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ClosureReadError(f"{field} must be a positive integer") from exc
     if parsed < 1 or str(value).strip() != str(parsed):
         raise ClosureReadError(f"{field} must be a positive integer")
@@ -155,7 +155,7 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
     try:
         inventory = RepositoryInventory.load(inventory_path)
         selected = WorklinkConfig.load(home / "worklink.yaml").repository
-    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, OverflowError, yaml.YAMLError) as exc:
         raise ClosureReadError(f"repository trust unavailable: {exc}") from exc
     if not inventory.declared or not selected:
         raise ClosureReadError("repository trust unavailable: Worklink repository is not declared")
@@ -164,11 +164,16 @@ def resolve_completion_repository(home: Path, *, runner: Runner) -> RepositoryCo
         raise ClosureReadError(f"repository trust unavailable: {selected!r} is not in inventory")
     if repository.mode != "rw":
         raise ClosureReadError("repository trust unavailable: selected repository is not writable")
-    configured_paths = [
-        Path(value).resolve()
-        for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO")
-        if (value := os.environ.get(name))
-    ]
+    try:
+        configured_paths = [
+            Path(value).resolve()
+            for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO")
+            if (value := os.environ.get(name))
+        ]
+    except (OSError, RuntimeError) as exc:
+        raise ClosureReadError(
+            f"repository trust unavailable: configured repository path cannot be resolved: {exc}"
+        ) from exc
     if not configured_paths or any(path != repository.root for path in configured_paths):
         raise ClosureReadError(
             "repository trust unavailable: WORKLINK_REPO/MIMIR_WORKLINK_REPO must select the declared root"
