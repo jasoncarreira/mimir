@@ -1456,3 +1456,82 @@ def test_post_unlabel_read_failure_is_visible_and_cleanup_is_not_duplicated(
 
     assert [outcome.issue_id for outcome in outcomes] == [1295]
     assert len([call for call in tracker.calls if call[1:3] == ["issue", "unlabel"]]) == 1
+
+
+def test_close_recovery_fallback_pr_read_failure_is_visible_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo, tracker = _recovery_fixture(
+        tmp_path, monkeypatch, stage="close_started", fail_show_calls=set(),
+    )
+    good_forge = forge(1295)
+    pr_reads = 0
+
+    def fail_fallback_pr_read(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal pr_reads
+        pr_reads += 1
+        if pr_reads == 2:
+            return cp(returncode=1, stderr="forge unavailable during recovery")
+        return good_forge(args)
+
+    assert closure.reconcile_merged_leaves(
+        home,
+        chainlink_runner=tracker,
+        gh_runner=fail_fallback_pr_read,
+        git_runner=git_runner(repo),
+    ) == []
+
+    assert pr_reads == 2
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    unresolved = [entry for entry in notices.values() if not entry["resolved"]]
+    assert len(unresolved) == 1
+    assert unresolved[0]["reason"] == "close_recovery_read_failed"
+
+
+def test_close_recovery_fallback_association_failure_is_visible_without_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo, tracker = _recovery_fixture(
+        tmp_path, monkeypatch, stage="close_started", fail_show_calls=set(),
+    )
+    evidence_path = home / "state" / "worklink" / "evidence" / "1295-1.json"
+    good_forge = forge(1295)
+    pr_reads = 0
+
+    def corrupt_before_fallback_discovery(
+        args: Sequence[str],
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal pr_reads
+        pr_reads += 1
+        result = good_forge(args)
+        if pr_reads == 1:
+            # Initial association discovery has completed. The fallback PR read
+            # still succeeds, then the later production discovery reads this
+            # malformed active evidence and must be caught visibly.
+            evidence_path.write_text("{", encoding="utf-8")
+        return result
+
+    assert closure.reconcile_merged_leaves(
+        home,
+        chainlink_runner=tracker,
+        gh_runner=corrupt_before_fallback_discovery,
+        git_runner=git_runner(repo),
+    ) == []
+
+    assert pr_reads == 2
+    assert not [
+        call for call in tracker.calls
+        if call[1:3] in (["issue", "comment"], ["issue", "close"], ["issue", "unlabel"])
+    ]
+    notices = load_failure_state(
+        dispatch_failure_state_dir(home)
+    )["merge_reconciliations"]["notices"]
+    unresolved = [entry for entry in notices.values() if not entry["resolved"]]
+    assert len(unresolved) == 1
+    assert unresolved[0]["reason"] == "close_recovery_read_failed"
