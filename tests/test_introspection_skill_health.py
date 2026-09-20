@@ -81,12 +81,18 @@ def test_negatives_ignored_without_conn(tmp_path, monkeypatch):
     assert _run(tmp_path, {"memory": 10}) == []
 
 
-def test_retire_on_zero_usage(tmp_path, monkeypatch):
+def test_zero_usage_alone_does_not_recommend_retirement(tmp_path, monkeypatch):
     _patch(monkeypatch, installed=["dormant"])
-    out = _run(tmp_path, {})
-    sh = next(s for s in out if s.skill == "dormant")
-    assert sh.retire_candidate and not sh.refine_candidate
-    assert "no usage" in "; ".join(sh.reasons)
+    assert _run(tmp_path, {}) == []
+
+
+def test_unknown_runs_do_not_lower_skill_success_rate(tmp_path, monkeypatch):
+    _patch(
+        monkeypatch,
+        outcomes={"policy": SkillOutcome(skill="policy", unknown=5, load_unknown=5)},
+        installed=["policy"],
+    )
+    assert _run(tmp_path, {}) == []
 
 
 def test_used_and_healthy_not_flagged(tmp_path, monkeypatch):

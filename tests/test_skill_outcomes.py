@@ -572,6 +572,17 @@ def test_render_skill_telemetry_returns_none_when_only_untried():
     assert out is None
 
 
+def test_unknown_only_skill_is_not_rendered_as_risky():
+    agg = SkillOutcome(skill="wiki", unknown=3, load_unknown=3)
+
+    proven, untried, risky = order_skills(["wiki"], {"wiki": agg})
+
+    assert proven == []
+    assert untried == ["wiki"]
+    assert risky == []
+    assert render_skill_telemetry(["wiki"], {"wiki": agg}) is None
+
+
 # ─── success_criteria refinement ─────────────────────────────────────────
 
 
@@ -602,11 +613,10 @@ def test_classify_load_with_criteria_met_yields_success():
     assert out == [("alert", "success", base, "load")]
 
 
-def test_classify_load_with_criteria_unmet_yields_incomplete():
+def test_classify_load_with_unobserved_criterion_tool_yields_unknown():
     """Load succeeded but the operator's success_criteria found no
-    matching event in the tail → ``incomplete`` (not failure).
-    Operators see this distinct from "the file errored" so they can
-    investigate procedure drift vs broken skills separately."""
+    matching event in the turn → ``unknown`` (not failure). Persisted events
+    cannot establish that the criterion tool was available to this turn."""
     base = datetime(2026, 5, 22, tzinfo=timezone.utc)
     criteria = {
         "alert": SkillSuccessCriteria(
@@ -619,7 +629,28 @@ def test_classify_load_with_criteria_unmet_yields_incomplete():
         {"type": "tool_result", "id": "w1", "is_error": False},
     ]
     out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
-    assert out == [("alert", "incomplete", base, "load")]
+    assert out == [("alert", "unknown", base, "load")]
+
+
+def test_classify_read_only_policy_run_is_unknown_not_failure():
+    base = datetime(2026, 5, 22, tzinfo=timezone.utc)
+    criteria = {
+        "wiki": SkillSuccessCriteria(any_of=[{
+            "tool_call": {
+                "name": "write_file",
+                "args": {"file_path_glob": "*state/wiki/*"},
+            },
+        }]),
+    }
+    events = _read_file_event("wiki") + [
+        {"type": "tool_call", "id": "lint", "name": "read_file",
+         "args": {"file_path": "/h/state/wiki/index.md"}},
+        {"type": "tool_result", "id": "lint", "is_error": False},
+    ]
+
+    out = list(_classify_skill_calls(events, base, skill_criteria=criteria))
+
+    assert out == [("wiki", "unknown", base, "load")]
 
 
 def test_classify_load_failure_skips_criteria_check():
@@ -704,9 +735,8 @@ def test_classify_criteria_args_subset_match():
     assert out_drift[0][1] == "incomplete"
 
 
-def test_aggregate_threads_criteria_through_to_classifier(tmp_path):
-    """End-to-end: aggregate() respects skill_criteria — the incomplete
-    counter increments for loads that don't trigger any criteria."""
+def test_aggregate_records_unknown_criteria_distinct_from_failure(tmp_path):
+    """Unavailable criteria produce first-class unknown outcome data."""
     base = datetime(2026, 5, 22, tzinfo=timezone.utc)
     turns = tmp_path / "turns.jsonl"
     drift_turn = {
@@ -727,12 +757,14 @@ def test_aggregate_threads_criteria_through_to_classifier(tmp_path):
         turns, now=base, skill_criteria=criteria, home=Path("/h"),
     )
     alert = aggs["alert"]
-    assert alert.incomplete == 1
-    assert alert.load_incomplete == 1
+    assert alert.unknown == 1
+    assert alert.load_unknown == 1
+    assert alert.incomplete == 0
+    assert alert.failure == 0
     assert alert.success == 0
     assert alert.total == 1
-    # success_rate folds incomplete into the denominator as not-success
-    assert alert.success_rate == 0.0
+    assert alert.assessed_total == 0
+    assert alert.success_rate is None
 
 
 # ─── frontmatter loader ──────────────────────────────────────────────────

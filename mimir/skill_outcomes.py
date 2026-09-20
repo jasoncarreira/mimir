@@ -94,13 +94,10 @@ _SKILL_READ_RE = re.compile(r"^([^/]+)/SKILL\.md$")
 #
 # When the classifier sees a successful load whose skill has a
 # ``success_criteria``, it scans the rest of the turn for events
-# matching any of the patterns. If at least one matches, the load is
-# classified as **success** (procedure completed). If none match, the
-# load is classified as **incomplete** — the file opened, but the
-# stated outcome never landed. Operators see ``incomplete`` distinct
-# from ``failure`` (file errored) and from ``abandoned`` (no result
-# pair); incomplete is a "drift" signal, the others are "broken"
-# signals.
+# matching any of the patterns. A match is **success**. A call to a
+# referenced tool with a nonmatching shape is **incomplete**. If no
+# referenced tool appears, the persisted turn cannot prove the tool
+# was available or needed, so the result is **unknown**, not failure.
 #
 # Schema (intentionally minimal — extend per skill as needs surface):
 #   any_of: list of patterns (success on FIRST match)
@@ -137,6 +134,15 @@ class SkillSuccessCriteria:
                 if _pattern_matches_event(pattern, ev):
                     return True
         return False
+
+    def referenced_tool_names(self) -> set[str]:
+        """Return criterion tool names that can make this run assessable."""
+        names: set[str] = set()
+        for pattern in self.any_of:
+            tool_call = pattern.get("tool_call")
+            if isinstance(tool_call, dict) and isinstance(tool_call.get("name"), str):
+                names.add(tool_call["name"])
+        return names
 
 
 def _pattern_matches_event(pattern: dict[str, Any], event: dict) -> bool:
@@ -326,6 +332,9 @@ class SkillOutcome:
     # ``load`` kind — execution outcomes already have a clean signal
     # via ``tool_result.is_error`` on the ``task()`` result.
     incomplete: int = 0
+    # Criteria could not be assessed because the turn contains no evidence
+    # that any referenced tool was available. This is not a failed run.
+    unknown: int = 0
     # Per-path breakdown of the totals above. Sum invariants:
     # ``execution_success + load_success == success`` (and same for
     # failure/abandoned/incomplete — though execution_incomplete is
@@ -337,10 +346,15 @@ class SkillOutcome:
     load_failure: int = 0
     load_abandoned: int = 0
     load_incomplete: int = 0
+    load_unknown: int = 0
     last_used: datetime | None = None
 
     @property
     def total(self) -> int:
+        return self.assessed_total + self.unknown
+
+    @property
+    def assessed_total(self) -> int:
         return self.success + self.failure + self.abandoned + self.incomplete
 
     @property
@@ -358,7 +372,12 @@ class SkillOutcome:
             + self.load_failure
             + self.load_abandoned
             + self.load_incomplete
+            + self.load_unknown
         )
+
+    @property
+    def load_assessed_total(self) -> int:
+        return self.load_total - self.load_unknown
 
     @property
     def success_rate(self) -> float | None:
@@ -367,9 +386,9 @@ class SkillOutcome:
         abandoned because the agent gave up mid-skill, incomplete
         because it loaded but the procedure criteria didn't match. None
         when no usable data."""
-        if self.total == 0:
+        if self.assessed_total == 0:
             return None
-        return self.success / self.total
+        return self.success / self.assessed_total
 
     @property
     def execution_success_rate(self) -> float | None:
@@ -386,9 +405,9 @@ class SkillOutcome:
         Less reliable than ``execution_success_rate`` — read the
         :class:`SkillOutcome` docstring on the proxy/clean distinction
         before acting on this number."""
-        if self.load_total == 0:
+        if self.load_assessed_total == 0:
             return None
-        return self.load_success / self.load_total
+        return self.load_success / self.load_assessed_total
 
 
 def _classify_skill_calls(
@@ -402,7 +421,7 @@ def _classify_skill_calls(
     pair their tool_call ↔ tool_result by id, yield
     ``(skill_name, outcome, ts, kind)`` tuples.
 
-    Outcome ∈ {"success", "failure", "abandoned"}.
+    Outcome ∈ {"success", "failure", "abandoned", "incomplete", "unknown"}.
     Kind ∈ {"execution", "load"} — see below.
 
     **Two invocation patterns on the deepagents runtime:**
@@ -598,7 +617,16 @@ def _refine_load_outcome(
     # match tool_call events anyway so the tool_result event in
     # between is a no-op for matching.
     tail = events[call_idx + 1:]
-    return "success" if criteria.matches_any(tail) else "incomplete"
+    if criteria.matches_any(tail):
+        return "success"
+    referenced_tools = criteria.referenced_tool_names()
+    called_tools = {
+        ev.get("name") for ev in events
+        if isinstance(ev, dict) and ev.get("type") == "tool_call"
+    }
+    # With no observed criterion tool, persisted turn data cannot distinguish
+    # an available-but-unused tool from one omitted by the turn's tool surface.
+    return "incomplete" if referenced_tools & called_tools else "unknown"
 
 
 def aggregate(
@@ -677,6 +705,10 @@ def aggregate(
                 entry.incomplete += 1
                 if kind == "load":
                     entry.load_incomplete += 1
+            elif outcome == "unknown":
+                entry.unknown += 1
+                if kind == "load":
+                    entry.load_unknown += 1
             else:  # abandoned
                 entry.abandoned += 1
                 if kind == "execution":
@@ -712,7 +744,7 @@ def order_skills(
         # i.e. nothing we can rank against. Skill outcomes that exist
         # but failed are "risky"; skills missing from aggregates are
         # untried.
-        if agg is None or agg.total == 0:
+        if agg is None or agg.assessed_total == 0:
             untried.append(name)
             continue
         rate = agg.success_rate or 0.0
@@ -760,24 +792,28 @@ def render_skill_telemetry(
         success_criteria detected drift (file loaded but procedure
         didn't fire)."""
         et = agg.execution_total
-        lt = agg.load_total
+        lt = agg.load_assessed_total
         incomplete_suffix = (
             f", {agg.incomplete} incomplete" if agg.incomplete else ""
         )
+        unknown_suffix = f", {agg.unknown} unknown" if agg.unknown else ""
         if et and lt:
             return (
-                f"{agg.success}/{agg.total} in window — "
+                f"{agg.success}/{agg.assessed_total} in window — "
                 f"exec {agg.execution_success}/{et}, "
-                f"load {agg.load_success}/{lt}{incomplete_suffix}"
+                f"load {agg.load_success}/{lt}{incomplete_suffix}{unknown_suffix}"
             )
         if et:
-            return f"{agg.success}/{agg.total} in window (exec)"
+            return f"{agg.success}/{agg.assessed_total} in window (exec)"
         if lt:
             return (
-                f"{agg.success}/{agg.total} in window (load)"
-                f"{incomplete_suffix}"
+                f"{agg.success}/{agg.assessed_total} in window (load)"
+                f"{incomplete_suffix}{unknown_suffix}"
             )
-        return f"{agg.success}/{agg.total} in window{incomplete_suffix}"
+        return (
+            f"{agg.success}/{agg.assessed_total} in window"
+            f"{incomplete_suffix}{unknown_suffix}"
+        )
 
     lines: list[str] = []
     if proven:
