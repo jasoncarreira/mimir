@@ -5765,6 +5765,13 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     credentials: dict[str, str],
     selected: str,
 ) -> None:
+    settings = (("credential.https://github.com.helper", "!trusted-controller-helper"),)
+
+    def capture(repo):
+        assert repo == tmp_path / "repo"
+        return settings
+
+    monkeypatch.setattr("mimir.worklink.orchestrator._git_credential_settings", capture)
     result, launched, verified_tokens, commands = _run_factory_preflight_case(
         tmp_path, monkeypatch, credentials=credentials
     )
@@ -5772,6 +5779,7 @@ def test_factory_dispatch_verifies_process_token_and_normalizes_child_aliases(
     assert result.reason == "launch reached"
     assert verified_tokens == [selected]
     assert len(launched) == 1
+    assert launched[0].factory_credential_settings == settings
     assert launched[0].env["GH_TOKEN"] == selected
     assert launched[0].env["GITHUB_TOKEN"] == selected
     assert json.loads(launched[0].env["MIMIR_WORK_ITEM_JSON"]) == {
@@ -8780,6 +8788,13 @@ print(json.dumps([str(path) for path in pruned]))
         return parse_factory_status(payload)
 
     statuses = [status("needs-human", lock)]
+    credential_settings = (("credential.https://github.com.helper", "!recovery-helper"),)
+
+    def capture_credentials(trusted_repo):
+        assert trusted_repo == repo
+        return credential_settings
+
+    monkeypatch.setattr("mimir.worklink.orchestrator._git_credential_settings", capture_credentials)
     if action is not None:
         statuses.append(status("needs-human", "fresh"))
     statuses.extend([
@@ -8826,6 +8841,7 @@ print(json.dumps([str(path) for path in pruned]))
 
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             self.launches += 1
+            assert spec.factory_credential_settings == credential_settings
             if local_compute:
                 self.process = subprocess.Popen(
                     [sys.executable, "-c", "import time; time.sleep(300)"],

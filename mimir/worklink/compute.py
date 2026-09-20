@@ -67,6 +67,7 @@ class WorkSpec:
     local_checkout: Path | None = None
     local_argv: Sequence[str] | None = None
     output_root: Path | None = None
+    factory_credential_settings: tuple[tuple[str, str], ...] = field(default=(), repr=False)
 
 
 def with_worker_environment(
@@ -602,6 +603,13 @@ class LocalSubprocessComputeBackend:
                     environment = {**_local_child_env(), **spec.env}
                     runtime_path = environment.get("PATH")
                     environment.update(base_worker_environment(identifier))
+                    # Captured by the controller from the trusted repository, never
+                    # from the worker checkout. Preserve scoped keys and reset entries.
+                    if spec.factory_credential_settings:
+                        environment["GIT_CONFIG_COUNT"] = str(len(spec.factory_credential_settings))
+                        for index, (key, value) in enumerate(spec.factory_credential_settings):
+                            environment[f"GIT_CONFIG_KEY_{index}"] = key
+                            environment[f"GIT_CONFIG_VALUE_{index}"] = value
                     if runtime_path:
                         environment["PATH"] = runtime_path
                     # MUST stay OUTSIDE the checkout. opencode snapshots its

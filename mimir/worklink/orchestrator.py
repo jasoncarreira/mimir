@@ -73,7 +73,7 @@ from .checkout import CheckoutLease, cleanup_checkout, coding_enabled, create_is
 from ..redaction import redact_text
 from ..repository_config import RepositoryInventory
 from ..secret_scan import secret_matches
-from .safe_git import ControllerGitPublication
+from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FactoryStatus,
@@ -2396,6 +2396,7 @@ class WorklinkRunner:
                     test_command=test_cmd,
                 )
                 _require_factory_launch_binding(spec, run_id, publishing_identity)
+                spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
                 factory_record = FactoryRunRecord(
                     run_id=run_id,
                     issue_id=issue_id,
@@ -2733,6 +2734,7 @@ class WorklinkRunner:
             # selects the retained sandbox validated above. Session data is
             # attempt-scoped as on the initial launch.
             spec = replace(spec, local_checkout=sandbox.parent.parent)
+        spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
         handle = await compute.launch(spec)
         relaunched = replace(
             retained.observed(resumed, datetime.now(UTC).isoformat()),
