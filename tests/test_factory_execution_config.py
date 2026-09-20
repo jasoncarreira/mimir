@@ -28,6 +28,18 @@ async def test_factory_launch_uses_captured_trusted_scoped_helpers(
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(controller / ".config"))
     monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    # Production capture deliberately strips all GIT_* overrides before reading
+    # trusted configuration, including the NOSYSTEM override above. Isolate this
+    # fixture after that scrub so macOS's system osxkeychain helper cannot leak
+    # into the expected repo-local settings (especially the no-helper case).
+    from mimir.worklink import safe_git
+
+    capture_environment = safe_git._capture_environment
+    monkeypatch.setattr(safe_git, "_capture_environment", lambda: {
+        **capture_environment(),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    })
     trusted = tmp_path / "trusted"
     checkout = tmp_path / "checkout"
     for repo in (trusted, checkout):
