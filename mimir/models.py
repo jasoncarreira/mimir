@@ -1343,7 +1343,7 @@ class ServerDiscoveredPRStates:
         replacement_target = (state.repo.lower(), state.pr_number)
         if (
             target != replacement_target
-            or original.action_scope.event_type != "pr_changes_requested_stale"
+            or original.action_scope.event_type not in {"pr_changes_requested_stale", "pr_ci_failure"}
             or state.action_scope.event_type != original.action_scope.event_type
             or state.action_scope.provenance != RepoPRScopeProvenance.SERVER_DISCOVERED
         ):
