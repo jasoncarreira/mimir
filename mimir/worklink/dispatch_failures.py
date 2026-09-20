@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import os
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -164,6 +165,207 @@ def failure_state_transaction(state_dir: Path):
             save_failure_state(state_dir, state)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _validate_merge_reconciliations(value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {"intents": {}, "notices": {}}
+    if not isinstance(value, dict) or set(value) != {"intents", "notices"}:
+        raise OSError("merge reconciliation state unavailable: invalid namespace")
+    intents = value["intents"]
+    notices = value["notices"]
+    if not isinstance(intents, dict) or not isinstance(notices, dict):
+        raise OSError("merge reconciliation state unavailable: invalid namespace mappings")
+    for key, entry in intents.items():
+        expected_key = None
+        if isinstance(entry, dict):
+            identity = json.dumps(
+                [1, entry.get("issue_id"), entry.get("repository"), entry.get("pr_number")],
+                separators=(",", ":"),
+            )
+            expected_key = hashlib.sha256(identity.encode()).hexdigest()
+        source_digests = entry.get("source_digests") if isinstance(entry, dict) else None
+        if (
+            not isinstance(key, str)
+            or len(key) != 64
+            or any(character not in "0123456789abcdef" for character in key)
+            or not isinstance(entry, dict)
+            or entry.get("intent_key") != key
+            or type(entry.get("issue_id")) is not int
+            or not isinstance(entry.get("repository"), str)
+            or not entry["repository"]
+            or type(entry.get("pr_number")) is not int
+            or not isinstance(entry.get("pr_url"), str)
+            or not isinstance(entry.get("base_ref"), str)
+            or not entry["base_ref"]
+            or not isinstance(entry.get("merge_commit_sha"), str)
+            or not entry["merge_commit_sha"]
+            or not isinstance(entry.get("merged_at"), str)
+            or not entry["merged_at"]
+            or not isinstance(entry.get("audit_text"), str)
+            or not entry["audit_text"].startswith(f"WORKLINK_CLOSED v1 {key}\n")
+            or not isinstance(source_digests, list)
+            or not all(
+                isinstance(digest, str)
+                and len(digest) == 64
+                and all(character in "0123456789abcdef" for character in digest)
+                for digest in source_digests
+            )
+            or entry.get("stage") not in {
+                "discovered", "audit_started", "audit_confirmed", "close_started",
+                "closed_verified", "cleanup_pending", "uncertain", "finalized",
+            }
+            or type(entry.get("result_finalized")) is not bool
+            or key != expected_key
+            or not (
+                entry.get("uncertainty") is None
+                or entry.get("uncertainty") in {
+                    "audit_outcome_uncertain", "close_outcome_uncertain"
+                }
+            )
+            or (entry["result_finalized"] and entry.get("stage") != "finalized")
+        ):
+            raise OSError("merge reconciliation state unavailable: invalid intent")
+    for key, entry in notices.items():
+        expected_notice_key = None
+        if isinstance(entry, dict):
+            canonical = json.dumps(
+                [
+                    1, entry.get("issue_id"), entry.get("repository"),
+                    entry.get("pr_url"), entry.get("reason"),
+                ],
+                separators=(",", ":"),
+            )
+            expected_notice_key = (
+                "worklink-merge-reconciliation:"
+                + hashlib.sha256(canonical.encode()).hexdigest()
+            )
+        if (
+            not isinstance(key, str)
+            or not key.startswith("worklink-merge-reconciliation:")
+            or len(key) != len("worklink-merge-reconciliation:") + 64
+            or not isinstance(entry, dict)
+            or entry.get("delivery_key") != key
+            or not isinstance(entry.get("reason"), str)
+            or not entry["reason"]
+            or not isinstance(entry.get("detail"), str)
+            or not isinstance(entry.get("created_at"), str)
+            or type(entry.get("notified")) is not bool
+            or type(entry.get("resolved")) is not bool
+            or not (entry.get("issue_id") is None or type(entry["issue_id"]) is int)
+            or not (entry.get("repository") is None or isinstance(entry["repository"], str))
+            or not (entry.get("pr_url") is None or isinstance(entry["pr_url"], str))
+            or key != expected_notice_key
+        ):
+            raise OSError("merge reconciliation state unavailable: invalid notice")
+    return value
+
+
+def _fsync_failure_state(state_dir: Path) -> None:
+    path = state_dir / STATE_FILE
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_fd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@contextmanager
+def merge_reconciliation_transaction(state_dir: Path):
+    """Mutate the merge namespace and require a durable commit before return."""
+    with failure_state_transaction(state_dir) as state:
+        reconciliations = _validate_merge_reconciliations(
+            state.get("merge_reconciliations")
+        )
+        state["merge_reconciliations"] = reconciliations
+        yield reconciliations
+    _fsync_failure_state(state_dir)
+
+
+def _merge_notice_key(
+    issue_id: int | None,
+    repository: str | None,
+    pr_url: str | None,
+    reason: str,
+) -> str:
+    canonical = json.dumps(
+        [1, issue_id, repository, pr_url, reason], separators=(",", ":")
+    )
+    return "worklink-merge-reconciliation:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def record_merge_reconciliation_notice(
+    state_dir: Path,
+    *,
+    issue_id: int | None,
+    repository: str | None,
+    pr_url: str | None,
+    reason: str,
+    detail: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Persist one immutable, permanently deduplicated reconciliation refusal."""
+    key = _merge_notice_key(issue_id, repository, pr_url, reason)
+    created_at = (now or datetime.now(UTC)).isoformat()
+    with merge_reconciliation_transaction(state_dir) as reconciliations:
+        entry = reconciliations["notices"].setdefault(
+            key,
+            {
+                "delivery_key": key,
+                "issue_id": issue_id,
+                "repository": repository,
+                "pr_url": pr_url,
+                "reason": reason,
+                "detail": redact_text(detail)[:1000],
+                "created_at": created_at,
+                "notified": False,
+                "resolved": False,
+            },
+        )
+        return dict(entry)
+
+
+def pending_merge_reconciliation_notices(state_dir: Path) -> list[dict[str, Any]]:
+    """Return unacknowledged notices, including resolved-but-undelivered ones."""
+    with merge_reconciliation_transaction(state_dir) as reconciliations:
+        return [
+            dict(entry)
+            for _, entry in sorted(reconciliations["notices"].items())
+            if not entry["notified"]
+        ]
+
+
+def mark_merge_reconciliation_notified(state_dir: Path, delivery_key: str) -> bool:
+    with merge_reconciliation_transaction(state_dir) as reconciliations:
+        entry = reconciliations["notices"].get(delivery_key)
+        if not isinstance(entry, dict) or entry["notified"]:
+            return False
+        entry["notified"] = True
+        return True
+
+
+def resolve_merge_reconciliation_notices(
+    state_dir: Path,
+    *,
+    issue_id: int,
+    pr_url: str | None,
+) -> int:
+    resolved = 0
+    with merge_reconciliation_transaction(state_dir) as reconciliations:
+        for entry in reconciliations["notices"].values():
+            if (
+                not entry["resolved"]
+                and entry.get("issue_id") == issue_id
+                and (pr_url is None or entry.get("pr_url") in {None, pr_url})
+            ):
+                entry["resolved"] = True
+                resolved += 1
+    return resolved
 
 
 def is_transient_contention(error: str) -> bool:

@@ -655,87 +655,27 @@ def close_merged_chainlinks_for_home(
     dry_run: bool = False,
     gh_runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
 ) -> list[MergedChainlinkResult]:
-    """Close chainlinks in worklink:review whose PRs have been merged.
+    """Reconcile explicitly completing merged leaf PRs through the safe closer."""
+    from .merge_closure import reconcile_merged_leaves
 
-    This is the reconciliation pass that handles chainlink #844: when a chainlink
-    reaches worklink:review (post-PR-open) and its PR is subsequently MERGED,
-    this function detects that merge and closes the chainlink.
+    def default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, capture_output=True, text=True, check=False)
 
-    The PR<->chainlink association is resolved from:
-    1. The evidence file in <home>/state/worklink/evidence/<issue>-<attempt>.json
-    2. The WORKLINK_EVIDENCE comment on the issue (fallback)
-
-    Idempotent: re-running on an already-closed chainlink is a no-op.
-    Fail-safe: an unresolvable PR state leaves the chainlink as-is.
-
-    Returns a list of chainlinks that were closed.
-    """
-
-    if gh_runner is None:
-        def gh_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-            return subprocess.run(args, capture_output=True, text=True, check=False)
-
-    cl = make_claims(home)
-
-    open_issue_ids = cl.issue_ids(status="open")
-    if not open_issue_ids:
-        return []
-    review_issue_ids = set(cl.issue_ids_with_label("worklink:review", status="open"))
-
-    closed_results: list[MergedChainlinkResult] = []
-
-    for issue_id in open_issue_ids:
-        pr_url = get_pr_url_for_review_issue(home, issue_id, chainlink_runner=cl.runner)
-        if not pr_url:
-            continue
-
-        merge_state = _check_pr_merged_via_gh_runner(pr_url, runner=gh_runner)
-        if merge_state is None:
-            continue
-
-        if merge_state.state == "CLOSED" and not merge_state.merged:
-            evidence = _find_latest_evidence_file_for_issue(home, issue_id)
-            if evidence is not None and evidence[1].get("status") == "completed" and not dry_run:
-                evidence_path, _evidence_payload = evidence
-                evidence_path.rename(evidence_path.with_suffix(".json.closed-unmerged"))
-            continue
-
-        if not merge_state.merged:
-            continue
-
-        # The widened open-issue scan exists only so closed-unmerged evidence
-        # can be archived after an operator re-queues an issue. Preserve the
-        # original merged-PR close population: never fight an operator who
-        # deliberately re-opened a completed issue without worklink:review.
-        if issue_id not in review_issue_ids:
-            continue
-
-        if dry_run:
-            closed_results.append(MergedChainlinkResult(
-                issue_id=issue_id,
-                pr_url=pr_url,
-                merged_at=merge_state.merged_at,
-                merge_commit_sha=merge_state.merge_commit_sha,
-            ))
-            continue
-
-        merge_info = ""
-        if merge_state.merge_commit_sha:
-            merge_info = f" (merged as {merge_state.merge_commit_sha[:7]})"
-        comment = (
-            f"WORKLINK_CLOSED: PR merged{merge_info}. "
-            f"Chainlink complete via PR {pr_url}"
+    claims = make_claims(home)
+    outcomes = reconcile_merged_leaves(
+        home,
+        gh_bin=gh_bin,
+        dry_run=dry_run,
+        chainlink_runner=claims.runner,
+        gh_runner=gh_runner or default_runner,
+        git_runner=default_runner,
+    )
+    return [
+        MergedChainlinkResult(
+            issue_id=outcome.issue_id,
+            pr_url=outcome.pr_url,
+            merged_at=outcome.merged_at,
+            merge_commit_sha=outcome.merge_commit_sha,
         )
-
-        cl._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
-        cl._run("issue", "comment", str(issue_id), comment, check=False)
-        cl._run("issue", "close", str(issue_id), check=False)
-
-        closed_results.append(MergedChainlinkResult(
-            issue_id=issue_id,
-            pr_url=pr_url,
-            merged_at=merge_state.merged_at,
-            merge_commit_sha=merge_state.merge_commit_sha,
-        ))
-
-    return closed_results
+        for outcome in outcomes
+    ]
