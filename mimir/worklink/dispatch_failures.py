@@ -108,6 +108,48 @@ def current_failure_identity(state_dir: Path, issue_id: int) -> tuple[str, str] 
     return signature, occurrence
 
 
+def active_failure_identities(
+    state_dir: Path,
+    *,
+    limit: int,
+    exclude_issue_ids: set[int] | None = None,
+) -> list[tuple[int, str, str]]:
+    """Return a bounded snapshot of active incidents for lifecycle reconciliation."""
+    if limit < 1:
+        return []
+    state = _read_failure_state_strict(state_dir)
+    if state is None:
+        return []
+    excluded = exclude_issue_ids or set()
+    identities: list[tuple[int, str, str]] = []
+    for raw_issue_id, entry in state["issues"].items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
+            raise ValueError("dispatch failure state unavailable: invalid issue record")
+        if not entry["active"]:
+            continue
+        try:
+            issue_id = int(raw_issue_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("dispatch failure state unavailable: invalid issue identity") from exc
+        if str(issue_id) != raw_issue_id or issue_id < 1:
+            raise ValueError("dispatch failure state unavailable: invalid issue identity")
+        if issue_id in excluded:
+            continue
+        signature = entry.get("signature")
+        occurrence = entry.get("occurrence_id")
+        if (
+            not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence, str)
+            or not occurrence
+        ):
+            raise ValueError("dispatch failure state unavailable: invalid incident identity")
+        identities.append((issue_id, signature, occurrence))
+        if len(identities) == limit:
+            break
+    return identities
+
+
 def is_dispatch_failure_intervention(event: Any) -> bool:
     """Recognize a framework-authored Worklink incident delivery by structure."""
     if getattr(event, "trigger", None) != "poller":

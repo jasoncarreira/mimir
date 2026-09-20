@@ -12,7 +12,11 @@ import pytest
 
 from mimir.worklink import merge_closure as closure
 from mimir.worklink import dispatch_failures
-from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+from mimir.worklink.dispatch_failures import (
+    autonomous_dispatch_block_reason,
+    dispatch_failure_state_dir,
+    load_failure_state,
+)
 
 
 HISTORICAL_IDS = (1295, 1296, 1297, 1298, 1299, 1300, 1301, 1762, 1780, 1781, 1766)
@@ -174,6 +178,144 @@ def test_canonical_historical_leaf_closes_audit_first(
         if call[1] == "issue" and call[2] in {"comment", "close", "unlabel"}
     ]
     assert rerun_mutations == ["comment", "close", "unlabel"]
+
+
+def test_reconciler_close_retires_incident_and_unblocks_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 1790
+    evidence(home, issue_id)
+    tracker = Tracker(issue_id)
+    state_dir = dispatch_failure_state_dir(home)
+    dispatch_failures.record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="worker timed out", log_path="worker.log",
+    )
+
+    outcomes = closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(issue_id),
+        git_runner=git_runner(repo),
+    )
+
+    assert [outcome.issue_id for outcome in outcomes] == [issue_id]
+    assert load_failure_state(state_dir)["issues"][str(issue_id)]["active"] is False
+    assert autonomous_dispatch_block_reason(state_dir, issue_id) is None
+
+
+def test_reconciler_close_does_not_retire_a_newer_incident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 1791
+    evidence(home, issue_id)
+    tracker = Tracker(issue_id)
+    state_dir = dispatch_failure_state_dir(home)
+    old = dispatch_failures.record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="old failure", log_path="old.log",
+    )
+    exact_resolver = dispatch_failures.resolve_failure_if_current
+
+    def fail_again_before_resolution(
+        target_dir: Path, target_issue_id: int, signature: str, occurrence_id: str,
+    ) -> bool:
+        dispatch_failures.record_failure(
+            target_dir, issue_id=target_issue_id, attempt=2, exit_status=1,
+            error="new failure", log_path="new.log",
+        )
+        return exact_resolver(
+            target_dir, target_issue_id, signature, occurrence_id,
+        )
+
+    monkeypatch.setattr(closure, "resolve_failure_if_current", fail_again_before_resolution)
+
+    outcomes = closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=forge(issue_id),
+        git_runner=git_runner(repo),
+    )
+
+    current = load_failure_state(state_dir)["issues"][str(issue_id)]
+    assert [outcome.issue_id for outcome in outcomes] == [issue_id]
+    assert current["active"] is True
+    assert current["signature"] != old["signature"]
+    assert autonomous_dispatch_block_reason(state_dir, issue_id) is not None
+
+
+def test_closed_issue_sweep_retires_incident_idempotently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 1792
+    tracker = Tracker(issue_id, labels={"triage"})
+    tracker.status = "closed"
+    state_dir = dispatch_failure_state_dir(home)
+    dispatch_failures.record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="manually closed work failed", log_path=None,
+    )
+
+    for _ in range(2):
+        assert closure.reconcile_merged_leaves(
+            home, chainlink_runner=tracker, gh_runner=lambda args: cp(1),
+            git_runner=git_runner(repo),
+        ) == []
+
+    assert load_failure_state(state_dir)["issues"][str(issue_id)]["active"] is False
+    assert autonomous_dispatch_block_reason(state_dir, issue_id) is None
+    assert not [call for call in tracker.calls if call[1:3] == ["issue", "show"]]
+
+
+def test_closed_issue_sweep_leaves_open_incident_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 1793
+    tracker = Tracker(issue_id, labels={"triage"})
+    state_dir = dispatch_failure_state_dir(home)
+    dispatch_failures.record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="still actionable", log_path=None,
+    )
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=lambda args: cp(1),
+        git_runner=git_runner(repo),
+    ) == []
+
+    assert load_failure_state(state_dir)["issues"][str(issue_id)]["active"] is True
+    assert autonomous_dispatch_block_reason(state_dir, issue_id) is not None
+
+
+def test_closed_issue_sweep_bounds_retirements_and_tracker_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home, repo = configured_home(tmp_path, monkeypatch)
+    state_dir = dispatch_failure_state_dir(home)
+    issue_ids = (1794, 1795, 1796)
+    for issue_id in issue_ids:
+        dispatch_failures.record_failure(
+            state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+            error=f"failure {issue_id}", log_path=None,
+        )
+    calls: list[list[str]] = []
+
+    def tracker(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        calls.append(command)
+        assert command[1:3] == ["issue", "list"]
+        return cp(stdout="[]")
+
+    monkeypatch.setattr(closure, "MAX_INCIDENT_RETIREMENTS_PER_SWEEP", 2)
+
+    assert closure.reconcile_merged_leaves(
+        home, chainlink_runner=tracker, gh_runner=lambda args: cp(1),
+        git_runner=git_runner(repo),
+    ) == []
+
+    entries = load_failure_state(state_dir)["issues"]
+    assert [entries[str(issue_id)]["active"] for issue_id in issue_ids] == [False, False, True]
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("body", [

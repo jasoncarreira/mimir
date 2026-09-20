@@ -20,9 +20,12 @@ from ..redaction import redact_text
 from ..repository_config import RepositoryConfig, RepositoryInventory
 from .backends import WorklinkConfig
 from .dispatch_failures import (
+    active_failure_identities,
+    current_failure_identity,
     dispatch_failure_state_dir,
     merge_reconciliation_transaction,
     record_merge_reconciliation_notice,
+    resolve_failure_if_current,
     resolve_merge_reconciliation_notices,
 )
 
@@ -52,6 +55,7 @@ _FORBIDDEN = re.compile(
 _EVIDENCE_NAME = re.compile(r"(?P<issue>[1-9][0-9]*)-(?P<attempt>[1-9][0-9]*)\.json")
 _SHA = re.compile(r"[0-9a-fA-F]{7,64}")
 _COMPETING_LABELS = frozenset({"worklink:ready", "worklink:in-progress", "worklink:blocked"})
+MAX_INCIDENT_RETIREMENTS_PER_SWEEP = 100
 
 
 class ClosureReadError(RuntimeError):
@@ -599,6 +603,14 @@ def _process_intent(
     if entry.get("result_finalized"):
         return None
     try:
+        captured_incident = current_failure_identity(state_dir, issue_id)
+    except ValueError as exc:
+        _notice(
+            state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
+            reason="incident_identity_unavailable", detail=str(exc),
+        )
+        return None
+    try:
         issue, pr, association = _revalidate(
             home, issue_id, pr_url, repository=repository, gh_bin=gh_bin,
             chainlink_runner=chainlink_runner, gh_runner=gh_runner,
@@ -771,6 +783,10 @@ def _process_intent(
                     reason="cleanup_verification_failed", detail="review label absence was not verified",
                 )
                 return None
+        if captured_incident is not None:
+            resolve_failure_if_current(
+                state_dir, issue_id, captured_incident[0], captured_incident[1],
+            )
         _update_intent(state_dir, key, stage="finalized", result_finalized=True)
         resolve_merge_reconciliation_notices(state_dir, issue_id=issue_id, pr_url=pr_url)
         return ClosureOutcome(issue_id, pr.url, str(pr.merged_at), str(pr.merge_commit_sha))
@@ -805,9 +821,19 @@ def reconcile_merged_leaves(
                     reason="repository_trust_failed", detail=str(exc),
                 )
             return []
+        pending = {} if dry_run else _pending_intents(state_dir)
+        pending_issue_ids = {
+            int(entry["issue_id"]) for entry in pending.values()
+            if isinstance(entry.get("issue_id"), int)
+        }
         try:
+            observed_incidents = [] if dry_run else active_failure_identities(
+                state_dir,
+                limit=MAX_INCIDENT_RETIREMENTS_PER_SWEEP,
+                exclude_issue_ids=pending_issue_ids,
+            )
             open_ids = _list_open_issue_ids(chainlink_runner)
-        except ClosureReadError as exc:
+        except (ClosureReadError, ValueError) as exc:
             if not dry_run:
                 _notice(
                     state_dir, issue_id=None, repository=repository.slug, pr_url=None,
@@ -815,10 +841,15 @@ def reconcile_merged_leaves(
                 )
             return []
         if not dry_run:
+            for issue_id, signature, occurrence_id in observed_incidents:
+                if issue_id not in open_ids:
+                    resolve_failure_if_current(
+                        state_dir, issue_id, signature, occurrence_id,
+                    )
+        if not dry_run:
             resolve_merge_reconciliation_notices(
                 state_dir, issue_id=None, pr_url=None,
             )
-        pending = {} if dry_run else _pending_intents(state_dir)
         issue_ids = open_ids | {
             int(entry["issue_id"]) for entry in pending.values()
             if isinstance(entry.get("issue_id"), int)
