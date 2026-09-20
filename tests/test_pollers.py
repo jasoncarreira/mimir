@@ -4565,6 +4565,252 @@ def worklink_receipt_consumer(monkeypatch):
     return consumer
 
 
+@pytest.mark.parametrize("kind", ["factory_start", "factory_success"])
+def test_factory_transition_receipt_pruning_waits_for_acknowledgement(
+    home, worklink_receipts, worklink_receipt_consumer, monkeypatch, kind,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_factory_transition(
+        state, kind=kind, issue_id=42, run_id="run-42", attempt=1,
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    receipt = state / ".delivery-receipts" / hashlib.sha256(key.encode()).hexdigest()
+    os.utime(receipt, (1, 1))
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+    assert not obsolete.exists(), "pending transitions must not disable all pruning"
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is False
+    emitted = Mock()
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted)
+    worklink_receipt_consumer._deliver_factory_transitions(
+        state, SimpleNamespace(hard_exhausted=lambda: False),
+    )
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is True
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+    worklink_receipt_consumer._deliver_factory_transitions(
+        state, SimpleNamespace(hard_exhausted=lambda: False),
+    )
+    emitted.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["factory_start", "factory_success"])
+@pytest.mark.parametrize("broken", [
+    "mapping-null", "mapping-list", "entry-null", "entry-list",
+    "kind-missing", "kind-unknown", "kind-list",
+    "issue_id-missing", "issue_id-string", "issue_id-bool",
+    "run_id-missing", "run_id-int", "run_id-empty",
+    "attempt-missing", "attempt-string", "attempt-bool",
+    "notified-missing", "notified-int", "notified-string", "pr_url-int",
+    "key-mismatch", "delivery_key-missing", "delivery_key-mismatch",
+])
+def test_factory_transition_receipt_pruning_fails_closed(
+    home, worklink_receipts, kind, broken,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_factory_transition(
+        state, kind=kind, issue_id=42, run_id="run-42", attempt=1,
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    with failures.failure_state_transaction(state) as ledger:
+        malformed = dict(entry, notified=True)
+        field, defect = broken.split("-", 1)
+        if field not in {"mapping", "entry", "key", "delivery_key"}:
+            if defect == "missing":
+                malformed.pop(field)
+            else:
+                malformed[field] = {
+                    "unknown": "factory_failure", "list": [], "string": "1",
+                    "bool": True, "int": 1, "empty": "",
+                }[defect]
+        # Keep identity keys consistent so type guards are tested independently.
+        malformed_key = (
+            f"worklink-{malformed.get('kind')}:{malformed.get('issue_id')}:"
+            f"{malformed.get('run_id')}:{malformed.get('attempt')}"
+        )
+        malformed["delivery_key"] = malformed_key
+        if field == "key":
+            malformed_key = "mismatched-key"
+            malformed["delivery_key"] = malformed_key
+        elif field == "delivery_key":
+            if defect == "missing":
+                malformed.pop("delivery_key")
+            else:
+                malformed["delivery_key"] = "mismatched-key"
+        transitions = {malformed_key: malformed}
+        if field == "mapping":
+            transitions = None if defect == "null" else []
+        elif field == "entry":
+            transitions[malformed_key] = None if defect == "null" else []
+        ledger["factory_transitions"] = transitions
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists(), "malformed transitions must abort the entire sweep"
+    assert failures.delivery_receipt_exists(state, key)
+
+
+@pytest.mark.parametrize("changed", ["kind", "issue_id", "run_id", "attempt"])
+def test_factory_transition_ledger_identity_and_immutability(worklink_receipts, changed):
+    failures, state, _, record = worklink_receipts
+    record()
+    incidents = failures.load_failure_state(state)["issues"]
+    identity = dict(kind="factory_start", issue_id=42, run_id="run-42", attempt=1)
+    first = failures.record_factory_transition(state, **identity)
+    key = first["delivery_key"]
+    assert key == "worklink-factory_start:42:run-42:1"
+    assert first == {
+        **identity, "issue_title": "", "delivery_key": key, "pr_url": None, "notified": False,
+    }
+    with failures.failure_state_transaction(state) as ledger:
+        ledger["factory_transitions"][key]["notified"] = True
+    duplicate = failures.record_factory_transition(state, **identity, pr_url="https://example.com/pr/1")
+    assert duplicate == {**first, "notified": True}
+    identity[changed] = {
+        "kind": "factory_success", "issue_id": 43, "run_id": "run-43", "attempt": 2,
+    }[changed]
+    distinct = failures.record_factory_transition(state, **identity)
+    ledger = failures.load_failure_state(state)
+    assert distinct["delivery_key"] != key
+    assert distinct["notified"] is False
+    assert len(ledger["factory_transitions"]) == 2
+    assert ledger["issues"] == incidents
+    with pytest.raises(ValueError, match="invalid factory transition kind"):
+        failures.record_factory_transition(state, **{**identity, "kind": "incident"})
+    assert failures.load_failure_state(state) == ledger
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["factory_start", "factory_success"])
+async def test_factory_transition_prompt_handoff_and_acknowledgement(
+    home, worklink_receipts, worklink_receipt_consumer, capsys, kind,
+):
+    failures, state, cfg, _ = worklink_receipts
+    consumer = worklink_receipt_consumer
+    pr_url = "https://github.com/example/repo/pull/42" if kind == "factory_success" else None
+    entry = failures.record_factory_transition(
+        state, kind=kind, issue_id=42, issue_title="Ship factory milestones",
+        run_id="run-42", attempt=2, pr_url=pr_url,
+    )
+    key = entry["delivery_key"]
+    consumer._deliver_factory_transitions(state, SimpleNamespace(hard_exhausted=lambda: False))
+    offered = json.loads(capsys.readouterr().out)
+    milestone = "started" if kind == "factory_start" else "succeeded"
+    detail = (
+        "A build slot is now occupied by this epic."
+        if kind == "factory_start" else "The epic completed successfully."
+    )
+    assert offered == {
+        "poller": failures.POLLER_NAME,
+        "prompt": (
+            f"Worklink factory {milestone} for issue 42: Ship factory milestones. "
+            f"{detail} Informational status update only.\n\n"
+            f"Kind: {kind}\nRun: run-42\nAttempt: 2\nPR: {pr_url or '(none)'}"
+        ),
+        "kind": kind, "issue_id": 42, "run_id": "run-42", "attempt": 2,
+        "pr_url": pr_url, "source_id": key, "delivery_key": key,
+    }
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is False
+    assert not failures.delivery_receipt_exists(state, key)
+    # Run the actual consumer in the framework child, not a hand-built prompt.
+    _install_script(home, "factory_delivery.py", f"""
+import os
+import runpy
+from pathlib import Path
+consumer = runpy.run_path({consumer.__file__!r})
+consumer['_deliver_factory_transitions'](Path(os.environ['STATE_DIR']), consumer['TickBudget']())
+""")
+    cfg = replace(cfg, command=f"{sys.executable} factory_delivery.py")
+    accepted = _CapturingEnqueue()
+
+    async def enqueue(event, *, relevance_check=None):
+        return await accepted(event)
+
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 1
+    event = accepted.events[0]
+    assert event.extra["items"] == [{k: v for k, v in offered.items() if k not in {"prompt", "poller"}}]
+    assert offered["prompt"] in event.content
+    assert not failures.is_dispatch_failure_intervention(event)
+    assert failures.delivery_receipt_exists(state, key)
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is False
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 0
+    assert len(accepted.events) == 1
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is True
+    # The existing GC removes the receipt after the child acknowledges it.
+    assert not failures.delivery_receipt_exists(state, key)
+    failures.record_factory_transition(
+        state, kind=kind, issue_id=42, issue_title="Ship factory milestones",
+        run_id="run-42", attempt=2, pr_url=pr_url,
+    )
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 0
+    assert len(accepted.events) == 1
+
+
+@pytest.mark.parametrize("incident", [False, True])
+def test_factory_transition_main_delivers_without_ready_work(
+    home, worklink_receipts, worklink_receipt_consumer, monkeypatch, capsys, incident,
+):
+    failures, state, _, record = worklink_receipts
+    if incident:
+        _, _, receipt = record()
+        receipt.unlink()
+    failures.record_factory_transition(
+        state, kind="factory_start", issue_id=42, run_id="run-42", attempt=1,
+    )
+    consumer = worklink_receipt_consumer
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(home))
+    monkeypatch.setattr(consumer.WorklinkConfig, "load", lambda path: None)
+    monkeypatch.setattr(consumer, "BackendRegistry", lambda config: None)
+    monkeypatch.setattr(consumer, "_active_lock_issue_ids", lambda home: set())
+    monkeypatch.setattr(consumer, "_worklink_dispatch_plan", lambda *a, **kw: ([], 0, 0, 0, set()))
+    dispatch = Mock()
+    monkeypatch.setattr(consumer, "_dispatch", dispatch)
+    assert consumer.main() == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    milestone = output[1] if incident else output[0]
+    assert milestone["kind"] == "factory_start"
+    assert "prompt" in milestone and "signal" not in milestone
+    assert output[-1]["signal"] == "worklink_ready_scan"
+    if incident:
+        assert output[0]["prompt"].startswith("Worklink incident")
+        assert output[-1]["reason"] == "failure incident prompt emitted; skipping dispatch"
+    else:
+        assert output[-1]["ready_count"] == 0
+    dispatch.assert_not_called()
+
+
+def test_factory_transition_tick_budget_and_locked_emission(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    entry = failures.record_factory_transition(
+        state, kind="factory_start", issue_id=42, run_id="run-42", attempt=1,
+    )
+    consumer = worklink_receipt_consumer
+    emitted = []
+
+    def emit(prompt):
+        with (state / f"{failures.STATE_FILE}.lock").open("a") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        emitted.append(prompt)
+
+    monkeypatch.setattr(consumer, "_emit", emit)
+    consumer._deliver_factory_transitions(state, SimpleNamespace(hard_exhausted=lambda: True))
+    assert emitted == []
+    consumer._deliver_factory_transitions(state, SimpleNamespace(hard_exhausted=lambda: False))
+    assert len(emitted) == 1
+    _write_delivery_receipt(state, entry["delivery_key"])
+    consumer._deliver_factory_transitions(state, SimpleNamespace(hard_exhausted=lambda: True))
+    assert len(emitted) == 1
+    assert failures.load_failure_state(state)["factory_transitions"][entry["delivery_key"]]["notified"] is True
+
+
 def test_worklink_receipt_pruning_preserves_barrier_crash_window_and_negative_control(
     home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch,
 ):
