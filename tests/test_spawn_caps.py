@@ -176,6 +176,9 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     home.mkdir()
     seed.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local/share"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(home / ".cache"))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:test-model")
     auth = home / ".local/share/opencode/auth.json"
     auth.parent.mkdir(parents=True)
@@ -185,7 +188,10 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     subprocess.run(["git", "-C", str(seed), "config", "user.email", "test@example.invalid"], check=True)
     (seed / "README").write_text("seed")
     subprocess.run(["git", "-C", str(seed), "add", "README"], check=True)
-    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "seed"], check=True)
+    subprocess.run(
+        ["git", "-C", str(seed), "-c", "commit.gpgsign=false", "commit", "-q", "-m", "seed"],
+        check=True,
+    )
     set_spawn_config({"default_cwd": tmp_path, "artifact_root": home / "artifacts"})
     calls = {"factory": 0, "envs": []}
 
@@ -202,9 +208,7 @@ def _surface_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     def factory(source, **kwargs):
         calls["factory"] += 1
-        destination = tmp_path / f"issued-{calls['factory']}"
-        subprocess.run(["git", "clone", "-q", str(source), str(destination)], check=True)
-        return Checkout(destination)
+        return Checkout(source)
 
     async def runner(argv, directory, worker_env, projections=(), **kwargs):
         calls["envs"].append(dict(worker_env))
