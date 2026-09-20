@@ -8266,7 +8266,7 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
             factory_clock.now += 5.0
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", reach_deadline)
-    monkeypatch.setattr(orchestrator, "_FACTORY_STARTUP_STATUS_TIMEOUT_S", 30.0)
+    monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "30")
     with pytest.raises(orchestrator.WorklinkError, match="factory never initialised"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
@@ -10679,3 +10679,48 @@ def test_worker_report_dir_failure_aborts_before_the_backend_launches(
         orch._make_executor_report_dir(1481, 3, worker_uid_drop=True)
 
     assert not report.exists(), "the unusable report directory must be cleaned up"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 300.0),
+        ("450", 450.0),
+        ("0", 300.0),
+        ("-5", 300.0),
+        ("soon", 300.0),
+        # float() accepts these; a NaN deadline compares False against every
+        # bound and silently disables the check, and an infinite one overflows
+        # math.ceil(run_timeout + timeout) before supervision begins.
+        ("nan", 300.0),
+        ("inf", 300.0),
+        ("-inf", 300.0),
+    ],
+)
+def test_factory_startup_deadline_resolves_or_announces(
+    monkeypatch: pytest.MonkeyPatch, caplog, raw: str | None, expected: float,
+) -> None:
+    """Absent is silent; a set-but-unusable value is announced, never silent.
+
+    The former hardcoded 120s could not cover OpenCode boot plus a model round
+    trip plus ``factory init`` on a loaded host, which killed chainlink #1783
+    attempt 4 mid-startup at 115s.
+    """
+    monkeypatch.delenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", raising=False)
+    if raw is not None:
+        monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", raw)
+    from mimir.worklink import orchestrator as _orch
+
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        _orch, "_log_event", lambda name, **kw: events.append((name, kw))
+    )
+    assert _orch._factory_startup_status_timeout_s() == expected
+    announced = [name for name, _ in events]
+    # Unset and usable stay silent; a value the operator set but we cannot use
+    # must say so rather than degrade quietly into the default.
+    if raw is not None and expected == 300.0:
+        assert announced == ["worklink_factory_startup_timeout_unusable"], announced
+        assert events[0][1]["value"] == raw
+    else:
+        assert announced == [], announced
