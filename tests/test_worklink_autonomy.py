@@ -89,10 +89,19 @@ def test_incident_occurrence_is_stable_until_guarded_resolution(tmp_path: Path) 
     assert pending_failure_alerts(state_dir)[0] == {91}
     assert pending_failure_alerts(state_dir)[1] == []
     assert not resolve_failure_if_current(
+        state_dir, 91, "newer-signature", first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
         state_dir, 91, first["signature"], "newer-occurrence"
     )
     assert resolve_failure_if_current(
         state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
+        state_dir, 91, first["signature"], first["occurrence_id"]
+    )
+    assert not resolve_failure_if_current(
+        state_dir, 92, first["signature"], first["occurrence_id"]
     )
     assert autonomous_dispatch_block_reason(state_dir, 91) is None
 
