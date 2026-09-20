@@ -221,7 +221,11 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
     factory transitions and all extant continuation sidecars remain protected,
     without an age limit.
     """
-    from .worklink.dispatch_failures import STATE_FILE, dispatch_failure_state_dir
+    from .worklink.dispatch_failures import (
+        STATE_FILE,
+        _validate_merge_reconciliations,
+        dispatch_failure_state_dir,
+    )
 
     try:
         if persist_dir.resolve() != dispatch_failure_state_dir(home).resolve():
@@ -309,6 +313,12 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                             or key != f"worklink-{kind}:{issue}:{run}:{attempt}"
                             or entry.get("delivery_key") != key):
                         return
+                    if not entry["notified"]:
+                        live.add(hashlib.sha256(key.encode()).hexdigest())
+                reconciliations = _validate_merge_reconciliations(
+                    state.get("merge_reconciliations")
+                )
+                for key, entry in reconciliations["notices"].items():
                     if not entry["notified"]:
                         live.add(hashlib.sha256(key.encode()).hexdigest())
                 # The existing writer's directory fsync is best-effort. Require

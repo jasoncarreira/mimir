@@ -3086,7 +3086,46 @@ class FakeChainlinkForReview:
         return [" ".join(c[1:4]) for c in self.calls]
 
 
-def test_close_merged_chainlinks_dry_run(tmp_path: Path) -> None:
+def test_close_merged_chainlinks_public_wrapper_preserves_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink import merge_closure
+
+    chainlink_runner = lambda args: cp()  # noqa: E731
+    github_runner = lambda args: cp()  # noqa: E731
+    monkeypatch.setattr(
+        autonomy, "make_claims", lambda home: SimpleNamespace(runner=chainlink_runner),
+    )
+    captured = {}
+
+    def reconcile(home, **kwargs):
+        captured.update(home=home, **kwargs)
+        return [merge_closure.ClosureOutcome(
+            740,
+            "https://github.com/owner/repo/pull/1029",
+            "2026-07-05T12:00:00Z",
+            "912e48d6",
+        )]
+
+    monkeypatch.setattr(merge_closure, "reconcile_merged_leaves", reconcile)
+    result = autonomy.close_merged_chainlinks_for_home(
+        tmp_path, gh_bin="trusted-gh", dry_run=True, gh_runner=github_runner,
+    )
+    assert result == [autonomy.MergedChainlinkResult(
+        740,
+        "https://github.com/owner/repo/pull/1029",
+        "2026-07-05T12:00:00Z",
+        "912e48d6",
+    )]
+    assert captured["home"] == tmp_path
+    assert captured["gh_bin"] == "trusted-gh"
+    assert captured["dry_run"] is True
+    assert captured["chainlink_runner"] is chainlink_runner
+    assert captured["gh_runner"] is github_runner
+    assert callable(captured["git_runner"])
+
+
+def test_close_merged_chainlinks_dry_run_without_repository_trust(tmp_path: Path) -> None:
     """Dry run mode reports what would be closed without making changes."""
     home = tmp_path / "home"
     home.mkdir()
@@ -3112,15 +3151,14 @@ def test_close_merged_chainlinks_dry_run(tmp_path: Path) -> None:
     finally:
         aut.make_claims = orig_make_claims
 
-    assert len(results) == 1
-    assert results[0].issue_id == 740
-    assert results[0].pr_url == "https://github.com/owner/repo/pull/1029"
-    assert results[0].merge_commit_sha == "912e48d6"
+    # The public wrapper now fails closed when the home has no declared,
+    # attested repository inventory; qualification behavior is covered by the
+    # dedicated merge-closure tests.
+    assert results == []
     assert "issue close 740" not in fake_cl.names()
 
 
-def test_close_merged_chainlinks_actually_closes(tmp_path: Path) -> None:
-    """Actually close the chainlink when PR is merged."""
+def test_close_merged_chainlinks_refuses_without_repository_trust(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     evidence_dir = home / "state" / "worklink" / "evidence"
@@ -3146,11 +3184,9 @@ def test_close_merged_chainlinks_actually_closes(tmp_path: Path) -> None:
     finally:
         aut.make_claims = orig_make_claims
 
-    assert len(results) == 1
-    assert results[0].issue_id == 841
-    assert "issue unlabel 841" in fake_cl.names()
-    assert "issue close 841" in fake_cl.names()
-    assert any("PR merged" in " ".join(c) for c in fake_cl.calls)
+    assert results == []
+    assert "issue unlabel 841" not in fake_cl.names()
+    assert "issue close 841" not in fake_cl.names()
     assert rerun_results == []
 
 
@@ -3237,8 +3273,7 @@ def test_close_merged_chainlinks_skips_open_pr(tmp_path: Path) -> None:
     assert claim.reason == "review_ready_evidence_exists"
 
 
-def test_close_merged_chainlinks_archives_closed_unmerged_evidence(tmp_path: Path) -> None:
-    """A closed-unmerged attempt is archived and becomes claimable again."""
+def test_close_merged_chainlinks_does_not_archive_without_repository_trust(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
     evidence_dir = home / "state" / "worklink" / "evidence"
@@ -3271,8 +3306,8 @@ def test_close_merged_chainlinks_archives_closed_unmerged_evidence(tmp_path: Pat
         aut.make_claims = orig_make_claims
 
     assert results == []
-    assert not evidence_path.exists()
-    assert evidence_path.with_suffix(".json.closed-unmerged").exists()
+    assert evidence_path.exists()
+    assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
 
     claims = ChainlinkClaims(agent_id="test", runner=fake_cl, home_path=home)
     claim = claims.claim_issue(
@@ -3280,9 +3315,8 @@ def test_close_merged_chainlinks_archives_closed_unmerged_evidence(tmp_path: Pat
         comments=fake_cl.comments[843],
         labels=["worklink:ready"],
     )
-    assert claim.claimed is True
-    assert claim.record is not None
-    assert claim.record.attempt == 2
+    assert claim.claimed is False
+    assert claim.reason == "review_ready_evidence_exists"
 
 
 def test_close_merged_chainlinks_closed_unmerged_dry_run_keeps_evidence(tmp_path: Path) -> None:
@@ -3310,7 +3344,7 @@ def test_close_merged_chainlinks_closed_unmerged_dry_run_keeps_evidence(tmp_path
     assert not evidence_path.with_suffix(".json.closed-unmerged").exists()
 
 
-def test_close_merged_chainlinks_gh_failure_keeps_evidence(tmp_path: Path) -> None:
+def test_close_merged_chainlinks_missing_trust_keeps_evidence(tmp_path: Path) -> None:
     home = tmp_path / "home"
     evidence_dir = home / "state" / "worklink" / "evidence"
     evidence_dir.mkdir(parents=True)
@@ -3337,8 +3371,7 @@ def test_close_merged_chainlinks_gh_failure_keeps_evidence(tmp_path: Path) -> No
     assert not [call for call in fake_cl.calls if call[1:3] in (["issue", "unlabel"], ["issue", "comment"], ["issue", "close"])]
 
 
-def test_close_merged_chainlinks_closes_epic_from_mirror_comment(tmp_path: Path) -> None:
-    """Completed feature-factory epics expose PR URL via mirror comments."""
+def test_close_merged_chainlinks_refuses_epic_mirror_without_repository_trust(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
 
@@ -3360,9 +3393,8 @@ def test_close_merged_chainlinks_closes_epic_from_mirror_comment(tmp_path: Path)
     finally:
         aut.make_claims = orig_make_claims
 
-    assert [result.issue_id for result in results] == [845]
-    assert "issue unlabel 845" in fake_cl.names()
-    assert any("PR merged" in " ".join(c) for c in fake_cl.calls)
+    assert results == []
+    assert "issue unlabel 845" not in fake_cl.names()
 
 
 def test_close_merged_chainlinks_leaves_epic_with_open_pr(tmp_path: Path) -> None:
