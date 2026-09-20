@@ -297,7 +297,15 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
     )
     if not isinstance(payload, dict):
         raise ClosureReadError("PR snapshot must be an object")
-    if payload.get("number") != number or payload.get("html_url") != canonical_url:
+    # True == 1 and 1.0 == 1, so equality alone admits a bool or float
+    # where the forge must have returned an integer. This is an identity check;
+    # it has to reject a value that merely compares equal to the expected number.
+    payload_number = payload.get("number")
+    if (
+        type(payload_number) is not int
+        or payload_number != number
+        or payload.get("html_url") != canonical_url
+    ):
         raise ClosureReadError("PR snapshot identity mismatch")
     body = payload.get("body")
     state = payload.get("state")
@@ -607,9 +615,19 @@ def _process_intent(
                 reason="intent_revalidation_failed", detail=str(exc),
             )
             return None
-        issue = _read_issue(issue_id, chainlink_runner)
-        pr = read_pr_snapshot(pr_url, gh_bin=gh_bin, runner=gh_runner)
-        association = discover_associations(home, issue)
+        try:
+            issue = _read_issue(issue_id, chainlink_runner)
+            pr = read_pr_snapshot(pr_url, gh_bin=gh_bin, runner=gh_runner)
+            association = discover_associations(home, issue)
+        except ClosureReadError as recovery_exc:
+            # The recovery path re-reads the same sources that just failed. An
+            # unguarded second failure escapes _process_intent and aborts the
+            # whole sweep, leaving no durable record of why.
+            _notice(
+                state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
+                reason="close_recovery_read_failed", detail=str(recovery_exc),
+            )
+            return None
     persisted_identity = {
         "repository": repository.slug,
         "pr_url": pr.url,
@@ -716,7 +734,14 @@ def _process_intent(
         _update_intent(state_dir, key, stage="closed_verified")
         stage = "closed_verified"
     if stage in {"closed_verified", "cleanup_pending"}:
-        issue = _read_issue(issue_id, chainlink_runner)
+        try:
+            issue = _read_issue(issue_id, chainlink_runner)
+        except ClosureReadError as cleanup_exc:
+            _notice(
+                state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
+                reason="cleanup_read_failed", detail=str(cleanup_exc),
+            )
+            return None
         if issue.is_open:
             _notice(
                 state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
@@ -732,7 +757,14 @@ def _process_intent(
                     reason="cleanup_failed", detail="review label removal failed",
                 )
                 return None
-            issue = _read_issue(issue_id, chainlink_runner)
+            try:
+                issue = _read_issue(issue_id, chainlink_runner)
+            except ClosureReadError as verify_exc:
+                _notice(
+                    state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,
+                    reason="cleanup_read_failed", detail=str(verify_exc),
+                )
+                return None
             if issue.is_open or "worklink:review" in issue.labels:
                 _notice(
                     state_dir, issue_id=issue_id, repository=repository.slug, pr_url=pr_url,

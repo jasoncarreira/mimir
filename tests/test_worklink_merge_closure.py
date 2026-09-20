@@ -1176,3 +1176,113 @@ reconcile_merged_leaves(home, chainlink_runner=chainlink, gh_runner=lambda a: cp
     assert events[0].split()[1] == events[1].split()[1]
     assert events[2].split()[1] == events[3].split()[1]
     assert events[0].split()[1] != events[2].split()[1]
+
+
+# chainlink #1304 integrated-acceptance repair: the two production defects the
+# factory's own acceptance review caught against a green suite.
+
+
+@pytest.mark.parametrize("number_value", [True, 1.0])
+def test_pr_identity_rejects_values_that_merely_compare_equal(number_value: object) -> None:
+    """True == 1 and 1.0 == 1; an identity check must reject both.
+
+    Equality alone admitted a bool or float where the forge must have returned
+    an integer, so a snapshot could satisfy the identity gate without being the
+    pull request that was asked for.
+    """
+    url = "https://github.com/example/project/pull/1"
+    payload = {
+        "number": number_value, "html_url": url, "body": "Closes chainlink #14.",
+        "state": "closed", "merged": True, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": "example/project"}, "ref": "main"},
+    }
+    with pytest.raises(closure.ClosureReadError):
+        closure.read_pr_snapshot(url, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
+
+
+def test_pr_identity_still_admits_a_genuine_integer_number() -> None:
+    """The guard must reject the type, not the value: a real int still passes."""
+    url = "https://github.com/example/project/pull/1"
+    payload = {
+        "number": 1, "html_url": url, "body": "Closes chainlink #14.",
+        "state": "closed", "merged": True, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": "example/project"}, "ref": "main"},
+    }
+    snapshot = closure.read_pr_snapshot(
+        url, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)),
+    )
+    assert snapshot.number == 1
+
+
+def _seed_pending_intent(home: Path, issue_id: int, *, stage: str) -> str:
+    """Persist one unfinalised intent at *stage*, as a prior pass would leave it."""
+    state_dir = dispatch_failure_state_dir(home)
+    key = hashlib.sha256(
+        json.dumps([1, issue_id, "example/project", 42], separators=(",", ":")).encode()
+    ).hexdigest()
+    closure._persist_intent(state_dir, key, {
+        "intent_key": key,
+        "issue_id": issue_id,
+        "repository": "example/project",
+        "pr_number": 42,
+        "pr_url": PR_URL,
+        "base_ref": "main",
+        "merge_commit_sha": MERGE_SHA,
+        "merged_at": MERGED_AT,
+        "audit_text": (
+            f"WORKLINK_CLOSED v1 {key}\n"
+            f"Chainlink #{issue_id} complete via PR {PR_URL}.\n"
+            f"Merged at {MERGED_AT}; merge commit {MERGE_SHA}; completion base main."
+        ),
+        "source_digests": [],
+    })
+    closure._update_intent(state_dir, key, stage=stage)
+    return key
+
+
+def _tracker_failing_only_on_issue_show(issue_id: int):
+    """Inventory succeeds; reading the issue fails, as a degraded tracker does.
+
+    Failing every call instead stops the sweep at inventory, which is a
+    different defect and would not reach the recovery path under test.
+    """
+    inventory = Tracker(issue_id)
+
+    def run(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args)[1:3] == ["issue", "show"]:
+            return cp(returncode=1, stderr="tracker unavailable")
+        return inventory(args)
+
+    return run
+
+
+@pytest.mark.parametrize("stage", ["close_started", "closed_verified", "cleanup_pending"])
+def test_recovery_read_failure_records_a_notice_instead_of_escaping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str,
+) -> None:
+    """A second read failure in the verified-close recovery path must not escape.
+
+    The recovery branch re-reads the very sources whose failure put it there. An
+    unguarded failure propagated out of _process_intent and aborted the entire
+    reconciliation pass, leaving no durable record of why and skipping every
+    other issue in the batch.
+    """
+    home, repo = configured_home(tmp_path, monkeypatch)
+    issue_id = 1295
+    evidence(home, issue_id)
+    _seed_pending_intent(home, issue_id, stage=stage)
+
+    outcomes = closure.reconcile_merged_leaves(
+        home,
+        chainlink_runner=_tracker_failing_only_on_issue_show(issue_id),
+        gh_runner=forge(issue_id),
+        git_runner=git_runner(repo),
+    )
+
+    assert outcomes == []
+    notices = load_failure_state(dispatch_failure_state_dir(home))["merge_reconciliations"]["notices"]
+    reasons = [entry["reason"] for entry in notices.values() if not entry["resolved"]]
+    assert reasons, "a read failure during recovery must leave a durable notice"
+    assert all(reason.endswith("_read_failed") or reason == "intent_revalidation_failed" for reason in reasons), reasons
