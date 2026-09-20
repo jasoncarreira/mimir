@@ -118,13 +118,46 @@ _GITHUB_BARE_CLOSING_REFERENCE_RE = re.compile(
     r"(?P<separator>\s*:\s*|\s+)#(?P<number>[0-9]+)\b",
     re.IGNORECASE,
 )
-_FACTORY_STARTUP_STATUS_TIMEOUT_S = 120.0
+#: Seconds the controller waits for the factory to publish its first status.
+#: The window must cover OpenCode's boot, config and plugin loading, one model
+#: round trip, and `factory init`. Measured on chainlink #1783 attempt 4: 74s
+#: elapsed before the init call was even evaluated, leaving under 50s of the
+#: former 120s for init to finish, and the run was killed mid-startup. Raising
+#: this only slows detection of a factory that never starts; a started run is
+#: still bounded by the separate run timeout.
+_FACTORY_STARTUP_STATUS_TIMEOUT_DEFAULT_S = 300.0
+_FACTORY_STARTUP_STATUS_TIMEOUT_ENV = "MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S"
 _FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
 _WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
 
 
 def _epic_run_timeout_s() -> float:
     return factory_run_timeout_s()
+
+
+def _factory_startup_status_timeout_s() -> float:
+    """Resolve the first-status deadline, saying so when a set value is unusable.
+
+    Same contract as the sibling factory settings: absent is ordinary and
+    silent, but a value the operator set and this cannot use is announced
+    rather than degrading quietly into the default.
+    """
+    raw = os.environ.get(_FACTORY_STARTUP_STATUS_TIMEOUT_ENV)
+    if raw is None:
+        return _FACTORY_STARTUP_STATUS_TIMEOUT_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or value <= 0:
+        _log_event(
+            "worklink_factory_startup_timeout_unusable",
+            variable=_FACTORY_STARTUP_STATUS_TIMEOUT_ENV,
+            value=raw,
+            default_s=_FACTORY_STARTUP_STATUS_TIMEOUT_DEFAULT_S,
+        )
+        return _FACTORY_STARTUP_STATUS_TIMEOUT_DEFAULT_S
+    return value
 
 
 def _epic_stale_heartbeat_s() -> float:
@@ -2801,7 +2834,7 @@ class WorklinkRunner:
         loop = asyncio.get_running_loop()
         run_timeout = _epic_run_timeout_s()
         deadline = loop.time() + run_timeout
-        startup_deadline = min(deadline, loop.time() + _FACTORY_STARTUP_STATUS_TIMEOUT_S)
+        startup_deadline = min(deadline, loop.time() + _factory_startup_status_timeout_s())
         stale_after = _epic_stale_heartbeat_s()
         last_status: FactoryStatus | None = None
         last_change = loop.time()
@@ -2813,7 +2846,7 @@ class WorklinkRunner:
             wait_task = asyncio.create_task(
                 compute.wait(
                     handle,
-                    max(1, math.ceil(run_timeout + _FACTORY_STARTUP_STATUS_TIMEOUT_S)),
+                    max(1, math.ceil(run_timeout + _factory_startup_status_timeout_s())),
                 )
             )
         except BaseException:
