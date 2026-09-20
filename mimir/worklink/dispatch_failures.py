@@ -9,7 +9,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from .._atomic import atomic_write_json
 from ..redaction import redact_text
@@ -173,6 +173,32 @@ def is_transient_contention(error: str) -> bool:
         all(marker in normalized for marker in markers)
         for markers in _TRANSIENT_CONTENTION_MARKERS
     )
+
+
+def record_factory_transition(
+    state_dir: Path,
+    *,
+    kind: Literal["factory_start", "factory_success"],
+    issue_id: int,
+    run_id: str,
+    attempt: int,
+    pr_url: str | None = None,
+) -> dict[str, Any]:
+    """Record an immutable factory milestone, independently of incidents."""
+    if kind not in {"factory_start", "factory_success"}:
+        raise ValueError(f"invalid factory transition kind: {kind}")
+    delivery_key = f"worklink-{kind}:{issue_id}:{run_id}:{attempt}"
+    with failure_state_transaction(state_dir) as state:
+        entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, {
+            "kind": kind,
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "attempt": attempt,
+            "pr_url": pr_url,
+            "delivery_key": delivery_key,
+            "notified": False,
+        })
+    return entry
 
 
 def record_failure(

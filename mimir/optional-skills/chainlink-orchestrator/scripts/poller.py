@@ -405,6 +405,41 @@ def _dispatch(
     return True
 
 
+def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> None:
+    """Offer informational milestones until the framework acknowledges them."""
+    with failure_state_transaction(state_dir) as state:
+        for delivery_key, entry in state.get("factory_transitions", {}).items():
+            if entry["notified"]:
+                continue
+            if delivery_receipt_exists(state_dir, delivery_key):
+                entry["notified"] = True
+                continue
+            if tick_budget.hard_exhausted():
+                return
+            milestone = "started" if entry["kind"] == "factory_start" else "succeeded"
+            detail = (
+                "A build slot is now occupied by this epic."
+                if entry["kind"] == "factory_start" else "The epic completed successfully."
+            )
+            _emit({
+                "prompt": (
+                    f"Worklink factory {milestone} for issue {entry['issue_id']}. "
+                    f"{detail} Informational status update only.\n\n"
+                    f"Kind: {entry['kind']}\n"
+                    f"Run: {entry['run_id']}\n"
+                    f"Attempt: {entry['attempt']}\n"
+                    f"PR: {entry['pr_url'] or '(none)'}"
+                ),
+                "source_id": delivery_key,
+                "delivery_key": delivery_key,
+                "kind": entry["kind"],
+                "issue_id": entry["issue_id"],
+                "run_id": entry["run_id"],
+                "attempt": entry["attempt"],
+                "pr_url": entry["pr_url"],
+            })
+
+
 def _deliver_failure_alerts(
     state_dir: Path,
     alerts: list[dict[str, object]],
@@ -474,6 +509,7 @@ def main() -> int:
     state_dir = dispatch_failure_state_dir(home)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
+        _deliver_factory_transitions(state_dir, tick_budget)
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
         alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
     except OSError as exc:

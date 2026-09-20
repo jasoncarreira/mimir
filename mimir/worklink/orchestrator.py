@@ -2421,6 +2421,13 @@ class WorklinkRunner:
                 factory_record = replace(factory_record, handle=handle)
                 try:
                     save_factory_record(self.home, factory_record)
+                    if autonomous:
+                        from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
+
+                        record_factory_transition(
+                            dispatch_failure_state_dir(self.home), kind="factory_start",
+                            issue_id=issue_id, run_id=run_id, attempt=claim_record.attempt,
+                        )
                 except BaseException:
                     await _cancel_and_cleanup_factory_handle(compute, handle)
                     raise
@@ -2577,6 +2584,14 @@ class WorklinkRunner:
             if result.reason:
                 reason = f"{result.reason}; {reason}"
             result = replace(result, status="failed", reason=reason)
+        if autonomous and result.status == "review_ready":
+            from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
+
+            record_factory_transition(
+                dispatch_failure_state_dir(self.home), kind="factory_success",
+                issue_id=issue_id, run_id=retained.run_id if retained is not None else run_id,
+                attempt=result.attempt, pr_url=result.pr_url,
+            )
         return result
 
     async def _recover_factory_070(
@@ -2742,6 +2757,14 @@ class WorklinkRunner:
         )
         try:
             save_factory_record(self.home, relaunched)
+            if autonomous:
+                from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition
+
+                record_factory_transition(
+                    dispatch_failure_state_dir(self.home), kind="factory_start",
+                    issue_id=retained.issue_id, run_id=retained.run_id,
+                    attempt=retained.attempt,
+                )
         except BaseException:
             await _cancel_and_cleanup_factory_handle(compute, handle)
             raise

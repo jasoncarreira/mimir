@@ -217,9 +217,9 @@ _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
     """Sweep occurrence receipts only after the failure ledger supersedes them.
 
-    The shipped ready-queue emits only failure and continuation delivery keys.
-    Failure UUIDs are never reused; current unacknowledged occurrences and all
-    extant continuation sidecars remain protected, without an age limit.
+    Failure UUIDs are never reused; current unacknowledged occurrences, pending
+    factory transitions and all extant continuation sidecars remain protected,
+    without an age limit.
     """
     from .worklink.dispatch_failures import STATE_FILE, dispatch_failure_state_dir
 
@@ -289,6 +289,27 @@ def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
                         return
                     if entry["active"] and signature not in notified:
                         key = f"worklink-run-failure:{issue}:{signature}:{occurrence}"
+                        live.add(hashlib.sha256(key.encode()).hexdigest())
+                transitions = state.get("factory_transitions", {})
+                if not isinstance(transitions, dict):
+                    return
+                for key, entry in transitions.items():
+                    if not isinstance(entry, dict):
+                        return
+                    kind = entry.get("kind")
+                    issue = entry.get("issue_id")
+                    run = entry.get("run_id")
+                    attempt = entry.get("attempt")
+                    if (kind not in ("factory_start", "factory_success")
+                            or type(issue) is not int
+                            or not isinstance(run, str) or not run
+                            or type(attempt) is not int
+                            or type(entry.get("notified")) is not bool
+                            or not (entry.get("pr_url") is None or isinstance(entry["pr_url"], str))
+                            or key != f"worklink-{kind}:{issue}:{run}:{attempt}"
+                            or entry.get("delivery_key") != key):
+                        return
+                    if not entry["notified"]:
                         live.add(hashlib.sha256(key.encode()).hexdigest())
                 # The existing writer's directory fsync is best-effort. Require
                 # it here before allowing receipt deletion to become durable.
