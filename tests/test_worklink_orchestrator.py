@@ -2858,6 +2858,9 @@ def test_worklink_pr_body_includes_build_section_and_intact_evidence(tmp_path: P
         call for call in calls if isinstance(call, list) and call[:3] == ["gh", "pr", "create"]
     )
     body = pr_call[pr_call.index("--body") + 1]
+    from mimir.worklink.merge_closure import parse_completion_reference
+
+    assert parse_completion_reference(body, expected_issue_id=441).qualifies
     assert f"Build summary:\n\n{section}\n\n" in body
     assert body.endswith(
         "Worklink evidence:\n"

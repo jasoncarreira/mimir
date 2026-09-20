@@ -4811,6 +4811,180 @@ def test_factory_transition_tick_budget_and_locked_emission(
     assert failures.load_failure_state(state)["factory_transitions"][entry["delivery_key"]]["notified"] is True
 
 
+def test_merge_notice_identity_and_durability(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    identity = {
+        "issue_id": 1304,
+        "repository": "example/project",
+        "pr_url": "https://github.com/example/project/pull/42",
+        "reason": "completion_base_mismatch",
+        "detail": "base was release",
+    }
+    first = failures.record_merge_reconciliation_notice(state, **identity)
+    duplicate = failures.record_merge_reconciliation_notice(
+        state, **{**identity, "detail": "changed detail must not rewrite history"},
+    )
+    distinct = failures.record_merge_reconciliation_notice(
+        state, **{**identity, "reason": "repository_identity_mismatch"},
+    )
+    assert duplicate == first
+    assert distinct["delivery_key"] != first["delivery_key"]
+    assert first["delivery_key"].startswith("worklink-merge-reconciliation:")
+    ledger = failures.load_failure_state(state)["merge_reconciliations"]
+    assert set(ledger["notices"]) == {first["delivery_key"], distinct["delivery_key"]}
+    assert ledger["intents"] == {}
+    failures.resolve_merge_reconciliation_notices(
+        state, issue_id=1304, pr_url=identity["pr_url"],
+    )
+    recurring = failures.record_merge_reconciliation_notice(state, **identity)
+    assert recurring["delivery_key"] == first["delivery_key"]
+    assert recurring["resolved"] is False
+    ledger = failures.load_failure_state(state)["merge_reconciliations"]
+    assert ledger["notices"][distinct["delivery_key"]]["resolved"] is True
+
+
+def test_merge_notices_deliver_without_tracker_or_ready_work(
+    home, worklink_receipts, worklink_receipt_consumer, monkeypatch, capsys,
+):
+    failures, state, _, _ = worklink_receipts
+    entry = failures.record_merge_reconciliation_notice(
+        state,
+        issue_id=1304,
+        repository="example/project",
+        pr_url="https://github.com/example/project/pull/42",
+        reason="audit_outcome_uncertain",
+        detail="exact marker absent",
+    )
+    consumer = worklink_receipt_consumer
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.setattr(
+        consumer.WorklinkConfig, "load",
+        lambda path: (_ for _ in ()).throw(ValueError("tracker/config unavailable")),
+    )
+    assert consumer.main() == 0
+    output = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output[0]["kind"] == "worklink_merge_reconciliation"
+    assert output[0]["delivery_key"] == entry["delivery_key"]
+    assert "Do not auto-close" in output[0]["prompt"]
+    assert output[-1]["signal"] == "worklink_poller_misconfigured"
+
+
+def test_merge_receipt_pruning_and_stale_snapshot(
+    home, worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_merge_reconciliation_notice(
+        state,
+        issue_id=1304,
+        repository="example/project",
+        pr_url=None,
+        reason="missing_pr_association",
+        detail="no exact active association",
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    receipt = state / ".delivery-receipts" / hashlib.sha256(key.encode()).hexdigest()
+    failures.resolve_merge_reconciliation_notices(
+        state, issue_id=1304, pr_url=None,
+    )
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+    assert not obsolete.exists()
+    emitted = Mock()
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted)
+    worklink_receipt_consumer._deliver_merge_reconciliations(
+        state, SimpleNamespace(hard_exhausted=lambda: False),
+    )
+    emitted.assert_not_called()
+    assert failures.load_failure_state(state)["merge_reconciliations"]["notices"][key]["notified"]
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+
+
+def test_merge_notice_emission_holds_ledger_lock(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch,
+):
+    failures, state, _, _ = worklink_receipts
+    failures.record_merge_reconciliation_notice(
+        state,
+        issue_id=1304,
+        repository="example/project",
+        pr_url=None,
+        reason="missing_pr_association",
+        detail="no exact association",
+    )
+    emitted = []
+
+    def emit(record):
+        with (state / f"{failures.STATE_FILE}.lock").open("a") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        emitted.append(record)
+
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emit)
+    worklink_receipt_consumer._deliver_merge_reconciliations(
+        state, SimpleNamespace(hard_exhausted=lambda: False),
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["kind"] == "worklink_merge_reconciliation"
+
+
+def test_receipt_pruning_rejects_semantically_invalid_intent(
+    home, worklink_receipts,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    issue_id = 1304
+    repository = "example/project"
+    pr_number = 42
+    pr_url = f"https://github.com/{repository}/pull/{pr_number}"
+    identity = json.dumps([1, issue_id, repository, pr_number], separators=(",", ":"))
+    key = hashlib.sha256(identity.encode()).hexdigest()
+    merged_at = "2026-09-20T12:00:00Z"
+    sha = "abcdef1234567890"
+    audit = (
+        f"WORKLINK_CLOSED v1 {key}\n"
+        f"Chainlink #{issue_id} complete via PR {pr_url}.\n"
+        f"Merged at {merged_at}; merge commit {sha}; completion base main."
+    )
+    with failures.failure_state_transaction(state) as ledger:
+        ledger["merge_reconciliations"] = {
+            "intents": {key: {
+                "intent_key": key,
+                "issue_id": 0,
+                "repository": repository,
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "base_ref": "main",
+                "merge_commit_sha": sha,
+                "merged_at": merged_at,
+                "audit_text": audit,
+                "source_digests": [],
+                "stage": "discovered",
+                "result_finalized": False,
+            }},
+            "notices": {},
+        }
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists()
+
+
+def test_merge_receipt_pruning_fails_closed_on_malformed_namespace(
+    home, worklink_receipts,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    with failures.failure_state_transaction(state) as ledger:
+        ledger["merge_reconciliations"] = {"intents": [], "notices": {}}
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists()
+
+
 def test_worklink_receipt_pruning_preserves_barrier_crash_window_and_negative_control(
     home: Path, worklink_receipts, worklink_receipt_consumer, monkeypatch,
 ):

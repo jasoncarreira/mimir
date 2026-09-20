@@ -46,10 +46,13 @@ from mimir.worklink.claims import WORKLINK_EPIC_LABEL, scope_active_worklink_loc
 from mimir.worklink.continuation import consume_worklink_budget_continuations
 from mimir.worklink.dispatch_failures import (
     POLLER_NAME,
+    _validate_merge_reconciliations,
     delivery_receipt_exists,
     dispatch_failure_state_dir,
     failure_state_transaction,
     mark_failure_notified,
+    mark_merge_reconciliation_notified,
+    pending_merge_reconciliation_notices,
     pending_failure_alerts,
     record_failure,
 )
@@ -441,6 +444,48 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
             })
 
 
+def _deliver_merge_reconciliations(state_dir: Path, tick_budget: TickBudget) -> None:
+    """Offer durable merge refusals without changing dispatch eligibility."""
+    for notice in pending_merge_reconciliation_notices(state_dir):
+        delivery_key = notice["delivery_key"]
+        with failure_state_transaction(state_dir) as state:
+            reconciliations = _validate_merge_reconciliations(
+                state.get("merge_reconciliations")
+            )
+            current = reconciliations["notices"].get(delivery_key)
+            if not isinstance(current, dict) or current.get("notified") is not False:
+                continue
+            delivered = delivery_receipt_exists(state_dir, delivery_key)
+            if not delivered:
+                if tick_budget.hard_exhausted():
+                    return
+                _emit({
+                    "prompt": (
+                        "Worklink merge reconciliation requires human inspection. "
+                        "Do not auto-close the Chainlink, repost the audit marker, reset durable "
+                        "intent, or infer completion. Inspect the current issue, PR, repository "
+                        "configuration, and reconciliation ledger; preserve uncertainty for an "
+                        "operator when positive evidence is unavailable.\n\n"
+                        f"Reason: {current['reason']}\n"
+                        f"Detail: {current['detail']}\n"
+                        f"Issue: {current.get('issue_id') or '(unknown)'}\n"
+                        f"Repository: {current.get('repository') or '(unknown)'}\n"
+                        f"PR: {current.get('pr_url') or '(unknown)'}\n"
+                        f"Ledger: {state_dir / 'dispatch_failures.json'}"
+                    ),
+                    "source_id": delivery_key,
+                    "delivery_key": delivery_key,
+                    "kind": "worklink_merge_reconciliation",
+                    "reason": current["reason"],
+                    "issue_id": current.get("issue_id"),
+                    "repository": current.get("repository"),
+                    "pr_url": current.get("pr_url"),
+                    "resolved": current["resolved"],
+                })
+        if delivered:
+            mark_merge_reconciliation_notified(state_dir, delivery_key)
+
+
 def _deliver_failure_alerts(
     state_dir: Path,
     alerts: list[dict[str, object]],
@@ -494,6 +539,13 @@ def main() -> int:
         _emit({"signal": "worklink_poller_misconfigured", "reason": "MIMIR_HOME unset"})
         return 0
     home = Path(home_env)
+    state_dir = dispatch_failure_state_dir(home)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _deliver_merge_reconciliations(state_dir, tick_budget)
+    except OSError as exc:
+        _emit({"signal": "worklink_merge_reconciliation_state_error", "reason": str(exc)})
+        return 0
     config_path = home / "worklink.yaml"
     try:
         BackendRegistry(WorklinkConfig.load(config_path))
@@ -507,8 +559,6 @@ def main() -> int:
         return 0
     repo = os.environ.get("WORKLINK_REPO")
     # Detached workers and this reader must resolve the ledger from the same trusted home.
-    state_dir = dispatch_failure_state_dir(home)
-    state_dir.mkdir(parents=True, exist_ok=True)
     try:
         backed_off_ids, alerts = pending_failure_alerts(state_dir)
         alerts_acknowledged = _deliver_failure_alerts(state_dir, alerts, tick_budget)
