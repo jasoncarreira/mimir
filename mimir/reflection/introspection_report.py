@@ -27,7 +27,7 @@ connection for the negative-learning count. When ``home`` is provided, the
 report also includes home-gated sections such as skill health and the
 memory-health section, which calls :mod:`mimir.memory_doctor` read-only.
 
-Algedonic side-effect: when ``--emit-algedonic`` is set and heartbeat
+Algedonic side-effect: when ``--emit-algedonic`` is set and scheduled-turn
 success rate falls below ``--health-threshold``, append a
 ``heartbeat_health_degraded`` event to events.jsonl so the agent's
 algedonic surfacing picks it up next turn.
@@ -121,6 +121,7 @@ class HeartbeatPipeline:
     dropped: int = 0        # scheduled_tick_dropped events (dispatcher)
     completed: int = 0      # turns with trigger=scheduled_tick (any error)
     successful: int = 0     # turns with trigger=scheduled_tick AND error is None
+    schedule_name: str | None = None
 
     @property
     def attempted(self) -> int:
@@ -128,10 +129,10 @@ class HeartbeatPipeline:
 
     @property
     def success_rate(self) -> float | None:
-        """Pipeline success: completed turns with no error / fired."""
-        if self.fired == 0:
+        """Completed-turn success rate for one consistent population."""
+        if self.completed == 0:
             return None
-        return self.successful / self.fired
+        return self.successful / self.completed
 
 
 @dataclass
@@ -186,6 +187,7 @@ class Report:
     drift_started: list[str] = field(default_factory=list)
     drift_stopped: list[str] = field(default_factory=list)
     heartbeat: HeartbeatPipeline = field(default_factory=HeartbeatPipeline)
+    scheduled_pipelines: list[HeartbeatPipeline] = field(default_factory=list)
     performance_trends: list[PerformanceTrend] = field(default_factory=list)
     error_recurrence: list[ErrorRecurrence] = field(default_factory=list)
     skill_lifecycle: list[tuple[str, int]] = field(default_factory=list)
@@ -339,7 +341,7 @@ def _build_skill_health(
 ) -> list[SkillHealth]:
     """Per-skill refine/retire candidates from the objective signals
     (chainlink #267): skill_outcomes success-rate + negative-kind
-    ``skill_learning`` count + zero-recent-usage. The reflection turn reads
+    ``skill_learning`` count. The reflection turn reads
     these and authors operator-gated refine/retire recommendations.
 
     Best-effort: a missing input (no ``home``, no saga conn, an import or
@@ -383,7 +385,7 @@ def _build_skill_health(
     for skill in sorted(set(skill_counts) | set(outcomes) | set(installed)):
         oc = outcomes.get(skill)
         success_rate = oc.success_rate if oc is not None else None
-        runs = oc.total if oc is not None else 0
+        runs = oc.assessed_total if oc is not None else 0
         invocations = int(skill_counts.get(skill, 0))
         negatives = _negatives(skill)
 
@@ -401,12 +403,6 @@ def _build_skill_health(
         if negatives >= _SKILL_REFINE_NEG_LEARNINGS:
             refine = True
             reasons.append(f"{negatives} negative learning(s) in {days}d")
-        # Retire: installed but no sign of use this window (neither an
-        # explicit Skill() call nor any skill_outcomes sample).
-        if skill in installed and invocations == 0 and runs == 0:
-            retire = True
-            reasons.append(f"no usage in {days}d")
-
         if refine or retire:
             candidates.append(SkillHealth(
                 skill=skill,
@@ -465,6 +461,7 @@ def aggregate(
     error_recurrence: dict[tuple[str, str], list[datetime]] = defaultdict(list)
     daily_perf: dict[tuple[str, str], list[float]] = defaultdict(list)
     skill_counts: Counter[str] = Counter()
+    scheduled_turns: dict[str, HeartbeatPipeline] = defaultdict(HeartbeatPipeline)
 
     for rec in _iter_jsonl(turns_log):
         ts = _parse_ts(rec.get("ts"))
@@ -486,6 +483,18 @@ def aggregate(
             stats.total_turns += 1
             if rec.get("error") is None:
                 stats.successful += 1
+            if trigger == "scheduled_tick":
+                channel_id = rec.get("channel_id")
+                schedule_name = (
+                    channel_id.removeprefix("scheduler:")
+                    if isinstance(channel_id, str) and channel_id.startswith("scheduler:")
+                    else "unknown"
+                )
+                scheduled = scheduled_turns[schedule_name]
+                scheduled.schedule_name = schedule_name
+                scheduled.completed += 1
+                if rec.get("error") is None:
+                    scheduled.successful += 1
             ch = rec.get("channel_id")
             if isinstance(ch, str):
                 channels_by_trigger[trigger].add(ch)
@@ -624,6 +633,7 @@ def aggregate(
 
     # Pass 2: events.jsonl for heartbeat pipeline counts.
     pipeline = HeartbeatPipeline()
+    scheduled_events: dict[str, HeartbeatPipeline] = defaultdict(HeartbeatPipeline)
     for rec in _iter_jsonl(events_log):
         ts = _parse_ts(rec.get("timestamp"))
         if ts is None:
@@ -633,17 +643,42 @@ def aggregate(
             # can't contribute, early-stop.
             break
         etype = rec.get("type")
+        if etype not in {
+            "scheduled_tick", "scheduled_tick_suppressed", "scheduled_tick_dropped",
+        }:
+            continue
+        raw_schedule_name = rec.get("schedule_name")
+        channel_id = rec.get("channel_id")
+        schedule_name = (
+            raw_schedule_name
+            if isinstance(raw_schedule_name, str) and raw_schedule_name
+            else channel_id.removeprefix("scheduler:")
+            if isinstance(channel_id, str) and channel_id.startswith("scheduler:")
+            else "unknown"
+        )
+        scheduled = scheduled_events[schedule_name]
+        scheduled.schedule_name = schedule_name
         if etype == "scheduled_tick":
             pipeline.fired += 1
+            scheduled.fired += 1
         elif etype == "scheduled_tick_suppressed":
             pipeline.suppressed += 1
+            scheduled.suppressed += 1
         elif etype == "scheduled_tick_dropped":
             pipeline.dropped += 1
+            scheduled.dropped += 1
     # Completed/successful come from turn_counts (already computed).
     sched = next((s for s in turn_counts if s.trigger == "scheduled_tick"), None)
     if sched is not None:
         pipeline.completed = sched.total_turns
         pipeline.successful = sched.successful
+    scheduled_pipelines = []
+    for schedule_name in sorted(set(scheduled_events) | set(scheduled_turns)):
+        events_pipeline = scheduled_events[schedule_name]
+        turns_pipeline = scheduled_turns[schedule_name]
+        events_pipeline.completed = turns_pipeline.completed
+        events_pipeline.successful = turns_pipeline.successful
+        scheduled_pipelines.append(events_pipeline)
 
     skill_lifecycle = sorted(skill_counts.items(), key=lambda kv: -kv[1])
     skill_health = _build_skill_health(
@@ -666,6 +701,7 @@ def aggregate(
         drift_started=drift_started,
         drift_stopped=drift_stopped,
         heartbeat=pipeline,
+        scheduled_pipelines=scheduled_pipelines,
         performance_trends=performance_trends,
         error_recurrence=recurrence_rows,
         skill_lifecycle=skill_lifecycle,
@@ -717,8 +753,19 @@ def render_markdown(report: Report) -> str:
     lines.append(f"- Dropped by dispatcher: **{pl.dropped}**")
     lines.append(f"- Completed turns: **{pl.completed}**")
     lines.append(f"- Successful turns: **{pl.successful}**")
-    lines.append(f"- Pipeline success rate: **{_fmt_pct(pl.success_rate)}** "
-                 f"(successful / fired)")
+    lines.append(f"- Completed-turn success rate: **{_fmt_pct(pl.success_rate)}** "
+                 f"(successful / completed)")
+    if report.scheduled_pipelines:
+        lines.append("")
+        lines.append("| Schedule | Fired | Suppressed | Dropped | Completed | Successful | Turn success |")
+        lines.append("|----------|-------|------------|---------|-----------|------------|--------------|")
+        for scheduled in report.scheduled_pipelines:
+            lines.append(
+                f"| {scheduled.schedule_name} | {scheduled.fired} | "
+                f"{scheduled.suppressed} | {scheduled.dropped} | "
+                f"{scheduled.completed} | {scheduled.successful} | "
+                f"{_fmt_pct(scheduled.success_rate)} |"
+            )
     lines.append("")
 
     # Memory health from mimir memory doctor.
@@ -887,7 +934,7 @@ def health_degraded_fields(report: Report, *, threshold: float) -> dict | None:
 
     Returns only the payload fields (no ``type``/``session_id``/``timestamp`` —
     the EventLogger stamps those). No signal when ``success_rate`` is ``None``
-    (heartbeat fired==0 in window) or >= threshold. Callers emit via the shared
+    (no completed scheduled turns in window) or >= threshold. Callers emit via the shared
     logger (``log_event`` / ``log_event_sync``) so the write is serialized —
     never a raw append, which races the EventLogger's trim (#486)."""
     rate = report.heartbeat.success_rate

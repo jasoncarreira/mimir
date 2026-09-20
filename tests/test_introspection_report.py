@@ -402,7 +402,43 @@ def test_heartbeat_pipeline_full_picture(tmp_path: Path):
     assert pl.dropped == 1
     assert pl.completed == 2
     assert pl.successful == 1
-    assert pl.success_rate == pytest.approx(1 / 3)
+    assert pl.success_rate == pytest.approx(1 / 2)
+
+
+def test_scheduled_pipeline_rates_are_bounded_and_attributable(tmp_path: Path):
+    turns = tmp_path / "turns.jsonl"
+    events = tmp_path / "events.jsonl"
+    for i in range(2):
+        _write_event(
+            events, ts=NOW - timedelta(hours=i + 1), type="scheduled_tick",
+            schedule_name="heartbeat", channel_id="scheduler:heartbeat",
+        )
+    _write_event(
+        events, ts=NOW - timedelta(hours=3), type="scheduled_tick",
+        schedule_name="reflect", channel_id="scheduler:reflect",
+    )
+    for i in range(4):
+        _write_turn(
+            turns, ts=NOW - timedelta(minutes=i + 1), trigger="scheduled_tick",
+            channel_id="scheduler:reflect", error="boom" if i == 0 else None,
+        )
+    _write_turn(
+        turns, ts=NOW - timedelta(minutes=10), trigger="scheduled_tick",
+        channel_id="scheduler:heartbeat",
+    )
+
+    rep = aggregate(turns, events, days=7, now=NOW)
+
+    by_schedule = {p.schedule_name: p for p in rep.scheduled_pipelines}
+    assert by_schedule["heartbeat"].success_rate == 1.0
+    assert by_schedule["reflect"].success_rate == pytest.approx(3 / 4)
+    assert all(
+        pipeline.success_rate is None or 0 <= pipeline.success_rate <= 1
+        for pipeline in [rep.heartbeat, *rep.scheduled_pipelines]
+    )
+    body = render_markdown(rep)
+    assert "| heartbeat | 2 |" in body
+    assert "| reflect | 1 |" in body
 
 
 def test_heartbeat_pipeline_no_signal(tmp_path: Path):
@@ -419,7 +455,7 @@ def test_emit_health_event_when_below_threshold(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     rep = Report(
         days=7, generated_at=NOW,
-        heartbeat=HeartbeatPipeline(fired=10, successful=5),
+        heartbeat=HeartbeatPipeline(fired=10, completed=10, successful=5),
     )
     emitted = maybe_emit_health_event(rep, events, threshold=0.80)
     assert emitted is True
@@ -434,7 +470,7 @@ def test_no_emit_when_above_threshold(tmp_path: Path):
     events = tmp_path / "events.jsonl"
     rep = Report(
         days=7, generated_at=NOW,
-        heartbeat=HeartbeatPipeline(fired=10, successful=9),
+        heartbeat=HeartbeatPipeline(fired=10, completed=10, successful=9),
     )
     emitted = maybe_emit_health_event(rep, events, threshold=0.80)
     assert emitted is False
@@ -453,7 +489,7 @@ def test_no_emit_when_no_signal(tmp_path: Path):
 
 
 def test_health_degraded_fields_below_threshold():
-    rep = Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, successful=5))
+    rep = Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, completed=10, successful=5))
     fields = health_degraded_fields(rep, threshold=0.80)
     assert fields is not None
     assert fields["success_rate"] == 0.5
@@ -464,7 +500,7 @@ def test_health_degraded_fields_below_threshold():
 
 def test_health_degraded_fields_none_above_threshold_or_no_signal():
     assert health_degraded_fields(
-        Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, successful=9)),
+        Report(days=7, generated_at=NOW, heartbeat=HeartbeatPipeline(fired=10, completed=10, successful=9)),
         threshold=0.80,
     ) is None
     # no signal: heartbeat fired==0

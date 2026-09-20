@@ -1177,7 +1177,7 @@ async def test_introspection_report_callback_writes_report_and_emits(tmp_path: P
     home = tmp_path
     logs = home / "logs"
     logs.mkdir(exist_ok=True)
-    # 4 fired ticks, only 1 successful turn → 25% pipeline rate.
+    # 4 fired ticks, 2 completed turns, only 1 successful → 50% turn rate.
     base = datetime.now(tz=timezone.utc)
     with (logs / "events.jsonl").open("w") as f:
         for i in range(4):
@@ -1232,7 +1232,7 @@ async def test_introspection_report_callback_writes_report_and_emits(tmp_path: P
         json.loads(line) for line in events
         if json.loads(line)["type"] == "heartbeat_health_degraded"
     )
-    assert health["success_rate"] == 0.25
+    assert health["success_rate"] == 0.5
 
 
 class _StubArbiter:
