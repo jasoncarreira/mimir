@@ -4,6 +4,7 @@ import array
 import ctypes
 import fcntl
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,10 +20,12 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+import uuid
 
 from .._rmtree import rmtree_missing_ok
 from .checkout import _normalize_checkout_fd
 from .identities import get_identities
+from .run_state import leaf_session_digest
 from .worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     ENABLED_CHECKOUT_ROOT,
@@ -37,10 +40,11 @@ HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
+RETAINED_RECEIPT_ROOT = Path("/var/lib/mimir-worklink/retained-receipts")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-repository-binding"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -70,11 +74,23 @@ _PATH_LAUNCH_FIELDS = frozenset({
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
+_RETAINED_FIELDS = frozenset({
+    "version", "op", "executor_identity", "operation_id", "target_kind",
+    "issue", "attempt",
+})
+_RETAINED_FACTORY_FIELDS = _RETAINED_FIELDS | {
+    "repository_id", "checkout_device", "checkout_inode",
+}
+_RETAINED_LEAF_FIELDS = _RETAINED_FIELDS | {
+    "target_identifier", "leaf_session",
+}
 _jobs: dict[str, subprocess.Popen[bytes] | _FactoryProcess] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
+_retained_control_lock = threading.Lock()
 _OUTPUT_LIMIT_POLL_S = 0.01
 _FACTORY_STOP_TIMEOUT_S = 5.0
+_LEAF_STATE_TIMEOUT_S = 2.0
 
 
 @dataclass
@@ -109,6 +125,23 @@ class _FactoryProcess:
             raise RuntimeError("worklink_factory_reap_refused: supervisor did not finish")
         if self.error is not None:
             raise RuntimeError(self.error)
+
+
+@dataclass(frozen=True)
+class _RetainedLeafBinding:
+    identifier: str
+    issue_id: int
+    attempt: int
+    process: subprocess.Popen[bytes]
+    process_start_ticks: int
+    checkout_path: Path
+    checkout_device: int
+    checkout_inode: int
+    leaf_session: str
+
+
+_retained_leaf_bindings: dict[str, _RetainedLeafBinding] = {}
+_held_leaf_identifiers: set[str] = set()
 
 
 class _CapHeader(ctypes.Structure):
@@ -350,7 +383,13 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
     )
 
 
-def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False) -> int:
+def _open_factory_checkout(
+    request: dict[str, Any],
+    *,
+    for_launch: bool = False,
+    allow_transfer: bool = True,
+    expected_identity: tuple[int, int] | None = None,
+) -> int:
     """Validate, then transfer/reopen; launch platform checks precede mutation."""
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
@@ -399,6 +438,8 @@ def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False)
             raise RuntimeError("factory checkout isolation boundary is invalid")
         checkout_fd = os.open("checkout", flags, dir_fd=boundary_fd)
         checkout = os.fstat(checkout_fd)
+        if expected_identity is not None and (checkout.st_dev, checkout.st_ino) != expected_identity:
+            raise RuntimeError("factory retained checkout identity was replaced")
         expected_owner = identities.mimir_uid if mode == 0o2700 else identities.worklink_uid
         if (
             checkout.st_uid != expected_owner
@@ -413,12 +454,27 @@ def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False)
         if for_launch and sys.platform != "linux":
             raise RuntimeError("worklink_factory_reap_refused: PR_SET_CHILD_SUBREAPER requires Linux")
         if mode == 0o2700:
+            if not allow_transfer:
+                raise RuntimeError("factory checkout admission receipt no longer matches exposed state")
             # No worker can reach this new tree until the last chmod. Recovery
             # must never repeat a privileged walk of an already exposed tree.
             _normalize_checkout_fd(
                 checkout_fd, owner_uid=identities.worklink_uid, group_gid=identities.worklink_gid,
             )
             os.fchmod(boundary_fd, 0o2750)
+            exposed_boundary = os.fstat(boundary_fd)
+            exposed_checkout = os.fstat(checkout_fd)
+            if (
+                exposed_boundary.st_uid != identities.mimir_uid
+                or exposed_boundary.st_gid != identities.worklink_gid
+                or stat.S_IMODE(exposed_boundary.st_mode) != 0o2750
+                or exposed_checkout.st_uid != identities.worklink_uid
+                or exposed_checkout.st_gid != identities.worklink_gid
+                or stat.S_IMODE(exposed_checkout.st_mode) != 0o2770
+                or (exposed_checkout.st_dev, exposed_checkout.st_ino)
+                != (checkout.st_dev, checkout.st_ino)
+            ):
+                raise RuntimeError("factory checkout ownership transfer did not reach its required post-state")
         result = checkout_fd
         checkout_fd = -1
         return result
@@ -426,6 +482,152 @@ def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False)
         if checkout_fd >= 0:
             os.close(checkout_fd)
         os.close(boundary_fd)
+
+
+def _derive_retained_checkout_path(
+    kind: str, issue: int, attempt: int, repository_id: str | None = None,
+) -> Path:
+    if kind not in {"leaf", "factory"}:
+        raise RuntimeError("retained checkout kind is invalid")
+    try:
+        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("retained checkout root is unavailable") from exc
+    if kind == "factory":
+        if repository_id is None or re.fullmatch(r"[0-9a-f]{64}", repository_id) is None:
+            raise RuntimeError("retained factory repository identity is invalid")
+        repository = root / repository_id
+        boundary = repository / f"{issue}-{attempt}"
+        candidate = boundary / "checkout"
+        try:
+            repository_metadata = repository.stat(follow_symlinks=False)
+            boundary_metadata = boundary.stat(follow_symlinks=False)
+            candidate_metadata = candidate.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("retained factory checkout is missing or replaced") from exc
+        if not all(
+            stat.S_ISDIR(value.st_mode)
+            for value in (repository_metadata, boundary_metadata, candidate_metadata)
+        ):
+            raise RuntimeError("retained factory checkout is missing or replaced")
+        return candidate
+    try:
+        repositories = tuple(root.iterdir())
+    except OSError as exc:
+        raise RuntimeError("retained checkout root is unavailable") from exc
+    candidates: list[Path] = []
+    for repository in repositories:
+        if re.fullmatch(r"[A-Za-z0-9._-]+", repository.name) is None or repository.name in {".", ".."}:
+            continue
+        try:
+            repository_metadata = repository.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(repository_metadata.st_mode):
+            continue
+        boundary = repository / f"{issue}-{attempt}"
+        candidate = boundary
+        try:
+            boundary_metadata = boundary.stat(follow_symlinks=False)
+            candidate_metadata = candidate.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(boundary_metadata.st_mode) and stat.S_ISDIR(candidate_metadata.st_mode):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise RuntimeError("retained checkout target is missing or ambiguous")
+    return candidates[0]
+
+
+def _open_retained_leaf_checkout(path: Path) -> int:
+    """Open an already exposed leaf checkout without a privileged tree walk."""
+    identities = get_identities()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_fd = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            parent = os.fstat(directory_fd)
+            if parent.st_uid not in {0, identities.mimir_uid} or (
+                (parent.st_mode & 0o002 or (
+                    parent.st_gid == identities.worklink_gid and parent.st_mode & 0o020
+                )) and not parent.st_mode & stat.S_ISVTX
+            ):
+                raise RuntimeError("retained leaf checkout ancestor is worker-writable")
+            child_fd = os.open(component, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        observed = os.fstat(directory_fd)
+        if (
+            observed.st_uid != identities.mimir_uid
+            or observed.st_gid != identities.worklink_gid
+            or stat.S_IMODE(observed.st_mode) != 0o2770
+        ):
+            raise RuntimeError("retained leaf checkout ownership or mode is invalid")
+        result = directory_fd
+        directory_fd = -1
+        return result
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def _open_retained_checkout(
+    request: dict[str, Any], *, allow_transfer: bool,
+) -> tuple[int, Path]:
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    kind = request.get("target_kind")
+    if not isinstance(kind, str):
+        raise RuntimeError("retained checkout kind is invalid")
+    repository_id = request.get("repository_id") if kind == "factory" else None
+    if repository_id is not None and not isinstance(repository_id, str):
+        raise RuntimeError("retained factory repository identity is invalid")
+    path = _derive_retained_checkout_path(kind, issue, attempt, repository_id)
+    if kind == "factory":
+        expected_identity = (
+            _identity_integer(request, "checkout_device"),
+            _identity_integer(request, "checkout_inode"),
+        )
+        fd = _open_factory_checkout(
+            {
+                "issue": issue,
+                "attempt": attempt,
+                "path": str(path),
+                "run_uid": get_identities().worklink_uid,
+                "op": "admit_retained_checkout",
+            },
+            allow_transfer=allow_transfer,
+            expected_identity=expected_identity,
+        )
+    else:
+        fd = _open_retained_leaf_checkout(path)
+    observed = os.fstat(fd)
+    current = path.stat(follow_symlinks=False)
+    if (observed.st_dev, observed.st_ino) != (current.st_dev, current.st_ino):
+        os.close(fd)
+        raise RuntimeError("retained checkout was replaced during admission")
+    return fd, path
+
+
+def _retained_leaf_checkout_source(
+    fd: int, request: dict[str, Any],
+) -> tuple[Path, int, int] | None:
+    if request.get("op") != "launch_path":
+        return None
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    try:
+        root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        relative = path.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if len(relative.parts) != 2 or relative.parts[1] != f"{issue}-{attempt}":
+        return None
+    if path != _derive_retained_checkout_path("leaf", issue, attempt):
+        raise RuntimeError("retained leaf checkout is missing or ambiguous")
+    observed = os.fstat(fd)
+    return path, observed.st_dev, observed.st_ino
 
 
 def _validate_command(request: dict[str, Any]) -> list[str]:
@@ -659,6 +861,22 @@ def _terminate_process_group(proc: subprocess.Popen[bytes], timeout_s: float = 5
         ) from exc
 
 
+def _process_is_retained_held(proc: subprocess.Popen[bytes]) -> bool:
+    with _jobs_lock:
+        return any(
+            identifier in _held_leaf_identifiers and binding.process is proc
+            for identifier, binding in _retained_leaf_bindings.items()
+        )
+
+
+def _set_leaf_held(identifier: str, held: bool) -> None:
+    with _jobs_lock:
+        if held:
+            _held_leaf_identifiers.add(identifier)
+        else:
+            _held_leaf_identifiers.discard(identifier)
+
+
 def _cancel(identifier: str) -> None:
     with _jobs_lock:
         proc = _jobs.get(identifier)
@@ -715,6 +933,345 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
     _send(connection, {"id": identifier, "status": "cancelled"})
 
 
+def _retained_request_digest(request: dict[str, Any]) -> str:
+    encoded = json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _control_process_stat(pid: int) -> tuple[str, int, int, int] | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        return fields[0], int(fields[2]), int(fields[3]), int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _leaf_group_states(binding: _RetainedLeafBinding) -> list[str]:
+    leader = _control_process_stat(binding.process.pid)
+    if (
+        leader is None
+        or leader[0] in {"Z", "X"}
+        or leader[1] != binding.process.pid
+        or leader[2] != binding.process.pid
+        or leader[3] != binding.process_start_ticks
+    ):
+        raise RuntimeError("retained leaf process is dead, replaced, or PID-reused")
+    states: list[str] = []
+    try:
+        entries = tuple(Path("/proc").iterdir())
+    except OSError as exc:
+        raise RuntimeError("retained leaf process state is unavailable") from exc
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        observed = _control_process_stat(int(entry.name))
+        if observed is not None and observed[1] == binding.process.pid and observed[0] not in {"Z", "X"}:
+            states.append(observed[0])
+    if not states:
+        raise RuntimeError("retained leaf process is dead, replaced, or PID-reused")
+    return states
+
+
+def _leaf_is_held(binding: _RetainedLeafBinding) -> bool:
+    return all(state in {"T", "t"} for state in _leaf_group_states(binding))
+
+
+def _leaf_is_running(binding: _RetainedLeafBinding) -> bool:
+    return all(state not in {"T", "t"} for state in _leaf_group_states(binding))
+
+
+def _wait_leaf_post_state(
+    binding: _RetainedLeafBinding, predicate: Callable[[_RetainedLeafBinding], bool], description: str,
+) -> None:
+    deadline = time.monotonic() + _LEAF_STATE_TIMEOUT_S
+    while not predicate(binding):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"retained leaf did not reach {description} post-state")
+        time.sleep(0.01)
+
+
+def _verify_retained_leaf_target(request: dict[str, Any]) -> _RetainedLeafBinding:
+    identifier = request.get("target_identifier")
+    session = request.get("leaf_session")
+    if not isinstance(identifier, str) or not isinstance(session, str):
+        raise RuntimeError("retained leaf target identity is invalid")
+    _validate_identifier(identifier)
+    if re.fullmatch(r"[0-9a-f]{64}", session) is None:
+        raise RuntimeError("retained leaf session is invalid")
+    issue = _positive_integer(request, "issue")
+    attempt = _positive_integer(request, "attempt")
+    with _jobs_lock:
+        binding = _retained_leaf_bindings.get(identifier)
+        process = _jobs.get(identifier)
+    if binding is None or process is not binding.process or isinstance(process, _FactoryProcess):
+        raise RuntimeError("retained leaf target is missing; a fresh process will not be launched")
+    if (
+        binding.issue_id != issue
+        or binding.attempt != attempt
+        or binding.leaf_session != session
+    ):
+        raise RuntimeError("retained leaf target identity or attempt was replaced")
+    if binding.process.poll() is not None:
+        raise RuntimeError("retained leaf process is dead; a fresh process will not be launched")
+    _leaf_group_states(binding)
+    expected_path = _derive_retained_checkout_path("leaf", issue, attempt)
+    try:
+        observed = expected_path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError("retained leaf checkout is missing or replaced") from exc
+    if (
+        expected_path != binding.checkout_path
+        or not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino)
+        != (binding.checkout_device, binding.checkout_inode)
+    ):
+        raise RuntimeError("retained leaf checkout is missing or replaced")
+    return binding
+
+
+def _retained_leaf_identity(binding: _RetainedLeafBinding) -> dict[str, object]:
+    return {
+        "target_kind": "leaf",
+        "issue": binding.issue_id,
+        "attempt": binding.attempt,
+        "target_identifier": binding.identifier,
+        "leaf_session": binding.leaf_session,
+        "process_pid": binding.process.pid,
+        "process_start_ticks": binding.process_start_ticks,
+        "checkout": {
+            "path": str(binding.checkout_path),
+            "device": binding.checkout_device,
+            "inode": binding.checkout_inode,
+        },
+    }
+
+
+def _receipt_directory() -> Path:
+    directory = RETAINED_RECEIPT_ROOT
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    observed = directory.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(observed.st_mode) or stat.S_ISLNK(observed.st_mode):
+        raise RuntimeError("retained worker receipt directory is unsafe")
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def _receipt_path(operation_id: str) -> Path:
+    _validate_identifier(operation_id)
+    return _receipt_directory() / f"{operation_id}.json"
+
+
+def _load_retained_receipt(operation_id: str) -> dict[str, object] | None:
+    path = _receipt_path(operation_id)
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("retained worker receipt is unavailable") from exc
+    if not stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode) or observed.st_size > 65536:
+        raise RuntimeError("retained worker receipt is unsafe")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("retained worker receipt is malformed") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "operation_id", "request_digest", "identity", "outcome",
+    }:
+        raise RuntimeError("retained worker receipt is malformed")
+    if value.get("operation_id") != operation_id:
+        raise RuntimeError("retained worker receipt identity mismatch")
+    return value
+
+
+def _save_retained_receipt(receipt: dict[str, object]) -> None:
+    operation_id = receipt["operation_id"]
+    if not isinstance(operation_id, str):
+        raise RuntimeError("retained worker receipt identity is invalid")
+    path = _receipt_path(operation_id)
+    encoded = json.dumps(receipt, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    temporary = path.with_name(f".{operation_id}.{uuid.uuid4()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+    try:
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise RuntimeError("retained worker receipt write was incomplete")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _admit_retained_checkout(
+    request: dict[str, Any], *, allow_transfer: bool,
+) -> tuple[dict[str, object], dict[str, object]]:
+    binding: _RetainedLeafBinding | None = None
+    if request.get("target_kind") == "leaf":
+        binding = _verify_retained_leaf_target(request)
+        if binding.identifier not in _held_leaf_identifiers or not _leaf_is_held(binding):
+            raise RuntimeError("retained leaf must be held before checkout admission")
+    fd, path = _open_retained_checkout(request, allow_transfer=allow_transfer)
+    try:
+        observed = os.fstat(fd)
+        checkout = {
+            "path": str(path),
+            "device": observed.st_dev,
+            "inode": observed.st_ino,
+        }
+    finally:
+        os.close(fd)
+    if binding is not None and (
+        checkout["path"] != str(binding.checkout_path)
+        or (checkout["device"], checkout["inode"])
+        != (binding.checkout_device, binding.checkout_inode)
+    ):
+        raise RuntimeError("retained leaf checkout identity changed during admission")
+    identity = (
+        _retained_leaf_identity(binding)
+        if binding is not None
+        else {
+            "target_kind": "factory",
+            "issue": request["issue"],
+            "attempt": request["attempt"],
+            "repository_id": request["repository_id"],
+            "checkout": checkout,
+        }
+    )
+    return identity, checkout
+
+
+def _verify_retained_receipt_post_state(
+    request: dict[str, Any], receipt: dict[str, object],
+) -> dict[str, object] | None:
+    outcome = receipt.get("outcome")
+    if outcome in {"held", "running"}:
+        identity = receipt.get("identity")
+        if not isinstance(identity, dict) or any(
+            identity.get(field) != request.get(request_field)
+            for field, request_field in (
+                ("target_kind", "target_kind"),
+                ("issue", "issue"),
+                ("attempt", "attempt"),
+                ("target_identifier", "target_identifier"),
+                ("leaf_session", "leaf_session"),
+            )
+        ):
+            raise RuntimeError("retained worker receipt identity mismatch")
+        if outcome == "running":
+            # The leaf may finish before a controller retries a lost response.
+            # The fsynced applied receipt is terminal proof for this exact request;
+            # replay never signals or launches a process based on later PID state.
+            return None
+        binding = _verify_retained_leaf_target(request)
+        predicate = _leaf_is_held if outcome == "held" else _leaf_is_running
+        if not predicate(binding) or identity != _retained_leaf_identity(binding):
+            raise RuntimeError("retained worker receipt no longer matches process post-state")
+        if outcome == "held":
+            _set_leaf_held(binding.identifier, True)
+        return None
+    if outcome == "admitted":
+        identity, checkout = _admit_retained_checkout(request, allow_transfer=False)
+        if receipt.get("identity") != identity:
+            raise RuntimeError("retained worker receipt no longer matches checkout post-state")
+        return checkout
+    raise RuntimeError("retained worker receipt outcome is invalid")
+
+
+def _handle_retained_control(
+    connection: socket.socket, request: dict[str, Any], fds: list[int],
+) -> None:
+    operation = request.get("op")
+    target_kind = request.get("target_kind")
+    expected_fields = _RETAINED_LEAF_FIELDS if target_kind == "leaf" else _RETAINED_FACTORY_FIELDS
+    if fds or set(request) != expected_fields:
+        raise RuntimeError("retained worker request must carry the exact typed contract and no FDs")
+    _validate_executor_identity(request)
+    if operation not in {"hold_leaf", "resume_leaf", "admit_retained_checkout"}:
+        raise RuntimeError("unsupported retained worker operation")
+    if operation in {"hold_leaf", "resume_leaf"} and target_kind != "leaf":
+        raise RuntimeError("leaf process control requires a leaf target")
+    if operation == "admit_retained_checkout" and target_kind not in {"leaf", "factory"}:
+        raise RuntimeError("retained checkout kind is invalid")
+    operation_id = request.get("operation_id")
+    if not isinstance(operation_id, str):
+        raise RuntimeError("retained worker operation identity is invalid")
+    _validate_identifier(operation_id)
+    _positive_integer(request, "issue")
+    _positive_integer(request, "attempt")
+    digest = _retained_request_digest(request)
+    expected_outcome = {
+        "hold_leaf": "held",
+        "resume_leaf": "running",
+        "admit_retained_checkout": "admitted",
+    }[operation]
+    with _retained_control_lock:
+        receipt = _load_retained_receipt(operation_id)
+        if receipt is not None:
+            if receipt.get("request_digest") != digest or receipt.get("outcome") != expected_outcome:
+                raise RuntimeError("retained worker operation ID was reused for another request")
+            checkout = _verify_retained_receipt_post_state(request, receipt)
+            status = "already_applied"
+        else:
+            checkout: dict[str, object] | None = None
+            if operation == "hold_leaf":
+                binding = _verify_retained_leaf_target(request)
+                _set_leaf_held(binding.identifier, True)
+                try:
+                    if not _leaf_is_held(binding):
+                        os.killpg(binding.process.pid, signal.SIGSTOP)
+                    _wait_leaf_post_state(binding, _leaf_is_held, "held")
+                except Exception:
+                    try:
+                        remains_held = _leaf_is_held(binding)
+                    except RuntimeError:
+                        remains_held = False
+                    _set_leaf_held(binding.identifier, remains_held)
+                    raise
+                identity = _retained_leaf_identity(binding)
+            elif operation == "resume_leaf":
+                binding = _verify_retained_leaf_target(request)
+                if binding.identifier not in _held_leaf_identifiers or not _leaf_is_held(binding):
+                    raise RuntimeError("retained leaf is not held by the executor")
+                os.killpg(binding.process.pid, signal.SIGCONT)
+                _wait_leaf_post_state(binding, _leaf_is_running, "running")
+                identity = _retained_leaf_identity(binding)
+            else:
+                identity, checkout = _admit_retained_checkout(request, allow_transfer=True)
+            receipt = {
+                "operation_id": operation_id,
+                "request_digest": digest,
+                "identity": identity,
+                "outcome": expected_outcome,
+            }
+            try:
+                _save_retained_receipt(receipt)
+            finally:
+                if operation == "resume_leaf":
+                    _set_leaf_held(binding.identifier, False)
+            status = "applied"
+        response: dict[str, object] = {
+            "operation_id": operation_id,
+            "request_digest": digest,
+            "status": status,
+            "outcome": expected_outcome,
+        }
+        if checkout is not None:
+            response["checkout"] = checkout
+        _send(connection, response)
+
+
 def _wait_with_output_limits(
     proc: subprocess.Popen[bytes],
     timeout_s: float,
@@ -733,7 +1290,14 @@ def _wait_with_output_limits(
     if isinstance(proc, _FactoryProcess):
         return _wait_factory(proc, timeout_s, stdout_fd, stdout_limit, stderr_fd, stderr_limit)
     deadline = time.monotonic() + timeout_s + _CONTROLLER_CANCELLATION_GRACE_S
+    held_since: float | None = None
     while True:
+        if _process_is_retained_held(proc):
+            if held_since is None:
+                held_since = time.monotonic()
+        elif held_since is not None:
+            deadline += max(0.0, time.monotonic() - held_since)
+            held_since = None
         for fd, limit in ((stdout_fd, stdout_limit), (stderr_fd, stderr_limit)):
             if os.fstat(fd).st_size > limit:
                 os.ftruncate(fd, limit)
@@ -743,7 +1307,7 @@ def _wait_with_output_limits(
         if exit_code is not None:
             _terminate_process_group(proc, 0)
             return exit_code, False, False
-        if time.monotonic() >= deadline:
+        if held_since is None and time.monotonic() >= deadline:
             _terminate_process_group(proc)
             return proc.returncode if proc.returncode is not None else -signal.SIGKILL, True, False
         time.sleep(_OUTPUT_LIMIT_POLL_S)
@@ -857,6 +1421,7 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
     home = Path()
     proc: subprocess.Popen[bytes] | _FactoryProcess | None = None
     supervisor_parent = supervisor_child = None
+    retained_leaf_source: tuple[Path, int, int] | None = None
     try:
         if path_addressed:
             fds.insert(0, _open_factory_checkout(request, for_launch=True) if factory else _open_path_checkout(request))
@@ -867,6 +1432,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         )
         os.close(fds[0])
         fds[0] = anchored_fd
+        if not factory:
+            retained_leaf_source = _retained_leaf_checkout_source(anchored_fd, request)
         candidate_home = HOME_ROOT / identifier
         candidate_home.mkdir(mode=0o700)
         home = candidate_home
@@ -908,6 +1475,36 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             close_fds=True,
             pass_fds=(fds[0], supervisor_child.fileno()) if factory else (fds[0],),
         )
+        retained_binding: _RetainedLeafBinding | None = None
+        if retained_leaf_source is not None:
+            process_identity = _control_process_stat(proc.pid)
+            if (
+                process_identity is None
+                or process_identity[0] in {"Z", "X"}
+                or process_identity[1] != proc.pid
+                or process_identity[2] != proc.pid
+            ):
+                raise RuntimeError("retained leaf process did not establish an exact session identity")
+            checkout_path, checkout_device, checkout_inode = retained_leaf_source
+            start_ticks = process_identity[3]
+            retained_binding = _RetainedLeafBinding(
+                identifier=identifier,
+                issue_id=request["issue"],
+                attempt=request["attempt"],
+                process=proc,
+                process_start_ticks=start_ticks,
+                checkout_path=checkout_path,
+                checkout_device=checkout_device,
+                checkout_inode=checkout_inode,
+                leaf_session=leaf_session_digest(
+                    issue_id=request["issue"],
+                    attempt=request["attempt"],
+                    handle_substrate="local_subprocess",
+                    handle_identifier=identifier,
+                    process_start_ticks=start_ticks,
+                    shim_pid=proc.pid,
+                ),
+            )
         if factory:
             supervisor_child.close()
 
@@ -920,6 +1517,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
             proc = _FactoryProcess(proc, supervisor_parent, emit)
         with _jobs_lock:
             _jobs[identifier] = proc
+            if retained_binding is not None:
+                _retained_leaf_bindings[identifier] = retained_binding
             _launching.remove(identifier)
         _send(connection, {"id": identifier, "status": "started", "pid": proc.pid})
         exit_code, timed_out, output_overflow = _wait_with_output_limits(
@@ -932,6 +1531,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         )
         with _jobs_lock:
             _jobs.pop(identifier, None)
+            _retained_leaf_bindings.pop(identifier, None)
+            _held_leaf_identifiers.discard(identifier)
         _cleanup_home(home)
         home = Path()
         _send(connection, {
@@ -945,6 +1546,8 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
         with _jobs_lock:
             _launching.discard(identifier)
             active = _jobs.pop(identifier, None) if _jobs.get(identifier) is proc else None
+            _retained_leaf_bindings.pop(identifier, None)
+            _held_leaf_identifiers.discard(identifier)
         if isinstance(active, _FactoryProcess):
             if not active.done.is_set():
                 active.channel.close()
@@ -956,6 +1559,14 @@ def _handle_launch(connection: socket.socket, request: dict[str, Any], fds: list
                     raise RuntimeError("worklink_factory_reap_refused: supervisor failed during launch")
         elif active is not None and active.poll() is None:
             _terminate_process_group(active)
+        elif (
+            active is None
+            and proc is not None
+            and not isinstance(proc, _FactoryProcess)
+            and callable(getattr(proc, "poll", None))
+            and proc.poll() is None
+        ):
+            _terminate_process_group(proc)
         for channel in (supervisor_parent, supervisor_child):
             if channel is not None:
                 channel.close()
@@ -991,6 +1602,10 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_cancel(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)
+        elif request.get("op") in {
+            "hold_leaf", "resume_leaf", "admit_retained_checkout",
+        }:
+            _handle_retained_control(connection, request, fds)
         else:
             raise RuntimeError("unsupported worker operation")
     except Exception as exc:

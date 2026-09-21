@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 import errno
+import hashlib
 import json
 import os
 import uuid
@@ -23,6 +24,62 @@ from pathlib import Path
 from typing import Any
 
 RUN_STATE_VERSION = 2
+
+
+@dataclass(frozen=True)
+class LeafProcessIdentity:
+    """Canonical attempt-bound identity for one retained leaf process."""
+
+    issue_id: int
+    attempt: int
+    handle_substrate: str
+    handle_identifier: str
+    process_pid: int
+    process_start_ticks: int
+    leaf_session: str
+
+
+def leaf_session_digest(
+    *,
+    issue_id: int,
+    attempt: int,
+    handle_substrate: str,
+    handle_identifier: str,
+    process_start_ticks: int,
+    shim_pid: int | None,
+) -> str:
+    """Hash the complete stable handle identity, including its attempt binding."""
+    if issue_id < 1 or attempt < 1 or process_start_ticks <= 0:
+        raise ValueError("leaf process identity is invalid")
+    if handle_substrate != "local_subprocess":
+        raise ValueError("retained leaf requires a local subprocess handle")
+    if not handle_identifier or "\x00" in handle_identifier:
+        raise ValueError("leaf process handle identifier is invalid")
+    process_pid = shim_pid
+    if process_pid is None:
+        if not handle_identifier.isascii() or not handle_identifier.isdecimal():
+            raise ValueError("direct leaf process handle requires a decimal PID")
+        process_pid = int(handle_identifier)
+    else:
+        try:
+            parsed = uuid.UUID(handle_identifier, version=4)
+        except ValueError as exc:
+            raise ValueError("worker leaf process handle requires a canonical UUIDv4") from exc
+        if str(parsed) != handle_identifier:
+            raise ValueError("worker leaf process handle requires a canonical UUIDv4")
+    if process_pid <= 0:
+        raise ValueError("leaf process PID is invalid")
+    canonical = {
+        "attempt": attempt,
+        "handle_identifier": handle_identifier,
+        "handle_substrate": handle_substrate,
+        "issue_id": issue_id,
+        "process_pid": process_pid,
+        "process_start_ticks": process_start_ticks,
+        "version": 1,
+    }
+    encoded = json.dumps(canonical, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -74,6 +131,35 @@ class WorklinkRunState:
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
+
+    def leaf_process_identity(self) -> LeafProcessIdentity:
+        """Return the derived session identity required for retained leaf control."""
+        if self.phase != "spawned" or self.process_start_ticks is None:
+            raise ValueError("retained leaf has no complete spawned process identity")
+        process_pid = _state_pid(self)
+        if process_pid is None:
+            raise ValueError("retained leaf process PID is invalid")
+        leaf_session = leaf_session_digest(
+            issue_id=self.issue_id,
+            attempt=self.attempt,
+            handle_substrate=self.handle_substrate,
+            handle_identifier=self.handle_identifier,
+            process_start_ticks=self.process_start_ticks,
+            shim_pid=self.shim_pid,
+        )
+        return LeafProcessIdentity(
+            issue_id=self.issue_id,
+            attempt=self.attempt,
+            handle_substrate=self.handle_substrate,
+            handle_identifier=self.handle_identifier,
+            process_pid=process_pid,
+            process_start_ticks=self.process_start_ticks,
+            leaf_session=leaf_session,
+        )
+
+    @property
+    def leaf_session(self) -> str:
+        return self.leaf_process_identity().leaf_session
 
     @classmethod
     def from_json(cls, data: Any) -> "WorklinkRunState":

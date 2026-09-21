@@ -4,6 +4,7 @@ import array
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -12,11 +13,12 @@ from pathlib import Path, PurePosixPath
 import socket
 import struct
 import subprocess
-from typing import Mapping, Protocol, Sequence
+from typing import Literal, Mapping, Protocol, Sequence
 import uuid
 
 from ..output_capture import OutputSink, open_output_pair
 from . import identities
+from .run_state import LeafProcessIdentity
 
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
@@ -26,7 +28,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-repository-binding"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -121,6 +123,103 @@ class WorkerProjection:
         parsed = json.loads(self.document)
         if not isinstance(parsed, dict):
             raise ValueError("worker projection must be a JSON object")
+
+
+@dataclass(frozen=True)
+class RetainedWorkerTarget:
+    """Server-held retained target; it contains no caller-selected path or PID."""
+
+    kind: Literal["leaf", "factory"]
+    issue_id: int
+    attempt: int
+    worker_identifier: str | None = None
+    leaf_session: str | None = None
+    repository_id: str | None = None
+    checkout_device: int | None = None
+    checkout_inode: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"leaf", "factory"} or self.issue_id < 1 or self.attempt < 1:
+            raise ValueError("retained worker target identity is invalid")
+        if self.kind == "factory":
+            if self.worker_identifier is not None or self.leaf_session is not None:
+                raise ValueError("factory retained target cannot carry a leaf process")
+            if (
+                self.repository_id is None
+                or re.fullmatch(r"[0-9a-f]{64}", self.repository_id) is None
+                or type(self.checkout_device) is not int
+                or self.checkout_device < 0
+                or type(self.checkout_inode) is not int
+                or self.checkout_inode < 0
+            ):
+                raise ValueError("factory retained target requires an exact repository checkout")
+            return
+        if (
+            self.worker_identifier is None
+            or self.leaf_session is None
+            or self.repository_id is not None
+            or self.checkout_device is not None
+            or self.checkout_inode is not None
+        ):
+            raise ValueError("leaf retained target requires its worker session")
+        _validate_identifier(self.worker_identifier)
+        if re.fullmatch(r"[0-9a-f]{64}", self.leaf_session) is None:
+            raise ValueError("leaf retained target session is invalid")
+
+    @classmethod
+    def for_leaf(cls, identity: LeafProcessIdentity) -> RetainedWorkerTarget:
+        if identity.handle_substrate != "local_subprocess":
+            raise ValueError("retained leaf requires a local subprocess handle")
+        # Worker controls address the executor's opaque UUID. Legacy direct PID
+        # handles remain readable, but are deliberately not controllable here.
+        _validate_identifier(identity.handle_identifier)
+        return cls(
+            "leaf",
+            identity.issue_id,
+            identity.attempt,
+            identity.handle_identifier,
+            identity.leaf_session,
+        )
+
+    @classmethod
+    def for_factory(
+        cls, *, repository_root: Path, issue_id: int, attempt: int,
+    ) -> RetainedWorkerTarget:
+        try:
+            repository = repository_root.resolve(strict=True)
+            if not repository.is_dir():
+                raise ValueError("factory retained repository root is not a directory")
+            repository_id = hashlib.sha256(str(repository).encode("utf-8")).hexdigest()
+            checkout = (
+                WORKLINK_CHECKOUT_ROOT
+                / repository_id
+                / f"{issue_id}-{attempt}"
+                / "checkout"
+            )
+            observed = checkout.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("factory retained checkout is unavailable") from exc
+        if not checkout.is_dir() or checkout.is_symlink():
+            raise ValueError("factory retained checkout is not a directory")
+        return cls(
+            "factory",
+            issue_id,
+            attempt,
+            repository_id=repository_id,
+            checkout_device=observed.st_dev,
+            checkout_inode=observed.st_ino,
+        )
+
+
+@dataclass(frozen=True)
+class RetainedWorkerReceipt:
+    operation_id: str
+    request_digest: str
+    outcome: Literal["held", "running", "admitted"]
+    already_applied: bool
+    checkout: Path | None = None
+    device: int | None = None
+    inode: int | None = None
 
 
 @dataclass
@@ -406,6 +505,124 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "cancelled":
                 raise RuntimeError("worker executor returned an invalid cancel response")
+        finally:
+            sock.close()
+
+    async def hold_leaf(
+        self, target: RetainedWorkerTarget, *, operation_id: str
+    ) -> RetainedWorkerReceipt:
+        if target.kind != "leaf":
+            raise ValueError("leaf hold requires a leaf retained target")
+        return await self._retained_control("hold_leaf", target, operation_id)
+
+    async def resume_leaf(
+        self, target: RetainedWorkerTarget, *, operation_id: str
+    ) -> RetainedWorkerReceipt:
+        if target.kind != "leaf":
+            raise ValueError("leaf resume requires a leaf retained target")
+        return await self._retained_control("resume_leaf", target, operation_id)
+
+    async def admit_retained_checkout(
+        self, target: RetainedWorkerTarget, *, operation_id: str
+    ) -> RetainedWorkerReceipt:
+        return await self._retained_control("admit_retained_checkout", target, operation_id)
+
+    async def _retained_control(
+        self,
+        operation: Literal["hold_leaf", "resume_leaf", "admit_retained_checkout"],
+        target: RetainedWorkerTarget,
+        operation_id: str,
+    ) -> RetainedWorkerReceipt:
+        _validate_identifier(operation_id)
+        request: dict[str, object] = {
+            "version": 1,
+            "op": operation,
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "operation_id": operation_id,
+            "target_kind": target.kind,
+            "issue": target.issue_id,
+            "attempt": target.attempt,
+        }
+        if target.kind == "leaf":
+            request["target_identifier"] = target.worker_identifier
+            request["leaf_session"] = target.leaf_session
+        else:
+            request["repository_id"] = target.repository_id
+            request["checkout_device"] = target.checkout_device
+            request["checkout_inode"] = target.checkout_inode
+        payload = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
+        if len(payload) > MAX_REQUEST_BYTES:
+            raise ValueError("retained worker request exceeds size limit")
+        expected_digest = hashlib.sha256(payload).hexdigest()
+        sock = await asyncio.to_thread(self._connect, CANCEL_SOCKET_TIMEOUT_S)
+        try:
+            sock.send(payload)
+            response = json.loads(await asyncio.to_thread(sock.recv, 4096))
+            if "error" in response:
+                error = str(response["error"])
+                if "stale root executor image" in error or "unsupported worker operation" in error:
+                    raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+                raise RuntimeError(error)
+            if response.get("operation_id") != operation_id:
+                raise RuntimeError("worker executor response operation identity mismatch")
+            status = response.get("status")
+            if status not in {"applied", "already_applied"}:
+                raise RuntimeError("worker executor returned an invalid retained-control result")
+            if response.get("request_digest") != expected_digest:
+                raise RuntimeError("worker executor response request digest mismatch")
+            expected_outcome = {
+                "hold_leaf": "held",
+                "resume_leaf": "running",
+                "admit_retained_checkout": "admitted",
+            }[operation]
+            if response.get("outcome") != expected_outcome:
+                raise RuntimeError("worker executor returned an invalid retained-control outcome")
+            checkout = response.get("checkout")
+            path: Path | None = None
+            device: int | None = None
+            inode: int | None = None
+            if operation == "admit_retained_checkout":
+                if not isinstance(checkout, dict) or set(checkout) != {"path", "device", "inode"}:
+                    raise RuntimeError("worker executor returned an invalid checkout admission")
+                raw_path = checkout["path"]
+                device = checkout["device"]
+                inode = checkout["inode"]
+                if (
+                    not isinstance(raw_path, str)
+                    or not raw_path.startswith("/")
+                    or type(device) is not int
+                    or device < 0
+                    or type(inode) is not int
+                    or inode < 0
+                ):
+                    raise RuntimeError("worker executor returned an invalid checkout admission")
+                path = Path(raw_path)
+                if target.kind == "factory":
+                    expected_path = (
+                        WORKLINK_CHECKOUT_ROOT
+                        / str(target.repository_id)
+                        / f"{target.issue_id}-{target.attempt}"
+                        / "checkout"
+                    )
+                    if (
+                        path != expected_path
+                        or device != target.checkout_device
+                        or inode != target.checkout_inode
+                    ):
+                        raise RuntimeError(
+                            "worker executor returned a mismatched factory checkout admission"
+                        )
+            elif checkout is not None:
+                raise RuntimeError("worker executor returned an unexpected checkout admission")
+            return RetainedWorkerReceipt(
+                operation_id=operation_id,
+                request_digest=expected_digest,
+                outcome=expected_outcome,
+                already_applied=status == "already_applied",
+                checkout=path,
+                device=device,
+                inode=inode,
+            )
         finally:
             sock.close()
 
