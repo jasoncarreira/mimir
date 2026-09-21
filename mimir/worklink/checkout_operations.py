@@ -234,6 +234,7 @@ class RetainedCheckoutOperations:
         root_fd = self._open_root()
         try:
             files: list[str] = []
+            entries: list[tuple[tuple[str, ...], tuple[int, int, int]]] = []
             pending: list[tuple[int, tuple[str, ...]]] = [(os.dup(root_fd), ())]
             try:
                 while pending:
@@ -254,8 +255,19 @@ class RetainedCheckoutOperations:
                                     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                                     dir_fd=directory_fd,
                                 )
+                                opened = os.fstat(child)
+                                identity = (value.st_dev, value.st_ino, value.st_mode)
+                                if (opened.st_dev, opened.st_ino, opened.st_mode) != identity:
+                                    os.close(child)
+                                    raise CheckoutConflictError(
+                                        "retained checkout directory was replaced during listing"
+                                    )
+                                entries.append((relative, identity))
                                 pending.append((child, relative))
                             elif stat.S_ISREG(value.st_mode):
+                                entries.append(
+                                    (relative, (value.st_dev, value.st_ino, value.st_mode))
+                                )
                                 files.append(_display_path(relative))
                                 if len(files) > limit:
                                     raise CheckoutOperationError("retained checkout file listing exceeds bounds")
@@ -268,6 +280,8 @@ class RetainedCheckoutOperations:
             finally:
                 for directory_fd, _ in pending:
                     os.close(directory_fd)
+            for relative, identity in entries:
+                _verify_path_identity(root_fd, relative, identity)
             self._verify_named_root(root_fd)
             self._revalidate()
             return tuple(sorted(files))
@@ -285,12 +299,15 @@ class RetainedCheckoutOperations:
         parent_fd = -1
         file_fd = -1
         try:
-            parent_fd, _ = _open_parent(root_fd, parts)
+            parent_fd, directory_identities = _open_parent(root_fd, parts)
             file_fd = _open_regular(parent_fd, parts[-1])
             value = os.fstat(file_fd)
+            target_identity = (value.st_dev, value.st_ino, value.st_mode)
             os.lseek(file_fd, offset, os.SEEK_SET)
             content = os.read(file_fd, limit)
             digest = _sha256_fd(file_fd)
+            _verify_parent_walk(root_fd, parts, directory_identities)
+            _verify_path_identity(root_fd, parts, target_identity)
             self._verify_named_root(root_fd)
             self._revalidate()
             return FileRead(
@@ -426,9 +443,23 @@ class RetainedCheckoutOperations:
             _verify_parent_walk(root_fd, parts, directory_identities)
             self._verify_named_root(root_fd)
             _verify_target_identity(parent_fd, parts[-1], target_identity)
+
+            def final_pre_effect_check() -> None:
+                _verify_parent_walk(root_fd, parts, directory_identities)
+                self._verify_named_root(root_fd)
+                _verify_target_identity(parent_fd, parts[-1], target_identity)
+                self._revalidate()
+
+            final_pre_effect_check()
             if intent.action == "write":
                 assert document is not None
-                _atomic_replace(parent_fd, parts[-1], document, target_identity)
+                _atomic_replace(
+                    parent_fd,
+                    parts[-1],
+                    document,
+                    target_identity,
+                    pre_effect=final_pre_effect_check,
+                )
                 resulting, _ = _digest_at(parent_fd, parts[-1], missing_ok=False)
             else:
                 os.unlink(parts[-1], dir_fd=parent_fd)
@@ -458,8 +489,8 @@ class RetainedCheckoutOperations:
         self._verify_checkout()
         head = self._head()
         before = self.candidate_tree()
-        self._revalidate()
         with _test_environment() as environment:
+            self._revalidate()
             result = self._runner(
                 ("/bin/sh", "-c", command),
                 cwd=self.identity.path,
@@ -502,6 +533,7 @@ class RetainedCheckoutOperations:
             self._scan_index_for_secrets(tests.head, index_path)
             self._revalidate()
             self._verify_checkout()
+            self._revalidate()
             result = self._git(
                 "-c", "commit.gpgSign=false", "commit", "-m", message,
                 index_path=index_path,
@@ -584,8 +616,13 @@ class RetainedCheckoutOperations:
         root_fd = self._open_root()
         parent_fd = -1
         try:
-            parent_fd, _ = _open_parent(root_fd, parts)
-            digest, _ = _digest_at(parent_fd, parts[-1], missing_ok=missing_ok)
+            parent_fd, directory_identities = _open_parent(root_fd, parts)
+            digest, target_identity = _digest_at(
+                parent_fd, parts[-1], missing_ok=missing_ok
+            )
+            _verify_parent_walk(root_fd, parts, directory_identities)
+            if target_identity is not None:
+                _verify_path_identity(root_fd, parts, target_identity)
             self._verify_named_root(root_fd)
             return digest
         finally:
@@ -663,7 +700,13 @@ class RetainedCheckoutOperations:
             if not raw_path:
                 continue
             path = os.fsdecode(raw_path)
-            staged = self._git("cat-file", "blob", f":{path}", index_path=index_path)
+            staged = self._git(
+                "cat-file",
+                "blob",
+                f":{path}",
+                index_path=index_path,
+                output_limit=MAX_WRITE_BYTES,
+            )
             if staged.returncode != 0:
                 raise CheckoutOperationError(
                     f"cannot scan staged retained checkout path {path!r} for secrets"
@@ -673,7 +716,13 @@ class RetainedCheckoutOperations:
             )
             if not staged_matches:
                 continue
-            previous = self._git("cat-file", "blob", f"{base}:{path}", index_path=index_path)
+            previous = self._git(
+                "cat-file",
+                "blob",
+                f"{base}:{path}",
+                index_path=index_path,
+                output_limit=MAX_WRITE_BYTES,
+            )
             if previous.returncode == 0:
                 base_matches = secret_matches(
                     _bytes_output(previous.stdout).decode("utf-8", errors="surrogateescape")
@@ -717,6 +766,7 @@ class RetainedCheckoutOperations:
         self,
         *args: str,
         index_path: Path | None = None,
+        output_limit: int = MAX_COMMAND_OUTPUT_BYTES,
     ) -> subprocess.CompletedProcess[bytes]:
         environment = _git_environment(index_path)
         return self._runner(
@@ -724,7 +774,7 @@ class RetainedCheckoutOperations:
             cwd=self.identity.path,
             env=environment,
             timeout=GIT_TIMEOUT_SECONDS,
-            output_limit=MAX_COMMAND_OUTPUT_BYTES,
+            output_limit=output_limit,
         )
 
     def _git_text(
@@ -834,10 +884,35 @@ def _verify_parent_walk(
     parts: Sequence[str],
     expected: Sequence[tuple[int, int]],
 ) -> None:
-    reopened, observed = _open_parent(root_fd, parts)
+    try:
+        reopened, observed = _open_parent(root_fd, parts)
+    except OSError as exc:
+        raise CheckoutConflictError(
+            "retained checkout path was replaced during traversal"
+        ) from exc
     os.close(reopened)
     if tuple(observed) != tuple(expected):
         raise CheckoutConflictError("retained checkout path was replaced during traversal")
+
+
+def _verify_path_identity(
+    root_fd: int,
+    parts: Sequence[str],
+    expected: tuple[int, int, int],
+) -> None:
+    parent_fd = -1
+    try:
+        parent_fd, _ = _open_parent(root_fd, parts)
+        value = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise CheckoutConflictError(
+            "retained checkout path was replaced during operation"
+        ) from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    if stat.S_ISLNK(value.st_mode) or (value.st_dev, value.st_ino, value.st_mode) != expected:
+        raise CheckoutConflictError("retained checkout path was replaced during operation")
 
 
 def _open_regular(parent_fd: int, name: str) -> int:
@@ -896,6 +971,8 @@ def _atomic_replace(
     name: str,
     content: bytes,
     previous: tuple[int, int, int] | None,
+    *,
+    pre_effect: Callable[[], None],
 ) -> None:
     temporary = f".worklink-{uuid.uuid4()}"
     mode = stat.S_IMODE(previous[2]) if previous is not None else 0o644
@@ -919,6 +996,7 @@ def _atomic_replace(
         os.close(descriptor)
     try:
         _verify_target_identity(parent_fd, name, previous)
+        pre_effect()
         os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
     except BaseException:
