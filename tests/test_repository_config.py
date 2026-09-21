@@ -202,6 +202,85 @@ def test_legacy_root_disagreement_fails_closed_with_both_values(
     assert str(allowed) in message
 
 
+def test_legacy_root_agreement_uses_canonical_path_to_mode_not_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS",
+        f"{allowed}:ro,{checkout}:rw",
+    )
+
+    config = Config.from_env()
+
+    assert dict(config.file_tool_roots) == {
+        str(allowed.resolve()): "ro",
+        str(checkout.resolve()): "rw",
+    }
+
+
+def test_coding_target_requires_one_observable_canonical_rw_binding(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    config = tmp_path / "repositories.yaml"
+    config.write_text(
+        yaml.safe_dump({"repositories": [{
+            "slug": "owner/repo",
+            "root": str(checkout),
+            "mode": "rw",
+            "origin": "https://github.com/owner/repo.git",
+            "base_branch": "main",
+        }]}),
+        encoding="utf-8",
+    )
+    inventory = RepositoryInventory.load(config)
+
+    assert inventory.coding_target(
+        "OWNER/REPO", authorized_roots=((str(checkout), "rw"),)
+    ).slug == "owner/repo"
+    for roots in (
+        (),
+        ((str(checkout), "ro"),),
+        ((str(checkout), "rw"), (str(checkout), "rw")),
+    ):
+        with pytest.raises(ValueError, match="exactly one canonical authorized 'rw'"):
+            inventory.coding_target("owner/repo", authorized_roots=roots)
+
+
+def test_only_enabled_coding_target_requires_rw_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    inventory_text = (home / "repositories.yaml").read_text(encoding="utf-8")
+    (home / "repositories.yaml").write_text(
+        inventory_text.replace("mode: rw", "mode: ro", 1),
+        encoding="utf-8",
+    )
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+
+    assert Config.from_env().coding_enabled is False
+
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    with pytest.raises(RuntimeError, match="coding target owner/repo must have mode 'rw'"):
+        Config.from_env()
+
+
 @pytest.mark.parametrize(
     ("name", "legacy_value", "declared_value"),
     [

@@ -71,6 +71,46 @@ class RepositoryInventory:
         resolved = root.resolve()
         return next((repo for repo in self.repositories if repo.root == resolved), None)
 
+    def root_mode_map(self) -> dict[str, str]:
+        """Return the canonical authorization projection for this inventory."""
+        return {
+            str(item.root): item.mode
+            for item in (*self.repositories, *self.allowed_roots)
+        }
+
+    def coding_target(
+        self,
+        slug: str,
+        *,
+        authorized_roots: tuple[tuple[str, str], ...] | None = None,
+    ) -> RepositoryConfig:
+        """Resolve one coding target and prove its effective ``rw`` binding."""
+        normalized = slug.strip().lower()
+        matches = tuple(repo for repo in self.repositories if repo.slug == normalized)
+        if len(matches) != 1:
+            raise ValueError(
+                f"coding target {normalized or slug!r} must resolve to exactly one "
+                f"declared repository; found {len(matches)}"
+            )
+        target = matches[0]
+        if target.mode != "rw":
+            raise ValueError(
+                f"coding target {target.slug} must have mode 'rw'; found {target.mode!r}"
+            )
+        if authorized_roots is not None:
+            target_path = str(target.root)
+            bindings = tuple(
+                mode
+                for path, mode in authorized_roots
+                if str(Path(path).resolve()) == target_path
+            )
+            if bindings != ("rw",):
+                raise ValueError(
+                    f"coding target {target.slug} must have exactly one canonical "
+                    f"authorized 'rw' binding at {target.root}; found {bindings!r}"
+                )
+        return target
+
 
 _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _TEST_SUITE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")

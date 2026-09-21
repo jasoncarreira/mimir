@@ -513,7 +513,9 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
-def _configure_declared_repositories(home: Path) -> None:
+def _configure_declared_repositories(
+    home: Path, *, require_coding_target: bool = False,
+) -> None:
     """Validate the repository inventory and reconcile its legacy projections."""
     from .repository_config import RepositoryInventory
     from .worklink.backends.registry import WorklinkConfig
@@ -529,7 +531,7 @@ def _configure_declared_repositories(home: Path) -> None:
     )
     rendered_roots = ",".join(f"{path}:{mode}" for path, mode in declared_roots)
     effective_declared = _parse_file_tool_roots(rendered_roots, home, always_rw=())
-    if effective_declared != declared_roots:
+    if dict(effective_declared) != inventory.root_mode_map():
         raise RuntimeError(
             "declared repositories/allowed_roots contain a root that is not a valid "
             f"file-tool root: declared={declared_roots!r}, effective={effective_declared!r}"
@@ -567,6 +569,14 @@ def _configure_declared_repositories(home: Path) -> None:
             f"{worklink.repository}"
         )
     declared_target = str(target.root) if target is not None else None
+    if require_coding_target and worklink.repository is not None:
+        try:
+            target = inventory.coding_target(
+                worklink.repository,
+                authorized_roots=effective_declared,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
     for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO"):
         legacy_target = os.environ.get(name)
         if legacy_target and (
@@ -1168,7 +1178,11 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
-        _configure_declared_repositories(home)
+        coding_enabled_value = coding_enabled()
+        _configure_declared_repositories(
+            home,
+            require_coding_target=coding_enabled_value,
+        )
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
                 "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "
@@ -1179,7 +1193,6 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled_value = coding_enabled()
         from .opencode_config import opencode_config_path
 
         resolved_opencode_config = opencode_config_path()

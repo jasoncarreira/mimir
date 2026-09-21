@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import subprocess
 from typing import Callable, Mapping, Protocol, Sequence
 
 from .backends import ToolPin
+from .backends.feature_factory import FACTORY_VERSION
 
 
 OPENCODE_VERSION = "1.18.21"
@@ -77,7 +79,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="feature-factory",
         category="coding-cli",
-        pin="0.9.2",
+        pin=FACTORY_VERSION,
         smoke="test -f \"$MIMIR_FACTORY_ENTRYPOINT\"",
         source="npm",
         package="feature-factory",
@@ -87,7 +89,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="opencode-feature-factory",
         category="coding-plugin",
-        pin="0.9.2",
+        pin=FACTORY_VERSION,
         smoke="opencode --version",
         source="npm",
         package="opencode-feature-factory",
@@ -131,6 +133,91 @@ def default_tool_pins() -> tuple[ToolPin, ...]:
     """Return the source-controlled initial Worklink external executable inventory."""
 
     return DEFAULT_TOOL_PINS
+
+
+@dataclass(frozen=True)
+class FactoryPackageObservation:
+    entrypoint: str
+    feature_factory_manifest: str
+    plugin_manifest: str
+    feature_factory_version: str | None
+    plugin_version: str | None
+    package_bound: bool
+    detail: str = ""
+
+
+def probe_factory_packages(entrypoint: str | Path) -> FactoryPackageObservation:
+    """Observe both package manifests without hiding historical version drift."""
+    raw = Path(entrypoint)
+    try:
+        resolved = raw.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return FactoryPackageObservation(
+            str(raw), "missing", "missing", None, None, False,
+            f"entrypoint unavailable: {type(exc).__name__}",
+        )
+    package_root = resolved.parent.parent
+    feature_manifest = package_root / "package.json"
+    plugin_manifest = package_root.parent / "opencode-feature-factory" / "package.json"
+
+    def read_manifest(path: Path, expected_name: str) -> tuple[str | None, str | None]:
+        try:
+            raw_manifest = path.read_bytes()
+            if len(raw_manifest) > 1024 * 1024 or b"\x00" in raw_manifest:
+                return None, "invalid manifest"
+            value = json.loads(raw_manifest.decode("utf-8", "strict"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None, "unreadable manifest"
+        if not isinstance(value, dict) or value.get("name") != expected_name:
+            return None, "wrong package name"
+        version = value.get("version")
+        if not isinstance(version, str):
+            return None, "invalid version"
+        return version, None
+
+    feature_version, feature_error = read_manifest(feature_manifest, "feature-factory")
+    plugin_version, plugin_error = read_manifest(
+        plugin_manifest, "opencode-feature-factory"
+    )
+    shape_valid = (
+        resolved.is_file()
+        and resolved.name == "factory.js"
+        and resolved.parent.name == "bin"
+        and package_root.name == "feature-factory"
+    )
+    valid = (
+        shape_valid
+        and feature_version == FACTORY_VERSION
+        and plugin_version == FACTORY_VERSION
+    )
+    details = [
+        detail
+        for detail in (
+            None if shape_valid else "entrypoint is not package-bound",
+            feature_error,
+            plugin_error,
+            (
+                None
+                if feature_version in {None, FACTORY_VERSION}
+                else f"feature-factory version is {feature_version}"
+            ),
+            (
+                None
+                if plugin_version in {None, FACTORY_VERSION}
+                else f"opencode-feature-factory version is {plugin_version}"
+            ),
+        )
+        if detail
+    ]
+    return FactoryPackageObservation(
+        str(resolved),
+        str(feature_manifest),
+        str(plugin_manifest),
+        feature_version,
+        plugin_version,
+        valid,
+        "; ".join(details),
+    )
 
 
 @dataclass(frozen=True)
