@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+import json
+import logging
 import os
 from pathlib import Path
+import socket
 import stat
 import subprocess
 import tempfile
-import threading
 from typing import Any
+
+import yaml
 
 from .providers import probe_opencode_executable, probe_opencode_version
 from .repository_config import RepositoryInventory
@@ -26,8 +29,10 @@ from .worklink.tool_pins import FACTORY_VERSION, OPENCODE_VERSION, probe_factory
 from .worklink.worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     EXECUTOR_PROTOCOL_IDENTITY,
-    verify_executor_identity,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 class StartupStatus(str, Enum):
@@ -182,6 +187,7 @@ class StartupEnvironment:
     authorized_root_modes: tuple[tuple[str, str], ...] | None = None
     factory_entrypoint: Path = Path(DEFAULT_FACTORY_ENTRYPOINT)
     executor_socket: Path = DEFAULT_EXECUTOR_SOCKET
+    git_executable: Path = Path("/usr/bin/git")
 
 
 Probe = Callable[[], ProbeObservation]
@@ -264,7 +270,7 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         return ProbeObservation(result.version == OPENCODE_VERSION, result.observed)
 
     def git_executable() -> ProbeObservation:
-        path = Path("/usr/bin/git")
+        path = environment.git_executable
         try:
             mode = path.lstat().st_mode
             ok = stat.S_ISREG(mode) and os.access(path, os.X_OK)
@@ -299,10 +305,22 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         )
 
     def inventory_probe() -> ProbeObservation:
+        if not inventory_path.is_file():
+            return ProbeObservation(
+                False,
+                "missing",
+                f"repository inventory is missing: {inventory_path}",
+            )
         try:
             loaded = inventory()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             return ProbeObservation(False, type(exc).__name__, str(exc))
+        if not loaded.declared:
+            return ProbeObservation(
+                False,
+                "malformed",
+                "repository inventory declares no repositories or allowed roots",
+            )
         return ProbeObservation(True, {
             "repositories": len(loaded.repositories),
             "allowed_roots": len(loaded.allowed_roots),
@@ -360,11 +378,11 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         expected = {"root": str(target.root), "origin": target.origin}
         try:
             top = subprocess.run(
-                ["/usr/bin/git", "-C", str(target.root), "rev-parse", "--show-toplevel"],
+                [str(environment.git_executable), "-C", str(target.root), "rev-parse", "--show-toplevel"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False,
             )
             origin = subprocess.run(
-                ["/usr/bin/git", "-C", str(target.root), "config", "--local", "--get", "remote.origin.url"],
+                [str(environment.git_executable), "-C", str(target.root), "config", "--local", "--get", "remote.origin.url"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=False,
             )
             actual_root = str(Path(top.stdout.strip()).resolve()) if top.returncode == 0 else None
@@ -394,19 +412,48 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         return ProbeObservation(len(expected) == 16, {"commands": expected})
 
     def worker_protocol() -> ProbeObservation:
+        expected = EXECUTOR_PROTOCOL_IDENTITY
+        worker = "unavailable"
+        source_commit: str | None = None
         try:
-            source_commit = _run_coroutine(verify_executor_identity(environment.executor_socket))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+                connection.settimeout(5)
+                connection.connect(str(environment.executor_socket))
+                connection.send(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "op": "identity",
+                            "executor_identity": expected,
+                        },
+                        separators=(",", ":"),
+                    ).encode()
+                )
+                response = json.loads(connection.recv(4096))
+            if isinstance(response, dict):
+                actual = response.get("executor_identity")
+                if isinstance(actual, str):
+                    worker = actual
+                commit = response.get("source_commit")
+                if isinstance(commit, str):
+                    source_commit = commit
+            ok = (
+                isinstance(response, dict)
+                and response.get("status") == "identity"
+                and worker == expected
+                and source_commit is not None
+                and len(source_commit) == 40
+                and all(character in "0123456789abcdef" for character in source_commit)
+            )
+            detail = "" if ok else "worker handshake did not match the controller protocol"
         except Exception as exc:
-            return ProbeObservation(False, {
-                "controller": EXECUTOR_PROTOCOL_IDENTITY,
-                "worker": "unavailable",
-                "failure": str(exc),
-            })
-        return ProbeObservation(True, {
-            "controller": EXECUTOR_PROTOCOL_IDENTITY,
-            "worker": EXECUTOR_PROTOCOL_IDENTITY,
+            ok = False
+            detail = str(exc)
+        return ProbeObservation(ok, {
+            "controller": expected,
+            "worker": worker,
             "source_commit": source_commit,
-        })
+        }, detail)
 
     return {
         "coding.feature_state": lambda: ProbeObservation(
@@ -433,26 +480,62 @@ def _worklink_repository(home: Path) -> str | None:
     return WorklinkConfig.load(home / "worklink.yaml").repository
 
 
-def _run_coroutine(coroutine: Any) -> Any:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coroutine)
-    result: list[Any] = []
-    failure: list[BaseException] = []
+def current_startup_environment() -> StartupEnvironment:
+    """Build startup applicability from the deployment's installed surfaces."""
+    from .worklink.backends.registry import WorklinkConfig
 
-    def run() -> None:
-        try:
-            result.append(asyncio.run(coroutine))
-        except BaseException as exc:
-            failure.append(exc)
+    raw_home = os.environ.get("MIMIR_HOME", "").strip()
+    home = Path(raw_home).resolve() if raw_home else Path.cwd().resolve()
+    ready_queue = (
+        home / "skills" / "chainlink-orchestrator" / "pollers.json"
+    ).is_file()
+    worklink = WorklinkConfig.load(home / "worklink.yaml")
+    configured_backends = {
+        worklink.defaults.backend,
+        *worklink.defaults.backend_by_category.values(),
+        *(route.backend for route in worklink.routes),
+    }
+    retained_factory = any(
+        (home / "state" / "worklink" / "factory-runs").glob("*.json")
+    )
+    settings = worklink.backend_settings.get("feature_factory", {})
+    entrypoint = Path(
+        str(
+            settings.get("entrypoint")
+            or os.environ.get("MIMIR_FACTORY_ENTRYPOINT")
+            or DEFAULT_FACTORY_ENTRYPOINT
+        )
+    )
+    return StartupEnvironment(
+        home=home,
+        coding_enabled=True,
+        repositories_configured=(home / "repositories.yaml").is_file(),
+        ready_queue_enabled=ready_queue,
+        factory_recovery_enabled=(
+            retained_factory or (ready_queue and "feature_factory" in configured_backends)
+        ),
+        retained_recovery_enabled=ready_queue,
+        worklink_repository=worklink.repository,
+        factory_entrypoint=entrypoint,
+    )
 
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join()
-    if failure:
-        raise failure[0]
-    return result[0]
+
+def enforce_current_startup_before_tool_registration() -> StartupReport:
+    """Run applicable probes before the coding tool registry can dispatch work."""
+    from .tools.forge import initialize_github_forge_identity
+
+    initialize_github_forge_identity()
+    report = validate_startup(current_startup_environment())
+    report.require_success()
+    for warning in report.warnings:
+        log.warning(
+            "coding startup requirement warning name=%s observed=%r detail=%s; "
+            "dependent tools will be omitted",
+            warning.name,
+            warning.observed,
+            warning.detail,
+        )
+    return report
 
 
 validate_coding_startup = validate_startup

@@ -514,7 +514,7 @@ def _parse_file_tool_roots(
 
 
 def _configure_declared_repositories(
-    home: Path, *, require_coding_target: bool = False,
+    home: Path, *, require_ready_queue_target: bool = False,
 ) -> None:
     """Validate the repository inventory and reconcile its legacy projections."""
     from .repository_config import RepositoryInventory
@@ -569,7 +569,7 @@ def _configure_declared_repositories(
             f"{worklink.repository}"
         )
     declared_target = str(target.root) if target is not None else None
-    if require_coding_target and worklink.repository is not None:
+    if require_ready_queue_target and worklink.repository is not None:
         try:
             target = inventory.coding_target(
                 worklink.repository,
@@ -1181,7 +1181,10 @@ class Config:
         coding_enabled_value = coding_enabled()
         _configure_declared_repositories(
             home,
-            require_coding_target=coding_enabled_value,
+            require_ready_queue_target=(
+                coding_enabled_value
+                and (home / "skills" / "chainlink-orchestrator" / "pollers.json").is_file()
+            ),
         )
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(

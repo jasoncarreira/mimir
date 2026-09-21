@@ -255,7 +255,7 @@ def test_coding_target_requires_one_observable_canonical_rw_binding(
             inventory.coding_target("owner/repo", authorized_roots=roots)
 
 
-def test_only_enabled_coding_target_requires_rw_mode(
+def test_only_active_ready_queue_coding_target_requires_rw_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -277,8 +277,60 @@ def test_only_enabled_coding_target_requires_rw_mode(
 
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    assert Config.from_env().coding_enabled is True
+
+    _clear_legacy(monkeypatch)
+    poller = home / "skills" / "chainlink-orchestrator" / "pollers.json"
+    poller.parent.mkdir(parents=True)
+    poller.write_text("{}", encoding="utf-8")
     with pytest.raises(RuntimeError, match="coding target owner/repo must have mode 'rw'"):
         Config.from_env()
+
+
+def test_ready_queue_target_rw_keeps_unrelated_repository_ro_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = tmp_path / "target"
+    unrelated = tmp_path / "unrelated"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(target, "https://github.com/owner/target.git")
+    _git_checkout(unrelated, "https://github.com/owner/unrelated.git")
+    home.mkdir()
+    (home / "repositories.yaml").write_text(
+        yaml.safe_dump({
+            "repositories": [
+                {"slug": "owner/target", "root": str(target), "mode": "rw",
+                 "origin": "https://github.com/owner/target.git", "base_branch": "main"},
+                {"slug": "owner/unrelated", "root": str(unrelated), "mode": "ro",
+                 "origin": "https://github.com/owner/unrelated.git", "base_branch": "main"},
+            ],
+            "allowed_roots": [{"root": str(allowed), "mode": "ro"}],
+        }),
+        encoding="utf-8",
+    )
+    (home / "worklink.yaml").write_text(
+        "repository: owner/target\n", encoding="utf-8"
+    )
+    poller = home / "skills" / "chainlink-orchestrator" / "pollers.json"
+    poller.parent.mkdir(parents=True)
+    poller.write_text("{}", encoding="utf-8")
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+
+    config = Config.from_env()
+
+    assert dict(config.file_tool_roots) == {
+        str(target.resolve()): "rw",
+        str(unrelated.resolve()): "ro",
+        str(allowed.resolve()): "ro",
+    }
+    assert access_control._configured_repo_write_roots() == [target.resolve()]
+    assert access_control._configured_repo_roots() == [
+        target.resolve(), unrelated.resolve(),
+    ]
 
 
 @pytest.mark.parametrize(

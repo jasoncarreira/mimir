@@ -455,10 +455,8 @@ def probe_opencode_version(
 
 
 def opencode_available() -> bool:
-    """True when the ``opencode`` CLI — which the ``spawn_open_code`` tool
-    shells out to (``opencode run``) — is on ``PATH``.
+    """Validate coding startup before the OpenCode tool can be registered."""
+    from .startup_validation import enforce_current_startup_before_tool_registration
 
-    This is a presence, not auth-state, check for the provider-agnostic
-    coding substrate.
-    """
-    return probe_opencode_executable().executable
+    report = enforce_current_startup_before_tool_registration()
+    return report.check("coding.opencode.executable").status.value == "pass"
