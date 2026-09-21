@@ -29,7 +29,16 @@ from .compute import (
     WorkSpec,
     with_worker_environment,
 )
-from .dispatch_failures import terminal_error
+from .diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    compose_diagnostics,
+    external_active_ingest,
+    legacy_unknown,
+    server_fixed,
+    server_structural,
+    transform_diagnostic,
+)
 
 
 log = logging.getLogger(__name__)
@@ -41,6 +50,7 @@ class CommandResult:
     exit_code: int
     summary: str | None = None
     observed: bool = True
+    summary_diagnostic: DiagnosticEnvelope | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,7 @@ class TestResult:
     observed: bool = True
     counts: TestCounts | None = None
     failed_tests: tuple[str, ...] = ()
+    failed_test_diagnostics: tuple[DiagnosticEnvelope, ...] = ()
     report_error: str | None = None
     # Failed in the gate but passed in isolation; diagnostic, not proof of flakiness.
     flaky_tests: tuple[str, ...] = ()
@@ -76,6 +87,8 @@ class TestResult:
     retention_error: str | None = None
     gate_run_id: str | None = None
     gate_phase: str | None = None
+    summary_diagnostic: DiagnosticEnvelope | None = None
+    skipped_reason_diagnostic: DiagnosticEnvelope | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,8 @@ class WorklinkEvidence:
     # branch updates made after Worklink finished.
     head_sha: str | None = None
     test_env: dict[str, str] = field(default_factory=dict)
+    failure_diagnostic: DiagnosticEnvelope | None = None
+    blocked_diagnostic: DiagnosticEnvelope | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +131,7 @@ class EvidenceValidation:
     review_ready: bool
     reasons: tuple[str, ...]
     evidence: WorklinkEvidence
+    reason_diagnostics: tuple[DiagnosticEnvelope, ...] = ()
 
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
@@ -141,28 +157,53 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     ``TestResult`` produced by the executor's own command run.
     """
     reasons: list[str] = []
+    reason_diagnostics: list[DiagnosticEnvelope] = []
     status = evidence.status
 
     if evidence.failure_reason:
+        diagnostic = _normalize_evidence_diagnostic(
+            evidence.failure_reason, evidence.failure_diagnostic
+        )
         evidence = replace(
             evidence,
-            failure_reason=terminal_error(evidence.failure_reason),
+            failure_reason=diagnostic.text,
+            failure_diagnostic=diagnostic,
+        )
+
+    if evidence.blocked_reason:
+        blocked_diagnostic = _normalize_evidence_diagnostic(
+            evidence.blocked_reason, evidence.blocked_diagnostic, final_line=False
+        )
+        evidence = replace(
+            evidence,
+            blocked_reason=blocked_diagnostic.text,
+            blocked_diagnostic=blocked_diagnostic,
         )
 
     if status not in {"completed", "blocked", "failed"}:
         reasons.append("invalid_status")
+        reason_diagnostics.append(server_fixed("invalid_status"))
         status = "failed"
 
     if status == "blocked" and not evidence.blocked_reason:
         reasons.append("blocked_missing_reason")
+        reason_diagnostics.append(server_fixed("blocked_missing_reason"))
         status = "failed"
 
     if status == "blocked":
-        return EvidenceValidation(status="blocked", review_ready=False, reasons=tuple(reasons), evidence=evidence)
+        return EvidenceValidation(
+            status="blocked",
+            review_ready=False,
+            reasons=tuple(reasons),
+            evidence=evidence,
+            reason_diagnostics=tuple(reason_diagnostics),
+        )
 
     if status == "failed":
         if evidence.failure_reason:
             reasons.append(evidence.failure_reason)
+            assert evidence.failure_diagnostic is not None
+            reason_diagnostics.append(evidence.failure_diagnostic)
         else:
             # A backend that reports "failed" without supplying text used to
             # produce a record with status=failed, failure_reason=null and an
@@ -173,28 +214,36 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
             # the run failed. `blocked` already has `blocked_missing_reason`
             # for exactly this; `failed` now has its counterpart.
             reasons.append("failed_missing_reason")
+            reason_diagnostics.append(server_fixed("failed_missing_reason"))
+            diagnostic = server_structural(
+                f"{evidence.backend} reported failure without a reason",
+                producer_tag=DiagnosticProducer.EVIDENCE,
+            )
             evidence = replace(
                 evidence,
-                failure_reason=(
-                    f"{evidence.backend} reported failure without a reason"
-                ),
+                failure_reason=diagnostic.text,
+                failure_diagnostic=diagnostic,
             )
 
     if status == "completed" and not evidence.files_changed:
         reasons.append("completed_empty_diff")
+        reason_diagnostics.append(server_fixed("completed_empty_diff"))
         status = "failed"
 
     if not evidence.diff_observed:
         reasons.append("diff_not_observed")
+        reason_diagnostics.append(server_fixed("diff_not_observed"))
         status = "failed"
 
     tests_ok = False
     if evidence.tests is None:
         if status == "completed":
             reasons.append("tests_missing")
+            reason_diagnostics.append(server_fixed("tests_missing"))
             status = "failed"
     elif not evidence.tests.observed:
         reasons.append("tests_not_observed")
+        reason_diagnostics.append(server_fixed("tests_not_observed"))
         status = "failed"
     elif evidence.tests.skipped_reason is not None:
         # A recorded skip explains the missing gate; it does not pass it.
@@ -202,10 +251,19 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
     elif evidence.tests.timed_out:
         # A gate budget/configuration fault, not a failing assertion to repair.
         reasons.append("gate_timed_out")
+        reason_diagnostics.append(server_fixed("gate_timed_out"))
         if status == "completed":
             status = "failed"
         if not evidence.failure_reason:
-            evidence = replace(evidence, failure_reason="test gate timed out; check gate timeout configuration")
+            diagnostic = server_fixed(
+                "test gate timed out; check gate timeout configuration",
+                producer_tag=DiagnosticProducer.EVIDENCE,
+            )
+            evidence = replace(
+                evidence,
+                failure_reason=diagnostic.text,
+                failure_diagnostic=diagnostic,
+            )
     elif evidence.tests.exit_code == 0:
         tests_ok = True
     elif evidence.tests.exit_code == 127:
@@ -213,24 +271,57 @@ def validate_evidence(evidence: WorklinkEvidence) -> EvidenceValidation:
         # environment/config error no code change can fix. Distinct reason so
         # retries and #817 repair rounds are not spent on it.
         reasons.append("gate_command_not_found")
+        reason_diagnostics.append(server_fixed("gate_command_not_found"))
         if status == "completed":
             status = "failed"
         if not evidence.failure_reason:
+            diagnostic = server_fixed(
+                "test gate command was not found (exit 127)",
+                producer_tag=DiagnosticProducer.EVIDENCE,
+            )
             evidence = replace(
                 evidence,
-                failure_reason="test gate command was not found (exit 127)",
+                failure_reason=diagnostic.text,
+                failure_diagnostic=diagnostic,
             )
     else:
         reasons.append("tests_failed")
+        reason_diagnostics.append(server_fixed("tests_failed"))
         if status == "completed":
             status = "failed"
         if not evidence.failure_reason:
-            evidence = replace(evidence, failure_reason=_gate_failure_reason(evidence.tests))
+            diagnostic = _gate_failure_diagnostic(evidence.tests)
+            evidence = replace(
+                evidence,
+                failure_reason=diagnostic.text,
+                failure_diagnostic=diagnostic,
+            )
 
     review_ready = status == "completed" and bool(evidence.files_changed) and tests_ok and evidence.diff_observed
     if status != evidence.status:
         evidence = replace(evidence, status=status)
-    return EvidenceValidation(status=status, review_ready=review_ready, reasons=tuple(reasons), evidence=evidence)
+    return EvidenceValidation(
+        status=status,
+        review_ready=review_ready,
+        reasons=tuple(reasons),
+        evidence=evidence,
+        reason_diagnostics=tuple(reason_diagnostics),
+    )
+
+
+def _normalize_evidence_diagnostic(
+    text: str,
+    diagnostic: object,
+    *,
+    final_line: bool = True,
+) -> DiagnosticEnvelope:
+    if isinstance(diagnostic, DiagnosticEnvelope) and diagnostic.text == text:
+        source = diagnostic
+    else:
+        # Mismatched, missing, dictionary, and arbitrary sidecars have no mint
+        # authority. Preserve the display text while failing its provenance closed.
+        source = legacy_unknown(text, producer_tag=DiagnosticProducer.EVIDENCE)
+    return transform_diagnostic(source, final_line=final_line, limit=1000)
 
 
 async def observe_evidence(
@@ -259,6 +350,8 @@ async def observe_evidence(
     skip_test_reason: str | None = None,
     runner: Run | None = None,
     gate_rerun_max_failures: int = 10,
+    failure_diagnostic: DiagnosticEnvelope | None = None,
+    blocked_diagnostic: DiagnosticEnvelope | None = None,
 ) -> EvidenceValidation:
     """Build evidence by observing a normalized checkout after a backend run."""
     return await _observe_evidence_from_ref(
@@ -285,6 +378,8 @@ async def observe_evidence(
         skip_test_reason=skip_test_reason,
         runner=runner,
         gate_rerun_max_failures=gate_rerun_max_failures,
+        failure_diagnostic=failure_diagnostic,
+        blocked_diagnostic=blocked_diagnostic,
         include_checkout_status=True,
         checkout_ref=checkout_ref,
     )
@@ -633,6 +728,8 @@ async def _observe_evidence_from_ref(
     pre_commands: list[CommandResult] | None = None,
     pre_observed: bool = True,
     gate_rerun_max_failures: int = 10,
+    failure_diagnostic: DiagnosticEnvelope | None = None,
+    blocked_diagnostic: DiagnosticEnvelope | None = None,
 ) -> EvidenceValidation:
     runner = runner or _run
     from .checkout import coding_enabled
@@ -658,16 +755,36 @@ async def _observe_evidence_from_ref(
         path_groups.append(_paths_from_status(status.stdout))
     files_changed = _merge_paths(*path_groups)
     commands: list[CommandResult] = list(pre_commands or [])
+    committed_summary = _summarize(committed)
+    stat_summary = stat.stdout.strip()
     commands.extend([
-        CommandResult(f"git diff --name-only {range_ref}", committed.returncode, _summarize(committed)),
-        CommandResult(f"git diff --stat {range_ref}", stat.returncode, stat.stdout.strip()),
+        CommandResult(
+            f"git diff --name-only {range_ref}",
+            committed.returncode,
+            committed_summary,
+            summary_diagnostic=external_active_ingest(
+                committed_summary, producer_tag=DiagnosticProducer.GIT_PROCESS
+            ),
+        ),
+        CommandResult(
+            f"git diff --stat {range_ref}",
+            stat.returncode,
+            stat_summary,
+            summary_diagnostic=external_active_ingest(
+                stat_summary, producer_tag=DiagnosticProducer.GIT_PROCESS
+            ),
+        ),
     ])
     if status is not None:
+        status_summary = _summarize(status)
         commands.append(
             CommandResult(
                 "git status --porcelain=v1 --untracked-files=all",
                 status.returncode,
-                _summarize(status),
+                status_summary,
+                summary_diagnostic=external_active_ingest(
+                    status_summary, producer_tag=DiagnosticProducer.GIT_PROCESS
+                ),
             )
         )
 
@@ -675,18 +792,37 @@ async def _observe_evidence_from_ref(
     checkout_result = None
     if checkout_ref:
         checkout_result = git_run("checkout", "--detach", checkout_ref)
+        checkout_summary = _summarize(checkout_result)
         commands.append(
             CommandResult(
                 f"git checkout --detach {checkout_ref}",
                 checkout_result.returncode,
-                _summarize(checkout_result),
+                checkout_summary,
+                summary_diagnostic=external_active_ingest(
+                    checkout_summary, producer_tag=DiagnosticProducer.GIT_PROCESS
+                ),
             )
         )
     if test_command and skip_test_reason:
-        tests = TestResult(test_command, skipped_reason=skip_test_reason)
+        tests = TestResult(
+            test_command,
+            skipped_reason=skip_test_reason,
+            skipped_reason_diagnostic=legacy_unknown(
+                skip_test_reason, producer_tag=DiagnosticProducer.EVIDENCE
+            ),
+        )
     elif test_command:
         if checkout_result is not None and checkout_result.returncode != 0:
-            tests = TestResult(test_command, None, "checkout failed before test", observed=False)
+            tests = TestResult(
+                test_command,
+                None,
+                "checkout failed before test",
+                observed=False,
+                summary_diagnostic=server_fixed(
+                    "checkout failed before test",
+                    producer_tag=DiagnosticProducer.EVIDENCE,
+                ),
+            )
         else:
             run_id = uuid.uuid4().hex
 
@@ -733,12 +869,25 @@ async def _observe_evidence_from_ref(
                             stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
                         )
                 structured = read_pytest_result(command, report_dir)
-                commands.append(CommandResult(redact_text(command), test.returncode, redact_text(_summarize(test))))
+                command_summary = redact_text(_summarize(test))
+                summary = redact_text(_summarize_test_output(test))
+                commands.append(CommandResult(
+                    redact_text(command),
+                    test.returncode,
+                    command_summary,
+                    summary_diagnostic=external_active_ingest(
+                        command_summary,
+                        producer_tag=DiagnosticProducer.REPOSITORY_TEST,
+                    ),
+                ))
                 observation = replace(
                     structured or TestResult(redact_text(command)),
                     cmd=redact_text(command),
                     exit_code=test.returncode,
-                    summary=redact_text(_summarize_test_output(test)),
+                    summary=summary,
+                    summary_diagnostic=external_active_ingest(
+                        summary, producer_tag=DiagnosticProducer.REPOSITORY_TEST
+                    ),
                     timed_out=timed_out,
                     gate_run_id=run_id,
                     gate_phase=phase,
@@ -866,6 +1015,8 @@ async def _observe_evidence_from_ref(
         model=model,
         failure_reason=failure_reason,
         blocked_reason=blocked_reason,
+        failure_diagnostic=failure_diagnostic,
+        blocked_diagnostic=blocked_diagnostic,
         transcript=transcript,
         test_env=dict(work_spec.backend_config.get("test_env", {})) if work_spec else {},
         executor_tests=executor_tests,
@@ -1100,6 +1251,7 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
         return TestResult(command, report_error="junit_read_error")
 
     failed_tests: tuple[str, ...] = ()
+    failed_test_diagnostics: tuple[DiagnosticEnvelope, ...] = ()
     try:
         payload = json.loads(_gate_read(lastfailed_path, _PYTEST_REPORT_MAX_BYTES))
         if isinstance(payload, dict):
@@ -1107,6 +1259,12 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
                 redact_text(node_id)[:1000]
                 for node_id, is_failed in payload.items()
                 if isinstance(node_id, str) and is_failed is True
+            )
+            failed_test_diagnostics = tuple(
+                external_active_ingest(
+                    node_id, producer_tag=DiagnosticProducer.REPOSITORY_TEST
+                )
+                for node_id in failed_tests
             )
     except (OSError, ValueError):
         pass
@@ -1123,6 +1281,7 @@ def read_pytest_result(command: str, report_dir: Path) -> TestResult | None:
         exit_code=0 if failed == 0 and errors == 0 else 1,
         counts=counts,
         failed_tests=failed_tests,
+        failed_test_diagnostics=failed_test_diagnostics,
     )
 
 
@@ -1145,19 +1304,101 @@ def _command_with_pytest_report(command: str, report_dir: Path) -> str:
     return f"PYTEST_ADDOPTS={shlex.quote(environment['PYTEST_ADDOPTS'])} {command}"
 
 
-def _gate_failure_reason(tests: TestResult) -> str:
+def _gate_failure_diagnostic(tests: TestResult) -> DiagnosticEnvelope:
     counts = tests.counts
     if counts is None:
-        return terminal_error(
-            f"test gate failed (exit {tests.exit_code}); structured counts unavailable"
-            + (f" ({tests.report_error})" if tests.report_error else "")
+        text = f"test gate failed (exit {tests.exit_code}); structured counts unavailable"
+        if tests.report_error:
+            text += f" ({tests.report_error})"
+        if (
+            (tests.exit_code is not None and type(tests.exit_code) is not int)
+            or tests.report_error not in {
+                None,
+                "junit_oversize",
+                "junit_missing",
+                "junit_parse_error",
+                "junit_invalid_counts",
+                "junit_read_error",
+            }
+        ):
+            return transform_diagnostic(
+                legacy_unknown(text, producer_tag=DiagnosticProducer.EVIDENCE),
+                final_line=True,
+                limit=1000,
+            )
+        return transform_diagnostic(
+            server_structural(text, producer_tag=DiagnosticProducer.EVIDENCE),
+            final_line=True,
+            limit=1000,
+        )
+    if not isinstance(counts, TestCounts):
+        return transform_diagnostic(
+            legacy_unknown(
+                "test gate failed; structured counts malformed",
+                producer_tag=DiagnosticProducer.EVIDENCE,
+            ),
+            final_line=True,
+            limit=1000,
         )
     count_text = (
         f"{counts.failed} failed, {counts.errors} errors, {counts.passed} passed, "
         f"{counts.skipped} skipped, {counts.total} total"
     )
-    failures = ", ".join(tests.failed_tests) or "no failing node IDs reported"
-    return terminal_error(f"test gate failed; counts: {count_text}; failures: {failures}")
+    valid_failed_tests = isinstance(tests.failed_tests, tuple) and all(
+        isinstance(node_id, str) for node_id in tests.failed_tests
+    )
+    failures = (
+        ", ".join(tests.failed_tests)
+        if valid_failed_tests and tests.failed_tests
+        else "no failing node IDs reported"
+    )
+    if (
+        not valid_failed_tests
+        or any(
+            type(value) is not int or value < 0
+            for value in (
+                counts.total,
+                counts.failed,
+                counts.errors,
+                counts.passed,
+                counts.skipped,
+            )
+        )
+        or counts.failed + counts.errors + counts.passed + counts.skipped
+        != counts.total
+    ):
+        return transform_diagnostic(
+            legacy_unknown(
+                f"test gate failed; counts: {count_text}; failures: {failures}",
+                producer_tag=DiagnosticProducer.EVIDENCE,
+            ),
+            final_line=True,
+            limit=1000,
+        )
+    structural = server_structural(
+        f"test gate failed; counts: {count_text}; failures: ",
+        producer_tag=DiagnosticProducer.EVIDENCE,
+    )
+    if tests.failed_tests:
+        diagnostic = compose_diagnostics(
+            structural,
+            external_active_ingest(
+                failures, producer_tag=DiagnosticProducer.REPOSITORY_TEST
+            ),
+        )
+    else:
+        diagnostic = compose_diagnostics(
+            structural,
+            server_fixed(
+                failures, producer_tag=DiagnosticProducer.EVIDENCE
+            ),
+        )
+    return transform_diagnostic(diagnostic, final_line=True, limit=1000)
+
+
+def _gate_failure_reason(tests: TestResult) -> str:
+    """Compatibility text view of the typed gate failure diagnostic."""
+    return _gate_failure_diagnostic(tests).text
 
 
 def _gate_results_diverge(
