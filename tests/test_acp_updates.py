@@ -449,27 +449,41 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     event = {"type": "tool_call", "phase": "start", "id": "x", "tool_name": "search"}
     for _ in range(MAX_UPDATE_ITEMS):
         dispatcher.enqueue(event)
-    await publisher.entered.wait()
+    # This generous bound is a hang guard, not a latency assertion.
+    try:
+        await asyncio.wait_for(publisher.entered.wait(), 10)
+    except TimeoutError:
+        pytest.fail("hang guard expired waiting for the worker to enter publish_live")
     # The in-flight publication has freed a slot. Fill it so close cannot
     # enqueue its sentinel before timing out.
     dispatcher.enqueue(event)
-    assert dispatcher.queue.full()
+    assert dispatcher.queue.full(), "precondition failed: update queue is not full"
     monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
     worker = dispatcher._worker
-    assert worker is not None
+    assert worker is not None, "precondition failed: dispatcher worker was not started"
     closing = asyncio.create_task(dispatcher.close())
     try:
         await asyncio.sleep(0)
-        assert not closing.done()
-        await asyncio.wait_for(asyncio.shield(closing), 1)
+        assert not closing.done(), "close did not suspend while the full worker was blocked"
+        # This generous bound is a hang guard, not a latency assertion.
+        done, _ = await asyncio.wait({closing}, timeout=10)
+        assert closing in done, "hang guard expired waiting for close to complete"
+        try:
+            await closing
+        except Exception as exc:
+            pytest.fail(f"close raised unexpectedly: {exc!r}")
         assert worker.cancelled(), "close must stop the worker, not just detach it"
-        assert not dispatcher._publication_failed
-        assert isinstance(dispatcher.failure, TimeoutError)
-        assert not publisher.release.is_set()
-        assert dispatcher._worker is None
-        assert dispatcher.queue.empty()
-        assert dispatcher.queued_bytes == 0
-        await asyncio.wait_for(dispatcher.queue.join(), 1)
+        assert not dispatcher._publication_failed, "close incorrectly recorded a publication failure"
+        assert isinstance(dispatcher.failure, TimeoutError), "close did not retain its timeout failure"
+        assert not publisher.release.is_set(), "close incorrectly released the blocked publisher"
+        assert dispatcher._worker is None, "close did not clear the cancelled worker"
+        assert dispatcher.queue.empty(), "close left updates in the queue"
+        assert dispatcher.queued_bytes == 0, "close left queued byte accounting nonzero"
+        # This generous bound is a hang guard, not a latency assertion.
+        try:
+            await asyncio.wait_for(dispatcher.queue.join(), 10)
+        except TimeoutError:
+            pytest.fail("hang guard expired waiting for the emptied queue to join")
     finally:
         closing.cancel()
         worker.cancel()
