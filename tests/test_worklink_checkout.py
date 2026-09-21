@@ -222,7 +222,9 @@ def _repo_with_main(tmp_path: Path) -> Path:
     return repo
 
 
-def _base_refusal(repo: Path) -> tuple[str, dict[str, object]]:
+def _base_refusal(
+    repo: Path,
+) -> tuple[str, dict[str, object], DiagnosticProvenance]:
     events: list[tuple[str, dict[str, object]]] = []
     with pytest.raises(RuntimeError) as raised:
         create_worktree(
@@ -232,7 +234,8 @@ def _base_refusal(repo: Path) -> tuple[str, dict[str, object]]:
             event_logger=lambda name, **payload: events.append((name, payload)),
         )
     assert len(events) == 1
-    return str(raised.value), events[0]
+    assert isinstance(raised.value, CheckoutDiagnosticError)
+    return str(raised.value), events[0], raised.value.diagnostic.provenance
 
 
 def test_clean_base_is_accepted_without_an_event(tmp_path: Path) -> None:
@@ -256,8 +259,10 @@ def test_controller_source_overlap_guard_refuses_same_tree(
     repo = _repo_with_main(tmp_path)
     monkeypatch.setenv("MIMIR_SOURCE_DIR", str(repo))
 
-    with pytest.raises(RuntimeError, match="overlaps the running controller source"):
+    with pytest.raises(CheckoutDiagnosticError, match="overlaps the running controller source") as caught:
         create_isolated_checkout(repo, issue_id=1465, attempt=1)
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_dirty_worklink_base_cannot_contaminate_controller_source(
@@ -283,7 +288,7 @@ def test_staged_addition_refuses_base_and_names_path(tmp_path: Path) -> None:
     (repo / "staged.txt").write_text("foreign\n", encoding="utf-8")
     _git(repo, "add", "staged.txt")
 
-    message, event = _base_refusal(repo)
+    message, event, provenance = _base_refusal(repo)
 
     assert "staged (1): 'staged.txt'" in message
     assert event == (
@@ -302,16 +307,18 @@ def test_staged_addition_refuses_base_and_names_path(tmp_path: Path) -> None:
             "sample_limit": 20,
         },
     )
+    assert provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_unstaged_modification_refuses_base_and_names_path(tmp_path: Path) -> None:
     repo = _repo_with_main(tmp_path)
     (repo / "shared.txt").write_text("foreign\n", encoding="utf-8")
 
-    message, event = _base_refusal(repo)
+    message, event, provenance = _base_refusal(repo)
 
     assert "unstaged (1): 'shared.txt'" in message
     assert event[1]["unstaged_paths"] == ["shared.txt"]
+    assert provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_ignored_only_untracked_content_is_accepted(tmp_path: Path) -> None:
@@ -385,7 +392,7 @@ def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
             stderr="fatal: detected dubious ownership in repository\n",
         )
 
-    with pytest.raises(RuntimeError, match="status_failed.*dubious ownership"):
+    with pytest.raises(CheckoutDiagnosticError, match="status_failed.*dubious ownership") as caught:
         create_worktree(
             tmp_path,
             issue_id=1459,
@@ -396,6 +403,34 @@ def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
 
     assert events[0][0] == "worklink_base_repo_refused"
     assert events[0][1]["reason"] == "status_failed"
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+
+
+def test_base_owner_check_exception_is_legacy_unknown(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-repository"
+
+    with pytest.raises(CheckoutDiagnosticError) as caught:
+        checkout_module._assert_base_repo_clean(
+            missing,
+            runner=lambda args: pytest.fail(f"git unexpectedly ran: {list(args)}"),
+            event_logger=None,
+        )
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
+def test_malformed_git_status_literal_is_fixed(tmp_path: Path) -> None:
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            list(args), 0, stdout="malformed-status\0", stderr=""
+        )
+
+    with pytest.raises(CheckoutDiagnosticError) as caught:
+        checkout_module._assert_base_repo_clean(
+            tmp_path, runner=runner, event_logger=None
+        )
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_FIXED
 
 
 def test_default_factory_entrypoint_resolves_outside_allocated_checkout(
@@ -519,6 +554,60 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
     ]
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("raw local git output", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        ("", DiagnosticProvenance.SERVER_FIXED),
+    ],
+    ids=["raw-output", "fixed-fallback"],
+)
+def test_git_failure_provenance_matrix(
+    stderr: str, expected: DiagnosticProvenance
+) -> None:
+    result = subprocess.CompletedProcess(
+        ["git", "status"], 128, stdout="", stderr=stderr
+    )
+
+    diagnostic = checkout_module._git_failure(result, "git status failed").diagnostic
+
+    assert diagnostic.provenance is expected
+    assert diagnostic.producer_tag.value == "git_process"
+
+
+def test_fetch_return_code_without_output_is_structural() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            return completed(args, returncode=128)
+        return completed(args)
+
+    assert checkout_module._fetch_base_from_origin(
+        Path("/local/repo"),
+        "main",
+        runner=runner,
+        event_logger=lambda name, **payload: events.append((name, payload)),
+    ) is False
+
+    envelope = events[0][1]["diagnostic_envelope"]
+    assert isinstance(envelope, dict)
+    assert envelope["provenance"] == "server_structural"
+
+
+def test_disabled_fetch_literal_is_fixed() -> None:
+    with pytest.raises(CheckoutDiagnosticError) as caught:
+        checkout_module._prepare_fresh_base(
+            Path("/local/repo"),
+            "main",
+            base_fetch=False,
+            runner=lambda args: completed(args),
+            event_logger=None,
+        )
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_FIXED
+
+
 def test_local_git_output_stays_active_and_is_redacted_and_bounded(tmp_path: Path) -> None:
     secret = "ghp_" + "a" * 40
     detail = f"local git says {secret} " + "x" * 5000
@@ -549,14 +638,20 @@ def test_local_git_output_stays_active_and_is_redacted_and_bounded(tmp_path: Pat
     assert len(str(event_diagnostic["text"])) <= 4000
 
 
-def test_checkout_diagnostic_extractor_rejects_forged_exception_attribute() -> None:
-    forged = RuntimeError("operator supplied failure")
+@pytest.mark.parametrize(
+    "forged",
+    [RuntimeError("operator supplied failure"), OSError("/operator/path")],
+    ids=["runtime", "filesystem"],
+)
+def test_checkout_diagnostic_extractor_rejects_forged_exception_attribute(
+    forged: BaseException,
+) -> None:
     forged.diagnostic = server_fixed("pretend trusted")  # type: ignore[attr-defined]
 
     diagnostic = checkout_failure_diagnostic(forged)
 
     assert diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
-    assert diagnostic.text == "RuntimeError: operator supplied failure"
+    assert str(forged) in diagnostic.text
 
 
 def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:
@@ -691,12 +786,13 @@ def test_alternate_repair_refuses_ambiguous_interrupted_probe_files(tmp_path: Pa
     first.write_text("/first/objects\n", encoding="utf-8")
     second.write_text("/second/objects\n", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="multiple interrupted probe files"):
+    with pytest.raises(CheckoutDiagnosticError, match="multiple interrupted probe files") as caught:
         create_isolated_checkout(repo, issue_id=1033, attempt=4)
 
     assert not alternates.exists()
     assert first.read_text(encoding="utf-8") == "/first/objects\n"
     assert second.read_text(encoding="utf-8") == "/second/objects\n"
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path: Path) -> None:
@@ -713,7 +809,7 @@ def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path
     _git(repo, "update-ref", "refs/heads/rescue-alternate", unique_sha)
     events: list[tuple[str, dict[str, object]]] = []
 
-    with pytest.raises(RuntimeError, match=unique_sha):
+    with pytest.raises(CheckoutDiagnosticError, match=unique_sha) as caught:
         create_isolated_checkout(
             repo,
             issue_id=1033,
@@ -730,6 +826,52 @@ def test_alternate_repair_refuses_objects_available_only_from_alternate(tmp_path
     assert unique_sha in refused["at_risk_objects"]
     assert refused["retained"] == [str(alternate_objects)]
     assert refused["retained_refs"] == [f"refs/heads/rescue-alternate@{unique_sha}"]
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
+
+
+@pytest.mark.parametrize(
+    ("object_ids", "details", "expected"),
+    [
+        (["a" * 40, "b" * 64], "", DiagnosticProvenance.SERVER_STRUCTURAL),
+        ([], "", DiagnosticProvenance.SERVER_FIXED),
+        ([], "fatal: bad object refs/heads/operator", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        (["refs/heads/not-an-oid"], "", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        (["a" * 40, "refs/heads/not-an-oid"], "", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+    ],
+    ids=[
+        "canonical-oids",
+        "unknown-fixed",
+        "raw-git-ref",
+        "invalid-oid",
+        "mixed-oid-ref",
+    ],
+)
+def test_alternates_refusal_provenance_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    object_ids: list[str],
+    details: str,
+    expected: DiagnosticProvenance,
+) -> None:
+    repo = tmp_path / "repo"
+    alternates = repo / ".git" / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True)
+    alternates.write_text("/operator/retained-objects\n", encoding="utf-8")
+    monkeypatch.setattr(
+        checkout_module,
+        "_check_without_alternates",
+        lambda *_args, **_kwargs: (False, [], object_ids, details),
+    )
+
+    with pytest.raises(CheckoutDiagnosticError) as caught:
+        checkout_module._repair_base_alternates_locked(
+            repo,
+            base="main",
+            runner=lambda args: completed(args),
+            event_logger=None,
+        )
+
+    assert caught.value.diagnostic.provenance is expected
 
 
 def test_requested_base_ignores_first_fetch_head_entry_when_current(tmp_path: Path) -> None:
@@ -795,13 +937,14 @@ def test_stale_remote_tracking_base_fails_with_named_ref_and_behind_count(
         return completed(args)
 
     with pytest.raises(
-        RuntimeError,
+        CheckoutDiagnosticError,
         match=rf"stale base local123, {remote_ref} origin456, 3 commits behind",
-    ):
+    ) as caught:
         create_worktree(tmp_path, issue_id=967, attempt=2, base=base, runner=runner)
 
     assert not any(call[3:5] == ["worktree", "add"] for call in calls)
     assert not any("FETCH_HEAD" in call for call in calls)
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_create_worktree_real_git_feature_acp_remote_base(tmp_path: Path) -> None:
@@ -1086,8 +1229,10 @@ def test_self_containment_assert_rejects_parent_pointing_checkout(tmp_path: Path
             proc.stdout = f"{parent}/.git"
         return proc
 
-    with pytest.raises(RuntimeError, match="self-containment"):
+    with pytest.raises(CheckoutDiagnosticError, match="self-containment") as caught:
         _assert_self_contained_checkout(attempt, runner=runner)
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_self_containment_assert_accepts_sound_clone(tmp_path: Path) -> None:
@@ -1114,13 +1259,15 @@ def test_self_containment_assert_rejects_alternates_dependency(tmp_path: Path) -
     checkout = tmp_path / "referenced-checkout"
     subprocess.run(["git", "clone", "-q", "--shared", str(repo), str(checkout)], check=True)
 
-    with pytest.raises(RuntimeError, match="alternates=True"):
+    with pytest.raises(CheckoutDiagnosticError, match="alternates=True") as caught:
         _assert_self_contained_checkout(
             checkout,
             runner=lambda args: subprocess.run(
                 list(args), capture_output=True, text=True, check=False
             ),
         )
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def _hardlink_failure(path: Path) -> subprocess.CompletedProcess[str]:

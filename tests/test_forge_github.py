@@ -12,12 +12,17 @@ from mimir.forge.github import (
     GitHubIdentityFailureKind,
     GitHubIdentityVerificationError,
     bound_diff,
+    confirm_github_identity,
     github_identity_failure_diagnostic,
 )
 from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
 from mimir.tools.forge import initialize_github_forge_identity
-from mimir.worklink.diagnostics import DiagnosticProvenance, server_fixed
+from mimir.worklink.diagnostics import (
+    DiagnosticProducer,
+    DiagnosticProvenance,
+    server_fixed,
+)
 
 
 def _scope() -> RepoPRActionScope:
@@ -505,6 +510,96 @@ def test_identity_error_defaults_legacy_and_generic_forgery_is_ignored() -> None
 
     assert diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
     assert diagnostic.text == "RuntimeError: operator supplied failure"
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected"),
+    [
+        ("confirm-cache-empty", DiagnosticProvenance.SERVER_FIXED),
+        ("confirm-credential-changed", DiagnosticProvenance.SERVER_FIXED),
+        ("confirm-login-mismatch", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        ("declared-empty", DiagnosticProvenance.SERVER_FIXED),
+        ("cached-credential-changed", DiagnosticProvenance.SERVER_FIXED),
+        ("cached-login-mismatch", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        ("transport", DiagnosticProvenance.SERVER_FIXED),
+        ("status", DiagnosticProvenance.SERVER_STRUCTURAL),
+        ("invalid-response-login", DiagnosticProvenance.SERVER_STRUCTURAL),
+        ("response-login-mismatch", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        ("generic-exception", DiagnosticProvenance.LEGACY_UNKNOWN),
+    ],
+)
+def test_github_identity_preflight_provenance_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+    branch: str,
+    expected: DiagnosticProvenance,
+) -> None:
+    token = "local-test-token"
+    fingerprint = github_module._credential_fingerprint(token)
+
+    if branch == "confirm-cache-empty":
+        invoke = lambda: confirm_github_identity("reviewer", token)
+    elif branch == "confirm-credential-changed":
+        monkeypatch.setattr(
+            github_module,
+            "_verified_identity",
+            ("reviewer", github_module._credential_fingerprint("old-token")),
+        )
+        invoke = lambda: confirm_github_identity("reviewer", token)
+    elif branch == "confirm-login-mismatch":
+        monkeypatch.setattr(
+            github_module, "_verified_identity", ("other-bot", fingerprint)
+        )
+        invoke = lambda: confirm_github_identity("reviewer", token)
+    elif branch == "declared-empty":
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([])
+        ).verify_identity("")
+    elif branch == "cached-credential-changed":
+        monkeypatch.setattr(
+            github_module,
+            "_verified_identity",
+            ("reviewer", github_module._credential_fingerprint("old-token")),
+        )
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([])
+        ).verify_identity("reviewer")
+    elif branch == "cached-login-mismatch":
+        monkeypatch.setattr(
+            github_module, "_verified_identity", ("other-bot", fingerprint)
+        )
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([])
+        ).verify_identity("reviewer")
+    elif branch == "transport":
+        class FailingSession:
+            def request(self, *args, **kwargs):
+                raise requests.ConnectionError("local transport detail")
+
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=FailingSession()
+        ).verify_identity("reviewer")
+    elif branch == "status":
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([Response({}, status=403)])
+        ).verify_identity("reviewer")
+    elif branch == "invalid-response-login":
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([Response({"login": "invalid login"})])
+        ).verify_identity("reviewer")
+    elif branch == "response-login-mismatch":
+        invoke = lambda: GitHubForgeClient(
+            token=token, session=Session([Response({"login": "other-bot"})])
+        ).verify_identity("reviewer")
+    else:
+        invoke = lambda: (_ for _ in ()).throw(
+            GitHubIdentityVerificationError("arbitrary adapter exception")
+        )
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        invoke()
+
+    assert caught.value.diagnostic.provenance is expected
+    assert caught.value.diagnostic.producer_tag is DiagnosticProducer.FORGE
 
 
 def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:

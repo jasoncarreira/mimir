@@ -1324,7 +1324,8 @@ def _repair_base_alternates_locked(
                 at_risk_objects=object_ids,
                 worktree_prune=_strip_for_event(worktree_prune.stdout + worktree_prune.stderr),
             )
-        risks = ", ".join(object_ids) or _strip_for_event(details) or "unknown objects"
+        rendered_details = _strip_for_event(details)
+        risks = ", ".join(object_ids) or rendered_details or "unknown objects"
         message = (
             "base repo alternates repair refused; objects are reachable only through "
             f"the retained alternate: {risks}"
@@ -1333,12 +1334,16 @@ def _repair_base_alternates_locked(
             re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)
             for object_id in object_ids
         )
-        if canonical_object_ids and not _strip_for_event(details):
+        if canonical_object_ids:
             source = server_structural(
                 risks, producer_tag=DiagnosticProducer.GIT_PROCESS
             )
-        else:
+        elif object_ids or rendered_details:
             source = external_active_ingest(
+                risks, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        else:
+            source = server_fixed(
                 risks, producer_tag=DiagnosticProducer.GIT_PROCESS
             )
         raise _checkout_failure(
