@@ -46,6 +46,7 @@ from .claims import (
 )
 from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
 from .control import _claim_mutex
+from .diagnostics import DiagnosticProducer, server_structural
 from .factory_state import (
     LIVE_CONTROLLER_PHASES,
     RETAINED_CONTROLLER_PHASES,
@@ -427,13 +428,33 @@ def reap_stale_claims_for_home(
             issue_id=record.issue_id,
             attempt=record.attempt,
             exit_status=None,
-            error=(
+            error=server_structural(
                 "stale autonomous claim reaped after heartbeat expiry; "
-                f"target worklink:{transition}"
+                f"target worklink:{transition}",
+                producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
             ),
-            log_path=os.environ.get("WORKLINK_RUN_LOG"),
-            work_path=state.checkout if state is not None else None,
-            preserved_ref=state.branch if state is not None else None,
+            log_path=(
+                server_structural(
+                    value,
+                    producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+                )
+                if (value := os.environ.get("WORKLINK_RUN_LOG")) else None
+            ),
+            work_path=(
+                server_structural(
+                    state.checkout,
+                    producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+                )
+                if state is not None and state.checkout else None
+            ),
+            preserved_ref=(
+                server_structural(
+                    state.branch,
+                    producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+                )
+                if state is not None and state.branch else None
+            ),
+            target_kind="leaf",
             now=heartbeat.astimezone(timezone.utc),
         )
 

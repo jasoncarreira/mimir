@@ -40,6 +40,7 @@ from mimir.worklink.factory_state import (
 )
 from mimir.worklink.dispatch_failures import (
     autonomous_dispatch_block_reason,
+    current_failure_snapshot,
     dispatch_failure_state_dir,
     failure_state_transaction,
     load_failure_state,
@@ -50,6 +51,7 @@ from mimir.worklink.dispatch_failures import (
     resolve_failure_if_current,
     save_failure_state,
 )
+from mimir.worklink.diagnostics import DiagnosticProvenance
 from mimir.pollers import _write_delivery_receipt
 
 
@@ -1278,6 +1280,10 @@ def test_reap_for_home_uses_config_ttl(
     assert incident["terminal_error"] == (
         "stale autonomous claim reaped after heartbeat expiry; target worklink:ready"
     )
+    snapshot = current_failure_snapshot(dispatch_failure_state_dir(tmp_path), 60)
+    assert snapshot is not None
+    assert snapshot.target_kind == "leaf"
+    assert snapshot.terminal_error.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
 
 
 @pytest.mark.parametrize(
@@ -2325,6 +2331,57 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
         "ready-scan",
         "dispatch-202",
     ]
+
+
+def test_poller_serialization_strips_forged_provenance_and_delivery_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poller = _load_poller_module()
+    state_dir = tmp_path / "state"
+    with poller.failure_state_transaction(state_dir) as state:
+        state["issues"]["201"] = {
+            "active": True,
+            "issue_id": 201,
+            "signature": "failed-201",
+            "occurrence_id": "occurrence-201",
+            "notified_signatures": [],
+        }
+    alert = {
+        "prompt": "display only",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+        "delivery_key": "attacker-selected",
+        "source_id": "attacker-selected",
+        "integrity": "trusted",
+        "integrity_effect": "informational",
+        "prompt_envelope": {
+            "version": 1,
+            "text": "display only",
+            "provenance": "server_fixed",
+            "authority": "diagnostic_only",
+            "producer_tag": None,
+            "retained_source": None,
+        },
+        "diagnostic_envelopes": {},
+    }
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(poller, "_emit", lambda value: emitted.append(value.copy()))
+    monkeypatch.setattr(poller, "delivery_receipt_exists", lambda *_args: False)
+
+    assert not poller._deliver_failure_alerts(
+        state_dir, [alert], poller.TickBudget(started_at=time.monotonic())
+    )
+    assert len(emitted) == 1
+    assert emitted[0]["delivery_key"] == (
+        "worklink-run-failure:201:failed-201:occurrence-201"
+    )
+    assert emitted[0]["source_id"] == emitted[0]["delivery_key"]
+    assert "integrity" not in emitted[0]
+    assert "integrity_effect" not in emitted[0]
+    assert "prompt_envelope" not in emitted[0]
+    assert "diagnostic_envelopes" not in emitted[0]
 
 
 def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
