@@ -535,8 +535,17 @@ def record_failure(
     run_id: str | None = None,
     work_path: str | None = None,
     transcript_path: str | None = None,
+    work_started: bool | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    """Record a dispatch failure.
+
+    ``work_started=False`` is reserved for preconditions decided before this
+    dispatch creates or adopts a checkout/sandbox or invokes a backend. Such a
+    refusal is retained for diagnosis, but is inactive and does not consume an
+    attempt. The default preserves the historical attempt-based classification
+    for callers that do not own that lifecycle boundary.
+    """
     now = now or datetime.now(UTC)
     full_error = redact_text(str(error))[:4000]
     safe_error = terminal_error(error)
@@ -562,8 +571,11 @@ def record_failure(
         key = str(issue_id)
         prior = state["issues"].get(key)
         prior = prior if isinstance(prior, dict) else {}
+        prework_refusal = work_started is False
         same_occurrence = (
-            prior.get("active") is True and prior.get("signature") == signature
+            not prework_refusal
+            and prior.get("active") is True
+            and prior.get("signature") == signature
         )
         consecutive = (
             int(prior.get("consecutive", 0)) + 1
@@ -575,10 +587,10 @@ def record_failure(
             MAX_BACKOFF_MINUTES,
         )
         entry = {
-            "active": True,
+            "active": not prework_refusal,
             "issue_id": issue_id,
             "attempt": attempt,
-            "attempt_consumed": attempt is not None,
+            "attempt_consumed": attempt is not None and not prework_refusal,
             "exit_status": exit_status,
             "terminal_error": safe_error,
             "signature": signature,
@@ -591,7 +603,11 @@ def record_failure(
                 str(prior.get("failed_at") or now.isoformat())
                 if same_occurrence else now.isoformat()
             ),
-            "retry_after": (now + timedelta(minutes=delay)).isoformat(),
+            "retry_after": (
+                None
+                if prework_refusal
+                else (now + timedelta(minutes=delay)).isoformat()
+            ),
             "log_path": redact_text(
                 log_path if log_path is not None else str(prior.get("log_path") or "")
             )[:1000],

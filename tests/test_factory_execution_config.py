@@ -340,7 +340,7 @@ def test_legacy_factory_recovery_refuses_before_git_or_lock_mutation(tmp_path, m
     retained = SimpleNamespace(
         issue_id=41, run_id=orchestrator.factory_record_run_ids(41)[0], repository="owner/repo",
         base_ref="main", launcher=str(launcher), controller_phase="failed", session="retained",
-        sandbox=str(tmp_path / "repo/41-2/.factory-sandboxes/run"), branch="feature/run",
+        sandbox=str(tmp_path / "repo/41-2/.factory-sandboxes/run"), branch="feature/run", status=None,
     )
     Path(retained.sandbox).mkdir(parents=True)
     verify = Mock(return_value="head")
