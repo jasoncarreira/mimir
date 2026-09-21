@@ -216,14 +216,18 @@ def factory_records_dir(home: Path) -> Path:
 
 
 @contextmanager
-def factory_checkout_interlock(home: Path, *, pruning: bool = False) -> Iterator[bool]:
-    """Try a home-wide, cross-process checkout lock without waiting.
+def retained_target_interlock(home: Path, *, pruning: bool = False) -> Iterator[bool]:
+    """Try the shared home-wide retained-target lock without waiting.
 
     Controllers hold a shared lock from before the authoritative retained read
     through supervision/finalization (not just durable handle publication).
     Pruners hold an exclusive lock across record reads and checkout deletion,
     returning without doing either when acquisition fails. Never unlink this
     stable lock file: replacing its inode would split the interlock.
+
+    The global lock order is this interlock, then a recovery-record lock, then
+    retained-state rereads, then a short incident snapshot/CAS. Callers must not
+    acquire this interlock while holding any later lock in that order.
     """
     directory_fd: int | None = None
     lock_fd: int | None = None
@@ -264,6 +268,13 @@ def factory_checkout_interlock(home: Path, *, pruning: bool = False) -> Iterator
             os.close(lock_fd)
         if directory_fd is not None:
             os.close(directory_fd)
+
+
+@contextmanager
+def factory_checkout_interlock(home: Path, *, pruning: bool = False) -> Iterator[bool]:
+    """Compatibility name for the shared retained-target interlock."""
+    with retained_target_interlock(home, pruning=pruning) as acquired:
+        yield acquired
 
 
 def factory_record_run_ids(issue_id: int) -> tuple[str, str]:
