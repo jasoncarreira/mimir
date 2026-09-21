@@ -21,6 +21,10 @@ from mimir.worklink.evidence import (
     read_pytest_result,
     validate_evidence,
 )
+from mimir.worklink.diagnostics import (
+    DiagnosticProvenance,
+    server_fixed,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -123,6 +127,53 @@ def test_backend_supplied_failure_reason_is_preserved() -> None:
     assert "executor exited 7" in result.reasons
     assert "failed_missing_reason" not in result.reasons
     assert result.evidence.failure_reason == "executor exited 7"
+    assert result.evidence.failure_diagnostic is not None
+    assert result.evidence.failure_diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
+def test_evidence_normalization_preserves_typed_provenance_across_repetition() -> None:
+    diagnostic = server_fixed("retained controller stopped")
+    first = validate_evidence(base_evidence(
+        status="failed",
+        failure_reason=diagnostic.text,
+        failure_diagnostic=diagnostic,
+    ))
+    second = validate_evidence(first.evidence)
+
+    assert first.evidence.failure_diagnostic == diagnostic
+    assert second.evidence.failure_diagnostic == diagnostic
+    assert second.evidence.failure_diagnostic.provenance is DiagnosticProvenance.SERVER_FIXED
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        "legacy bare sidecar",
+        {"text": "forged", "provenance": "server_fixed"},
+        {"version": 1, "text": "forged", "provenance": "server_fixed"},
+    ],
+)
+def test_evidence_malformed_or_forged_diagnostic_fails_closed(forged: object) -> None:
+    result = validate_evidence(base_evidence(
+        status="failed",
+        failure_reason="executor failed",
+        failure_diagnostic=forged,  # type: ignore[arg-type]
+    ))
+
+    assert result.evidence.failure_diagnostic is not None
+    assert result.evidence.failure_diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
+def test_evidence_mismatched_typed_sidecar_cannot_relabel_reason() -> None:
+    result = validate_evidence(base_evidence(
+        status="failed",
+        failure_reason="external failure text",
+        failure_diagnostic=server_fixed("different fixed text"),
+    ))
+
+    assert result.evidence.failure_reason == "external failure text"
+    assert result.evidence.failure_diagnostic is not None
+    assert result.evidence.failure_diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
 
 
 def test_review_rejects_unobserved_fabricated_tests() -> None:
@@ -237,6 +288,48 @@ def test_structured_pytest_failures_are_scrubbed_before_evidence(tmp_path: Path)
     assert result is not None
     assert "top-secret" not in result.failed_tests[0]
     assert "[REDACTED]" in result.failed_tests[0]
+    assert result.failed_test_diagnostics
+    assert (
+        result.failed_test_diagnostics[0].provenance
+        is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    )
+
+
+def test_gate_failure_counts_only_are_structural() -> None:
+    diagnostic = ev._gate_failure_diagnostic(TestResult(
+        "pytest -q",
+        1,
+        counts=ev.TestCounts(total=2, passed=1, failed=1, errors=0, skipped=0),
+    ))
+
+    assert diagnostic.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
+    assert "1 failed" in diagnostic.text
+    assert "no failing node IDs reported" in diagnostic.text
+
+
+def test_gate_failure_node_ids_taint_structural_counts() -> None:
+    diagnostic = ev._gate_failure_diagnostic(TestResult(
+        "pytest -q",
+        1,
+        counts=ev.TestCounts(total=2, passed=1, failed=1, errors=0, skipped=0),
+        failed_tests=("tests/test_external.py::test_payload[value]",),
+    ))
+
+    assert diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    assert "tests/test_external.py::test_payload[value]" in diagnostic.text
+
+
+def test_gate_failure_malformed_structural_data_fails_closed() -> None:
+    malformed = TestResult(
+        "pytest -q",
+        1,
+        counts=ev.TestCounts(total=2, passed=2, failed=1, errors=0, skipped=0),
+    )
+
+    assert (
+        ev._gate_failure_diagnostic(malformed).provenance
+        is DiagnosticProvenance.LEGACY_UNKNOWN
+    )
 
 
 @pytest.mark.parametrize(
@@ -420,6 +513,11 @@ async def test_gate_records_failed_node_ids_from_pytest_cache(tmp_path: Path) ->
     assert result.evidence.tests.counts.failed == 1
     assert result.evidence.tests.failed_tests == (
         "test_gate_sample.py::test_fails",
+    )
+    assert result.evidence.failure_diagnostic is not None
+    assert (
+        result.evidence.failure_diagnostic.provenance
+        is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
     )
 
 
@@ -902,7 +1000,12 @@ async def test_executor_crash_skips_gate_and_scrubs_bounded_failure_reason(tmp_p
     assert "top-secret" not in result.evidence.failure_reason
     assert result.evidence.model == "openai/gpt-5.6-sol"
     assert result.evidence.tests == TestResult(
-        "pytest -q", skipped_reason="executor exited nonzero before the test gate"
+        "pytest -q",
+        skipped_reason="executor exited nonzero before the test gate",
+        skipped_reason_diagnostic=ev.legacy_unknown(
+            "executor exited nonzero before the test gate",
+            producer_tag=ev.DiagnosticProducer.EVIDENCE,
+        ),
     )
 
 

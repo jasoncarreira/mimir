@@ -19,6 +19,16 @@ import subprocess
 import time
 from typing import Any, Callable, Iterable, Sequence
 
+from .diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    external_active_ingest,
+    legacy_unknown,
+    server_fixed,
+    server_structural,
+    with_least_trusted_provenance,
+)
+
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
 
@@ -76,6 +86,14 @@ log = logging.getLogger(__name__)
 
 class _ChainlinkContentionExhausted(RuntimeError):
     pass
+
+
+class ChainlinkDiagnosticError(RuntimeError):
+    """A Chainlink failure whose provenance was set by this adapter."""
+
+    def __init__(self, diagnostic: DiagnosticEnvelope) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.text)
 
 
 def scope_active_worklink_lock_ids(
@@ -192,6 +210,23 @@ class ClaimResult:
     record: ClaimRecord | None = None
     attempts_exhausted: bool = False
     reason: str | None = None
+    reason_diagnostic: DiagnosticEnvelope | None = None
+
+
+def _claim_refusal(
+    reason: str,
+    *,
+    diagnostic: DiagnosticEnvelope | None = None,
+    attempts_exhausted: bool = False,
+) -> ClaimResult:
+    return ClaimResult(
+        False,
+        attempts_exhausted=attempts_exhausted,
+        reason=reason,
+        reason_diagnostic=diagnostic or server_fixed(
+            reason, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -386,7 +421,7 @@ class ChainlinkClaims:
         if labels is not None:
             label_set.update(labels)
         if "worklink:review" in label_set:
-            return ClaimResult(False, reason="lifecycle_state_incompatible")
+            return _claim_refusal("lifecycle_state_incompatible")
 
         claim_home = Path(home_path) if home_path is not None else self.home_path
         if claim_home is not None:
@@ -400,7 +435,7 @@ class ChainlinkClaims:
                     issue_id,
                     intent_path,
                 )
-                return ClaimResult(False, reason="publication_intent_exists")
+                return _claim_refusal("publication_intent_exists")
 
         review_ready = self.review_ready_evidence(issue_id, home_path=home_path)
         if review_ready is not None:
@@ -419,16 +454,24 @@ class ChainlinkClaims:
                 review_ready.path,
                 review_ready.payload.get("pr_url"),
             )
-            return ClaimResult(False, reason="review_ready_evidence_exists")
+            return _claim_refusal("review_ready_evidence_exists")
 
         try:
             lock = self._claim_lock_with_retry(
                 issue_id, home_path=claim_home, before_claim=before_claim
             )
         except _ChainlinkContentionExhausted:
-            return ClaimResult(False, reason="claim_contention_exhausted")
+            return _claim_refusal("claim_contention_exhausted")
         if lock.returncode != 0:
-            return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
+            detail = (lock.stderr or lock.stdout).strip()
+            if detail:
+                return _claim_refusal(
+                    detail,
+                    diagnostic=external_active_ingest(
+                        detail, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
+                    ),
+                )
+            return _claim_refusal("claim_failed")
         if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
             # chainlink #822: the chainlink CLI treats a same-agent re-claim as
             # idempotent success ("You already hold the lock", rc=0). All poller
@@ -452,7 +495,25 @@ class ChainlinkClaims:
                         issue_id=issue_id,
                         error=f"{type(exc).__name__}: {exc}"[:500],
                     )
-                return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
+                reason = f"claim_guard_{guard_outcome}"
+                source = (
+                    exc.diagnostic
+                    if isinstance(exc, ChainlinkDiagnosticError)
+                    else legacy_unknown(
+                        exc, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
+                    )
+                )
+                return _claim_refusal(
+                    reason,
+                    diagnostic=with_least_trusted_provenance(
+                        reason,
+                        server_structural(
+                            reason,
+                            producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                        ),
+                        source,
+                    ),
+                )
             for existing in claim_records_from_comments(guard_comments):
                 if existing.issue_id != issue_id:
                     continue
@@ -462,7 +523,7 @@ class ChainlinkClaims:
                 anchor = latest.heartbeat_at or latest.claimed_at
                 age_s = (self.clock() - anchor).total_seconds()
                 if age_s < self.duplicate_freshness_s:
-                    return ClaimResult(False, reason="duplicate_run_live")
+                    return _claim_refusal("duplicate_run_live")
                 guard_outcome = "stale_heartbeat"
             steal = self._run("locks", "steal", str(issue_id), check=False)
             self._emit_claim_stolen(
@@ -483,7 +544,7 @@ class ChainlinkClaims:
         if attempts_used >= self.max_attempts:
             self.release_issue(issue_id)
             self._attempts_exhausted(issue_id, attempts_used)
-            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
+            return _claim_refusal("attempts_exhausted", attempts_exhausted=True)
 
         if max_active_locks is not None:
             try:
@@ -503,11 +564,14 @@ class ChainlinkClaims:
                     if lock_id > 0 and lock_id != issue_id
                 )
                 ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
-                return ClaimResult(
-                    False,
-                    reason=(
-                        f"concurrency cap reached ({active - 1}/{max_active_locks} active "
-                        f"claims before this reservation{ids_suffix})"
+                reason = (
+                    f"concurrency cap reached ({active - 1}/{max_active_locks} active "
+                    f"claims before this reservation{ids_suffix})"
+                )
+                return _claim_refusal(
+                    reason,
+                    diagnostic=server_structural(
+                        reason, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
                     ),
                 )
 
@@ -1257,20 +1321,37 @@ class ChainlinkClaims:
         result = self._run("issue", "show", str(issue_id), "--json", check=False)
         if result.returncode != 0:
             if strict:
-                raise RuntimeError("chainlink issue show failed while reading comments")
+                detail = (result.stderr or result.stdout).strip()
+                diagnostic = (
+                    external_active_ingest(
+                        detail, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
+                    )
+                    if detail
+                    else server_fixed(
+                        "chainlink issue show failed while reading comments",
+                        producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                    )
+                )
+                raise ChainlinkDiagnosticError(diagnostic)
             return []
         try:
             payload = json.loads(result.stdout if strict else result.stdout or "{}")
         except json.JSONDecodeError:
             if strict:
-                raise
+                raise ChainlinkDiagnosticError(server_fixed(
+                    "chainlink issue show returned invalid JSON",
+                    producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                )) from None
             return []
         if strict and (
             not isinstance(payload, dict)
             or not isinstance(payload.get("comments"), list)
             or any(not isinstance(item, (str, dict)) for item in payload["comments"])
         ):
-            raise RuntimeError("chainlink issue show returned unexpected comments shape")
+            raise ChainlinkDiagnosticError(server_fixed(
+                "chainlink issue show returned unexpected comments shape",
+                producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+            ))
         out: list[str] = []
         for item in payload.get("comments") or ():
             if isinstance(item, str):
@@ -1369,5 +1450,16 @@ class ChainlinkClaims:
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         result = self._run_with_retry(*args, home_path=self.home_path)
         if check and result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout).strip() or f"chainlink {' '.join(args)} failed")
+            detail = (result.stderr or result.stdout).strip()
+            diagnostic = (
+                external_active_ingest(
+                    detail, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
+                )
+                if detail
+                else server_structural(
+                    f"chainlink {' '.join(args)} failed",
+                    producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                )
+            )
+            raise ChainlinkDiagnosticError(diagnostic)
         return result

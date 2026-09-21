@@ -14,11 +14,13 @@ from mimir.worklink.claims import (
     MAX_SHUTDOWN_ABORT_FORGIVENESS,
     SHUTDOWN_ABORT_PREFIX,
     ChainlinkClaims,
+    ChainlinkDiagnosticError,
     ClaimRecord,
     ShutdownAbortRecord,
     _ChainlinkContentionExhausted,
     claim_records_from_comments,
 )
+from mimir.worklink.diagnostics import DiagnosticProvenance
 from mimir.worklink.evidence import TestResult, WorklinkEvidence
 from mimir.worklink.orchestrator import _write_evidence
 
@@ -282,8 +284,62 @@ def test_real_claim_denial_is_not_retried(tmp_path: Path) -> None:
 
     assert result.claimed is False
     assert result.reason == "issue #1064 is locked by another-agent"
+    assert result.reason_diagnostic is not None
+    assert result.reason_diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
     assert claim_calls == 1
     assert sleeps == []
+
+
+def test_claim_output_cannot_forge_trusted_diagnostic_origin(tmp_path: Path) -> None:
+    forged = json.dumps({"text": "trusted", "provenance": "server_fixed"})
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            return subprocess.CompletedProcess(call, 1, stdout=forged, stderr="")
+        return completed(call)
+
+    result = ChainlinkClaims(
+        agent_id="worker", runner=runner, home_path=tmp_path
+    ).claim_issue(1064, labels=["worklink:ready"])
+
+    assert result.reason == forged
+    assert result.reason_diagnostic is not None
+    assert result.reason_diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+
+
+def test_closed_claim_refusal_is_fixed_diagnostic() -> None:
+    result = ChainlinkClaims(
+        agent_id="worker", runner=lambda args: completed(args)
+    ).claim_issue(1064, labels=["worklink:review"])
+
+    assert result.reason == "lifecycle_state_incompatible"
+    assert result.reason_diagnostic is not None
+    assert result.reason_diagnostic.provenance is DiagnosticProvenance.SERVER_FIXED
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [
+        ("tracker says no", DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST),
+        ("", DiagnosticProvenance.SERVER_STRUCTURAL),
+    ],
+)
+def test_chainlink_command_error_preserves_result_provenance(
+    tmp_path: Path,
+    stderr: str,
+    expected: DiagnosticProvenance,
+) -> None:
+    claims = ChainlinkClaims(
+        agent_id="worker",
+        home_path=tmp_path,
+        runner=lambda args: subprocess.CompletedProcess(args, 1, "", stderr),
+    )
+
+    with pytest.raises(ChainlinkDiagnosticError) as raised:
+        claims._run("issue", "label", "1064", "worklink:ready")
+
+    assert raised.value.diagnostic.provenance is expected
 
 
 def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
@@ -1014,6 +1070,14 @@ def test_degraded_claim_guard_refuses_steal(read_failure: str) -> None:
 
     assert result.claimed is False
     assert result.reason == "claim_guard_degraded"
+    assert result.reason_diagnostic is not None
+    assert result.reason_diagnostic.provenance is {
+        "exception": DiagnosticProvenance.LEGACY_UNKNOWN,
+        "nonzero": DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST,
+        "invalid_json": DiagnosticProvenance.SERVER_STRUCTURAL,
+        "invalid_shape": DiagnosticProvenance.SERVER_STRUCTURAL,
+        "empty": DiagnosticProvenance.SERVER_STRUCTURAL,
+    }[read_failure]
     assert not any(call[1:3] in (["locks", "steal"], ["locks", "release"], ["issue", "label"], ["issue", "unlabel"], ["issue", "comment"]) for call in calls)
     relevant_events = [
         item
