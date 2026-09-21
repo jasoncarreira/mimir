@@ -18,6 +18,15 @@ from typing import Any, Callable, Sequence
 
 from .._rmtree import rmtree_missing_ok
 from ..coding import coding_enabled
+from .diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    external_active_ingest,
+    legacy_unknown,
+    server_fixed,
+    server_structural,
+    with_least_trusted_provenance,
+)
 from .identities import get_identities
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -28,6 +37,45 @@ _REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
 _OPENCODE_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/opencode-checkouts")
 _AUTHORIZATION_FACTORY = object()
 _DIRTY_PATH_SAMPLE_LIMIT = 20
+
+
+class CheckoutDiagnosticError(RuntimeError):
+    """Checkout failure carrying server-minted diagnostic provenance."""
+
+    def __init__(self, diagnostic: DiagnosticEnvelope) -> None:
+        if not isinstance(diagnostic, DiagnosticEnvelope):
+            raise TypeError("checkout diagnostic errors require a typed envelope")
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.text)
+
+
+def checkout_failure_diagnostic(error: BaseException) -> DiagnosticEnvelope:
+    """Return producer provenance without trusting arbitrary exception attributes."""
+    if isinstance(error, CheckoutDiagnosticError):
+        return error.diagnostic
+    return legacy_unknown(error, producer_tag=DiagnosticProducer.CHECKOUT)
+
+
+def _git_failure(
+    result: subprocess.CompletedProcess[str], fallback: str
+) -> CheckoutDiagnosticError:
+    detail = (result.stderr or result.stdout).strip()
+    if detail:
+        diagnostic = external_active_ingest(
+            detail, producer_tag=DiagnosticProducer.GIT_PROCESS
+        )
+    else:
+        diagnostic = server_fixed(
+            fallback, producer_tag=DiagnosticProducer.GIT_PROCESS
+        )
+    return CheckoutDiagnosticError(diagnostic)
+
+
+def _checkout_failure(
+    text: str,
+    source: DiagnosticEnvelope,
+) -> CheckoutDiagnosticError:
+    return CheckoutDiagnosticError(with_least_trusted_provenance(text, source))
 
 
 def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -42,9 +90,14 @@ def _assert_base_separate_from_controller(repo: Path) -> None:
     base = repo.resolve()
     source = Path(source_raw).resolve()
     if base == source or base.is_relative_to(source) or source.is_relative_to(base):
-        raise RuntimeError(
+        message = (
             "Worklink base repository overlaps the running controller source: "
             f"WORKLINK_REPO={base}, MIMIR_SOURCE_DIR={source}; provision a dedicated base clone"
+        )
+        raise CheckoutDiagnosticError(
+            external_active_ingest(
+                message, producer_tag=DiagnosticProducer.CHECKOUT
+            )
         )
 
 
@@ -113,7 +166,7 @@ def create_worktree(
         ]
     )
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree add failed")
+        raise _git_failure(result, "git worktree add failed")
     return CheckoutLease(
         issue_id=issue_id,
         attempt=attempt,
@@ -167,7 +220,7 @@ def _clone_attempt_checkout(
         return
     detail = (clone.stderr or clone.stdout).strip()
     if no_hardlinks or _HARDLINK_FAILURE_MARKER not in detail:
-        raise RuntimeError(detail or "git clone failed")
+        raise _git_failure(clone, "git clone failed")
 
     # The failed clone leaves a partial directory; --no-hardlinks needs a clean
     # target, and create_isolated_checkout already refused a pre-existing path.
@@ -186,8 +239,16 @@ def _clone_attempt_checkout(
         ["git", "clone", "--local", "--no-hardlinks", "--quiet", str(repo), str(path)],
     )
     if copied.returncode != 0:
-        raise RuntimeError(
-            (copied.stderr or copied.stdout).strip() or "git clone failed",
+        copied_error = _git_failure(copied, "git clone failed")
+        raise _checkout_failure(
+            copied_error.diagnostic.text,
+            with_least_trusted_provenance(
+                detail,
+                external_active_ingest(
+                    detail, producer_tag=DiagnosticProducer.GIT_PROCESS
+                ),
+                copied_error.diagnostic,
+            ),
         )
 
 
@@ -486,9 +547,8 @@ def _configure_build_identity(
     for key, value in (("user.name", name), ("user.email", email)):
         applied = runner(["git", "-C", str(path), "config", key, value])
         if applied.returncode != 0:
-            raise RuntimeError(
-                (applied.stderr or applied.stdout).strip()
-                or f"git config {key} failed for the attempt checkout"
+            raise _git_failure(
+                applied, f"git config {key} failed for the attempt checkout"
             )
     if event_logger is not None:
         event_logger(
@@ -548,7 +608,12 @@ def create_isolated_checkout(
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
-        raise RuntimeError(f"attempt checkout already exists: {path}")
+        raise CheckoutDiagnosticError(
+            external_active_ingest(
+                f"attempt checkout already exists: {path}",
+                producer_tag=DiagnosticProducer.CHECKOUT,
+            )
+        )
     if factory_worker:
         # Never expose the tree while the executor transfers ownership. The
         # enclosing attempt remains controller-owned after the worker starts.
@@ -580,15 +645,12 @@ def create_isolated_checkout(
     )
     start_sha = runner(["git", "-C", str(repo), "rev-parse", "--verify", start_point])
     if start_sha.returncode != 0:
-        raise RuntimeError((start_sha.stderr or start_sha.stdout).strip() or "git rev-parse failed")
+        raise _git_failure(start_sha, "git rev-parse failed")
     local_base = start_sha.stdout.strip()
 
     parent_push = runner(["git", "-C", str(repo), "remote", "get-url", "--push", "origin"])
     if parent_push.returncode != 0 or not parent_push.stdout.strip():
-        raise RuntimeError(
-            (parent_push.stderr or parent_push.stdout).strip()
-            or "git remote get-url --push origin failed"
-        )
+        raise _git_failure(parent_push, "git remote get-url --push origin failed")
     wanted_push_target = parent_push.stdout.strip()
 
     previous_umask = os.umask(0o007) if worker_accessible else None
@@ -605,21 +667,25 @@ def create_isolated_checkout(
             ["git", "-C", str(path), "remote", "set-url", "origin", wanted_push_target]
         )
         if set_remote.returncode != 0:
-            raise RuntimeError((set_remote.stderr or set_remote.stdout).strip() or "git remote set-url failed")
+            raise _git_failure(set_remote, "git remote set-url failed")
 
         checkout_push = runner(
             ["git", "-C", str(path), "remote", "get-url", "--push", "origin"]
         )
         if checkout_push.returncode != 0:
-            raise RuntimeError(
-                (checkout_push.stderr or checkout_push.stdout).strip()
-                or "isolated checkout push-target verification failed"
+            raise _git_failure(
+                checkout_push, "isolated checkout push-target verification failed"
             )
         observed_push_target = checkout_push.stdout.strip()
         if observed_push_target != wanted_push_target:
-            raise RuntimeError(
+            message = (
                 "isolated checkout push-target mismatch: "
                 f"wanted {wanted_push_target!r}, observed {observed_push_target!r}"
+            )
+            raise CheckoutDiagnosticError(
+                external_active_ingest(
+                    message, producer_tag=DiagnosticProducer.GIT_PROCESS
+                )
             )
     except RuntimeError:
         shutil.rmtree(path, ignore_errors=True)
@@ -627,7 +693,7 @@ def create_isolated_checkout(
 
     checkout = runner(["git", "-C", str(path), "checkout", "-B", branch, local_base])
     if checkout.returncode != 0:
-        raise RuntimeError((checkout.stderr or checkout.stdout).strip() or "git checkout failed")
+        raise _git_failure(checkout, "git checkout failed")
 
     try:
         _configure_build_identity(repo, path, runner=runner, event_logger=event_logger)
@@ -656,9 +722,13 @@ def create_isolated_checkout(
                 )
             finally:
                 os.close(checkout_fd)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as exc:
         shutil.rmtree(path, ignore_errors=True)
-        raise
+        if isinstance(exc, CheckoutDiagnosticError):
+            raise
+        raise CheckoutDiagnosticError(
+            legacy_unknown(exc, producer_tag=DiagnosticProducer.CHECKOUT)
+        ) from exc
 
     return CheckoutLease(
         issue_id=issue_id,
@@ -709,6 +779,17 @@ def _fetch_base_from_origin(
     if result.returncode == 0 and not _dangling_alternates(repo):
         return True
     if event_logger is not None:
+        output = (result.stderr or result.stdout).strip()
+        diagnostic = (
+            external_active_ingest(
+                output, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+            if output
+            else server_structural(
+                f"git fetch failed with return code {result.returncode}",
+                producer_tag=DiagnosticProducer.GIT_PROCESS,
+            )
+        )
         event_logger(
             "worklink_base_fetch_failed",
             repo=str(repo),
@@ -716,6 +797,7 @@ def _fetch_base_from_origin(
             returncode=result.returncode,
             stdout=_strip_for_event(result.stdout),
             stderr=_strip_for_event(result.stderr),
+            diagnostic_envelope=diagnostic.to_dict(),
         )
     return False
 
@@ -730,17 +812,38 @@ def _prepare_fresh_base(
 ) -> str:
     """Return a fetched, locally resolvable base that contains origin's fetched tip."""
     if not base_fetch:
-        raise RuntimeError("base repo fetch is disabled; refusing to build on an unverified base")
+        raise CheckoutDiagnosticError(
+            server_fixed(
+                "base repo fetch is disabled; refusing to build on an unverified base",
+                producer_tag=DiagnosticProducer.CHECKOUT,
+            )
+        )
     _assert_base_repo_clean(repo, runner=runner, event_logger=event_logger)
     _repair_base_alternates(repo, base=base, runner=runner, event_logger=event_logger)
     if not _fetch_base_from_origin(repo, base, runner=runner, event_logger=event_logger):
-        raise RuntimeError(f"base repo fetch failed for origin/{base.removeprefix('origin/')}")
+        message = f"base repo fetch failed for origin/{base.removeprefix('origin/')}"
+        raise CheckoutDiagnosticError(
+            external_active_ingest(
+                message, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        )
 
     remote_base = base.removeprefix("origin/")
     fetched_ref = f"origin/{remote_base}"
     fetched = runner(["git", "-C", str(repo), "rev-parse", "--verify", fetched_ref])
     if fetched.returncode != 0 or not fetched.stdout.strip():
-        raise RuntimeError(f"fetched base tip is not resolvable as {fetched_ref}")
+        message = f"fetched base tip is not resolvable as {fetched_ref}"
+        source = (
+            external_active_ingest(
+                (fetched.stderr or fetched.stdout).strip(),
+                producer_tag=DiagnosticProducer.GIT_PROCESS,
+            )
+            if (fetched.stderr or fetched.stdout).strip()
+            else external_active_ingest(
+                fetched_ref, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        )
+        raise _checkout_failure(message, source)
     fetched_tip = fetched.stdout.strip()
     start_point = _resolve_local_base(repo, remote_base, prefer_origin=True, runner=runner)
     fresh = runner(
@@ -754,8 +857,11 @@ def _prepare_fresh_base(
         ["git", "-C", str(repo), "rev-list", "--count", f"{start_point}..{fetched_tip}"]
     )
     count = behind.stdout.strip() if behind.returncode == 0 and behind.stdout.strip() else "unknown"
-    raise RuntimeError(
-        f"stale base {local_sha}, {fetched_ref} {fetched_tip}, {count} commits behind"
+    message = f"stale base {local_sha}, {fetched_ref} {fetched_tip}, {count} commits behind"
+    raise CheckoutDiagnosticError(
+        external_active_ingest(
+            message, producer_tag=DiagnosticProducer.GIT_PROCESS
+        )
     )
 
 
@@ -769,7 +875,13 @@ def _assert_base_repo_clean(
     try:
         owner_uid = repo.stat().st_uid
     except OSError as exc:
-        _refuse_base_repo(repo, event_logger, reason="owner_check_failed", detail=str(exc))
+        _refuse_base_repo(
+            repo,
+            event_logger,
+            reason="owner_check_failed",
+            detail=str(exc),
+            source=legacy_unknown(exc, producer_tag=DiagnosticProducer.CHECKOUT),
+        )
     effective_uid = os.geteuid()
     if effective_uid != owner_uid:
         _refuse_base_repo(
@@ -777,6 +889,10 @@ def _assert_base_repo_clean(
             event_logger,
             reason="owner_mismatch",
             detail=f"base owner uid {owner_uid}, status account uid {effective_uid}",
+            source=server_structural(
+                f"base owner uid {owner_uid}, status account uid {effective_uid}",
+                producer_tag=DiagnosticProducer.CHECKOUT,
+            ),
             owner_uid=owner_uid,
             effective_uid=effective_uid,
         )
@@ -792,6 +908,15 @@ def _assert_base_repo_clean(
             event_logger,
             reason="status_failed",
             detail=detail,
+            source=(
+                external_active_ingest(
+                    detail, producer_tag=DiagnosticProducer.GIT_PROCESS
+                )
+                if (status.stderr or status.stdout).strip()
+                else server_fixed(
+                    detail, producer_tag=DiagnosticProducer.GIT_PROCESS
+                )
+            ),
             returncode=status.returncode,
         )
 
@@ -811,6 +936,10 @@ def _assert_base_repo_clean(
                 event_logger,
                 reason="status_malformed",
                 detail="git status returned malformed porcelain output",
+                source=server_fixed(
+                    "git status returned malformed porcelain output",
+                    producer_tag=DiagnosticProducer.GIT_PROCESS,
+                ),
             )
         index_state, worktree_state = record[0], record[1]
         path = record[3:]
@@ -851,6 +980,10 @@ def _assert_base_repo_clean(
         event_logger,
         reason="dirty",
         detail=f"{dirty_count} dirty path(s); {detail}",
+        source=external_active_ingest(
+            f"{dirty_count} dirty path(s); {detail}",
+            producer_tag=DiagnosticProducer.GIT_PROCESS,
+        ),
         **payload,
     )
 
@@ -861,8 +994,15 @@ def _refuse_base_repo(
     *,
     reason: str,
     detail: str,
+    source: DiagnosticEnvelope | None = None,
     **payload: Any,
 ) -> None:
+    source = source or external_active_ingest(
+        detail, producer_tag=DiagnosticProducer.CHECKOUT
+    )
+    diagnostic = with_least_trusted_provenance(
+        f"base repo refused ({reason}): {detail}", source
+    )
     if event_logger is not None:
         event_logger(
             "worklink_base_repo_refused",
@@ -871,7 +1011,7 @@ def _refuse_base_repo(
             detail=detail[:1000],
             **payload,
         )
-    raise RuntimeError(f"base repo refused ({reason}): {detail}")
+    raise CheckoutDiagnosticError(diagnostic)
 
 
 def _rev_parse_for_error(repo: Path, ref: str, *, runner: Runner) -> str:
@@ -1053,9 +1193,14 @@ def _recover_interrupted_alternates_probe(
         return
     if len(interrupted) > 1:
         candidates = ", ".join(str(path) for path in interrupted)
-        raise RuntimeError(
+        message = (
             "base repo alternates probe recovery refused; multiple interrupted "
             f"probe files require operator review: {candidates}"
+        )
+        raise CheckoutDiagnosticError(
+            external_active_ingest(
+                message, producer_tag=DiagnosticProducer.CHECKOUT
+            )
         )
 
     hidden = interrupted[0]
@@ -1179,10 +1324,31 @@ def _repair_base_alternates_locked(
                 at_risk_objects=object_ids,
                 worktree_prune=_strip_for_event(worktree_prune.stdout + worktree_prune.stderr),
             )
-        risks = ", ".join(object_ids) or _strip_for_event(details) or "unknown objects"
-        raise RuntimeError(
+        rendered_details = _strip_for_event(details)
+        risks = ", ".join(object_ids) or rendered_details or "unknown objects"
+        message = (
             "base repo alternates repair refused; objects are reachable only through "
             f"the retained alternate: {risks}"
+        )
+        canonical_object_ids = bool(object_ids) and all(
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)
+            for object_id in object_ids
+        )
+        if canonical_object_ids:
+            source = server_structural(
+                risks, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        elif object_ids or rendered_details:
+            source = external_active_ingest(
+                risks, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        else:
+            source = server_fixed(
+                risks, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
+        raise _checkout_failure(
+            message,
+            source,
         )
 
     backup = _alternates_backup_path(alternates)
@@ -1294,10 +1460,15 @@ def _assert_self_contained_checkout(path: Path, *, runner: Runner) -> None:
     alternates = _git_objects_dir(path)
     has_alternates = alternates is not None and (alternates / "info" / "alternates").exists()
     if not (top_ok and gitdir_ok) or has_alternates:
-        raise RuntimeError(
+        message = (
             "isolated checkout failed self-containment check (#517): "
             f"toplevel={top.stdout.strip()!r} git-dir={gitdir.stdout.strip()!r} "
             f"expected rooted at {resolved}; alternates={has_alternates}"
+        )
+        raise CheckoutDiagnosticError(
+            external_active_ingest(
+                message, producer_tag=DiagnosticProducer.GIT_PROCESS
+            )
         )
 
 
@@ -1330,13 +1501,11 @@ def cleanup_checkout(
             # that was just removed. A factory checkout instead uses the target
             # branch, which must never be deleted from the parent repository.
             if delete.returncode not in (0, 1):
-                raise RuntimeError(
-                    (delete.stderr or delete.stdout).strip() or "git branch delete failed"
-                )
+                raise _git_failure(delete, "git branch delete failed")
         return True
     result = runner(["git", "-C", str(lease.repo), "worktree", "remove", "--force", str(lease.path)])
     if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip() or "git worktree remove failed")
+        raise _git_failure(result, "git worktree remove failed")
     return True
 
 
