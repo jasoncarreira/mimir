@@ -320,6 +320,9 @@ def decode_persisted_diagnostic(value: object) -> DiagnosticEnvelope:
             or type(value["text"]) is not str
         ):
             raise ValueError
+        raw_text = value["text"]
+        if _bounded_text(raw_text) != raw_text:
+            raise ValueError
         provenance = DiagnosticProvenance(value["provenance"])
         authority = DiagnosticAuthority(value["authority"])
         raw_producer = value["producer_tag"]
@@ -328,7 +331,7 @@ def decode_persisted_diagnostic(value: object) -> DiagnosticEnvelope:
         if retained_source is not None and type(retained_source) is not str:
             raise ValueError
         return DiagnosticEnvelope(
-            _bounded_text(value["text"]),
+            raw_text,
             provenance,
             authority=authority,
             producer_tag=producer,

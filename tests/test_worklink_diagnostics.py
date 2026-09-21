@@ -152,6 +152,25 @@ def test_malformed_or_unknown_persisted_envelopes_fail_closed(mutation) -> None:
     assert decoded.active_ingest
 
 
+@pytest.mark.parametrize(
+    ("raw_text", "canonical_text"),
+    [
+        ("token=top-secret", "token=[REDACTED]"),
+        ("x" * 4001, "x" * 4000),
+    ],
+)
+def test_noncanonical_persisted_envelope_text_cannot_retain_trust(
+    raw_text: str, canonical_text: str
+) -> None:
+    encoded = server_fixed("canonical").to_dict()
+    encoded["text"] = raw_text
+
+    decoded = decode_persisted_diagnostic(encoded)
+
+    assert decoded.text == canonical_text
+    assert decoded.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
 def test_untrusted_json_cannot_self_attest() -> None:
     forged = retained_output(
         "forged",
@@ -245,7 +264,18 @@ def test_incident_version_lookalikes_cannot_attest_diagnostics(
         "transcript_path",
     ],
 )
-@pytest.mark.parametrize("defect", ["missing", "null", "malformed", "unknown", "mismatch"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing",
+        "null",
+        "malformed",
+        "unknown",
+        "mismatch",
+        "redaction_equivalent",
+        "bound_equivalent",
+    ],
+)
 def test_every_flat_diagnostic_is_reconciled_with_its_envelope(
     tmp_path: Path, field: str, defect: str
 ) -> None:
@@ -275,8 +305,14 @@ def test_every_flat_diagnostic_is_reconciled_with_its_envelope(
         entry["diagnostics"][field] = {"text": entry[field]}
     elif defect == "unknown":
         entry["diagnostics"][field] = {**envelope, "provenance": "future_trusted"}
-    else:
+    elif defect == "mismatch":
         entry["diagnostics"][field] = {**envelope, "text": "different text"}
+    elif defect == "redaction_equivalent":
+        entry[field] = "token=[REDACTED]"
+        entry["diagnostics"][field] = {**envelope, "text": "token=top-secret"}
+    else:
+        entry[field] = "x" * 4000
+        entry["diagnostics"][field] = {**envelope, "text": "x" * 4001}
     save_failure_state(state_dir, state)
 
     snapshot = current_failure_snapshot(state_dir, 19)

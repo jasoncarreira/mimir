@@ -122,6 +122,9 @@ def _entry_diagnostic(
             return None if flat_absent else legacy_unknown(flat_text)
         if type(flat_value) is not str:
             return legacy_unknown(flat_text)
+        raw_envelope_text = value.get("text") if isinstance(value, Mapping) else None
+        if type(raw_envelope_text) is not str or raw_envelope_text != flat_value:
+            return legacy_unknown(flat_value)
         decoded = decode_persisted_diagnostic(value)
         if decoded.text != flat_value:
             return legacy_unknown(flat_value)
