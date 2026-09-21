@@ -362,6 +362,8 @@ def test_production_git_binding_mismatch_is_named_fatal(
         ("malformed-inventory", "coding.repositories.inventory"),
         ("root-mode", "coding.repositories.root_mode_agreement"),
         ("target-ro", "coding.worklink.target_rw_unique"),
+        ("worklink-path", "coding.worklink.target_rw_unique"),
+        ("mimir-path", "coding.worklink.target_rw_unique"),
         ("git-binding", "coding.worklink.git_binding"),
     ],
 )
@@ -407,6 +409,13 @@ def test_config_defers_repository_defects_to_tool_registration_startup_catalog(
             other = tmp_path / "other"
             other.mkdir()
             monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{other}:ro")
+        elif defect in {"worklink-path", "mimir-path"}:
+            other = tmp_path / "other"
+            other.mkdir()
+            variable = (
+                "WORKLINK_REPO" if defect == "worklink-path" else "MIMIR_WORKLINK_REPO"
+            )
+            monkeypatch.setenv(variable, str(other))
 
     config = Config.from_env()
 

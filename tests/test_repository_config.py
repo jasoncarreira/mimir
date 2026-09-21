@@ -116,7 +116,7 @@ def test_empty_legacy_repository_value_uses_declarative_config(
     assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
 
 
-def test_worklink_target_defect_is_deferred_to_closed_startup_registry(
+def test_coding_disabled_worklink_target_must_name_declared_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -132,13 +132,25 @@ def test_worklink_target_defect_is_deferred_to_closed_startup_registry(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    config = Config.from_env()
-
-    assert config.coding_enabled is False
-    assert "WORKLINK_REPO" not in os.environ
+    with pytest.raises(RuntimeError, match="worklink.yaml repository does not name"):
+        Config.from_env()
 
 
-def test_repository_origin_mismatch_is_deferred_to_closed_startup_registry(
+def test_coding_disabled_malformed_inventory_preserves_config_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "repositories.yaml").write_text("repositories: [\n", encoding="utf-8")
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+
+    with pytest.raises(yaml.YAMLError):
+        Config.from_env()
+
+
+def test_coding_disabled_repository_origin_mismatch_remains_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -150,12 +162,11 @@ def test_repository_origin_mismatch_is_deferred_to_closed_startup_registry(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    config = Config.from_env()
+    with pytest.raises(RuntimeError, match="repository owner/repo did not bind"):
+        Config.from_env()
 
-    assert dict(config.file_tool_roots)[str(checkout.resolve())] == "rw"
 
-
-def test_parent_directory_binding_defect_is_deferred_to_startup_registry(
+def test_coding_disabled_parent_directory_cannot_satisfy_repository_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -169,12 +180,11 @@ def test_parent_directory_binding_defect_is_deferred_to_startup_registry(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    config = Config.from_env()
+    with pytest.raises(RuntimeError, match="found 'not a git checkout'"):
+        Config.from_env()
 
-    assert dict(config.file_tool_roots)[str(parent.resolve())] == "rw"
 
-
-def test_legacy_root_disagreement_is_preserved_for_closed_startup_report(
+def test_coding_disabled_legacy_root_disagreement_remains_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -189,12 +199,8 @@ def test_legacy_root_disagreement_is_preserved_for_closed_startup_report(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw,{other}:ro")
 
-    config = Config.from_env()
-
-    assert dict(config.file_tool_roots) == {
-        str(checkout.resolve()): "rw",
-        str(other.resolve()): "ro",
-    }
+    with pytest.raises(RuntimeError, match="MIMIR_FILE_TOOL_ROOTS disagrees"):
+        Config.from_env()
 
 
 def test_legacy_root_agreement_uses_canonical_path_to_mode_not_order(
@@ -355,16 +361,12 @@ def test_nonempty_legacy_disagreement_fails_closed_with_both_values(
     declared_value = declared_value.format(other=other, checkout=checkout)
     monkeypatch.setenv(name, legacy_value)
 
-    if name == "GITHUB_REPOS":
-        with pytest.raises(RuntimeError) as exc_info:
-            Config.from_env()
-        message = str(exc_info.value)
-        assert name in message
-        assert legacy_value in message
-        assert declared_value in message
-    else:
+    with pytest.raises(RuntimeError) as exc_info:
         Config.from_env()
-        assert os.environ[name] == legacy_value
+    message = str(exc_info.value)
+    assert name in message
+    assert legacy_value in message
+    assert declared_value in message
 
 
 def test_worklink_config_names_one_neutral_repository(tmp_path: Path) -> None:

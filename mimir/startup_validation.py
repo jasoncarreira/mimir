@@ -362,12 +362,24 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
             target = loaded.coding_target(target_name or "", authorized_roots=roots)
         except (OSError, ValueError) as exc:
             return ProbeObservation(False, {"target": target_name, "result": str(exc)})
+        configured_paths = {
+            name: value
+            for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO")
+            if (value := os.environ.get(name, "").strip())
+        }
+        mismatches = {
+            name: value
+            for name, value in configured_paths.items()
+            if not Path(value).is_absolute() or Path(value).resolve() != target.root
+        }
         count = sum(str(Path(path).resolve()) == str(target.root) for path, _ in roots)
-        return ProbeObservation(True, {
+        return ProbeObservation(not mismatches, {
             "target": target.slug,
             "path": str(target.root),
             "count": count,
             "mode": target.mode,
+            "configured_paths": configured_paths,
+            "path_mismatches": mismatches,
         })
 
     def git_binding() -> ProbeObservation:
