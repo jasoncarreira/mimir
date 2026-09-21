@@ -308,6 +308,119 @@ def test_delete_requires_digest_and_replays_after_unlink(tmp_path: Path) -> None
     assert not path.exists()
 
 
+@pytest.mark.parametrize("action", ["write", "delete"])
+@pytest.mark.parametrize("replacement", ["parent", "target"])
+def test_replay_refuses_nested_path_replacement_before_already_applied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    replacement: str,
+) -> None:
+    repo = _repository(tmp_path)
+    checkout = _open(repo)
+    path = repo / "nested" / "note.txt"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if action == "write":
+        intent = checkout.prepare_write(
+            str(uuid.uuid4()),
+            "nested/note.txt",
+            "after\n",
+            expected_sha256=digest,
+        )
+        checkout.apply_file_intent(intent, content="after\n")
+    else:
+        intent = checkout.prepare_delete(
+            str(uuid.uuid4()), "nested/note.txt", expected_sha256=digest
+        )
+        checkout.apply_file_intent(intent)
+    real_digest = operations._digest_at
+    replaced = False
+
+    def digest_then_replace(parent_fd, name, *, missing_ok):
+        nonlocal replaced
+        result = real_digest(parent_fd, name, missing_ok=missing_ok)
+        if not replaced:
+            replaced = True
+            if replacement == "parent":
+                _detach_nested_parent(repo, tmp_path)
+            elif action == "write":
+                alternate = repo / "nested" / "alternate"
+                alternate.write_text("after\n", encoding="utf-8")
+                alternate.replace(path)
+            else:
+                path.write_text("resurrected\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(operations, "_digest_at", digest_then_replace)
+
+    with pytest.raises(CheckoutConflictError, match="replaced|absent"):
+        checkout.apply_file_intent(
+            intent, content="after\n" if action == "write" else None
+        )
+
+
+@pytest.mark.parametrize("action", ["write", "delete"])
+@pytest.mark.parametrize("replacement", ["parent", "target"])
+def test_mutation_refuses_nested_path_replacement_after_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    replacement: str,
+) -> None:
+    repo = _repository(tmp_path)
+    checkout = _open(repo)
+    path = repo / "nested" / "note.txt"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if action == "write":
+        intent = checkout.prepare_write(
+            str(uuid.uuid4()),
+            "nested/note.txt",
+            "after\n",
+            expected_sha256=digest,
+        )
+        real_effect = operations.os.replace
+        changed = False
+
+        def replace_then_change(*args, **kwargs):
+            nonlocal changed
+            result = real_effect(*args, **kwargs)
+            if not changed:
+                changed = True
+                if replacement == "parent":
+                    _detach_nested_parent(repo, tmp_path)
+                else:
+                    alternate = repo / "nested" / "alternate"
+                    alternate.write_text("after\n", encoding="utf-8")
+                    real_effect(alternate, path)
+            return result
+
+        monkeypatch.setattr(operations.os, "replace", replace_then_change)
+    else:
+        intent = checkout.prepare_delete(
+            str(uuid.uuid4()), "nested/note.txt", expected_sha256=digest
+        )
+        real_effect = operations.os.unlink
+        changed = False
+
+        def unlink_then_change(*args, **kwargs):
+            nonlocal changed
+            result = real_effect(*args, **kwargs)
+            if not changed:
+                changed = True
+                if replacement == "parent":
+                    _detach_nested_parent(repo, tmp_path)
+                else:
+                    path.write_text("resurrected\n", encoding="utf-8")
+            return result
+
+        monkeypatch.setattr(operations.os, "unlink", unlink_then_change)
+
+    with pytest.raises(CheckoutConflictError, match="replaced|absent"):
+        checkout.apply_file_intent(
+            intent, content="after\n" if action == "write" else None
+        )
+
+
 def test_target_inode_replacement_during_write_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

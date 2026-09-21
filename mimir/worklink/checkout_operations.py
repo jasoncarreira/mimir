@@ -429,13 +429,24 @@ class RetainedCheckoutOperations:
         try:
             parent_fd, directory_identities = _open_parent(root_fd, parts)
             observed, target_identity = _digest_at(parent_fd, parts[-1], missing_ok=True)
-            if intent.action == "write" and observed == intent.resulting_sha256:
+
+            def verify_named_result(
+                expected_target: tuple[int, int, int] | None,
+            ) -> None:
+                _verify_parent_walk(root_fd, parts, directory_identities)
                 self._verify_named_root(root_fd)
+                if expected_target is None:
+                    _verify_path_absent(root_fd, parts)
+                else:
+                    _verify_path_identity(root_fd, parts, expected_target)
                 self._revalidate()
+
+            if intent.action == "write" and observed == intent.resulting_sha256:
+                assert target_identity is not None
+                verify_named_result(target_identity)
                 return FileMutationResult(intent, "already_applied", observed)
             if intent.action == "delete" and observed is None:
-                self._verify_named_root(root_fd)
-                self._revalidate()
+                verify_named_result(None)
                 return FileMutationResult(intent, "already_applied", None)
             _require_expected_digest(observed, intent.expected_sha256)
 
@@ -453,22 +464,28 @@ class RetainedCheckoutOperations:
             final_pre_effect_check()
             if intent.action == "write":
                 assert document is not None
-                _atomic_replace(
+                applied_identity = _atomic_replace(
                     parent_fd,
                     parts[-1],
                     document,
                     target_identity,
                     pre_effect=final_pre_effect_check,
                 )
-                resulting, _ = _digest_at(parent_fd, parts[-1], missing_ok=False)
+                resulting, resulting_identity = _digest_at(
+                    parent_fd, parts[-1], missing_ok=False
+                )
+                if resulting_identity != applied_identity:
+                    raise CheckoutConflictError(
+                        "retained checkout file was replaced after write"
+                    )
             else:
                 os.unlink(parts[-1], dir_fd=parent_fd)
                 os.fsync(parent_fd)
                 resulting = None
-            self._verify_named_root(root_fd)
-            self._revalidate()
+                resulting_identity = None
             if resulting != intent.resulting_sha256:
                 raise CheckoutConflictError("file mutation result digest changed")
+            verify_named_result(resulting_identity)
             return FileMutationResult(intent, "applied", resulting)
         finally:
             if parent_fd >= 0:
@@ -915,6 +932,26 @@ def _verify_path_identity(
         raise CheckoutConflictError("retained checkout path was replaced during operation")
 
 
+def _verify_path_absent(root_fd: int, parts: Sequence[str]) -> None:
+    try:
+        parent_fd, _ = _open_parent(root_fd, parts)
+    except OSError as exc:
+        raise CheckoutConflictError(
+            "retained checkout path was replaced during operation"
+        ) from exc
+    try:
+        os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise CheckoutConflictError(
+            "retained checkout path was replaced during operation"
+        ) from exc
+    finally:
+        os.close(parent_fd)
+    raise CheckoutConflictError("retained checkout path is no longer absent")
+
+
 def _open_regular(parent_fd: int, name: str) -> int:
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
     value = os.fstat(fd)
@@ -973,7 +1010,7 @@ def _atomic_replace(
     previous: tuple[int, int, int] | None,
     *,
     pre_effect: Callable[[], None],
-) -> None:
+) -> tuple[int, int, int]:
     temporary = f".worklink-{uuid.uuid4()}"
     mode = stat.S_IMODE(previous[2]) if previous is not None else 0o644
     descriptor = os.open(
@@ -988,6 +1025,8 @@ def _atomic_replace(
             written = os.write(descriptor, view)
             view = view[written:]
         os.fsync(descriptor)
+        value = os.fstat(descriptor)
+        resulting_identity = (value.st_dev, value.st_ino, value.st_mode)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=parent_fd)
@@ -1003,6 +1042,7 @@ def _atomic_replace(
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=parent_fd)
         raise
+    return resulting_identity
 
 
 def _git_environment(index_path: Path | None) -> dict[str, str]:
