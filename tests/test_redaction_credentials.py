@@ -128,7 +128,7 @@ def test_benign_structured_keys() -> None:
 def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
     texts = {
         size: (fragment * (size // len(fragment) + 1))[:size]
-        for size in (65536, 131072)
+        for size in (65536, 131072, 262144)
     }
     # Warm both paths before measuring; neither input contains YAML block
     # indicators, so doubling does not switch between parser and scanner paths.
@@ -148,10 +148,11 @@ def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
             samples[size].append(elapsed)
 
     t_1x = statistics.median(samples[65536])
-    t_2x = statistics.median(samples[131072])
-    # Linear work should grow ~2x; 3x allows noise while remaining below the
-    # ~4x growth of quadratic backtracking. No machine-specific time deadline.
-    assert t_2x < t_1x * 3, (fragment, t_1x, t_2x)
+    t_4x = statistics.median(samples[262144])
+    # Across this 4x size span, linear and quadratic work grow ~4x and ~16x.
+    # Their geometric midpoint (8x) tolerates up to 2x multiplicative noise in
+    # either direction while still discriminating the two complexity classes.
+    assert t_4x < t_1x * 8, (fragment, t_1x, t_4x)
 
 
 def test_shared_pattern_registration() -> None:
