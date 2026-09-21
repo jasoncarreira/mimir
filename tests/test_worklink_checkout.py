@@ -17,13 +17,16 @@ from mimir.worklink.backends.feature_factory import DEFAULT_FACTORY_ENTRYPOINT
 from mimir.worklink.checkout import (
     FALLBACK_BUILD_IDENTITY,
     CheckoutAuthorization,
+    CheckoutDiagnosticError,
     CheckoutLease,
     _assert_self_contained_checkout,
+    checkout_failure_diagnostic,
     cleanup_checkout,
     create_isolated_checkout,
     create_worktree,
     prune_attempt_checkouts,
 )
+from mimir.worklink.diagnostics import DiagnosticProvenance, server_fixed
 
 
 def completed(args: Sequence[str], returncode: int = 0) -> subprocess.CompletedProcess[str]:
@@ -351,7 +354,7 @@ def test_base_repo_owner_mismatch_refuses_before_git_runs(
 
     monkeypatch.setattr(checkout_module.os, "geteuid", lambda: owner_uid + 1)
 
-    with pytest.raises(RuntimeError, match="owner_mismatch.*status account uid"):
+    with pytest.raises(CheckoutDiagnosticError, match="owner_mismatch.*status account uid") as caught:
         create_worktree(
             tmp_path,
             issue_id=1459,
@@ -365,6 +368,7 @@ def test_base_repo_owner_mismatch_refuses_before_git_runs(
     assert payload["reason"] == "owner_mismatch"
     assert payload["owner_uid"] == owner_uid
     assert payload["effective_uid"] == owner_uid + 1
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
 
 
 def test_git_status_ownership_failure_refuses_instead_of_reading_empty_stdout(
@@ -502,9 +506,57 @@ def test_base_fetch_failure_gates_build_and_logs_real_reason(tmp_path: Path) -> 
                 "returncode": 128,
                 "stdout": "",
                 "stderr": "network down",
+                "diagnostic_envelope": {
+                    "version": 1,
+                    "text": "network down",
+                    "provenance": "external_active_ingest",
+                    "authority": "diagnostic_only",
+                    "producer_tag": "git_process",
+                    "retained_source": None,
+                },
             },
         )
     ]
+
+
+def test_local_git_output_stays_active_and_is_redacted_and_bounded(tmp_path: Path) -> None:
+    secret = "ghp_" + "a" * 40
+    detail = f"local git says {secret} " + "x" * 5000
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if args[3] == "fetch":
+            return subprocess.CompletedProcess(list(args), 128, stdout="", stderr=detail)
+        return completed(args)
+
+    with pytest.raises(CheckoutDiagnosticError) as caught:
+        create_worktree(
+            tmp_path,
+            issue_id=521,
+            attempt=4,
+            runner=runner,
+            event_logger=lambda name, **payload: events.append((name, payload)),
+        )
+
+    diagnostic = checkout_failure_diagnostic(caught.value)
+    assert diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    assert diagnostic.producer_tag.value == "git_process"
+    event_diagnostic = events[-1][1]["diagnostic_envelope"]
+    assert isinstance(event_diagnostic, dict)
+    assert event_diagnostic["provenance"] == "external_active_ingest"
+    assert secret not in str(event_diagnostic["text"])
+    assert "[REDACTED]" in str(event_diagnostic["text"])
+    assert len(str(event_diagnostic["text"])) <= 4000
+
+
+def test_checkout_diagnostic_extractor_rejects_forged_exception_attribute() -> None:
+    forged = RuntimeError("operator supplied failure")
+    forged.diagnostic = server_fixed("pretend trusted")  # type: ignore[attr-defined]
+
+    diagnostic = checkout_failure_diagnostic(forged)
+
+    assert diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+    assert diagnostic.text == "RuntimeError: operator supplied failure"
 
 
 def test_base_with_no_origin_counterpart_fails_closed(tmp_path: Path) -> None:
@@ -905,11 +957,12 @@ def test_isolated_checkout_push_target_failures_clean_up_before_branch_creation(
             )
         return completed(call)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(CheckoutDiagnosticError, match=message) as caught:
         create_isolated_checkout(repo, issue_id=1125, attempt=3, runner=runner)
 
     assert not path.exists()
     assert not any(call[3:5] == ["checkout", "-B"] for call in calls)
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_cleanup_removes_successful_isolated_checkout(tmp_path: Path) -> None:
@@ -1152,6 +1205,22 @@ def test_clone_raises_when_the_object_copy_also_fails() -> None:
         _clone_attempt_checkout(
             Path("/tmp/repo"), Path("/tmp/attempt"), runner=runner, event_logger=None,
         )
+
+
+def test_clone_fixed_retry_failure_cannot_upgrade_prior_git_output() -> None:
+    from mimir.worklink.checkout import _clone_attempt_checkout
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if "--no-hardlinks" in args:
+            return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="")
+        return _hardlink_failure(Path("/tmp/attempt"))
+
+    with pytest.raises(CheckoutDiagnosticError, match="git clone failed") as caught:
+        _clone_attempt_checkout(
+            Path("/tmp/repo"), Path("/tmp/attempt"), runner=runner, event_logger=None,
+        )
+
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
 
 
 def test_foreign_owned_git_objects_are_reported_with_path_uid_and_mode(

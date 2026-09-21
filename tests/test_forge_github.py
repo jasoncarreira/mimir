@@ -12,10 +12,12 @@ from mimir.forge.github import (
     GitHubIdentityFailureKind,
     GitHubIdentityVerificationError,
     bound_diff,
+    github_identity_failure_diagnostic,
 )
 from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
 from mimir.tools.forge import initialize_github_forge_identity
+from mimir.worklink.diagnostics import DiagnosticProvenance, server_fixed
 
 
 def _scope() -> RepoPRActionScope:
@@ -448,6 +450,7 @@ def test_identity_http_outage_has_typed_transient_provenance(status: int) -> Non
         client.verify_identity("reviewer")
 
     assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
 
 
 def test_identity_transport_failure_has_typed_transient_provenance() -> None:
@@ -461,6 +464,8 @@ def test_identity_transport_failure_has_typed_transient_provenance() -> None:
         client.verify_identity("reviewer")
 
     assert caught.value.failure_kind == GitHubIdentityFailureKind.TRANSIENT
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_FIXED
+    assert caught.value.diagnostic.text == "forge transport failed"
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -471,6 +476,35 @@ def test_invalid_github_credential_is_permanent(status: int) -> None:
         client.verify_identity("reviewer")
 
     assert caught.value.failure_kind == GitHubIdentityFailureKind.PERMANENT
+    assert caught.value.diagnostic.provenance is DiagnosticProvenance.SERVER_STRUCTURAL
+
+
+def test_identity_mismatch_keeps_login_and_operator_declaration_active_and_bounded() -> None:
+    secret = "ghp_" + "a" * 40
+    declared = f"reviewer-{secret}-" + "x" * 5000
+    client = GitHubForgeClient(session=Session([Response({"login": "other-bot"})]))
+
+    with pytest.raises(GitHubIdentityVerificationError) as caught:
+        client.verify_identity(declared)
+
+    diagnostic = caught.value.diagnostic
+    assert diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    assert diagnostic.producer_tag.value == "forge"
+    assert secret not in diagnostic.text
+    assert "[REDACTED]" in diagnostic.text
+    assert len(diagnostic.text) <= 4000
+
+
+def test_identity_error_defaults_legacy_and_generic_forgery_is_ignored() -> None:
+    error = GitHubIdentityVerificationError("adapter supplied arbitrary wording")
+    assert error.diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+    forged = RuntimeError("operator supplied failure")
+    forged.diagnostic = server_fixed("pretend trusted")  # type: ignore[attr-defined]
+    diagnostic = github_identity_failure_diagnostic(forged)
+
+    assert diagnostic.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+    assert diagnostic.text == "RuntimeError: operator supplied failure"
 
 
 def test_startup_identity_verification_registers_matching_client(monkeypatch) -> None:

@@ -14,6 +14,14 @@ from typing import Any
 import requests
 
 from ..models import NormalizedPullRequestSnapshot, RepoPRActionScope
+from ..worklink.diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    external_active_ingest,
+    legacy_unknown,
+    server_fixed,
+    server_structural,
+)
 from .client import (
     CheckProjection,
     CommentProjection,
@@ -142,8 +150,16 @@ class GitHubIdentityFailureKind(StrEnum):
 
 
 class _GitHubRequestError(ForgeError):
-    def __init__(self, message: str, *, retryable: bool) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        diagnostic: DiagnosticEnvelope,
+        *,
+        retryable: bool,
+    ) -> None:
+        if not isinstance(diagnostic, DiagnosticEnvelope):
+            raise TypeError("GitHub request errors require a typed diagnostic")
+        super().__init__(diagnostic.text)
+        self.diagnostic = diagnostic
         self.retryable = retryable
 
 
@@ -157,11 +173,43 @@ class GitHubIdentityVerificationError(ForgeError):
         declared_login: str = "",
         authenticated_login: str = "",
         failure_kind: GitHubIdentityFailureKind = GitHubIdentityFailureKind.PERMANENT,
+        _diagnostic: DiagnosticEnvelope | None = None,
     ) -> None:
-        super().__init__(message)
+        diagnostic = _diagnostic or legacy_unknown(
+            message, producer_tag=DiagnosticProducer.FORGE
+        )
+        if not isinstance(diagnostic, DiagnosticEnvelope):
+            raise TypeError("GitHub identity errors require a typed diagnostic")
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.text)
         self.declared_login = declared_login
         self.authenticated_login = authenticated_login
         self.failure_kind = failure_kind
+
+
+def github_identity_failure_diagnostic(
+    error: BaseException,
+) -> DiagnosticEnvelope:
+    """Extract only diagnostics minted by this adapter's identity error type."""
+    if isinstance(error, GitHubIdentityVerificationError):
+        return error.diagnostic
+    return legacy_unknown(error, producer_tag=DiagnosticProducer.FORGE)
+
+
+def _identity_error(
+    diagnostic: DiagnosticEnvelope,
+    *,
+    declared_login: str = "",
+    authenticated_login: str = "",
+    failure_kind: GitHubIdentityFailureKind = GitHubIdentityFailureKind.PERMANENT,
+) -> GitHubIdentityVerificationError:
+    return GitHubIdentityVerificationError(
+        diagnostic.text,
+        declared_login=declared_login,
+        authenticated_login=authenticated_login,
+        failure_kind=failure_kind,
+        _diagnostic=diagnostic,
+    )
 
 
 def _credential_fingerprint(token: str) -> str:
@@ -176,20 +224,32 @@ def confirm_github_identity(principal: str, token: str | None = None) -> str:
     with _identity_lock:
         verified = _verified_identity
     if verified is None:
-        raise GitHubIdentityVerificationError(
-            "github identity verification cache is empty",
+        raise _identity_error(
+            server_fixed(
+                "github identity verification cache is empty",
+                producer_tag=DiagnosticProducer.FORGE,
+            ),
             declared_login=expected,
         )
     login, verified_fingerprint = verified
     if fingerprint != verified_fingerprint:
-        raise GitHubIdentityVerificationError(
-            "github identity verification cache does not match active credential",
+        raise _identity_error(
+            server_fixed(
+                "github identity verification cache does not match active credential",
+                producer_tag=DiagnosticProducer.FORGE,
+            ),
             declared_login=expected,
             authenticated_login=login,
         )
     if login.casefold() != expected.casefold():
-        raise GitHubIdentityVerificationError(
-            f"github acting identity mismatch: authenticated as {login}, scope principal is {principal}",
+        message = (
+            f"github acting identity mismatch: authenticated as {login}, "
+            f"scope principal is {principal}"
+        )
+        raise _identity_error(
+            external_active_ingest(
+                message, producer_tag=DiagnosticProducer.FORGE
+            ),
             declared_login=expected,
             authenticated_login=login,
         )
@@ -225,21 +285,35 @@ class GitHubForgeClient:
         """Resolve and process-cache the token owner, refusing any mismatch."""
         expected = declared_login.strip()
         if not expected:
-            raise GitHubIdentityVerificationError("github declared identity is empty")
+            raise _identity_error(
+                server_fixed(
+                    "github declared identity is empty",
+                    producer_tag=DiagnosticProducer.FORGE,
+                )
+            )
         fingerprint = _credential_fingerprint(self._token.strip())
         global _verified_identity
         with _identity_lock:
             if _verified_identity is not None:
                 login, cached_fingerprint = _verified_identity
                 if cached_fingerprint != fingerprint:
-                    raise GitHubIdentityVerificationError(
-                        "github identity verification cache does not match active credential",
+                    raise _identity_error(
+                        server_fixed(
+                            "github identity verification cache does not match active credential",
+                            producer_tag=DiagnosticProducer.FORGE,
+                        ),
                         declared_login=expected,
                         authenticated_login=login,
                     )
                 if login.casefold() != expected.casefold():
-                    raise GitHubIdentityVerificationError(
-                        f"github identity mismatch: authenticated as {login}, declared as {expected}",
+                    message = (
+                        f"github identity mismatch: authenticated as {login}, "
+                        f"declared as {expected}"
+                    )
+                    raise _identity_error(
+                        external_active_ingest(
+                            message, producer_tag=DiagnosticProducer.FORGE
+                        ),
                         declared_login=expected,
                         authenticated_login=login,
                     )
@@ -247,8 +321,8 @@ class GitHubForgeClient:
             try:
                 data = self._request("GET", "/user")
             except _GitHubRequestError as exc:
-                raise GitHubIdentityVerificationError(
-                    str(exc),
+                raise _identity_error(
+                    exc.diagnostic,
                     declared_login=expected,
                     failure_kind=(
                         GitHubIdentityFailureKind.TRANSIENT
@@ -258,13 +332,22 @@ class GitHubForgeClient:
                 ) from exc
             login = str(data.get("login", "")).strip() if isinstance(data, Mapping) else ""
             if _REVIEWER.fullmatch(login) is None:
-                raise GitHubIdentityVerificationError(
-                    "github identity verification returned an invalid login",
+                raise _identity_error(
+                    server_structural(
+                        "github identity verification returned an invalid login",
+                        producer_tag=DiagnosticProducer.FORGE,
+                    ),
                     declared_login=expected,
                 )
             if login.casefold() != expected.casefold():
-                raise GitHubIdentityVerificationError(
-                    f"github identity mismatch: authenticated as {login}, declared as {expected}",
+                message = (
+                    f"github identity mismatch: authenticated as {login}, "
+                    f"declared as {expected}"
+                )
+                raise _identity_error(
+                    external_active_ingest(
+                        message, producer_tag=DiagnosticProducer.FORGE
+                    ),
                     declared_login=expected,
                     authenticated_login=login,
                 )
@@ -312,7 +395,11 @@ class GitHubForgeClient:
             )
         except requests.RequestException as exc:
             raise _GitHubRequestError(
-                f"forge transport failed: {type(exc).__name__}", retryable=True,
+                server_fixed(
+                    "forge transport failed",
+                    producer_tag=DiagnosticProducer.FORGE,
+                ),
+                retryable=True,
             ) from exc
         raw = response.content
         if len(raw) > max_bytes:
@@ -327,7 +414,10 @@ class GitHubForgeClient:
                 429: "rate limited",
             }
             raise _GitHubRequestError(
-                reasons.get(response.status_code, "forge request failed"),
+                server_structural(
+                    reasons.get(response.status_code, "forge request failed"),
+                    producer_tag=DiagnosticProducer.FORGE,
+                ),
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
         if not raw:
