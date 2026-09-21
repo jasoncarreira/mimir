@@ -53,6 +53,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import secrets
+import stat
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,12 +68,20 @@ from .access_control import (
     POLLER_RECOVERY_REPLAY_EXTRA_KEY,
 )
 from .event_logger import log_event
-from .models import AgentEvent, InformationFlowLabels, SourceLabel
+from .models import (
+    AgentEvent,
+    InformationFlowLabels,
+    SourceLabel,
+    _restore_recovery_selection,
+)
+from .worklink import recovery_dispatch
 
 log = logging.getLogger(__name__)
 
 #: Per-poller recovery state file, under the poller's persist_dir.
 RECOVERY_STATE_FILE = ".recovery.json"
+_RECOVERY_SELECTION_KEY_FILE = ".recovery-selection.key"
+_recovery_selection_keys: dict[Path, bytes] = {}
 
 #: Max re-enqueue attempts for a failed poller turn before giving up.
 #: Mirrors github-poller's ``REVIEW_REQUEST_MAX_ATTEMPTS`` (#516) — same
@@ -198,12 +209,90 @@ def _save_state(persist_dir: Path, state: dict) -> None:
         log.warning("poller recovery: state save failed for %s: %s", persist_dir, exc)
 
 
-def _event_to_stash(event: AgentEvent) -> dict[str, Any]:
+def _recovery_selection_key_path(persist_dir: Path) -> Path | None:
+    raw_home = os.environ.get("MIMIR_HOME")
+    if not raw_home:
+        return None
+    home = Path(raw_home).expanduser().resolve()
+    try:
+        persist_dir.resolve().relative_to(home)
+    except ValueError:
+        return None
+    return home / "state" / _RECOVERY_SELECTION_KEY_FILE
+
+
+def _load_recovery_selection_key(persist_dir: Path) -> bytes | None:
+    """Load the server-only key that lets control attestations survive restart."""
+    path = _recovery_selection_key_path(persist_dir)
+    if path is None:
+        return None
+    cached = _recovery_selection_keys.get(path)
+    if cached is not None:
+        return cached
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600)
+    except FileExistsError:
+        fd = -1
+    if fd >= 0:
+        key = secrets.token_bytes(32)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(key)
+            while view:
+                written = os.write(fd, view)
+                if written == 0:
+                    raise OSError("short write while creating recovery selection key")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            parent_fd = os.open(path.parent, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError:
+            pass
+        _recovery_selection_keys[path] = key
+        return key
+
+    fd = os.open(path, os.O_RDONLY | flags)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or (hasattr(os, "getuid") and info.st_uid != os.getuid())
+        ):
+            raise OSError("recovery selection key has unsafe ownership or mode")
+        key = os.read(fd, 33)
+    finally:
+        os.close(fd)
+    if len(key) != 32:
+        raise OSError("recovery selection key has invalid length")
+    _recovery_selection_keys[path] = key
+    return key
+
+
+def _event_to_stash(
+    event: AgentEvent,
+    *,
+    selection_key: bytes | None = None,
+) -> dict[str, Any]:
     """Return a JSON-native event payload without stringifying IFC sets."""
     payload = asdict(replace(event, continuation_auth_context=None))
     # Authority is never persisted in the poller-writable recovery file. The
     # live scheduler reattaches its immutable manifest grant on re-enqueue.
     payload.pop("service_authority", None)
+    payload["recovery_selections"] = [
+        selection.to_stash_record(key=selection_key)
+        for selection in event.recovery_selections
+        if recovery_dispatch._recovery_selection_is_authentic(selection)
+    ]
     labels = event.ifc_labels
     if isinstance(labels, InformationFlowLabels):
         payload["ifc_labels"] = {
@@ -269,6 +358,12 @@ async def stash_enqueued_event(
         return
     stashed_dt = _utc_now()
     stashed_at = stashed_dt.isoformat()
+    selection_key = None
+    if event.recovery_selections:
+        try:
+            selection_key = _load_recovery_selection_key(persist_dir)
+        except OSError as exc:
+            log.warning("poller recovery: selection key unavailable: %s", exc)
     state["inflight"][event.source_id] = {
         "attempts": 0,
         # First-seen timestamp drives the GC TTL (#310).
@@ -282,7 +377,7 @@ async def stash_enqueued_event(
         "scan_from": enqueued_at or (
             stashed_dt - timedelta(minutes=1)
         ).isoformat(),
-        "event": _event_to_stash(event),
+        "event": _event_to_stash(event, selection_key=selection_key),
     }
     if pending_enqueue:
         state["inflight"][event.source_id]["pending_enqueue"] = True
@@ -336,7 +431,11 @@ async def _bound_pending_enqueue(
     return excess
 
 
-def _event_from_stash(d: Any) -> AgentEvent | None:
+def _event_from_stash(
+    d: Any,
+    *,
+    persist_dir: Path | None = None,
+) -> AgentEvent | None:
     """Rebuild an ``AgentEvent`` from its stashed ``asdict`` form. Returns
     None (logged) on a shape mismatch — a stale .recovery.json written by
     an older mimir whose AgentEvent had different fields shouldn't crash
@@ -348,6 +447,22 @@ def _event_from_stash(d: Any) -> AgentEvent | None:
         payload.pop("audience_provider", None)
         payload.pop("owner_attestation", None)
         payload["continuation_auth_context"] = None
+        raw_selections = payload.pop("recovery_selections", ())
+        selection_key = None
+        if raw_selections and persist_dir is not None:
+            try:
+                selection_key = _load_recovery_selection_key(persist_dir)
+            except OSError as exc:
+                log.warning("poller recovery: selection key unavailable: %s", exc)
+        selections = tuple(
+            selection
+            for selection in (
+                _restore_recovery_selection(record, key=selection_key)
+                for record in raw_selections
+            )
+            if selection is not None
+        ) if isinstance(raw_selections, list) else ()
+        payload["recovery_selections"] = selections
         raw_labels = payload.get("ifc_labels")
         if isinstance(raw_labels, dict):
             raw_sources = raw_labels.get("sources") or ()
@@ -516,9 +631,10 @@ def _restore_event(
     channel_id: str,
     service_principal: str | None,
     service_authority: Any,
+    persist_dir: Path | None = None,
 ) -> AgentEvent | None:
     """Rebuild a stashed event and reapply scheduler-owned identity fields."""
-    event = _event_from_stash(entry.get("event"))
+    event = _event_from_stash(entry.get("event"), persist_dir=persist_dir)
     if event is None:
         return None
     event.channel_id = channel_id
@@ -532,7 +648,32 @@ def _restore_event(
     event.repo_pr_action_scope = None
     event.continuation_auth_context = None
     event.source_session_acl = None
-    if service_authority is not None and service_principal:
+    valid_selections = recovery_dispatch.valid_event_recovery_selections(event)
+    incident_items = (
+        event.extra.get("items")
+        if isinstance(event.extra, dict) else None
+    )
+    has_incident_display = bool(
+        isinstance(incident_items, list)
+        and any(
+            isinstance(item, dict)
+            and isinstance(item.get("delivery_key"), str)
+            and item["delivery_key"].startswith("worklink-run-failure:")
+            for item in incident_items
+        )
+    )
+    if valid_selections:
+        event.recovery_selections = valid_selections
+        event.ifc_labels = recovery_dispatch.replay_selection_labels(
+            event, valid_selections,
+        )
+    elif has_incident_display:
+        event.recovery_selections = ()
+        event.ifc_labels = recovery_dispatch.active_display_only_labels(
+            service_principal=service_principal,
+            event_source_id=event.source_id,
+        )
+    elif service_authority is not None and service_principal:
         source_principal = f"service:{service_principal}"
         event.ifc_labels = InformationFlowLabels().with_channel(
             channel_id
@@ -775,6 +916,7 @@ async def reconcile_failed_turns(
                     channel_id=channel_id,
                     service_principal=service_principal,
                     service_authority=service_authority,
+                    persist_dir=persist_dir,
                 )
                 if event is not None and await _is_stale(event, relevance_check):
                     del inflight[source_id]
@@ -912,6 +1054,7 @@ async def reconcile_failed_turns(
                 channel_id=channel_id,
                 service_principal=service_principal,
                 service_authority=service_authority,
+                persist_dir=persist_dir,
             )
             if event is not None and await _is_stale(event, relevance_check):
                 del inflight[source_id]

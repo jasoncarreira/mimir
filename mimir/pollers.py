@@ -114,6 +114,7 @@ from .event_logger import log_event, log_event_sync, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
+from .worklink import recovery_dispatch
 from .poller_budget import (
     PollerBudgetConfig,
     parse_poller_budget_config,
@@ -166,6 +167,7 @@ POLLER_INVALID_LINE_CHARS = 500
 # JSON line would otherwise blow the prompt-build cache and burn
 # budget on the next turn (Mimir's PR #88 review nit 4).
 POLLER_PROMPT_CHARS = 16_000
+_MAX_RECOVERY_ITEMS_PER_BATCH = POLLER_PROMPT_CHARS // 80
 # Hard byte ceilings on a poller subprocess's stdout/stderr (chainlink
 # #258). The POLLER_PROMPT_CHARS cap above only applies AFTER the bytes
 # are read — ``communicate()`` buffers the ENTIRE stream first, so a
@@ -3019,6 +3021,7 @@ async def run_poller(
     # the per-item cap to preserve verbatim pass-through; the
     # batch-level cap below handles single giant prompts.
     items: list[dict[str, Any]] = []
+    recovery_identities: set[tuple[int, str, str]] = set()
     # Per-item soft cap: divide the prompt budget across the batch,
     # reserving a small slice (50 chars) per item for the numbered
     # marker + newline overhead in the rendered batch. Floors at 100
@@ -3133,7 +3136,45 @@ async def run_poller(
                 )
             continue
 
-        prompt = str(parsed.get("prompt", "")).strip()
+        reattested_recovery = None
+        if (
+            poller.name == recovery_dispatch.POLLER_NAME
+            and recovery_dispatch.is_recovery_alert(parsed)
+        ):
+            try:
+                reattested_recovery = recovery_dispatch.reattest_recovery_alert(
+                    parsed, persist_dir,
+                )
+            except recovery_dispatch.RecoveryDispatchError as exc:
+                log.warning(
+                    "poller %r: rejected recovery alert: %s", poller.name, exc,
+                )
+                await log_event(
+                    "poller_recovery_alert_rejected",
+                    poller=poller.name,
+                    reason=str(exc),
+                )
+                continue
+            if reattested_recovery.identity in recovery_identities:
+                log.warning(
+                    "poller %r: duplicate recovery incident ignored (first wins)",
+                    poller.name,
+                )
+                await log_event(
+                    "poller_duplicate_recovery_item",
+                    poller=poller.name,
+                    issue_id=reattested_recovery.snapshot.issue_id,
+                    error_signature=reattested_recovery.snapshot.signature,
+                    failure_occurrence_id=reattested_recovery.snapshot.occurrence_id,
+                )
+                continue
+            recovery_identities.add(reattested_recovery.identity)
+
+        prompt = (
+            reattested_recovery.prompt
+            if reattested_recovery is not None
+            else str(parsed.get("prompt", "")).strip()
+        )
         if not prompt:
             continue
 
@@ -3160,11 +3201,19 @@ async def run_poller(
         # into AgentEvent.extra so downstream prompt rendering can
         # surface platform-specific metadata (source_platform, urls,
         # etc.) without colliding with the AgentEvent dataclass shape.
-        extras = {
-            k: v for k, v in parsed.items()
-            if k not in ("prompt", "poller", "integrity", "integrity_effect")
-        }
-        items.append({"prompt": prompt, "extras": extras})
+        extras = (
+            dict(reattested_recovery.extras)
+            if reattested_recovery is not None
+            else {
+                k: v for k, v in parsed.items()
+                if k not in ("prompt", "poller", "integrity", "integrity_effect")
+            }
+        )
+        items.append({
+            "prompt": prompt,
+            "extras": extras,
+            "recovery": reattested_recovery,
+        })
 
     # Phase 2: batch items into groups of up to ``poller.batch_size``.
     # batch_size=1 preserves the per-item-per-turn shape; >1 coalesces
@@ -3173,6 +3222,11 @@ async def run_poller(
     # already filters non-positive values, but tests construct
     # ``PollerConfig`` directly bypassing that path.
     batch_size = max(1, poller.batch_size)
+    if any(
+        isinstance(item.get("recovery"), recovery_dispatch.ReattestedRecoveryItem)
+        for item in items
+    ):
+        batch_size = min(batch_size, _MAX_RECOVERY_ITEMS_PER_BATCH)
     batches: list[list[dict[str, Any]]] = [
         items[i:i + batch_size]
         for i in range(0, len(items), batch_size)
@@ -3208,6 +3262,12 @@ async def run_poller(
     event_count = 0
     rejected_count = 0
     for batch_idx, batch in enumerate(batches):
+        recovery_dispatch.add_recovery_handles(batch)
+        for item in batch:
+            if isinstance(item.get("recovery"), recovery_dispatch.ReattestedRecoveryItem):
+                item["extras"] = _redact_poller_payload(
+                    item["extras"], env, explicit_env_redact_keys,
+                )
         content = _render_batch(poller.name, batch, batch_idx, len(batches))
         # Apply the prompt cap once more on the assembled batch — even
         # with per-item caps, ``batch_size × cap`` could exceed the
@@ -3224,6 +3284,11 @@ async def run_poller(
                 content[:POLLER_PROMPT_CHARS]
                 + "\n\n[…truncated by poller framework]"
             )
+        content = recovery_dispatch.preserve_recovery_handles(
+            content,
+            batch,
+            max_chars=POLLER_PROMPT_CHARS,
+        )
 
         # Per-batch extra. ``items`` carries per-item metadata so the
         # agent can react to specific items without re-parsing the
@@ -3241,8 +3306,13 @@ async def run_poller(
         channel_id = poller.channel_id()
         authority = poller.resolved_authority()
         service_principal = f"service:{authority.canonical}"
+        event_source_id = (
+            f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}"
+        )
         item_labels = InformationFlowLabels()
         for item in batch:
+            if isinstance(item.get("recovery"), recovery_dispatch.ReattestedRecoveryItem):
+                continue
             item_extras = item["extras"]
             trusted = poller.trust_source == "trusted_system"
             if poller.trust_source == "github":
@@ -3313,6 +3383,19 @@ async def run_poller(
                 integrity="trusted" if trusted else "untrusted",
                 integrity_effect="active_ingest",
             ))
+        content, recovery_selections, recovery_labels = (
+            recovery_dispatch.bind_recovery_batch(
+                batch,
+                content=content,
+                poller_name=poller.name,
+                service_principal=authority.canonical,
+                event_source_id=event_source_id,
+                batch_index=batch_idx,
+                batch_count=len(batches),
+            )
+        )
+        for source in recovery_labels.sources:
+            item_labels = item_labels.with_source(source)
         event = AgentEvent(
             trigger="poller",
             channel_id=channel_id,
@@ -3320,12 +3403,13 @@ async def run_poller(
             service_authority=authority,
             content=content,
             source="poller",
-            source_id=f"{POLLER_CHANNEL_PREFIX}{poller.name}:{fire_ts_ms}:batch:{batch_idx}",
+            source_id=event_source_id,
             extra=_redact_poller_payload(extra, env, explicit_env_redact_keys),
             # Stamp provenance before recovery stashes the event. Retries now
             # round-trip the exact service label instead of rebuilding it from
             # ambient state after a failed turn.
             ifc_labels=item_labels,
+            recovery_selections=recovery_selections,
         )
         enqueued_at = datetime.now(tz=timezone.utc).isoformat()
         try:

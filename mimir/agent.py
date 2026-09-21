@@ -523,6 +523,41 @@ def _initialize_ifc_labels(
     return labels
 
 
+def _initialize_recovery_selections(event: AgentEvent) -> tuple:
+    """Validate internal controls before they can enter the current turn."""
+    from .worklink import recovery_dispatch
+
+    selections = recovery_dispatch.valid_event_recovery_selections(event)
+    extra = event.extra if isinstance(event.extra, Mapping) else {}
+    items = extra.get("items")
+    incident_display = bool(
+        extra.get("poller_name") == recovery_dispatch.POLLER_NAME
+        and isinstance(items, list)
+        and any(
+            isinstance(item, Mapping)
+            and isinstance(item.get("delivery_key"), str)
+            and item["delivery_key"].startswith("worklink-run-failure:")
+            for item in items
+        )
+    )
+    supplied = event.recovery_selections
+    if selections and len(selections) == len(supplied):
+        event.recovery_selections = selections
+        event.ifc_labels = _merge_ifc_labels(
+            event.ifc_labels,
+            recovery_dispatch.selection_labels(selections),
+        )
+        return selections
+    event.recovery_selections = ()
+    if incident_display or supplied:
+        display_labels = recovery_dispatch.active_display_only_labels(
+            service_principal=event.service_principal,
+            event_source_id=event.source_id,
+        )
+        event.ifc_labels = _merge_ifc_labels(event.ifc_labels, display_labels)
+    return ()
+
+
 def _shell_continuation_auth_context(event: AgentEvent) -> AuthContext | None:
     """Return a trusted shell continuation carrier only for its origin channel."""
     inherited = event.continuation_auth_context
@@ -1887,6 +1922,7 @@ class Agent:
         turn_id = turn_id or make_turn_id()
         explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
+        recovery_selections = _initialize_recovery_selections(event)
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
@@ -2112,6 +2148,15 @@ class Agent:
                 # Frozen authorization context (chainlink #864).
                 auth_context=auth_ctx,
                 ifc_labels=initial_ifc_labels,
+                event_source_id=event.source_id,
+                service_principal=event.service_principal,
+                poller_name=(
+                    event.extra.get("poller_name")
+                    if isinstance(event.extra, Mapping)
+                    and isinstance(event.extra.get("poller_name"), str)
+                    else None
+                ),
+                recovery_selections=recovery_selections,
             )
             ctx.turn_event_emitter = emitter
             emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
