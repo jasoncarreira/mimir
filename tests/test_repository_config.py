@@ -116,7 +116,7 @@ def test_empty_legacy_repository_value_uses_declarative_config(
     assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
 
 
-def test_worklink_target_must_name_declared_repository(
+def test_worklink_target_defect_is_deferred_to_closed_startup_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -132,14 +132,13 @@ def test_worklink_target_must_name_declared_repository(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    with pytest.raises(
-        RuntimeError,
-        match="worklink.yaml repository does not name a declared repository: owner/missing",
-    ):
-        Config.from_env()
+    config = Config.from_env()
+
+    assert config.coding_enabled is False
+    assert "WORKLINK_REPO" not in os.environ
 
 
-def test_repository_origin_mismatch_is_fatal_and_names_both_origins(
+def test_repository_origin_mismatch_is_deferred_to_closed_startup_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -151,16 +150,12 @@ def test_repository_origin_mismatch_is_fatal_and_names_both_origins(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    with pytest.raises(RuntimeError) as exc_info:
-        Config.from_env()
+    config = Config.from_env()
 
-    message = str(exc_info.value)
-    assert "repository owner/repo did not bind" in message
-    assert "https://github.com/owner/repo.git" in message
-    assert "git@github.com:owner/repo.git" in message
+    assert dict(config.file_tool_roots)[str(checkout.resolve())] == "rw"
 
 
-def test_parent_directory_cannot_satisfy_repository_record(
+def test_parent_directory_binding_defect_is_deferred_to_startup_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -174,11 +169,12 @@ def test_parent_directory_cannot_satisfy_repository_record(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    with pytest.raises(RuntimeError, match="found 'not a git checkout'"):
-        Config.from_env()
+    config = Config.from_env()
+
+    assert dict(config.file_tool_roots)[str(parent.resolve())] == "rw"
 
 
-def test_legacy_root_disagreement_fails_closed_with_both_values(
+def test_legacy_root_disagreement_is_preserved_for_closed_startup_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -193,13 +189,12 @@ def test_legacy_root_disagreement_fails_closed_with_both_values(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw,{other}:ro")
 
-    with pytest.raises(RuntimeError) as exc_info:
-        Config.from_env()
+    config = Config.from_env()
 
-    message = str(exc_info.value)
-    assert "MIMIR_FILE_TOOL_ROOTS disagrees" in message
-    assert str(other) in message
-    assert str(allowed) in message
+    assert dict(config.file_tool_roots) == {
+        str(checkout.resolve()): "rw",
+        str(other.resolve()): "ro",
+    }
 
 
 def test_legacy_root_agreement_uses_canonical_path_to_mode_not_order(
@@ -283,8 +278,7 @@ def test_only_active_ready_queue_coding_target_requires_rw_mode(
     poller = home / "skills" / "chainlink-orchestrator" / "pollers.json"
     poller.parent.mkdir(parents=True)
     poller.write_text("{}", encoding="utf-8")
-    with pytest.raises(RuntimeError, match="coding target owner/repo must have mode 'rw'"):
-        Config.from_env()
+    assert Config.from_env().coding_enabled is True
 
 
 def test_ready_queue_target_rw_keeps_unrelated_repository_ro_authorization(
@@ -361,13 +355,16 @@ def test_nonempty_legacy_disagreement_fails_closed_with_both_values(
     declared_value = declared_value.format(other=other, checkout=checkout)
     monkeypatch.setenv(name, legacy_value)
 
-    with pytest.raises(RuntimeError) as exc_info:
+    if name == "GITHUB_REPOS":
+        with pytest.raises(RuntimeError) as exc_info:
+            Config.from_env()
+        message = str(exc_info.value)
+        assert name in message
+        assert legacy_value in message
+        assert declared_value in message
+    else:
         Config.from_env()
-
-    message = str(exc_info.value)
-    assert name in message
-    assert legacy_value in message
-    assert declared_value in message
+        assert os.environ[name] == legacy_value
 
 
 def test_worklink_config_names_one_neutral_repository(tmp_path: Path) -> None:

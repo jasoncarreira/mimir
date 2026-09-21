@@ -9,7 +9,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import socket
 import stat
 import subprocess
 import tempfile
@@ -29,6 +28,7 @@ from .worklink.tool_pins import FACTORY_VERSION, OPENCODE_VERSION, probe_factory
 from .worklink.worker_client import (
     DEFAULT_EXECUTOR_SOCKET,
     EXECUTOR_PROTOCOL_IDENTITY,
+    WorkerClient,
 )
 
 
@@ -416,9 +416,9 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         worker = "unavailable"
         source_commit: str | None = None
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
-                connection.settimeout(5)
-                connection.connect(str(environment.executor_socket))
+            client = object.__new__(WorkerClient)
+            client.socket_path = environment.executor_socket
+            with client._connect(timeout_s=5) as connection:
                 connection.send(
                     json.dumps(
                         {

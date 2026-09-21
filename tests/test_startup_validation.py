@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import threading
 
@@ -355,6 +356,94 @@ def test_production_git_binding_mismatch_is_named_fatal(
     ).status is StartupStatus.FATAL
 
 
+@pytest.mark.parametrize(
+    ("defect", "stable_name"),
+    [
+        ("malformed-inventory", "coding.repositories.inventory"),
+        ("root-mode", "coding.repositories.root_mode_agreement"),
+        ("target-ro", "coding.worklink.target_rw_unique"),
+        ("git-binding", "coding.worklink.git_binding"),
+    ],
+)
+def test_config_defers_repository_defects_to_tool_registration_startup_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+    stable_name: str,
+) -> None:
+    from mimir.config import Config
+    from mimir.tools import all_mimir_tools
+
+    _basic_environment(tmp_path, monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setattr(
+        "mimir.tools.forge.initialize_github_forge_identity", lambda: True
+    )
+    poller = tmp_path / "skills" / "chainlink-orchestrator" / "pollers.json"
+    poller.parent.mkdir(parents=True)
+    poller.write_text("{}", encoding="utf-8")
+    (tmp_path / "worklink.yaml").write_text(
+        "repository: owner/repo\n", encoding="utf-8"
+    )
+    checkout = tmp_path / "repo"
+    if defect == "malformed-inventory":
+        (tmp_path / "repositories.yaml").write_text(
+            "repositories: [\n", encoding="utf-8"
+        )
+    else:
+        actual_origin = (
+            "https://github.com/owner/other.git"
+            if defect == "git-binding"
+            else "https://github.com/owner/repo.git"
+        )
+        _init_repository(checkout, actual_origin)
+        _write_repository_inventory(
+            tmp_path,
+            checkout,
+            mode="ro" if defect == "target-ro" else "rw",
+        )
+        if defect == "root-mode":
+            other = tmp_path / "other"
+            other.mkdir()
+            monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{other}:ro")
+
+    config = Config.from_env()
+
+    with pytest.raises(RuntimeError, match=stable_name):
+        all_mimir_tools(coding_enabled=config.coding_enabled)
+
+
+def test_production_github_warning_omits_dependent_coding_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.forge.github import GitHubForgeClient
+    from mimir.tools import all_mimir_tools
+    import mimir.forge.github as github_module
+    import mimir.tools.forge as forge_tools
+
+    degraded_probe = forge_tools.github_identity_is_degraded
+    _basic_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(forge_tools, "github_identity_is_degraded", degraded_probe)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    monkeypatch.setenv("GITHUB_TOKEN", "local-token")
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    monkeypatch.setattr(github_module, "_verified_identity", None)
+    monkeypatch.setattr(
+        GitHubForgeClient,
+        "_request",
+        lambda self, method, path, **kwargs: {"login": "different-local-user"},
+    )
+
+    names = {tool.name for tool in all_mimir_tools(coding_enabled=True)}
+
+    assert forge_tools.github_identity_is_degraded() is True
+    assert "spawn_open_code" not in names
+    assert not ({"repo_test", "github_create_pull_request"} & names)
+
+
 def _factory_fixture(root: Path, version: str, script: str = "") -> Path:
     modules = root / "node_modules"
     factory = modules / "feature-factory"
@@ -408,8 +497,9 @@ def test_production_factory_command_contract_missing_is_named_fatal(
     ).status is StartupStatus.FATAL
 
 
-def _worker_server(path: Path, identity: str) -> threading.Thread:
+def _worker_server(path: Path, identity: str) -> tuple[threading.Thread, list[bytes]]:
     ready = threading.Event()
+    received: list[bytes] = []
 
     def serve() -> None:
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
@@ -418,17 +508,48 @@ def _worker_server(path: Path, identity: str) -> threading.Thread:
             ready.set()
             connection, _ = server.accept()
             with connection:
-                connection.recv(4096)
-                connection.send(json.dumps({
-                    "status": "identity",
-                    "executor_identity": identity,
-                    "source_commit": "a" * 40,
-                }).encode())
+                request = connection.recv(4096)
+                received.append(request)
+                if request:
+                    connection.send(json.dumps({
+                        "status": "identity",
+                        "executor_identity": identity,
+                        "source_commit": "a" * 40,
+                    }).encode())
 
     thread = threading.Thread(target=serve)
     thread.start()
     assert ready.wait(timeout=2)
-    return thread
+    return thread, received
+
+
+def _stub_worker_peer_uid(
+    monkeypatch: pytest.MonkeyPatch, uid: int,
+) -> None:
+    real_socket = socket.socket
+
+    class PeerSocket:
+        def __init__(self, *args, **kwargs):
+            self._socket = real_socket(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._socket, name)
+
+        def getsockopt(self, level, option, length=0):
+            if level == socket.SOL_SOCKET and option == socket.SO_PEERCRED:
+                return struct.pack("3i", 1234, uid, 1234)
+            return self._socket.getsockopt(level, option, length)
+
+        def close(self):
+            return self._socket.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    monkeypatch.setattr("mimir.worklink.worker_client.socket.socket", PeerSocket)
 
 
 @pytest.mark.parametrize(
@@ -449,7 +570,8 @@ def test_production_worker_handshake_reports_actual_matching_or_mismatched_ident
         retained_recovery_enabled=True,
         executor_socket=tmp_path / "worker.sock",
     )
-    thread = _worker_server(environment.executor_socket, identity)
+    thread, received = _worker_server(environment.executor_socket, identity)
+    _stub_worker_peer_uid(monkeypatch, 0)
 
     check = validate_startup(environment).check("coding.worklink.worker_protocol")
     thread.join(timeout=2)
@@ -460,4 +582,28 @@ def test_production_worker_handshake_reports_actual_matching_or_mismatched_ident
         "worker": identity,
         "source_commit": "a" * 40,
     }
+    assert received and received[0]
+    assert not thread.is_alive()
+
+
+def test_production_worker_handshake_rejects_unverified_nonroot_peer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = replace(
+        _basic_environment(tmp_path, monkeypatch),
+        retained_recovery_enabled=True,
+        executor_socket=tmp_path / "worker.sock",
+    )
+    thread, received = _worker_server(
+        environment.executor_socket, EXECUTOR_PROTOCOL_IDENTITY
+    )
+    _stub_worker_peer_uid(monkeypatch, 1002)
+
+    check = validate_startup(environment).check("coding.worklink.worker_protocol")
+    thread.join(timeout=2)
+
+    assert check.status is StartupStatus.FATAL
+    assert check.observed["worker"] == "unavailable"
+    assert "peer is not root" in check.detail
+    assert received == [b""]
     assert not thread.is_alive()
