@@ -830,6 +830,21 @@ class FeatureFactoryBackend:
             sandbox=sandbox,
         )
 
+    def terminal(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        reason: str,
+        sandbox: Path,
+        launcher: str | Path,
+    ) -> None:
+        self._control(
+            launcher,
+            ("terminal", run_id, status, "--reason", reason, "--repo", str(sandbox)),
+            sandbox=sandbox,
+        )
+
     def lock(
         self,
         run_id: str,

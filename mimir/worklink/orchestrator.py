@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -144,10 +145,56 @@ _FACTORY_PROGRESS_IGNORED_DIRS = frozenset(
 )
 _FACTORY_PROGRESS_MAX_FILES = 100_000
 _FACTORY_PROGRESS_MAX_BYTES = 256 * 1024 * 1024
+_FACTORY_BUDGET_PARK_LEAD_S = 300.0
 
 
 def _epic_run_timeout_s() -> float:
     return factory_run_timeout_s()
+
+
+def _factory_budget_park_reason(status: FactoryStatus, record: FactoryRunRecord) -> str:
+    next_step = status.next
+    if next_step is None and status.next_action is not None:
+        value = status.next_action.get("kind")
+        next_step = value if isinstance(value, str) and value.strip() else None
+    next_step = next_step or "unknown next action"
+
+    slices = status.slices or ()
+    merged = 0
+    in_review = 0
+    for item in slices:
+        value = str(item.get("status", "")).strip().lower().replace("_", "-")
+        if value in {"merged", "completed"}:
+            merged += 1
+        elif value in {"review", "in-review", "reviewing"}:
+            in_review += 1
+    pending = len(slices) - merged - in_review
+    slice_tally = (
+        f"{merged} of {len(slices)} slices merged, {in_review} in review, {pending} pending"
+    )
+
+    gates = status.gates or {}
+    gate_states = []
+    for name, row in sorted(gates.items()):
+        value = row.get("status") if isinstance(row, dict) else None
+        gate_states.append(f"{name}={value if isinstance(value, str) else 'unknown'}")
+    gate_tally = ", ".join(gate_states) if gate_states else "none reported"
+    session = record.session or status.lock_session or "$SESSION_ID"
+    resume = shlex.join(
+        [
+            "factory",
+            "resume",
+            record.run_id,
+            "--session",
+            session,
+            "--repo",
+            record.sandbox,
+        ]
+    )
+    return (
+        f"budget exhausted at {next_step}; {slice_tally}; gates: {gate_tally}; "
+        f"no work lost; resume to continue: {resume}"
+    )
 
 
 def _factory_startup_status_timeout_s() -> float:
@@ -2920,6 +2967,8 @@ class WorklinkRunner:
         loop = asyncio.get_running_loop()
         run_timeout = _epic_run_timeout_s()
         deadline = loop.time() + run_timeout
+        park_lead = min(_FACTORY_BUDGET_PARK_LEAD_S, run_timeout / 2)
+        park_deadline = deadline - park_lead
         # Resolve once per invocation: a second read could announce the same
         # unusable setting twice and could disagree if the environment moved.
         startup_timeout = _factory_startup_status_timeout_s()
@@ -2983,6 +3032,87 @@ class WorklinkRunner:
             cancel_attempted = True
             await compute.cancel(handle)
 
+        async def park_for_budget(current: FactoryStatus) -> WorklinkRunResult:
+            nonlocal factory_record, failed, wait_result
+            reason = _factory_budget_park_reason(current, factory_record)
+            await cancel_once()
+            wait_result = await _finish_factory_wait_task(wait_task)
+            if compute.job_alive(handle):
+                raise WorklinkError("factory driver survived cancellation before budget park")
+            retain_result(wait_result, "needs-human")
+            await asyncio.to_thread(
+                backend.terminal,
+                factory_record.run_id,
+                "needs-human",
+                reason=reason,
+                sandbox=Path(factory_record.sandbox),
+                launcher=factory_record.launcher,
+            )
+
+            snapshot_failure = "factory status reports park_snapshot null"
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    parked = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            backend.status,
+                            factory_record.run_id,
+                            sandbox=Path(factory_record.sandbox),
+                            launcher=factory_record.launcher,
+                        ),
+                        timeout=remaining,
+                    )
+                    _require_factory_status(parked, factory_record)
+                    if not parked.is_parked:
+                        raise WorklinkError(
+                            "factory terminal did not return a needs-human status"
+                        )
+                    factory_record = replace(
+                        factory_record.observed(parked, datetime.now(UTC).isoformat()),
+                        controller_phase="parked",
+                        controller_error=_factory_controller_error(reason),
+                    )
+                    save_factory_record(self.home, factory_record)
+                    if parked.park_snapshot is not None:
+                        break
+                except TimeoutError:
+                    snapshot_failure = "factory status verification timed out"
+                    break
+                delay = min(
+                    max(0.01, float(backend.poll_interval_s)),
+                    max(0, deadline - loop.time()),
+                )
+                if delay <= 0:
+                    break
+                await asyncio.sleep(delay)
+
+            if factory_record.status is None or not factory_record.status.is_parked:
+                raise WorklinkError(
+                    f"factory budget park could not be verified: {snapshot_failure}"
+                )
+            if factory_record.status.park_snapshot is None:
+                factory_record = replace(
+                    factory_record,
+                    controller_error=_factory_controller_error(
+                        f"{reason}; snapshot publication failed: {snapshot_failure}"
+                    ),
+                )
+                save_factory_record(self.home, factory_record)
+            failed = False
+            return await self._finish_factory_070(
+                issue=issue,
+                claim_record=claim_record,
+                claims=claims,
+                backend=backend,
+                compute=compute,
+                factory_record=factory_record,
+                test_cmd=test_cmd,
+                runner=runner,
+                started_at=started_at,
+            )
+
         def end_stale_episode(reason: str) -> None:
             nonlocal stale_started, stale_failure
             if stale_started is None:
@@ -3021,12 +3151,18 @@ class WorklinkRunner:
 
         try:
             while True:
+                if last_status is not None and loop.time() >= park_deadline:
+                    return await park_for_budget(last_status)
                 if status is None:
-                    remaining = startup_deadline - loop.time() if last_status is None else deadline - loop.time()
+                    remaining = (
+                        startup_deadline - loop.time()
+                        if last_status is None
+                        else park_deadline - loop.time()
+                    )
                     if remaining <= 0:
                         if last_status is None:
                             raise WorklinkError("factory never initialised before startup deadline")
-                        raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
+                        return await park_for_budget(last_status)
                     try:
                         status = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -3042,7 +3178,7 @@ class WorklinkRunner:
                             raise WorklinkError(
                                 "factory never initialised before startup deadline"
                             ) from exc
-                        raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)") from exc
+                        return await park_for_budget(last_status)
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
@@ -3202,12 +3338,15 @@ class WorklinkRunner:
                     raise WorklinkError(
                         f"OpenCode process exited while factory status was running{suffix}"
                     )
-                if loop.time() >= deadline:
-                    raise WorklinkError(f"factory exceeded run timeout ({run_timeout:.0f}s)")
+                if loop.time() >= park_deadline:
+                    assert last_status is not None
+                    return await park_for_budget(last_status)
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
                 if pre_manifest:
                     poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
+                else:
+                    poll_delay = min(poll_delay, max(0, park_deadline - loop.time()))
                 await asyncio.sleep(poll_delay)
                 status = None
         finally:
@@ -3246,10 +3385,15 @@ class WorklinkRunner:
         if status is None:
             raise WorklinkError("factory terminal projection is missing")
         if status.is_parked:
+            diagnosis = factory_record.controller_error or "factory run is parked"
             park_report = (
-                f"factory run is parked; control-plane snapshot: {status.park_snapshot}"
+                f"{diagnosis}; control-plane snapshot: {status.park_snapshot}"
                 if status.park_snapshot is not None
-                else "factory run is parked; no control-plane snapshot published"
+                else (
+                    diagnosis
+                    if "snapshot publication failed:" in diagnosis
+                    else f"{diagnosis}; no control-plane snapshot published"
+                )
             )
             claims.transition_issue(
                 issue.issue_id,

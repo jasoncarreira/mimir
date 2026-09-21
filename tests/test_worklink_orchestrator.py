@@ -7746,6 +7746,167 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     assert lifecycle == [("cancel", handle), ("cleanup", handle)]
 
 
+@pytest.mark.parametrize(
+    ("snapshot_published", "cancellation_stops_driver"),
+    [(True, True), (False, True), (True, False)],
+)
+def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    snapshot_published: bool,
+    cancellation_stops_driver: bool,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    cancel_called = asyncio.Event()
+    lifecycle: list[str] = []
+    transitions: list[dict[str, object]] = []
+    terminal_reasons: list[str] = []
+    parked = False
+    parked_status_reads = 0
+    snapshot = str(sandbox / ".factory" / ".parked" / "700")
+    slices = tuple(
+        {"id": f"slice-{index}", "status": value, "attempts": 1}
+        for index, value in enumerate(
+            ["merged"] * 9 + ["in-review"] + ["ready"] * 3,
+            start=1,
+        )
+    )
+    running = replace(
+        _factory_lifecycle_status(sandbox, status="running"),
+        next="observe-slice:be-retained-recovery-service",
+        slices=slices,
+        gates={
+            "implementation": {
+                "status": "passed",
+                "at": None,
+                "artifact": None,
+                "reviewed_head": None,
+            }
+        },
+    )
+
+    class Claims:
+        def heartbeat_issue(self, record: ClaimRecord) -> None:
+            return None
+
+        def transition_issue(self, *args: object, **kwargs: object) -> None:
+            transitions.append(kwargs)
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await cancel_called.wait()
+            if cancellation_stops_driver:
+                return ComputeResult(-15, "", "cancelled", handle=selected)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            cancel_called.set()
+            if cancellation_stops_driver:
+                stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 5
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal parked_status_reads
+            if not parked:
+                return running
+            parked_status_reads += 1
+            return replace(
+                running,
+                status="needs-human",
+                park_snapshot=(
+                    snapshot
+                    if snapshot_published and parked_status_reads >= 2
+                    else None
+                ),
+            )
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def terminal(
+            self, run_id: str, status: str, *, reason: str, **kwargs: object
+        ) -> None:
+            nonlocal parked
+            assert stopped.is_set(), "live driver was parked"
+            lifecycle.append("terminal")
+            terminal_reasons.append(reason)
+            parked = True
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += delay
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    def run() -> WorklinkRunResult:
+        return asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=Claims(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
+        )
+
+    if not cancellation_stops_driver:
+        with pytest.raises(
+            WorklinkError,
+            match="factory driver survived cancellation before budget park",
+        ):
+            run()
+        assert lifecycle == ["cancel", "cleanup"]
+        assert terminal_reasons == []
+        assert transitions == []
+        return
+
+    result = run()
+    assert result.status == "needs-human"
+    assert lifecycle == ["cancel", "terminal", "cleanup"]
+    reason = terminal_reasons[0]
+    assert "budget exhausted at observe-slice:be-retained-recovery-service" in reason
+    assert "9 of 13 slices merged, 1 in review, 3 pending" in reason
+    assert "gates: implementation=passed" in reason
+    assert (
+        f"factory resume 700 --session session-1 --repo {sandbox}" in reason
+    )
+    retained = load_factory_record(tmp_path, "700")
+    assert retained is not None and retained.controller_phase == "parked"
+    assert retained.status is not None and retained.status.is_parked
+    assert transitions[0]["status"] == "blocked"
+    report = str(transitions[0]["reason"])
+    if snapshot_published:
+        assert retained.status.park_snapshot == snapshot
+        assert f"control-plane snapshot: {snapshot}" in report
+    else:
+        assert retained.status.park_snapshot is None
+        assert (
+            "snapshot publication failed: factory status reports park_snapshot null"
+            in report
+        )
+        assert "control-plane snapshot:" not in report
+
+
 def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) -> None:
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8130,7 +8291,7 @@ def test_factory_work_snapshot_does_not_depend_on_private_run_state(
     assert orchestrator._factory_work_snapshot(sandbox) != first
 
 
-@pytest.mark.parametrize("terminal", ["result", "exception", "timeout"])
+@pytest.mark.parametrize("terminal", ["result", "exception"])
 def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8339,7 +8500,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
     assert Path(retained.transcript).is_file()
 
 
-@pytest.mark.parametrize("ending", ["parked", "timeout", "newer-incident"])
+@pytest.mark.parametrize("ending", ["parked", "newer-incident"])
 def test_factory_stale_status_events_are_bounded_per_episode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8401,7 +8562,7 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
     monkeypatch.setenv(
         "MIMIR_FACTORY_RUN_TIMEOUT_S",
-        "4001" if ending in {"parked", "newer-incident"} else "4000",
+        "4301",
     )
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     monkeypatch.setattr(orchestrator, "save_factory_record", lambda *args: None)
@@ -8510,7 +8671,7 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         assert len(alerts) == 1
 
 
-@pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence", "timeout"])
+@pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence"])
 def test_factory_supervision_cancels_and_cleans_on_every_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

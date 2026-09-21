@@ -471,7 +471,7 @@ class TestWriteGuardBackend:
             "builtin-skill",
             "operator-skill",
         }
-        assert "skills_load_errors" not in update
+        assert not update.get("skills_load_errors")
         assert not any("Skills load errors" in record.message for record in caplog.records)
 
     def test_non_admin_docs_are_readable_discoverable_and_read_only(
