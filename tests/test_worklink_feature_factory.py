@@ -978,12 +978,28 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         sandbox=sandbox,
         launcher=entrypoint,
     )
+    backend.terminal(
+        "1551",
+        "needs-human",
+        reason="budget exhausted; resume to continue",
+        sandbox=sandbox,
+        launcher=entrypoint,
+    )
     assert status.status == "running"
     assert [args[2:] for args, _ in calls] == [
         ("resume", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("status", "1551", "--repo", str(sandbox), "--json"),
         ("heartbeat", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
+        (
+            "terminal",
+            "1551",
+            "needs-human",
+            "--reason",
+            "budget exhausted; resume to continue",
+            "--repo",
+            str(sandbox),
+        ),
     ]
     assert all(args[:2] == ("node", str(entrypoint.resolve())) for args, _ in calls)
     assert all("cwd" not in kwargs for _, kwargs in calls)
