@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Protocol
 
 from ..compute import ComputeResult, WorkSpec
+from ..diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    external_active_ingest,
+)
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ class WorkOrder:
 BLOCKED_MARKER = "WORKLINK_BLOCKED:"
 
 
-def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
+def blocked_reason_from_output(stdout: str, stderr: str) -> DiagnosticEnvelope | None:
     """Extract a backend-requested Worklink blocked reason from output.
 
     Backend CLIs are model-driven and may discover a planner/design flaw that
@@ -69,7 +74,10 @@ def blocked_reason_from_output(stdout: str, stderr: str) -> str | None:
         if stripped.startswith(BLOCKED_MARKER):
             reason = _clean_blocked_reason(stripped[len(BLOCKED_MARKER) :].strip())
             if reason:
-                return reason
+                return external_active_ingest(
+                    reason,
+                    producer_tag=DiagnosticProducer.OPENCODE_PROCESS,
+                )
     return None
 
 
@@ -101,8 +109,10 @@ class RawResult:
     exit_code: int
     transcript_path: Path | None
     backend_status: str
-    error: str | None
-    blocked_reason: str | None = None
+    # Strings remain accepted for third-party and legacy backends. Shipping
+    # backends return envelopes so the incident ledger can preserve provenance.
+    error: DiagnosticEnvelope | str | None
+    blocked_reason: DiagnosticEnvelope | str | None = None
     output_overflow: bool = False
 
 

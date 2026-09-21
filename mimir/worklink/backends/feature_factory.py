@@ -16,6 +16,16 @@ from typing import Any, Callable, ClassVar, Mapping, Sequence
 
 from ...opencode_config import OpenCodeConfigError
 from ..compute import ComputeResult, WorkSpec
+from ..diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    RetainedOutputCapture,
+    external_active_ingest,
+    legacy_unknown,
+    retained_output,
+    server_fixed,
+    server_structural,
+)
 from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
@@ -110,7 +120,30 @@ def _factory_max_retries(environ: Mapping[str, str] | None = None) -> int:
 
 
 class FactoryContractError(RuntimeError):
-    pass
+    """A factory contract failure with diagnostic provenance retained."""
+
+    def __init__(self, value: DiagnosticEnvelope | BaseException | str) -> None:
+        self.diagnostic = (
+            value if isinstance(value, DiagnosticEnvelope) else legacy_unknown(value)
+        )
+        super().__init__(self.diagnostic.text)
+
+
+def _factory_output_diagnostic(
+    text: str,
+    *,
+    capture: RetainedOutputCapture | None = None,
+) -> DiagnosticEnvelope:
+    """Classify factory output without trusting the factory process tag."""
+    if capture is None:
+        return external_active_ingest(
+            text, producer_tag=DiagnosticProducer.FACTORY_PROCESS
+        )
+    return retained_output(
+        text,
+        capture=capture,
+        producer_tag=DiagnosticProducer.FACTORY_PROCESS,
+    )
 
 
 @dataclass(frozen=True)
@@ -785,11 +818,20 @@ class FeatureFactoryBackend:
                     timeout=30, output_limit=_MAX_STATUS_BYTES,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise FactoryContractError("factory control command timed out") from exc
+            raise FactoryContractError(
+                server_fixed("factory control command timed out")
+            ) from exc
         _strict_diagnostic(result)
         if result.returncode != 0:
             detail = _strict_diagnostic(result)
-            raise FactoryContractError(detail or f"factory control exited {result.returncode}")
+            diagnostic = (
+                _factory_output_diagnostic(detail)
+                if detail
+                else server_structural(
+                    f"factory control exited {result.returncode}"
+                )
+            )
+            raise FactoryContractError(diagnostic)
         return result
 
     def status(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> FactoryStatus:
@@ -847,15 +889,44 @@ class FeatureFactoryBackend:
             sandbox=sandbox,
         )
 
-    async def interpret(self, order: WorkOrder, result: object) -> RawResult:
+    async def interpret(
+        self,
+        order: WorkOrder,
+        result: object,
+        *,
+        retained_capture: RetainedOutputCapture | None = None,
+    ) -> RawResult:
         if not isinstance(result, ComputeResult):
             raise TypeError("FeatureFactoryBackend.interpret expects ComputeResult")
         if result.launch_error:
-            return RawResult(-1, None, "backend_error", result.launch_error)
+            return RawResult(
+                -1,
+                None,
+                "backend_error",
+                legacy_unknown(
+                    result.launch_error,
+                    producer_tag=DiagnosticProducer.FACTORY_PROCESS,
+                ),
+            )
         if result.timed_out:
-            return RawResult(-1, None, "failed", "OpenCode process timed out")
+            return RawResult(
+                -1,
+                None,
+                "failed",
+                server_fixed("OpenCode process timed out"),
+            )
         if result.exit_code != 0:
-            return RawResult(result.exit_code, None, "failed", result.stderr or None)
+            return RawResult(
+                result.exit_code,
+                None,
+                "failed",
+                _factory_output_diagnostic(
+                    result.stderr,
+                    capture=retained_capture,
+                )
+                if result.stderr
+                else None,
+            )
         return RawResult(0, None, "interrupted", None)
 
 
