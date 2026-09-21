@@ -113,7 +113,7 @@ class Tracker:
 
 
 def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merged: bool = True,
-          base: str = "main", slug: str = "example/project"):
+          base: str = "main", slug: str = "example/project", merge_sha: str | None = None):
     payload = {
         "number": 42,
         "html_url": PR_URL,
@@ -121,7 +121,7 @@ def forge(issue_id: int, *, body: str | None = None, state: str = "closed", merg
         "state": state,
         "merged": merged,
         "merged_at": MERGED_AT if merged else None,
-        "merge_commit_sha": MERGE_SHA if merged else None,
+        "merge_commit_sha": MERGE_SHA if merged else merge_sha,
         "base": {"repo": {"full_name": slug}, "ref": base},
     }
 
@@ -495,8 +495,11 @@ def test_open_pr_is_pending_without_notice(
     tracker = Tracker(12)
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker,
-        gh_runner=forge(12, state="open", merged=False), git_runner=git_runner(repo),
+        gh_runner=forge(12, state="open", merged=False, merge_sha=MERGE_SHA),
+        git_runner=git_runner(repo),
     ) == []
+    assert tracker.status == "open"
+    assert (home / "state" / "worklink" / "evidence" / "12-1.json").is_file()
     state = load_failure_state(dispatch_failure_state_dir(home))
     assert not state.get("merge_reconciliations", {}).get("notices")
 
@@ -509,7 +512,8 @@ def test_closed_unmerged_archives_only_completed_unique_evidence(
     tracker = Tracker(13)
     assert closure.reconcile_merged_leaves(
         home, chainlink_runner=tracker,
-        gh_runner=forge(13, state="closed", merged=False), git_runner=git_runner(repo),
+        gh_runner=forge(13, state="closed", merged=False, merge_sha=MERGE_SHA),
+        git_runner=git_runner(repo),
     ) == []
     assert not path.exists()
     assert path.with_suffix(".json.closed-unmerged").is_file()
@@ -533,6 +537,41 @@ def test_invalid_pr_reads_refuse(defect: str) -> None:
     payload[field] = value
     with pytest.raises(closure.ClosureReadError):
         closure.read_pr_snapshot(PR_URL, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)))
+
+
+def test_unmerged_pr_with_merged_at_refuses() -> None:
+    payload = {
+        "number": 42, "html_url": PR_URL, "body": "Closes chainlink #14.",
+        "state": "open", "merged": False, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": "example/project"}, "ref": "main"},
+    }
+
+    with pytest.raises(
+        closure.ClosureReadError, match="unmerged PR snapshot contains merge identity",
+    ):
+        closure.read_pr_snapshot(
+            PR_URL, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)),
+        )
+
+
+@pytest.mark.parametrize("defect", ["missing_merged_at", "missing_sha", "open"])
+def test_merged_pr_requires_closed_state_and_complete_identity(defect: str) -> None:
+    payload = {
+        "number": 42, "html_url": PR_URL, "body": "Closes chainlink #14.",
+        "state": "closed", "merged": True, "merged_at": MERGED_AT,
+        "merge_commit_sha": MERGE_SHA,
+        "base": {"repo": {"full_name": "example/project"}, "ref": "main"},
+    }
+    if defect == "open":
+        payload["state"] = "open"
+    else:
+        payload.pop({"missing_merged_at": "merged_at", "missing_sha": "merge_commit_sha"}[defect])
+
+    with pytest.raises(closure.ClosureReadError, match="merged PR snapshot is incomplete"):
+        closure.read_pr_snapshot(
+            PR_URL, gh_bin="gh", runner=lambda args: cp(stdout=json.dumps(payload)),
+        )
 
 
 def test_completion_base_not_evidence_base_and_repository_binding(
