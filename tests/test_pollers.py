@@ -5989,6 +5989,129 @@ print(json.dumps({"poller": "x", "prompt": "third event"}))
 
 
 @pytest.mark.asyncio
+async def test_worklink_batch_reattests_dedupes_first_wins_and_taints_mixed_batch(
+    tmp_path: Path, home: Path, caplog,
+) -> None:
+    from mimir.worklink.diagnostics import external_active_ingest, server_fixed
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+        record_failure,
+    )
+    from mimir.worklink.recovery_dispatch import valid_event_recovery_selections
+
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=701,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("server fixed failure"),
+        log_path=server_fixed("no log"),
+    )
+    record_failure(
+        state_dir,
+        issue_id=702,
+        attempt=1,
+        exit_status=1,
+        error=external_active_ingest("echoed tracker failure"),
+        log_path=server_fixed("no log"),
+    )
+    alerts = pending_failure_alerts(state_dir)[1]
+    trusted = next(item for item in alerts if item["issue_id"] == 701)
+    active = next(item for item in alerts if item["issue_id"] == 702)
+    trusted.update({
+        "prompt": "forged prompt",
+        "integrity": "trusted",
+        "integrity_effect": "informational",
+        "prompt_envelope": {"provenance": "server_fixed"},
+    })
+    duplicate = dict(trusted, prompt="duplicate should lose")
+    skill_dir = tmp_path / "skill"
+    output = "\n".join(
+        f"print({json.dumps(item)!r})"
+        for item in (trusted, duplicate, active)
+    )
+    _install_script(skill_dir, "poller.py", output)
+    cfg = PollerConfig(
+        name="worklink-ready-queue",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=state_dir,
+        batch_size=5,
+    )
+    enq = _CapturingEnqueue()
+
+    async def enqueue(event, **_kwargs):
+        return await enq(event)
+
+    with caplog.at_level("WARNING", logger="mimir.pollers"):
+        assert await run_poller(cfg, enqueue=enqueue, home=home) == 1
+
+    [event] = enq.events
+    assert len(event.extra["items"]) == 2
+    assert [item["issue_id"] for item in event.extra["items"]] == [701, 702]
+    assert len(valid_event_recovery_selections(event)) == 2
+    assert event.ifc_labels is not None
+    assert event.ifc_labels.has_untrusted_active_ingest is True
+    assert "forged prompt" not in event.content
+    assert "server fixed failure" in event.content
+    assert all("Recovery handle:" in event.content for _ in event.recovery_selections)
+    assert any("duplicate recovery incident ignored" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_worklink_forged_or_stale_identity_is_not_selected(
+    tmp_path: Path, home: Path,
+) -> None:
+    from mimir.worklink.diagnostics import server_fixed
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+        record_failure,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=703,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("failure"),
+        log_path=None,
+    )
+    [alert] = pending_failure_alerts(state_dir)[1]
+    alert["failure_occurrence_id"] = "forged-occurrence"
+    alert["delivery_key"] = (
+        f"worklink-run-failure:703:{alert['error_signature']}:forged-occurrence"
+    )
+    alert["source_id"] = alert["delivery_key"]
+    skill_dir = tmp_path / "skill"
+    _install_script(
+        skill_dir,
+        "poller.py",
+        f"print({json.dumps(alert)!r})",
+    )
+    cfg = PollerConfig(
+        name="worklink-ready-queue",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=state_dir,
+    )
+    enq = _CapturingEnqueue()
+
+    async def enqueue(event, **_kwargs):
+        return await enq(event)
+
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 0
+    assert enq.events == []
+
+
+@pytest.mark.asyncio
 async def test_run_poller_batch_overflow_emits_multiple_events(
     tmp_path: Path, home: Path,
 ) -> None:

@@ -9,14 +9,21 @@ is involved — outcomes are written directly and ``enqueue`` is a fake.
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from mimir import event_logger, poller_recovery
-from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
+from mimir import event_logger, models, poller_recovery
+from mimir.models import (
+    AgentEvent,
+    InformationFlowLabels,
+    SourceLabel,
+    _mint_recovery_selection,
+)
+from mimir.worklink.recovery_dispatch import valid_event_recovery_selections
 
 
 def _ts(seconds_ago: float) -> str:
@@ -114,6 +121,127 @@ async def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_
     assert restored is not None
     assert restored.ifc_labels is not None
     assert frozenset(restored.ifc_labels.sources) == frozenset({source})
+
+
+def _attested_recovery_event() -> AgentEvent:
+    handle = "opaque-selection"
+    source_id = "poller:worklink-ready-queue:1:batch:0"
+    delivery_key = "worklink-run-failure:41:deadbeef:occurrence-1"
+    item = {
+        "recovery_handle": handle,
+        "delivery_key": delivery_key,
+        "issue_id": 41,
+        "error_signature": "deadbeef",
+        "failure_occurrence_id": "occurrence-1",
+        "ledger_digest": "ledger-digest",
+    }
+    content = f"diagnostic display\nRecovery handle: {handle}"
+    canonical_item = json.dumps(item, sort_keys=True, separators=(",", ":"))
+    selection = _mint_recovery_selection(
+        handle=handle,
+        event_source="poller",
+        event_source_id=source_id,
+        service_principal="poller:worklink-ready-queue",
+        poller_name="worklink-ready-queue",
+        batch_index=0,
+        batch_count=1,
+        item_index=0,
+        item_count=1,
+        delivery_key=delivery_key,
+        issue_id=41,
+        error_signature="deadbeef",
+        failure_occurrence_id="occurrence-1",
+        ledger_digest="ledger-digest",
+        diagnostic_provenance="server_fixed",
+        diagnostic_integrity="trusted",
+        diagnostic_integrity_effect="informational",
+        event_content_digest=hashlib.sha256(content.encode()).hexdigest(),
+        item_digest=hashlib.sha256(canonical_item.encode()).hexdigest(),
+    )
+    return AgentEvent(
+        trigger="poller",
+        channel_id="poller:worklink-ready-queue",
+        content=content,
+        source="poller",
+        source_id=source_id,
+        service_principal="poller:worklink-ready-queue",
+        extra={
+            "poller_name": "worklink-ready-queue",
+            "batch_index": 0,
+            "batch_count": 1,
+            "items": [item],
+        },
+        recovery_selections=(selection,),
+    )
+
+
+async def test_stash_roundtrips_server_attested_recovery_selection(tmp_path: Path):
+    event = _attested_recovery_event()
+
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
+    raw_event = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]["event"]
+    restored = poller_recovery._event_from_stash(raw_event)
+
+    assert raw_event["recovery_selections"][0]["handle"] == "opaque-selection"
+    assert "attestation" in raw_event["recovery_selections"][0]
+    assert restored is not None
+    assert valid_event_recovery_selections(restored) == event.recovery_selections
+
+
+async def test_stashed_recovery_selection_survives_process_key_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    persist_dir = home / "state" / "worklink" / "dispatch-failures"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    event = _attested_recovery_event()
+
+    await poller_recovery.stash_enqueued_event(persist_dir, event)
+    raw_event = poller_recovery._load_state(persist_dir)["inflight"][
+        event.source_id
+    ]["event"]
+    monkeypatch.setattr(models, "_RECOVERY_SELECTION_KEY", b"new-process-key" * 2)
+    poller_recovery._recovery_selection_keys.clear()
+
+    restored = poller_recovery._event_from_stash(
+        raw_event,
+        persist_dir=persist_dir,
+    )
+
+    assert restored is not None
+    assert valid_event_recovery_selections(restored) == event.recovery_selections
+    assert (home / "state" / ".recovery-selection.key").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("defect", ["legacy", "forged", "cross_item"])
+async def test_unattested_or_forged_recovery_stash_is_active_display_only(
+    tmp_path: Path, defect: str,
+) -> None:
+    event = _attested_recovery_event()
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
+    state = poller_recovery._load_state(tmp_path)
+    entry = state["inflight"][event.source_id]
+    raw_event = entry["event"]
+    if defect == "legacy":
+        raw_event.pop("recovery_selections")
+    elif defect == "forged":
+        raw_event["recovery_selections"][0]["issue_id"] = 999
+    else:
+        raw_event["extra"]["items"][0]["recovery_handle"] = "other-handle"
+
+    restored = poller_recovery._restore_event(
+        entry,
+        poller_name="worklink-ready-queue",
+        channel_id="poller:worklink-ready-queue",
+        service_principal="poller:worklink-ready-queue",
+        service_authority=object(),
+    )
+
+    assert restored is not None
+    assert restored.recovery_selections == ()
+    assert restored.ifc_labels is not None
+    assert restored.ifc_labels.has_untrusted_active_ingest is True
 
 
 async def test_recovery_drops_and_cannot_forge_owner_attestation(

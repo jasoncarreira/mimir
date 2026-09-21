@@ -213,12 +213,14 @@ class _BudgetExhaustingAgent(_FakeAgent):
         super().__init__(response_messages)
         self._budget = budget
         self._denied_tools = denied_tools or ["Bash"]
+        self.turn_recovery_selections: list[tuple] = []
 
     async def astream(self, state: dict[str, Any], *, config: dict[str, Any], context=None, stream_mode: str = "values"):
         from mimir._context import get_current_turn
 
         _ctx = get_current_turn()
         if _ctx is not None:
+            self.turn_recovery_selections.append(_ctx.recovery_selections)
             _ctx.tool_call_count = self._budget
             _ctx.tool_call_budget = self._budget
             _ctx.tool_call_budget_exhausted = True
@@ -5838,6 +5840,12 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     assert item["delivery_key"] == (
         f"worklink-run-failure:441:{incident['signature']}:{incident['occurrence_id']}"
     )
+    [selection] = queued.recovery_selections
+    assert selection.handle == item["recovery_handle"]
+    assert selection.issue_id == 441
+    assert selection.error_signature == incident["signature"]
+    assert selection.failure_occurrence_id == incident["occurrence_id"]
+    assert fake_model.turn_recovery_selections == [(selection,)]
 
     assert len(fake_model.invocations) == 1
     [input_message] = fake_model.invocations[0]["state"]["messages"]
@@ -5853,6 +5861,7 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
         "factory-441.json",
         "Work:",
         "retained-checkout",
+        selection.handle,
     ):
         assert pointer in agent_input
     assert (

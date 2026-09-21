@@ -7,7 +7,9 @@ TurnRecord is the on-disk turns.jsonl shape (SPEC §10.2).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import secrets
 import time
 import threading
 import uuid
@@ -139,6 +141,8 @@ class IntegrityEffect(StrEnum):
 
 
 _OWNER_ATTESTATION_TOKEN = object()
+_RECOVERY_SELECTION_TOKEN = object()
+_RECOVERY_SELECTION_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -172,6 +176,139 @@ def _mint_owner_attestation(
         raw_author,
         source_channel,
         _token=_OWNER_ATTESTATION_TOKEN,
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RecoverySelection:
+    """Opaque current-turn authority for one re-attested Worklink incident."""
+
+    handle: str
+    event_source: str
+    event_source_id: str
+    service_principal: str
+    poller_name: str
+    batch_index: int
+    batch_count: int
+    item_index: int
+    item_count: int
+    delivery_key: str
+    issue_id: int
+    error_signature: str
+    failure_occurrence_id: str
+    ledger_digest: str
+    diagnostic_provenance: str
+    diagnostic_integrity: str
+    diagnostic_integrity_effect: str
+    event_content_digest: str
+    item_digest: str
+    _attestation: str = field(repr=False, compare=False)
+
+    def __init__(self, *, _token: object, _attestation: str, **values: Any) -> None:
+        if _token is not _RECOVERY_SELECTION_TOKEN:
+            raise TypeError("recovery selections must be minted by the server factory")
+        expected = {field.name for field in dataclass_fields(type(self))} - {"_attestation"}
+        if set(values) != expected:
+            raise TypeError("invalid recovery selection fields")
+        for name, value in values.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_attestation", _attestation)
+        self._validate()
+
+    def _validate(self) -> None:
+        text_fields = (
+            "handle", "event_source", "event_source_id", "service_principal", "poller_name",
+            "delivery_key", "error_signature", "failure_occurrence_id",
+            "ledger_digest", "diagnostic_provenance", "diagnostic_integrity",
+            "diagnostic_integrity_effect", "event_content_digest", "item_digest",
+        )
+        if any(not isinstance(getattr(self, name), str) or not getattr(self, name)
+               for name in text_fields):
+            raise ValueError("recovery selection text fields must be non-empty")
+        for name in ("batch_index", "item_index"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError("recovery selection indexes must be non-negative")
+        for name in ("batch_count", "item_count", "issue_id"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError("recovery selection counts must be positive")
+        if self.batch_index >= self.batch_count or self.item_index >= self.item_count:
+            raise ValueError("recovery selection index is outside its batch")
+        if self.diagnostic_integrity not in Integrity._value2member_map_:
+            raise ValueError("invalid recovery diagnostic integrity")
+        if self.diagnostic_integrity_effect not in IntegrityEffect._value2member_map_:
+            raise ValueError("invalid recovery diagnostic integrity effect")
+
+    def _signed_values(self) -> dict[str, Any]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in dataclass_fields(type(self))
+            if field.name != "_attestation"
+        }
+
+    def to_stash_record(self, *, key: bytes | None = None) -> dict[str, Any]:
+        values = self._signed_values()
+        return {
+            **values,
+            "attestation": _recovery_selection_signature(values, key=key),
+        }
+
+
+def _recovery_selection_payload(values: dict[str, Any]) -> bytes:
+    return json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _recovery_selection_signature(
+    values: dict[str, Any],
+    *,
+    key: bytes | None = None,
+) -> str:
+    return hmac.new(
+        key if key is not None else _RECOVERY_SELECTION_KEY,
+        _recovery_selection_payload(values),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _mint_recovery_selection(**values: Any) -> RecoverySelection:
+    return RecoverySelection(
+        _token=_RECOVERY_SELECTION_TOKEN,
+        _attestation=_recovery_selection_signature(values),
+        **values,
+    )
+
+
+def _restore_recovery_selection(
+    record: object,
+    *,
+    key: bytes | None = None,
+) -> RecoverySelection | None:
+    if not isinstance(record, dict):
+        return None
+    field_names = {field.name for field in dataclass_fields(RecoverySelection)}
+    expected = (field_names - {"_attestation"}) | {"attestation"}
+    if set(record) != expected or not isinstance(record.get("attestation"), str):
+        return None
+    values = {name: record[name] for name in expected if name != "attestation"}
+    signature = _recovery_selection_signature(values, key=key)
+    if not hmac.compare_digest(signature, record["attestation"]):
+        return None
+    try:
+        return RecoverySelection(
+            _token=_RECOVERY_SELECTION_TOKEN,
+            _attestation=_recovery_selection_signature(values),
+            **values,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _recovery_selection_is_authentic(selection: object) -> bool:
+    return bool(
+        isinstance(selection, RecoverySelection)
+        and hmac.compare_digest(
+            _recovery_selection_signature(selection._signed_values()),
+            selection._attestation,
+        )
     )
 
 
@@ -396,6 +533,33 @@ class SourceLabel(_SourceLabelAuthoritySlot):
             sensitivity=sensitivity,
             authorized_principals=acl,
             source_kind=source_kind,
+            integrity=integrity,
+            integrity_effect=integrity_effect,
+        )
+
+    @classmethod
+    def worklink_recovery(
+        cls,
+        *,
+        service_principal: str | None,
+        resource_id: str | None,
+        diagnostic_provenance: str,
+        integrity: str,
+        integrity_effect: str,
+    ) -> "SourceLabel":
+        """Build one server-classified ready-queue diagnostic source."""
+        principal = f"service:{service_principal}" if service_principal else None
+        return cls(
+            principal=principal,
+            domain="worklink_recovery",
+            domain_qualifier=diagnostic_provenance,
+            resource_id=resource_id,
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind=SourceKind.SERVICE,
             integrity=integrity,
             integrity_effect=integrity_effect,
         )
@@ -960,6 +1124,10 @@ class AgentEvent:
     # Exact immutable service grant selected by a trusted internal constructor.
     # Public ingress never copies this object from request data.
     service_authority: Any = None
+    # Server-minted current-event Worklink controls. Payload dictionaries cannot
+    # construct RecoverySelection, and consumers must rebind these to the turn
+    # and current incident ledger before use.
+    recovery_selections: tuple[RecoverySelection, ...] = ()
     # Optional server-discovered heartbeat authority. Poller scopes are always
     # rebuilt from their trusted payload items and never accepted here.
     repo_pr_action_scope: "RepoPRActionScope | None" = None
@@ -1719,6 +1887,12 @@ class TurnContext:
     # continuation context. Propagated to subagents, spawns, continuations,
     # and resumed turns. Blocked at incompatible sinks.
     ifc_labels: InformationFlowLabels | None = None
+    # Exact event identity and immutable Worklink controls copied only after the
+    # Agent validates their server attestation and item binding.
+    event_source_id: str | None = None
+    service_principal: str | None = None
+    poller_name: str | None = None
+    recovery_selections: tuple[RecoverySelection, ...] = ()
     # Number of successful send_message deliveries in this turn (incremented
     # only after the bridge confirms ``SendResult.sent``). The forgot-to-send
     # guard emits ``interactive_turn_no_send_message`` when an interactive turn
