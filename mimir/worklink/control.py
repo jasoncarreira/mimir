@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Callable, Iterator, Sequence
 
 from .compute import LaunchHandle, LocalSubprocessComputeBackend
+from .diagnostics import DiagnosticProducer, server_structural
 from .factory_state import (
     archive_factory_record,
     factory_process_is_alive,
@@ -462,13 +463,27 @@ def reconcile_run_states(
                     issue_id=state.issue_id,
                     attempt=state.attempt,
                     exit_status=None,
-                    error=(
+                    error=server_structural(
                         "dead local Worklink controller requires recovery; "
-                        f"publication={publication_outcome}; target={target}"
+                        f"publication={publication_outcome}; target={target}",
+                        producer_tag=DiagnosticProducer.WORKLINK_CONTROL,
                     ),
                     log_path=None,
-                    preserved_ref=state.branch or None,
-                    work_path=state.checkout or None,
+                    preserved_ref=(
+                        server_structural(
+                            state.branch,
+                            producer_tag=DiagnosticProducer.WORKLINK_CONTROL,
+                        )
+                        if state.branch else None
+                    ),
+                    work_path=(
+                        server_structural(
+                            state.checkout,
+                            producer_tag=DiagnosticProducer.WORKLINK_CONTROL,
+                        )
+                        if state.checkout else None
+                    ),
+                    target_kind="leaf",
                 )
             except OSError as exc:
                 _emit_reconcile_event(

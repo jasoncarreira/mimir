@@ -56,6 +56,12 @@ from mimir.worklink.dispatch_failures import (
     pending_failure_alerts,
     record_failure,
 )
+from mimir.worklink.diagnostics import (
+    DiagnosticProducer,
+    compose_diagnostics,
+    legacy_unknown,
+    server_structural,
+)
 
 
 READY_LABEL = "worklink:ready"
@@ -374,9 +380,24 @@ def _dispatch(
             issue_id=item.issue_id,
             attempt=None,
             exit_status=1,
-            error=f"detached {item.mode} dispatch failed: {exc}",
-            log_path=str(log_path),
-            work_path=repo,
+            error=compose_diagnostics(
+                server_structural(
+                    f"detached {item.mode} dispatch failed: ",
+                    producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+                ),
+                legacy_unknown(
+                    str(exc), producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY
+                ),
+            ),
+            log_path=server_structural(
+                str(log_path),
+                producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+            ),
+            work_path=server_structural(
+                repo,
+                producer_tag=DiagnosticProducer.WORKLINK_AUTONOMY,
+            ),
+            target_kind="factory" if item.mode == "epic" else "leaf",
         )
         _emit(
             {
@@ -492,22 +513,57 @@ def _deliver_failure_alerts(
     tick_budget: TickBudget,
 ) -> bool:
     """Offer prompt alerts; receipts are observed on a later poller tick."""
+    allowed_output_fields = {
+        "prompt", "source_id", "issue_id", "attempt", "attempt_consumed",
+        "exit_status", "terminal_error", "target_kind", "error_signature",
+        "failure_occurrence_id", "log", "preserved_ref", "preservation_error",
+        "run_id", "work_path", "transcript", "retry_after", "delivery_key",
+    }
+
     def still_pending(state, alert):
-        entry = state["issues"].get(str(alert["issue_id"]))
+        issue_id = alert.get("issue_id")
+        signature = alert.get("error_signature")
+        occurrence_id = alert.get("failure_occurrence_id")
+        if (
+            type(issue_id) is not int
+            or issue_id < 1
+            or not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence_id, str)
+            or not occurrence_id
+        ):
+            raise OSError("dispatch failure alert has invalid incident identity")
+        entry = state["issues"].get(str(issue_id))
+        if isinstance(entry, dict) and (
+            type(entry.get("issue_id")) is not int
+            or entry["issue_id"] != issue_id
+        ):
+            raise OSError("dispatch failure state unavailable: invalid issue identity")
         return (
             isinstance(entry, dict)
             and entry.get("active") is True
-            and entry.get("signature") == alert["error_signature"]
-            and entry.get("occurrence_id") == alert["failure_occurrence_id"]
-            and alert["error_signature"] not in (entry.get("notified_signatures") or [])
+            and entry.get("signature") == signature
+            and entry.get("occurrence_id") == occurrence_id
+            and signature not in (entry.get("notified_signatures") or [])
         )
 
     emitted = False
     for alert in alerts:
-        delivery_key = str(alert.get("delivery_key") or (
-            f"worklink-run-failure:{alert['issue_id']}:"
-            f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
-        ))
+        issue_id = alert.get("issue_id")
+        signature = alert.get("error_signature")
+        occurrence_id = alert.get("failure_occurrence_id")
+        if (
+            type(issue_id) is not int
+            or issue_id < 1
+            or not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence_id, str)
+            or not occurrence_id
+        ):
+            raise OSError("dispatch failure alert has invalid incident identity")
+        delivery_key = (
+            f"worklink-run-failure:{issue_id}:{signature}:{occurrence_id}"
+        )
         # The supplied alert list is only a snapshot. Revalidate under the
         # janitor/writer lock and keep it through receipt check and emission;
         # an acknowledged receipt may already have been reclaimed.
@@ -518,15 +574,21 @@ def _deliver_failure_alerts(
             if not delivered:
                 if tick_budget.hard_exhausted():
                     return False
-                alert["delivery_key"] = delivery_key
-                _emit(alert)
+                serialized = {
+                    key: value
+                    for key, value in alert.items()
+                    if key in allowed_output_fields
+                }
+                serialized["delivery_key"] = delivery_key
+                serialized["source_id"] = delivery_key
+                _emit(serialized)
                 emitted = True
         if delivered:
             mark_failure_notified(
                 state_dir,
-                int(alert["issue_id"]),
-                str(alert["error_signature"]),
-                alert["failure_occurrence_id"],
+                issue_id,
+                signature,
+                occurrence_id,
             )
 
     return not emitted
