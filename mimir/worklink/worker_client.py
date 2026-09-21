@@ -28,7 +28,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v10-retained-control"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-repository-binding"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -134,6 +134,9 @@ class RetainedWorkerTarget:
     attempt: int
     worker_identifier: str | None = None
     leaf_session: str | None = None
+    repository_id: str | None = None
+    checkout_device: int | None = None
+    checkout_inode: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"leaf", "factory"} or self.issue_id < 1 or self.attempt < 1:
@@ -141,8 +144,23 @@ class RetainedWorkerTarget:
         if self.kind == "factory":
             if self.worker_identifier is not None or self.leaf_session is not None:
                 raise ValueError("factory retained target cannot carry a leaf process")
+            if (
+                self.repository_id is None
+                or re.fullmatch(r"[0-9a-f]{64}", self.repository_id) is None
+                or type(self.checkout_device) is not int
+                or self.checkout_device < 0
+                or type(self.checkout_inode) is not int
+                or self.checkout_inode < 0
+            ):
+                raise ValueError("factory retained target requires an exact repository checkout")
             return
-        if self.worker_identifier is None or self.leaf_session is None:
+        if (
+            self.worker_identifier is None
+            or self.leaf_session is None
+            or self.repository_id is not None
+            or self.checkout_device is not None
+            or self.checkout_inode is not None
+        ):
             raise ValueError("leaf retained target requires its worker session")
         _validate_identifier(self.worker_identifier)
         if re.fullmatch(r"[0-9a-f]{64}", self.leaf_session) is None:
@@ -164,8 +182,33 @@ class RetainedWorkerTarget:
         )
 
     @classmethod
-    def for_factory(cls, *, issue_id: int, attempt: int) -> RetainedWorkerTarget:
-        return cls("factory", issue_id, attempt)
+    def for_factory(
+        cls, *, repository_root: Path, issue_id: int, attempt: int,
+    ) -> RetainedWorkerTarget:
+        try:
+            repository = repository_root.resolve(strict=True)
+            if not repository.is_dir():
+                raise ValueError("factory retained repository root is not a directory")
+            repository_id = hashlib.sha256(str(repository).encode("utf-8")).hexdigest()
+            checkout = (
+                WORKLINK_CHECKOUT_ROOT
+                / repository_id
+                / f"{issue_id}-{attempt}"
+                / "checkout"
+            )
+            observed = checkout.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError("factory retained checkout is unavailable") from exc
+        if not checkout.is_dir() or checkout.is_symlink():
+            raise ValueError("factory retained checkout is not a directory")
+        return cls(
+            "factory",
+            issue_id,
+            attempt,
+            repository_id=repository_id,
+            checkout_device=observed.st_dev,
+            checkout_inode=observed.st_ino,
+        )
 
 
 @dataclass(frozen=True)
@@ -503,6 +546,10 @@ class WorkerClient:
         if target.kind == "leaf":
             request["target_identifier"] = target.worker_identifier
             request["leaf_session"] = target.leaf_session
+        else:
+            request["repository_id"] = target.repository_id
+            request["checkout_device"] = target.checkout_device
+            request["checkout_inode"] = target.checkout_inode
         payload = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
         if len(payload) > MAX_REQUEST_BYTES:
             raise ValueError("retained worker request exceeds size limit")
@@ -550,6 +597,21 @@ class WorkerClient:
                 ):
                     raise RuntimeError("worker executor returned an invalid checkout admission")
                 path = Path(raw_path)
+                if target.kind == "factory":
+                    expected_path = (
+                        WORKLINK_CHECKOUT_ROOT
+                        / str(target.repository_id)
+                        / f"{target.issue_id}-{target.attempt}"
+                        / "checkout"
+                    )
+                    if (
+                        path != expected_path
+                        or device != target.checkout_device
+                        or inode != target.checkout_inode
+                    ):
+                        raise RuntimeError(
+                            "worker executor returned a mismatched factory checkout admission"
+                        )
             elif checkout is not None:
                 raise RuntimeError("worker executor returned an unexpected checkout admission")
             return RetainedWorkerReceipt(

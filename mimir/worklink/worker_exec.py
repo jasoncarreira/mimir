@@ -44,7 +44,7 @@ RETAINED_RECEIPT_ROOT = Path("/var/lib/mimir-worklink/retained-receipts")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v10-retained-control"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-repository-binding"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -74,11 +74,14 @@ _PATH_LAUNCH_FIELDS = frozenset({
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
-_RETAINED_FACTORY_FIELDS = frozenset({
+_RETAINED_FIELDS = frozenset({
     "version", "op", "executor_identity", "operation_id", "target_kind",
     "issue", "attempt",
 })
-_RETAINED_LEAF_FIELDS = _RETAINED_FACTORY_FIELDS | {
+_RETAINED_FACTORY_FIELDS = _RETAINED_FIELDS | {
+    "repository_id", "checkout_device", "checkout_inode",
+}
+_RETAINED_LEAF_FIELDS = _RETAINED_FIELDS | {
     "target_identifier", "leaf_session",
 }
 _jobs: dict[str, subprocess.Popen[bytes] | _FactoryProcess] = {}
@@ -381,7 +384,11 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
 
 
 def _open_factory_checkout(
-    request: dict[str, Any], *, for_launch: bool = False, allow_transfer: bool = True,
+    request: dict[str, Any],
+    *,
+    for_launch: bool = False,
+    allow_transfer: bool = True,
+    expected_identity: tuple[int, int] | None = None,
 ) -> int:
     """Validate, then transfer/reopen; launch platform checks precede mutation."""
     issue = _positive_integer(request, "issue")
@@ -431,6 +438,8 @@ def _open_factory_checkout(
             raise RuntimeError("factory checkout isolation boundary is invalid")
         checkout_fd = os.open("checkout", flags, dir_fd=boundary_fd)
         checkout = os.fstat(checkout_fd)
+        if expected_identity is not None and (checkout.st_dev, checkout.st_ino) != expected_identity:
+            raise RuntimeError("factory retained checkout identity was replaced")
         expected_owner = identities.mimir_uid if mode == 0o2700 else identities.worklink_uid
         if (
             checkout.st_uid != expected_owner
@@ -475,11 +484,34 @@ def _open_factory_checkout(
         os.close(boundary_fd)
 
 
-def _derive_retained_checkout_path(kind: str, issue: int, attempt: int) -> Path:
+def _derive_retained_checkout_path(
+    kind: str, issue: int, attempt: int, repository_id: str | None = None,
+) -> Path:
     if kind not in {"leaf", "factory"}:
         raise RuntimeError("retained checkout kind is invalid")
     try:
         root = WORKLINK_CHECKOUT_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("retained checkout root is unavailable") from exc
+    if kind == "factory":
+        if repository_id is None or re.fullmatch(r"[0-9a-f]{64}", repository_id) is None:
+            raise RuntimeError("retained factory repository identity is invalid")
+        repository = root / repository_id
+        boundary = repository / f"{issue}-{attempt}"
+        candidate = boundary / "checkout"
+        try:
+            repository_metadata = repository.stat(follow_symlinks=False)
+            boundary_metadata = boundary.stat(follow_symlinks=False)
+            candidate_metadata = candidate.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeError("retained factory checkout is missing or replaced") from exc
+        if not all(
+            stat.S_ISDIR(value.st_mode)
+            for value in (repository_metadata, boundary_metadata, candidate_metadata)
+        ):
+            raise RuntimeError("retained factory checkout is missing or replaced")
+        return candidate
+    try:
         repositories = tuple(root.iterdir())
     except OSError as exc:
         raise RuntimeError("retained checkout root is unavailable") from exc
@@ -494,7 +526,7 @@ def _derive_retained_checkout_path(kind: str, issue: int, attempt: int) -> Path:
         if not stat.S_ISDIR(repository_metadata.st_mode):
             continue
         boundary = repository / f"{issue}-{attempt}"
-        candidate = boundary if kind == "leaf" else boundary / "checkout"
+        candidate = boundary
         try:
             boundary_metadata = boundary.stat(follow_symlinks=False)
             candidate_metadata = candidate.stat(follow_symlinks=False)
@@ -547,8 +579,15 @@ def _open_retained_checkout(
     kind = request.get("target_kind")
     if not isinstance(kind, str):
         raise RuntimeError("retained checkout kind is invalid")
-    path = _derive_retained_checkout_path(kind, issue, attempt)
+    repository_id = request.get("repository_id") if kind == "factory" else None
+    if repository_id is not None and not isinstance(repository_id, str):
+        raise RuntimeError("retained factory repository identity is invalid")
+    path = _derive_retained_checkout_path(kind, issue, attempt, repository_id)
     if kind == "factory":
+        expected_identity = (
+            _identity_integer(request, "checkout_device"),
+            _identity_integer(request, "checkout_inode"),
+        )
         fd = _open_factory_checkout(
             {
                 "issue": issue,
@@ -558,6 +597,7 @@ def _open_retained_checkout(
                 "op": "admit_retained_checkout",
             },
             allow_transfer=allow_transfer,
+            expected_identity=expected_identity,
         )
     else:
         fd = _open_retained_leaf_checkout(path)
@@ -1105,6 +1145,7 @@ def _admit_retained_checkout(
             "target_kind": "factory",
             "issue": request["issue"],
             "attempt": request["attempt"],
+            "repository_id": request["repository_id"],
             "checkout": checkout,
         }
     )

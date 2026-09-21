@@ -32,6 +32,7 @@ from mimir.worklink.worker_client import (
     verify_executor_identity,
 )
 from mimir.worklink.run_state import WorklinkRunState, leaf_session_digest
+import mimir.worklink.worker_client as worker_client
 import mimir.worklink.worker_exec as worker_exec
 from mimir.worklink import identities
 
@@ -2837,9 +2838,17 @@ def test_leaf_session_identity_is_canonical_attempt_bound_and_storage_compatible
 
 @pytest.mark.asyncio
 async def test_retained_client_sends_only_typed_server_control_fields(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[dict[str, object]] = []
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    repository_id = hashlib.sha256(str(repository_root.resolve()).encode()).hexdigest()
+    retained_root = tmp_path / ".worklink"
+    factory_checkout = retained_root / repository_id / "41-2" / "checkout"
+    factory_checkout.mkdir(parents=True)
+    factory_metadata = factory_checkout.stat()
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
 
     class Peer:
         response: bytes = b""
@@ -2868,11 +2877,18 @@ async def test_retained_client_sends_only_typed_server_control_fields(
                 "outcome": outcome,
             }
             if outcome == "admitted":
-                response["checkout"] = {
-                    "path": "/workspace/.worklink/repo/41-2",
-                    "device": 7,
-                    "inode": 9,
-                }
+                if request["target_kind"] == "factory":
+                    response["checkout"] = {
+                        "path": str(factory_checkout),
+                        "device": factory_metadata.st_dev,
+                        "inode": factory_metadata.st_ino,
+                    }
+                else:
+                    response["checkout"] = {
+                        "path": "/workspace/.worklink/repo/41-2",
+                        "device": 7,
+                        "inode": 9,
+                    }
             self.response = json.dumps(response).encode()
 
         def recv(self, _size: int) -> bytes:
@@ -2892,7 +2908,9 @@ async def test_retained_client_sends_only_typed_server_control_fields(
     admitted = await client.admit_retained_checkout(target, operation_id=str(uuid.uuid4()))
     resumed = await client.resume_leaf(target, operation_id=str(uuid.uuid4()))
     factory_admitted = await client.admit_retained_checkout(
-        RetainedWorkerTarget.for_factory(issue_id=41, attempt=2),
+        RetainedWorkerTarget.for_factory(
+            repository_root=repository_root, issue_id=41, attempt=2,
+        ),
         operation_id=str(uuid.uuid4()),
     )
 
@@ -2901,7 +2919,11 @@ async def test_retained_client_sends_only_typed_server_control_fields(
         Path("/workspace/.worklink/repo/41-2"), 7, 9,
     )
     assert resumed.outcome == "running"
-    assert factory_admitted.outcome == "admitted"
+    assert (
+        factory_admitted.checkout,
+        factory_admitted.device,
+        factory_admitted.inode,
+    ) == (factory_checkout, factory_metadata.st_dev, factory_metadata.st_ino)
     assert [request["op"] for request in requests] == [
         "hold_leaf", "admit_retained_checkout", "resume_leaf", "admit_retained_checkout",
     ]
@@ -2910,6 +2932,144 @@ async def test_retained_client_sends_only_typed_server_control_fields(
         assert set(request) == worker_exec._RETAINED_LEAF_FIELDS
     assert set(requests[-1]) == worker_exec._RETAINED_FACTORY_FIELDS
     assert not ({"path", "pid", "signal", "argv", "command", "target_identifier"} & set(requests[-1]))
+    assert requests[-1]["repository_id"] == repository_id
+    assert requests[-1]["checkout_device"] == factory_metadata.st_dev
+    assert requests[-1]["checkout_inode"] == factory_metadata.st_ino
+
+
+def _retained_factory_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[RetainedWorkerTarget, Path]:
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    repository_id = hashlib.sha256(str(repository_root.resolve()).encode()).hexdigest()
+    retained_root = tmp_path / ".worklink"
+    checkout = retained_root / repository_id / "41-2" / "checkout"
+    checkout.mkdir(parents=True)
+    retained_root.chmod(0o755)
+    checkout.parent.parent.chmod(0o755)
+    checkout.parent.chmod(0o2700)
+    checkout.chmod(0o2770)
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
+    monkeypatch.setattr(worker_exec, "WORKLINK_CHECKOUT_ROOT", retained_root)
+    monkeypatch.setattr(worker_exec, "RETAINED_RECEIPT_ROOT", tmp_path / "receipts")
+    monkeypatch.setattr(worker_exec, "get_identities", lambda: SimpleNamespace(
+        mimir_uid=os.getuid(), worklink_uid=os.getuid(), worklink_gid=os.getgid(),
+    ))
+    return (
+        RetainedWorkerTarget.for_factory(
+            repository_root=repository_root, issue_id=41, attempt=2,
+        ),
+        checkout,
+    )
+
+
+def _retained_factory_request(
+    target: RetainedWorkerTarget, *, operation_id: str | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "op": "admit_retained_checkout",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+        "operation_id": operation_id or str(uuid.uuid4()),
+        "target_kind": "factory",
+        "issue": target.issue_id,
+        "attempt": target.attempt,
+        "repository_id": target.repository_id,
+        "checkout_device": target.checkout_device,
+        "checkout_inode": target.checkout_inode,
+    }
+
+
+@pytest.mark.parametrize("replacement", ["missing", "replaced"])
+def test_retained_factory_rejects_missing_or_replaced_checkout_before_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str,
+) -> None:
+    target, checkout = _retained_factory_fixture(tmp_path, monkeypatch)
+    decoy_repository_id = "f" * 64 if target.repository_id != "f" * 64 else "e" * 64
+    decoy = (
+        worker_exec.WORKLINK_CHECKOUT_ROOT
+        / decoy_repository_id
+        / "41-2"
+        / "checkout"
+    )
+    decoy.mkdir(parents=True)
+    decoy.parent.chmod(0o2700)
+    decoy.chmod(0o2770)
+    original = checkout.with_name("original-checkout")
+    checkout.rename(original)
+    if replacement == "replaced":
+        checkout.mkdir()
+        checkout.chmod(0o2770)
+    transfer = Mock(side_effect=AssertionError("invalid retained checkout reached transfer"))
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+
+    with pytest.raises(RuntimeError, match="missing or replaced|identity was replaced"):
+        worker_exec._handle_retained_control(
+            Mock(), _retained_factory_request(target), [],
+        )
+
+    transfer.assert_not_called()
+    assert stat.S_IMODE(original.parent.stat().st_mode) == 0o2700
+    assert stat.S_IMODE(decoy.parent.stat().st_mode) == 0o2700
+    assert list(worker_exec.RETAINED_RECEIPT_ROOT.iterdir()) == []
+
+
+def test_retained_factory_transfers_once_then_verifies_exposed_and_replayed_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, checkout = _retained_factory_fixture(tmp_path, monkeypatch)
+    events: list[str] = []
+
+    def normalize(fd: int, **_kwargs: object) -> None:
+        observed = os.fstat(fd)
+        assert (observed.st_dev, observed.st_ino) == (
+            target.checkout_device,
+            target.checkout_inode,
+        )
+        assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2700
+        events.append("transfer")
+
+    transfer = Mock(side_effect=normalize)
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    responses: list[dict[str, object]] = []
+
+    class Connection:
+        def send(self, payload: bytes, _flags: int = 0) -> None:
+            responses.append(json.loads(payload))
+
+    request = _retained_factory_request(target)
+    worker_exec._handle_retained_control(Connection(), request, [])
+
+    assert events == ["transfer"]
+    assert stat.S_IMODE(checkout.parent.stat().st_mode) == 0o2750
+    assert responses[-1]["status"] == "applied"
+    assert responses[-1]["checkout"] == {
+        "path": str(checkout),
+        "device": target.checkout_device,
+        "inode": target.checkout_inode,
+    }
+    receipt = json.loads(
+        (worker_exec.RETAINED_RECEIPT_ROOT / f"{request['operation_id']}.json").read_text()
+    )
+    assert receipt["identity"]["repository_id"] == target.repository_id
+
+    transfer.reset_mock()
+    worker_exec._handle_retained_control(
+        Connection(), _retained_factory_request(target), [],
+    )
+    assert responses[-1]["status"] == "applied"
+    worker_exec._handle_retained_control(Connection(), request, [])
+    assert responses[-1]["status"] == "already_applied"
+    transfer.assert_not_called()
+
+    moved = checkout.with_name("admitted-checkout")
+    checkout.rename(moved)
+    checkout.mkdir()
+    checkout.chmod(0o2770)
+    with pytest.raises(RuntimeError, match="identity was replaced"):
+        worker_exec._handle_retained_control(Connection(), request, [])
+    transfer.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="retained leaf controls require procfs")
@@ -3113,14 +3273,19 @@ def test_retained_leaf_control_rejects_dead_or_replaced_process_identity(
         "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
         "operation_id": str(uuid.uuid4()),
         "target_kind": "leaf",
-        "issue": 42 if failure == "wrong_attempt" else 41,
-        "attempt": 2,
+        "issue": 41,
+        "attempt": 3 if failure == "wrong_attempt" else 2,
         "target_identifier": identifier,
         "leaf_session": "b" * 64 if failure == "wrong_session" else session,
     }
+    signal_process = Mock(side_effect=AssertionError("invalid target was signalled"))
+    monkeypatch.setattr(worker_exec.os, "killpg", signal_process)
+    receipt_path = worker_exec.RETAINED_RECEIPT_ROOT / f"{request['operation_id']}.json"
     try:
         with pytest.raises(RuntimeError, match="dead|PID-reused|replaced"):
             worker_exec._handle_retained_control(Mock(), request, [])
+        signal_process.assert_not_called()
+        assert not receipt_path.exists()
     finally:
         with worker_exec._jobs_lock:
             worker_exec._jobs.pop(identifier, None)
