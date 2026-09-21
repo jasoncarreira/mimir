@@ -2306,11 +2306,18 @@ class WorklinkRunner:
                     run_id=exc.record.run_id,
                     work_path=exc.record.sandbox,
                     transcript_path=exc.record.transcript,
+                    work_started=False,
                 )
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
                 raise
-            current_issue = issue_reader.read(issue_id)
+            try:
+                current_issue = issue_reader.read(issue_id)
+            except Exception as read_exc:
+                # Preserve the already-recorded precondition refusal rather than
+                # replacing it with a secondary diagnostic read failure.
+                incident_owner.bind(read_exc)
+                raise
             if "worklink:in-progress" not in current_issue.labels:
                 claims.transition_issue(
                     issue_id,
@@ -2530,6 +2537,7 @@ class WorklinkRunner:
                         str(lease.path) if lease is not None else None
                     ),
                     transcript_path=current.transcript if current is not None else None,
+                    work_started=True,
                 )
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
@@ -2594,6 +2602,7 @@ class WorklinkRunner:
                         str(lease.path) if lease is not None else None
                     ),
                     transcript_path=current.transcript if current is not None else None,
+                    work_started=True,
                 )
                 incident_owner.bind(exc)
             except OSError as write_exc:
@@ -3375,6 +3384,15 @@ def _verify_factory_recovery_target(
         raise WorklinkError("retained factory lifecycle is not recoverable")
     if not retained.session:
         raise WorklinkError("retained factory session is missing")
+    if (
+        retained.status is not None
+        and not retained.status.is_terminal
+        and retained.status.status != "needs-human"
+    ):
+        raise WorklinkError(
+            "factory resume requires current status needs-human; "
+            f"found {retained.status.status!r}"
+        )
     sandbox = Path(retained.sandbox)
     from .worker_client import WORKLINK_CHECKOUT_ROOT, factory_checkout_for_path
 
@@ -4117,6 +4135,7 @@ def _record_run_failure(
     run_id: str | None = None,
     work_path: str | None = None,
     transcript_path: str | None = None,
+    work_started: bool | None = None,
 ) -> dict[str, Any] | None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
@@ -4125,7 +4144,7 @@ def _record_run_failure(
         "worklink_run_failed",
         issue_id=issue_id,
         attempt=attempt,
-        attempt_consumed=attempt is not None,
+        attempt_consumed=attempt is not None and work_started is not False,
         exit_status=exit_status,
         terminal_error=safe_error,
         preserved_ref=preserved_ref,
@@ -4144,6 +4163,7 @@ def _record_run_failure(
             run_id=run_id,
             work_path=work_path,
             transcript_path=transcript_path,
+            work_started=work_started,
         )
     return None
 
