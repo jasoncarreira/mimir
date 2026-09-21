@@ -12,14 +12,17 @@ from mimir.worklink.backends import ToolPin
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import (
     ChainlinkBumpFiler,
+    FACTORY_VERSION as STARTUP_FACTORY_VERSION,
     OPENCODE_VERSION,
     ToolPinDrift,
     UpstreamVersion,
     default_tool_pins,
     inventory_tool_pins,
+    probe_factory_packages,
     render_bump_issue_body,
     render_bump_issue_title,
 )
+from mimir.providers import probe_opencode_version
 
 
 class FakeResolver:
@@ -55,6 +58,7 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
     assert pins["opencode"].category == "coding-cli"
     assert pins["opencode"].pin == OPENCODE_VERSION
     assert pins["feature-factory"].pin == FACTORY_VERSION
+    assert STARTUP_FACTORY_VERSION == FACTORY_VERSION == "0.9.2"
     assert pins["opencode-feature-factory"].pin == FACTORY_VERSION
     assert pins["opencode-feature-factory"].category == "coding-plugin"
     assert pins["opencode-project-memory"].category == "coding-plugin"
@@ -66,6 +70,44 @@ def test_default_tool_pin_inventory_covers_distinct_executable_risk_surfaces() -
         assert pin.source
         assert pin.install
         assert pin.risk
+
+
+def test_historical_opencode_1_18_9_is_observed_as_a_pin_mismatch() -> None:
+    def runner(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, "opencode 1.18.9\n", "")
+
+    result = probe_opencode_version(Path("/stub/opencode"), runner=runner)
+
+    assert result.version == "1.18.9"
+    assert result.version != OPENCODE_VERSION
+
+
+def test_historical_factory_0_9_1_manifests_fail_package_bound_probe(
+    tmp_path: Path,
+) -> None:
+    modules = tmp_path / "node_modules"
+    factory = modules / "feature-factory"
+    plugin = modules / "opencode-feature-factory"
+    (factory / "bin").mkdir(parents=True)
+    plugin.mkdir(parents=True)
+    entrypoint = factory / "bin/factory.js"
+    entrypoint.write_text("", encoding="utf-8")
+    (factory / "package.json").write_text(
+        json.dumps({"name": "feature-factory", "version": "0.9.1"}),
+        encoding="utf-8",
+    )
+    (plugin / "package.json").write_text(
+        json.dumps({"name": "opencode-feature-factory", "version": "0.9.1"}),
+        encoding="utf-8",
+    )
+
+    result = probe_factory_packages(entrypoint)
+
+    assert result.feature_factory_version == "0.9.1"
+    assert result.plugin_version == "0.9.1"
+    assert result.package_bound is False
+    assert "feature-factory version is 0.9.1" in result.detail
+    assert "opencode-feature-factory version is 0.9.1" in result.detail
 
 
 def test_worklink_docs_describe_current_tool_pin_inventory() -> None:

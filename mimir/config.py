@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+import yaml
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
@@ -513,12 +514,19 @@ def _parse_file_tool_roots(
     return tuple(out.items())
 
 
-def _configure_declared_repositories(home: Path) -> None:
-    """Validate the repository inventory and reconcile its legacy projections."""
+def _configure_declared_repositories(
+    home: Path, *, defer_validation: bool = False,
+) -> None:
+    """Project valid repository declarations; startup validation reports defects."""
     from .repository_config import RepositoryInventory
     from .worklink.backends.registry import WorklinkConfig
 
-    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    try:
+        inventory = RepositoryInventory.load(home / "repositories.yaml")
+    except (OSError, ValueError, yaml.YAMLError):
+        if defer_validation:
+            return
+        raise
     if not inventory.declared:
         return
     worklink = WorklinkConfig.load(home / "worklink.yaml")
@@ -529,7 +537,8 @@ def _configure_declared_repositories(home: Path) -> None:
     )
     rendered_roots = ",".join(f"{path}:{mode}" for path, mode in declared_roots)
     effective_declared = _parse_file_tool_roots(rendered_roots, home, always_rw=())
-    if effective_declared != declared_roots:
+    roots_valid = dict(effective_declared) == inventory.root_mode_map()
+    if not roots_valid and not defer_validation:
         raise RuntimeError(
             "declared repositories/allowed_roots contain a root that is not a valid "
             f"file-tool root: declared={declared_roots!r}, effective={effective_declared!r}"
@@ -538,12 +547,12 @@ def _configure_declared_repositories(home: Path) -> None:
     legacy_roots = os.environ.get("MIMIR_FILE_TOOL_ROOTS")
     if legacy_roots:
         effective_legacy = _parse_file_tool_roots(legacy_roots, home, always_rw=())
-        if dict(effective_legacy) != dict(declared_roots):
+        if dict(effective_legacy) != dict(declared_roots) and not defer_validation:
             raise RuntimeError(
                 "MIMIR_FILE_TOOL_ROOTS disagrees with repositories.yaml: "
                 f"legacy={effective_legacy!r}, declared={declared_roots!r}"
             )
-    else:
+    if not legacy_roots and roots_valid:
         os.environ["MIMIR_FILE_TOOL_ROOTS"] = rendered_roots
 
     declared_slugs = tuple(repo.slug for repo in inventory.repositories)
@@ -561,7 +570,7 @@ def _configure_declared_repositories(home: Path) -> None:
         os.environ["GITHUB_REPOS"] = ",".join(declared_slugs)
 
     target = inventory.repository(worklink.repository) if worklink.repository else None
-    if worklink.repository is not None and target is None:
+    if worklink.repository is not None and target is None and not defer_validation:
         raise RuntimeError(
             "worklink.yaml repository does not name a declared repository: "
             f"{worklink.repository}"
@@ -572,7 +581,7 @@ def _configure_declared_repositories(home: Path) -> None:
         if legacy_target and (
             declared_target is None
             or Path(legacy_target).resolve() != Path(declared_target)
-        ):
+        ) and not defer_validation:
             raise RuntimeError(
                 f"{name} disagrees with worklink.yaml: "
                 f"legacy={legacy_target!r}, declared={declared_target!r}"
@@ -580,6 +589,8 @@ def _configure_declared_repositories(home: Path) -> None:
     if declared_target is not None and not os.environ.get("WORKLINK_REPO"):
         os.environ["WORKLINK_REPO"] = declared_target
 
+    if defer_validation:
+        return
     git = shutil.which("git")
     if git is None and inventory.repositories:
         raise RuntimeError("declared repositories cannot be validated: git is unavailable")
@@ -588,18 +599,12 @@ def _configure_declared_repositories(home: Path) -> None:
         try:
             top = subprocess.run(
                 [str(git), "-C", str(repo.root), "rev-parse", "--show-toplevel"],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
                 check=False,
             )
             origin = subprocess.run(
                 [str(git), "-C", str(repo.root), "config", "--local", "--get", "remote.origin.url"],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
                 check=False,
             )
             observed_top = Path(top.stdout.strip()).resolve() if top.returncode == 0 else None
@@ -1168,7 +1173,8 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
-        _configure_declared_repositories(home)
+        coding_enabled_value = coding_enabled()
+        _configure_declared_repositories(home, defer_validation=coding_enabled_value)
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
                 "MIMIR_FILE_OP_ROOTS is retired and ignored; migrate its required "
@@ -1179,7 +1185,6 @@ class Config:
         prompts_override = _env("MIMIR_PROMPTS_DIR")
         archive_dir = _env("MIMIR_TURNS_ARCHIVE_DIR")
         model_spec = _env("MIMIR_MODEL_SPEC", DEFAULT_MODEL_SPEC)
-        coding_enabled_value = coding_enabled()
         from .opencode_config import opencode_config_path
 
         resolved_opencode_config = opencode_config_path()

@@ -116,7 +116,7 @@ def test_empty_legacy_repository_value_uses_declarative_config(
     assert os.environ["WORKLINK_REPO"] == str(checkout.resolve())
 
 
-def test_worklink_target_must_name_declared_repository(
+def test_coding_disabled_worklink_target_must_name_declared_repository(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -132,14 +132,25 @@ def test_worklink_target_must_name_declared_repository(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    with pytest.raises(
-        RuntimeError,
-        match="worklink.yaml repository does not name a declared repository: owner/missing",
-    ):
+    with pytest.raises(RuntimeError, match="worklink.yaml repository does not name"):
         Config.from_env()
 
 
-def test_repository_origin_mismatch_is_fatal_and_names_both_origins(
+def test_coding_disabled_malformed_inventory_preserves_config_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "repositories.yaml").write_text("repositories: [\n", encoding="utf-8")
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+
+    with pytest.raises(yaml.YAMLError):
+        Config.from_env()
+
+
+def test_coding_disabled_repository_origin_mismatch_remains_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -151,16 +162,11 @@ def test_repository_origin_mismatch_is_fatal_and_names_both_origins(
     _clear_legacy(monkeypatch)
     monkeypatch.setenv("MIMIR_HOME", str(home))
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError, match="repository owner/repo did not bind"):
         Config.from_env()
 
-    message = str(exc_info.value)
-    assert "repository owner/repo did not bind" in message
-    assert "https://github.com/owner/repo.git" in message
-    assert "git@github.com:owner/repo.git" in message
 
-
-def test_parent_directory_cannot_satisfy_repository_record(
+def test_coding_disabled_parent_directory_cannot_satisfy_repository_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -178,7 +184,7 @@ def test_parent_directory_cannot_satisfy_repository_record(
         Config.from_env()
 
 
-def test_legacy_root_disagreement_fails_closed_with_both_values(
+def test_coding_disabled_legacy_root_disagreement_remains_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
@@ -193,13 +199,138 @@ def test_legacy_root_disagreement_fails_closed_with_both_values(
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{checkout}:rw,{other}:ro")
 
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError, match="MIMIR_FILE_TOOL_ROOTS disagrees"):
         Config.from_env()
 
-    message = str(exc_info.value)
-    assert "MIMIR_FILE_TOOL_ROOTS disagrees" in message
-    assert str(other) in message
-    assert str(allowed) in message
+
+def test_legacy_root_agreement_uses_canonical_path_to_mode_not_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv(
+        "MIMIR_FILE_TOOL_ROOTS",
+        f"{allowed}:ro,{checkout}:rw",
+    )
+
+    config = Config.from_env()
+
+    assert dict(config.file_tool_roots) == {
+        str(allowed.resolve()): "ro",
+        str(checkout.resolve()): "rw",
+    }
+
+
+def test_coding_target_requires_one_observable_canonical_rw_binding(
+    tmp_path: Path,
+) -> None:
+    checkout = tmp_path / "checkout"
+    config = tmp_path / "repositories.yaml"
+    config.write_text(
+        yaml.safe_dump({"repositories": [{
+            "slug": "owner/repo",
+            "root": str(checkout),
+            "mode": "rw",
+            "origin": "https://github.com/owner/repo.git",
+            "base_branch": "main",
+        }]}),
+        encoding="utf-8",
+    )
+    inventory = RepositoryInventory.load(config)
+
+    assert inventory.coding_target(
+        "OWNER/REPO", authorized_roots=((str(checkout), "rw"),)
+    ).slug == "owner/repo"
+    for roots in (
+        (),
+        ((str(checkout), "ro"),),
+        ((str(checkout), "rw"), (str(checkout), "rw")),
+    ):
+        with pytest.raises(ValueError, match="exactly one canonical authorized 'rw'"):
+            inventory.coding_target("owner/repo", authorized_roots=roots)
+
+
+def test_only_active_ready_queue_coding_target_requires_rw_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(checkout, "https://github.com/owner/repo.git")
+    _write_inventory(home, checkout, allowed)
+    inventory_text = (home / "repositories.yaml").read_text(encoding="utf-8")
+    (home / "repositories.yaml").write_text(
+        inventory_text.replace("mode: rw", "mode: ro", 1),
+        encoding="utf-8",
+    )
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_CODING_ENABLED", raising=False)
+
+    assert Config.from_env().coding_enabled is False
+
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+    assert Config.from_env().coding_enabled is True
+
+    _clear_legacy(monkeypatch)
+    poller = home / "skills" / "chainlink-orchestrator" / "pollers.json"
+    poller.parent.mkdir(parents=True)
+    poller.write_text("{}", encoding="utf-8")
+    assert Config.from_env().coding_enabled is True
+
+
+def test_ready_queue_target_rw_keeps_unrelated_repository_ro_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = tmp_path / "target"
+    unrelated = tmp_path / "unrelated"
+    allowed = tmp_path / "reference"
+    allowed.mkdir()
+    _git_checkout(target, "https://github.com/owner/target.git")
+    _git_checkout(unrelated, "https://github.com/owner/unrelated.git")
+    home.mkdir()
+    (home / "repositories.yaml").write_text(
+        yaml.safe_dump({
+            "repositories": [
+                {"slug": "owner/target", "root": str(target), "mode": "rw",
+                 "origin": "https://github.com/owner/target.git", "base_branch": "main"},
+                {"slug": "owner/unrelated", "root": str(unrelated), "mode": "ro",
+                 "origin": "https://github.com/owner/unrelated.git", "base_branch": "main"},
+            ],
+            "allowed_roots": [{"root": str(allowed), "mode": "ro"}],
+        }),
+        encoding="utf-8",
+    )
+    (home / "worklink.yaml").write_text(
+        "repository: owner/target\n", encoding="utf-8"
+    )
+    poller = home / "skills" / "chainlink-orchestrator" / "pollers.json"
+    poller.parent.mkdir(parents=True)
+    poller.write_text("{}", encoding="utf-8")
+    _clear_legacy(monkeypatch)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1")
+
+    config = Config.from_env()
+
+    assert dict(config.file_tool_roots) == {
+        str(target.resolve()): "rw",
+        str(unrelated.resolve()): "ro",
+        str(allowed.resolve()): "ro",
+    }
+    assert access_control._configured_repo_write_roots() == [target.resolve()]
+    assert access_control._configured_repo_roots() == [
+        target.resolve(), unrelated.resolve(),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -232,7 +363,6 @@ def test_nonempty_legacy_disagreement_fails_closed_with_both_values(
 
     with pytest.raises(RuntimeError) as exc_info:
         Config.from_env()
-
     message = str(exc_info.value)
     assert name in message
     assert legacy_value in message

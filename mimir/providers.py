@@ -34,10 +34,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 # Canonical provider labels. These are the values written to
@@ -397,11 +399,64 @@ def claude_code_auth_status(
 _OPENCODE_CLI = "opencode"
 
 
-def opencode_available() -> bool:
-    """True when the ``opencode`` CLI — which the ``spawn_open_code`` tool
-    shells out to (``opencode run``) — is on ``PATH``.
+@dataclass(frozen=True)
+class ExecutableProbe:
+    path: Path | None
+    executable: bool
+    observed: str
 
-    This is a presence, not auth-state, check for the provider-agnostic
-    coding substrate.
-    """
-    return shutil.which(_OPENCODE_CLI) is not None
+
+@dataclass(frozen=True)
+class VersionProbe:
+    version: str | None
+    observed: str
+
+
+def probe_opencode_executable() -> ExecutableProbe:
+    """Resolve OpenCode to one regular executable using its canonical path."""
+    configured = shutil.which(_OPENCODE_CLI)
+    if configured is None:
+        return ExecutableProbe(None, False, "missing")
+    try:
+        path = Path(configured).resolve(strict=True)
+        executable = path.is_file() and os.access(path, os.X_OK)
+    except (OSError, RuntimeError):
+        return ExecutableProbe(None, False, f"unresolvable: {configured}")
+    return ExecutableProbe(path, executable, str(path) if executable else f"not executable: {path}")
+
+
+def probe_opencode_version(
+    executable: Path,
+    *,
+    timeout: float = 5.0,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> VersionProbe:
+    """Run the fixed, bounded OpenCode version probe."""
+    try:
+        result = runner(
+            [str(executable), "--version"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return VersionProbe(None, f"probe failed: {type(exc).__name__}")
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode != 0:
+        return VersionProbe(None, f"exit {result.returncode}: {output[:500]}".rstrip())
+    if len(output.encode("utf-8")) > 4096 or "\x00" in output:
+        return VersionProbe(None, "invalid version output")
+    match = re.search(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])", output)
+    if match is None:
+        return VersionProbe(None, f"unrecognized version: {output[:500]}")
+    return VersionProbe(match.group(1), match.group(1))
+
+
+def opencode_available() -> bool:
+    """Validate coding startup before the OpenCode tool can be registered."""
+    from .startup_validation import enforce_current_startup_before_tool_registration
+
+    report = enforce_current_startup_before_tool_registration()
+    return report.check("coding.opencode.executable").status.value == "pass"
