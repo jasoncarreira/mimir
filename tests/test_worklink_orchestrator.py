@@ -7880,6 +7880,256 @@ def factory_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return clock
 
 
+def _run_factory_progress_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    *,
+    writes: tuple[tuple[float, str, str], ...] = (),
+    stop_at: float,
+    rewrite: tuple[str, str] | None = None,
+) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        load_failure_state,
+    )
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    if rewrite is not None:
+        path = sandbox / rewrite[0]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rewrite[1], encoding="utf-8")
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    events: list[tuple[str, dict[str, Any]]] = []
+    pending = list(writes)
+    running = _factory_lifecycle_status(sandbox, status="running")
+
+    class CaseFinished(RuntimeError):
+        pass
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 60
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            if factory_clock.now >= stop_at:
+                raise CaseFinished
+            return running
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += delay
+        while pending and pending[0][0] <= factory_clock.now:
+            _, relative, content = pending.pop(0)
+            path = sandbox / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        if rewrite is not None:
+            (sandbox / rewrite[0]).write_text(rewrite[1], encoding="utf-8")
+        await asyncio.sleep(0)
+
+    monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
+    monkeypatch.setenv("MIMIR_FACTORY_RUN_TIMEOUT_S", str(stop_at + 900))
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setattr(orchestrator, "save_factory_record", lambda *args: None)
+    monkeypatch.setattr(
+        orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
+    )
+
+    with pytest.raises(CaseFinished):
+        asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=_FactoryLifecycleClaims(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+                autonomous=True,
+            )
+        )
+    return load_failure_state(dispatch_failure_state_dir(tmp_path)), events
+
+
+@pytest.mark.parametrize(
+    ("occurrence", "writes", "stop_at"),
+    [
+        (
+            "attempt-5-23-22",
+            (
+                (1740, "research-map.md", "research complete"),
+                (2460, "technical-brief.md", "brief complete"),
+                (3660, "validation-report.md", "validation complete"),
+            ),
+            3720,
+        ),
+        (
+            "attempt-7-02-22-57",
+            ((1260, "validation-report.md", "validation complete"),),
+            1320,
+        ),
+        (
+            "attempt-7-03-28-39",
+            (
+                (720, "plan/plan.md", "eight-slice plan"),
+                (720, "plan/slices.json", '[{"slice": 1}, {"slice": 8}]'),
+            ),
+            1080,
+        ),
+    ],
+)
+def test_factory_1783_progress_does_not_create_incident_or_alert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    occurrence: str,
+    writes: tuple[tuple[float, str, str], ...],
+    stop_at: float,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+    )
+
+    state, _ = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, writes=writes, stop_at=stop_at
+    )
+
+    assert occurrence
+    assert state.get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+
+
+def test_factory_wedged_without_any_progress_still_escalates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+    )
+
+    state, _ = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    )
+
+    incident = state["issues"]["700"]
+    assert incident["active"] is True
+    assert incident["terminal_error"] == "factory status made no useful progress"
+    blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
+    assert blocked == {700}
+    assert len(alerts) == 1
+
+
+def test_factory_looping_on_identical_file_rewrites_still_escalates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    state, _ = _run_factory_progress_case(
+        tmp_path,
+        monkeypatch,
+        factory_clock,
+        stop_at=1860,
+        rewrite=("plan/plan.md", "same incomplete step"),
+    )
+
+    incident = state["issues"]["700"]
+    assert incident["active"] is True
+    assert incident["terminal_error"] == "factory status made no useful progress"
+
+
+def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda _sandbox: None)
+    state, _ = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    )
+
+    incident = state["issues"]["700"]
+    assert incident["active"] is True
+    assert incident["terminal_error"] == "factory status made no useful progress"
+
+
+def test_factory_work_advance_releases_a_stale_incident(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+    )
+
+    state, events = _run_factory_progress_case(
+        tmp_path,
+        monkeypatch,
+        factory_clock,
+        writes=((1860, "validation-report.md", "now complete"),),
+        stop_at=1920,
+    )
+
+    assert state["issues"]["700"]["active"] is False
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    ended = [fields for name, fields in events if name.endswith("stale_status_ended")]
+    assert ended[-1]["end_reason"] == "work_advanced"
+
+
+def test_factory_work_snapshot_does_not_depend_on_private_run_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    private = sandbox / ".factory" / "700" / "run.json"
+    artifact = sandbox / ".factory" / "700" / "artifacts" / "technical-brief.md"
+    artifact.parent.mkdir(parents=True)
+    private.write_text('{"status": "running"}', encoding="utf-8")
+    artifact.write_text("first", encoding="utf-8")
+    real_open = Path.open
+
+    def controller_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == private:
+            raise PermissionError("worker-owned 0600 state")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", controller_open)
+    first = orchestrator._factory_work_snapshot(sandbox)
+    with real_open(private, "w", encoding="utf-8") as stream:
+        stream.write('{"status": "different"}')
+    assert orchestrator._factory_work_snapshot(sandbox) == first
+    artifact.write_text("second", encoding="utf-8")
+    assert orchestrator._factory_work_snapshot(sandbox) != first
+
+
 @pytest.mark.parametrize("terminal", ["result", "exception", "timeout"])
 def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
     tmp_path: Path,
@@ -8077,7 +8327,8 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
             release_signals=scans,
         )
 
-    assert status_calls == 2
+    # Two complete quiet windows are required before the incident write.
+    assert status_calls == 3
     assert writes == ["factory status made no useful progress"]
     assert lifecycle == ["cancel", "cleanup"]
     assert releases == []

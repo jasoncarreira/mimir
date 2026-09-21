@@ -12,6 +12,7 @@ import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
+import hashlib
 import json
 import math
 import os
@@ -129,6 +130,20 @@ _FACTORY_STARTUP_STATUS_TIMEOUT_DEFAULT_S = 300.0
 _FACTORY_STARTUP_STATUS_TIMEOUT_ENV = "MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S"
 _FACTORY_PUBLISHING_IDENTITY_ENV = "MIMIR_FACTORY_PUBLISHING_IDENTITY"
 _WORK_ITEM_RUN_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
+_FACTORY_PROGRESS_IGNORED_DIRS = frozenset(
+    {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
+)
+_FACTORY_PROGRESS_MAX_FILES = 100_000
+_FACTORY_PROGRESS_MAX_BYTES = 256 * 1024 * 1024
 
 
 def _epic_run_timeout_s() -> float:
@@ -171,6 +186,63 @@ def _epic_stale_heartbeat_s() -> float:
         return value if value > 0 else 900.0
     except ValueError:
         return 900.0
+
+
+def _factory_work_snapshot(sandbox: Path) -> bytes | None:
+    """Hash durable, controller-readable sandbox content without following links.
+
+    Returning ``None`` is deliberately not evidence of progress. The supervisor
+    can therefore inspect public factory artifacts while ignoring private state
+    such as a worker-owned manifest that its uid cannot read.
+    """
+    digest = hashlib.sha256()
+    files = 0
+    total = 0
+
+    def scan_error(_error: OSError) -> None:
+        return None
+
+    try:
+        for root, directories, names in os.walk(
+            sandbox, topdown=True, followlinks=False, onerror=scan_error
+        ):
+            directories[:] = sorted(
+                name for name in directories if name not in _FACTORY_PROGRESS_IGNORED_DIRS
+            )
+            root_path = Path(root)
+            for name in sorted(names):
+                path = root_path / name
+                relative = path.relative_to(sandbox).as_posix().encode(
+                    "utf-8", "surrogateescape"
+                )
+                try:
+                    metadata = path.lstat()
+                    if stat.S_ISLNK(metadata.st_mode):
+                        target = os.readlink(path).encode("utf-8", "surrogateescape")
+                        digest.update(b"L\0" + relative + b"\0" + target + b"\0")
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode):
+                        continue
+                    files += 1
+                    if files > _FACTORY_PROGRESS_MAX_FILES:
+                        return None
+                    file_digest = hashlib.sha256()
+                    with path.open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            total += len(chunk)
+                            if total > _FACTORY_PROGRESS_MAX_BYTES:
+                                return None
+                            file_digest.update(chunk)
+                except PermissionError:
+                    # Worker-private control state is not a progress signal.
+                    continue
+                except OSError:
+                    return None
+                digest.update(b"F\0" + relative + b"\0")
+                digest.update(file_digest.digest())
+    except OSError:
+        return None
+    return digest.digest()
 
 
 def _autonomous_leaf_block_reason(home: Path, issue_id: int) -> str | None:
@@ -2855,6 +2927,9 @@ class WorklinkRunner:
         stale_after = _epic_stale_heartbeat_s()
         last_status: FactoryStatus | None = None
         last_change = loop.time()
+        work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
+        next_work_check = last_change + stale_after
+        unchanged_work_windows = 0
         stale_started: float | None = None
         stale_started_at: str | None = None
         stale_episode = 0
@@ -2926,7 +3001,7 @@ class WorklinkRunner:
                 end_reason=reason,
             )
             stale_started = None
-            if reason == "status_changed" and stale_failure is not None:
+            if reason in {"status_changed", "work_advanced"} and stale_failure is not None:
                 from .dispatch_failures import (
                     dispatch_failure_state_dir,
                     resolve_failure_if_current,
@@ -2982,6 +3057,9 @@ class WorklinkRunner:
                         end_stale_episode("status_changed")
                         last_status = status
                         last_change = loop.time()
+                        work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
+                        next_work_check = last_change + stale_after
+                        unchanged_work_windows = 0
                     if factory_record.session is not None and status.lock_session not in {
                         None,
                         factory_record.session,
@@ -3003,10 +3081,41 @@ class WorklinkRunner:
                             sandbox=Path(factory_record.sandbox),
                             launcher=factory_record.launcher,
                         )
-                    if stale_started is None and loop.time() - last_change >= stale_after:
-                        stale_started = loop.time()
-                        stale_started_at = datetime.now(UTC).isoformat()
-                        stale_episode += 1
+                    now = loop.time()
+                    check_work = now >= next_work_check or stale_failure is not None
+                    if check_work:
+                        current_work = _factory_work_snapshot(Path(factory_record.sandbox))
+                        if (
+                            current_work is not None
+                            and work_snapshot is not None
+                            and current_work != work_snapshot
+                        ):
+                            end_stale_episode("work_advanced")
+                            work_snapshot = current_work
+                            next_work_check = now + stale_after
+                            unchanged_work_windows = 0
+                        elif now >= next_work_check:
+                            work_snapshot = current_work
+                            next_work_check = now + stale_after
+                            unchanged_work_windows += 1
+                            if stale_started is None:
+                                stale_started = now
+                                stale_started_at = datetime.now(UTC).isoformat()
+                                stale_episode += 1
+                                _log_event(
+                                    "worklink_factory_stale_status",
+                                    issue_id=issue.issue_id,
+                                    attempt=factory_record.attempt,
+                                    run_id=factory_record.run_id,
+                                    stale_episode=stale_episode,
+                                    stale_started_at=stale_started_at,
+                                    diagnostic_after_s=stale_after,
+                                    unchanged_for_s=now - last_change,
+                                    stale_duration_s=0.0,
+                                    lock=status.lock,
+                                    process_alive=compute.job_alive(handle),
+                                )
+                    if stale_failure is None and unchanged_work_windows >= 2:
                         try:
                             incident = incident_owner.record(
                                 producer="factory_stall",
@@ -3029,19 +3138,6 @@ class WorklinkRunner:
                                 str(incident["signature"]),
                                 str(incident["occurrence_id"]),
                             )
-                        _log_event(
-                            "worklink_factory_stale_status",
-                            issue_id=issue.issue_id,
-                            attempt=factory_record.attempt,
-                            run_id=factory_record.run_id,
-                            stale_episode=stale_episode,
-                            stale_started_at=stale_started_at,
-                            diagnostic_after_s=stale_after,
-                            unchanged_for_s=stale_started - last_change,
-                            stale_duration_s=0.0,
-                            lock=status.lock,
-                            process_alive=compute.job_alive(handle),
-                        )
                     if status.is_terminal or status.is_parked:
                         if not wait_task.done():
                             await cancel_once()
