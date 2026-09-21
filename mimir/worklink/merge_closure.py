@@ -333,7 +333,8 @@ def read_pr_snapshot(pr_url: str, *, gh_bin: str, runner: Runner) -> PrSnapshot:
             raise ClosureReadError("merged PR snapshot has invalid merged_at") from exc
         if parsed_time.tzinfo is None or _SHA.fullmatch(merge_sha) is None:
             raise ClosureReadError("merged PR snapshot has invalid merge identity")
-    elif merged_at is not None or merge_sha is not None:
+    # GitHub may expose a synthetic test-merge SHA before a PR is merged.
+    elif merged_at is not None:
         raise ClosureReadError("unmerged PR snapshot contains merge identity")
     return PrSnapshot(
         canonical_url, slug, number, body, state, merged, merged_at,
