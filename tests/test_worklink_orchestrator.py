@@ -56,6 +56,7 @@ from mimir.worklink.orchestrator import (
     _epic_prompt,
     _epic_run_timeout_s,
     _epic_stale_heartbeat_s,
+    _factory_transcript_snapshot,
     _read_checkout_git_identity,
     _read_factory_publishing_identity,
     _read_pr_body_section,
@@ -8047,6 +8048,7 @@ def _run_factory_progress_case(
     factory_clock: SimpleNamespace,
     *,
     writes: tuple[tuple[float, str, str], ...] = (),
+    transcript_writes: tuple[tuple[float, str], ...] = (),
     stop_at: float,
     rewrite: tuple[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
@@ -8066,6 +8068,16 @@ def _run_factory_progress_case(
     stopped = asyncio.Event()
     events: list[tuple[str, dict[str, Any]]] = []
     pending = list(writes)
+    pending_transcript = list(transcript_writes)
+    transcript = (
+        tmp_path
+        / "state"
+        / "worklink"
+        / "transcripts"
+        / "feature_factory-700-a1-fixture.stderr.log"
+    )
+    transcript.parent.mkdir(parents=True)
+    transcript.touch(mode=0o600)
     running = _factory_lifecycle_status(sandbox, status="running")
 
     class CaseFinished(RuntimeError):
@@ -8103,6 +8115,10 @@ def _run_factory_progress_case(
             path = sandbox / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
+        while pending_transcript and pending_transcript[0][0] <= factory_clock.now:
+            _, content = pending_transcript.pop(0)
+            with transcript.open("a", encoding="utf-8") as stream:
+                stream.write(content)
         if rewrite is not None:
             (sandbox / rewrite[0]).write_text(rewrite[1], encoding="utf-8")
         await asyncio.sleep(0)
@@ -8134,7 +8150,7 @@ def _run_factory_progress_case(
 
 
 @pytest.mark.parametrize(
-    ("occurrence", "writes", "stop_at"),
+    ("occurrence", "writes", "transcript_writes", "stop_at"),
     [
         (
             "attempt-5-23-22",
@@ -8143,20 +8159,14 @@ def _run_factory_progress_case(
                 (2460, "technical-brief.md", "brief complete"),
                 (3660, "validation-report.md", "validation complete"),
             ),
+            tuple((at, f"attempt 5 activity at {at}\n") for at in range(840, 3721, 840)),
             3720,
         ),
         (
-            "attempt-7-02-22-57",
-            ((1260, "validation-report.md", "validation complete"),),
-            1320,
-        ),
-        (
-            "attempt-7-03-28-39",
-            (
-                (720, "plan/plan.md", "eight-slice plan"),
-                (720, "plan/slices.json", '[{"slice": 1}, {"slice": 8}]'),
-            ),
-            1080,
+            "attempt-9-21-38",
+            (),
+            tuple((at, f"attempt 9 activity at {at}\n") for at in range(840, 10801, 840)),
+            10800,
         ),
     ],
 )
@@ -8166,6 +8176,7 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
     factory_clock: SimpleNamespace,
     occurrence: str,
     writes: tuple[tuple[float, str, str], ...],
+    transcript_writes: tuple[tuple[float, str], ...],
     stop_at: float,
 ) -> None:
     from mimir.worklink.dispatch_failures import (
@@ -8174,7 +8185,12 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
     )
 
     state, _ = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, writes=writes, stop_at=stop_at
+        tmp_path,
+        monkeypatch,
+        factory_clock,
+        writes=writes,
+        transcript_writes=transcript_writes,
+        stop_at=stop_at,
     )
 
     assert occurrence
@@ -8182,7 +8198,7 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
-def test_factory_wedged_without_any_progress_still_escalates(
+def test_factory_dead_without_any_liveness_signal_escalates_within_two_windows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8198,13 +8214,13 @@ def test_factory_wedged_without_any_progress_still_escalates(
 
     incident = state["issues"]["700"]
     assert incident["active"] is True
-    assert incident["terminal_error"] == "factory status made no useful progress"
+    assert incident["terminal_error"] == "factory emitted no liveness signals"
     blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
     assert blocked == {700}
     assert len(alerts) == 1
 
 
-def test_factory_looping_on_identical_file_rewrites_still_escalates(
+def test_factory_logging_without_productivity_runs_to_its_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8213,13 +8229,12 @@ def test_factory_looping_on_identical_file_rewrites_still_escalates(
         tmp_path,
         monkeypatch,
         factory_clock,
+        transcript_writes=((840, "still reasoning\n"), (1740, "still reasoning\n")),
         stop_at=1860,
         rewrite=("plan/plan.md", "same incomplete step"),
     )
 
-    incident = state["issues"]["700"]
-    assert incident["active"] is True
-    assert incident["terminal_error"] == "factory status made no useful progress"
+    assert state.get("issues", {}).get("700") is None
 
 
 def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
@@ -8236,7 +8251,32 @@ def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
 
     incident = state["issues"]["700"]
     assert incident["active"] is True
-    assert incident["terminal_error"] == "factory status made no useful progress"
+    assert incident["terminal_error"] == "factory emitted no liveness signals"
+
+
+def test_factory_transcript_snapshot_requires_controller_read_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    transcript = root / "feature_factory-700-a1-fixture.stderr.log"
+    transcript.write_text("model output", encoding="utf-8")
+    transcript.chmod(0o600)
+
+    assert _factory_transcript_snapshot(root, 700, 1) == {
+        transcript.name: len(b"model output")
+    }
+
+    real_open = Path.open
+
+    def unreadable(path: Path, *args: Any, **kwargs: Any) -> Any:
+        if path == transcript:
+            raise PermissionError("not readable by controller")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", unreadable)
+    assert _factory_transcript_snapshot(root, 700, 1) == {}
+    assert _factory_transcript_snapshot(root, 701, 1) == {}
 
 
 def test_factory_work_advance_releases_a_stale_incident(
@@ -8260,7 +8300,7 @@ def test_factory_work_advance_releases_a_stale_incident(
     assert state["issues"]["700"]["active"] is False
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
     ended = [fields for name, fields in events if name.endswith("stale_status_ended")]
-    assert ended[-1]["end_reason"] == "work_advanced"
+    assert ended[-1]["end_reason"] == "liveness_observed"
 
 
 def test_factory_work_snapshot_does_not_depend_on_private_run_state(
@@ -8394,7 +8434,7 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
     assert result.status == "failed"
     incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
     assert incident["active"] is True
-    assert incident["terminal_error"] != "factory status made no useful progress"
+    assert incident["terminal_error"] != "factory emitted no liveness signals"
     if terminal == "result":
         assert incident["terminal_error"] == "factory terminal failed"
         assert status_calls == 4
@@ -8490,7 +8530,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
 
     # Two complete quiet windows are required before the incident write.
     assert status_calls == 3
-    assert writes == ["factory status made no useful progress"]
+    assert writes == ["factory emitted no liveness signals"]
     assert lifecycle == ["cancel", "cleanup"]
     assert releases == []
     assert scans == []
@@ -8642,7 +8682,9 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         assert end["stale_started_at"] == entry["stale_started_at"]
         assert datetime.fromisoformat(entry["stale_started_at"]).tzinfo == UTC
         assert end["end_reason"] == (
-            "supervision_ended" if episode == 2 and ending == "timeout" else "status_changed"
+            "supervision_ended"
+            if episode == 2 and ending == "timeout"
+            else "liveness_observed"
         )
     assert backend.status_calls == backend.heartbeat_calls == (
         4001 if ending in {"parked", "newer-incident"} else 4000
