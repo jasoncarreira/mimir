@@ -7746,12 +7746,16 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     assert lifecycle == [("cancel", handle), ("cleanup", handle)]
 
 
-@pytest.mark.parametrize("snapshot_published", [True, False])
+@pytest.mark.parametrize(
+    ("snapshot_published", "cancellation_stops_driver"),
+    [(True, True), (False, True), (True, False)],
+)
 def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
     snapshot_published: bool,
+    cancellation_stops_driver: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -7759,6 +7763,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     sandbox.mkdir()
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
+    cancel_called = asyncio.Event()
     lifecycle: list[str] = []
     transitions: list[dict[str, object]] = []
     terminal_reasons: list[str] = []
@@ -7795,15 +7800,20 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
-            await stopped.wait()
-            return ComputeResult(-15, "", "cancelled", handle=selected)
+            await cancel_called.wait()
+            if cancellation_stops_driver:
+                return ComputeResult(-15, "", "cancelled", handle=selected)
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
         def job_alive(self, selected: LaunchHandle) -> bool:
             return not stopped.is_set()
 
         async def cancel(self, selected: LaunchHandle) -> None:
             lifecycle.append("cancel")
-            stopped.set()
+            cancel_called.set()
+            if cancellation_stops_driver:
+                stopped.set()
 
         async def cleanup(self, selected: LaunchHandle) -> None:
             lifecycle.append("cleanup")
@@ -7844,20 +7854,33 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
 
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
-    result = asyncio.run(
-        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
-            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-            claims=Claims(),
-            backend=Backend(),
-            compute=Compute(),
-            factory_record=_factory_lifecycle_record(sandbox, handle),
-            test_cmd="pytest -q",
-            runner=lambda args: cp(args),
-            started_at=datetime.now(UTC),
+    def run() -> WorklinkRunResult:
+        return asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+                claims=Claims(),
+                backend=Backend(),
+                compute=Compute(),
+                factory_record=_factory_lifecycle_record(sandbox, handle),
+                test_cmd="pytest -q",
+                runner=lambda args: cp(args),
+                started_at=datetime.now(UTC),
+            )
         )
-    )
 
+    if not cancellation_stops_driver:
+        with pytest.raises(
+            WorklinkError,
+            match="factory driver survived cancellation before budget park",
+        ):
+            run()
+        assert lifecycle == ["cancel", "cleanup"]
+        assert terminal_reasons == []
+        assert transitions == []
+        return
+
+    result = run()
     assert result.status == "needs-human"
     assert lifecycle == ["cancel", "terminal", "cleanup"]
     reason = terminal_reasons[0]
@@ -7877,7 +7900,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         assert f"control-plane snapshot: {snapshot}" in report
     else:
         assert retained.status.park_snapshot is None
-        assert "snapshot publication failed:" in report
+        assert (
+            "snapshot publication failed: factory status reports park_snapshot null"
+            in report
+        )
         assert "control-plane snapshot:" not in report
 
 
