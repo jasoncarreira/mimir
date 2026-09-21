@@ -78,6 +78,16 @@ _GIT_CONTENTION_PATTERNS = (
     re.compile(r"another process is using this repository", re.IGNORECASE),
 )
 
+_CLOSED_WORKLINK_LABELS = frozenset({
+    "worklink:blocked",
+    "worklink:epic",
+    "worklink:failed",
+    "worklink:in-progress",
+    "worklink:ready",
+    "worklink:review",
+})
+_CLOSED_ISSUE_STATUSES = frozenset({"open", "closed"})
+
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
@@ -122,6 +132,62 @@ def _is_git_contention(result: subprocess.CompletedProcess[str]) -> bool:
         return False
     detail = (result.stderr or "") + "\n" + (result.stdout or "")
     return any(pattern.search(detail) for pattern in _GIT_CONTENTION_PATTERNS)
+
+
+def _closed_chainlink_operation(args: Sequence[str]) -> str | None:
+    """Return a closed operation code only when every argument is validated."""
+    def issue_id(value: str) -> bool:
+        return (
+            value.isascii()
+            and value.isdigit()
+            and int(value) > 0
+            and str(int(value)) == value
+        )
+
+    if tuple(args) == ("locks", "list", "--json"):
+        return "locks_list"
+    if (
+        len(args) == 3
+        and args[0] == "locks"
+        and args[1] in {"claim", "release", "steal"}
+        and issue_id(args[2])
+    ):
+        return f"locks_{args[1]}"
+    if (
+        len(args) == 4
+        and tuple(args[:2]) == ("issue", "show")
+        and issue_id(args[2])
+        and args[3] == "--json"
+    ):
+        return "issue_show"
+    if (
+        len(args) == 4
+        and args[0] == "issue"
+        and args[1] in {"label", "unlabel"}
+        and issue_id(args[2])
+        and args[3] in _CLOSED_WORKLINK_LABELS
+    ):
+        return f"issue_{args[1]}"
+    if tuple(args[:2]) != ("issue", "list"):
+        return None
+    remainder = list(args[2:])
+    if (
+        len(remainder) == 3
+        and remainder[0] == "--status"
+        and remainder[1] in _CLOSED_ISSUE_STATUSES
+        and remainder[2] == "--json"
+    ):
+        return "issue_list"
+    if (
+        len(remainder) == 5
+        and remainder[0] == "--label"
+        and remainder[1] in _CLOSED_WORKLINK_LABELS
+        and remainder[2] == "--status"
+        and remainder[3] in _CLOSED_ISSUE_STATUSES
+        and remainder[4] == "--json"
+    ):
+        return "issue_list_by_label"
+    return None
 
 
 @dataclass(frozen=True)
@@ -1451,15 +1517,29 @@ class ChainlinkClaims:
         result = self._run_with_retry(*args, home_path=self.home_path)
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
-            diagnostic = (
-                external_active_ingest(
+            if detail:
+                diagnostic = external_active_ingest(
                     detail, producer_tag=DiagnosticProducer.CHAINLINK_PROCESS
                 )
-                if detail
-                else server_structural(
-                    f"chainlink {' '.join(args)} failed",
-                    producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
-                )
-            )
+            else:
+                operation = _closed_chainlink_operation(args)
+                if operation is not None:
+                    diagnostic = server_structural(
+                        f"chainlink operation {operation} failed without diagnostic output",
+                        producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                    )
+                else:
+                    fixed = server_fixed(
+                        "chainlink command failed without diagnostic output",
+                        producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                    )
+                    diagnostic = with_least_trusted_provenance(
+                        fixed.text,
+                        fixed,
+                        external_active_ingest(
+                            "unchecked Chainlink command arguments",
+                            producer_tag=DiagnosticProducer.CHAINLINK_PROCESS,
+                        ),
+                    )
             raise ChainlinkDiagnosticError(diagnostic)
         return result

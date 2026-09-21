@@ -342,6 +342,36 @@ def test_chainlink_command_error_preserves_result_provenance(
     assert raised.value.diagnostic.provenance is expected
 
 
+def test_empty_chainlink_failure_does_not_trust_issue_comment_argv(
+    tmp_path: Path,
+) -> None:
+    external_reason = "tracker supplied failure prose"
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        return subprocess.CompletedProcess(
+            call,
+            1 if call[1:3] == ["issue", "comment"] else 0,
+            "",
+            "",
+        )
+
+    claims = ChainlinkClaims(agent_id="worker", home_path=tmp_path, runner=runner)
+
+    with pytest.raises(ChainlinkDiagnosticError) as raised:
+        claims.transition_issue(
+            1064,
+            status="failed",
+            review_ready=False,
+            reason=external_reason,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    assert diagnostic.text == "chainlink command failed without diagnostic output"
+    assert external_reason not in diagnostic.text
+
+
 def test_claim_contention_retry_bound_is_explicit(tmp_path: Path) -> None:
     claim_calls = 0
     events: list[dict[str, object]] = []
