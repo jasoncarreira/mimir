@@ -292,6 +292,40 @@ def _factory_work_snapshot(sandbox: Path) -> bytes | None:
     return digest.digest()
 
 
+def _factory_transcript_snapshot(
+    transcript_root: Path, issue_id: int, attempt: int
+) -> dict[str, int]:
+    """Return sizes of controller-readable live stderr transcripts.
+
+    Missing, unreadable, and non-regular files contribute no liveness signal.
+    The factory's raw stderr is owned by the controller and grows while a long
+    model request streams even when neither status nor sandbox content moves.
+    """
+    snapshot: dict[str, int] = {}
+    pattern = f"feature_factory-{issue_id}-a{attempt}-*.stderr.log"
+    try:
+        paths = transcript_root.glob(pattern)
+        for path in paths:
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue
+                with path.open("rb") as stream:
+                    metadata = os.fstat(stream.fileno())
+                if stat.S_ISREG(metadata.st_mode):
+                    snapshot[path.name] = metadata.st_size
+            except OSError:
+                continue
+    except OSError:
+        return {}
+    return snapshot
+
+
+def _factory_transcript_grew(
+    previous: dict[str, int], current: dict[str, int]
+) -> bool:
+    return any(size > previous.get(name, 0) for name, size in current.items())
+
+
 def _autonomous_leaf_block_reason(home: Path, issue_id: int) -> str | None:
     from .dispatch_failures import (
         autonomous_dispatch_block_reason,
@@ -2977,8 +3011,13 @@ class WorklinkRunner:
         last_status: FactoryStatus | None = None
         last_change = loop.time()
         work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
+        transcript_root = self.home / "state" / "worklink" / "transcripts"
+        transcript_snapshot = _factory_transcript_snapshot(
+            transcript_root, issue.issue_id, factory_record.attempt
+        )
         next_work_check = last_change + stale_after
-        unchanged_work_windows = 0
+        dead_windows = 0
+        status_changed_in_window = False
         stale_started: float | None = None
         stale_started_at: str | None = None
         stale_episode = 0
@@ -3131,7 +3170,7 @@ class WorklinkRunner:
                 end_reason=reason,
             )
             stale_started = None
-            if reason in {"status_changed", "work_advanced"} and stale_failure is not None:
+            if reason == "liveness_observed" and stale_failure is not None:
                 from .dispatch_failures import (
                     dispatch_failure_state_dir,
                     resolve_failure_if_current,
@@ -3190,12 +3229,8 @@ class WorklinkRunner:
                 else:
                     _require_factory_status(status, factory_record)
                     if status != last_status:
-                        end_stale_episode("status_changed")
+                        status_changed_in_window = last_status is not None
                         last_status = status
-                        last_change = loop.time()
-                        work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
-                        next_work_check = last_change + stale_after
-                        unchanged_work_windows = 0
                     if factory_record.session is not None and status.lock_session not in {
                         None,
                         factory_record.session,
@@ -3218,22 +3253,38 @@ class WorklinkRunner:
                             launcher=factory_record.launcher,
                         )
                     now = loop.time()
-                    check_work = now >= next_work_check or stale_failure is not None
-                    if check_work:
+                    window_ended = now >= next_work_check
+                    if window_ended or stale_failure is not None:
                         current_work = _factory_work_snapshot(Path(factory_record.sandbox))
-                        if (
+                        current_transcript = _factory_transcript_snapshot(
+                            transcript_root, issue.issue_id, factory_record.attempt
+                        )
+                        work_advanced = (
                             current_work is not None
                             and work_snapshot is not None
                             and current_work != work_snapshot
-                        ):
-                            end_stale_episode("work_advanced")
+                        )
+                        transcript_grew = _factory_transcript_grew(
+                            transcript_snapshot, current_transcript
+                        )
+                        alive = status_changed_in_window or work_advanced or transcript_grew
+                        if alive:
+                            end_stale_episode("liveness_observed")
+                            dead_windows = 0
+                            last_change = now
                             work_snapshot = current_work
+                            transcript_snapshot = current_transcript
+                            status_changed_in_window = False
                             next_work_check = now + stale_after
-                            unchanged_work_windows = 0
-                        elif now >= next_work_check:
+                        elif window_ended:
                             work_snapshot = current_work
+                            transcript_snapshot = current_transcript
+                            status_changed_in_window = False
                             next_work_check = now + stale_after
-                            unchanged_work_windows += 1
+                            # Stable output cannot distinguish a reasoning loop from
+                            # a long useful request. Productivity is bounded by the
+                            # run budget; this detector only identifies absent life.
+                            dead_windows += 1
                             if stale_started is None:
                                 stale_started = now
                                 stale_started_at = datetime.now(UTC).isoformat()
@@ -3251,7 +3302,7 @@ class WorklinkRunner:
                                     lock=status.lock,
                                     process_alive=compute.job_alive(handle),
                                 )
-                    if stale_failure is None and unchanged_work_windows >= 2:
+                    if stale_failure is None and dead_windows >= 2:
                         try:
                             incident = incident_owner.record(
                                 producer="factory_stall",
@@ -3259,7 +3310,7 @@ class WorklinkRunner:
                                 home=self.home,
                                 issue_id=issue.issue_id,
                                 attempt=factory_record.attempt,
-                                error="factory status made no useful progress",
+                                error="factory emitted no liveness signals",
                                 exit_status=None,
                                 autonomous=autonomous,
                                 run_id=factory_record.run_id,
