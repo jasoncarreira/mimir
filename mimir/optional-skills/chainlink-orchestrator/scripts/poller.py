@@ -521,20 +521,48 @@ def _deliver_failure_alerts(
     }
 
     def still_pending(state, alert):
-        entry = state["issues"].get(str(alert["issue_id"]))
+        issue_id = alert.get("issue_id")
+        signature = alert.get("error_signature")
+        occurrence_id = alert.get("failure_occurrence_id")
+        if (
+            type(issue_id) is not int
+            or issue_id < 1
+            or not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence_id, str)
+            or not occurrence_id
+        ):
+            raise OSError("dispatch failure alert has invalid incident identity")
+        entry = state["issues"].get(str(issue_id))
+        if isinstance(entry, dict) and (
+            type(entry.get("issue_id")) is not int
+            or entry["issue_id"] != issue_id
+        ):
+            raise OSError("dispatch failure state unavailable: invalid issue identity")
         return (
             isinstance(entry, dict)
             and entry.get("active") is True
-            and entry.get("signature") == alert["error_signature"]
-            and entry.get("occurrence_id") == alert["failure_occurrence_id"]
-            and alert["error_signature"] not in (entry.get("notified_signatures") or [])
+            and entry.get("signature") == signature
+            and entry.get("occurrence_id") == occurrence_id
+            and signature not in (entry.get("notified_signatures") or [])
         )
 
     emitted = False
     for alert in alerts:
+        issue_id = alert.get("issue_id")
+        signature = alert.get("error_signature")
+        occurrence_id = alert.get("failure_occurrence_id")
+        if (
+            type(issue_id) is not int
+            or issue_id < 1
+            or not isinstance(signature, str)
+            or not signature
+            or not isinstance(occurrence_id, str)
+            or not occurrence_id
+        ):
+            raise OSError("dispatch failure alert has invalid incident identity")
         delivery_key = (
-            f"worklink-run-failure:{alert['issue_id']}:"
-            f"{alert['error_signature']}:{alert['failure_occurrence_id']}"
+            f"worklink-run-failure:{issue_id}:{signature}:{occurrence_id}"
         )
         # The supplied alert list is only a snapshot. Revalidate under the
         # janitor/writer lock and keep it through receipt check and emission;
@@ -558,9 +586,9 @@ def _deliver_failure_alerts(
         if delivered:
             mark_failure_notified(
                 state_dir,
-                int(alert["issue_id"]),
-                str(alert["error_signature"]),
-                alert["failure_occurrence_id"],
+                issue_id,
+                signature,
+                occurrence_id,
             )
 
     return not emitted

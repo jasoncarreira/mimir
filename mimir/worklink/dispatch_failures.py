@@ -108,21 +108,65 @@ def _empty_failure_state() -> dict[str, Any]:
 def _entry_diagnostic(
     entry: Mapping[str, Any], field: str
 ) -> DiagnosticEnvelope | None:
+    flat_value = entry.get(field)
+    flat_absent = field != "terminal_error" and (
+        flat_value is None or flat_value == ""
+    )
+    flat_text = "" if flat_value is None else str(flat_value)
     diagnostics = entry.get("diagnostics")
-    if entry.get("version") == 2 and isinstance(diagnostics, Mapping):
-        value = diagnostics.get(field)
+    if type(entry.get("version")) is int and entry["version"] == 2:
+        if not isinstance(diagnostics, Mapping) or field not in diagnostics:
+            return None if flat_absent else legacy_unknown(flat_text)
+        value = diagnostics[field]
         if value is None:
-            return None
-        return decode_persisted_diagnostic(value)
-    value = entry.get(field)
-    if value is None:
+            return None if flat_absent else legacy_unknown(flat_text)
+        if type(flat_value) is not str:
+            return legacy_unknown(flat_text)
+        decoded = decode_persisted_diagnostic(value)
+        if decoded.text != flat_value:
+            return legacy_unknown(flat_value)
+        return decoded
+    if flat_absent:
         return None
-    return legacy_unknown(value)
+    return legacy_unknown(flat_text)
+
+
+def _canonical_issue_id(raw_issue_id: object, entry: object) -> int:
+    if (
+        not isinstance(raw_issue_id, str)
+        or re.fullmatch(r"[1-9][0-9]*", raw_issue_id) is None
+        or not isinstance(entry, Mapping)
+    ):
+        raise ValueError("dispatch failure state unavailable: invalid issue identity")
+    issue_id = int(raw_issue_id)
+    embedded_issue_id = entry.get("issue_id")
+    if type(embedded_issue_id) is not int or embedded_issue_id != issue_id:
+        raise ValueError("dispatch failure state unavailable: invalid issue identity")
+    return issue_id
+
+
+def _validated_issue_entries(state: Mapping[str, Any]) -> dict[int, dict[str, Any]]:
+    issues = state.get("issues")
+    if not isinstance(issues, Mapping):
+        raise ValueError("dispatch failure state unavailable: invalid ledger shape")
+    validated: dict[int, dict[str, Any]] = {}
+    for raw_issue_id, entry in issues.items():
+        issue_id = _canonical_issue_id(raw_issue_id, entry)
+        if not isinstance(entry, dict):
+            raise ValueError("dispatch failure state unavailable: invalid issue record")
+        validated[issue_id] = entry
+    return validated
+
+
+def _requested_issue_id(issue_id: object) -> int:
+    if type(issue_id) is not int or issue_id < 1:
+        raise ValueError("dispatch failure state unavailable: invalid issue identity")
+    return issue_id
 
 
 def _upgrade_failure_entry(entry: dict[str, Any]) -> None:
     """Upgrade one touched legacy incident without changing identity or text."""
-    if entry.get("version") == 2:
+    if type(entry.get("version")) is int and entry["version"] == 2:
         return
     diagnostics: dict[str, object | None] = {}
     for field in _DIAGNOSTIC_FIELDS:
@@ -153,7 +197,7 @@ def _read_failure_state_strict(state_dir: Path) -> dict[str, Any] | None:
         raise ValueError(f"dispatch failure state unavailable: {exc}") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("issues"), dict):
         raise ValueError("dispatch failure state unavailable: invalid ledger shape")
-    if payload.get("version", 1) != 1:
+    if type(payload.get("version")) is not int or payload["version"] != 1:
         raise ValueError("dispatch failure state unavailable: unsupported ledger version")
     return payload
 
@@ -161,12 +205,14 @@ def _read_failure_state_strict(state_dir: Path) -> dict[str, Any] | None:
 def autonomous_dispatch_block_reason(state_dir: Path, issue_id: int) -> str | None:
     """Fail closed when autonomous fresh work may supersede an incident."""
     try:
+        issue_id = _requested_issue_id(issue_id)
         state = _read_failure_state_strict(state_dir)
+        entries = {} if state is None else _validated_issue_entries(state)
     except ValueError as exc:
         return str(exc)
     if state is None:
         return None
-    entry = state["issues"].get(str(issue_id))
+    entry = entries.get(issue_id)
     if entry is None:
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
@@ -180,10 +226,11 @@ def current_failure_snapshot(
     state_dir: Path, issue_id: int
 ) -> FailureSnapshot | None:
     """Return a strict immutable snapshot of the current active occurrence."""
+    issue_id = _requested_issue_id(issue_id)
     state = _read_failure_state_strict(state_dir)
     if state is None:
         return None
-    entry = state["issues"].get(str(issue_id))
+    entry = _validated_issue_entries(state).get(issue_id)
     if entry is None:
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
@@ -249,19 +296,16 @@ def active_failure_identities(
     state = _read_failure_state_strict(state_dir)
     if state is None:
         return []
+    entries = _validated_issue_entries(state)
     excluded = exclude_issue_ids or set()
+    if any(type(issue_id) is not int or issue_id < 1 for issue_id in excluded):
+        raise ValueError("dispatch failure state unavailable: invalid issue identity")
     identities: list[tuple[int, str, str]] = []
-    for raw_issue_id, entry in state["issues"].items():
+    for issue_id, entry in entries.items():
         if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
             raise ValueError("dispatch failure state unavailable: invalid issue record")
         if not entry["active"]:
             continue
-        try:
-            issue_id = int(raw_issue_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("dispatch failure state unavailable: invalid issue identity") from exc
-        if str(issue_id) != raw_issue_id or issue_id < 1:
-            raise ValueError("dispatch failure state unavailable: invalid issue identity")
         if issue_id in excluded:
             continue
         signature = entry.get("signature")
@@ -668,6 +712,7 @@ def record_failure(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
+    issue_id = _requested_issue_id(issue_id)
     if target_kind not in {None, "leaf", "factory"}:
         raise ValueError("target_kind must be leaf or factory")
     normalized_error = transform_diagnostic(normalize_diagnostic(error), limit=4000)
@@ -718,8 +763,12 @@ def record_failure(
             "notified_signatures": [],
         }
     with failure_state_transaction(state_dir) as state:
+        try:
+            entries = _validated_issue_entries(state)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
         key = str(issue_id)
-        prior = state["issues"].get(key)
+        prior = entries.get(issue_id)
         prior = prior if isinstance(prior, dict) else {}
         same_occurrence = (
             prior.get("active") is True and prior.get("signature") == signature
@@ -847,14 +896,14 @@ def pending_failure_alerts(
     backed_off: set[int] = set()
     alerts: list[dict[str, object]] = []
     with failure_state_transaction(state_dir) as state:
-        for entry in state["issues"].values():
+        try:
+            entries = _validated_issue_entries(state)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
+        for issue_id, entry in entries.items():
             if not isinstance(entry, dict) or entry.get("active") is not True:
                 continue
             _upgrade_failure_entry(entry)
-            try:
-                issue_id = int(entry["issue_id"])
-            except (KeyError, TypeError, ValueError):
-                continue
             backed_off.add(issue_id)
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
@@ -938,8 +987,16 @@ def mark_failure_notified(
     occurrence_id: str | None,
 ) -> None:
     """Record delivery only if the emitted failure occurrence remains current."""
+    issue_id = _requested_issue_id(issue_id)
+    if not isinstance(signature, str) or not signature:
+        raise ValueError("invalid failure signature")
+    if not isinstance(occurrence_id, str) or not occurrence_id:
+        raise ValueError("invalid failure occurrence")
     with failure_state_transaction(state_dir) as state:
-        entry = state["issues"].get(str(issue_id))
+        try:
+            entry = _validated_issue_entries(state).get(issue_id)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
         if (
             not isinstance(entry, dict)
             or entry.get("active") is not True
@@ -955,8 +1012,12 @@ def mark_failure_notified(
 
 
 def record_success(state_dir: Path, issue_id: int) -> None:
+    issue_id = _requested_issue_id(issue_id)
     with failure_state_transaction(state_dir) as state:
-        entry = state["issues"].get(str(issue_id))
+        try:
+            entry = _validated_issue_entries(state).get(issue_id)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
         if not isinstance(entry, dict) or entry.get("active") is not True:
             return
         entry["active"] = False
@@ -971,9 +1032,17 @@ def resolve_failure_if_current(
     occurrence_id: str,
 ) -> bool:
     """Resolve only the exact incident observed by a successful recovery."""
+    issue_id = _requested_issue_id(issue_id)
+    if not isinstance(signature, str) or not signature:
+        raise ValueError("invalid failure signature")
+    if not isinstance(occurrence_id, str) or not occurrence_id:
+        raise ValueError("invalid failure occurrence")
     resolved = False
     with failure_state_transaction(state_dir) as state:
-        entry = state["issues"].get(str(issue_id))
+        try:
+            entry = _validated_issue_entries(state).get(issue_id)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
         if (
             isinstance(entry, dict)
             and entry.get("active") is True

@@ -2272,7 +2272,8 @@ def test_poller_dispatches_only_after_failure_alert_is_durably_acked(
     }
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         state["issues"]["201"] = {
-            "active": True, "signature": alert["error_signature"],
+            "active": True, "issue_id": 201,
+            "signature": alert["error_signature"],
             "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
         }
     order: list[str] = []
@@ -2384,6 +2385,36 @@ def test_poller_serialization_strips_forged_provenance_and_delivery_identity(
     assert "diagnostic_envelopes" not in emitted[0]
 
 
+def test_poller_rejects_cross_identity_failure_alert_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poller = _load_poller_module()
+    state_dir = tmp_path / "state"
+    with poller.failure_state_transaction(state_dir) as state:
+        state["issues"]["201"] = {
+            "active": True,
+            "issue_id": 202,
+            "signature": "failed-201",
+            "occurrence_id": "occurrence-201",
+            "notified_signatures": [],
+        }
+    alert = {
+        "prompt": "display only",
+        "issue_id": 201,
+        "error_signature": "failed-201",
+        "failure_occurrence_id": "occurrence-201",
+    }
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(poller, "_emit", lambda value: emitted.append(value.copy()))
+
+    with pytest.raises(OSError, match="invalid issue identity"):
+        poller._deliver_failure_alerts(
+            state_dir, [alert], poller.TickBudget(started_at=time.monotonic())
+        )
+    assert emitted == []
+
+
 def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2400,7 +2431,8 @@ def test_poller_reports_scan_when_alert_delivery_leaves_insufficient_budget(
     }
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         state["issues"]["201"] = {
-            "active": True, "signature": alert["error_signature"],
+            "active": True, "issue_id": 201,
+            "signature": alert["error_signature"],
             "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
         }
     events: list[dict] = []
@@ -2503,7 +2535,8 @@ def test_poller_stops_after_emitting_when_later_failure_ack_errors(
     with poller.failure_state_transaction(dispatch_failure_state_dir(home)) as state:
         for alert in (first, second):
             state["issues"][str(alert["issue_id"])] = {
-                "active": True, "signature": alert["error_signature"],
+                "active": True, "issue_id": alert["issue_id"],
+                "signature": alert["error_signature"],
                 "occurrence_id": alert["failure_occurrence_id"], "notified_signatures": [],
             }
     emitted: list[dict] = []

@@ -22,10 +22,15 @@ from mimir.worklink.diagnostics import (
     transform_diagnostic,
 )
 from mimir.worklink.dispatch_failures import (
+    active_failure_identities,
+    autonomous_dispatch_block_reason,
     current_failure_snapshot,
     load_failure_state,
+    mark_failure_notified,
     pending_failure_alerts,
     record_failure,
+    record_success,
+    resolve_failure_if_current,
     resolve_failure_snapshot_if_current,
     save_failure_state,
 )
@@ -132,6 +137,10 @@ def test_retained_output_requires_independent_server_held_capture() -> None:
         lambda value: {**value, "producer_tag": "friendly_process"},
         lambda value: {**value, "extra": True},
         lambda value: {**value, "version": 2},
+        lambda value: {**value, "version": True},
+        lambda value: {**value, "version": 1.0},
+        lambda value: {**value, "version": "1"},
+        lambda value: {**value, "version": None},
         lambda value: {"text": value["text"]},
     ],
 )
@@ -185,6 +194,152 @@ def test_ledger_v2_preserves_flat_text_and_strict_envelopes(tmp_path: Path) -> N
     assert alerts[0]["terminal_error"] == "closed outcome=stalled"
     assert alerts[0]["target_kind"] == "leaf"
     assert alerts[0]["prompt_envelope"]["provenance"] == "server_structural"
+
+
+@pytest.mark.parametrize("version", [True, 1.0, "1", None, 2])
+def test_ledger_version_requires_exact_integer_one(
+    tmp_path: Path, version: object
+) -> None:
+    state_dir = tmp_path / "ledger"
+    state_dir.mkdir()
+    save_failure_state(state_dir, {"version": version, "issues": {}})
+
+    with pytest.raises(ValueError, match="unsupported ledger version"):
+        current_failure_snapshot(state_dir, 1)
+    with pytest.raises(OSError, match="unsupported ledger version"):
+        pending_failure_alerts(state_dir)
+
+
+@pytest.mark.parametrize("version", [True, 2.0, "2", None])
+def test_incident_version_lookalikes_cannot_attest_diagnostics(
+    tmp_path: Path, version: object
+) -> None:
+    state_dir = tmp_path / "ledger"
+    record_failure(
+        state_dir,
+        issue_id=18,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("trusted text"),
+        log_path=None,
+    )
+    state = load_failure_state(state_dir)
+    state["issues"]["18"]["version"] = version
+    save_failure_state(state_dir, state)
+
+    snapshot = current_failure_snapshot(state_dir, 18)
+    assert snapshot is not None
+    assert snapshot.terminal_error.text == "trusted text"
+    assert snapshot.terminal_error.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "terminal_error",
+        "preservation_error",
+        "log_path",
+        "preserved_ref",
+        "run_id",
+        "work_path",
+        "transcript_path",
+    ],
+)
+@pytest.mark.parametrize("defect", ["missing", "null", "malformed", "unknown", "mismatch"])
+def test_every_flat_diagnostic_is_reconciled_with_its_envelope(
+    tmp_path: Path, field: str, defect: str
+) -> None:
+    state_dir = tmp_path / f"ledger-{field}-{defect}"
+    record_failure(
+        state_dir,
+        issue_id=19,
+        attempt=1,
+        exit_status=1,
+        error=server_structural("terminal"),
+        log_path=server_structural("log"),
+        preserved_ref=server_structural("ref"),
+        preservation_error=server_structural("preservation"),
+        run_id=server_structural("run"),
+        work_path=server_structural("work"),
+        transcript_path=server_structural("transcript"),
+        target_kind="factory",
+    )
+    state = load_failure_state(state_dir)
+    entry = state["issues"]["19"]
+    envelope = entry["diagnostics"][field]
+    if defect == "missing":
+        del entry["diagnostics"][field]
+    elif defect == "null":
+        entry["diagnostics"][field] = None
+    elif defect == "malformed":
+        entry["diagnostics"][field] = {"text": entry[field]}
+    elif defect == "unknown":
+        entry["diagnostics"][field] = {**envelope, "provenance": "future_trusted"}
+    else:
+        entry["diagnostics"][field] = {**envelope, "text": "different text"}
+    save_failure_state(state_dir, state)
+
+    snapshot = current_failure_snapshot(state_dir, 19)
+    assert snapshot is not None
+    reconciled = getattr(snapshot, field)
+    assert reconciled is not None
+    assert reconciled.text == entry[field]
+    assert reconciled.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+    _, alerts = pending_failure_alerts(state_dir)
+    assert alerts[0]["diagnostic_envelopes"][field]["provenance"] == "legacy_unknown"
+    assert alerts[0]["prompt_envelope"]["provenance"] == "legacy_unknown"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "terminal_error",
+        "preservation_error",
+        "log_path",
+        "preserved_ref",
+        "run_id",
+        "work_path",
+        "transcript_path",
+    ],
+)
+@pytest.mark.parametrize("defect", ["missing", "null", "malformed"])
+def test_invalid_flat_diagnostic_cannot_retain_envelope_trust(
+    tmp_path: Path, field: str, defect: str
+) -> None:
+    state_dir = tmp_path / f"ledger-flat-{field}-{defect}"
+    record_failure(
+        state_dir,
+        issue_id=20,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("terminal"),
+        log_path=server_fixed("log"),
+        preserved_ref=server_fixed("ref"),
+        preservation_error=server_fixed("preservation"),
+        run_id=server_fixed("run"),
+        work_path=server_fixed("work"),
+        transcript_path=server_fixed("transcript"),
+        target_kind="factory",
+    )
+    state = load_failure_state(state_dir)
+    entry = state["issues"]["20"]
+    if defect == "missing":
+        del entry[field]
+    elif defect == "null":
+        entry[field] = None
+    else:
+        entry[field] = ["malformed"]
+    save_failure_state(state_dir, state)
+
+    snapshot = current_failure_snapshot(state_dir, 20)
+    assert snapshot is not None
+    reconciled = getattr(snapshot, field)
+    assert reconciled is not None
+    assert reconciled.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+    _, alerts = pending_failure_alerts(state_dir)
+    assert alerts[0]["diagnostic_envelopes"][field]["provenance"] == "legacy_unknown"
+    assert alerts[0]["prompt_envelope"]["provenance"] == "legacy_unknown"
 
 
 @pytest.mark.parametrize("first_trusted", [True, False])
@@ -250,6 +405,85 @@ def test_legacy_v1_upgrade_preserves_identity_and_fails_closed(tmp_path: Path) -
     assert upgraded["issues"]["33"]["diagnostics"]["terminal_error"][
         "provenance"
     ] == "legacy_unknown"
+
+
+@pytest.mark.parametrize(
+    ("map_key", "embedded_issue_id", "requested_issue_id"),
+    [
+        ("41", 42, 41),
+        ("042", 42, 42),
+        ("0", 0, 41),
+        ("-1", -1, 41),
+        ("true", True, 41),
+    ],
+)
+def test_cross_identity_incident_records_fail_closed_on_every_read_and_write(
+    tmp_path: Path,
+    map_key: str,
+    embedded_issue_id: object,
+    requested_issue_id: int,
+) -> None:
+    state_dir = tmp_path / "ledger"
+    entry = record_failure(
+        state_dir,
+        issue_id=41,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("failure"),
+        log_path=None,
+    )
+    state = load_failure_state(state_dir)
+    malformed = state["issues"].pop("41")
+    malformed["issue_id"] = embedded_issue_id
+    state["issues"][map_key] = malformed
+    save_failure_state(state_dir, state)
+
+    with pytest.raises(ValueError, match="invalid issue identity"):
+        current_failure_snapshot(state_dir, requested_issue_id)
+    with pytest.raises(ValueError, match="invalid issue identity"):
+        active_failure_identities(state_dir, limit=10)
+    with pytest.raises(OSError, match="invalid issue identity"):
+        pending_failure_alerts(state_dir)
+    assert "invalid issue identity" in (
+        autonomous_dispatch_block_reason(state_dir, requested_issue_id) or ""
+    )
+    with pytest.raises(OSError, match="invalid issue identity"):
+        mark_failure_notified(
+            state_dir, requested_issue_id, entry["signature"], entry["occurrence_id"]
+        )
+    with pytest.raises(OSError, match="invalid issue identity"):
+        record_success(state_dir, requested_issue_id)
+    with pytest.raises(OSError, match="invalid issue identity"):
+        resolve_failure_if_current(
+            state_dir, requested_issue_id, entry["signature"], entry["occurrence_id"]
+        )
+    assert load_failure_state(state_dir)["issues"][map_key]["active"] is True
+
+
+@pytest.mark.parametrize("issue_id", [True, 0, -1, 41.0, "41"])
+def test_requested_and_resolution_issue_identity_must_be_a_positive_integer(
+    tmp_path: Path, issue_id: object
+) -> None:
+    state_dir = tmp_path / "ledger"
+    entry = record_failure(
+        state_dir,
+        issue_id=41,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("failure"),
+        log_path=None,
+    )
+
+    with pytest.raises(ValueError, match="invalid issue identity"):
+        current_failure_snapshot(state_dir, issue_id)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="invalid issue identity"):
+        resolve_failure_if_current(
+            state_dir,
+            issue_id,  # type: ignore[arg-type]
+            entry["signature"],
+            entry["occurrence_id"],
+        )
+    assert current_failure_snapshot(state_dir, 41) is not None
 
 
 def test_malformed_v2_envelope_is_display_only_and_exact_snapshot_cas(

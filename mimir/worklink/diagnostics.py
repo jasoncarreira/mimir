@@ -314,7 +314,11 @@ def decode_persisted_diagnostic(value: object) -> DiagnosticEnvelope:
     }:
         return legacy_unknown(fallback_text)
     try:
-        if value["version"] != 1 or type(value["text"]) is not str:
+        if (
+            type(value["version"]) is not int
+            or value["version"] != 1
+            or type(value["text"]) is not str
+        ):
             raise ValueError
         provenance = DiagnosticProvenance(value["provenance"])
         authority = DiagnosticAuthority(value["authority"])
