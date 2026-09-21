@@ -167,6 +167,7 @@ POLLER_INVALID_LINE_CHARS = 500
 # JSON line would otherwise blow the prompt-build cache and burn
 # budget on the next turn (Mimir's PR #88 review nit 4).
 POLLER_PROMPT_CHARS = 16_000
+_MAX_RECOVERY_ITEMS_PER_BATCH = POLLER_PROMPT_CHARS // 80
 # Hard byte ceilings on a poller subprocess's stdout/stderr (chainlink
 # #258). The POLLER_PROMPT_CHARS cap above only applies AFTER the bytes
 # are read — ``communicate()`` buffers the ENTIRE stream first, so a
@@ -3221,6 +3222,11 @@ async def run_poller(
     # already filters non-positive values, but tests construct
     # ``PollerConfig`` directly bypassing that path.
     batch_size = max(1, poller.batch_size)
+    if any(
+        isinstance(item.get("recovery"), recovery_dispatch.ReattestedRecoveryItem)
+        for item in items
+    ):
+        batch_size = min(batch_size, _MAX_RECOVERY_ITEMS_PER_BATCH)
     batches: list[list[dict[str, Any]]] = [
         items[i:i + batch_size]
         for i in range(0, len(items), batch_size)
@@ -3278,6 +3284,11 @@ async def run_poller(
                 content[:POLLER_PROMPT_CHARS]
                 + "\n\n[…truncated by poller framework]"
             )
+        content = recovery_dispatch.preserve_recovery_handles(
+            content,
+            batch,
+            max_chars=POLLER_PROMPT_CHARS,
+        )
 
         # Per-batch extra. ``items`` carries per-item metadata so the
         # agent can react to specific items without re-parsing the

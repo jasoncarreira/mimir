@@ -23,7 +23,10 @@ from mimir.models import (
     SourceLabel,
     _mint_recovery_selection,
 )
-from mimir.worklink.recovery_dispatch import valid_event_recovery_selections
+from mimir.worklink.recovery_dispatch import (
+    selection_labels,
+    valid_event_recovery_selections,
+)
 
 
 def _ts(seconds_ago: float) -> str:
@@ -123,7 +126,7 @@ async def test_stash_roundtrips_ifc_sources_without_stringifying_frozensets(tmp_
     assert frozenset(restored.ifc_labels.sources) == frozenset({source})
 
 
-def _attested_recovery_event() -> AgentEvent:
+def _attested_recovery_event(*, with_ordinary_item: bool = False) -> AgentEvent:
     handle = "opaque-selection"
     source_id = "poller:worklink-ready-queue:1:batch:0"
     delivery_key = "worklink-run-failure:41:deadbeef:occurrence-1"
@@ -135,7 +138,14 @@ def _attested_recovery_event() -> AgentEvent:
         "failure_occurrence_id": "occurrence-1",
         "ledger_digest": "ledger-digest",
     }
+    ordinary_item = {
+        "source_id": "ordinary:1",
+        "message": "arbitrary ordinary poller prose",
+    }
+    items = [item, ordinary_item] if with_ordinary_item else [item]
     content = f"diagnostic display\nRecovery handle: {handle}"
+    if with_ordinary_item:
+        content += "\narbitrary ordinary poller prose"
     canonical_item = json.dumps(item, sort_keys=True, separators=(",", ":"))
     selection = _mint_recovery_selection(
         handle=handle,
@@ -146,7 +156,7 @@ def _attested_recovery_event() -> AgentEvent:
         batch_index=0,
         batch_count=1,
         item_index=0,
-        item_count=1,
+        item_count=len(items),
         delivery_key=delivery_key,
         issue_id=41,
         error_signature="deadbeef",
@@ -158,6 +168,21 @@ def _attested_recovery_event() -> AgentEvent:
         event_content_digest=hashlib.sha256(content.encode()).hexdigest(),
         item_digest=hashlib.sha256(canonical_item.encode()).hexdigest(),
     )
+    labels = selection_labels((selection,))
+    if with_ordinary_item:
+        labels = labels.with_source(SourceLabel(
+            principal="service:poller:worklink-ready-queue",
+            domain="channel",
+            resource_id="ordinary:1",
+            bridge_instance="poller",
+            sensitivity="internal",
+            authorized_principals=frozenset({
+                "service:poller:worklink-ready-queue",
+            }),
+            source_kind="service",
+            integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
     return AgentEvent(
         trigger="poller",
         channel_id="poller:worklink-ready-queue",
@@ -169,8 +194,9 @@ def _attested_recovery_event() -> AgentEvent:
             "poller_name": "worklink-ready-queue",
             "batch_index": 0,
             "batch_count": 1,
-            "items": [item],
+            "items": items,
         },
+        ifc_labels=labels,
         recovery_selections=(selection,),
     )
 
@@ -212,6 +238,35 @@ async def test_stashed_recovery_selection_survives_process_key_rotation(
     assert restored is not None
     assert valid_event_recovery_selections(restored) == event.recovery_selections
     assert (home / "state" / ".recovery-selection.key").stat().st_mode & 0o777 == 0o600
+
+
+async def test_valid_mixed_recovery_stash_replay_preserves_active_item_ifc(
+    tmp_path: Path,
+) -> None:
+    event = _attested_recovery_event(with_ordinary_item=True)
+    assert event.ifc_labels is not None
+    assert event.ifc_labels.has_untrusted_active_ingest is True
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
+    entry = poller_recovery._load_state(tmp_path)["inflight"][event.source_id]
+
+    restored = poller_recovery._restore_event(
+        entry,
+        poller_name="worklink-ready-queue",
+        channel_id="poller:worklink-ready-queue",
+        service_principal="poller:worklink-ready-queue",
+        service_authority=object(),
+    )
+
+    assert restored is not None
+    assert valid_event_recovery_selections(restored) == restored.recovery_selections
+    assert restored.ifc_labels is not None
+    assert restored.ifc_labels.has_untrusted_active_ingest is True
+    assert any(
+        source.resource_id == "ordinary:1:item:1"
+        and source.integrity == "untrusted"
+        and source.integrity_effect == "active_ingest"
+        for source in restored.ifc_labels.sources
+    )
 
 
 @pytest.mark.parametrize("defect", ["legacy", "forged", "cross_item"])

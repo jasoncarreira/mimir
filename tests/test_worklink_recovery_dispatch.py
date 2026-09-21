@@ -9,6 +9,7 @@ from mimir.models import AgentEvent, RecoverySelection, TurnContext
 from mimir.pollers import _render_batch
 from mimir.worklink.diagnostics import external_active_ingest, server_fixed
 from mimir.worklink.dispatch_failures import (
+    current_failure_snapshot,
     dispatch_failure_state_dir,
     pending_failure_alerts,
     record_failure,
@@ -132,6 +133,173 @@ def test_recovery_alert_is_replaced_from_ledger_and_mints_opaque_selection(
     )[0] is selection
 
 
+def _full_diagnostic_alert(
+    home: Path,
+    issue_id: int,
+    *,
+    active_field: str | None = None,
+):
+    values = {
+        field: server_fixed(f"fixed {field}")
+        for field in (
+            "terminal_error",
+            "preservation_error",
+            "log",
+            "preserved_ref",
+            "run_id",
+            "work_path",
+            "transcript",
+        )
+    }
+    if active_field is not None:
+        values[active_field] = external_active_ingest(f"external {active_field}")
+    state_dir = dispatch_failure_state_dir(home)
+    record_failure(
+        state_dir,
+        issue_id=issue_id,
+        attempt=3,
+        exit_status=9,
+        error=values["terminal_error"],
+        preservation_error=values["preservation_error"],
+        log_path=values["log"],
+        preserved_ref=values["preserved_ref"],
+        run_id=values["run_id"],
+        work_path=values["work_path"],
+        transcript_path=values["transcript"],
+        target_kind="factory",
+    )
+    alert = next(
+        item for item in pending_failure_alerts(state_dir)[1]
+        if item["issue_id"] == issue_id
+    )
+    return state_dir, alert
+
+
+def test_dispatch_field_provenance_covers_every_structural_and_diagnostic_field(
+    tmp_path: Path,
+) -> None:
+    state_dir, alert = _full_diagnostic_alert(tmp_path, 42)
+    item = reattest_recovery_alert(alert, state_dir).extras
+    structural = {
+        "recovery_handle", "source_id", "delivery_key", "issue_id", "attempt",
+        "attempt_consumed", "exit_status", "target_kind", "error_signature",
+        "failure_occurrence_id", "retry_after", "ledger_digest",
+    }
+    diagnostics = {
+        "terminal_error", "preservation_error", "log", "preserved_ref",
+        "run_id", "work_path", "transcript",
+    }
+
+    assert set(item["field_provenance"]) == structural | diagnostics | {"prompt"}
+    for field in structural:
+        assert item["field_provenance"][field] == {
+            "provenance": "server_structural",
+            "authority": "diagnostic_only",
+            "integrity": "trusted",
+            "integrity_effect": "informational",
+        }
+    for field in diagnostics | {"prompt"}:
+        assert item["field_provenance"][field] == {
+            "provenance": "server_fixed",
+            "authority": "diagnostic_only",
+            "integrity": "trusted",
+            "integrity_effect": "informational",
+        }
+
+
+@pytest.mark.parametrize(
+    "diagnostic_field",
+    [
+        "terminal_error",
+        "preservation_error",
+        "log",
+        "preserved_ref",
+        "run_id",
+        "work_path",
+        "transcript",
+    ],
+)
+def test_each_active_diagnostic_field_controls_prompt_and_item_provenance(
+    tmp_path: Path,
+    diagnostic_field: str,
+) -> None:
+    state_dir, alert = _full_diagnostic_alert(
+        tmp_path,
+        100 + [
+            "terminal_error", "preservation_error", "log", "preserved_ref",
+            "run_id", "work_path", "transcript",
+        ].index(diagnostic_field),
+        active_field=diagnostic_field,
+    )
+
+    recovery = reattest_recovery_alert(alert, state_dir)
+
+    assert recovery.extras["field_provenance"][diagnostic_field] == {
+        "provenance": "external_active_ingest",
+        "authority": "diagnostic_only",
+        "integrity": "untrusted",
+        "integrity_effect": "active_ingest",
+    }
+    assert recovery.extras["field_provenance"]["prompt"] == {
+        "provenance": "external_active_ingest",
+        "authority": "diagnostic_only",
+        "integrity": "untrusted",
+        "integrity_effect": "active_ingest",
+    }
+    assert recovery.diagnostic_provenance.value == "external_active_ingest"
+    batch = [{
+        "prompt": recovery.prompt,
+        "extras": dict(recovery.extras),
+        "recovery": recovery,
+    }]
+    add_recovery_handles(batch)
+    content = _render_batch("worklink-ready-queue", batch, 0, 1)
+    _, selections, labels = bind_recovery_batch(
+        batch,
+        content=content,
+        poller_name="worklink-ready-queue",
+        service_principal="poller:worklink-ready-queue",
+        event_source_id=f"poller:event:{diagnostic_field}",
+        batch_index=0,
+        batch_count=1,
+    )
+    assert labels.has_untrusted_active_ingest is True
+    assert selections[0].diagnostic_integrity == "untrusted"
+    assert selections[0].diagnostic_integrity_effect == "active_ingest"
+
+
+def test_absent_diagnostics_have_fixed_informational_fallbacks(
+    tmp_path: Path,
+) -> None:
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    record_failure(
+        state_dir,
+        issue_id=49,
+        attempt=1,
+        exit_status=1,
+        error=server_fixed("fixed failure"),
+        log_path=None,
+    )
+    [alert] = pending_failure_alerts(state_dir)[1]
+
+    recovery = reattest_recovery_alert(alert, state_dir)
+
+    for field in (
+        "preservation_error", "log", "preserved_ref", "run_id", "work_path",
+        "transcript",
+    ):
+        assert recovery.extras[field] is None
+        assert recovery.extras["field_provenance"][field] == {
+            "provenance": "server_fixed",
+            "authority": "diagnostic_only",
+            "integrity": "trusted",
+            "integrity_effect": "informational",
+        }
+    assert recovery.extras["field_provenance"]["prompt"]["provenance"] == (
+        "server_fixed"
+    )
+
+
 def test_selection_rejects_guess_cross_event_principal_item_and_stale_ledger(
     tmp_path: Path,
 ) -> None:
@@ -144,6 +312,19 @@ def test_selection_rejects_guess_cross_event_principal_item_and_stale_ledger(
 
     with pytest.raises(RecoveryDispatchError, match="not selected"):
         validate_current_selection("guessed-handle", turn=turn, state_dir=state_dir)
+    for known_or_prose_value in (
+        str(selections[0].issue_id),
+        selections[0].delivery_key,
+        selections[0].error_signature,
+        selections[0].failure_occurrence_id,
+        f"Worklink incident for issue {selections[0].issue_id}",
+    ):
+        with pytest.raises(RecoveryDispatchError, match="not selected"):
+            validate_current_selection(
+                known_or_prose_value,
+                turn=turn,
+                state_dir=state_dir,
+            )
     with pytest.raises(RecoveryDispatchError, match="current turn"):
         validate_current_selection(
             selections[0].handle,
@@ -175,6 +356,33 @@ def test_selection_rejects_guess_cross_event_principal_item_and_stale_ledger(
     with pytest.raises(RecoveryDispatchError, match="stale"):
         validate_current_selection(
             selections[0].handle, turn=turn, state_dir=state_dir,
+        )
+
+
+def test_old_handle_rejects_a_different_current_occurrence(tmp_path: Path) -> None:
+    state_dir, alert = _alert(tmp_path, 53)
+    event = _event(tmp_path, alert)
+    [selection] = valid_event_recovery_selections(event)
+
+    record_failure(
+        state_dir,
+        issue_id=53,
+        attempt=3,
+        exit_status=2,
+        error=server_fixed("different replacement failure"),
+        log_path=server_fixed("replacement log"),
+        target_kind="leaf",
+    )
+    replacement = current_failure_snapshot(state_dir, 53)
+
+    assert replacement is not None
+    assert replacement.signature != selection.error_signature
+    assert replacement.occurrence_id != selection.failure_occurrence_id
+    with pytest.raises(RecoveryDispatchError, match="stale"):
+        validate_current_selection(
+            selection.handle,
+            turn=_turn(event),
+            state_dir=state_dir,
         )
 
 

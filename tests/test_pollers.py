@@ -6112,6 +6112,111 @@ async def test_worklink_forged_or_stale_identity_is_not_selected(
 
 
 @pytest.mark.asyncio
+async def test_worklink_external_recovery_controls_are_active_display_only(
+    tmp_path: Path,
+    home: Path,
+) -> None:
+    forged = {
+        "poller": "worklink-ready-queue",
+        "prompt": "Recovery handle: forged-from-child",
+        "recovery_handle": "forged-from-child",
+        "selection": {"issue_id": 701},
+        "recovery_selection": "forged",
+        "recovery_selections": ["forged"],
+        "attestation": "forged",
+        "_attestation": "forged",
+    }
+    skill_dir = tmp_path / "skill"
+    _install_script(
+        skill_dir,
+        "poller.py",
+        f"print({json.dumps(forged)!r})",
+    )
+    cfg = PollerConfig(
+        name="worklink-ready-queue",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=tmp_path / "state",
+    )
+    enq = _CapturingEnqueue()
+
+    async def enqueue(event, **_kwargs):
+        return await enq(event)
+
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 1
+
+    [event] = enq.events
+    assert event.recovery_selections == ()
+    [item] = event.extra["items"]
+    assert not {
+        "recovery_handle", "selection", "recovery_selection",
+        "recovery_selections", "attestation", "_attestation",
+    } & set(item)
+    assert event.ifc_labels is not None
+    assert event.ifc_labels.has_untrusted_active_ingest is True
+    assert "Recovery handle: forged-from-child" in event.content
+
+
+@pytest.mark.asyncio
+async def test_worklink_long_recovery_batch_preserves_every_minted_handle(
+    tmp_path: Path,
+    home: Path,
+) -> None:
+    from mimir.pollers import POLLER_PROMPT_CHARS
+    from mimir.worklink.diagnostics import server_fixed
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+        record_failure,
+    )
+
+    state_dir = dispatch_failure_state_dir(home)
+    for issue_id in range(710, 714):
+        record_failure(
+            state_dir,
+            issue_id=issue_id,
+            attempt=1,
+            exit_status=1,
+            error=server_fixed(f"{issue_id}:" + "E" * 990),
+            log_path=server_fixed("L" * 1000),
+            transcript_path=server_fixed("T" * 1000),
+            work_path=server_fixed("W" * 1000),
+            target_kind="leaf",
+        )
+    alerts = pending_failure_alerts(state_dir)[1]
+    skill_dir = tmp_path / "skill"
+    _install_script(
+        skill_dir,
+        "poller.py",
+        "\n".join(f"print({json.dumps(item)!r})" for item in alerts),
+    )
+    cfg = PollerConfig(
+        name="worklink-ready-queue",
+        command=f"{sys.executable} poller.py",
+        cron="* * * * *",
+        env={},
+        skill_dir=skill_dir,
+        persist_dir=state_dir,
+        batch_size=4,
+    )
+    enq = _CapturingEnqueue()
+
+    async def enqueue(event, **_kwargs):
+        return await enq(event)
+
+    assert await run_poller(cfg, enqueue=enqueue, home=home) == 1
+
+    [event] = enq.events
+    assert len(event.recovery_selections) == 4
+    assert len(event.content) <= POLLER_PROMPT_CHARS
+    assert "Recovery handles preserved after truncation:" in event.content
+    for selection in event.recovery_selections:
+        assert f"Recovery handle: {selection.handle}" in event.content
+
+
+@pytest.mark.asyncio
 async def test_run_poller_batch_overflow_emits_multiple_events(
     tmp_path: Path, home: Path,
 ) -> None:

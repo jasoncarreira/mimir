@@ -34,6 +34,14 @@ from .dispatch_failures import (
 
 _INCIDENT_PREFIX = "worklink-run-failure:"
 _STRUCTURAL_PROVENANCE = DiagnosticProvenance.SERVER_STRUCTURAL.value
+_EXTERNAL_CONTROL_KEYS = frozenset({
+    "_attestation",
+    "attestation",
+    "recovery_handle",
+    "recovery_selection",
+    "recovery_selections",
+    "selection",
+})
 
 
 class RecoveryDispatchError(ValueError):
@@ -248,6 +256,32 @@ def add_recovery_handles(batch: list[dict[str, Any]]) -> None:
             item["prompt"] = f"{item['prompt']}\nRecovery handle: {handle}"
 
 
+def preserve_recovery_handles(
+    content: str,
+    batch: list[dict[str, Any]],
+    *,
+    max_chars: int,
+) -> str:
+    """Keep every server-minted handle visible after the final prompt cap."""
+    handles = tuple(
+        item["extras"]["recovery_handle"]
+        for item in batch
+        if isinstance(item.get("recovery"), ReattestedRecoveryItem)
+        and isinstance(item.get("extras"), Mapping)
+        and isinstance(item["extras"].get("recovery_handle"), str)
+    )
+    if not handles or all(f"Recovery handle: {handle}" in content for handle in handles):
+        return content
+    footer = (
+        "\n\n[…truncated by poller framework]\n\n"
+        "Recovery handles preserved after truncation:\n"
+        + "\n".join(f"Recovery handle: {handle}" for handle in handles)
+    )
+    if len(footer) >= max_chars:
+        raise RecoveryDispatchError("recovery handles exceed the event prompt limit")
+    return content[:max_chars - len(footer)].rstrip() + footer
+
+
 def bind_recovery_batch(
     batch: list[dict[str, Any]],
     *,
@@ -263,13 +297,21 @@ def bind_recovery_batch(
     selections: list[RecoverySelection] = []
     labels = InformationFlowLabels()
     for item_index, item in enumerate(batch):
-        handle = item["extras"].get("recovery_handle")
+        recovery = item.get("recovery")
+        extras = item.get("extras")
+        if not isinstance(recovery, ReattestedRecoveryItem):
+            if isinstance(extras, dict):
+                for key in _EXTERNAL_CONTROL_KEYS:
+                    extras.pop(key, None)
+            continue
+        if not isinstance(extras, dict):
+            raise RecoveryDispatchError("re-attested recovery item has invalid metadata")
+        handle = extras.get("recovery_handle")
         if not isinstance(handle, str):
             continue
-        recovery = item["recovery"]
         snapshot = recovery.snapshot
         integrity, integrity_effect = _diagnostic_ifc(recovery.diagnostic_provenance)
-        item_digest = _canonical_digest(item["extras"])
+        item_digest = _canonical_digest(extras)
         selection = _mint_recovery_selection(
             handle=handle,
             event_source="poller",
@@ -280,7 +322,7 @@ def bind_recovery_batch(
             batch_count=batch_count,
             item_index=item_index,
             item_count=len(batch),
-            delivery_key=item["extras"]["delivery_key"],
+            delivery_key=extras["delivery_key"],
             issue_id=snapshot.issue_id,
             error_signature=snapshot.signature,
             failure_occurrence_id=snapshot.occurrence_id,
@@ -382,6 +424,38 @@ def selection_labels(
     return labels
 
 
+def replay_selection_labels(
+    event: AgentEvent,
+    selections: tuple[RecoverySelection, ...],
+) -> InformationFlowLabels:
+    """Rebuild replay IFC, treating every item outside a selection as active."""
+    labels = selection_labels(selections)
+    selected_indexes = {selection.item_index for selection in selections}
+    extra = event.extra if isinstance(event.extra, Mapping) else {}
+    items = extra.get("items")
+    if not isinstance(items, list):
+        return labels
+    for item_index, item in enumerate(items):
+        if item_index in selected_indexes:
+            continue
+        resource = (
+            (item.get("source_id") or item.get("delivery_key"))
+            if isinstance(item, Mapping) else None
+        )
+        labels = labels.with_source(SourceLabel.worklink_recovery(
+            service_principal=event.service_principal,
+            resource_id=(
+                f"{resource}:item:{item_index}"
+                if isinstance(resource, str) and resource
+                else f"{event.source_id or 'poller'}:item:{item_index}"
+            ),
+            diagnostic_provenance=DiagnosticProvenance.LEGACY_UNKNOWN.value,
+            integrity=Integrity.UNTRUSTED,
+            integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+        ))
+    return labels
+
+
 def active_display_only_labels(
     *, service_principal: str | None, event_source_id: str | None,
 ) -> InformationFlowLabels:
@@ -439,7 +513,9 @@ __all__ = (
     "add_recovery_handles",
     "bind_recovery_batch",
     "is_recovery_alert",
+    "preserve_recovery_handles",
     "reattest_recovery_alert",
+    "replay_selection_labels",
     "selection_labels",
     "valid_event_recovery_selections",
     "validate_current_selection",

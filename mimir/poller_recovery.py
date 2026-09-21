@@ -664,7 +664,9 @@ def _restore_event(
     )
     if valid_selections:
         event.recovery_selections = valid_selections
-        event.ifc_labels = recovery_dispatch.selection_labels(valid_selections)
+        event.ifc_labels = recovery_dispatch.replay_selection_labels(
+            event, valid_selections,
+        )
     elif has_incident_display:
         event.recovery_selections = ()
         event.ifc_labels = recovery_dispatch.active_display_only_labels(
