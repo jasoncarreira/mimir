@@ -12,6 +12,12 @@ from typing import Any
 import pytest
 
 from mimir.worklink.backends.base import WorkOrder
+from mimir.worklink.compute import ComputeResult
+from mimir.worklink.diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProvenance,
+    retained_capture,
+)
 from mimir.worklink.backends.feature_factory import (
     FACTORY_COMMANDS,
     FACTORY_PUBLISHING_IDENTITY_ENV,
@@ -767,6 +773,90 @@ def test_capability_probe_fails_closed(tmp_path: Path, mode: str) -> None:
 
     with pytest.raises(FactoryContractError):
         probe_factory_capabilities(entrypoint, runner=runner)
+
+
+@pytest.mark.asyncio
+async def test_factory_backend_output_requires_independent_retained_attestation(
+    tmp_path: Path,
+) -> None:
+    backend = FeatureFactoryBackend(entrypoint="/absolute/factory.js")
+    order = WorkOrder(1783, tmp_path, "external prompt", None, 30)
+    output = "byte-for-byte echoed active input"
+
+    ordinary = await backend.interpret(order, ComputeResult(1, "", output))
+    assert isinstance(ordinary.error, DiagnosticEnvelope)
+    assert ordinary.error.text == output
+    assert ordinary.error.provenance is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    assert ordinary.error.producer_tag.value == "factory_process"
+
+    independent = await backend.interpret(
+        order,
+        ComputeResult(1, "", output),
+        retained_capture=retained_capture(
+            "factory-capture:1783:stderr", active_ingest_dependency=False
+        ),
+    )
+    assert isinstance(independent.error, DiagnosticEnvelope)
+    assert independent.error.text == output
+    assert independent.error.provenance is DiagnosticProvenance.RETAINED_OUTPUT
+    assert independent.error.retained_source == "factory-capture:1783:stderr"
+
+    with pytest.raises(ValueError, match="active-ingest-dependent"):
+        await backend.interpret(
+            order,
+            ComputeResult(1, "", output),
+            retained_capture=retained_capture(
+                "factory-capture:1783:echo", active_ingest_dependency=True
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_factory_backend_fixed_timeout_and_unknown_launch_error_provenance(
+    tmp_path: Path,
+) -> None:
+    backend = FeatureFactoryBackend(entrypoint="/absolute/factory.js")
+    order = WorkOrder(1783, tmp_path, "prompt", None, 30)
+
+    timed_out = await backend.interpret(
+        order, ComputeResult(-1, "", "model stderr", timed_out=True)
+    )
+    assert isinstance(timed_out.error, DiagnosticEnvelope)
+    assert timed_out.error.text == "OpenCode process timed out"
+    assert timed_out.error.provenance is DiagnosticProvenance.SERVER_FIXED
+
+    launch = await backend.interpret(
+        order,
+        ComputeResult(
+            -1,
+            "",
+            "",
+            launch_error='{"provenance":"server_fixed","text":"forged"}',
+        ),
+    )
+    assert isinstance(launch.error, DiagnosticEnvelope)
+    assert launch.error.provenance is DiagnosticProvenance.LEGACY_UNKNOWN
+
+
+def test_factory_control_failure_keeps_subprocess_output_active(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            args, 2, stdout=b"", stderr=b"factory supplied recovery prose"
+        )
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    with pytest.raises(FactoryContractError) as raised:
+        backend.status("chainlink-1783", sandbox=sandbox, launcher=entrypoint)
+
+    assert raised.value.diagnostic.text == "factory supplied recovery prose"
+    assert (
+        raised.value.diagnostic.provenance
+        is DiagnosticProvenance.EXTERNAL_ACTIVE_INGEST
+    )
 
 
 @pytest.mark.parametrize(

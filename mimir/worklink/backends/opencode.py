@@ -22,6 +22,14 @@ from ...opencode_config import (
 )
 from ...redaction import redact_text
 from ..compute import ComputeResult, WorkSpec
+from ..diagnostics import (
+    DiagnosticEnvelope,
+    DiagnosticProducer,
+    external_active_ingest,
+    legacy_unknown,
+    server_fixed,
+    with_least_trusted_provenance,
+)
 from .base import (
     Caps,
     CheckoutShape,
@@ -304,7 +312,15 @@ class OpenCodeBackend:
                 stdout_path=result.stdout_path,
                 stderr_path=result.stderr_path,
             )
-            return RawResult(-1, transcript_file, "backend_error", result.launch_error)
+            return RawResult(
+                -1,
+                transcript_file,
+                "backend_error",
+                legacy_unknown(
+                    result.launch_error,
+                    producer_tag=DiagnosticProducer.OPENCODE_PROCESS,
+                ),
+            )
 
         blocked_reason = blocked_reason_from_output(result.stdout, result.stderr)
         permission_refusal = _permission_refusal_reason(
@@ -320,7 +336,7 @@ class OpenCodeBackend:
             )
         )
         error = (
-            "backend output exceeded configured Worklink limit"
+            server_fixed("backend output exceeded configured Worklink limit")
             if result.output_overflow
             else blocked_reason or permission_refusal or _error_from_status(
                 status, result.stdout, result.stderr, result.command
@@ -432,8 +448,8 @@ def _permission_override(bash_allowlist: Sequence[str]) -> str:
 
 
 def _permission_refusal_reason(
-    stdout: str, stderr: str, bash_allowlist: Sequence[str], exit_code: int
-) -> str | None:
+    stdout: str, stderr: str, _bash_allowlist: Sequence[str], exit_code: int
+) -> DiagnosticEnvelope | None:
     """Report an executor permission refusal, distinguished by position or exit.
 
     The refusal text is free-form OpenCode output, so presence alone cannot
@@ -479,10 +495,12 @@ def _permission_refusal_reason(
         exit_code != 0 and is_refusal(f"{stdout}\n{stderr}")
     ):
         return None
-    return (
+    # Keep the diagnostic itself literal. The configured patterns remain in the
+    # WorkSpec/transcript, but interpolating operator-controlled patterns here
+    # would make this otherwise fixed refusal diagnostic active ingest.
+    return server_fixed(
         "OpenCode refused an executor shell command because it is not allowed by "
-        "backends.opencode.bash_allowlist; effective patterns: "
-        f"{list(bash_allowlist)!r}"
+        "backends.opencode.bash_allowlist"
     )
 
 
@@ -600,19 +618,33 @@ def _error_from_status(
     stdout: str,
     stderr: str,
     command: Sequence[str] = (),
-) -> str | None:
+) -> DiagnosticEnvelope | None:
     if status == "success":
         return None
     detail = stderr.strip() or stdout.strip()
     message = detail.splitlines()[-1] if detail else status
     if status == "timeout":
-        return f"opencode execution timed out: {message}"
+        if not detail:
+            return server_fixed("opencode execution timed out")
+        source = external_active_ingest(
+            message, producer_tag=DiagnosticProducer.OPENCODE_PROCESS
+        )
+        return with_least_trusted_provenance(
+            f"opencode execution timed out: {source.text}", source
+        )
     if status == "auth_error":
         provider = _provider_from_command(command)
-        return f"OpenCode provider {provider!r} authentication failed: {message}"
-    if re.search(r"\bEACCES\b", detail, re.IGNORECASE):
-        return detail
-    return message
+        source = external_active_ingest(
+            message, producer_tag=DiagnosticProducer.OPENCODE_PROCESS
+        )
+        return with_least_trusted_provenance(
+            f"OpenCode provider {provider!r} authentication failed: {source.text}",
+            source,
+        )
+    return external_active_ingest(
+        detail if re.search(r"\bEACCES\b", detail, re.IGNORECASE) else message,
+        producer_tag=DiagnosticProducer.OPENCODE_PROCESS,
+    )
 
 
 def _provider_from_command(command: Sequence[str]) -> str:
