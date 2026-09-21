@@ -337,6 +337,71 @@ def test_production_ready_queue_target_ro_is_named_fatal(
     ).status is StartupStatus.FATAL
 
 
+@pytest.mark.parametrize("variable", ["WORKLINK_REPO", "MIMIR_WORKLINK_REPO"])
+@pytest.mark.parametrize(
+    ("value_case", "expected_ok"),
+    [
+        ("empty", False),
+        ("whitespace", False),
+        ("padded-canonical", False),
+        ("mismatched", False),
+        ("canonical", True),
+    ],
+)
+def test_worklink_raw_repository_paths_cannot_bypass_startup_dispatch_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    variable: str,
+    value_case: str,
+    expected_ok: bool,
+) -> None:
+    checkout = tmp_path / "repo"
+    checkout.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    _write_repository_inventory(tmp_path, checkout)
+    environment = StartupEnvironment(
+        home=tmp_path,
+        coding_enabled=True,
+        repositories_configured=True,
+        ready_queue_enabled=True,
+        worklink_repository="owner/repo",
+        authorized_root_modes=((str(checkout), "rw"),),
+    )
+    values = {
+        "empty": "",
+        "whitespace": " \t ",
+        "padded-canonical": f" {checkout} ",
+        "mismatched": str(other),
+        "canonical": str(checkout),
+    }
+    monkeypatch.delenv("WORKLINK_REPO", raising=False)
+    monkeypatch.delenv("MIMIR_WORKLINK_REPO", raising=False)
+    monkeypatch.setenv(variable, values[value_case])
+    overrides = _passing_overrides()
+    del overrides["coding.worklink.target_rw_unique"]
+
+    report = validate_startup(environment, probe_overrides=overrides)
+    check = report.check("coding.worklink.target_rw_unique")
+    dispatched = False
+
+    if expected_ok:
+        report.require_success()
+        dispatched = True
+        assert check.status is StartupStatus.PASS
+        assert check.observed["configured_paths"] == {variable: str(checkout)}
+    else:
+        with pytest.raises(RuntimeError, match="coding.worklink.target_rw_unique"):
+            report.require_success()
+            dispatched = True
+        assert check.status is StartupStatus.FATAL
+        assert check.observed["path_mismatches"] == {
+            variable: values[value_case]
+        }
+
+    assert dispatched is expected_ok
+
+
 def test_production_git_binding_mismatch_is_named_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

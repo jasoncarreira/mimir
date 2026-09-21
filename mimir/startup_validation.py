@@ -363,14 +363,14 @@ def _default_probes(environment: StartupEnvironment) -> dict[str, Probe]:
         except (OSError, ValueError) as exc:
             return ProbeObservation(False, {"target": target_name, "result": str(exc)})
         configured_paths = {
-            name: value
+            name: os.environ[name]
             for name in ("WORKLINK_REPO", "MIMIR_WORKLINK_REPO")
-            if (value := os.environ.get(name, "").strip())
+            if name in os.environ
         }
         mismatches = {
             name: value
             for name, value in configured_paths.items()
-            if not Path(value).is_absolute() or Path(value).resolve() != target.root
+            if value != str(target.root)
         }
         count = sum(str(Path(path).resolve()) == str(target.root) for path, _ in roots)
         return ProbeObservation(not mismatches, {
