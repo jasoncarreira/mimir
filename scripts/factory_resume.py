@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""Resume a parked factory run, restoring it to a supervised running state.
+"""Check a parked factory run is recoverable, then dispatch it through mimir.
 
-Resume grants a fresh full budget: ``_supervise_factory_070`` recomputes
-``deadline = loop.time() + run_timeout`` on entry and nothing persists elapsed
-time, so a run parked at 11h50m comes back with the whole budget again.
+This script deliberately does **not** call ``factory resume``.
 
-``needs-human`` is explicitly not final — only ``completed``, ``partial`` and
-``blocked`` are — so a parked run is resumable by design.
+mimir's recovery path does the whole transition as one operation: it refuses a
+status that is not ``running`` or ``needs-human``, requires the retained process
+to be verifiably dead, steals or claims the session lock as needed, resumes,
+checks the returned status is owned and running, validates the recovery binding,
+launches a driver, saves the new handle and enters supervision. Unparking from
+outside spends the ``needs-human`` transition that path is gated on, and then the
+supported path refuses the run with ``factory resume requires current status
+needs-human``. That is not hypothetical: it is how an attempt was lost.
 
-Two things this script checks that are easy to skip:
+Two details follow from reading that path rather than guessing at it:
 
-**The lock reads ``fresh`` immediately after the holder dies.** It has to age
-into staleness before ``dead_lock`` flips, so a resume attempted straight after
-a park will see a live-looking lock owned by a dead session. Stealing is
-legitimate only once status proves the holder is gone, so this refuses to steal
-on a fresh lock rather than forcing it.
+**The session is not the operator's to choose.** Recovery steals the lock using
+the *recorded* session and then resumes with it. A new session id produces a lock
+whose owner does not match what resume expects.
 
-**mimir's retained record has to come back too.** Parking sets
-``controller_phase=parked``; leaving it there after the factory is running again
-leaves the two views disagreeing, which is the same class of bug that let a
-parked run be pruned.
+**A stale lock is not the operator's to steal.** Recovery already steals when
+``lock`` is ``stale`` or ``dead_lock`` is set, in the same sequence that then
+verifies ownership. A manual steal beforehand only moves the lock out from under
+those checks.
+
+So the useful work here is the preflight: report exactly which of mimir's own
+recovery preconditions hold, and refuse with the specific one that does not,
+before spending a dispatch on a run that will be rejected.
 """
 
 from __future__ import annotations
@@ -28,18 +34,16 @@ import argparse
 import json
 import subprocess
 import sys
-from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mimir.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
 from mimir.worklink.factory_state import (  # noqa: E402
-    factory_checkout_interlock,
+    factory_process_is_alive,
+    factory_process_is_verified_dead,
     load_factory_record,
-    save_factory_record,
 )
+from mimir.worklink.orchestrator import _RECOVERABLE_FACTORY_PHASES  # noqa: E402
 
 PARKED = "needs-human"
 
@@ -65,18 +69,71 @@ def factory_status(launcher: Path, run_id: str, sandbox: Path) -> dict:
         raise ResumeError(f"factory status returned unparseable JSON: {exc}") from exc
 
 
+def preflight(record, status: dict, sandbox: Path) -> list[str]:
+    """Return the recovery preconditions that do not hold, most specific first.
+
+    Each check mirrors one in ``_verify_factory_recovery_target`` or the resume
+    block that follows it. ``_RECOVERABLE_FACTORY_PHASES`` is imported rather
+    than restated so this cannot drift from the gate it is reporting on.
+    """
+    problems: list[str] = []
+
+    reported = status.get("status")
+    if reported not in {"running", PARKED}:
+        problems.append(
+            f"factory status is {reported!r}; recovery resumes only 'running' or 'needs-human'"
+        )
+
+    if record.controller_phase not in _RECOVERABLE_FACTORY_PHASES:
+        problems.append(
+            f"retained controller_phase is {record.controller_phase!r}; recoverable phases are "
+            f"{sorted(_RECOVERABLE_FACTORY_PHASES)}"
+        )
+
+    if not record.session:
+        problems.append("retained session is missing; recovery resumes with the recorded session")
+
+    if (
+        record.status is not None
+        and not record.status.is_terminal
+        and record.status.status != PARKED
+    ):
+        problems.append(
+            f"retained status is {record.status.status!r}; recovery requires 'needs-human'. "
+            "An out-of-band 'factory resume' is the usual cause."
+        )
+
+    if factory_process_is_alive(record):
+        problems.append("the retained factory process is still alive; recovery refuses a live run")
+    elif not factory_process_is_verified_dead(record):
+        problems.append(
+            "the retained process cannot be verified dead (no recorded birth marker, or it is a "
+            "zombie); recovery requires verified death to rule out pid reuse"
+        )
+
+    if not sandbox.is_absolute() or not sandbox.is_dir() or sandbox.is_symlink():
+        problems.append(f"sandbox is unavailable as an absolute real directory: {sandbox}")
+
+    if not status.get("park_snapshot") and reported == PARKED:
+        problems.append(
+            "park_snapshot is null: the park was never acknowledged, so its control plane was "
+            "not published and the run is evidence only"
+        )
+
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__ and __doc__.splitlines()[0])
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--sandbox", required=True, type=Path)
     parser.add_argument("--home", required=True, type=Path)
     parser.add_argument("--launcher", required=True, type=Path)
-    parser.add_argument("--session", required=True, help="the new session id taking the run")
+    parser.add_argument("--repo", type=Path, help="controller repo checkout to dispatch from")
     parser.add_argument(
-        "--steal-stale-lock", action="store_true",
-        help="take the lock when status proves the holder is gone (dead_lock true)",
+        "--dispatch", action="store_true",
+        help="after a clean preflight, dispatch through 'mimir worklink run-epic --autonomous'",
     )
-    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     sandbox = args.sandbox.resolve()
@@ -89,74 +146,53 @@ def main(argv: list[str] | None = None) -> int:
             "resumable; its snapshot is evidence only, and the factory has no restore command."
         )
 
-    status = factory_status(args.launcher, args.run_id, sandbox)
-    print(f"status  : {status.get('status')}  lock={status.get('lock')} dead_lock={status.get('dead_lock')}")
-    if status.get("status") != PARKED:
-        raise ResumeError(f"run is not parked (status={status.get('status')}); nothing to resume")
-    if not status.get("park_snapshot"):
-        print("warning : park_snapshot is null — the park was never fully published")
-
     record = load_factory_record(args.home, args.run_id)
     if record is None:
         raise ResumeError(f"no retained record for {args.run_id} under {args.home}")
 
-    if args.dry_run:
-        print("dry-run : would steal a stale lock if needed, resume, then reconcile the record")
+    status = factory_status(args.launcher, args.run_id, sandbox)
+    print(
+        f"factory : status={status.get('status')} lock={status.get('lock')} "
+        f"dead_lock={status.get('dead_lock')} park_snapshot={bool(status.get('park_snapshot'))}"
+    )
+    print(
+        f"record  : phase={record.controller_phase} "
+        f"status={None if record.status is None else record.status.status} "
+        f"session={'set' if record.session else 'MISSING'} issue={record.issue_id}"
+    )
+
+    problems = preflight(record, status, sandbox)
+    if problems:
+        print()
+        print("not recoverable:")
+        for problem in problems:
+            print(f"  - {problem}")
+        raise ResumeError(f"{len(problems)} recovery precondition(s) do not hold")
+    print("preflight: every recovery precondition holds")
+
+    dispatch = [
+        "mimir", "worklink", "run-epic", str(record.issue_id),
+        "--home", str(args.home), "--repo", str(args.repo or record.sandbox), "--autonomous",
+    ]
+    print()
+    if not args.dispatch:
+        print("dispatch with (or re-run with --dispatch):")
+        print("  " + " ".join(dispatch))
+        print()
+        print(
+            "that path resumes, relaunches and enters supervision as one operation. Do not run\n"
+            "'factory resume' first: it spends the needs-human transition the path is gated on."
+        )
         return 0
 
-    if status.get("dead_lock"):
-        if not args.steal_stale_lock:
-            raise ResumeError(
-                "the lock is stale (dead_lock true). Re-run with --steal-stale-lock to take it; "
-                "status proving the holder gone is what makes a steal legitimate."
-            )
-        steal = _run([
-            "node", str(args.launcher), "lock", args.run_id, "steal",
-            "--session", args.session, "--repo", str(sandbox), "--json",
-        ])
-        if steal.returncode != 0:
-            raise ResumeError(f"lock steal failed: {(steal.stderr or steal.stdout).strip()[:300]}")
-        held = factory_status(args.launcher, args.run_id, sandbox)
-        if held.get("lock") != "fresh" or held.get("dead_lock"):
-            raise ResumeError("lock is not held fresh after the steal; refusing to resume")
-        print("lock    : stolen and held fresh")
-    elif status.get("lock") == "fresh":
-        print(
-            "note    : the lock still reads fresh. Immediately after a park this is expected — "
-            "the dead holder's lock has not aged into staleness yet. Resume may refuse until it does."
-        )
-
-    resumed = _run([
-        "node", str(args.launcher), "resume", args.run_id,
-        "--session", args.session, "--repo", str(sandbox), "--json",
-    ])
-    if resumed.returncode != 0:
-        raise ResumeError(f"factory resume failed: {(resumed.stderr or resumed.stdout).strip()[:300]}")
-
-    after = factory_status(args.launcher, args.run_id, sandbox)
-    if after.get("status") == PARKED:
-        raise ResumeError("factory still reports needs-human after resume; the run did not unpark")
-    print(f"resumed : status={after.get('status')} next={after.get('next')}")
-
-    with factory_checkout_interlock(args.home) as acquired:
-        if not acquired:
-            raise ResumeError(
-                "could not acquire the factory checkout interlock; the factory is running again but "
-                "mimir's record still reads parked. Re-run to reconcile."
-            )
-        current = load_factory_record(args.home, args.run_id)
-        if current is None:
-            raise ResumeError("retained record vanished while resuming")
-        reconciled = replace(
-            current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
-            controller_phase="running",
-        )
-        save_factory_record(args.home, reconciled)
-    print("reconciled: controller_phase=running")
-
-    print()
-    print("the run is unparked but has no driver: dispatch it through mimir so it is supervised,")
-    print("rather than launching the factory CLI by hand.")
+    if args.repo is None:
+        raise ResumeError("--dispatch needs --repo: the controller checkout, not the sandbox")
+    print("dispatching: " + " ".join(dispatch))
+    result = _run(dispatch, timeout=600)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode != 0:
+        raise ResumeError(f"dispatch exited {result.returncode}")
     return 0
 
 

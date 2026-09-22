@@ -22,6 +22,21 @@ the factory itself reports ``needs-human``. That is why the supervisor is stoppe
 before the driver here: if the driver dies under a live supervisor, the
 supervisor records a terminal failure first and marks the tree prunable before
 the park can land.
+
+**The controller has to be stopped first, before anything it owns.** The
+controller's own budget park (``park_for_budget`` in ``orchestrator.py``) is
+race-free precisely because it cancels a handle it owns and therefore never
+observes an unexpected exit. A script that kills the compute processes under a
+live controller gives it exactly that unexpected exit: it runs its failure path,
+writes ``failed`` to the retained record, and races this script's later
+terminalize and reconcile — and whichever write lands second wins. There is no
+ordering of the compute processes that avoids this, so the controller is stopped
+first and its death is verified before any other process is signalled.
+
+Which process to stop is not guessed from ``ps``. The retained record's
+``handle`` names the driver, and ``factory_process_is_verified_dead`` is the same
+predicate mimir's own recovery path applies before it will resume, so this script
+asserts the state resume actually requires rather than a proxy for it.
 """
 
 from __future__ import annotations
@@ -45,6 +60,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mimir.worklink.backends.feature_factory import parse_factory_status  # noqa: E402
 from mimir.worklink.factory_state import (  # noqa: E402
     factory_checkout_interlock,
+    factory_process_is_alive,
+    factory_process_is_verified_dead,
     load_factory_record,
     save_factory_record,
 )
@@ -176,24 +193,115 @@ def publish_snapshot(plane: Path, parked_dir: Path, run_id: str) -> Path:
     return canonical
 
 
-def stop_processes(run_id: str, *, timeout: float = 20.0) -> list[int]:
-    """Stop the supervisor before the driver, and report what was signalled.
+def process_argv(pid: int) -> str | None:
+    """Return a live process's argv, or None if it is gone.
 
-    Order matters and is the opposite of intuition: a driver that dies under a
-    live supervisor is recorded as a terminal failure, which marks the checkout
-    prunable before the park can complete.
+    ``ps`` rather than ``/proc`` so the same check works on the macOS host where
+    these scripts are tested and in the Linux container where they are run.
+    """
+    result = _run(["ps", "-o", "args=", "-p", str(pid)])
+    if result.returncode != 0:
+        return None
+    argv = result.stdout.strip()
+    return argv or None
+
+
+def verify_controller(pid: int, issue_id: int) -> str:
+    """Confirm a pid really is the controller for this issue before signalling it.
+
+    The tokens are derived from the retained record, not supplied by the
+    operator, so a mistyped pid is refused rather than acted on.
+    """
+    argv = process_argv(pid)
+    if argv is None:
+        raise ParkError(
+            f"--controller-pid {pid} is not running. If the controller is already gone, "
+            "pass --controller-pid none, which verifies that rather than assuming it."
+        )
+    required = ("worklink", "run-epic", str(issue_id))
+    missing = [token for token in required if token not in argv]
+    if missing:
+        raise ParkError(
+            f"--controller-pid {pid} does not look like this run's controller "
+            f"(argv lacks {missing}): {argv[:200]}"
+        )
+    return argv
+
+
+def find_controllers(issue_id: int) -> list[int]:
+    """Report controller candidates so a refusal can name them.
+
+    This never selects one. Picking a process to kill by pattern match is how an
+    operator kills the wrong run; the operator names the pid and this verifies it.
+    """
+    listing = _run(["ps", "-eo", "pid=,args="])
+    self_pid = os.getpid()
+    found: list[int] = []
+    for line in listing.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        head, _, argv = line.partition(" ")
+        try:
+            pid = int(head)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        # This script's own argv carries every token it searches for.
+        if "factory_park.py" in argv:
+            continue
+        if all(token in argv for token in ("worklink", "run-epic", str(issue_id))):
+            found.append(pid)
+    return found
+
+
+def stop_pid(pid: int, label: str, *, timeout: float = 20.0) -> None:
+    """SIGTERM, then SIGKILL, then verify the pid is actually gone."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            raise ParkError(
+                f"not permitted to signal {label} (pid {pid}): {exc}. Run as the uid that owns it."
+            ) from exc
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.5)
+    if _pid_alive(pid):
+        raise ParkError(f"{label} (pid {pid}) survived SIGKILL; refusing to continue the park")
+
+
+def stop_residual_compute(run_id: str, *, timeout: float = 20.0) -> list[int]:
+    """Stop any supervisor or driver left for this run, supervisor first.
+
+    The record's handle is the authoritative driver and is stopped by the caller
+    before this runs. This is a sweep for the rest of the tree, and the order is
+    the opposite of intuition: a driver that dies under a live supervisor is
+    recorded as a terminal failure, which marks the checkout prunable before the
+    park can complete.
     """
     stopped: list[int] = []
+    self_pid = os.getpid()
     for pattern in ("factory_supervisor", "opencode run"):
         listing = _run(["ps", "-eo", "pid=,args="])
         for line in listing.stdout.splitlines():
             line = line.strip()
-            if not line or pattern not in line or run_id not in line:
+            if not line:
                 continue
-            # Never match this script's own argv, which carries both strings.
-            if str(os.getpid()) == line.split(maxsplit=1)[0]:
+            head, _, argv = line.partition(" ")
+            try:
+                pid = int(head)
+            except ValueError:
                 continue
-            pid = int(line.split(maxsplit=1)[0])
+            if pid == self_pid or "factory_park.py" in argv:
+                continue
+            if pattern not in argv or run_id not in argv:
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
                 stopped.append(pid)
@@ -230,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--home", required=True, type=Path, help="MIMIR_HOME holding the retained record")
     parser.add_argument("--launcher", required=True, type=Path, help="path to the factory CLI entrypoint")
     parser.add_argument("--reason", required=True, help="diagnosis that makes resume a one-liner")
+    parser.add_argument(
+        "--controller-pid", required=True,
+        help=(
+            "pid of the 'mimir worklink run-epic <issue>' controller that owns this run, "
+            "or 'none' to assert it is already gone. The controller is stopped first: killing "
+            "the compute processes underneath a live one makes it race this park's own writes."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="report the plan and refuse to change anything")
     args = parser.parse_args(argv)
 
@@ -258,12 +374,64 @@ def main(argv: list[str] | None = None) -> int:
     if record is None:
         raise ParkError(f"no retained record for {args.run_id} under {args.home}")
 
+    # Identify the controller before anything is signalled, so a bad pid is a
+    # refusal rather than a half-completed park.
+    controller_pid: int | None = None
+    if args.controller_pid.strip().lower() == "none":
+        live = find_controllers(record.issue_id)
+        if live:
+            raise ParkError(
+                f"--controller-pid none asserts the controller is gone, but these processes "
+                f"still look like this run's controller: {live}. Pass the right pid."
+            )
+        print("controller : already gone (verified: no matching process)")
+    else:
+        try:
+            controller_pid = int(args.controller_pid)
+        except ValueError as exc:
+            raise ParkError("--controller-pid must be a pid or the word 'none'") from exc
+        argv = verify_controller(controller_pid, record.issue_id)
+        print(f"controller : pid {controller_pid} verified -> {argv[:120]}")
+
     if args.dry_run:
-        print("dry-run: would stop the supervisor then the driver, terminalize, publish, reconcile")
+        print(
+            "dry-run: would stop the controller, then the recorded driver, then any residual "
+            "supervisor/driver, then terminalize, publish and reconcile"
+        )
         return 0
 
-    stopped = stop_processes(args.run_id)
-    print(f"stopped    : {stopped or 'none found'}")
+    # The controller goes first and its death is verified. Until it is gone, any
+    # write this script makes to the retained record can be overwritten by the
+    # controller's failure path reacting to the driver's exit.
+    if controller_pid is not None:
+        stop_pid(controller_pid, "controller")
+        print(f"stopped    : controller pid {controller_pid}")
+
+    # The record's handle is the authoritative driver, not a ps pattern match.
+    if factory_process_is_alive(record):
+        handle_pid = record.handle.shim_pid if record.handle else None
+        if handle_pid is None and record.handle is not None:
+            try:
+                handle_pid = int(record.handle.identifier)
+            except ValueError:
+                handle_pid = None
+        if handle_pid is None:
+            raise ParkError("retained handle reports alive but names no pid; refusing to guess")
+        stop_pid(handle_pid, "recorded driver")
+        print(f"stopped    : recorded driver pid {handle_pid}")
+
+    residual = stop_residual_compute(args.run_id)
+    print(f"stopped    : residual {residual or 'none found'}")
+
+    # This is the predicate mimir's recovery path applies before it will resume.
+    # Asserting it here means a park that publishes is a park that can be resumed.
+    if not factory_process_is_verified_dead(record):
+        raise ParkError(
+            "cannot verify the recorded factory process is dead. mimir's recovery path requires "
+            "factory_process_is_verified_dead before it will resume, so publishing a park now "
+            "would produce a run that cannot be resumed through the supported path."
+        )
+    print("verified   : recorded process is dead (the predicate resume will re-check)")
 
     terminal = _run([
         "node", str(args.launcher), "terminal", args.run_id, TERMINAL_PARKED,
@@ -303,9 +471,26 @@ def main(argv: list[str] | None = None) -> int:
     print("reconciled : controller_phase=parked, observed status=needs-human")
 
     print()
+    # Re-read rather than trust the write: if anything still held this record,
+    # the operator needs to know now and not at resume time.
+    settled = load_factory_record(args.home, args.run_id)
+    if settled is None:
+        raise ParkError("retained record vanished immediately after reconcile")
+    if settled.controller_phase != "parked":
+        raise ParkError(
+            f"retained record reads controller_phase={settled.controller_phase!r} immediately "
+            "after reconcile: something else is still writing it. The park is not safe to rely on."
+        )
+    if settled.status is None or settled.status.status != TERMINAL_PARKED:
+        raise ParkError(
+            "retained record does not read needs-human after reconcile; resume would refuse it"
+        )
+    print("settled    : record re-read and still parked")
+
+    print()
     print("resume with:")
     print(f"  scripts/factory_resume.py --run-id {args.run_id} --sandbox {sandbox} \\")
-    print(f"      --home {args.home} --launcher {args.launcher} --session <NEW_SESSION_ID>")
+    print(f"      --home {args.home} --launcher {args.launcher} --repo <CONTROLLER_REPO>")
     return 0
 
 
