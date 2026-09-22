@@ -903,6 +903,99 @@ that has never had a base must be provisioned with this clone before startup;
 Worklink does not guess a checkout or clone destination on first use and fails
 closed when `WORKLINK_REPO` is absent.
 
+### Parking and resuming a factory run by hand
+
+The controller parks a run itself when its budget is nearly spent
+(`park_for_budget`), and that is the path to prefer. `scripts/factory_park.py`
+and `scripts/factory_resume.py` cover the case where an operator needs to park
+sooner — to preserve an approved spec, an approved decomposition and slice
+reviews that a budget kill would otherwise sweep. Resume recomputes the deadline
+from the monotonic clock on entry, so a resumed run gets a full budget again.
+
+```bash
+scripts/factory_park.py --run-id chainlink-1783 \
+    --sandbox  <checkout>/.factory-sandboxes/chainlink-1783 \
+    --home /mimir-home --launcher <factory.js> \
+    --controller-pid <PID> --reason "parked to preserve slice reviews"
+```
+
+Two constraints are not obvious and are enforced rather than documented alone:
+
+- **The controller is stopped first.** The controller's own park is race-free
+  because it cancels a handle it owns and never sees an unexpected exit. Killing
+  the supervisor or driver underneath a live controller gives it exactly that:
+  it runs its failure path, writes `failed` to the retained record, and races the
+  park's own reconcile. `--controller-pid` is required; pass `none` to assert the
+  controller is already gone, which is verified rather than assumed.
+- **The snapshot belongs to the checkout, not the sandbox.**
+  `observedParkSnapshot` derives the operator root as `dirname(dirname(repo))`,
+  so a published snapshot lives at `<checkout>/.factory/.parked/<run-id>`.
+  Publishing into the sandbox's own `.factory` produces a byte-correct snapshot
+  the factory never acknowledges, and `factory status` reports
+  `park_snapshot: null`.
+
+A park also releases the Chainlink claim the stopped controller held, records a
+forgiveness marker for it, and clears `worklink:in-progress`. It mirrors
+`release_owned_claims_for_shutdown`, including that path's ordering — forgiveness
+first, then the release, then the label — so a partial failure leaves the claim
+held but already credited rather than released and charged. It deliberately does
+*not* add `worklink:ready` the way the shutdown path does: a park is resumed by
+an explicit dispatch, and arming the issue here would auto-dispatch a parked epic.
+
+Whether the claim can be released and forgiven is decided *before* the park stops
+anything, and re-running the script on an already-parked run completes a
+reconciliation a previous run left undone rather than refusing. Both exist for
+the same reason: every claim-side refusal is unrecoverable once the run is
+terminalized, because the run is then parked with its claim still held and still
+charged, and a flat "already parked" refusal would stop anyone finishing the job.
+A park that starts is a park that can finish.
+
+The forgiveness marker is not bookkeeping. `claim_issue` charges an attempt for
+every successful claim and judges exhaustion from `attempts_used`, which
+discounts a claim only when a `ShutdownAbortRecord` matches it on
+`(issue_id, attempt, agent_id, claimed_at)`. Without one, park-then-resume spends
+two attempts on a single run, and a run parked on its **last** attempt comes back
+`attempts_exhausted` — parked and permanently unresumable. The attempt *ordinal*
+still advances, which is what keeps branch, checkout and evidence paths from
+colliding. Forgiveness is also bounded: `MAX_SHUTDOWN_ABORT_FORGIVENESS` is 2, so
+a run parked repeatedly eventually cannot be credited again, and the script
+refuses rather than publishing a park it knows resume will reject.
+
+Without the release the next dispatch is refused, by a
+path worth stating because it is indirect: the chainlink CLI treats a same-agent
+re-claim as idempotent success and prints "You already hold the lock" with rc=0,
+and `claim_issue` uses that exact string to decide whether to run its
+duplicate-liveness guard, which then finds the stopped controller's own heartbeat
+comment still fresh and returns `duplicate_run_live` for the whole
+`duplicate_freshness_s` window (600s by default). A released lock is claimed
+outright, so that branch is never entered. If the release fails the park still
+stands, and the script exits 3 naming the command to run.
+
+A park also reconciles mimir's retained record to `controller_phase=parked` with
+an observed `needs-human` status. That is not bookkeeping: `_attempt_is_active`
+reads mimir's last observed status rather than the factory plane, so a record
+left reading `running` behind a dead process is pruned by the next cleanup pass
+even while the factory itself reports a parked run.
+
+Resume is a preflight plus a dispatch, and deliberately does **not** call
+`factory resume`:
+
+```bash
+scripts/factory_resume.py --run-id chainlink-1783 \
+    --sandbox <checkout>/.factory-sandboxes/chainlink-1783 \
+    --home /mimir-home --launcher <factory.js> --repo <controller repo>
+```
+
+mimir's recovery path performs the whole transition as one operation — it
+requires the retained process to be verifiably dead, steals or claims the
+session lock using the *recorded* session, resumes, verifies the result is owned
+and running, validates the recovery binding, relaunches and enters supervision.
+Unparking from outside spends the `needs-human` transition that path is gated on,
+after which it refuses the run with `factory resume requires current status
+needs-human` and the attempt is lost. So the script reports which recovery
+preconditions hold, refuses with the specific one that does not, and then hands
+off to `mimir worklink run-epic <issue> --autonomous`.
+
 ### Leaf publication fence and manual reconciliation
 
 Leaf publication uses **coordination**, not GitHub-side idempotency: exclusive
