@@ -771,7 +771,7 @@ class TestParkToImmediateDispatch:
         assert result.attempts_exhausted is True
         assert result.reason == "attempts_exhausted"
 
-    def test_releasing_another_agents_claim_is_refused(self) -> None:
+    def test_releasing_another_agents_claim_is_refused(self, tmp_path: Path) -> None:
         """The ownership check that makes this safe to run by hand.
 
         It must refuse before writing anything: a forgiveness marker for someone
@@ -781,9 +781,39 @@ class TestParkToImmediateDispatch:
         run = _park_stub(calls, _claim_history(1, agent="someone-else"))
         with mock.patch.object(park, "_run", run):
             with pytest.raises(park.ParkError, match="held by 'someone-else'"):
-                park.release_claim_with_forgiveness("chainlink", 1783, AGENT)
+                park.release_claim_with_forgiveness("chainlink", 1783, AGENT, tmp_path)
         assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
         assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+
+    def test_object_shaped_comments_are_read_not_stringified(self, tmp_path: Path) -> None:
+        """`chainlink issue show --json` may return comments as objects.
+
+        A local parser that only handles the string form finds no claim records
+        on a real issue and refuses a valid park, claiming the claim does not
+        exist. This is why the script reads through `_issue_comments` rather than
+        stringifying whatever it is handed.
+        """
+        claim = _claim_history(1)[0]
+        calls: list[list[str]] = []
+
+        def run(cmd, **kwargs):
+            argv = list(cmd)
+            calls.append(argv)
+            if argv[1:4] == ["issue", "show", "1783"]:
+                # the object form, with the text under `content`
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"comments": [{"content": claim}]}), "",
+                )
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with mock.patch.object(park, "_run", run):
+            code, detail = park.release_claim_with_forgiveness(
+                "chainlink", 1783, AGENT, tmp_path,
+            )
+
+        assert code == 0
+        assert "forgiven" in detail
+        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
 
     def test_a_failed_release_is_reported_rather_than_silently_parked(
         self, tmp_path: Path, monkeypatch, capsys

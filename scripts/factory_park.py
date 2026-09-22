@@ -348,19 +348,31 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def issue_comments(chainlink_bin: str, issue_id: int) -> list[str]:
-    """Read an issue's comments, which is where claim history lives."""
-    result = _run([chainlink_bin, "issue", "show", str(issue_id), "--json"])
-    if result.returncode != 0:
-        raise ParkError(
-            f"could not read issue {issue_id}: {(result.stderr or result.stdout).strip()[:200]}"
-        )
+def claims_client(chainlink_bin: str, agent_id: str, home: Path) -> ChainlinkClaims:
+    """A claims client that shells through this script's own ``_run``."""
+    return ChainlinkClaims(
+        chainlink_bin=chainlink_bin,
+        agent_id=agent_id,
+        home_path=home,
+        runner=lambda argv: _run(list(argv)),
+    )
+
+
+def issue_comments(claims: ChainlinkClaims, issue_id: int) -> list[str]:
+    """Read an issue's comments through the reader the claim guard itself uses.
+
+    Deliberately not a local parser. ``chainlink issue show --json`` may return
+    comments as strings *or* as objects carrying the text under ``content``,
+    ``text`` or ``body``, and a parser that only handles the string form finds no
+    claim records on a real issue -- which here would mean refusing a valid park
+    because its claim "does not exist". Reusing ``_issue_comments`` means this
+    cannot disagree with the code whose decisions it is trying to anticipate;
+    ``strict=True`` turns a shape surprise into a loud failure.
+    """
     try:
-        payload = json.loads(result.stdout)
-    except ValueError as exc:
-        raise ParkError(f"issue {issue_id} did not return JSON: {exc}") from exc
-    comments = payload.get("comments") or []
-    return [str(comment) for comment in comments]
+        return claims._issue_comments(issue_id, strict=True)
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        raise ParkError(f"could not read the comments on issue {issue_id}: {exc}") from exc
 
 
 def latest_claim(comments: list[str], issue_id: int):
@@ -378,7 +390,7 @@ def latest_claim(comments: list[str], issue_id: int):
 
 
 def release_claim_with_forgiveness(
-    chainlink_bin: str, issue_id: int, agent_id: str,
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
 ) -> tuple[int, str]:
     """Release the parked run's claim without charging it an attempt.
 
@@ -401,7 +413,8 @@ def release_claim_with_forgiveness(
     the run is resumed by an explicit dispatch -- and arming it here would
     auto-dispatch a parked epic.
     """
-    comments = issue_comments(chainlink_bin, issue_id)
+    claims = claims_client(chainlink_bin, agent_id, home)
+    comments = issue_comments(claims, issue_id)
     claim = latest_claim(comments, issue_id)
     if claim is None:
         raise ParkError(
@@ -415,7 +428,6 @@ def release_claim_with_forgiveness(
             "pass --agent-id if this run really was claimed under a different identity."
         )
 
-    claims = ChainlinkClaims(chainlink_bin=chainlink_bin, agent_id=agent_id)
     before = claims.attempts_used(comments)
 
     abort = ShutdownAbortRecord(
@@ -626,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
     #     one run, and a run parked on its last attempt returns
     #     `attempts_exhausted` rather than resuming.
     code, detail = release_claim_with_forgiveness(
-        args.chainlink_bin, record.issue_id, args.agent_id,
+        args.chainlink_bin, record.issue_id, args.agent_id, args.home,
     )
     if code == 0:
         print(f"released   : claim on issue {record.issue_id} ({detail})")
