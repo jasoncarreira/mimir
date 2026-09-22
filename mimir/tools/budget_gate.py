@@ -76,6 +76,7 @@ from ..access_control import (
     get_trusted_service_from_auth_context,
     normalize_sink_destination,
     parse_service_shell_argv_with_diagnostics,
+    recovery_sink_token,
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
@@ -505,6 +506,8 @@ def _extract_sink_target(
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
     tool_name = _tool_name_from_request(request)
+    if tool_name.startswith("worklink_recovery_"):
+        return recovery_sink_token(tool_name, auth_context, args)
     if tool_name in {
         "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body",
         "pr_rerequest_review", "unsupported_operation", "repo_checkout",
@@ -2243,6 +2246,8 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
         expected_fields = _GIT_OPERATION_RESULT_FIELDS
     elif tool_name == "repo_test":
         expected_fields = _PROJECT_TEST_RESULT_FIELDS
+    elif tool_name.startswith("worklink_recovery_"):
+        expected_fields = frozenset({"ok"})
     if expected_fields is None:
         return False
     try:
@@ -2294,6 +2299,10 @@ def _tool_refusal_message(request: ToolCallRequest, tool_name: str, exc: ToolExc
 
 def _check_prohibited(tool_name: str, request: "ToolCallRequest") -> str | None:
     """Return a prohibition message if this bash call is prohibited, else None."""
+    if tool_name == "worklink_recovery_test":
+        # This operation runs only the server-owned repository test command;
+        # there is no model-authored shell argument for this guard to screen.
+        return None
     if not is_bash_tool(tool_name):
         return None
     tc = getattr(request, "tool_call", None) or {}

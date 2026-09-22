@@ -27,13 +27,14 @@ import logging
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields as dataclass_fields, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -71,6 +72,30 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _MAX_REQUESTED_TARGET_LENGTH = 1024
+
+WORKLINK_RECOVERY_OPERATIONS = frozenset({
+    "worklink_recovery_inspect",
+    "worklink_recovery_list",
+    "worklink_recovery_read",
+    "worklink_recovery_write",
+    "worklink_recovery_delete",
+    "worklink_recovery_test",
+    "worklink_recovery_commit",
+    "worklink_recovery_resume",
+})
+_WORKLINK_RECOVERY_SINK_OPERATIONS = frozenset({
+    "worklink_recovery_write",
+    "worklink_recovery_delete",
+    "worklink_recovery_test",
+    "worklink_recovery_commit",
+    "worklink_recovery_resume",
+})
+_WORKLINK_RECOVERY_READY_QUEUE = "poller:worklink-ready-queue"
+_WORKLINK_RECOVERY_POLLER = "worklink-ready-queue"
+_RECOVERY_SINK_TOKEN = re.compile(
+    r"recovery:(?P<selection>[0-9a-f]{64}):(?P<target>[0-9a-f]{64}):"
+    r"(?P<operation>[a-z_]+)(?::(?P<relative>[0-9a-f]{64}))?"
+)
 
 
 class AccessTier(StrEnum):
@@ -252,6 +277,11 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_revert": SinkCategory.FORGE,
     "repo_revert_abort": SinkCategory.FORGE,
     "repo_push": SinkCategory.FORGE,
+    "worklink_recovery_write": SinkCategory.FILE,
+    "worklink_recovery_delete": SinkCategory.FILE,
+    "worklink_recovery_test": SinkCategory.SHELL_PROCESS,
+    "worklink_recovery_commit": SinkCategory.FILE,
+    "worklink_recovery_resume": SinkCategory.SPAWN,
 }
 
 SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
@@ -382,6 +412,14 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "repo_revert": ToolFlowDirection.SINK,
     "repo_revert_abort": ToolFlowDirection.SINK,
     "repo_push": ToolFlowDirection.SINK,
+    "worklink_recovery_inspect": ToolFlowDirection.SOURCE,
+    "worklink_recovery_list": ToolFlowDirection.SOURCE,
+    "worklink_recovery_read": ToolFlowDirection.SOURCE,
+    "worklink_recovery_write": ToolFlowDirection.SINK,
+    "worklink_recovery_delete": ToolFlowDirection.SINK,
+    "worklink_recovery_test": ToolFlowDirection.BOTH,
+    "worklink_recovery_commit": ToolFlowDirection.SINK,
+    "worklink_recovery_resume": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -548,6 +586,14 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_revert": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_revert_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "worklink_recovery_inspect": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_list": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_read": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_write": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_delete": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_test": CapabilityTier.CODE_EXECUTION,
+    "worklink_recovery_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "worklink_recovery_resume": CapabilityTier.CODE_EXECUTION,
 }
 
 _CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
@@ -608,10 +654,12 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
+        *WORKLINK_RECOVERY_OPERATIONS,
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
         "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
+        *WORKLINK_RECOVERY_OPERATIONS,
     },
     "heartbeat": frozenset({
         "write_file", "edit_file", "shell_exec", "bash_async",
@@ -760,7 +808,11 @@ def build_trigger_service_principal(
         destination = _OPERATION_SINK_DESTINATION.get(operation)
         if destination:
             sink_destinations.add(destination)
-        if operation in {"write_file", "edit_file"}:
+        if operation in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+            policies.append(ServiceSinkPolicy(
+                operation, "retained_recovery_selection", operation,
+            ))
+        elif operation in {"write_file", "edit_file"}:
             policies.append(ServiceSinkPolicy(
                 operation,
                 "trigger_service_write_roots",
@@ -5387,6 +5439,851 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     return adapter is not None and adapter(normalized, policy.destination)
 
 
+def _recovery_selection_digest(selection: Any) -> str:
+    """Match the retained service's digest of the complete selected incident."""
+    values = {
+        item.name: getattr(selection, item.name)
+        for item in dataclass_fields(type(selection))
+        if item.name != "_attestation"
+    }
+    payload = json.dumps(
+        {"schema_version": 1, "selection": values},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recovery_journal_turn_matches(selection: Any, turn: Any, home: Path) -> bool:
+    """Reject a persisted selection replayed into a different ready-queue turn."""
+    selection_digest = _recovery_selection_digest(selection)
+    path = (
+        home / "state" / "worklink" / "recovery-operations" / "v1"
+        / "selections" / f"{selection_digest}.json"
+    )
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        record = _read_recovery_journal_record(
+            home,
+            ("selections", f"{selection_digest}.json"),
+            record_kind="selection",
+            keys=_RECOVERY_SELECTION_RECORD_KEYS,
+        )
+    except ValueError:
+        return False
+    binding = record.get("turn_binding")
+    expected = {
+        "channel_id": turn.channel_id,
+        "channel_source": turn.channel_source,
+        "event_source_id": turn.event_source_id,
+        "poller_name": turn.poller_name,
+        "service_principal": turn.service_principal,
+        "session_id": turn.session_id,
+        "trigger": turn.trigger,
+        "turn_id": turn.turn_id,
+    }
+    return bool(
+        record.get("selection_digest") == selection_digest
+        and isinstance(binding, dict)
+        and set(binding) == {"authority_digest", *expected}
+        and _valid_recovery_digest(binding.get("authority_digest"))
+        and all(binding.get(key) == value for key, value in expected.items())
+    )
+
+
+class RecoveryResourceAdapter:
+    """Authorize retained recovery only from the exact ready-queue turn."""
+
+    _OPERATIONS = WORKLINK_RECOVERY_OPERATIONS
+
+    @staticmethod
+    def _selection(
+        auth_context: "AuthContext | None",
+        arguments: Mapping[str, Any] | None,
+    ) -> Any | None:
+        from ._context import get_current_turn
+        from .models import AuthContext
+        from .worklink.dispatch_failures import dispatch_failure_state_dir
+        from .worklink.recovery_dispatch import (
+            RecoveryDispatchError,
+            validate_current_selection,
+        )
+
+        if not (
+            coding_enabled()
+            and isinstance(auth_context, AuthContext)
+            and auth_context.enforcement_enabled is True
+        ):
+            return None
+        service = get_trusted_service_from_auth_context(auth_context)
+        if not (
+            service is not None
+            and service.canonical == _WORKLINK_RECOVERY_READY_QUEUE
+            and service.trigger == "poller"
+            and service.authority_profile == "github"
+            and service.capability_tier is CapabilityTier.CODE_EXECUTION
+            and auth_context.trigger == "poller"
+            and auth_context.channel_id == _WORKLINK_RECOVERY_READY_QUEUE
+        ):
+            return None
+        turn = get_current_turn()
+        if not (
+            turn is not None
+            and getattr(turn, "auth_context", None) is auth_context
+            and getattr(turn, "access_control_enforced", None) is True
+            and getattr(turn, "trigger", None) == "poller"
+            and getattr(turn, "channel_id", None) == auth_context.channel_id
+            and getattr(turn, "channel_source", None) == "poller"
+            and getattr(turn, "service_principal", None) == service.canonical
+            and getattr(turn, "poller_name", None) == _WORKLINK_RECOVERY_POLLER
+            and isinstance(getattr(turn, "event_source_id", None), str)
+            and bool(turn.event_source_id)
+        ):
+            return None
+        handle = arguments.get("recovery_handle") if isinstance(arguments, Mapping) else None
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not isinstance(handle, str) or not handle or not home:
+            return None
+        try:
+            selection, _snapshot = validate_current_selection(
+                handle,
+                turn=turn,
+                state_dir=dispatch_failure_state_dir(Path(home)),
+            )
+        except (OSError, ValueError, RecoveryDispatchError):
+            return None
+        if not _recovery_journal_turn_matches(selection, turn, Path(home)):
+            return None
+        return selection
+
+    @classmethod
+    def active_turn(cls, auth_context: "AuthContext | None") -> bool:
+        """Return whether this exact carrier has any live selected recovery."""
+        from ._context import get_current_turn
+
+        turn = get_current_turn()
+        selections = getattr(turn, "recovery_selections", ()) if turn is not None else ()
+        return any(
+            cls._selection(auth_context, {"recovery_handle": selection.handle}) is selection
+            for selection in selections
+        )
+
+    @classmethod
+    def authorize_operation(
+        cls,
+        tool_name: str,
+        auth_context: "AuthContext | None",
+        arguments: Mapping[str, Any] | None,
+        *,
+        enforce: bool,
+    ) -> "ToolAuthorization":
+        selection = cls._selection(auth_context, arguments)
+        service = get_trusted_service_from_auth_context(auth_context)
+        admitted = (
+            tool_name in cls._OPERATIONS
+            and selection is not None
+            and service_can_invoke_operation(service, tool_name)
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=admitted,
+            reason=None if admitted else "recovery_service_required",
+            service_principal=service if admitted else None,
+            required_tier=AccessTier.USER if admitted else AccessTier.ADMIN,
+            enforcement_enabled=True,
+            would_block=not admitted,
+            flow_direction=get_tool_flow_direction(tool_name),
+        )
+
+
+def recovery_sink_token(
+    tool_name: str,
+    auth_context: "AuthContext | None",
+    arguments: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the server-only non-path destination for one recovery sink."""
+    if tool_name not in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+        return None
+    selection = RecoveryResourceAdapter._selection(auth_context, arguments)
+    if selection is None:
+        return None
+    handle = arguments.get("recovery_handle") if arguments is not None else None
+    if not isinstance(handle, str):
+        return None
+    try:
+        _selection, selection_record, _home = _current_recovery_selection_record(
+            auth_context, handle,
+        )
+    except ValueError:
+        return None
+    target_digest = selection_record["target_digest"]
+    token = (
+        f"recovery:{_recovery_selection_digest(selection)}:"
+        f"{target_digest}:{tool_name}"
+    )
+    if tool_name in {"worklink_recovery_write", "worklink_recovery_delete"}:
+        relative_path = arguments.get("relative_path") if arguments is not None else None
+        if not isinstance(relative_path, str) or not relative_path:
+            return None
+        token += ":" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+    return token
+
+
+def _target_matches_retained_recovery_selection(
+    target: str,
+    destination: str,
+    service: "ServicePrincipal | None" = None,
+    *,
+    auth_context: "AuthContext | None" = None,
+) -> bool:
+    """Validate a BudgetGate-issued token against the live selected incident."""
+    match = _RECOVERY_SINK_TOKEN.fullmatch(target)
+    if (
+        match is None
+        or destination not in _WORKLINK_RECOVERY_SINK_OPERATIONS
+        or match.group("operation") != destination
+        or service is None
+        or service != get_trusted_service_from_auth_context(auth_context)
+    ):
+        return False
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    for selection in getattr(turn, "recovery_selections", ()) if turn is not None else ():
+        try:
+            _current, selection_record, _home = _current_recovery_selection_record(
+                auth_context, selection.handle,
+            )
+        except ValueError:
+            continue
+        if (
+            match.group("selection") == _recovery_selection_digest(selection)
+            and match.group("target") == selection_record["target_digest"]
+            and RecoveryResourceAdapter._selection(
+                auth_context, {"recovery_handle": selection.handle},
+            ) is selection
+        ):
+            needs_relative = destination in {
+                "worklink_recovery_write", "worklink_recovery_delete",
+            }
+            return bool(match.group("relative")) is needs_relative
+    return False
+
+
+_RECOVERY_BOUNDARY_GRANT_ISSUER = object()
+
+_RECOVERY_SELECTION_RECORD_KEYS = frozenset({
+    "schema_version", "record_kind", "selection_digest", "selection", "incident",
+    "target_digest", "target", "turn_binding", "created_at",
+})
+_RECOVERY_ADMISSION_RECORD_KEYS = frozenset({
+    "schema_version", "record_kind", "target_digest", "selection_digest", "target_kind",
+    "leaf_hold_operation_id", "leaf_hold_request_digest", "leaf_hold_worker_digest",
+    "admission_operation_id", "admission_request_digest", "admission_worker_digest",
+    "admitted_root", "admitted_device", "admitted_inode", "operation_root",
+    "operation_device", "operation_inode", "phase", "created_at", "updated_at",
+})
+_RECOVERY_JOURNAL_MAX_BYTES = 64 * 1024
+
+
+def _read_recovery_journal_record(
+    home: Path,
+    relative: tuple[str, ...],
+    *,
+    record_kind: str,
+    keys: frozenset[str],
+) -> dict[str, Any]:
+    """Read one exact service journal record without following filesystem links."""
+    components = (
+        *home.absolute().parts[1:],
+        "state", "worklink", "recovery-operations", "v1",
+        *relative,
+    )
+    if any(
+        not component or component in {".", ".."} or "/" in component
+        for component in components
+    ):
+        raise ValueError("recovery journal path is invalid")
+    directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    protected = False
+    try:
+        for component in components[:-1]:
+            child_fd = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            value = os.fstat(child_fd)
+            if not stat.S_ISDIR(value.st_mode):
+                os.close(child_fd)
+                raise ValueError("recovery journal directory is invalid")
+            protected = protected or component == "recovery-operations"
+            if protected and stat.S_IMODE(value.st_mode) != 0o700:
+                os.close(child_fd)
+                raise ValueError("recovery journal directory mode is invalid")
+            os.close(directory_fd)
+            directory_fd = child_fd
+        file_fd = os.open(
+            components[-1],
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            value = os.fstat(file_fd)
+            if (
+                not stat.S_ISREG(value.st_mode)
+                or value.st_nlink != 1
+                or stat.S_IMODE(value.st_mode) != 0o600
+                or value.st_size > _RECOVERY_JOURNAL_MAX_BYTES
+            ):
+                raise ValueError("recovery journal record is invalid")
+            raw = os.read(file_fd, _RECOVERY_JOURNAL_MAX_BYTES + 1)
+        finally:
+            os.close(file_fd)
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("recovery journal record is unavailable") from exc
+    finally:
+        os.close(directory_fd)
+    if len(raw) > _RECOVERY_JOURNAL_MAX_BYTES or b"\0" in raw:
+        raise ValueError("recovery journal record is invalid")
+    try:
+        record = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("recovery journal record is malformed") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record) != keys
+        or record.get("schema_version") != 1
+        or record.get("record_kind") != record_kind
+    ):
+        raise ValueError("recovery journal record is malformed")
+    return record
+
+
+def _valid_recovery_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _recovery_target_digest_from_record(target: object) -> str:
+    if (
+        not isinstance(target, dict)
+        or set(target) != {
+            "compatibility_code", "controllable", "factory", "leaf",
+            "repository", "target_kind",
+        }
+        or target.get("target_kind") not in {"leaf", "factory"}
+    ):
+        raise ValueError("recovery target record is invalid")
+    target_kind = str(target["target_kind"])
+    identity = target.get(target_kind)
+    repository = target.get("repository")
+    if not isinstance(identity, dict) or not isinstance(repository, dict):
+        raise ValueError("recovery target record is invalid")
+    core = dict(target)
+    core[target_kind] = {
+        key: value for key, value in identity.items()
+        if key not in {"head", "tree"}
+    }
+    payload = json.dumps(
+        {"schema_version": 1, "target": core},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _directory_matches_identity(path: str, device: int, inode: int) -> bool:
+    try:
+        candidate = Path(path)
+        value = candidate.stat(follow_symlinks=False)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        candidate.is_absolute()
+        and not candidate.is_symlink()
+        and stat.S_ISDIR(value.st_mode)
+        and (value.st_dev, value.st_ino) == (device, inode)
+    )
+
+
+def _current_recovery_selection_record(
+    auth_context: "AuthContext | None",
+    recovery_handle: str,
+) -> tuple[Any, dict[str, Any], Path]:
+    selection = RecoveryResourceAdapter._selection(
+        auth_context, {"recovery_handle": recovery_handle},
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if selection is None or service is None or not home_value:
+        raise ValueError("recovery boundary is not current")
+    home = Path(home_value)
+    selection_digest = _recovery_selection_digest(selection)
+    selection_record = _read_recovery_journal_record(
+        home,
+        ("selections", f"{selection_digest}.json"),
+        record_kind="selection",
+        keys=_RECOVERY_SELECTION_RECORD_KEYS,
+    )
+    expected_selection = {
+        item.name: getattr(selection, item.name)
+        for item in dataclass_fields(type(selection))
+        if item.name != "_attestation"
+    }
+    from .worklink.dispatch_failures import current_failure_snapshot, dispatch_failure_state_dir
+
+    incident = current_failure_snapshot(
+        dispatch_failure_state_dir(home), selection.issue_id,
+    )
+    expected_incident = (
+        {
+            "attempt": incident.attempt,
+            "error_signature": incident.signature,
+            "failure_occurrence_id": incident.occurrence_id,
+            "issue_id": incident.issue_id,
+            "ledger_digest": incident.ledger_digest,
+            "target_kind": incident.target_kind,
+        }
+        if incident is not None
+        else None
+    )
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    expected_turn_binding = (
+        {
+            "channel_id": turn.channel_id,
+            "channel_source": turn.channel_source,
+            "event_source_id": turn.event_source_id,
+            "poller_name": turn.poller_name,
+            "service_principal": turn.service_principal,
+            "session_id": turn.session_id,
+            "trigger": turn.trigger,
+            "turn_id": turn.turn_id,
+        }
+        if turn is not None
+        else None
+    )
+    recorded_turn_binding = selection_record.get("turn_binding")
+    turn_binding_matches = bool(
+        isinstance(recorded_turn_binding, dict)
+        and set(recorded_turn_binding) == {
+            "authority_digest", "channel_id", "channel_source", "event_source_id",
+            "poller_name", "service_principal", "session_id", "trigger", "turn_id",
+        }
+        and _valid_recovery_digest(recorded_turn_binding.get("authority_digest"))
+        and all(
+            recorded_turn_binding.get(key) == value
+            for key, value in (expected_turn_binding or {}).items()
+        )
+    )
+    target_digest = selection_record.get("target_digest")
+    if (
+        selection_record.get("selection_digest") != selection_digest
+        or selection_record.get("selection") != expected_selection
+        or selection_record.get("incident") != expected_incident
+        or not turn_binding_matches
+        or not _valid_recovery_digest(target_digest)
+        or _recovery_target_digest_from_record(selection_record.get("target"))
+        != target_digest
+    ):
+        raise ValueError("recovery selection journal does not match current state")
+    return selection, selection_record, home
+
+
+def _current_recovery_boundary(
+    auth_context: "AuthContext | None",
+    recovery_handle: str,
+) -> tuple[Any, dict[str, Any], dict[str, Any], Path]:
+    selection, selection_record, home = _current_recovery_selection_record(
+        auth_context, recovery_handle,
+    )
+    selection_digest = _recovery_selection_digest(selection)
+    target_digest = selection_record["target_digest"]
+    admission = _read_recovery_journal_record(
+        home,
+        ("targets", str(target_digest), "admission.json"),
+        record_kind="admission",
+        keys=_RECOVERY_ADMISSION_RECORD_KEYS,
+    )
+    if (
+        admission.get("phase") != "admitted"
+        or admission.get("selection_digest") != selection_digest
+        or admission.get("target_digest") != target_digest
+        or admission.get("target_kind")
+        != selection_record["target"].get("target_kind")
+    ):
+        raise ValueError("recovery checkout admission is not current")
+    return selection, selection_record, admission, home
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RecoveryBoundaryGrant:
+    """Immutable proof that the dedicated retained-checkout boundary is live."""
+
+    selection_digest: str
+    target_digest: str
+    admitted_root: str
+    admitted_device: int
+    admitted_inode: int
+    operation_root: str
+    operation_device: int
+    operation_inode: int
+    repository_slug: str
+    issue_id: int
+    attempt: int
+    target_kind: str
+    branch: str
+    compatibility_code: str
+    controllable: bool
+    selection_record_digest: str
+    admission_record_digest: str
+    service_principal: str
+    home: str
+    _issuer: object = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        _issuer: object,
+        selection_digest: str,
+        target_digest: str,
+        admitted_root: str,
+        admitted_device: int,
+        admitted_inode: int,
+        operation_root: str,
+        operation_device: int,
+        operation_inode: int,
+        repository_slug: str,
+        issue_id: int,
+        attempt: int,
+        target_kind: str,
+        branch: str,
+        compatibility_code: str,
+        controllable: bool,
+        selection_record_digest: str,
+        admission_record_digest: str,
+        service_principal: str,
+        home: str,
+    ) -> None:
+        if _issuer is not _RECOVERY_BOUNDARY_GRANT_ISSUER:
+            raise TypeError("recovery boundary grants must be minted by access control")
+        for name, value in locals().copy().items():
+            if name not in {"self", "_issuer"}:
+                object.__setattr__(self, name, value)
+        object.__setattr__(self, "_issuer", _issuer)
+
+
+def issue_recovery_boundary_grant(
+    auth_context: "AuthContext | None",
+    *,
+    recovery_handle: str,
+) -> RecoveryBoundaryGrant:
+    """Mint trust from the exact current binding and durable admission journal."""
+    selection, selection_record, admission, home = _current_recovery_boundary(
+        auth_context, recovery_handle,
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    assert service is not None
+    target_digest = str(selection_record["target_digest"])
+    target = selection_record["target"]
+    repository_record = target.get("repository")
+    if not isinstance(repository_record, dict):
+        raise ValueError("recovery repository binding is invalid")
+    repository_slug = repository_record.get("slug")
+    repository_root = repository_record.get("root")
+    repository_origin = repository_record.get("origin")
+    repository_device = repository_record.get("device")
+    repository_inode = repository_record.get("inode")
+    authorization_roots = repository_record.get("authorization_roots")
+    if (
+        not isinstance(repository_slug, str)
+        or not isinstance(repository_root, str)
+        or not isinstance(repository_origin, str)
+        or type(repository_device) is not int
+        or type(repository_inode) is not int
+        or not isinstance(authorization_roots, list)
+        or not all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, str) for value in item)
+            for item in authorization_roots
+        )
+    ):
+        raise ValueError("recovery repository binding is invalid")
+    from .repository_config import RepositoryInventory
+
+    inventory = RepositoryInventory.load(home / "repositories.yaml")
+    repository = inventory.coding_target(
+        repository_slug,
+        authorized_roots=tuple(tuple(item) for item in authorization_roots),
+    )
+    if (
+        inventory.root_mode_map() != dict(tuple(item) for item in authorization_roots)
+        or repository.root != Path(repository_root).resolve()
+        or repository.origin != repository_origin
+        or repository.base_branch != repository_record.get("base_branch")
+        or repository.mode != repository_record.get("mode")
+        or not _directory_matches_identity(
+            repository_root, repository_device, repository_inode,
+        )
+    ):
+        raise ValueError("recovery repository binding does not match inventory")
+    admitted_root = admission.get("admitted_root")
+    operation_root = admission.get("operation_root")
+    admitted_device = admission.get("admitted_device")
+    admitted_inode = admission.get("admitted_inode")
+    operation_device = admission.get("operation_device")
+    operation_inode = admission.get("operation_inode")
+    if not (
+        isinstance(admitted_root, str)
+        and isinstance(operation_root, str)
+        and type(admitted_device) is int
+        and type(admitted_inode) is int
+        and type(operation_device) is int
+        and type(operation_inode) is int
+        and _directory_matches_identity(admitted_root, admitted_device, admitted_inode)
+        and _directory_matches_identity(operation_root, operation_device, operation_inode)
+    ):
+        raise ValueError("recovery checkout identity changed")
+    target_kind = target.get("target_kind")
+    identity = target.get(str(target_kind))
+    issue_id = identity.get("issue_id") if isinstance(identity, dict) else None
+    attempt = identity.get("attempt") if isinstance(identity, dict) else None
+    branch = identity.get("branch") if isinstance(identity, dict) else None
+    compatibility_code = target.get("compatibility_code")
+    controllable = target.get("controllable")
+    expected_operation_root = (
+        identity.get("checkout") if target_kind == "leaf" and isinstance(identity, dict)
+        else identity.get("sandbox") if target_kind == "factory" and isinstance(identity, dict)
+        else None
+    )
+    if (
+        not isinstance(expected_operation_root, str)
+        or type(issue_id) is not int
+        or type(attempt) is not int
+        or not isinstance(branch, str)
+        or not isinstance(compatibility_code, str)
+        or type(controllable) is not bool
+        or issue_id != selection.issue_id
+        or identity.get("admitted_root") != admitted_root
+        or identity.get("admitted_device") != admitted_device
+        or identity.get("admitted_inode") != admitted_inode
+        or identity.get("operation_root") != operation_root
+        or identity.get("operation_device") != operation_device
+        or identity.get("operation_inode") != operation_inode
+        or Path(operation_root) != Path(expected_operation_root)
+        or (
+            target_kind == "leaf"
+            and Path(admitted_root) != Path(operation_root)
+        )
+        or (
+            target_kind == "factory"
+            and Path(admitted_root) != Path(operation_root)
+            and Path(operation_root)
+            != Path(admitted_root) / ".factory-sandboxes" / str(identity.get("run_id"))
+        )
+    ):
+        raise ValueError("recovery checkout does not match selected target")
+    for operation in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+        policy = service.sink_policy_for(operation)
+        if policy != ServiceSinkPolicy(
+            operation, "retained_recovery_selection", operation,
+        ):
+            raise ValueError("dedicated recovery sink policy is incomplete")
+    return RecoveryBoundaryGrant(
+        _issuer=_RECOVERY_BOUNDARY_GRANT_ISSUER,
+        selection_digest=_recovery_selection_digest(selection),
+        target_digest=target_digest,
+        admitted_root=admitted_root,
+        admitted_device=admitted_device,
+        admitted_inode=admitted_inode,
+        operation_root=operation_root,
+        operation_device=operation_device,
+        operation_inode=operation_inode,
+        repository_slug=repository.slug,
+        issue_id=issue_id,
+        attempt=attempt,
+        target_kind=str(target_kind),
+        branch=branch,
+        compatibility_code=compatibility_code,
+        controllable=controllable,
+        selection_record_digest=hashlib.sha256(
+            json.dumps(
+                selection_record, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        admission_record_digest=hashlib.sha256(
+            json.dumps(
+                admission, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        service_principal=service.canonical,
+        home=str(home.absolute()),
+    )
+
+
+def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
+    from ._context import get_current_turn
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    turn = get_current_turn()
+    service = get_trusted_service_from_auth_context(
+        getattr(turn, "auth_context", None),
+    )
+    current_selection = next(
+        (
+            selection
+            for selection in (getattr(turn, "recovery_selections", ()) or ())
+            if _recovery_selection_digest(selection) == grant.selection_digest
+        ),
+        None,
+    ) if turn is not None else None
+    if not (
+        isinstance(grant, RecoveryBoundaryGrant)
+        and grant._issuer is _RECOVERY_BOUNDARY_GRANT_ISSUER
+        and home_value
+        and str(Path(home_value).absolute()) == grant.home
+        and turn is not None
+        and service is not None
+        and service.canonical == grant.service_principal
+        and current_selection is not None
+        and RecoveryResourceAdapter._selection(
+            turn.auth_context,
+            {"recovery_handle": current_selection.handle},
+        ) is current_selection
+        and all(
+            service.sink_policy_for(operation) == ServiceSinkPolicy(
+                operation, "retained_recovery_selection", operation,
+            )
+            for operation in _WORKLINK_RECOVERY_SINK_OPERATIONS
+        )
+        and _directory_matches_identity(
+            grant.admitted_root, grant.admitted_device, grant.admitted_inode,
+        )
+        and _directory_matches_identity(
+            grant.operation_root, grant.operation_device, grant.operation_inode,
+        )
+    ):
+        raise ValueError("recovery boundary grant is stale")
+    selection_record = _read_recovery_journal_record(
+        Path(grant.home),
+        ("selections", f"{grant.selection_digest}.json"),
+        record_kind="selection",
+        keys=_RECOVERY_SELECTION_RECORD_KEYS,
+    )
+    admission = _read_recovery_journal_record(
+        Path(grant.home),
+        ("targets", grant.target_digest, "admission.json"),
+        record_kind="admission",
+        keys=_RECOVERY_ADMISSION_RECORD_KEYS,
+    )
+    target = selection_record.get("target")
+    target_kind = target.get("target_kind") if isinstance(target, dict) else None
+    identity = target.get(target_kind) if isinstance(target_kind, str) else None
+    repository_record = target.get("repository") if isinstance(target, dict) else None
+    if not isinstance(identity, dict) or not isinstance(repository_record, dict):
+        raise ValueError("recovery boundary grant no longer matches admission")
+    authorization_roots = repository_record.get("authorization_roots")
+    if not (
+        isinstance(authorization_roots, list)
+        and all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, str) for value in item)
+            for item in authorization_roots
+        )
+    ):
+        raise ValueError("recovery boundary grant no longer matches admission")
+    from .repository_config import RepositoryInventory
+
+    try:
+        inventory = RepositoryInventory.load(Path(grant.home) / "repositories.yaml")
+        repository = inventory.coding_target(
+            grant.repository_slug,
+            authorized_roots=tuple(tuple(item) for item in authorization_roots),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("recovery boundary grant repository is stale") from exc
+    if (
+        selection_record.get("selection_digest") != grant.selection_digest
+        or selection_record.get("target_digest") != grant.target_digest
+        or _recovery_target_digest_from_record(selection_record.get("target"))
+        != grant.target_digest
+        or hashlib.sha256(
+            json.dumps(
+                selection_record, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest() != grant.selection_record_digest
+        or admission.get("selection_digest") != grant.selection_digest
+        or admission.get("target_digest") != grant.target_digest
+        or admission.get("target_kind") != grant.target_kind
+        or admission.get("phase") != "admitted"
+        or admission.get("admitted_root") != grant.admitted_root
+        or admission.get("admitted_device") != grant.admitted_device
+        or admission.get("admitted_inode") != grant.admitted_inode
+        or admission.get("operation_root") != grant.operation_root
+        or admission.get("operation_device") != grant.operation_device
+        or admission.get("operation_inode") != grant.operation_inode
+        or target_kind != grant.target_kind
+        or identity.get("issue_id") != grant.issue_id
+        or identity.get("attempt") != grant.attempt
+        or identity.get("branch") != grant.branch
+        or identity.get("admitted_root") != grant.admitted_root
+        or identity.get("admitted_device") != grant.admitted_device
+        or identity.get("admitted_inode") != grant.admitted_inode
+        or identity.get("operation_root") != grant.operation_root
+        or identity.get("operation_device") != grant.operation_device
+        or identity.get("operation_inode") != grant.operation_inode
+        or target.get("compatibility_code") != grant.compatibility_code
+        or target.get("controllable") != grant.controllable
+        or repository_record.get("slug") != grant.repository_slug
+        or repository.root != Path(str(repository_record.get("root"))).resolve()
+        or repository.origin != repository_record.get("origin")
+        or repository.base_branch != repository_record.get("base_branch")
+        or repository.mode != repository_record.get("mode")
+        or inventory.root_mode_map()
+        != dict(tuple(item) for item in authorization_roots)
+        or not _directory_matches_identity(
+            str(repository_record.get("root")),
+            repository_record.get("device"),
+            repository_record.get("inode"),
+        )
+        or hashlib.sha256(
+            json.dumps(
+                admission, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest() != grant.admission_record_digest
+    ):
+        raise ValueError("recovery boundary grant no longer matches admission")
+
+
+def _trusted_recovery_source(
+    grant: RecoveryBoundaryGrant,
+    *,
+    domain: str,
+    resource_id: str,
+) -> "SourceLabel":
+    principal = f"service:{grant.service_principal}"
+    return replace(
+        protected_result_source(
+            None,
+            principal=principal,
+            domain=domain,
+            resource_id=resource_id,
+            bridge_instance="worklink_recovery",
+        ),
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+
+
 def _sink_adapter_admits(
     adapter: Any,
     target: str,
@@ -5418,6 +6315,10 @@ def _sink_adapter_admits(
             service == get_trusted_service_from_auth_context(auth_context)
             and adapter(target, destination, auth_context=auth_context)
         )
+    if adapter is _target_matches_retained_recovery_selection:
+        return adapter(
+            target, destination, service, auth_context=auth_context,
+        )
     if adapter is _target_matches_shell_profile:
         # Authorization validates the argv shape only. Filesystem operands are
         # resolved once by the execution binder after it has the authoritative
@@ -5443,6 +6344,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
     "github_pr_api": _target_matches_github_pr_api,
+    "retained_recovery_selection": _target_matches_retained_recovery_selection,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -6064,7 +6966,10 @@ class SinkGate:
                     None,
                 )
             return (
-                tool_name == "worklink_run"
+                tool_name in {
+                    "worklink_run", "worklink_recovery_test",
+                    "worklink_recovery_resume",
+                }
                 and not has_untrusted_active_ingest,
                 None,
             )
@@ -6279,6 +7184,24 @@ class SinkGate:
             auth_context, ifc_labels,
             missing_is_tainted=tool_name in {"shell_exec", "bash_async"},
         )
+        if (
+            tool_name in _WORKLINK_RECOVERY_SINK_OPERATIONS
+            and sink_category in {
+                SinkCategory.FILE, SinkCategory.SHELL_PROCESS, SinkCategory.SPAWN,
+            }
+            and has_untrusted_active_ingest
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=False,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
         client_authorized = False
         if client_authorized_host_execution is not None:
             from .tools.client_provider import client_authorized_host_execution_matches
@@ -6942,7 +7865,34 @@ class SinkGate:
             ):
                 return frozenset({target})
             return frozenset()
+        recovery_domains = {
+            "worklink_recovery",
+            *(
+                _PROTECTED_RESULT_DOMAINS[operation]
+                for operation in WORKLINK_RECOVERY_OPERATIONS
+            ),
+        }
+        if (
+            service is not None
+            and service.canonical == _WORKLINK_RECOVERY_READY_QUEUE
+            and service_policy is not None
+            and target is not None
+            and category is SinkCategory.SHELL_PROCESS
+            and RecoveryResourceAdapter.active_turn(auth_context)
+            and isinstance(sources, tuple)
+            and bool(sources)
+            and all(
+                source.principal == f"service:{service.canonical}"
+                and source.domain in recovery_domains
+                and source.integrity == "trusted"
+                and source.integrity_effect == "informational"
+                for source in sources
+            )
+        ):
+            return frozenset({target})
         if service is not None and service_policy is not None and target is not None:
+            if tool_name in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+                return frozenset({target})
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
             if (
@@ -7021,6 +7971,11 @@ def normalize_sink_destination(
     value = destination.strip()
     if not value or "\x00" in value:
         return None
+    if (
+        category in {SinkCategory.FILE, SinkCategory.SHELL_PROCESS, SinkCategory.SPAWN}
+        and _RECOVERY_SINK_TOKEN.fullmatch(value) is not None
+    ):
+        return value
     if category in {SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}:
         return ChannelResourceAdapter._resolve_channel(value) or None
     if category in {SinkCategory.FILE, SinkCategory.SPAWN}:
@@ -7054,6 +8009,8 @@ def resolve_sink_target(
     service: ServicePrincipal | None,
 ) -> str | None:
     """Return the concrete destination representation evaluated by the gate."""
+    if _RECOVERY_SINK_TOKEN.fullmatch(target) is not None:
+        return normalize_sink_destination(sink_category, target)
     if sink_category is not SinkCategory.SHELL_PROCESS:
         return normalize_sink_destination(sink_category, target)
     try:
@@ -7669,6 +8626,7 @@ class OperationCatalog:
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
         | frozenset({"hands_read"})
+        | WORKLINK_RECOVERY_OPERATIONS
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -8633,6 +9591,59 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in WORKLINK_RECOVERY_OPERATIONS:
+            recovery_auth = RecoveryResourceAdapter.authorize_operation(
+                tool_name, auth_context, arguments, enforce=enforce,
+            )
+            if not recovery_auth.allowed:
+                return finish(recovery_auth)
+            flow_direction = get_tool_flow_direction(tool_name)
+            if flow_direction in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+                expected_target = recovery_sink_token(
+                    tool_name, auth_context, arguments,
+                )
+                if sink_target != expected_target:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name,
+                        decision=OperationDecision.RESOURCE_SCOPED,
+                        allowed=False,
+                        reason="service_sink_destination_denied",
+                        service_principal=service,
+                        required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=True,
+                        would_block=True,
+                        flow_direction=flow_direction,
+                    ))
+                if ifc_labels is None and auth_context is not None:
+                    ifc_labels = getattr(auth_context, "ifc_labels", None)
+                sink_category = get_sink_category(tool_name)
+                sink_check = SinkGate.check_sink_flow(
+                    tool_name,
+                    sink_target,
+                    ifc_labels,
+                    auth_context,
+                    enforce=True,
+                )
+                sink_check.flow_direction = flow_direction
+                if not sink_check.allowed:
+                    return finish(sink_check)
+                recovery_auth.resolved_sink_target = sink_check.resolved_sink_target
+            return finish(recovery_auth)
+        if (
+            tool_name in {"write_file", "edit_file", "worklink_run"}
+            and RecoveryResourceAdapter.active_turn(auth_context)
+        ):
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=get_operation_catalog().get_decision(tool_name, auth_context),
+                allowed=False,
+                reason="active_recovery_dedicated_tools_required",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=True,
+                flow_direction=get_tool_flow_direction(tool_name),
+            ))
         if (
             service is not None
             and service.authority_profile == "session-boundary"
@@ -9260,6 +10271,14 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_revert": "repository",
     "repo_revert_abort": "repository",
     "repo_push": "repository",
+    "worklink_recovery_inspect": "worklink_recovery_state",
+    "worklink_recovery_list": "worklink_recovery_checkout",
+    "worklink_recovery_read": "worklink_recovery_checkout",
+    "worklink_recovery_write": "worklink_recovery_control",
+    "worklink_recovery_delete": "worklink_recovery_control",
+    "worklink_recovery_test": "worklink_recovery_test",
+    "worklink_recovery_commit": "worklink_recovery_control",
+    "worklink_recovery_resume": "worklink_recovery_control",
 }
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
@@ -9361,6 +10380,10 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_diff",
     "repo_unmerged",
     "hands_read",
+    "worklink_recovery_inspect",
+    "worklink_recovery_list",
+    "worklink_recovery_read",
+    "worklink_recovery_test",
 })
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
@@ -9380,6 +10403,38 @@ class ProtectedResultProvenance:
     """Non-model-visible provenance for the exact resources a native read returned."""
 
     sources: tuple["SourceLabel", ...]
+    recovery_publication: "RecoveryResultPublication | None" = None
+
+
+_RECOVERY_RESULT_PUBLICATION_ISSUER = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RecoveryResultPublication:
+    """Unforgeable capture metadata binding one result to its boundary grant."""
+
+    grant: RecoveryBoundaryGrant
+    operation: str
+    result_digest: str
+    sources: tuple["SourceLabel", ...]
+    _issuer: object = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        _issuer: object,
+        grant: RecoveryBoundaryGrant,
+        operation: str,
+        result_digest: str,
+        sources: tuple["SourceLabel", ...],
+    ) -> None:
+        if _issuer is not _RECOVERY_RESULT_PUBLICATION_ISSUER:
+            raise TypeError("recovery result publications must be minted by access control")
+        object.__setattr__(self, "grant", grant)
+        object.__setattr__(self, "operation", operation)
+        object.__setattr__(self, "result_digest", result_digest)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "_issuer", _issuer)
 
 
 @dataclass
@@ -9388,6 +10443,7 @@ class _ProtectedResultCapture:
 
     sources: list["SourceLabel"] = field(default_factory=list)
     seen: set["SourceLabel"] = field(default_factory=set)
+    recovery_publication: RecoveryResultPublication | None = None
     published: bool = False
     invalid: bool = False
     closed: bool = False
@@ -9429,6 +10485,304 @@ def publish_protected_result(sources: tuple["SourceLabel", ...]) -> None:
     _protected_result_provenance.set(ProtectedResultProvenance(sources))
 
 
+_RECOVERY_RESULT_KEYS: dict[str, frozenset[str]] = {
+    "worklink_recovery_inspect": frozenset({
+        "ok", "code", "selection_digest", "target_digest", "issue_id",
+        "attempt", "target_kind", "repository", "branch", "controllable",
+    }),
+    "worklink_recovery_list": frozenset({"ok", "code", "files", "target_digest"}),
+    "worklink_recovery_read": frozenset({"ok", "code", "read", "target_digest"}),
+    "worklink_recovery_write": frozenset({
+        "ok", "code", "operation_id", "request_digest", "outcome",
+        "relative_path", "sha256",
+    }),
+    "worklink_recovery_delete": frozenset({
+        "ok", "code", "operation_id", "request_digest", "outcome",
+        "relative_path", "sha256",
+    }),
+    "worklink_recovery_test": frozenset({
+        "ok", "code", "operation_id", "request_digest", "test_key",
+        "exit_code", "stdout", "stderr", "replayed",
+    }),
+    "worklink_recovery_commit": frozenset({
+        "ok", "code", "operation_id", "request_digest", "commit", "tree", "outcome",
+    }),
+    "worklink_recovery_resume": frozenset({
+        "ok", "code", "operation_id", "request_digest", "outcome", "incident_retired",
+    }),
+}
+_RECOVERY_READ_KEYS = frozenset({
+    "relative_path", "content", "sha256", "size", "offset", "complete",
+})
+_RECOVERY_RESUME_OUTCOMES = frozenset({
+    "applied", "already_applied", "stale_or_replaced", "failed", "ambiguous",
+    "occurrence_conflict",
+})
+
+
+def _recovery_result_mapping(result: Any) -> dict[str, Any] | None:
+    from langchain_core.messages import ToolMessage
+
+    value = getattr(result, "content", None) if isinstance(result, ToolMessage) else result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, Mapping):
+        return None
+    mapping = dict(value)
+    try:
+        json.dumps(mapping, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    return mapping
+
+
+def _valid_recovery_operation_identity(result: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(result.get("operation_id"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            result["operation_id"],
+        ) is not None
+        and _valid_recovery_digest(result.get("request_digest"))
+    )
+
+
+def _validated_recovery_relative_path(
+    root: str,
+    value: object,
+    *,
+    must_exist: bool,
+) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or any(
+        part in {"", ".", "..", ".git"} for part in relative.parts
+    ):
+        return None
+    try:
+        resolved_root = Path(root).resolve(strict=True)
+        resolved = (resolved_root / relative).resolve(strict=must_exist)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved.is_relative_to(resolved_root):
+        return None
+    if must_exist and not resolved.is_file():
+        return None
+    return resolved
+
+
+def _validated_recovery_result(
+    grant: RecoveryBoundaryGrant,
+    operation: str,
+    result: Any,
+) -> tuple[dict[str, Any], str, tuple[str, ...]] | None:
+    value = _recovery_result_mapping(result)
+    expected_keys = _RECOVERY_RESULT_KEYS.get(operation)
+    if value is None or expected_keys is None or set(value) != expected_keys:
+        return None
+    if type(value.get("ok")) is not bool or not isinstance(value.get("code"), str):
+        return None
+    domain = _PROTECTED_RESULT_DOMAINS[operation]
+    resources: tuple[str, ...]
+    if operation == "worklink_recovery_inspect":
+        if not (
+            value["ok"] is True
+            and value["code"] in {"ok", "current", "legacy_leaf_uncontrollable"}
+            and value.get("selection_digest") == grant.selection_digest
+            and value.get("target_digest") == grant.target_digest
+            and value.get("repository") == grant.repository_slug
+            and value.get("issue_id") == grant.issue_id
+            and value.get("attempt") == grant.attempt
+            and value.get("target_kind") == grant.target_kind
+            and value.get("branch") == grant.branch
+            and value.get("controllable") is grant.controllable
+            and value.get("code") == grant.compatibility_code
+        ):
+            return None
+        resources = (
+            str(
+                Path(grant.home) / "state" / "pollers"
+                / _WORKLINK_RECOVERY_POLLER / "dispatch_failures.json"
+            ),
+            str(
+                Path(grant.home) / "state" / "worklink" / "recovery-operations"
+                / "v1" / "selections" / f"{grant.selection_digest}.json"
+            ),
+        )
+    elif operation == "worklink_recovery_list":
+        files = value.get("files")
+        if not (
+            value["ok"] is True
+            and value["code"] == "ok"
+            and value.get("target_digest") == grant.target_digest
+            and isinstance(files, list)
+            and all(isinstance(item, str) and item for item in files)
+            and files == sorted(set(files))
+        ):
+            return None
+        if any(
+            _validated_recovery_relative_path(
+                grant.operation_root, item, must_exist=True,
+            ) is None
+            for item in files
+        ):
+            return None
+        resources = (grant.operation_root,) if files else ()
+    elif operation == "worklink_recovery_read":
+        read = value.get("read")
+        if not (
+            value["ok"] is True
+            and value["code"] == "ok"
+            and value.get("target_digest") == grant.target_digest
+            and isinstance(read, dict)
+            and set(read) == _RECOVERY_READ_KEYS
+            and isinstance(read.get("relative_path"), str)
+            and isinstance(read.get("content"), str)
+            and _valid_recovery_digest(read.get("sha256"))
+            and type(read.get("size")) is int
+            and type(read.get("offset")) is int
+            and type(read.get("complete")) is bool
+        ):
+            return None
+        resolved = _validated_recovery_relative_path(
+            grant.operation_root, read["relative_path"], must_exist=True,
+        )
+        if resolved is None or read["offset"] < 0 or read["size"] < 0:
+            return None
+        content_bytes = read["content"].encode("utf-8")
+        try:
+            with resolved.open("rb") as stream:
+                file_size = os.fstat(stream.fileno()).st_size
+                stream.seek(read["offset"])
+                observed_content = stream.read(len(content_bytes))
+                stream.seek(0)
+                digest = hashlib.sha256()
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+        except (OSError, ValueError):
+            return None
+        if (
+            file_size != read["size"]
+            or digest.hexdigest() != read["sha256"]
+            or observed_content != content_bytes
+            or read["complete"] is not (
+                read["offset"] + len(content_bytes) >= file_size
+            )
+        ):
+            return None
+        resources = (str(resolved),)
+    elif operation in {"worklink_recovery_write", "worklink_recovery_delete"}:
+        if not (
+            value["ok"] is True
+            and value["code"] == "ok"
+            and _valid_recovery_operation_identity(value)
+            and value.get("outcome") in {"applied", "already_applied"}
+            and isinstance(value.get("relative_path"), str)
+            and (value.get("sha256") is None or _valid_recovery_digest(value["sha256"]))
+        ):
+            return None
+        if (
+            _validated_recovery_relative_path(
+                grant.operation_root, value["relative_path"], must_exist=False,
+            ) is None
+            or (
+                operation == "worklink_recovery_write"
+                and not _valid_recovery_digest(value["sha256"])
+            )
+            or (
+                operation == "worklink_recovery_delete"
+                and value["sha256"] is not None
+            )
+        ):
+            return None
+        resources = (f"{grant.target_digest}:{value['operation_id']}",)
+    elif operation == "worklink_recovery_test":
+        exit_code = value.get("exit_code")
+        if not (
+            _valid_recovery_operation_identity(value)
+            and _valid_recovery_digest(value.get("test_key"))
+            and type(exit_code) is int
+            and isinstance(value.get("stdout"), str)
+            and isinstance(value.get("stderr"), str)
+            and type(value.get("replayed")) is bool
+            and value["ok"] is (exit_code == 0)
+            and value["code"] == ("ok" if exit_code == 0 else "tests_failed")
+        ):
+            return None
+        resources = (f"{grant.target_digest}:{value['test_key']}",)
+    elif operation == "worklink_recovery_commit":
+        if not (
+            value["ok"] is True
+            and value["code"] == "ok"
+            and _valid_recovery_operation_identity(value)
+            and value.get("outcome") in {"applied", "already_applied"}
+            and re.fullmatch(r"[0-9a-f]{40,64}", str(value.get("commit"))) is not None
+            and re.fullmatch(r"[0-9a-f]{40,64}", str(value.get("tree"))) is not None
+        ):
+            return None
+        resources = (f"{grant.target_digest}:{value['operation_id']}",)
+    else:
+        outcome = value.get("outcome")
+        successful = outcome in {"applied", "already_applied"}
+        if not (
+            _valid_recovery_operation_identity(value)
+            and outcome in _RECOVERY_RESUME_OUTCOMES
+            and value["ok"] is successful
+            and value["code"] == ("ok" if successful else outcome)
+            and type(value.get("incident_retired")) is bool
+            and value["incident_retired"] is successful
+        ):
+            return None
+        resources = (f"{grant.target_digest}:{value['operation_id']}",)
+    return value, domain, resources
+
+
+def publish_recovery_protected_result(
+    grant: RecoveryBoundaryGrant,
+    operation: str,
+    result: Mapping[str, Any],
+) -> None:
+    """Publish a validated result bound to one live admission and operation."""
+    _revalidate_recovery_boundary_grant(grant)
+    validated = _validated_recovery_result(grant, operation, result)
+    if validated is None:
+        invalidate_protected_result_capture()
+        raise ValueError("recovery result does not match its protected contract")
+    value, domain, resources = validated
+    sources = tuple(
+        _trusted_recovery_source(grant, domain=domain, resource_id=resource)
+        for resource in resources
+    )
+    result_digest = hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    publication = RecoveryResultPublication(
+        _issuer=_RECOVERY_RESULT_PUBLICATION_ISSUER,
+        grant=grant,
+        operation=operation,
+        result_digest=result_digest,
+        sources=sources,
+    )
+    capture = _protected_result_provenance.get()
+    if isinstance(capture, _ProtectedResultCapture):
+        with capture.lock:
+            if capture.closed:
+                return
+            if capture.recovery_publication is not None:
+                capture.invalid = True
+                raise ValueError("recovery result was published more than once")
+            capture.recovery_publication = publication
+        publish_protected_result(sources)
+        return
+    _protected_result_provenance.set(
+        ProtectedResultProvenance(sources, publication)
+    )
+
+
 def invalidate_protected_result_capture() -> None:
     """Mark the active capture incomplete so partial sources are not authoritative."""
     capture = _protected_result_provenance.get()
@@ -9449,7 +10803,9 @@ def end_protected_result_capture(
         with captured.lock:
             captured.closed = True
             result = (
-                ProtectedResultProvenance(tuple(captured.sources))
+                ProtectedResultProvenance(
+                    tuple(captured.sources), captured.recovery_publication,
+                )
                 if captured.published and not captured.invalid
                 else None
             )
@@ -9781,6 +11137,86 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
+def _classify_recovery_result(
+    tool_name: str,
+    arguments: dict[str, Any],
+    auth_context: "AuthContext | None",
+    result: Any,
+    provenance: ProtectedResultProvenance | None,
+    *,
+    failed: bool,
+) -> "InformationFlowLabels | None":
+    from .models import InformationFlowLabels
+
+    domain = _PROTECTED_RESULT_DOMAINS[tool_name]
+    publication = provenance.recovery_publication if provenance is not None else None
+    if (
+        publication is None
+        or publication._issuer is not _RECOVERY_RESULT_PUBLICATION_ISSUER
+        or publication.operation != tool_name
+        or provenance.sources != publication.sources
+    ):
+        return _incomplete_protected_result(
+            domain, arguments, tool_name=tool_name, auth_context=auth_context,
+        )
+    grant = publication.grant
+    selection = RecoveryResourceAdapter._selection(auth_context, arguments)
+    service = get_trusted_service_from_auth_context(auth_context)
+    try:
+        _revalidate_recovery_boundary_grant(grant)
+    except ValueError:
+        return _incomplete_protected_result(
+            domain, arguments, tool_name=tool_name, auth_context=auth_context,
+        )
+    validated = _validated_recovery_result(grant, tool_name, result)
+    if selection is None or service is None or validated is None:
+        return _incomplete_protected_result(
+            domain, arguments, tool_name=tool_name, auth_context=auth_context,
+        )
+    value, expected_domain, resources = validated
+    expected_sources = tuple(
+        _trusted_recovery_source(
+            grant, domain=expected_domain, resource_id=resource,
+        )
+        for resource in resources
+    )
+    digest = hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    relative_path = arguments.get("relative_path")
+    result_relative = (
+        value.get("read", {}).get("relative_path")
+        if tool_name == "worklink_recovery_read"
+        and isinstance(value.get("read"), dict)
+        else value.get("relative_path")
+        if tool_name in {"worklink_recovery_write", "worklink_recovery_delete"}
+        else None
+    )
+    if (
+        _recovery_selection_digest(selection) != grant.selection_digest
+        or service.canonical != grant.service_principal
+        or publication.result_digest != digest
+        or publication.sources != expected_sources
+        or failed is value["ok"]
+        or (
+            tool_name in {
+                "worklink_recovery_read", "worklink_recovery_write",
+                "worklink_recovery_delete",
+            }
+            and relative_path != result_relative
+        )
+    ):
+        return _incomplete_protected_result(
+            domain, arguments, tool_name=tool_name, auth_context=auth_context,
+        )
+    if not expected_sources:
+        return None
+    labels = InformationFlowLabels()
+    for source in expected_sources:
+        labels = labels.with_source(source)
+    return labels
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -9819,6 +11255,10 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    if tool_name in WORKLINK_RECOVERY_OPERATIONS:
+        return _classify_recovery_result(
+            tool_name, args, auth_context, result, provenance, failed=failed,
+        )
     if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
         if scope is None:
@@ -10081,7 +11521,11 @@ def classify_protected_result(
         # turn rather than silently laundering integrity through the tool.
         domain = "unknown"
 
-    if failed:
+    if failed and not (
+        tool_name in WORKLINK_RECOVERY_OPERATIONS
+        and provenance is not None
+        and not isinstance(result, BaseException)
+    ):
         return _incomplete_protected_result(
             domain, args, tool_name=tool_name, auth_context=auth_context,
         )
@@ -10309,6 +11753,10 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "memory_get": "saga",
     "hands_read": "client_provider",
     "hands_python": "client_provider",
+    "worklink_recovery_inspect": "worklink_recovery_state",
+    "worklink_recovery_list": "worklink_recovery_checkout",
+    "worklink_recovery_read": "worklink_recovery_checkout",
+    "worklink_recovery_test": "worklink_recovery_checkout",
     **{
         operation: "repository"
         for operation, direction in _TOOL_FLOW_MAP.items()
@@ -10390,6 +11838,11 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "repo_revert": "bound_pull_request",
     "repo_revert_abort": "bound_pull_request",
     "repo_push": "bound_pull_request",
+    "worklink_recovery_write": "filesystem",
+    "worklink_recovery_delete": "filesystem",
+    "worklink_recovery_test": "shell_process",
+    "worklink_recovery_commit": "filesystem",
+    "worklink_recovery_resume": "spawn_process",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({

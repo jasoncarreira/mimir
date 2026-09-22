@@ -210,3 +210,179 @@ def test_shell_result_integrity_depends_on_provenance_not_exit(failed, boundary)
     assert {(source.integrity, source.integrity_effect) for source in labels.sources} == {
         ("untrusted", effect),
     }
+
+
+_RECOVERY_RESULT_DOMAINS = {
+    "worklink_recovery_inspect": "worklink_recovery_state",
+    "worklink_recovery_list": "worklink_recovery_checkout",
+    "worklink_recovery_read": "worklink_recovery_checkout",
+    "worklink_recovery_write": "worklink_recovery_control",
+    "worklink_recovery_delete": "worklink_recovery_control",
+    "worklink_recovery_test": "worklink_recovery_test",
+    "worklink_recovery_commit": "worklink_recovery_control",
+    "worklink_recovery_resume": "worklink_recovery_control",
+}
+
+
+def _recovery_result_source(tool_name: str):
+    from mimir.models import SourceLabel
+
+    return SourceLabel(
+        principal="service:poller:worklink-ready-queue",
+        domain=_RECOVERY_RESULT_DOMAINS[tool_name],
+        resource_id=f"retained:{tool_name}",
+        bridge_instance="worklink_recovery",
+        sensitivity="internal",
+        authorized_principals=frozenset({
+            "service:poller:worklink-ready-queue",
+        }),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+
+
+def _recovery_authorization(tool_name: str) -> ac.ToolAuthorization:
+    return ac.ToolAuthorization(
+        tool_name=tool_name,
+        decision=ac.OperationDecision.RESOURCE_SCOPED,
+        allowed=True,
+    )
+
+
+@pytest.mark.parametrize("tool_name", sorted(_RECOVERY_RESULT_DOMAINS))
+def test_recovery_forged_source_without_grant_fails_closed(
+    tool_name: str,
+) -> None:
+    source = _recovery_result_source(tool_name)
+
+    labels = ac.classify_protected_result(
+        tool_name,
+        {"recovery_handle": "opaque"},
+        None,
+        _recovery_authorization(tool_name),
+        result='{"ok": true}',
+        provenance=ac.ProtectedResultProvenance((source,)),
+    )
+
+    assert labels is not None
+    assert {
+        (item.domain, item.integrity, item.integrity_effect)
+        for item in labels.sources
+    } == {(_RECOVERY_RESULT_DOMAINS[tool_name], "untrusted", "active_ingest")}
+
+
+@pytest.mark.parametrize("tool_name", sorted(_RECOVERY_RESULT_DOMAINS))
+def test_recovery_missing_publication_fails_closed(tool_name: str) -> None:
+    labels = ac.classify_protected_result(
+        tool_name,
+        {"recovery_handle": "opaque"},
+        None,
+        _recovery_authorization(tool_name),
+        result='{"ok": true}',
+    )
+
+    assert labels is not None
+    assert {
+        (source.domain, source.integrity, source.integrity_effect)
+        for source in labels.sources
+    } == {(_RECOVERY_RESULT_DOMAINS[tool_name], "untrusted", "active_ingest")}
+    assert ac._has_untrusted_active_ingest(None, labels) is True
+
+
+def test_recovery_unbound_empty_list_publication_fails_closed() -> None:
+    labels = ac.classify_protected_result(
+        "worklink_recovery_list",
+        {"recovery_handle": "opaque"},
+        None,
+        _recovery_authorization("worklink_recovery_list"),
+        result='{"ok": true, "files": []}',
+        provenance=ac.ProtectedResultProvenance(()),
+    )
+
+    assert labels is not None
+    assert ac._has_untrusted_active_ingest(None, labels) is True
+
+
+def test_recovery_unbound_handled_failure_fails_closed() -> None:
+    source = _recovery_result_source("worklink_recovery_test")
+
+    labels = ac.classify_protected_result(
+        "worklink_recovery_test",
+        {"recovery_handle": "opaque"},
+        None,
+        _recovery_authorization("worklink_recovery_test"),
+        result='{"ok": false, "code": "tests_failed"}',
+        provenance=ac.ProtectedResultProvenance((source,)),
+        failed=True,
+    )
+
+    assert labels is not None
+    assert ac._has_untrusted_active_ingest(None, labels) is True
+
+
+def test_recovery_unexpected_exception_invalidates_earlier_publication() -> None:
+    source = _recovery_result_source("worklink_recovery_test")
+
+    labels = ac.classify_protected_result(
+        "worklink_recovery_test",
+        {"recovery_handle": "opaque"},
+        None,
+        _recovery_authorization("worklink_recovery_test"),
+        result=RuntimeError("unexpected test runner failure"),
+        provenance=ac.ProtectedResultProvenance((source,)),
+        failed=True,
+    )
+
+    assert labels is not None
+    assert {
+        (item.domain, item.integrity, item.integrity_effect)
+        for item in labels.sources
+    } == {("worklink_recovery_test", "untrusted", "active_ingest")}
+
+
+def test_recovery_policy_refusal_adds_no_result_source() -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    refusal = ToolPolicyRefusal("recovery path is outside the admitted checkout")
+    result = ToolMessage(
+        content=str(refusal),
+        tool_call_id="recovery-refusal",
+        name="worklink_recovery_read",
+        status="error",
+    )
+
+    labels = ac.classify_protected_result(
+        "worklink_recovery_read",
+        {"recovery_handle": "opaque", "relative_path": "../escape"},
+        None,
+        _recovery_authorization("worklink_recovery_read"),
+        result=result,
+        policy_refusal=refusal,
+        failed=True,
+    )
+
+    assert labels is None
+
+
+def test_external_read_remains_active_ingest_beside_retained_read() -> None:
+    from mimir.models import InformationFlowLabels, SourceLabel
+
+    retained = InformationFlowLabels().with_source(
+        _recovery_result_source("worklink_recovery_read")
+    )
+    external = InformationFlowLabels().with_source(SourceLabel(
+        principal="external",
+        domain="filesystem",
+        resource_id="/outside/retained-checkout",
+        bridge_instance="filesystem",
+        sensitivity="internal",
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+    assert ac._has_untrusted_active_ingest(None, retained) is False
+    assert ac._has_untrusted_active_ingest(None, external) is True
