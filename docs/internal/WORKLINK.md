@@ -913,11 +913,26 @@ reviews that a budget kill would otherwise sweep. Resume recomputes the deadline
 from the monotonic clock on entry, so a resumed run gets a full budget again.
 
 ```bash
-scripts/factory_park.py --run-id chainlink-1783 \
+docker exec -u worklink -w /workspace/mimir mimirbot \
+  .venv/bin/python scripts/factory_park.py --run-id chainlink-1783 \
     --sandbox  <checkout>/.factory-sandboxes/chainlink-1783 \
     --home /mimir-home --launcher <factory.js> \
     --controller-pid <PID> --reason "parked to preserve slice reviews"
 ```
+
+**Run it as the `worklink` uid.** The control plane is `0600 worklink`, so the
+controller's own uid gets `EACCES` on `run.json`. That failure is quiet by
+default: `factory status` still exits zero and returns `{"valid": false,
+"error": "EACCES ..."}` with no `status` field, which reads as "not parked, not
+terminal" — permission to start stopping processes. Both scripts now refuse on
+`valid: false` and name the uid.
+
+`chainlink` resolves its tracker from the working directory, not from `--home`,
+so the scripts run it with `--chainlink-repo` (defaulting to `--home`) as cwd.
+Without that, running from the source checkout answers "Not a chainlink
+repository (or any parent)" and the park refuses over a claim that is plainly
+there. Both behaviours were found by dry-running the merged scripts against the
+live deployment, not by the suite.
 
 Two constraints are not obvious and are enforced rather than documented alone:
 

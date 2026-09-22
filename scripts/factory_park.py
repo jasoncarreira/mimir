@@ -91,10 +91,12 @@ class ParkError(RuntimeError):
     """A park refused before it changed anything the operator cannot undo."""
 
 
-def _run(cmd: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def _run(
+    cmd: list[str], *, timeout: int = 120, cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout, check=False,
+        timeout=timeout, check=False, cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -120,9 +122,22 @@ def factory_status(launcher: Path, run_id: str, sandbox: Path) -> dict:
     if result.returncode != 0:
         raise ParkError(f"factory status failed: {(result.stderr or result.stdout).strip()[:300]}")
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except ValueError as exc:
         raise ParkError(f"factory status returned unparseable JSON: {exc}") from exc
+    # `valid: false` still exits zero and carries no `status`, so treating the
+    # payload as a plain dict reads an unreadable run as "not parked, not
+    # terminal" -- i.e. as permission to start stopping processes. The usual
+    # cause is running as the wrong uid: the control plane is 0600 worklink, so
+    # the controller's own uid gets EACCES on run.json.
+    if not payload.get("valid", False):
+        error = str(payload.get("error") or "no error reported")[:200]
+        raise ParkError(
+            f"factory status reports the run is not readable: {error}. "
+            "The control plane is owned by the worklink uid; run this as that uid "
+            "(for example `docker exec -u worklink ...`) rather than as the controller."
+        )
+    return payload
 
 
 def plane_inventory(root: Path) -> list[tuple[str, str, int, str]]:
@@ -349,13 +364,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def claims_client(chainlink_bin: str, agent_id: str, home: Path) -> ChainlinkClaims:
-    """A claims client that shells through this script's own ``_run``."""
+def claims_client(
+    chainlink_bin: str, agent_id: str, home: Path, tracker: Path,
+) -> ChainlinkClaims:
+    """A claims client that shells through this script's own ``_run``.
+
+    ``cwd`` is the tracker checkout, not the caller's. The chainlink CLI resolves
+    its repository from the working directory and answers "Not a chainlink
+    repository (or any parent)" anywhere else, so a park run from the source
+    checkout -- the obvious place to run it from -- would otherwise refuse
+    because it could not read a claim that is plainly there.
+    """
     return ChainlinkClaims(
         chainlink_bin=chainlink_bin,
         agent_id=agent_id,
         home_path=home,
-        runner=lambda argv: _run(list(argv)),
+        runner=lambda argv: _run(list(argv), cwd=tracker),
     )
 
 
@@ -401,7 +425,7 @@ class ClaimPlan(NamedTuple):
 
 
 def plan_claim_release(
-    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path, tracker: Path,
 ) -> ClaimPlan:
     """Decide whether the claim can be released and forgiven, writing nothing.
 
@@ -411,7 +435,7 @@ def plan_claim_release(
     strands a parked run whose claim is still held and still charged. Deciding
     first means a park that starts is a park that can finish.
     """
-    claims = claims_client(chainlink_bin, agent_id, home)
+    claims = claims_client(chainlink_bin, agent_id, home, tracker)
     comments = issue_comments(claims, issue_id)
     claim = latest_claim(comments, issue_id)
     if claim is None:
@@ -446,7 +470,7 @@ def plan_claim_release(
 
 
 def release_claim_with_forgiveness(
-    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path, tracker: Path,
 ) -> tuple[int, str]:
     """Release the parked run's claim without charging it an attempt.
 
@@ -469,8 +493,10 @@ def release_claim_with_forgiveness(
     the run is resumed by an explicit dispatch -- and arming it here would
     auto-dispatch a parked epic.
     """
-    plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home)
-    marked = _run([chainlink_bin, "issue", "comment", str(issue_id), plan.abort.to_comment()])
+    plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home, tracker)
+    marked = _run(
+        [chainlink_bin, "issue", "comment", str(issue_id), plan.abort.to_comment()], cwd=tracker,
+    )
     if marked.returncode != 0:
         raise ParkError(
             "could not record the forgiveness marker: "
@@ -480,7 +506,7 @@ def release_claim_with_forgiveness(
 
     # Postcondition, not the decision: the plan already proved the marker would
     # count. This catches the marker landing differently than projected.
-    claims = claims_client(chainlink_bin, agent_id, home)
+    claims = claims_client(chainlink_bin, agent_id, home, tracker)
     observed = claims.attempts_used(issue_comments(claims, issue_id))
     if observed >= plan.before:
         raise ParkError(
@@ -488,19 +514,21 @@ def release_claim_with_forgiveness(
             f"{plan.before}). The claim is still charged; resolve it before resuming."
         )
 
-    released = _run([chainlink_bin, "locks", "release", str(issue_id)])
+    released = _run([chainlink_bin, "locks", "release", str(issue_id)], cwd=tracker)
     if released.returncode != 0:
         return released.returncode, (released.stderr or released.stdout).strip()[:200]
-    _run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
+    _run(
+        [chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"], cwd=tracker,
+    )
     return 0, f"attempt {plan.claim.attempt} forgiven, attempts_used {plan.before} -> {observed}"
 
 
 def claim_needs_reconciliation(
-    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path, tracker: Path,
 ) -> bool:
     """True when a parked run's claim is still charged and can still be forgiven."""
     try:
-        plan_claim_release(chainlink_bin, issue_id, agent_id, home)
+        plan_claim_release(chainlink_bin, issue_id, agent_id, home, tracker)
     except ParkError:
         return False
     return True
@@ -530,12 +558,21 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--chainlink-repo", type=Path, default=None,
+        help=(
+            "checkout the chainlink CLI resolves its tracker from; defaults to --home. "
+            "chainlink reads its repository from the working directory, so this is not "
+            "the directory you happen to run the script from"
+        ),
+    )
+    parser.add_argument(
         "--chainlink-bin", default="chainlink",
         help="chainlink CLI used to release the claim the stopped controller held",
     )
     parser.add_argument("--dry-run", action="store_true", help="report the plan and refuse to change anything")
     args = parser.parse_args(argv)
 
+    tracker = (args.chainlink_repo or args.home).resolve()
     sandbox = args.sandbox.resolve()
     root = operator_root(sandbox)
     plane = sandbox / ".factory" / args.run_id
@@ -560,14 +597,14 @@ def main(argv: list[str] | None = None) -> int:
         if record is None:
             raise ParkError(f"no retained record for {args.run_id} under {args.home}")
         if not claim_needs_reconciliation(
-            args.chainlink_bin, record.issue_id, args.agent_id, args.home
+            args.chainlink_bin, record.issue_id, args.agent_id, args.home, tracker
         ):
             raise ParkError(
                 "run is already parked and its claim needs no reconciliation; nothing to do"
             )
         print("already parked: completing the claim reconciliation a previous run left undone")
         code, detail = release_claim_with_forgiveness(
-            args.chainlink_bin, record.issue_id, args.agent_id, args.home,
+            args.chainlink_bin, record.issue_id, args.agent_id, args.home, tracker,
         )
         if code != 0:
             print(f"PARKED, BUT THE CLAIM IS STILL HELD: {detail}", file=sys.stderr)
@@ -603,7 +640,9 @@ def main(argv: list[str] | None = None) -> int:
     # Decide the claim outcome before stopping anything. Every refusal inside
     # plan_claim_release is unrecoverable once the run is terminalized, so it has
     # to happen while nothing has been changed yet.
-    plan = plan_claim_release(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
+    plan = plan_claim_release(
+        args.chainlink_bin, record.issue_id, args.agent_id, args.home, tracker,
+    )
     print(
         f"claim      : attempt {plan.claim.attempt} owned by {plan.claim.agent_id}; "
         f"forgiveness would take attempts_used {plan.before} -> {plan.after}"
@@ -713,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
     #     one run, and a run parked on its last attempt returns
     #     `attempts_exhausted` rather than resuming.
     code, detail = release_claim_with_forgiveness(
-        args.chainlink_bin, record.issue_id, args.agent_id, args.home,
+        args.chainlink_bin, record.issue_id, args.agent_id, args.home, tracker,
     )
     if code == 0:
         print(f"released   : claim on issue {record.issue_id} ({detail})")

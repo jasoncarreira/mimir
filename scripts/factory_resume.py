@@ -64,9 +64,20 @@ def factory_status(launcher: Path, run_id: str, sandbox: Path) -> dict:
     if result.returncode != 0:
         raise ResumeError(f"factory status failed: {(result.stderr or result.stdout).strip()[:300]}")
     try:
-        return json.loads(result.stdout)
+        payload = json.loads(result.stdout)
     except ValueError as exc:
         raise ResumeError(f"factory status returned unparseable JSON: {exc}") from exc
+    # `valid: false` exits zero and carries no `status`, so an unreadable run
+    # would otherwise be reported as "not parked" rather than as the permission
+    # problem it is. The control plane is 0600 worklink.
+    if not payload.get("valid", False):
+        error = str(payload.get("error") or "no error reported")[:200]
+        raise ResumeError(
+            f"factory status reports the run is not readable: {error}. "
+            "The control plane is owned by the worklink uid; run this as that uid "
+            "(for example `docker exec -u worklink ...`) rather than as the controller."
+        )
+    return payload
 
 
 def preflight(record, status: dict, sandbox: Path) -> list[str]:

@@ -812,7 +812,7 @@ class TestParkToImmediateDispatch:
         run = _park_stub(calls, _claim_history(1, agent="someone-else"))
         with mock.patch.object(park, "_run", run):
             with pytest.raises(park.ParkError, match="held by 'someone-else'"):
-                park.release_claim_with_forgiveness("chainlink", 1783, AGENT, tmp_path)
+                park.release_claim_with_forgiveness("chainlink", 1783, AGENT, tmp_path, tmp_path)
         assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
         assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
 
@@ -842,7 +842,7 @@ class TestParkToImmediateDispatch:
 
         with mock.patch.object(park, "_run", run):
             code, detail = park.release_claim_with_forgiveness(
-                "chainlink", 1783, AGENT, tmp_path,
+                "chainlink", 1783, AGENT, tmp_path, tmp_path,
             )
 
         assert code == 0
@@ -940,6 +940,77 @@ class TestParkToImmediateDispatch:
                 "--reason", "budget", "--controller-pid", "none", "--agent-id", AGENT,
             ])
         assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
+
+    def test_chainlink_runs_in_the_tracker_checkout_not_the_callers_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """The chainlink CLI resolves its repository from the working directory.
+
+        Run from the source checkout -- the obvious place -- it answers "Not a
+        chainlink repository (or any parent)", so the park refuses because it
+        cannot read a claim that is plainly there. Verified against the live
+        deployment before this was fixed.
+        """
+        tracker = tmp_path / "tracker"
+        tracker.mkdir()
+        seen: list[Path | None] = []
+        comments = _claim_history(1)
+
+        def run(cmd, cwd=None, **kwargs):
+            argv = list(cmd)
+            if argv[0] == "chainlink":
+                seen.append(cwd)
+            if argv[1:3] == ["issue", "comment"]:
+                comments.append(argv[4])
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1:4] == ["issue", "show", "1783"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"comments": list(comments)}), "",
+                )
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with mock.patch.object(park, "_run", run):
+            code, _ = park.release_claim_with_forgiveness(
+                "chainlink", 1783, AGENT, tmp_path, tracker,
+            )
+
+        assert code == 0
+        assert seen, "no chainlink call was made"
+        assert set(seen) == {tracker}, seen
+
+    def test_an_unreadable_control_plane_refuses_naming_the_uid(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """`valid: false` exits zero and carries no `status`.
+
+        Treating that payload as a plain dict reads an unreadable run as "not
+        parked, not terminal" -- permission to start stopping processes. The live
+        deployment returns exactly this to the controller uid, because the
+        control plane is 0600 worklink.
+        """
+        eacces = {
+            "run_id": "chainlink-1783",
+            "valid": False,
+            "sandbox_path": "/s",
+            "error": "EACCES: permission denied, open '.../run.json'",
+        }
+        monkeypatch.setattr(
+            park, "_run",
+            lambda cmd, **k: subprocess.CompletedProcess(list(cmd), 0, json.dumps(eacces), ""),
+        )
+        with pytest.raises(park.ParkError, match="worklink uid"):
+            park.factory_status(Path("/f.js"), "chainlink-1783", tmp_path)
+
+    def test_resume_also_refuses_an_unreadable_control_plane(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        eacces = {"run_id": "chainlink-1783", "valid": False, "sandbox_path": "/s"}
+        monkeypatch.setattr(
+            resume, "_run",
+            lambda cmd, **k: subprocess.CompletedProcess(list(cmd), 0, json.dumps(eacces), ""),
+        )
+        with pytest.raises(resume.ResumeError, match="worklink uid"):
+            resume.factory_status(Path("/f.js"), "chainlink-1783", tmp_path)
 
     def test_a_failed_release_is_reported_rather_than_silently_parked(
         self, tmp_path: Path, monkeypatch, capsys
