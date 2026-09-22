@@ -17436,6 +17436,7 @@ def test_recovery_empty_list_is_grant_bound_authoritative_empty(
     auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
     _repository, _checkout, target_digest = _write_recovery_admission(tmp_path, turn)
     result = _recovery_result("worklink_recovery_list", target_digest)
+    before = auth.ifc_state.labels
     token = set_current_turn(turn)
     try:
         grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
@@ -17457,6 +17458,10 @@ def test_recovery_empty_list_is_grant_bound_authoritative_empty(
         reset_current_turn(token)
 
     assert _recovery_source_tuples(auth) == ()
+    assert auth.ifc_state.labels == before
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is False
 
 
 @pytest.mark.parametrize("outcome", [
