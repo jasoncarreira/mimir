@@ -5514,7 +5514,11 @@ class RecoveryResourceAdapter:
             validate_current_selection,
         )
 
-        if not coding_enabled() or not isinstance(auth_context, AuthContext):
+        if not (
+            coding_enabled()
+            and isinstance(auth_context, AuthContext)
+            and auth_context.enforcement_enabled is True
+        ):
             return None
         service = get_trusted_service_from_auth_context(auth_context)
         if not (
@@ -5531,6 +5535,7 @@ class RecoveryResourceAdapter:
         if not (
             turn is not None
             and getattr(turn, "auth_context", None) is auth_context
+            and getattr(turn, "access_control_enforced", None) is True
             and getattr(turn, "trigger", None) == "poller"
             and getattr(turn, "channel_id", None) == auth_context.channel_id
             and getattr(turn, "channel_source", None) == "poller"
@@ -6149,8 +6154,15 @@ def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
         and service is not None
         and service.canonical == grant.service_principal
         and current_selection is not None
-        and _recovery_journal_turn_matches(
-            current_selection, turn, Path(grant.home),
+        and RecoveryResourceAdapter._selection(
+            turn.auth_context,
+            {"recovery_handle": current_selection.handle},
+        ) is current_selection
+        and all(
+            service.sink_policy_for(operation) == ServiceSinkPolicy(
+                operation, "retained_recovery_selection", operation,
+            )
+            for operation in _WORKLINK_RECOVERY_SINK_OPERATIONS
         )
         and _directory_matches_identity(
             grant.admitted_root, grant.admitted_device, grant.admitted_inode,
@@ -6211,6 +6223,7 @@ def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
         ).hexdigest() != grant.selection_record_digest
         or admission.get("selection_digest") != grant.selection_digest
         or admission.get("target_digest") != grant.target_digest
+        or admission.get("target_kind") != grant.target_kind
         or admission.get("phase") != "admitted"
         or admission.get("admitted_root") != grant.admitted_root
         or admission.get("admitted_device") != grant.admitted_device
@@ -6222,6 +6235,12 @@ def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
         or identity.get("issue_id") != grant.issue_id
         or identity.get("attempt") != grant.attempt
         or identity.get("branch") != grant.branch
+        or identity.get("admitted_root") != grant.admitted_root
+        or identity.get("admitted_device") != grant.admitted_device
+        or identity.get("admitted_inode") != grant.admitted_inode
+        or identity.get("operation_root") != grant.operation_root
+        or identity.get("operation_device") != grant.operation_device
+        or identity.get("operation_inode") != grant.operation_inode
         or target.get("compatibility_code") != grant.compatibility_code
         or target.get("controllable") != grant.controllable
         or repository_record.get("slug") != grant.repository_slug

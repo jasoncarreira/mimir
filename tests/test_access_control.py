@@ -16747,6 +16747,42 @@ def _recovery_result(
     }
 
 
+def _recovery_source_tuples(auth: AuthContext) -> tuple[tuple[object, ...], ...]:
+    return tuple(sorted((
+        (
+            source.principal,
+            source.domain,
+            source.resource_id,
+            source.bridge_instance,
+            source.sensitivity,
+            source.authorized_principals,
+            source.source_kind,
+            source.integrity,
+            source.integrity_effect,
+        )
+        for source in auth.ifc_state.labels.sources
+        if source.bridge_instance == "worklink_recovery"
+    ), key=lambda item: str(item[2])))
+
+
+def _expected_recovery_source(
+    domain: str,
+    resource_id: str,
+) -> tuple[object, ...]:
+    principal = f"service:{_WORKLINK_RECOVERY_READY_QUEUE}"
+    return (
+        principal,
+        domain,
+        resource_id,
+        "worklink_recovery",
+        "internal",
+        frozenset({principal}),
+        "protected_tool",
+        "trusted",
+        "informational",
+    )
+
+
 _RECOVERY_INVALID_RESULT_FIELDS = {
     "worklink_recovery_inspect": (
         "ok", "code", "selection_digest", "target_digest", "issue_id", "attempt",
@@ -16941,13 +16977,31 @@ def test_recovery_protected_success_traverses_capture_and_middleware(
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is False
-    expected_domain = access_control._PROTECTED_RESULT_DOMAINS[operation]
-    assert any(
-        source.domain == expected_domain
-        and source.integrity == "trusted"
-        and source.integrity_effect == "informational"
-        for source in auth.ifc_state.labels.sources
-    )
+    domain = access_control._PROTECTED_RESULT_DOMAINS[operation]
+    if operation == "worklink_recovery_inspect":
+        resources = (
+            str(
+                tmp_path / "state" / "pollers" / _WORKLINK_RECOVERY_POLLER
+                / "dispatch_failures.json"
+            ),
+            str(
+                tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+                / "selections"
+                / f"{access_control._recovery_selection_digest(turn.recovery_selections[0])}.json"
+            ),
+        )
+    elif operation == "worklink_recovery_list":
+        resources = (str(checkout),)
+    elif operation == "worklink_recovery_read":
+        resources = (str(retained_file.resolve()),)
+    elif operation == "worklink_recovery_test":
+        resources = (f"{target_digest}:{result['test_key']}",)
+    else:
+        resources = (f"{target_digest}:{result['operation_id']}",)
+    assert _recovery_source_tuples(auth) == tuple(sorted(
+        (_expected_recovery_source(domain, resource) for resource in resources),
+        key=lambda item: str(item[2]),
+    ))
 
 
 @pytest.mark.parametrize("case", [
@@ -17243,13 +17297,11 @@ def test_recovery_empty_file_read_is_exact_trusted_source(
     finally:
         reset_current_turn(token)
 
-    sources = [
-        source for source in auth.ifc_state.labels.sources
-        if source.domain == "worklink_recovery_checkout"
-    ]
-    assert [(source.resource_id, source.integrity, source.integrity_effect) for source in sources] == [
-        (str(retained_file.resolve()), "trusted", "informational")
-    ]
+    assert _recovery_source_tuples(auth) == (
+        _expected_recovery_source(
+            "worklink_recovery_checkout", str(retained_file.resolve()),
+        ),
+    )
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is False
@@ -17295,11 +17347,11 @@ def test_recovery_already_applied_results_publish_exact_control_source(
     finally:
         reset_current_turn(token)
 
-    assert any(
-        source.domain == "worklink_recovery_control"
-        and source.integrity == "trusted"
-        and source.integrity_effect == "informational"
-        for source in auth.ifc_state.labels.sources
+    assert _recovery_source_tuples(auth) == (
+        _expected_recovery_source(
+            "worklink_recovery_control",
+            f"{target_digest}:{result['operation_id']}",
+        ),
     )
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
@@ -17351,16 +17403,24 @@ def test_recovery_legacy_inspect_matches_exact_selected_compatibility(
     finally:
         reset_current_turn(token)
 
-    sources = [
-        source for source in auth.ifc_state.labels.sources
-        if source.domain == "worklink_recovery_state"
-    ]
-    assert len(sources) == 2
-    assert all(
-        source.integrity == "trusted"
-        and source.integrity_effect == "informational"
-        for source in sources
+    resources = (
+        str(
+            tmp_path / "state" / "pollers" / _WORKLINK_RECOVERY_POLLER
+            / "dispatch_failures.json"
+        ),
+        str(
+            tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+            / "selections"
+            / f"{access_control._recovery_selection_digest(turn.recovery_selections[0])}.json"
+        ),
     )
+    assert _recovery_source_tuples(auth) == tuple(sorted(
+        (
+            _expected_recovery_source("worklink_recovery_state", resource)
+            for resource in resources
+        ),
+        key=lambda item: str(item[2]),
+    ))
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is False
@@ -17396,10 +17456,7 @@ def test_recovery_empty_list_is_grant_bound_authoritative_empty(
     finally:
         reset_current_turn(token)
 
-    assert not any(
-        source.domain == "worklink_recovery_checkout"
-        for source in auth.ifc_state.labels.sources
-    )
+    assert _recovery_source_tuples(auth) == ()
 
 
 @pytest.mark.parametrize("outcome", [
@@ -17442,6 +17499,12 @@ def test_recovery_resume_outcomes_are_grant_bound_through_middleware(
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is False
+    assert _recovery_source_tuples(auth) == (
+        _expected_recovery_source(
+            "worklink_recovery_control",
+            f"{target_digest}:{result['operation_id']}",
+        ),
+    )
 
 
 def test_recovery_failed_test_is_handled_protected_result(
@@ -17477,6 +17540,12 @@ def test_recovery_failed_test_is_handled_protected_result(
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is False
+    assert _recovery_source_tuples(auth) == (
+        _expected_recovery_source(
+            "worklink_recovery_test",
+            f"{target_digest}:{result['test_key']}",
+        ),
+    )
 
 
 @pytest.mark.parametrize("path", [
@@ -17625,7 +17694,11 @@ def test_recovery_duplicate_publication_invalidates_capture(
 
 
 @pytest.mark.parametrize("stale", [
-    "selection_record", "admission_record", "inventory", "repository", "checkout",
+    "incident", "sink_policy_missing", "sink_policy_adapter",
+    "sink_policy_destination", "selection_record", "admission_record",
+    "inventory_root", "inventory_origin", "inventory_base_branch",
+    "inventory_mode", "inventory_authorization_roots", "repository_device",
+    "checkout",
 ])
 def test_recovery_stale_grant_cannot_publish(
     stale: str,
@@ -17644,32 +17717,100 @@ def test_recovery_stale_grant_cannot_publish(
     token = set_current_turn(turn)
     try:
         grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
-        if stale == "checkout":
-            checkout.rename(tmp_path / "stale-checkout")
-            checkout.mkdir()
-        elif stale == "repository":
-            repository.rename(tmp_path / "stale-repository")
-            repository.mkdir()
-        elif stale == "inventory":
-            inventory = tmp_path / "repositories.yaml"
-            inventory.write_text(
-                inventory.read_text(encoding="utf-8").replace("mode: rw", "mode: ro"),
-                encoding="utf-8",
-            )
-        else:
-            root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
-            path = (
-                root / "selections" / f"{grant.selection_digest}.json"
-                if stale == "selection_record"
-                else root / "targets" / target_digest / "admission.json"
-            )
-            record = json.loads(path.read_text(encoding="utf-8"))
-            record["updated_at" if stale == "admission_record" else "created_at"] = (
-                "2026-09-22T00:00:02+00:00"
-            )
-            path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-            path.chmod(0o600)
+        def make_stale() -> None:
+            if stale == "incident":
+                from mimir.worklink.diagnostics import server_fixed
+                from mimir.worklink.dispatch_failures import (
+                    dispatch_failure_state_dir,
+                    record_failure,
+                )
+
+                record_failure(
+                    dispatch_failure_state_dir(tmp_path),
+                    issue_id=1783,
+                    attempt=3,
+                    exit_status=1,
+                    error=server_fixed("post-grant replacement failure"),
+                    log_path=server_fixed("post-grant replacement log"),
+                    target_kind="leaf",
+                )
+            elif stale.startswith("sink_policy_"):
+                service = auth.service_authority
+                assert service is not None
+                if stale == "sink_policy_missing":
+                    policies = tuple(
+                        policy for policy in service.sink_policies
+                        if policy.operation != "worklink_recovery_write"
+                    )
+                else:
+                    policies = tuple(
+                        replace(
+                            policy,
+                            **(
+                                {"adapter": "configured_file_roots"}
+                                if stale == "sink_policy_adapter"
+                                else {"destination": "worklink_recovery_delete"}
+                            ),
+                        )
+                        if policy.operation == "worklink_recovery_write"
+                        else policy
+                        for policy in service.sink_policies
+                    )
+                turn.auth_context = replace(
+                    auth,
+                    service_authority=replace(service, sink_policies=policies),
+                )
+            elif stale == "checkout":
+                checkout.rename(tmp_path / "stale-checkout")
+                checkout.mkdir()
+            elif stale == "repository_device":
+                repository.rename(tmp_path / "stale-repository")
+                repository.mkdir()
+            elif stale.startswith("inventory_"):
+                inventory = tmp_path / "repositories.yaml"
+                content = inventory.read_text(encoding="utf-8")
+                if stale == "inventory_root":
+                    other_root = tmp_path / "other-root"
+                    other_root.mkdir()
+                    content = content.replace(
+                        f"root: {repository}", f"root: {other_root}",
+                    )
+                elif stale == "inventory_origin":
+                    content = content.replace(
+                        "https://github.com/owner/repo.git",
+                        "https://example.test/owner/repo.git",
+                    )
+                elif stale == "inventory_base_branch":
+                    content = content.replace("base_branch: main", "base_branch: trunk")
+                elif stale == "inventory_mode":
+                    content = content.replace("mode: rw", "mode: ro")
+                else:
+                    other_root = tmp_path / "other-root"
+                    other_root.mkdir()
+                    content += (
+                        "\n  - slug: other/repo\n"
+                        f"    root: {other_root}\n"
+                        "    mode: ro\n"
+                        "    origin: https://github.com/other/repo.git\n"
+                        "    base_branch: main\n"
+                    )
+                inventory.write_text(content, encoding="utf-8")
+            else:
+                root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+                path = (
+                    root / "selections" / f"{grant.selection_digest}.json"
+                    if stale == "selection_record"
+                    else root / "targets" / target_digest / "admission.json"
+                )
+                record = json.loads(path.read_text(encoding="utf-8"))
+                record[
+                    "updated_at" if stale == "admission_record" else "created_at"
+                ] = "2026-09-22T00:00:02+00:00"
+                path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+                path.chmod(0o600)
+
         def handler(call: object) -> ToolMessage:
+            make_stale()
             access_control.publish_recovery_protected_result(
                 grant, "worklink_recovery_read", result,
             )
@@ -17691,6 +17832,206 @@ def test_recovery_stale_grant_cannot_publish(
             )
     finally:
         reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("binding", [
+    "admission_target_kind", "admission_admitted_device",
+    "admission_operation_device", "target_kind", "target_admitted_device",
+    "target_operation_device", "repository_root", "repository_origin",
+    "repository_base_branch", "repository_mode", "repository_device",
+    "repository_authorization_roots",
+])
+def test_recovery_post_grant_binding_mutations_fail_closed_through_middleware(
+    binding: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result("worklink_recovery_read", target_digest)
+    root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+    selection_path = root / "selections" / (
+        f"{access_control._recovery_selection_digest(turn.recovery_selections[0])}.json"
+    )
+    admission_path = root / "targets" / target_digest / "admission.json"
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def mutate_binding() -> None:
+            path = (
+                admission_path
+                if binding.startswith("admission_")
+                else selection_path
+            )
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if binding == "admission_target_kind":
+                record["target_kind"] = "factory"
+            elif binding == "admission_admitted_device":
+                record["admitted_device"] += 1
+            elif binding == "admission_operation_device":
+                record["operation_device"] += 1
+            elif binding == "target_kind":
+                record["target"]["target_kind"] = "factory"
+            elif binding == "target_admitted_device":
+                record["target"]["leaf"]["admitted_device"] += 1
+            elif binding == "target_operation_device":
+                record["target"]["leaf"]["operation_device"] += 1
+            else:
+                repository_record = record["target"]["repository"]
+                changes: dict[str, object] = {
+                    "repository_root": str(tmp_path),
+                    "repository_origin": "https://example.test/other.git",
+                    "repository_base_branch": "trunk",
+                    "repository_mode": "ro",
+                    "repository_device": repository.stat().st_dev + 1,
+                    "repository_authorization_roots": [[str(repository), "ro"]],
+                }
+                repository_record[
+                    binding.removeprefix("repository_")
+                ] = changes[binding]
+            path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            path.chmod(0o600)
+
+        def handler(call: object) -> ToolMessage:
+            mutate_binding()
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_read",
+                    args={
+                        "recovery_handle": handle,
+                        "relative_path": "src/fix.py",
+                    },
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("record_kind", ["selection", "admission"])
+@pytest.mark.parametrize("predicate", [
+    "missing", "directory_mode", "directory_symlink", "file_symlink",
+    "regular_file", "single_link", "file_mode", "bounded_file", "nul",
+    "utf8", "json", "mapping", "keys", "schema", "record_kind",
+])
+def test_recovery_protected_journal_predicates_fail_closed_through_middleware(
+    record_kind: str,
+    predicate: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result("worklink_recovery_read", target_digest)
+    root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+    selection_digest = access_control._recovery_selection_digest(
+        turn.recovery_selections[0]
+    )
+    path = (
+        root / "selections" / f"{selection_digest}.json"
+        if record_kind == "selection"
+        else root / "targets" / target_digest / "admission.json"
+    )
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def mutate_journal() -> None:
+            if predicate == "missing":
+                path.unlink()
+            elif predicate == "directory_mode":
+                root.parent.chmod(0o755)
+            elif predicate == "directory_symlink":
+                directory = path.parent
+                backing = directory.with_name(f"{directory.name}-backing")
+                directory.rename(backing)
+                directory.symlink_to(backing, target_is_directory=True)
+            elif predicate == "file_symlink":
+                backing = path.with_suffix(".backing")
+                path.rename(backing)
+                path.symlink_to(backing)
+            elif predicate == "regular_file":
+                path.unlink()
+                path.mkdir()
+            elif predicate == "single_link":
+                os.link(path, path.with_suffix(".linked"))
+            elif predicate == "file_mode":
+                path.chmod(0o644)
+            elif predicate == "bounded_file":
+                path.write_bytes(b"x" * (access_control._RECOVERY_JOURNAL_MAX_BYTES + 1))
+            elif predicate == "nul":
+                path.write_bytes(path.read_bytes() + b"\0")
+            elif predicate == "utf8":
+                path.write_bytes(b"\xff")
+            elif predicate == "json":
+                path.write_bytes(b"{")
+            elif predicate == "mapping":
+                path.write_text("[]", encoding="utf-8")
+            else:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if predicate == "keys":
+                    record["unexpected"] = True
+                elif predicate == "schema":
+                    record["schema_version"] = 2
+                else:
+                    record["record_kind"] = "admission" if record_kind == "selection" else "selection"
+                path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            if path.exists() and path.is_file() and not path.is_symlink():
+                path.chmod(0o600 if predicate != "file_mode" else 0o644)
+
+        def handler(call: object) -> ToolMessage:
+            mutate_journal()
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_read",
+                    args={
+                        "recovery_handle": handle,
+                        "relative_path": "src/fix.py",
+                    },
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+
     assert access_control._has_untrusted_active_ingest(
         auth, auth.ifc_state.labels,
     ) is True
@@ -17876,8 +18217,9 @@ def test_recovery_operations_require_exact_current_ready_queue_service(
     "coding_disabled", "http_lookalike", "service_lookalike", "other_service",
     "service_trigger", "profile", "tier", "auth_trigger", "auth_channel",
     "carrier", "principal", "turn_trigger", "turn_channel", "source", "poller",
-    "event_empty", "event_wrong", "session", "turn_id", "handle", "capability",
-    "stale_ledger", "replaced_ledger", "shadow",
+    "turn_service_principal", "turn_enforcement_disabled", "event_empty", "event_wrong",
+    "session", "turn_id", "handle", "capability", "stale_ledger",
+    "replaced_ledger", "shadow",
 ])
 def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
     operation: str,
@@ -17952,6 +18294,10 @@ def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
             turn.channel_source = "webhook"
         elif mismatch == "poller":
             turn.poller_name = "other-poller"
+        elif mismatch == "turn_service_principal":
+            turn.service_principal = "poller:not-ready-queue"
+        elif mismatch == "turn_enforcement_disabled":
+            turn.access_control_enforced = False
         elif mismatch == "event_empty":
             turn.event_source_id = ""
         elif mismatch == "event_wrong":
@@ -17988,7 +18334,7 @@ def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
                 target_kind="leaf",
             )
         elif mismatch == "shadow":
-            auth = replace(auth, event_ingress="http")
+            auth = replace(auth, enforcement_enabled=False)
             turn.auth_context = auth
         decision = ToolRegistry().authorize_tool(
             operation,
