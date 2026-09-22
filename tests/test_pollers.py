@@ -725,6 +725,62 @@ def test_shipped_full_corpus_poller_grants_are_explicit_and_enumerated() -> None
     } == expected
 
 
+@pytest.mark.parametrize("coding_enabled", [False, True])
+def test_shipped_ready_queue_preserves_generic_and_appends_recovery_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    coding_enabled: bool,
+) -> None:
+    manifest_path = (
+        Path(__file__).parents[1]
+        / "mimir"
+        / "optional-skills"
+        / "chainlink-orchestrator"
+        / "pollers.json"
+    )
+    entry = next(
+        item
+        for item in json.loads(manifest_path.read_text(encoding="utf-8"))["pollers"]
+        if item["name"] == "worklink-ready-queue"
+    )
+    expected = (
+        "worklink_run", "write_file", "edit_file", "shell_exec",
+        "bash_jobs_list", "bash_job_output", "send_message", "operator_alert",
+        "worklink_recovery_inspect", "worklink_recovery_list",
+        "worklink_recovery_read", "worklink_recovery_write",
+        "worklink_recovery_delete", "worklink_recovery_test",
+        "worklink_recovery_commit", "worklink_recovery_resume",
+    )
+    monkeypatch.setenv("MIMIR_CODING_ENABLED", "1" if coding_enabled else "0")
+    state_root = tmp_path / "state" / "pollers"
+    persist_dir = state_root / entry["name"]
+    persist_dir.mkdir(parents=True)
+
+    principal = _parse_poller_authority(
+        entry["authority"],
+        name=entry["name"],
+        persist_dir=persist_dir,
+        state_root=state_root,
+        manifest_path=manifest_path,
+    )
+
+    assert tuple(entry["authority"]["capabilities"]) == expected
+    assert principal.capabilities == expected
+    assert principal.capabilities[:8] == expected[:8]
+    assert {
+        policy.operation: (policy.adapter, policy.destination)
+        for policy in principal.sink_policies
+        if policy.operation in access_control.WORKLINK_RECOVERY_OPERATIONS
+    } == {
+        operation: ("retained_recovery_selection", operation)
+        for operation in {
+            "worklink_recovery_write", "worklink_recovery_delete",
+            "worklink_recovery_test", "worklink_recovery_commit",
+            "worklink_recovery_resume",
+        }
+    }
+
+
 def test_session_boundary_poller_can_end_session_without_companions(tmp_path: Path) -> None:
     authority = _parse_poller_authority(
         _authority(

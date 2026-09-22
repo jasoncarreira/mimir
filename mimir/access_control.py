@@ -72,6 +72,30 @@ log = logging.getLogger(__name__)
 
 _MAX_REQUESTED_TARGET_LENGTH = 1024
 
+WORKLINK_RECOVERY_OPERATIONS = frozenset({
+    "worklink_recovery_inspect",
+    "worklink_recovery_list",
+    "worklink_recovery_read",
+    "worklink_recovery_write",
+    "worklink_recovery_delete",
+    "worklink_recovery_test",
+    "worklink_recovery_commit",
+    "worklink_recovery_resume",
+})
+_WORKLINK_RECOVERY_SINK_OPERATIONS = frozenset({
+    "worklink_recovery_write",
+    "worklink_recovery_delete",
+    "worklink_recovery_test",
+    "worklink_recovery_commit",
+    "worklink_recovery_resume",
+})
+_WORKLINK_RECOVERY_READY_QUEUE = "poller:worklink-ready-queue"
+_WORKLINK_RECOVERY_POLLER = "worklink-ready-queue"
+_RECOVERY_SINK_TOKEN = re.compile(
+    r"recovery:(?P<selection>[0-9a-f]{64}):(?P<target>[0-9a-f]{64}):"
+    r"(?P<operation>[a-z_]+)(?::(?P<relative>[0-9a-f]{64}))?"
+)
+
 
 class AccessTier(StrEnum):
     USER = "user"
@@ -252,6 +276,11 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "repo_revert": SinkCategory.FORGE,
     "repo_revert_abort": SinkCategory.FORGE,
     "repo_push": SinkCategory.FORGE,
+    "worklink_recovery_write": SinkCategory.FILE,
+    "worklink_recovery_delete": SinkCategory.FILE,
+    "worklink_recovery_test": SinkCategory.SHELL_PROCESS,
+    "worklink_recovery_commit": SinkCategory.FILE,
+    "worklink_recovery_resume": SinkCategory.SPAWN,
 }
 
 SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
@@ -382,6 +411,14 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "repo_revert": ToolFlowDirection.SINK,
     "repo_revert_abort": ToolFlowDirection.SINK,
     "repo_push": ToolFlowDirection.SINK,
+    "worklink_recovery_inspect": ToolFlowDirection.SOURCE,
+    "worklink_recovery_list": ToolFlowDirection.SOURCE,
+    "worklink_recovery_read": ToolFlowDirection.SOURCE,
+    "worklink_recovery_write": ToolFlowDirection.SINK,
+    "worklink_recovery_delete": ToolFlowDirection.SINK,
+    "worklink_recovery_test": ToolFlowDirection.BOTH,
+    "worklink_recovery_commit": ToolFlowDirection.SINK,
+    "worklink_recovery_resume": ToolFlowDirection.SINK,
 }
 
 IFC_POLICY_VERSION = "ifc-v1"
@@ -548,6 +585,14 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "repo_revert": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_revert_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "worklink_recovery_inspect": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_list": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_read": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_write": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_delete": CapabilityTier.SCOPE_CONTAINED,
+    "worklink_recovery_test": CapabilityTier.CODE_EXECUTION,
+    "worklink_recovery_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "worklink_recovery_resume": CapabilityTier.CODE_EXECUTION,
 }
 
 _CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
@@ -608,10 +653,12 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
         "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
         "repo_revert", "repo_revert_abort", "repo_push",
+        *WORKLINK_RECOVERY_OPERATIONS,
     }),
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
         "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
+        *WORKLINK_RECOVERY_OPERATIONS,
     },
     "heartbeat": frozenset({
         "write_file", "edit_file", "shell_exec", "bash_async",
@@ -760,7 +807,11 @@ def build_trigger_service_principal(
         destination = _OPERATION_SINK_DESTINATION.get(operation)
         if destination:
             sink_destinations.add(destination)
-        if operation in {"write_file", "edit_file"}:
+        if operation in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+            policies.append(ServiceSinkPolicy(
+                operation, "retained_recovery_selection", operation,
+            ))
+        elif operation in {"write_file", "edit_file"}:
             policies.append(ServiceSinkPolicy(
                 operation,
                 "trigger_service_write_roots",
@@ -5387,6 +5438,337 @@ def fetch_url_is_approved(target: str, auth_context: Any) -> bool:
     return adapter is not None and adapter(normalized, policy.destination)
 
 
+def _recovery_selection_digest(selection: Any) -> str:
+    """Hash the complete server-minted selection identity without its secret."""
+    values = {
+        name: getattr(selection, name)
+        for name in (
+            "handle", "event_source", "event_source_id", "service_principal",
+            "poller_name", "batch_index", "batch_count", "item_index",
+            "item_count", "delivery_key", "issue_id", "error_signature",
+            "failure_occurrence_id", "ledger_digest", "diagnostic_provenance",
+            "diagnostic_integrity", "diagnostic_integrity_effect",
+            "event_content_digest", "item_digest",
+        )
+    }
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _recovery_target_digest(selection: Any) -> str:
+    """Derive a non-path target identity from the selected ledger occurrence."""
+    payload = json.dumps({
+        "issue_id": selection.issue_id,
+        "error_signature": selection.error_signature,
+        "failure_occurrence_id": selection.failure_occurrence_id,
+        "ledger_digest": selection.ledger_digest,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class RecoveryResourceAdapter:
+    """Authorize retained recovery only from the exact ready-queue turn."""
+
+    _OPERATIONS = WORKLINK_RECOVERY_OPERATIONS
+
+    @staticmethod
+    def _selection(
+        auth_context: "AuthContext | None",
+        arguments: Mapping[str, Any] | None,
+    ) -> Any | None:
+        from ._context import get_current_turn
+        from .models import AuthContext
+        from .worklink.dispatch_failures import dispatch_failure_state_dir
+        from .worklink.recovery_dispatch import (
+            RecoveryDispatchError,
+            validate_current_selection,
+        )
+
+        if not coding_enabled() or not isinstance(auth_context, AuthContext):
+            return None
+        service = get_trusted_service_from_auth_context(auth_context)
+        if not (
+            service is not None
+            and service.canonical == _WORKLINK_RECOVERY_READY_QUEUE
+            and service.trigger == "poller"
+            and service.authority_profile == "github"
+            and service.capability_tier is CapabilityTier.CODE_EXECUTION
+            and auth_context.trigger == "poller"
+            and auth_context.channel_id == _WORKLINK_RECOVERY_READY_QUEUE
+        ):
+            return None
+        turn = get_current_turn()
+        if not (
+            turn is not None
+            and getattr(turn, "auth_context", None) is auth_context
+            and getattr(turn, "trigger", None) == "poller"
+            and getattr(turn, "channel_id", None) == auth_context.channel_id
+            and getattr(turn, "channel_source", None) == "poller"
+            and getattr(turn, "service_principal", None) == service.canonical
+            and getattr(turn, "poller_name", None) == _WORKLINK_RECOVERY_POLLER
+            and isinstance(getattr(turn, "event_source_id", None), str)
+            and bool(turn.event_source_id)
+        ):
+            return None
+        handle = arguments.get("recovery_handle") if isinstance(arguments, Mapping) else None
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if not isinstance(handle, str) or not handle or not home:
+            return None
+        try:
+            selection, _snapshot = validate_current_selection(
+                handle,
+                turn=turn,
+                state_dir=dispatch_failure_state_dir(Path(home)),
+            )
+        except (OSError, ValueError, RecoveryDispatchError):
+            return None
+        return selection
+
+    @classmethod
+    def active_turn(cls, auth_context: "AuthContext | None") -> bool:
+        """Return whether this exact carrier has any live selected recovery."""
+        from ._context import get_current_turn
+
+        turn = get_current_turn()
+        selections = getattr(turn, "recovery_selections", ()) if turn is not None else ()
+        return any(
+            cls._selection(auth_context, {"recovery_handle": selection.handle}) is selection
+            for selection in selections
+        )
+
+    @classmethod
+    def authorize_operation(
+        cls,
+        tool_name: str,
+        auth_context: "AuthContext | None",
+        arguments: Mapping[str, Any] | None,
+        *,
+        enforce: bool,
+    ) -> "ToolAuthorization":
+        selection = cls._selection(auth_context, arguments)
+        service = get_trusted_service_from_auth_context(auth_context)
+        admitted = (
+            tool_name in cls._OPERATIONS
+            and selection is not None
+            and service_can_invoke_operation(service, tool_name)
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=admitted,
+            reason=None if admitted else "recovery_service_required",
+            service_principal=service if admitted else None,
+            required_tier=AccessTier.USER if admitted else AccessTier.ADMIN,
+            enforcement_enabled=True,
+            would_block=not admitted,
+            flow_direction=get_tool_flow_direction(tool_name),
+        )
+
+
+def recovery_sink_token(
+    tool_name: str,
+    auth_context: "AuthContext | None",
+    arguments: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the server-only non-path destination for one recovery sink."""
+    if tool_name not in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+        return None
+    selection = RecoveryResourceAdapter._selection(auth_context, arguments)
+    if selection is None:
+        return None
+    token = (
+        f"recovery:{_recovery_selection_digest(selection)}:"
+        f"{_recovery_target_digest(selection)}:{tool_name}"
+    )
+    if tool_name in {"worklink_recovery_write", "worklink_recovery_delete"}:
+        relative_path = arguments.get("relative_path") if arguments is not None else None
+        if not isinstance(relative_path, str) or not relative_path:
+            return None
+        token += ":" + hashlib.sha256(relative_path.encode("utf-8")).hexdigest()
+    return token
+
+
+def _target_matches_retained_recovery_selection(
+    target: str,
+    destination: str,
+    service: "ServicePrincipal | None" = None,
+    *,
+    auth_context: "AuthContext | None" = None,
+) -> bool:
+    """Validate a BudgetGate-issued token against the live selected incident."""
+    match = _RECOVERY_SINK_TOKEN.fullmatch(target)
+    if (
+        match is None
+        or destination not in _WORKLINK_RECOVERY_SINK_OPERATIONS
+        or match.group("operation") != destination
+        or service is None
+        or service != get_trusted_service_from_auth_context(auth_context)
+    ):
+        return False
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    for selection in getattr(turn, "recovery_selections", ()) if turn is not None else ():
+        if (
+            match.group("selection") == _recovery_selection_digest(selection)
+            and match.group("target") == _recovery_target_digest(selection)
+            and RecoveryResourceAdapter._selection(
+                auth_context, {"recovery_handle": selection.handle},
+            ) is selection
+        ):
+            needs_relative = destination in {
+                "worklink_recovery_write", "worklink_recovery_delete",
+            }
+            return bool(match.group("relative")) is needs_relative
+    return False
+
+
+_RECOVERY_BOUNDARY_GRANT_ISSUER = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class RecoveryBoundaryGrant:
+    """Immutable proof that the dedicated retained-checkout boundary is live."""
+
+    selection_digest: str
+    target_digest: str
+    checkout_root: str
+    checkout_device: int
+    checkout_inode: int
+    repository_slug: str
+    service_principal: str
+    _issuer: object = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        *,
+        _issuer: object,
+        selection_digest: str,
+        target_digest: str,
+        checkout_root: str,
+        checkout_device: int,
+        checkout_inode: int,
+        repository_slug: str,
+        service_principal: str,
+    ) -> None:
+        if _issuer is not _RECOVERY_BOUNDARY_GRANT_ISSUER:
+            raise TypeError("recovery boundary grants must be minted by access control")
+        for name, value in locals().copy().items():
+            if name not in {"self", "_issuer"}:
+                object.__setattr__(self, name, value)
+        object.__setattr__(self, "_issuer", _issuer)
+
+
+def issue_recovery_boundary_grant(
+    auth_context: "AuthContext | None",
+    *,
+    recovery_handle: str,
+    target_digest: str,
+    repository_slug: str,
+    repository_root: Path | str,
+    repository_origin: str,
+    checkout_root: Path | str,
+    checkout_device: int,
+    checkout_inode: int,
+    admitted: bool,
+) -> RecoveryBoundaryGrant:
+    """Mint trust only after repository, checkout, and dedicated sinks agree."""
+    selection = RecoveryResourceAdapter._selection(
+        auth_context, {"recovery_handle": recovery_handle},
+    )
+    service = get_trusted_service_from_auth_context(auth_context)
+    if selection is None or service is None or not admitted:
+        raise ValueError("recovery boundary is not admitted for the current selection")
+    if not re.fullmatch(r"[0-9a-f]{64}", target_digest):
+        raise ValueError("recovery target digest is invalid")
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        raise ValueError("recovery repository inventory is unavailable")
+    from .repository_config import RepositoryInventory
+
+    inventory = RepositoryInventory.load(Path(home) / "repositories.yaml")
+    repository = inventory.coding_target(
+        repository_slug,
+        authorized_roots=tuple(inventory.root_mode_map().items()),
+    )
+    if (
+        repository.root != Path(repository_root).resolve()
+        or repository.origin != repository_origin
+    ):
+        raise ValueError("recovery repository binding does not match inventory")
+    checkout = Path(checkout_root)
+    try:
+        resolved_checkout = checkout.resolve(strict=True)
+        checkout_stat = resolved_checkout.stat()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("recovery checkout identity is unavailable") from exc
+    if (
+        not resolved_checkout.is_dir()
+        or type(checkout_device) is not int
+        or type(checkout_inode) is not int
+        or (checkout_stat.st_dev, checkout_stat.st_ino)
+        != (checkout_device, checkout_inode)
+    ):
+        raise ValueError("recovery checkout identity changed")
+    for operation in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+        policy = service.sink_policy_for(operation)
+        if policy != ServiceSinkPolicy(
+            operation, "retained_recovery_selection", operation,
+        ):
+            raise ValueError("dedicated recovery sink policy is incomplete")
+    return RecoveryBoundaryGrant(
+        _issuer=_RECOVERY_BOUNDARY_GRANT_ISSUER,
+        selection_digest=_recovery_selection_digest(selection),
+        target_digest=target_digest,
+        checkout_root=str(resolved_checkout),
+        checkout_device=checkout_device,
+        checkout_inode=checkout_inode,
+        repository_slug=repository.slug,
+        service_principal=service.canonical,
+    )
+
+
+def recovery_protected_result_source(
+    grant: RecoveryBoundaryGrant,
+    *,
+    domain: str,
+    resource_id: str,
+) -> "SourceLabel":
+    """Construct one trusted retained-result source from an issued grant."""
+    if (
+        not isinstance(grant, RecoveryBoundaryGrant)
+        or grant._issuer is not _RECOVERY_BOUNDARY_GRANT_ISSUER
+        or domain not in {
+            "worklink_recovery_state", "worklink_recovery_checkout",
+            "worklink_recovery_test", "worklink_recovery_control",
+        }
+        or not isinstance(resource_id, str)
+        or not resource_id
+    ):
+        raise ValueError("invalid recovery protected-result source")
+    if domain == "worklink_recovery_checkout":
+        try:
+            resource = Path(resource_id).resolve(strict=True)
+            root = Path(grant.checkout_root).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("recovery result path is unavailable") from exc
+        if resource != root and not resource.is_relative_to(root):
+            raise ValueError("recovery result path is outside the admitted checkout")
+        resource_id = str(resource)
+    principal = f"service:{grant.service_principal}"
+    return replace(
+        protected_result_source(
+            None,
+            principal=principal,
+            domain=domain,
+            resource_id=resource_id,
+            bridge_instance="worklink_recovery",
+        ),
+        integrity="trusted",
+        integrity_effect="informational",
+    )
+
+
 def _sink_adapter_admits(
     adapter: Any,
     target: str,
@@ -5418,6 +5800,10 @@ def _sink_adapter_admits(
             service == get_trusted_service_from_auth_context(auth_context)
             and adapter(target, destination, auth_context=auth_context)
         )
+    if adapter is _target_matches_retained_recovery_selection:
+        return adapter(
+            target, destination, service, auth_context=auth_context,
+        )
     if adapter is _target_matches_shell_profile:
         # Authorization validates the argv shape only. Filesystem operands are
         # resolved once by the execution binder after it has the authoritative
@@ -5443,6 +5829,7 @@ _SERVICE_SINK_ADAPTERS: dict[str, Callable[[str, str], bool]] = {
     "operator_alert": _target_matches_operator_alert,
     "approved_urls": _target_matches_approved_url,
     "github_pr_api": _target_matches_github_pr_api,
+    "retained_recovery_selection": _target_matches_retained_recovery_selection,
 }
 
 _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
@@ -6064,7 +6451,10 @@ class SinkGate:
                     None,
                 )
             return (
-                tool_name == "worklink_run"
+                tool_name in {
+                    "worklink_run", "worklink_recovery_test",
+                    "worklink_recovery_resume",
+                }
                 and not has_untrusted_active_ingest,
                 None,
             )
@@ -6279,6 +6669,24 @@ class SinkGate:
             auth_context, ifc_labels,
             missing_is_tainted=tool_name in {"shell_exec", "bash_async"},
         )
+        if (
+            tool_name in _WORKLINK_RECOVERY_SINK_OPERATIONS
+            and sink_category in {
+                SinkCategory.FILE, SinkCategory.SHELL_PROCESS, SinkCategory.SPAWN,
+            }
+            and has_untrusted_active_ingest
+        ):
+            return ToolAuthorization(
+                tool_name=tool_name,
+                decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=False,
+                reason=f"ifc_label_blocked:{sink_category.value}",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=True,
+                resolved_sink_target=resolved_target,
+            )
         client_authorized = False
         if client_authorized_host_execution is not None:
             from .tools.client_provider import client_authorized_host_execution_matches
@@ -6943,6 +7351,8 @@ class SinkGate:
                 return frozenset({target})
             return frozenset()
         if service is not None and service_policy is not None and target is not None:
+            if tool_name in _WORKLINK_RECOVERY_SINK_OPERATIONS:
+                return frozenset({target})
             source_channels = getattr(ifc_labels, "source_channels", None)
             service_channel = getattr(auth_context, "channel_id", None)
             if (
@@ -7021,6 +7431,11 @@ def normalize_sink_destination(
     value = destination.strip()
     if not value or "\x00" in value:
         return None
+    if (
+        category in {SinkCategory.FILE, SinkCategory.SHELL_PROCESS, SinkCategory.SPAWN}
+        and _RECOVERY_SINK_TOKEN.fullmatch(value) is not None
+    ):
+        return value
     if category in {SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}:
         return ChannelResourceAdapter._resolve_channel(value) or None
     if category in {SinkCategory.FILE, SinkCategory.SPAWN}:
@@ -7054,6 +7469,8 @@ def resolve_sink_target(
     service: ServicePrincipal | None,
 ) -> str | None:
     """Return the concrete destination representation evaluated by the gate."""
+    if _RECOVERY_SINK_TOKEN.fullmatch(target) is not None:
+        return normalize_sink_destination(sink_category, target)
     if sink_category is not SinkCategory.SHELL_PROCESS:
         return normalize_sink_destination(sink_category, target)
     try:
@@ -7669,6 +8086,7 @@ class OperationCatalog:
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
         | frozenset({"hands_read"})
+        | WORKLINK_RECOVERY_OPERATIONS
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -8633,6 +9051,44 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in WORKLINK_RECOVERY_OPERATIONS:
+            recovery_auth = RecoveryResourceAdapter.authorize_operation(
+                tool_name, auth_context, arguments, enforce=enforce,
+            )
+            if not recovery_auth.allowed:
+                return finish(recovery_auth)
+            flow_direction = get_tool_flow_direction(tool_name)
+            if flow_direction in {ToolFlowDirection.SINK, ToolFlowDirection.BOTH}:
+                if ifc_labels is None and auth_context is not None:
+                    ifc_labels = getattr(auth_context, "ifc_labels", None)
+                sink_category = get_sink_category(tool_name)
+                sink_check = SinkGate.check_sink_flow(
+                    tool_name,
+                    sink_target,
+                    ifc_labels,
+                    auth_context,
+                    enforce=True,
+                )
+                sink_check.flow_direction = flow_direction
+                if not sink_check.allowed:
+                    return finish(sink_check)
+                recovery_auth.resolved_sink_target = sink_check.resolved_sink_target
+            return finish(recovery_auth)
+        if (
+            tool_name in {"write_file", "edit_file", "worklink_run"}
+            and RecoveryResourceAdapter.active_turn(auth_context)
+        ):
+            return finish(ToolAuthorization(
+                tool_name=tool_name,
+                decision=get_operation_catalog().get_decision(tool_name, auth_context),
+                allowed=False,
+                reason="active_recovery_dedicated_tools_required",
+                service_principal=service,
+                required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True,
+                would_block=True,
+                flow_direction=get_tool_flow_direction(tool_name),
+            ))
         if (
             service is not None
             and service.authority_profile == "session-boundary"
@@ -9260,6 +9716,14 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "repo_revert": "repository",
     "repo_revert_abort": "repository",
     "repo_push": "repository",
+    "worklink_recovery_inspect": "worklink_recovery_state",
+    "worklink_recovery_list": "worklink_recovery_checkout",
+    "worklink_recovery_read": "worklink_recovery_checkout",
+    "worklink_recovery_write": "worklink_recovery_control",
+    "worklink_recovery_delete": "worklink_recovery_control",
+    "worklink_recovery_test": "worklink_recovery_test",
+    "worklink_recovery_commit": "worklink_recovery_control",
+    "worklink_recovery_resume": "worklink_recovery_control",
 }
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
@@ -9361,6 +9825,10 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "repo_diff",
     "repo_unmerged",
     "hands_read",
+    "worklink_recovery_inspect",
+    "worklink_recovery_list",
+    "worklink_recovery_read",
+    "worklink_recovery_test",
 })
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
@@ -10081,7 +10549,11 @@ def classify_protected_result(
         # turn rather than silently laundering integrity through the tool.
         domain = "unknown"
 
-    if failed:
+    if failed and not (
+        tool_name in WORKLINK_RECOVERY_OPERATIONS
+        and provenance is not None
+        and not isinstance(result, BaseException)
+    ):
         return _incomplete_protected_result(
             domain, args, tool_name=tool_name, auth_context=auth_context,
         )
@@ -10309,6 +10781,10 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "memory_get": "saga",
     "hands_read": "client_provider",
     "hands_python": "client_provider",
+    "worklink_recovery_inspect": "worklink_recovery_state",
+    "worklink_recovery_list": "worklink_recovery_checkout",
+    "worklink_recovery_read": "worklink_recovery_checkout",
+    "worklink_recovery_test": "worklink_recovery_checkout",
     **{
         operation: "repository"
         for operation, direction in _TOOL_FLOW_MAP.items()
@@ -10390,6 +10866,11 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "repo_revert": "bound_pull_request",
     "repo_revert_abort": "bound_pull_request",
     "repo_push": "bound_pull_request",
+    "worklink_recovery_write": "filesystem",
+    "worklink_recovery_delete": "filesystem",
+    "worklink_recovery_test": "shell_process",
+    "worklink_recovery_commit": "filesystem",
+    "worklink_recovery_resume": "spawn_process",
 }
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
