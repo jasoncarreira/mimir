@@ -16503,6 +16503,8 @@ def _write_recovery_admission(
     turn: TurnContext,
     *,
     checkout: Path | None = None,
+    compatibility_code: str = "current",
+    controllable: bool = True,
 ) -> tuple[Path, Path, str]:
     from dataclasses import fields
 
@@ -16566,8 +16568,8 @@ def _write_recovery_admission(
         "operation_inode": checkout_stat.st_ino,
     }
     target = {
-        "compatibility_code": "current",
-        "controllable": True,
+        "compatibility_code": compatibility_code,
+        "controllable": controllable,
         "factory": None,
         "leaf": leaf,
         "repository": repository_record,
@@ -16745,12 +16747,83 @@ def _recovery_result(
     }
 
 
+_RECOVERY_INVALID_RESULT_FIELDS = {
+    "worklink_recovery_inspect": (
+        "ok", "code", "selection_digest", "target_digest", "issue_id", "attempt",
+        "target_kind", "repository", "branch", "controllable",
+    ),
+    "worklink_recovery_list": ("ok", "code", "files", "target_digest"),
+    "worklink_recovery_read": (
+        "ok", "code", "target_digest", "relative_path", "content", "sha256",
+        "size", "offset", "complete",
+    ),
+    "worklink_recovery_write": (
+        "ok", "code", "operation_id", "request_digest", "outcome",
+        "relative_path", "sha256",
+    ),
+    "worklink_recovery_delete": (
+        "ok", "code", "operation_id", "request_digest", "outcome",
+        "relative_path", "sha256",
+    ),
+    "worklink_recovery_test": (
+        "ok", "code", "operation_id", "request_digest", "test_key", "exit_code",
+        "stdout", "stderr", "replayed",
+    ),
+    "worklink_recovery_commit": (
+        "ok", "code", "operation_id", "request_digest", "commit", "tree", "outcome",
+    ),
+    "worklink_recovery_resume": (
+        "ok", "code", "operation_id", "request_digest", "outcome", "incident_retired",
+    ),
+}
+
+
 _WORKLINK_RECOVERY_POLLER = "worklink-ready-queue"
 _WORKLINK_RECOVERY_READY_QUEUE = "poller:worklink-ready-queue"
 
 
 def test_recovery_catalog_is_complete_and_excluded_from_other_profiles() -> None:
     operations = access_control.WORKLINK_RECOVERY_OPERATIONS
+    expected_flows = {
+        "worklink_recovery_inspect": access_control.ToolFlowDirection.SOURCE,
+        "worklink_recovery_list": access_control.ToolFlowDirection.SOURCE,
+        "worklink_recovery_read": access_control.ToolFlowDirection.SOURCE,
+        "worklink_recovery_write": access_control.ToolFlowDirection.SINK,
+        "worklink_recovery_delete": access_control.ToolFlowDirection.SINK,
+        "worklink_recovery_test": access_control.ToolFlowDirection.BOTH,
+        "worklink_recovery_commit": access_control.ToolFlowDirection.SINK,
+        "worklink_recovery_resume": access_control.ToolFlowDirection.SINK,
+    }
+    expected_sinks = {
+        "worklink_recovery_write": SinkCategory.FILE,
+        "worklink_recovery_delete": SinkCategory.FILE,
+        "worklink_recovery_test": SinkCategory.SHELL_PROCESS,
+        "worklink_recovery_commit": SinkCategory.FILE,
+        "worklink_recovery_resume": SinkCategory.SPAWN,
+    }
+    expected_read_domains = {
+        "worklink_recovery_inspect": "worklink_recovery_state",
+        "worklink_recovery_list": "worklink_recovery_checkout",
+        "worklink_recovery_read": "worklink_recovery_checkout",
+        "worklink_recovery_test": "worklink_recovery_checkout",
+    }
+    expected_result_domains = {
+        "worklink_recovery_inspect": "worklink_recovery_state",
+        "worklink_recovery_list": "worklink_recovery_checkout",
+        "worklink_recovery_read": "worklink_recovery_checkout",
+        "worklink_recovery_write": "worklink_recovery_control",
+        "worklink_recovery_delete": "worklink_recovery_control",
+        "worklink_recovery_test": "worklink_recovery_test",
+        "worklink_recovery_commit": "worklink_recovery_control",
+        "worklink_recovery_resume": "worklink_recovery_control",
+    }
+    expected_destinations = {
+        "worklink_recovery_write": "filesystem",
+        "worklink_recovery_delete": "filesystem",
+        "worklink_recovery_test": "shell_process",
+        "worklink_recovery_commit": "filesystem",
+        "worklink_recovery_resume": "spawn_process",
+    }
     assert operations <= access_control.TRIGGER_AUTHORITY_PROFILES["github"]
     assert all(
         operations.isdisjoint(capabilities)
@@ -16774,6 +16847,45 @@ def test_recovery_catalog_is_complete_and_excluded_from_other_profiles() -> None
     assert {
         operation: catalog.get_decision(operation) for operation in operations
     } == {operation: OperationDecision.RESOURCE_SCOPED for operation in operations}
+    assert {
+        operation: access_control._TOOL_FLOW_MAP[operation]
+        for operation in operations
+    } == expected_flows
+    assert {
+        operation: access_control._SINK_CATEGORY_MAP[operation]
+        for operation in operations if operation in access_control._SINK_CATEGORY_MAP
+    } == expected_sinks
+    assert {
+        operation: access_control._OPERATION_READABLE_DOMAIN[operation]
+        for operation in operations
+        if operation in access_control._OPERATION_READABLE_DOMAIN
+    } == expected_read_domains
+    assert {
+        operation: access_control._PROTECTED_RESULT_DOMAINS[operation]
+        for operation in operations
+    } == expected_result_domains
+    assert {
+        operation: access_control._OPERATION_SINK_DESTINATION[operation]
+        for operation in operations
+        if operation in access_control._OPERATION_SINK_DESTINATION
+    } == expected_destinations
+    assert operations & access_control._READ_BACKEND_RESULT_TOOLS == {
+        "worklink_recovery_inspect", "worklink_recovery_list",
+        "worklink_recovery_read", "worklink_recovery_test",
+    }
+    assert operations <= OperationCatalog._RESOURCE_SCOPED_OPERATIONS
+    assert operations.isdisjoint(OperationCatalog._ADMIN_REQUIRED_OPERATIONS)
+    assert operations.isdisjoint(OperationCatalog._ADMIN_BUILTIN_TOOL_NAMES)
+    assert operations.isdisjoint(access_control._NON_INGESTING_RESULT_TOOLS)
+    assert operations.isdisjoint(access_control._FIXED_SERVICE_SINK_OPERATIONS)
+    assert all(
+        operations.isdisjoint(capabilities)
+        for capabilities in access_control.BOUNDED_PROFILE_CAPABILITIES.values()
+    )
+    assert (
+        access_control._SERVICE_SINK_ADAPTERS["retained_recovery_selection"]
+        is access_control._target_matches_retained_recovery_selection
+    )
 
 
 @pytest.mark.parametrize("operation", sorted(access_control.WORKLINK_RECOVERY_OPERATIONS))
@@ -16838,6 +16950,121 @@ def test_recovery_protected_success_traverses_capture_and_middleware(
     )
 
 
+@pytest.mark.parametrize("case", [
+    "traversal", "absolute", "git_metadata", "missing", "directory_symlink",
+])
+def test_recovery_read_rejects_every_unsafe_file_location(
+    case: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    paths = {
+        "traversal": "../escape.py",
+        "absolute": str(tmp_path / "absolute.py"),
+        "git_metadata": ".git/config",
+        "missing": "src/missing.py",
+        "directory_symlink": "linked/fix.py",
+    }
+    relative_path = paths[case]
+    if case == "git_metadata":
+        path = checkout / ".git" / "config"
+        path.parent.mkdir()
+        path.write_text("fixed\n", encoding="utf-8")
+    elif case == "directory_symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "fix.py").write_text("fixed\n", encoding="utf-8")
+        (checkout / "linked").symlink_to(outside, target_is_directory=True)
+    elif case == "absolute":
+        Path(relative_path).write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result(
+        "worklink_recovery_read", target_digest, relative_path=relative_path,
+    )
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError, match="protected contract"):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_read",
+                    args={
+                        "recovery_handle": handle,
+                        "relative_path": "src/fix.py",
+                    },
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("files", [
+    ["src/b.py", "src/a.py"],
+    ["src/a.py", "src/a.py"],
+])
+def test_recovery_list_rejects_unsorted_or_duplicate_paths(
+    files: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    source = checkout / "src"
+    source.mkdir()
+    (source / "a.py").write_text("a\n", encoding="utf-8")
+    (source / "b.py").write_text("b\n", encoding="utf-8")
+    result = _recovery_result(
+        "worklink_recovery_list", target_digest, files=files,
+    )
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_list", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError, match="protected contract"):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_list",
+                    args={"recovery_handle": handle},
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
 @pytest.mark.parametrize("operation", sorted(access_control.WORKLINK_RECOVERY_OPERATIONS))
 def test_recovery_publication_rejects_non_exact_result_contract(
     operation: str,
@@ -16868,6 +17095,275 @@ def test_recovery_publication_rejects_non_exact_result_contract(
         reset_current_turn(token)
 
     assert provenance is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "field"),
+    [
+        (operation, field)
+        for operation, fields in _RECOVERY_INVALID_RESULT_FIELDS.items()
+        for field in fields
+    ],
+)
+def test_recovery_publication_rejects_every_invalid_result_field(
+    operation: str,
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result(
+        operation,
+        target_digest,
+        files=["src/fix.py"] if operation == "worklink_recovery_list" else None,
+    )
+    if operation == "worklink_recovery_inspect":
+        result["selection_digest"] = access_control._recovery_selection_digest(
+            turn.recovery_selections[0]
+        )
+    if operation == "worklink_recovery_read" and field in result["read"]:
+        read = result["read"]
+        assert isinstance(read, dict)
+        invalid = {
+            "relative_path": "../escape",
+            "content": "tampered\n",
+            "sha256": "0" * 64,
+            "size": 7,
+            "offset": -1,
+            "complete": False,
+        }
+        read[field] = invalid[field]
+    else:
+        invalid: dict[str, object] = {
+            "ok": False if result["ok"] is True else True,
+            "code": "invalid",
+            "selection_digest": "0" * 64,
+            "target_digest": "0" * 64,
+            "issue_id": 1784,
+            "attempt": 3,
+            "target_kind": "factory",
+            "repository": "other/repo",
+            "branch": "other/branch",
+            "controllable": False,
+            "files": ["missing.py"],
+            "operation_id": "not-a-uuid",
+            "request_digest": "0" * 63,
+            "outcome": "invalid",
+            "relative_path": "../escape",
+            "sha256": (
+                None if operation == "worklink_recovery_write" else "0" * 64
+            ),
+            "test_key": "0" * 63,
+            "exit_code": "1",
+            "stdout": 1,
+            "stderr": 1,
+            "replayed": "false",
+            "commit": "0" * 39,
+            "tree": "0" * 39,
+            "incident_retired": False,
+        }
+        result[field] = invalid[field]
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+        arguments: dict[str, object] = {"recovery_handle": handle}
+        if operation in {
+            "worklink_recovery_read", "worklink_recovery_write",
+            "worklink_recovery_delete",
+        }:
+            arguments["relative_path"] = "src/fix.py"
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, operation, result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError, match="protected contract"):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(auth, tool_name=operation, args=arguments),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+def test_recovery_empty_file_read_is_exact_trusted_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "empty.txt"
+    retained_file.write_bytes(b"")
+    result = _recovery_result(
+        "worklink_recovery_read", target_digest, relative_path="empty.txt",
+    )
+    result["read"] = {
+        "relative_path": "empty.txt",
+        "content": "",
+        "sha256": hashlib.sha256(b"").hexdigest(),
+        "size": 0,
+        "offset": 0,
+        "complete": True,
+    }
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+        request = _tool_request(
+            auth,
+            tool_name="worklink_recovery_read",
+            args={"recovery_handle": handle, "relative_path": "empty.txt"},
+        )
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        BudgetGateMiddleware().wrap_tool_call(request, handler)
+    finally:
+        reset_current_turn(token)
+
+    sources = [
+        source for source in auth.ifc_state.labels.sources
+        if source.domain == "worklink_recovery_checkout"
+    ]
+    assert [(source.resource_id, source.integrity, source.integrity_effect) for source in sources] == [
+        (str(retained_file.resolve()), "trusted", "informational")
+    ]
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is False
+
+
+@pytest.mark.parametrize("operation", [
+    "worklink_recovery_write", "worklink_recovery_delete",
+    "worklink_recovery_commit", "worklink_recovery_resume",
+])
+def test_recovery_already_applied_results_publish_exact_control_source(
+    operation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, _checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    result = _recovery_result(
+        operation,
+        target_digest,
+        resume_outcome="already_applied",
+    )
+    if operation != "worklink_recovery_resume":
+        result["outcome"] = "already_applied"
+    arguments: dict[str, object] = {"recovery_handle": handle}
+    if operation in {"worklink_recovery_write", "worklink_recovery_delete"}:
+        arguments["relative_path"] = "src/fix.py"
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(grant, operation, result)
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        BudgetGateMiddleware().wrap_tool_call(
+            _tool_request(auth, tool_name=operation, args=arguments), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert any(
+        source.domain == "worklink_recovery_control"
+        and source.integrity == "trusted"
+        and source.integrity_effect == "informational"
+        for source in auth.ifc_state.labels.sources
+    )
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is False
+
+
+def test_recovery_legacy_inspect_matches_exact_selected_compatibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, _checkout, target_digest = _write_recovery_admission(
+        tmp_path,
+        turn,
+        compatibility_code="legacy_leaf_uncontrollable",
+        controllable=False,
+    )
+    result = _recovery_result("worklink_recovery_inspect", target_digest)
+    result.update({
+        "code": "legacy_leaf_uncontrollable",
+        "controllable": False,
+        "selection_digest": access_control._recovery_selection_digest(
+            turn.recovery_selections[0]
+        ),
+    })
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_inspect", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        BudgetGateMiddleware().wrap_tool_call(
+            _tool_request(
+                auth,
+                tool_name="worklink_recovery_inspect",
+                args={"recovery_handle": handle},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    sources = [
+        source for source in auth.ifc_state.labels.sources
+        if source.domain == "worklink_recovery_state"
+    ]
+    assert len(sources) == 2
+    assert all(
+        source.integrity == "trusted"
+        and source.integrity_effect == "informational"
+        for source in sources
+    )
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is False
 
 
 def test_recovery_empty_list_is_grant_bound_authoritative_empty(
@@ -17053,13 +17549,201 @@ def test_recovery_non_success_paths_cross_capture_and_middleware(
         ) is True
 
 
+def test_recovery_cross_operation_publication_fails_closed_through_middleware(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, _checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    result = _recovery_result("worklink_recovery_inspect", target_digest)
+    result["selection_digest"] = access_control._recovery_selection_digest(
+        turn.recovery_selections[0]
+    )
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_inspect", result,
+            )
+            return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+        BudgetGateMiddleware().wrap_tool_call(
+            _tool_request(
+                auth,
+                tool_name="worklink_recovery_list",
+                args={"recovery_handle": handle},
+            ),
+            handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+def test_recovery_duplicate_publication_invalidates_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    operation = "worklink_recovery_read"
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result(operation, target_digest)
+    arguments = {"recovery_handle": handle, "relative_path": "src/fix.py"}
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(grant, operation, result)
+            access_control.publish_recovery_protected_result(grant, operation, result)
+            return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+        with pytest.raises(ValueError, match="more than once"):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(auth, tool_name=operation, args=arguments), handler,
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("stale", [
+    "selection_record", "admission_record", "inventory", "repository", "checkout",
+])
+def test_recovery_stale_grant_cannot_publish(
+    stale: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result("worklink_recovery_read", target_digest)
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+        if stale == "checkout":
+            checkout.rename(tmp_path / "stale-checkout")
+            checkout.mkdir()
+        elif stale == "repository":
+            repository.rename(tmp_path / "stale-repository")
+            repository.mkdir()
+        elif stale == "inventory":
+            inventory = tmp_path / "repositories.yaml"
+            inventory.write_text(
+                inventory.read_text(encoding="utf-8").replace("mode: rw", "mode: ro"),
+                encoding="utf-8",
+            )
+        else:
+            root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
+            path = (
+                root / "selections" / f"{grant.selection_digest}.json"
+                if stale == "selection_record"
+                else root / "targets" / target_digest / "admission.json"
+            )
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["updated_at" if stale == "admission_record" else "created_at"] = (
+                "2026-09-22T00:00:02+00:00"
+            )
+            path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            path.chmod(0o600)
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                grant, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError, match="stale|no longer matches"):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_read",
+                    args={
+                        "recovery_handle": handle,
+                        "relative_path": "src/fix.py",
+                    },
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("operation", [
+    "worklink_recovery_read", "worklink_recovery_write", "worklink_recovery_delete",
+])
+def test_recovery_argument_result_path_mismatch_fails_closed_through_middleware(
+    operation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    result_file = checkout / "src" / "result.py"
+    result_file.parent.mkdir()
+    result_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result(
+        operation, target_digest, relative_path="src/result.py",
+    )
+    arguments = {
+        "recovery_handle": handle,
+        "relative_path": "src/request.py",
+    }
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(grant, operation, result)
+            return ToolMessage(content=json.dumps(result), tool_call_id=call.tool_call["id"])
+
+        BudgetGateMiddleware().wrap_tool_call(
+            _tool_request(auth, tool_name=operation, args=arguments), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
 def test_retained_read_preserves_shell_while_external_read_blocks_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     repo_review_git_root: Path,
 ) -> None:
     from langchain_core.messages import ToolMessage
-    from mimir.models import InformationFlowState
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     middleware = BudgetGateMiddleware()
@@ -17118,35 +17802,37 @@ def test_retained_read_preserves_shell_while_external_read_blocks_it(
             ),
             recovery_shell,
         )
+        assert retained_shell.status != "error"
+
+        external = (
+            tmp_path / "home" / "state" / "pollers"
+            / _WORKLINK_RECOVERY_POLLER / "external.txt"
+        )
+        external.write_text("external\n", encoding="utf-8")
+        active_auth = turn.auth_context
+        assert active_auth is not None
+        middleware.wrap_tool_call(
+            _tool_request(
+                active_auth, tool_name="read_file",
+                args={"file_path": str(external)},
+            ),
+            lambda call: ToolMessage(
+                content=external.read_text(encoding="utf-8"),
+                tool_call_id=call.tool_call["id"],
+            ),
+        )
+        active_auth = turn.auth_context
+        assert active_auth is not None
+        external_shell = middleware.wrap_tool_call(
+            _tool_request(
+                active_auth, tool_name="shell_exec",
+                args={"command": "git status --short"},
+            ),
+            lambda _call: pytest.fail("external-content shell executed"),
+        )
     finally:
         reset_current_turn(token)
 
-    external = tmp_path / "external.txt"
-    external.write_text("external\n", encoding="utf-8")
-    external_auth = _write_auth(admin=True)
-    external_auth = replace(
-        external_auth,
-        ifc_state=InformationFlowState(labels=external_auth.ifc_labels),
-    )
-    middleware.wrap_tool_call(
-        _tool_request(
-            external_auth, tool_name="read_file",
-            args={"file_path": str(external)},
-        ),
-        lambda call: ToolMessage(
-            content=external.read_text(encoding="utf-8"),
-            tool_call_id=call.tool_call["id"],
-        ),
-    )
-    external_shell = middleware.wrap_tool_call(
-        _tool_request(
-            external_auth, tool_name="shell_exec",
-            args={"command": "pwd"},
-        ),
-        lambda _call: pytest.fail("external-content shell executed"),
-    )
-
-    assert retained_shell.status != "error"
     assert recovery_shell_calls == 1
     assert external_shell.status == "error"
     assert "ifc_label_blocked:shell_process" in str(external_shell.content)
@@ -17187,8 +17873,11 @@ def test_recovery_operations_require_exact_current_ready_queue_service(
 
 @pytest.mark.parametrize("operation", sorted(access_control.WORKLINK_RECOVERY_OPERATIONS))
 @pytest.mark.parametrize("mismatch", [
-    "coding_disabled", "carrier", "principal", "channel", "source", "poller",
-    "event", "handle", "capability",
+    "coding_disabled", "http_lookalike", "service_lookalike", "other_service",
+    "service_trigger", "profile", "tier", "auth_trigger", "auth_channel",
+    "carrier", "principal", "turn_trigger", "turn_channel", "source", "poller",
+    "event_empty", "event_wrong", "session", "turn_id", "handle", "capability",
+    "stale_ledger", "replaced_ledger", "shadow",
 ])
 def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
     operation: str,
@@ -17206,23 +17895,71 @@ def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
         sink_target = access_control.recovery_sink_token(operation, auth, arguments)
         if mismatch == "coding_disabled":
             monkeypatch.setenv("MIMIR_CODING_ENABLED", "0")
-        elif mismatch == "carrier":
-            turn.auth_context = replace(auth)
-        elif mismatch == "principal":
+        elif mismatch == "http_lookalike":
+            auth = replace(auth, event_ingress="http")
+            turn.auth_context = auth
+        elif mismatch == "service_lookalike":
+            auth = replace(
+                auth, service_authority={"canonical": _WORKLINK_RECOVERY_READY_QUEUE},
+            )
+            turn.auth_context = auth
+        elif mismatch == "other_service":
             altered_service = replace(
-                auth.service_authority, canonical="poller:not-ready-queue",
+                auth.service_authority, canonical="poller:github-activity",
+            )
+            auth = replace(
+                auth,
+                canonical_principal=altered_service.canonical,
+                service_authority=altered_service,
+            )
+            turn.auth_context = auth
+            turn.service_principal = altered_service.canonical
+        elif mismatch == "service_trigger":
+            altered_service = replace(
+                auth.service_authority, trigger="scheduled_tick",
             )
             auth = replace(auth, service_authority=altered_service)
             turn.auth_context = auth
-            turn.service_principal = altered_service.canonical
-        elif mismatch == "channel":
+        elif mismatch == "profile":
+            altered_service = replace(
+                auth.service_authority, authority_profile="heartbeat",
+            )
+            auth = replace(auth, service_authority=altered_service)
+            turn.auth_context = auth
+        elif mismatch == "tier":
+            altered_service = replace(
+                auth.service_authority,
+                capability_tier=CapabilityTier.SCOPE_CONTAINED,
+            )
+            auth = replace(auth, service_authority=altered_service)
+            turn.auth_context = auth
+        elif mismatch == "auth_trigger":
+            auth = replace(auth, trigger="scheduled_tick")
+            turn.auth_context = auth
+        elif mismatch == "auth_channel":
+            auth = replace(auth, channel_id="poller:not-ready-queue")
+            turn.auth_context = auth
+        elif mismatch == "carrier":
+            turn.auth_context = replace(auth)
+        elif mismatch == "principal":
+            auth = replace(auth, canonical_principal="poller:not-ready-queue")
+            turn.auth_context = auth
+        elif mismatch == "turn_trigger":
+            turn.trigger = "scheduled_tick"
+        elif mismatch == "turn_channel":
             turn.channel_id = "poller:not-ready-queue"
         elif mismatch == "source":
             turn.channel_source = "webhook"
         elif mismatch == "poller":
             turn.poller_name = "other-poller"
-        elif mismatch == "event":
+        elif mismatch == "event_empty":
+            turn.event_source_id = ""
+        elif mismatch == "event_wrong":
             turn.event_source_id = "poller:event:other"
+        elif mismatch == "session":
+            turn.session_id = "poller:other-session"
+        elif mismatch == "turn_id":
+            turn.turn_id = "other-turn"
         elif mismatch == "handle":
             arguments["recovery_handle"] = "forged-handle"
         elif mismatch == "capability":
@@ -17234,6 +17971,24 @@ def test_recovery_operations_reject_every_ready_queue_selection_mismatch(
                 ),
             )
             auth = replace(auth, service_authority=altered_service)
+            turn.auth_context = auth
+        elif mismatch in {"stale_ledger", "replaced_ledger"}:
+            from mimir.worklink.diagnostics import server_fixed
+            from mimir.worklink.dispatch_failures import (
+                dispatch_failure_state_dir,
+                record_failure,
+            )
+            record_failure(
+                dispatch_failure_state_dir(tmp_path),
+                issue_id=1783,
+                attempt=3 if mismatch == "replaced_ledger" else 2,
+                exit_status=1,
+                error=server_fixed("replacement failure"),
+                log_path=server_fixed("replacement log"),
+                target_kind="leaf",
+            )
+        elif mismatch == "shadow":
+            auth = replace(auth, event_ingress="http")
             turn.auth_context = auth
         decision = ToolRegistry().authorize_tool(
             operation,
@@ -17365,12 +18120,20 @@ def test_generic_recovery_mutation_suppression_is_exactly_coding_enabled(
         reset_current_turn(token)
 
     if coding:
-        assert {decision.reason for decision in decisions.values()} == {
-            "active_recovery_dedicated_tools_required"
+        assert {
+            operation: (decision.allowed, decision.reason, decision.would_block)
+            for operation, decision in decisions.items()
+        } == {
+            operation: (False, "active_recovery_dedicated_tools_required", True)
+            for operation in decisions
         }
     else:
-        assert {decision.reason for decision in decisions.values()} == {
-            "service_sink_destination_denied"
+        assert {
+            operation: (decision.allowed, decision.reason, decision.would_block)
+            for operation, decision in decisions.items()
+        } == {
+            operation: (False, "service_sink_destination_denied", True)
+            for operation in decisions
         }
 
 
@@ -17389,10 +18152,16 @@ def test_generic_mutation_without_recovery_keeps_ordinary_authorization(
         for operation in ("write_file", "edit_file", "worklink_run")
     }
 
-    assert all(
-        decision.reason != "active_recovery_dedicated_tools_required"
-        for decision in decisions.values()
-    )
+    assert {
+        operation: (
+            decision.allowed, decision.reason, decision.would_block,
+            decision.decision,
+        )
+        for operation, decision in decisions.items()
+    } == {
+        operation: (True, None, False, OperationDecision.RESOURCE_SCOPED)
+        for operation in decisions
+    }
 
 
 def test_recovery_boundary_grant_requires_admission_before_issuance(
@@ -17439,32 +18208,190 @@ def test_recovery_boundary_grant_requires_admission_before_issuance(
     assert grant.target_digest == target_digest
 
 
-@pytest.mark.parametrize("tamper", ["selection_target", "admission_selection", "inode"])
+@pytest.mark.parametrize("field", [
+    "_issuer", "selection_digest", "target_digest", "admitted_root",
+    "admitted_device", "admitted_inode", "operation_root", "operation_device",
+    "operation_inode", "repository_slug", "issue_id", "attempt", "target_kind",
+    "branch", "compatibility_code", "controllable", "selection_record_digest",
+    "admission_record_digest", "service_principal", "home",
+])
+def test_every_recovery_grant_binding_is_revalidated_at_publication(
+    field: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
+    _repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    retained_file = checkout / "src" / "fix.py"
+    retained_file.parent.mkdir()
+    retained_file.write_text("fixed\n", encoding="utf-8")
+    result = _recovery_result("worklink_recovery_read", target_digest)
+    token = set_current_turn(turn)
+    try:
+        grant = access_control.issue_recovery_boundary_grant(auth, recovery_handle=handle)
+        values = {
+            name: getattr(grant, name)
+            for name in access_control.RecoveryBoundaryGrant.__dataclass_fields__
+            if name != "_issuer"
+        }
+        invalid: dict[str, object] = {
+            "_issuer": object(),
+            "selection_digest": "0" * 64,
+            "target_digest": "0" * 64,
+            "admitted_root": str(tmp_path),
+            "admitted_device": grant.admitted_device + 1,
+            "admitted_inode": grant.admitted_inode + 1,
+            "operation_root": str(tmp_path),
+            "operation_device": grant.operation_device + 1,
+            "operation_inode": grant.operation_inode + 1,
+            "repository_slug": "other/repo",
+            "issue_id": grant.issue_id + 1,
+            "attempt": grant.attempt + 1,
+            "target_kind": "factory",
+            "branch": "other/branch",
+            "compatibility_code": "legacy_leaf_uncontrollable",
+            "controllable": not grant.controllable,
+            "selection_record_digest": "0" * 64,
+            "admission_record_digest": "0" * 64,
+            "service_principal": "service:other",
+            "home": str(tmp_path / "other-home"),
+        }
+        if field == "_issuer":
+            with pytest.raises(TypeError, match="minted by access control"):
+                access_control.RecoveryBoundaryGrant(
+                    _issuer=invalid[field], **values,
+                )
+            return
+        values[field] = invalid[field]
+        forged = access_control.RecoveryBoundaryGrant(
+            _issuer=access_control._RECOVERY_BOUNDARY_GRANT_ISSUER,
+            **values,
+        )
+
+        def handler(call: object) -> ToolMessage:
+            access_control.publish_recovery_protected_result(
+                forged, "worklink_recovery_read", result,
+            )
+            return ToolMessage(
+                content=json.dumps(result), tool_call_id=call.tool_call["id"],
+            )
+
+        with pytest.raises(ValueError):
+            BudgetGateMiddleware().wrap_tool_call(
+                _tool_request(
+                    auth,
+                    tool_name="worklink_recovery_read",
+                    args={
+                        "recovery_handle": handle,
+                        "relative_path": "src/fix.py",
+                    },
+                ),
+                handler,
+            )
+    finally:
+        reset_current_turn(token)
+    assert access_control._has_untrusted_active_ingest(
+        auth, auth.ifc_state.labels,
+    ) is True
+
+
+@pytest.mark.parametrize("tamper", [
+    "selection_target", "selection_extra", "selection_turn", "selection_mode",
+    "selection_symlink", "selection_directory_symlink", "target_operation_root",
+    "repository_inode", "inventory_mode", "inventory_duplicate", "repository_replaced",
+    "admission_selection", "admission_target", "admission_extra", "admission_mode",
+    "admission_symlink", "admission_phase", "admitted_root", "admitted_inode",
+    "operation_root", "operation_inode", "checkout_replaced",
+])
 def test_recovery_boundary_grant_rejects_tampered_protected_records(
     tamper: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth, turn, handle = _active_recovery_context(tmp_path, monkeypatch)
-    _repository, _checkout, target_digest = _write_recovery_admission(tmp_path, turn)
+    repository, checkout, target_digest = _write_recovery_admission(tmp_path, turn)
     root = tmp_path / "state" / "worklink" / "recovery-operations" / "v1"
     selection_digest = access_control._recovery_selection_digest(
         turn.recovery_selections[0]
     )
-    path = (
-        root / "selections" / f"{selection_digest}.json"
-        if tamper == "selection_target"
-        else root / "targets" / target_digest / "admission.json"
-    )
-    record = json.loads(path.read_text(encoding="utf-8"))
-    if tamper == "selection_target":
-        record["target_digest"] = "0" * 64
-    elif tamper == "admission_selection":
-        record["selection_digest"] = "0" * 64
+    selection_path = root / "selections" / f"{selection_digest}.json"
+    admission_path = root / "targets" / target_digest / "admission.json"
+    if tamper.startswith("selection_") or tamper in {
+        "target_operation_root", "repository_inode",
+    }:
+        path = selection_path
     else:
-        record["operation_inode"] += 1
-    path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
-    path.chmod(0o600)
+        path = admission_path
+    if tamper in {"selection_symlink", "admission_symlink"}:
+        backing = path.with_suffix(".backing")
+        path.rename(backing)
+        path.symlink_to(backing)
+    elif tamper == "selection_directory_symlink":
+        directory = selection_path.parent
+        backing = directory.with_name("selections-backing")
+        directory.rename(backing)
+        directory.symlink_to(backing, target_is_directory=True)
+    elif tamper == "inventory_mode":
+        inventory = tmp_path / "repositories.yaml"
+        inventory.write_text(
+            inventory.read_text(encoding="utf-8").replace("mode: rw", "mode: ro"),
+            encoding="utf-8",
+        )
+    elif tamper == "inventory_duplicate":
+        inventory = tmp_path / "repositories.yaml"
+        inventory.write_text(
+            inventory.read_text(encoding="utf-8")
+            + "\n  - slug: owner/repo\n"
+            + f"    root: {repository}\n"
+            + "    mode: rw\n"
+            + "    origin: https://github.com/owner/repo.git\n"
+            + "    base_branch: main\n",
+            encoding="utf-8",
+        )
+    elif tamper == "repository_replaced":
+        repository.rename(tmp_path / "repository-replaced")
+        repository.mkdir()
+    elif tamper == "checkout_replaced":
+        checkout.rename(tmp_path / "checkout-replaced")
+        checkout.mkdir()
+    else:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if tamper == "selection_target":
+            record["target_digest"] = "0" * 64
+        elif tamper == "selection_extra":
+            record["unexpected"] = True
+        elif tamper == "selection_turn":
+            record["turn_binding"]["turn_id"] = "other-turn"
+        elif tamper == "selection_mode":
+            path.chmod(0o644)
+        elif tamper == "target_operation_root":
+            record["target"]["leaf"]["operation_root"] = str(tmp_path)
+        elif tamper == "repository_inode":
+            record["target"]["repository"]["inode"] += 1
+        elif tamper == "admission_selection":
+            record["selection_digest"] = "0" * 64
+        elif tamper == "admission_target":
+            record["target_digest"] = "0" * 64
+        elif tamper == "admission_extra":
+            record["unexpected"] = True
+        elif tamper == "admission_mode":
+            path.chmod(0o644)
+        elif tamper == "admission_phase":
+            record["phase"] = "intent"
+        elif tamper == "admitted_root":
+            record["admitted_root"] = str(tmp_path)
+        elif tamper == "admitted_inode":
+            record["admitted_inode"] += 1
+        elif tamper == "operation_root":
+            record["operation_root"] = str(tmp_path)
+        elif tamper == "operation_inode":
+            record["operation_inode"] += 1
+        if tamper not in {"selection_mode", "admission_mode"}:
+            path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+            path.chmod(0o600)
     token = set_current_turn(turn)
     try:
         with pytest.raises(ValueError):

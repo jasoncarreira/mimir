@@ -5454,6 +5454,48 @@ def _recovery_selection_digest(selection: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _recovery_journal_turn_matches(selection: Any, turn: Any, home: Path) -> bool:
+    """Reject a persisted selection replayed into a different ready-queue turn."""
+    selection_digest = _recovery_selection_digest(selection)
+    path = (
+        home / "state" / "worklink" / "recovery-operations" / "v1"
+        / "selections" / f"{selection_digest}.json"
+    )
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        record = _read_recovery_journal_record(
+            home,
+            ("selections", f"{selection_digest}.json"),
+            record_kind="selection",
+            keys=_RECOVERY_SELECTION_RECORD_KEYS,
+        )
+    except ValueError:
+        return False
+    binding = record.get("turn_binding")
+    expected = {
+        "channel_id": turn.channel_id,
+        "channel_source": turn.channel_source,
+        "event_source_id": turn.event_source_id,
+        "poller_name": turn.poller_name,
+        "service_principal": turn.service_principal,
+        "session_id": turn.session_id,
+        "trigger": turn.trigger,
+        "turn_id": turn.turn_id,
+    }
+    return bool(
+        record.get("selection_digest") == selection_digest
+        and isinstance(binding, dict)
+        and set(binding) == {"authority_digest", *expected}
+        and _valid_recovery_digest(binding.get("authority_digest"))
+        and all(binding.get(key) == value for key, value in expected.items())
+    )
+
+
 class RecoveryResourceAdapter:
     """Authorize retained recovery only from the exact ready-queue turn."""
 
@@ -5509,6 +5551,8 @@ class RecoveryResourceAdapter:
                 state_dir=dispatch_failure_state_dir(Path(home)),
             )
         except (OSError, ValueError, RecoveryDispatchError):
+            return None
+        if not _recovery_journal_turn_matches(selection, turn, Path(home)):
             return None
         return selection
 
@@ -6081,9 +6125,33 @@ def issue_recovery_boundary_grant(
 
 
 def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
+    from ._context import get_current_turn
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    turn = get_current_turn()
+    service = get_trusted_service_from_auth_context(
+        getattr(turn, "auth_context", None),
+    )
+    current_selection = next(
+        (
+            selection
+            for selection in (getattr(turn, "recovery_selections", ()) or ())
+            if _recovery_selection_digest(selection) == grant.selection_digest
+        ),
+        None,
+    ) if turn is not None else None
     if not (
         isinstance(grant, RecoveryBoundaryGrant)
         and grant._issuer is _RECOVERY_BOUNDARY_GRANT_ISSUER
+        and home_value
+        and str(Path(home_value).absolute()) == grant.home
+        and turn is not None
+        and service is not None
+        and service.canonical == grant.service_principal
+        and current_selection is not None
+        and _recovery_journal_turn_matches(
+            current_selection, turn, Path(grant.home),
+        )
         and _directory_matches_identity(
             grant.admitted_root, grant.admitted_device, grant.admitted_inode,
         )
@@ -6104,6 +6172,33 @@ def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
         record_kind="admission",
         keys=_RECOVERY_ADMISSION_RECORD_KEYS,
     )
+    target = selection_record.get("target")
+    target_kind = target.get("target_kind") if isinstance(target, dict) else None
+    identity = target.get(target_kind) if isinstance(target_kind, str) else None
+    repository_record = target.get("repository") if isinstance(target, dict) else None
+    if not isinstance(identity, dict) or not isinstance(repository_record, dict):
+        raise ValueError("recovery boundary grant no longer matches admission")
+    authorization_roots = repository_record.get("authorization_roots")
+    if not (
+        isinstance(authorization_roots, list)
+        and all(
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, str) for value in item)
+            for item in authorization_roots
+        )
+    ):
+        raise ValueError("recovery boundary grant no longer matches admission")
+    from .repository_config import RepositoryInventory
+
+    try:
+        inventory = RepositoryInventory.load(Path(grant.home) / "repositories.yaml")
+        repository = inventory.coding_target(
+            grant.repository_slug,
+            authorized_roots=tuple(tuple(item) for item in authorization_roots),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("recovery boundary grant repository is stale") from exc
     if (
         selection_record.get("selection_digest") != grant.selection_digest
         or selection_record.get("target_digest") != grant.target_digest
@@ -6123,6 +6218,24 @@ def _revalidate_recovery_boundary_grant(grant: RecoveryBoundaryGrant) -> None:
         or admission.get("operation_root") != grant.operation_root
         or admission.get("operation_device") != grant.operation_device
         or admission.get("operation_inode") != grant.operation_inode
+        or target_kind != grant.target_kind
+        or identity.get("issue_id") != grant.issue_id
+        or identity.get("attempt") != grant.attempt
+        or identity.get("branch") != grant.branch
+        or target.get("compatibility_code") != grant.compatibility_code
+        or target.get("controllable") != grant.controllable
+        or repository_record.get("slug") != grant.repository_slug
+        or repository.root != Path(str(repository_record.get("root"))).resolve()
+        or repository.origin != repository_record.get("origin")
+        or repository.base_branch != repository_record.get("base_branch")
+        or repository.mode != repository_record.get("mode")
+        or inventory.root_mode_map()
+        != dict(tuple(item) for item in authorization_roots)
+        or not _directory_matches_identity(
+            str(repository_record.get("root")),
+            repository_record.get("device"),
+            repository_record.get("inode"),
+        )
         or hashlib.sha256(
             json.dumps(
                 admission, sort_keys=True, separators=(",", ":"),
