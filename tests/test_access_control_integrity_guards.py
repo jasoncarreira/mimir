@@ -251,7 +251,7 @@ def _recovery_authorization(tool_name: str) -> ac.ToolAuthorization:
 
 
 @pytest.mark.parametrize("tool_name", sorted(_RECOVERY_RESULT_DOMAINS))
-def test_recovery_success_requires_and_preserves_exact_published_source(
+def test_recovery_forged_source_without_grant_fails_closed(
     tool_name: str,
 ) -> None:
     source = _recovery_result_source(tool_name)
@@ -266,8 +266,10 @@ def test_recovery_success_requires_and_preserves_exact_published_source(
     )
 
     assert labels is not None
-    assert labels.sources == (source,)
-    assert ac._has_untrusted_active_ingest(None, labels) is False
+    assert {
+        (item.domain, item.integrity, item.integrity_effect)
+        for item in labels.sources
+    } == {(_RECOVERY_RESULT_DOMAINS[tool_name], "untrusted", "active_ingest")}
 
 
 @pytest.mark.parametrize("tool_name", sorted(_RECOVERY_RESULT_DOMAINS))
@@ -288,7 +290,7 @@ def test_recovery_missing_publication_fails_closed(tool_name: str) -> None:
     assert ac._has_untrusted_active_ingest(None, labels) is True
 
 
-def test_recovery_empty_list_publication_is_authoritative() -> None:
+def test_recovery_unbound_empty_list_publication_fails_closed() -> None:
     labels = ac.classify_protected_result(
         "worklink_recovery_list",
         {"recovery_handle": "opaque"},
@@ -298,10 +300,11 @@ def test_recovery_empty_list_publication_is_authoritative() -> None:
         provenance=ac.ProtectedResultProvenance(()),
     )
 
-    assert labels is None
+    assert labels is not None
+    assert ac._has_untrusted_active_ingest(None, labels) is True
 
 
-def test_recovery_handled_failure_preserves_published_test_source() -> None:
+def test_recovery_unbound_handled_failure_fails_closed() -> None:
     source = _recovery_result_source("worklink_recovery_test")
 
     labels = ac.classify_protected_result(
@@ -315,8 +318,7 @@ def test_recovery_handled_failure_preserves_published_test_source() -> None:
     )
 
     assert labels is not None
-    assert labels.sources == (source,)
-    assert ac._has_untrusted_active_ingest(None, labels) is False
+    assert ac._has_untrusted_active_ingest(None, labels) is True
 
 
 def test_recovery_unexpected_exception_invalidates_earlier_publication() -> None:
