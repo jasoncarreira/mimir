@@ -16,6 +16,7 @@ _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 MAX_UPDATE_ITEMS = 128
 MAX_UPDATE_BYTES = 8 * 1024 * 1024
 UPDATE_CLOSE_TIMEOUT = 2.0
+UPDATE_CANCEL_TIMEOUT = 2.0
 # Match the proxy/relay's per-write budget, not a whole-turn/replay deadline.
 # Every completed update renews the budget, regardless of the queue's length.
 UPDATE_DELIVERY_TIMEOUT = WRITER_DRAIN_TIMEOUT
@@ -231,7 +232,7 @@ class UpdateDispatcher:
             # a publisher that resists cancellation. Keep ownership on failure.
             await asyncio.wait_for(
                 asyncio.shield(asyncio.gather(worker, return_exceptions=True)),
-                UPDATE_CLOSE_TIMEOUT,
+                UPDATE_CANCEL_TIMEOUT,
             )
             while not self.queue.empty():
                 self.queue.get_nowait()
@@ -258,6 +259,7 @@ class UpdateDispatcher:
     async def _run(self) -> None:
         while True:
             event = await self.queue.get()
+            size = self._queued_sizes.get_nowait()
             try:
                 if event is None:
                     return
@@ -285,7 +287,6 @@ class UpdateDispatcher:
                                 self._publication_failed = True
                                 break
             finally:
-                size = self._queued_sizes.get_nowait()
                 self._queued_sizes.task_done()
                 self._queued_bytes -= size
                 self.queue.task_done()
