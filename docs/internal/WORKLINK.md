@@ -934,8 +934,26 @@ Two constraints are not obvious and are enforced rather than documented alone:
   the factory never acknowledges, and `factory status` reports
   `park_snapshot: null`.
 
-A park also releases the Chainlink claim the stopped controller held, and clears
-`worklink:in-progress`. Without the release the next dispatch is refused, by a
+A park also releases the Chainlink claim the stopped controller held, records a
+forgiveness marker for it, and clears `worklink:in-progress`. It mirrors
+`release_owned_claims_for_shutdown`, including that path's ordering — forgiveness
+first, then the release, then the label — so a partial failure leaves the claim
+held but already credited rather than released and charged. It deliberately does
+*not* add `worklink:ready` the way the shutdown path does: a park is resumed by
+an explicit dispatch, and arming the issue here would auto-dispatch a parked epic.
+
+The forgiveness marker is not bookkeeping. `claim_issue` charges an attempt for
+every successful claim and judges exhaustion from `attempts_used`, which
+discounts a claim only when a `ShutdownAbortRecord` matches it on
+`(issue_id, attempt, agent_id, claimed_at)`. Without one, park-then-resume spends
+two attempts on a single run, and a run parked on its **last** attempt comes back
+`attempts_exhausted` — parked and permanently unresumable. The attempt *ordinal*
+still advances, which is what keeps branch, checkout and evidence paths from
+colliding. Forgiveness is also bounded: `MAX_SHUTDOWN_ABORT_FORGIVENESS` is 2, so
+a run parked repeatedly eventually cannot be credited again, and the script
+refuses rather than publishing a park it knows resume will reject.
+
+Without the release the next dispatch is refused, by a
 path worth stating because it is indirect: the chainlink CLI treats a same-agent
 re-claim as idempotent success and prints "You already hold the lock" with rc=0,
 and `claim_issue` uses that exact string to decide whether to run its

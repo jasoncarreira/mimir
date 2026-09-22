@@ -14,7 +14,7 @@ import stat
 import subprocess
 import sys
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -65,6 +65,73 @@ def _plane(root: Path) -> Path:
     (plane / "reviews").mkdir()
     (plane / "reviews" / "spec-writer.json").write_text('{"verdict": "APPROVE"}')
     return plane
+
+
+AGENT = "mimir-worklink"
+
+
+def _claim(attempt: int, *, at: datetime, agent: str = AGENT) -> ClaimRecord:
+    return ClaimRecord(
+        issue_id=1783, attempt=attempt, agent_id=agent, claimed_at=at, heartbeat_at=at,
+    )
+
+
+def _claim_history(count: int, *, agent: str = AGENT) -> list[str]:
+    """`count` charged claims, as the issue's comment history records them."""
+    base = datetime(2026, 9, 21, 3, 0, tzinfo=UTC)
+    return [
+        _claim(n + 1, at=base + timedelta(minutes=n), agent=agent).to_comment()
+        for n in range(count)
+    ]
+
+
+def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int = 0):
+    """Stub the park's subprocess surface: the factory CLI and chainlink.
+
+    `issue show` must answer with real claim comments, because the release path
+    reads ownership and attempt forgiveness out of them rather than being told.
+    """
+
+    def run(cmd, **kwargs):
+        argv = list(cmd)
+        calls.append(argv)
+        if argv[1:4] == ["issue", "show", "1783"]:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"comments": comments}), "",
+            )
+        if argv[1:3] == ["locks", "release"]:
+            return subprocess.CompletedProcess(
+                argv, release_rc, "", "lock held by another agent" if release_rc else "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    return run
+
+
+def _home_with(record, tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    save_factory_record(home, record)
+    _plane(Path(record.sandbox) / ".factory" / record.run_id)
+    return home
+
+
+def _park_main(record, home: Path, monkeypatch, run, tmp_path: Path, *, extra=()):
+    """Drive park.main() with the compute side stubbed out."""
+    statuses = iter([
+        _status("running", sandbox_path=record.sandbox),
+        _status(sandbox_path=record.sandbox),
+        _status(sandbox_path=record.sandbox),
+    ])
+    monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
+    monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+    monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
+    monkeypatch.setattr(park, "_run", run)
+    return park.main([
+        "--run-id", record.run_id, "--sandbox", record.sandbox,
+        "--home", str(home), "--launcher", record.launcher,
+        "--reason", "budget", "--controller-pid", "4242", "--agent-id", AGENT, *extra,
+    ])
 
 
 class TestOperatorRoot:
@@ -485,40 +552,19 @@ class TestParkStopsTheControllerFirst:
         the same park; it is the bug.
         """
         record = _record(tmp_path, phase="running", status="running")
-        home = tmp_path / "home"
-        home.mkdir()
-        save_factory_record(home, record)
-        _plane(Path(record.sandbox) / ".factory" / record.run_id)
+        home = _home_with(record, tmp_path)
 
         order: list[str] = []
-        sandbox_path = record.sandbox
-        statuses = iter([
-            _status("running", sandbox_path=sandbox_path),
-            _status(sandbox_path=sandbox_path),
-            _status(sandbox_path=sandbox_path),
-        ])
-        monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
-        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: True)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
-        monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
-        monkeypatch.setattr(
-            park, "stop_pid", lambda pid, label, **k: order.append(label),
-        )
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: order.append(label))
         monkeypatch.setattr(
             park, "stop_residual_compute", lambda run_id, **k: order.append("residual") or [],
         )
-        monkeypatch.setattr(
-            park, "_run",
-            lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "{}", ""),
-        )
 
-        park.main([
-            "--run-id", record.run_id, "--sandbox", record.sandbox,
-            "--home", str(home), "--launcher", record.launcher,
-            "--reason", "budget", "--controller-pid", "4242",
-        ])
-
+        assert _park_main(
+            record, home, monkeypatch, _park_stub([], _claim_history(1)), tmp_path,
+        ) == 0
         assert order == ["controller", "recorded driver", "residual"]
 
     def test_a_park_refuses_when_the_recorded_process_cannot_be_proven_dead(
@@ -531,35 +577,17 @@ class TestParkStopsTheControllerFirst:
         run and must stop before it terminalizes.
         """
         record = _record(tmp_path, phase="running", status="running")
-        home = tmp_path / "home"
-        home.mkdir()
-        save_factory_record(home, record)
-        _plane(Path(record.sandbox) / ".factory" / record.run_id)
-        terminalized: list[list[str]] = []
-
-        monkeypatch.setattr(
-            park, "factory_status",
-            lambda *a, **k: _status("running", sandbox_path=record.sandbox),
-        )
-        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        home = _home_with(record, tmp_path)
+        calls: list[list[str]] = []
         monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
         monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: False)
 
-        def record_run(cmd, **kwargs):
-            terminalized.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0, "{}", "")
-
-        monkeypatch.setattr(park, "_run", record_run)
-
         with pytest.raises(park.ParkError, match="cannot verify the recorded factory process"):
-            park.main([
-                "--run-id", record.run_id, "--sandbox", record.sandbox,
-                "--home", str(home), "--launcher", record.launcher,
-                "--reason", "budget", "--controller-pid", "4242",
-            ])
-        assert not any("terminal" in cmd for cmd in terminalized)
+            _park_main(record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path)
+        assert not any("terminal" in argv for argv in calls)
+        assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
 
     def test_stop_pid_verifies_death_rather_than_assuming_the_signal_worked(
         self, monkeypatch
@@ -641,41 +669,121 @@ class TestParkToImmediateDispatch:
     ) -> None:
         """And the park actually issues the release the pair above depends on."""
         record = _record(tmp_path, phase="running", status="running")
-        home = tmp_path / "home"
-        home.mkdir()
-        save_factory_record(home, record)
-        _plane(Path(record.sandbox) / ".factory" / record.run_id)
-
-        statuses = iter([
-            _status("running", sandbox_path=record.sandbox),
-            _status(sandbox_path=record.sandbox),
-            _status(sandbox_path=record.sandbox),
-        ])
-        monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
-        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        home = _home_with(record, tmp_path)
+        calls: list[list[str]] = []
         monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
         monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
-        monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
 
-        calls: list[list[str]] = []
-
-        def fake_run(cmd, **kwargs):
-            calls.append(list(cmd))
-            return subprocess.CompletedProcess(list(cmd), 0, "{}", "")
-
-        monkeypatch.setattr(park, "_run", fake_run)
-
-        rc = park.main([
-            "--run-id", record.run_id, "--sandbox", record.sandbox,
-            "--home", str(home), "--launcher", record.launcher,
-            "--reason", "budget", "--controller-pid", "4242",
-        ])
-
-        assert rc == 0
+        assert _park_main(
+            record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path,
+        ) == 0
         assert ["chainlink", "locks", "release", "1783"] in calls
         assert ["chainlink", "issue", "unlabel", "1783", "worklink:in-progress"] in calls
+
+    def test_forgiveness_is_recorded_before_the_release(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Order matters, and it is the established shutdown path's order.
+
+        Recording forgiveness first means a failure between the two steps leaves
+        the claim held but already credited, rather than released and charged.
+        """
+        record = _record(tmp_path, phase="running", status="running")
+        home = _home_with(record, tmp_path)
+        calls: list[list[str]] = []
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+
+        assert _park_main(
+            record, home, monkeypatch, _park_stub(calls, _claim_history(1)), tmp_path,
+        ) == 0
+
+        staged = [
+            "forgive" if argv[1:3] == ["issue", "comment"] else "release"
+            for argv in calls
+            if argv[1:3] in (["issue", "comment"], ["locks", "release"])
+        ]
+        assert staged == ["forgive", "release"]
+
+    def test_a_park_on_the_last_attempt_stays_resumable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The boundary the held/released pair above does not reach.
+
+        `claim_issue` charges an attempt per successful claim and judges
+        exhaustion from `attempts_used`. At the cap, a park that does not forgive
+        its own claim leaves the run parked and permanently unresumable, because
+        resume returns `attempts_exhausted` rather than recovering it.
+        """
+        record = _record(tmp_path, phase="running", status="running")
+        home = _home_with(record, tmp_path)
+        history = _claim_history(3)
+        calls: list[list[str]] = []
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+
+        counter = ChainlinkClaims(agent_id=AGENT, runner=lambda *a, **k: None, max_attempts=3)
+        assert counter.attempts_used(history) == 3, "fixture must sit at the cap"
+
+        assert _park_main(
+            record, home, monkeypatch, _park_stub(calls, history), tmp_path,
+        ) == 0
+
+        marker = next(argv[4] for argv in calls if argv[1:3] == ["issue", "comment"])
+        after = history + [marker]
+
+        # Judged by the real admission gate, not by re-deriving the arithmetic.
+        resumed = ChainlinkClaims(
+            agent_id=AGENT,
+            runner=self._runner([], held=False, comments=tuple(after)),
+            clock=lambda: datetime(2026, 9, 21, 5, 0, tzinfo=UTC),
+            max_attempts=3,
+        )
+        result = resumed.claim_issue(1783, after, home_path=tmp_path)
+        assert result.attempts_exhausted is False
+        assert result.claimed is True, result.reason
+
+    def test_an_unforgiven_claim_at_the_cap_is_refused_as_exhausted(
+        self, tmp_path: Path
+    ) -> None:
+        """The other half of that boundary.
+
+        Without it the test above would pass against a park that forgives
+        nothing, since it never shows that the cap was actually binding.
+        """
+        history = _claim_history(3)
+        claims = ChainlinkClaims(
+            agent_id=AGENT,
+            runner=self._runner([], held=False, comments=tuple(history)),
+            clock=lambda: datetime(2026, 9, 21, 5, 0, tzinfo=UTC),
+            max_attempts=3,
+        )
+
+        result = claims.claim_issue(1783, history, home_path=tmp_path)
+
+        assert result.claimed is False
+        assert result.attempts_exhausted is True
+        assert result.reason == "attempts_exhausted"
+
+    def test_releasing_another_agents_claim_is_refused(self) -> None:
+        """The ownership check that makes this safe to run by hand.
+
+        It must refuse before writing anything: a forgiveness marker for someone
+        else's claim would credit an attempt back to a run still using it.
+        """
+        calls: list[list[str]] = []
+        run = _park_stub(calls, _claim_history(1, agent="someone-else"))
+        with mock.patch.object(park, "_run", run):
+            with pytest.raises(park.ParkError, match="held by 'someone-else'"):
+                park.release_claim_with_forgiveness("chainlink", 1783, AGENT)
+        assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
 
     def test_a_failed_release_is_reported_rather_than_silently_parked(
         self, tmp_path: Path, monkeypatch, capsys
@@ -683,37 +791,17 @@ class TestParkToImmediateDispatch:
         """A park whose claim is still held is not dispatchable, and an operator
         must not have to discover that at resume time."""
         record = _record(tmp_path, phase="running", status="running")
-        home = tmp_path / "home"
-        home.mkdir()
-        save_factory_record(home, record)
-        _plane(Path(record.sandbox) / ".factory" / record.run_id)
-
-        statuses = iter([
-            _status("running", sandbox_path=record.sandbox),
-            _status(sandbox_path=record.sandbox),
-            _status(sandbox_path=record.sandbox),
-        ])
-        monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
-        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        home = _home_with(record, tmp_path)
+        calls: list[list[str]] = []
         monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
         monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
         monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
         monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
-        monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
 
-        def fake_run(cmd, **kwargs):
-            argv = list(cmd)
-            if argv[1:3] == ["locks", "release"]:
-                return subprocess.CompletedProcess(argv, 1, "", "lock held by another agent")
-            return subprocess.CompletedProcess(argv, 0, "{}", "")
-
-        monkeypatch.setattr(park, "_run", fake_run)
-
-        rc = park.main([
-            "--run-id", record.run_id, "--sandbox", record.sandbox,
-            "--home", str(home), "--launcher", record.launcher,
-            "--reason", "budget", "--controller-pid", "4242",
-        ])
+        rc = _park_main(
+            record, home, monkeypatch,
+            _park_stub(calls, _claim_history(1), release_rc=1), tmp_path,
+        )
 
         assert rc == 3
         captured = capsys.readouterr()
