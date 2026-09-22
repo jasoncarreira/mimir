@@ -168,7 +168,32 @@ def test_invalid_retry_after_fails_closed(
     ) is not None
 
 
-def test_1793_elapsed_retry_is_dispatchable_but_incident_remains_visible(
+def test_legacy_incident_without_failure_kind_never_auto_resumes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path="attempt-1.log",
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+    with failure_state_transaction(state_dir) as state:
+        del state["issues"]["1793"]["failure_kind"]
+    after_retry = datetime.fromisoformat(entry["retry_after"]) + timedelta(days=1)
+
+    excluded, alerts = pending_failure_alerts(state_dir, now=after_retry)
+
+    assert excluded == {1793}
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert alerts[0]["failure_kind"] is None
+    assert autonomous_dispatch_block_reason(state_dir, 1793, now=after_retry) is not None
+
+
+def test_classified_tests_failure_is_dispatchable_but_incident_remains_visible(
     tmp_path: Path,
 ) -> None:
     state_dir = tmp_path / "state"
