@@ -458,6 +458,14 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     # enqueue its sentinel before timing out.
     dispatcher.enqueue(event)
     assert dispatcher.queue.full(), "precondition failed: update queue is not full"
+    budgets: list[float] = []
+    real_wait_for = asyncio.wait_for
+
+    async def tracked_wait_for(awaitable, timeout):
+        budgets.append(timeout)
+        return await real_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(updates.asyncio, "wait_for", tracked_wait_for)
     monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
     monkeypatch.setattr(updates, "UPDATE_CANCEL_TIMEOUT", 1.0)
     worker = dispatcher._worker
@@ -478,6 +486,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
         assert isinstance(dispatcher.failure, TimeoutError), "close did not retain its timeout failure"
         assert not publisher.release.is_set(), "close incorrectly released the blocked publisher"
         assert dispatcher._worker is None, "close did not clear the cancelled worker"
+        assert budgets == [0.02, 1.0], budgets
         assert dispatcher.queue.empty(), "close left updates in the queue"
         assert dispatcher.queued_bytes == 0, "close left queued byte accounting nonzero"
         # This generous bound is a hang guard, not a latency assertion.
@@ -521,6 +530,7 @@ async def test_close_backstop_reports_a_cancellation_resistant_publisher(
         with pytest.raises(TimeoutError):
             await closing
         assert dispatcher._worker is worker
+        assert worker is not None and not worker.done()
     finally:
         publisher.release.set()
         worker.cancel()
