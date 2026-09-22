@@ -459,6 +459,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
     dispatcher.enqueue(event)
     assert dispatcher.queue.full(), "precondition failed: update queue is not full"
     monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
+    monkeypatch.setattr(updates, "UPDATE_CANCEL_TIMEOUT", 1.0)
     worker = dispatcher._worker
     assert worker is not None, "precondition failed: dispatcher worker was not started"
     closing = asyncio.create_task(dispatcher.close())
@@ -491,7 +492,7 @@ async def test_close_suspends_then_times_out_when_full_worker_is_blocked(
 
 
 @pytest.mark.asyncio
-async def test_close_completes_when_publisher_resists_cancellation(
+async def test_close_backstop_reports_a_cancellation_resistant_publisher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.acp import updates
@@ -499,52 +500,27 @@ async def test_close_completes_when_publisher_resists_cancellation(
     class ResistantPublisher(Publisher):
         async def publish_live(self, update):
             self.entered.set()
-            try:
-                await self.release.wait()
-            except asyncio.CancelledError:
-                # Outlast both close budgets before honoring cancellation.
-                await asyncio.sleep(0.5)
-                raise
+            while not self.release.is_set():
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    # Deliberately broken dependency to exercise the backstop.
+                    continue
 
     publisher = ResistantPublisher()
     dispatcher = UpdateDispatcher(publisher)
     dispatcher.enqueue(_start_event("start", "search", {}))
     await publisher.entered.wait()
-    dispatcher.enqueue(_start_event("start", "edit", {}))
-    assert not dispatcher.queue.empty(), "precondition failed: no queued update"
     monkeypatch.setattr(updates, "UPDATE_CLOSE_TIMEOUT", 0.02)
-    real_wait_for = asyncio.wait_for
-    timeouts = []
-
-    async def tracked_wait_for(awaitable, timeout):
-        try:
-            return await real_wait_for(awaitable, timeout)
-        except TimeoutError as exc:
-            timeouts.append(exc)
-            raise
-
-    monkeypatch.setattr(updates.asyncio, "wait_for", tracked_wait_for)
+    monkeypatch.setattr(updates, "UPDATE_CANCEL_TIMEOUT", 0.02)
     worker = dispatcher._worker
     closing = asyncio.create_task(dispatcher.close())
     try:
         done, _ = await asyncio.wait({closing}, timeout=1)
         assert closing in done, "close's cancellation backstop was not bounded"
-        await closing
-        assert len(timeouts) == 2
-        assert dispatcher.failure is timeouts[0]
-        assert dispatcher.failure is not timeouts[1]
-        assert dispatcher._worker is None
-        assert worker is not None and not worker.done()
-        assert worker.cancelling(), "close did not request worker cancellation"
-        assert dispatcher.queue.empty()
-        assert dispatcher.queued_bytes == 0
-        assert not dispatcher._publication_failed
-        assert not publisher.release.is_set()
-        # This generous bound is a hang guard, not a latency assertion.
-        try:
-            await real_wait_for(dispatcher.queue.join(), 10)
-        except TimeoutError:
-            pytest.fail("hang guard expired waiting for the emptied queue to join")
+        with pytest.raises(TimeoutError):
+            await closing
+        assert dispatcher._worker is worker
     finally:
         publisher.release.set()
         worker.cancel()

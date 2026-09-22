@@ -16,6 +16,7 @@ _VALID_TODO_STATUS = {"pending", "in_progress", "completed"}
 MAX_UPDATE_ITEMS = 128
 MAX_UPDATE_BYTES = 8 * 1024 * 1024
 UPDATE_CLOSE_TIMEOUT = 2.0
+UPDATE_CANCEL_TIMEOUT = 2.0
 # Match the proxy/relay's per-write budget, not a whole-turn/replay deadline.
 # Every completed update renews the budget, regardless of the queue's length.
 UPDATE_DELIVERY_TIMEOUT = WRITER_DRAIN_TIMEOUT
@@ -228,23 +229,17 @@ class UpdateDispatcher:
                 self._failure = exc
             worker.cancel()
             # Shield the gather so wait_for cannot itself wait indefinitely for
-            # a publisher that resists cancellation. Keep the original failure.
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(asyncio.gather(worker, return_exceptions=True)),
-                    UPDATE_CLOSE_TIMEOUT,
-                )
-            except TimeoutError:
-                pass
+            # a publisher that resists cancellation. Keep ownership on failure.
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(worker, return_exceptions=True)),
+                UPDATE_CANCEL_TIMEOUT,
+            )
             while not self.queue.empty():
                 self.queue.get_nowait()
                 size = self._queued_sizes.get_nowait()
                 self._queued_sizes.task_done()
                 self._queued_bytes -= size
                 self.queue.task_done()
-            # A cancellation-resistant worker still owns its in-flight item,
-            # but this dispatcher no longer owns either once close returns.
-            self._queued_bytes = 0
         self._worker = None
 
     async def _close_gracefully(self, worker: asyncio.Task[None]) -> None:
@@ -293,8 +288,7 @@ class UpdateDispatcher:
                                 break
             finally:
                 self._queued_sizes.task_done()
-                if self._worker is asyncio.current_task():
-                    self._queued_bytes -= size
+                self._queued_bytes -= size
                 self.queue.task_done()
                 self._made_progress()
 
