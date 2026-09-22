@@ -62,6 +62,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from typing import NamedTuple
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -389,6 +390,61 @@ def latest_claim(comments: list[str], issue_id: int):
     return latest
 
 
+class ClaimPlan(NamedTuple):
+    """What releasing this run's claim would do, computed without writing."""
+
+    claim: object
+    abort: ShutdownAbortRecord
+    comments: list[str]
+    before: int
+    after: int
+
+
+def plan_claim_release(
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+) -> ClaimPlan:
+    """Decide whether the claim can be released and forgiven, writing nothing.
+
+    This runs *before* the park stops anything. Every refusal below is
+    unrecoverable once the run is terminalized: the park's own already-parked
+    refusal stops the script being re-run to finish the job, so a late failure
+    strands a parked run whose claim is still held and still charged. Deciding
+    first means a park that starts is a park that can finish.
+    """
+    claims = claims_client(chainlink_bin, agent_id, home)
+    comments = issue_comments(claims, issue_id)
+    claim = latest_claim(comments, issue_id)
+    if claim is None:
+        raise ParkError(
+            f"issue {issue_id} has no claim record, so there is nothing to release; "
+            "refusing to invent forgiveness for a claim that was never recorded"
+        )
+    if claim.agent_id != agent_id:
+        raise ParkError(
+            f"the claim on issue {issue_id} is held by {claim.agent_id!r}, not {agent_id!r}. "
+            "Releasing another agent's claim is exactly what the ownership check prevents; "
+            "pass --agent-id if this run really was claimed under a different identity."
+        )
+
+    abort = ShutdownAbortRecord(
+        issue_id=issue_id,
+        attempt=claim.attempt,
+        agent_id=claim.agent_id,
+        claimed_at=claim.claimed_at,
+        aborted_at=datetime.now(UTC),
+    )
+    before = claims.attempts_used(comments)
+    after = claims.attempts_used(comments + [abort.to_comment()])
+    if after >= before:
+        raise ParkError(
+            f"a forgiveness marker would not discount this claim (attempts_used stays {before}). "
+            f"Forgiveness is bounded at {MAX_SHUTDOWN_ABORT_FORGIVENESS} per issue, and this run "
+            "has spent it, so a park would leave the claim charged and the run unresumable. "
+            "Nothing has been stopped or published; resolve the attempt budget first."
+        )
+    return ClaimPlan(claim=claim, abort=abort, comments=comments, before=before, after=after)
+
+
 def release_claim_with_forgiveness(
     chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
 ) -> tuple[int, str]:
@@ -413,31 +469,8 @@ def release_claim_with_forgiveness(
     the run is resumed by an explicit dispatch -- and arming it here would
     auto-dispatch a parked epic.
     """
-    claims = claims_client(chainlink_bin, agent_id, home)
-    comments = issue_comments(claims, issue_id)
-    claim = latest_claim(comments, issue_id)
-    if claim is None:
-        raise ParkError(
-            f"issue {issue_id} has no claim record, so there is nothing to release; "
-            "refusing to invent forgiveness for a claim that was never recorded"
-        )
-    if claim.agent_id != agent_id:
-        raise ParkError(
-            f"the claim on issue {issue_id} is held by {claim.agent_id!r}, not {agent_id!r}. "
-            "Releasing another agent's claim is exactly what the ownership check prevents; "
-            "pass --agent-id if this run really was claimed under a different identity."
-        )
-
-    before = claims.attempts_used(comments)
-
-    abort = ShutdownAbortRecord(
-        issue_id=issue_id,
-        attempt=claim.attempt,
-        agent_id=claim.agent_id,
-        claimed_at=claim.claimed_at,
-        aborted_at=datetime.now(UTC),
-    )
-    marked = _run([chainlink_bin, "issue", "comment", str(issue_id), abort.to_comment()])
+    plan = plan_claim_release(chainlink_bin, issue_id, agent_id, home)
+    marked = _run([chainlink_bin, "issue", "comment", str(issue_id), plan.abort.to_comment()])
     if marked.returncode != 0:
         raise ParkError(
             "could not record the forgiveness marker: "
@@ -445,19 +478,32 @@ def release_claim_with_forgiveness(
             "run is still owned and no attempt has been mis-charged."
         )
 
-    after = claims.attempts_used(comments + [abort.to_comment()])
-    if after >= before:
+    # Postcondition, not the decision: the plan already proved the marker would
+    # count. This catches the marker landing differently than projected.
+    claims = claims_client(chainlink_bin, agent_id, home)
+    observed = claims.attempts_used(issue_comments(claims, issue_id))
+    if observed >= plan.before:
         raise ParkError(
-            f"the forgiveness marker did not discount the claim (attempts_used stayed {before}). "
-            f"A run parked more than {MAX_SHUTDOWN_ABORT_FORGIVENESS} times cannot be forgiven "
-            "again, which is the usual cause; resume would consume an attempt."
+            f"the recorded forgiveness marker did not discount the claim (attempts_used stayed "
+            f"{plan.before}). The claim is still charged; resolve it before resuming."
         )
 
     released = _run([chainlink_bin, "locks", "release", str(issue_id)])
     if released.returncode != 0:
         return released.returncode, (released.stderr or released.stdout).strip()[:200]
     _run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"])
-    return 0, f"attempt {claim.attempt} forgiven, attempts_used {before} -> {after}"
+    return 0, f"attempt {plan.claim.attempt} forgiven, attempts_used {plan.before} -> {observed}"
+
+
+def claim_needs_reconciliation(
+    chainlink_bin: str, issue_id: int, agent_id: str, home: Path,
+) -> bool:
+    """True when a parked run's claim is still charged and can still be forgiven."""
+    try:
+        plan_claim_release(chainlink_bin, issue_id, agent_id, home)
+    except ParkError:
+        return False
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -507,7 +553,27 @@ def main(argv: list[str] | None = None) -> int:
     status = before.get("status")
     print(f"status     : {status}")
     if status == TERMINAL_PARKED:
-        raise ParkError("run is already parked; nothing to do")
+        # Do not refuse outright. A park that failed after terminalizing leaves
+        # the run parked with its claim still held and still charged, and a flat
+        # refusal here is what makes that state unrecoverable. Finish the job.
+        record = load_factory_record(args.home, args.run_id)
+        if record is None:
+            raise ParkError(f"no retained record for {args.run_id} under {args.home}")
+        if not claim_needs_reconciliation(
+            args.chainlink_bin, record.issue_id, args.agent_id, args.home
+        ):
+            raise ParkError(
+                "run is already parked and its claim needs no reconciliation; nothing to do"
+            )
+        print("already parked: completing the claim reconciliation a previous run left undone")
+        code, detail = release_claim_with_forgiveness(
+            args.chainlink_bin, record.issue_id, args.agent_id, args.home,
+        )
+        if code != 0:
+            print(f"PARKED, BUT THE CLAIM IS STILL HELD: {detail}", file=sys.stderr)
+            return 3
+        print(f"released   : claim on issue {record.issue_id} ({detail})")
+        return 0
     if status in {"completed", "partial", "blocked"}:
         raise ParkError(f"run is terminal ({status}); it cannot be parked")
 
@@ -533,6 +599,15 @@ def main(argv: list[str] | None = None) -> int:
             raise ParkError("--controller-pid must be a pid or the word 'none'") from exc
         argv = verify_controller(controller_pid, record.issue_id)
         print(f"controller : pid {controller_pid} verified -> {argv[:120]}")
+
+    # Decide the claim outcome before stopping anything. Every refusal inside
+    # plan_claim_release is unrecoverable once the run is terminalized, so it has
+    # to happen while nothing has been changed yet.
+    plan = plan_claim_release(args.chainlink_bin, record.issue_id, args.agent_id, args.home)
+    print(
+        f"claim      : attempt {plan.claim.attempt} owned by {plan.claim.agent_id}; "
+        f"forgiveness would take attempts_used {plan.before} -> {plan.after}"
+    )
 
     if args.dry_run:
         print(

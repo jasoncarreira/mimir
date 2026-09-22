@@ -942,6 +942,14 @@ held but already credited rather than released and charged. It deliberately does
 *not* add `worklink:ready` the way the shutdown path does: a park is resumed by
 an explicit dispatch, and arming the issue here would auto-dispatch a parked epic.
 
+Whether the claim can be released and forgiven is decided *before* the park stops
+anything, and re-running the script on an already-parked run completes a
+reconciliation a previous run left undone rather than refusing. Both exist for
+the same reason: every claim-side refusal is unrecoverable once the run is
+terminalized, because the run is then parked with its claim still held and still
+charged, and a flat "already parked" refusal would stop anyone finishing the job.
+A park that starts is a park that can finish.
+
 The forgiveness marker is not bookkeeping. `claim_issue` charges an attempt for
 every successful claim and judges exhaustion from `attempts_used`, which
 discounts a claim only when a `ShutdownAbortRecord` matches it on

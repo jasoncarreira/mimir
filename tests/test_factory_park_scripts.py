@@ -25,10 +25,16 @@ from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
+    load_factory_record,
     factory_process_is_alive,
     save_factory_record,
 )
-from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
+from mimir.worklink.claims import (
+    MAX_SHUTDOWN_ABORT_FORGIVENESS,
+    ChainlinkClaims,
+    ClaimRecord,
+    ShutdownAbortRecord,
+)
 from mimir.worklink.run_state import process_start_ticks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -85,6 +91,26 @@ def _claim_history(count: int, *, agent: str = AGENT) -> list[str]:
     ]
 
 
+
+def _exhausted_forgiveness_history() -> list[str]:
+    """Three claims with the forgiveness budget already spent on the first two.
+
+    `attempts_used` forgives at most MAX_SHUTDOWN_ABORT_FORGIVENESS claims, so a
+    marker for the third counts for nothing and the claim stays charged.
+    """
+    base = datetime(2026, 9, 21, 3, 0, tzinfo=UTC)
+    claims = [_claim(n + 1, at=base + timedelta(minutes=n)) for n in range(3)]
+    history = [c.to_comment() for c in claims]
+    for c in claims[:MAX_SHUTDOWN_ABORT_FORGIVENESS]:
+        history.append(
+            ShutdownAbortRecord(
+                issue_id=c.issue_id, attempt=c.attempt, agent_id=c.agent_id,
+                claimed_at=c.claimed_at, aborted_at=base + timedelta(hours=1),
+            ).to_comment()
+        )
+    return history
+
+
 def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int = 0):
     """Stub the park's subprocess surface: the factory CLI and chainlink.
 
@@ -95,9 +121,14 @@ def _park_stub(calls: list[list[str]], comments: list[str], *, release_rc: int =
     def run(cmd, **kwargs):
         argv = list(cmd)
         calls.append(argv)
+        if argv[1:3] == ["issue", "comment"]:
+            # A posted comment is visible to the next read, so the script's
+            # postcondition sees the marker it just wrote.
+            comments.append(argv[4])
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[1:4] == ["issue", "show", "1783"]:
             return subprocess.CompletedProcess(
-                argv, 0, json.dumps({"comments": comments}), "",
+                argv, 0, json.dumps({"comments": list(comments)}), "",
             )
         if argv[1:3] == ["locks", "release"]:
             return subprocess.CompletedProcess(
@@ -793,16 +824,19 @@ class TestParkToImmediateDispatch:
         exist. This is why the script reads through `_issue_comments` rather than
         stringifying whatever it is handed.
         """
-        claim = _claim_history(1)[0]
+        stored = [{"content": c} for c in _claim_history(1)]
         calls: list[list[str]] = []
 
         def run(cmd, **kwargs):
             argv = list(cmd)
             calls.append(argv)
+            if argv[1:3] == ["issue", "comment"]:
+                stored.append({"content": argv[4]})
+                return subprocess.CompletedProcess(argv, 0, "", "")
             if argv[1:4] == ["issue", "show", "1783"]:
                 # the object form, with the text under `content`
                 return subprocess.CompletedProcess(
-                    argv, 0, json.dumps({"comments": [{"content": claim}]}), "",
+                    argv, 0, json.dumps({"comments": list(stored)}), "",
                 )
             return subprocess.CompletedProcess(argv, 0, "{}", "")
 
@@ -814,6 +848,98 @@ class TestParkToImmediateDispatch:
         assert code == 0
         assert "forgiven" in detail
         assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+
+    def test_exhausted_forgiveness_refuses_before_anything_is_destroyed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The park must decide the claim outcome before it stops anything.
+
+        Forgiveness is bounded. If the budget is spent, the claim cannot be
+        credited back -- and discovering that *after* terminalizing leaves a
+        parked run whose claim is still held and charged, which is precisely the
+        unresumable state parking exists to avoid.
+        """
+        record = _record(tmp_path, phase="running", status="running")
+        home = _home_with(record, tmp_path)
+        history = _exhausted_forgiveness_history()
+        calls: list[list[str]] = []
+        stopped: list[str] = []
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: stopped.append(label))
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+
+        with pytest.raises(park.ParkError, match="forgiveness marker would not discount"):
+            _park_main(record, home, monkeypatch, _park_stub(calls, history), tmp_path)
+
+        assert stopped == [], "the controller was stopped before the claim was decided"
+        assert not any("terminal" in argv for argv in calls), "the run was terminalized"
+        assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
+        assert not any(argv[1:3] == ["locks", "release"] for argv in calls)
+        settled = load_factory_record(home, record.run_id)
+        assert settled is not None and settled.controller_phase == "running"
+
+    def test_an_already_parked_run_completes_its_claim_reconciliation(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Re-running must finish an interrupted park, not refuse it.
+
+        A flat "already parked; nothing to do" is what turns a park that failed
+        after terminalizing into an unrecoverable one.
+        """
+        record = _record(tmp_path, phase="parked", status="needs-human")
+        home = _home_with(record, tmp_path)
+        calls: list[list[str]] = []
+        run = _park_stub(calls, _claim_history(1))
+        monkeypatch.setattr(
+            park, "factory_status",
+            lambda *a, **k: _status(sandbox_path=record.sandbox),
+        )
+        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        monkeypatch.setattr(park, "_run", run)
+
+        rc = park.main([
+            "--run-id", record.run_id, "--sandbox", record.sandbox,
+            "--home", str(home), "--launcher", record.launcher,
+            "--reason", "budget", "--controller-pid", "none", "--agent-id", AGENT,
+        ])
+
+        assert rc == 0
+        assert ["chainlink", "locks", "release", "1783"] in calls
+        assert any(argv[1:3] == ["issue", "comment"] for argv in calls)
+
+    def test_an_already_parked_run_with_nothing_to_do_still_refuses(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The idempotent path must not re-forgive an already-reconciled claim.
+
+        Forgiveness is a bounded resource, so a second marker for the same claim
+        would spend capacity a later park needs.
+        """
+        record = _record(tmp_path, phase="parked", status="needs-human")
+        home = _home_with(record, tmp_path)
+        history = _claim_history(1)
+        claim = _claim(1, at=datetime(2026, 9, 21, 3, 0, tzinfo=UTC))
+        history.append(
+            ShutdownAbortRecord(
+                issue_id=claim.issue_id, attempt=claim.attempt, agent_id=claim.agent_id,
+                claimed_at=claim.claimed_at, aborted_at=datetime(2026, 9, 21, 4, 0, tzinfo=UTC),
+            ).to_comment()
+        )
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            park, "factory_status",
+            lambda *a, **k: _status(sandbox_path=record.sandbox),
+        )
+        monkeypatch.setattr(park, "_run", _park_stub(calls, history))
+
+        with pytest.raises(park.ParkError, match="needs no reconciliation"):
+            park.main([
+                "--run-id", record.run_id, "--sandbox", record.sandbox,
+                "--home", str(home), "--launcher", record.launcher,
+                "--reason", "budget", "--controller-pid", "none", "--agent-id", AGENT,
+            ])
+        assert not any(argv[1:3] == ["issue", "comment"] for argv in calls)
 
     def test_a_failed_release_is_reported_rather_than_silently_parked(
         self, tmp_path: Path, monkeypatch, capsys
