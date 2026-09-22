@@ -14,6 +14,7 @@ import pytest
 
 from mimir.contained_execution import CollectedExecutionResult
 from mimir.worklink import compute, worker_exec
+from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.safe_git import _git_credential_settings
 
 
@@ -423,7 +424,7 @@ async def test_factory_projects_native_config_only_for_opencode(
     native = {
         "model": "anthropic/test-model",
         "plugin": [
-            ["opencode-feature-factory@0.9.2", {"profile": "production", "options": {"parallel": 3}}],
+            [f"opencode-feature-factory@{FACTORY_VERSION}", {"profile": "production", "options": {"parallel": 3}}],
             "opencode-project-memory@0.1.0",
             "opencode-anthropic-auth@0.0.13",
         ],
