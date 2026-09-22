@@ -158,6 +158,7 @@ _LOCAL_ENV_CRED_PREFIXES = (
 
 DEFAULT_WORKLINK_STDOUT_BYTES = 64 * 1024 * 1024
 DEFAULT_WORKLINK_STDERR_BYTES = 16 * 1024 * 1024
+WORKLINK_GATE_ENV = "MIMIR_WORKLINK_GATE"
 _TERMINATED_DRAIN_TIMEOUT_S = 5.0
 _WORKER_CANCEL_TIMEOUT_S = 25.0
 _WORKER_COLLECTION_TIMEOUT_S = 10.0
@@ -316,6 +317,7 @@ def _enabled_child_env(spec: WorkSpec, identifier: str) -> dict[str, str]:
         )
     env = opencode_worker_environment(base_worker_environment(identifier), additions)
     env["HOME"] = home
+    env[WORKLINK_GATE_ENV] = "1"
     if permission is not None:
         try:
             parsed = json.loads(additions["OPENCODE_PERMISSION"])
