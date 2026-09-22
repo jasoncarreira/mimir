@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.0. Remove the
+  `.factory.json` `publish` override so the factory's default publisher honors
+  `PR_DRAFT` and validates the resulting URL. The sibling
+  `prime-agent-feature-factory` remains unconsumed and is not installed or pinned
+  here.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.9.2, matching the
   exact-match `FACTORY_VERSION` admission check. Both packages mimir installs are
   published at 0.9.2; `prime-agent-feature-factory` remains at 0.9.1 and is not

@@ -114,9 +114,10 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # Exact, not a subset: an unrecognized key here means the factory would either refuse the
     # declaration outright or act on something nobody reviewed. `bootstrap` joined the set when
     # this repository opted in to feature-factory #248, so a sandbox installs its dependencies
-    # before any gate instead of discovering they are absent.
+    # before any gate instead of discovering they are absent. `publish` is intentionally absent:
+    # feature-factory's default publisher honors `pr_draft` and validates its own output.
     assert set(data) == {
-        "resolve", "verify", "verify_timeout_ms", "publish", "bootstrap", "pr_draft",
+        "resolve", "verify", "verify_timeout_ms", "bootstrap", "pr_draft",
     }
     # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
     # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
@@ -124,16 +125,10 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # timeout -- which then blocks relaunching the run on the same SHA. The suite takes
     # 8.5-15 min here, so 30 min is headroom rather than a guess at the current runtime.
     assert data["verify_timeout_ms"] == 1800000
-    # The value, not merely the key. Asserting presence alone would pass with `pr_draft: true`, or
-    # with `--draft` restored in `publish`, either of which silently reinstates the draft-PR problem
-    # this declaration exists to remove: `gh pr merge` refuses a draft, and a draft is invisible to a
-    # poller that acts on open PRs.
+    # The value, not merely the key. A draft is invisible to a poller that acts on open PRs and
+    # `gh pr merge` refuses it.
     assert data["pr_draft"] is False
-    # And the two must agree. `publish` is currently unconsumed, so a stale `--draft` there breaks no
-    # run today -- but a declaration that says ready-for-review beside a command that says draft is a
-    # contradiction the next reader has to resolve, and whoever wires `publish` up would inherit it.
-    assert "--draft" not in data["publish"]
-    assert data["publish"].startswith("gh pr create ")
+    assert "publish" not in data
     # The declaration must not carry a credential; it may only reference the
     # environment the factory already inherits.
     blob = DECLARATION.read_text()
