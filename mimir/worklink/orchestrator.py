@@ -1756,6 +1756,11 @@ class WorklinkRunner:
                     issue_id=issue.issue_id,
                     attempt=attempt,
                     error=transition_reason or "Worklink run failed",
+                    failure_kind=(
+                        "tests_failed"
+                        if "tests_failed" in validation.reasons
+                        else "operator_required"
+                    ),
                     exit_status=raw.exit_code if raw.exit_code != 0 else 1,
                     autonomous=autonomous,
                     preserved_ref=lease.branch,
@@ -4427,6 +4432,7 @@ def _record_run_failure(
     work_path: str | None = None,
     transcript_path: str | None = None,
     work_started: bool | None = None,
+    failure_kind: str = "operator_required",
 ) -> dict[str, Any] | None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
@@ -4455,6 +4461,7 @@ def _record_run_failure(
             work_path=work_path,
             transcript_path=transcript_path,
             work_started=work_started,
+            failure_kind=failure_kind,
         )
     return None
 
