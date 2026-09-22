@@ -313,6 +313,7 @@ repository files and model-generated values never add permission entries.
 | `GITHUB_REPOS` | csv `owner/repository` | unset | Legacy projection of `repositories.yaml` `repositories[].slug`. When the repository inventory is declared, an omitted value is derived and a disagreeing value is a startup error. Without the inventory, it retains the legacy repository allowlist behavior. |
 | `MIMIR_WORKLINK_REPO` | str | unset | Dedicated base repository Worklink branches from (back-compat alias of `WORKLINK_REPO`, which wins). Never inferred from cwd or the Mimir installation. |
 | `MIMIR_WORKLINK_AGENT_ID` | str | process-generated | Internal process-scoped owner inherited by detached Worklink controllers; the server sets this automatically. |
+| `MIMIR_WORKLINK_GATE` | `1` | unset | Internal marker exported by the enabled Worklink leaf executor. It identifies commands running in the build-gate sandbox; operators and repository configuration must not set it. |
 | `PYTEST_ADDOPTS` | pytest arguments | unset | Existing pytest options are preserved by the Worklink gate alongside its fresh JUnit/cache reporting options. Failed-node reruns override selection and use `-n 0`, retaining execution settings such as warning policies. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |

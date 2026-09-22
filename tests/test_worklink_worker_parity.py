@@ -1063,6 +1063,7 @@ def test_enabled_environment_is_exact_and_closed() -> None:
         "LC_ALL": "C.UTF-8",
         "OPENCODE_CONFIG": f"{home}/.config/opencode/opencode.json",
         "OPENCODE_PERMISSION": '{"edit":"allow"}',
+        "MIMIR_WORKLINK_GATE": "1",
         "ANTHROPIC_API_KEY": "selected",
     }
 
