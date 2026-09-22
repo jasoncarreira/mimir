@@ -117,6 +117,136 @@ def test_autonomous_admission_fails_closed_for_corrupt_incident_state(tmp_path: 
     assert "state unavailable" in reason
 
 
+def test_unelapsed_retry_after_excludes_tests_failure_from_dispatch(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+    before_retry = datetime.fromisoformat(entry["retry_after"]) - timedelta(seconds=1)
+
+    excluded, alerts = pending_failure_alerts(state_dir, now=before_retry)
+
+    assert excluded == {1793}
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert autonomous_dispatch_block_reason(
+        state_dir, 1793, now=before_retry
+    ) == "an unresolved Worklink incident blocks fresh autonomous dispatch"
+
+
+@pytest.mark.parametrize("retry_after", [None, "not-a-timestamp"])
+def test_invalid_retry_after_fails_closed(
+    tmp_path: Path, retry_after: str | None
+) -> None:
+    state_dir = tmp_path / "state"
+    now = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=now,
+    )
+    with failure_state_transaction(state_dir) as state:
+        state["issues"]["1793"]["retry_after"] = retry_after
+
+    excluded, _ = pending_failure_alerts(state_dir, now=now + timedelta(days=1))
+
+    assert excluded == {1793}
+    assert autonomous_dispatch_block_reason(
+        state_dir, 1793, now=now + timedelta(days=1)
+    ) is not None
+
+
+def test_1793_elapsed_retry_is_dispatchable_but_incident_remains_visible(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 22, 6, 27, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1793,
+        attempt=1,
+        exit_status=1,
+        error="tests failed",
+        log_path="attempt-1.log",
+        failure_kind="tests_failed",
+        now=failed_at,
+    )
+
+    assert entry["retry_after"] == "2026-09-21T22:21:27+00:00"
+    observed_at = datetime(2026, 9, 21, 23, 42, tzinfo=UTC)
+    excluded, alerts = pending_failure_alerts(state_dir, now=observed_at)
+
+    assert excluded == set()
+    assert [alert["issue_id"] for alert in alerts] == [1793]
+    assert alerts[0]["failure_kind"] == "tests_failed"
+    assert load_failure_state(state_dir)["issues"]["1793"]["active"] is True
+    assert autonomous_dispatch_block_reason(state_dir, 1793, now=observed_at) is None
+
+
+def test_worklink_blocked_incident_never_auto_resumes(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    failed_at = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    entry = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=1,
+        exit_status=1,
+        error="spec requires an unavailable prerequisite",
+        log_path=None,
+        failure_kind="worklink_blocked",
+        now=failed_at,
+    )
+    after_retry = datetime.fromisoformat(entry["retry_after"]) + timedelta(days=1)
+
+    excluded, _ = pending_failure_alerts(state_dir, now=after_retry)
+
+    assert excluded == {1796}
+    assert autonomous_dispatch_block_reason(state_dir, 1796, now=after_retry) is not None
+
+
+def test_repeated_tests_failures_escalate_retry_delay(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    first_at = datetime(2026, 9, 21, 20, 0, tzinfo=UTC)
+    first = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=1,
+        exit_status=1,
+        error="same failing test",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=first_at,
+    )
+    second_at = first_at + timedelta(hours=1)
+    second = record_failure(
+        state_dir,
+        issue_id=1796,
+        attempt=2,
+        exit_status=1,
+        error="same failing test",
+        log_path=None,
+        failure_kind="tests_failed",
+        now=second_at,
+    )
+
+    assert first["consecutive"] == 1
+    assert datetime.fromisoformat(first["retry_after"]) - first_at == timedelta(minutes=15)
+    assert second["consecutive"] == 2
+    assert datetime.fromisoformat(second["retry_after"]) - second_at == timedelta(minutes=30)
+
+
 def test_acknowledged_legacy_active_incident_gets_stable_occurrence(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     with failure_state_transaction(state_dir) as state:

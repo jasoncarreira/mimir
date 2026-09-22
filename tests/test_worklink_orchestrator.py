@@ -3873,6 +3873,10 @@ def test_worklink_runner_timeout_transitions_failed_without_pr(tmp_path: Path) -
 def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool) -> None:
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
     calls, base_runner = _orchestrator_runner(repo, worktree)
 
     def runner(args, **kwargs):
@@ -3887,7 +3891,7 @@ def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool
     registry.register(FakeBackend())
     result = asyncio.run(
         WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
-            441, backend_name="fake", test_command="echo ok",
+            441, backend_name="fake", test_command="echo ok", autonomous=True,
         )
     )
 
@@ -3906,6 +3910,11 @@ def test_gate_timeout_blocks_instead_of_retrying(tmp_path: Path, timed_out: bool
         isinstance(call, list) and call[:3] == ["chainlink", "issue", "comment"]
         and reason in call[-1] for call in calls
     )
+    if not timed_out:
+        from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+        incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["441"]
+        assert incident["failure_kind"] == "tests_failed"
 
 
 def test_worklink_runner_dirty_after_commit_fails_before_push(tmp_path: Path) -> None:

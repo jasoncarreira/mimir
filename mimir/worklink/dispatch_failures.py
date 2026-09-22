@@ -21,6 +21,9 @@ POLLER_NAME = "worklink-ready-queue"
 INITIAL_BACKOFF_MINUTES = 15
 MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
+# A fresh attempt can repair a failing gate; spec and operational incidents
+# require changed external state and therefore remain operator-gated.
+AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed"})
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
@@ -71,8 +74,27 @@ def _read_failure_state_strict(state_dir: Path) -> dict[str, Any] | None:
     return payload
 
 
-def autonomous_dispatch_block_reason(state_dir: Path, issue_id: int) -> str | None:
+def _incident_blocks_dispatch(entry: Mapping[str, Any], now: datetime) -> bool:
+    """Keep active incidents fenced unless a classified backoff has elapsed."""
+    if entry.get("failure_kind") not in AUTO_RESUMABLE_FAILURE_KINDS:
+        return True
+    retry_after = entry.get("retry_after")
+    if not isinstance(retry_after, str):
+        return True
+    try:
+        return datetime.fromisoformat(retry_after) > now
+    except (TypeError, ValueError):
+        return True
+
+
+def autonomous_dispatch_block_reason(
+    state_dir: Path,
+    issue_id: int,
+    *,
+    now: datetime | None = None,
+) -> str | None:
     """Fail closed when autonomous fresh work may supersede an incident."""
+    now = now or datetime.now(UTC)
     try:
         state = _read_failure_state_strict(state_dir)
     except ValueError as exc:
@@ -84,7 +106,7 @@ def autonomous_dispatch_block_reason(state_dir: Path, issue_id: int) -> str | No
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
         return "dispatch failure state unavailable: invalid issue record"
-    if entry["active"]:
+    if entry["active"] and _incident_blocks_dispatch(entry, now):
         return "an unresolved Worklink incident blocks fresh autonomous dispatch"
     return None
 
@@ -536,6 +558,7 @@ def record_failure(
     work_path: str | None = None,
     transcript_path: str | None = None,
     work_started: bool | None = None,
+    failure_kind: str = "operator_required",
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Record a dispatch failure.
@@ -558,6 +581,7 @@ def record_failure(
             "attempt_consumed": False,
             "exit_status": exit_status,
             "terminal_error": safe_error,
+            "failure_kind": failure_kind,
             "signature": signature,
             "transient_contention": True,
             "failed_at": now.isoformat(),
@@ -593,6 +617,7 @@ def record_failure(
             "attempt_consumed": attempt is not None and not prework_refusal,
             "exit_status": exit_status,
             "terminal_error": safe_error,
+            "failure_kind": failure_kind,
             "signature": signature,
             "occurrence_id": (
                 str(prior.get("occurrence_id") or uuid.uuid4().hex)
@@ -642,7 +667,7 @@ def pending_failure_alerts(
     state_dir: Path, *, now: datetime | None = None
 ) -> tuple[set[int], list[dict[str, object]]]:
     """Return active issue exclusions and undelivered intervention prompts."""
-    del now
+    now = now or datetime.now(UTC)
     backed_off: set[int] = set()
     alerts: list[dict[str, object]] = []
     with failure_state_transaction(state_dir) as state:
@@ -653,7 +678,8 @@ def pending_failure_alerts(
                 issue_id = int(entry["issue_id"])
             except (KeyError, TypeError, ValueError):
                 continue
-            backed_off.add(issue_id)
+            if _incident_blocks_dispatch(entry, now):
+                backed_off.add(issue_id)
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
             notified = list(notified) if isinstance(notified, list) else []
@@ -696,6 +722,7 @@ def pending_failure_alerts(
                     "attempt_consumed": entry.get("attempt_consumed"),
                     "exit_status": entry.get("exit_status"),
                     "terminal_error": entry.get("terminal_error"),
+                    "failure_kind": entry.get("failure_kind"),
                     "error_signature": signature,
                     "failure_occurrence_id": entry.get("occurrence_id"),
                     "log": entry.get("log_path"),
