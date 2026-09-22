@@ -934,6 +934,17 @@ Two constraints are not obvious and are enforced rather than documented alone:
   the factory never acknowledges, and `factory status` reports
   `park_snapshot: null`.
 
+A park also releases the Chainlink claim the stopped controller held, and clears
+`worklink:in-progress`. Without the release the next dispatch is refused, by a
+path worth stating because it is indirect: the chainlink CLI treats a same-agent
+re-claim as idempotent success and prints "You already hold the lock" with rc=0,
+and `claim_issue` uses that exact string to decide whether to run its
+duplicate-liveness guard, which then finds the stopped controller's own heartbeat
+comment still fresh and returns `duplicate_run_live` for the whole
+`duplicate_freshness_s` window (600s by default). A released lock is claimed
+outright, so that branch is never entered. If the release fails the park still
+stands, and the script exits 3 naming the command to run.
+
 A park also reconciles mimir's retained record to `controller_phase=parked` with
 an observed `needs-human` status. That is not bookkeeping: `_attempt_is_active`
 reads mimir's last observed status rather than the factory plane, so a record

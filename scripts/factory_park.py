@@ -33,6 +33,16 @@ terminalize and reconcile — and whichever write lands second wins. There is no
 ordering of the compute processes that avoids this, so the controller is stopped
 first and its death is verified before any other process is signalled.
 
+Stopping the controller leaves its Chainlink claim behind, and that claim is
+what refuses the next dispatch, so the park releases it as its last step. The
+refusal is indirect enough to be worth stating: the chainlink CLI treats a
+same-agent re-claim as idempotent success and says "You already hold the lock",
+and ``claim_issue`` uses exactly that string to decide whether to run its
+duplicate-liveness guard -- which then finds the stopped controller's own
+heartbeat comment still fresh and returns ``duplicate_run_live`` for the whole
+``duplicate_freshness_s`` window. A released lock is claimed outright instead,
+so the guard is never reached.
+
 Which process to stop is not guessed from ``ps``. The retained record's
 ``handle`` names the driver, and ``factory_process_is_verified_dead`` is the same
 predicate mimir's own recovery path applies before it will resume, so this script
@@ -346,6 +356,10 @@ def main(argv: list[str] | None = None) -> int:
             "the compute processes underneath a live one makes it race this park's own writes."
         ),
     )
+    parser.add_argument(
+        "--chainlink-bin", default="chainlink",
+        help="chainlink CLI used to release the claim the stopped controller held",
+    )
     parser.add_argument("--dry-run", action="store_true", help="report the plan and refuse to change anything")
     args = parser.parse_args(argv)
 
@@ -486,6 +500,40 @@ def main(argv: list[str] | None = None) -> int:
             "retained record does not read needs-human after reconcile; resume would refuse it"
         )
     print("settled    : record re-read and still parked")
+
+    # Release the claim the stopped controller held. Without this an immediate
+    # resume dispatch is refused: the chainlink CLI answers a same-agent
+    # re-claim with "You already hold the lock" and rc=0, and `claim_issue`
+    # reads that string as the trigger for its duplicate-liveness guard, which
+    # then finds the stopped controller's own heartbeat comment still fresh and
+    # returns `duplicate_run_live`. Releasing means the next claim acquires the
+    # lock outright, so that branch is never entered.
+    released = _run([args.chainlink_bin, "locks", "release", str(record.issue_id)])
+    unlabelled = _run([
+        args.chainlink_bin, "issue", "unlabel", str(record.issue_id), "worklink:in-progress",
+    ])
+    if released.returncode == 0:
+        print(f"released   : claim on issue {record.issue_id}")
+    if unlabelled.returncode != 0:
+        print(
+            f"warning    : could not clear worklink:in-progress on {record.issue_id}: "
+            f"{(unlabelled.stderr or unlabelled.stdout).strip()[:200]}"
+        )
+    if released.returncode != 0:
+        # The park itself is published and reconciled, so this is not a refusal
+        # -- but the run is not dispatchable until the claim is released, which
+        # is the one thing an operator must not have to discover at resume time.
+        print()
+        print(
+            f"PARKED, BUT THE CLAIM IS STILL HELD: "
+            f"{(released.stderr or released.stdout).strip()[:200]}",
+            file=sys.stderr,
+        )
+        print(
+            f"release it before resuming:  {args.chainlink_bin} locks release {record.issue_id}",
+            file=sys.stderr,
+        )
+        return 3
 
     print()
     print("resume with:")

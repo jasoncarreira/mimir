@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,7 @@ from mimir.worklink.factory_state import (
     factory_process_is_alive,
     save_factory_record,
 )
+from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
 from mimir.worklink.run_state import process_start_ticks
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -567,3 +569,153 @@ class TestParkStopsTheControllerFirst:
         monkeypatch.setattr(park.time, "sleep", lambda seconds: None)
         with pytest.raises(park.ParkError, match="survived SIGKILL"):
             park.stop_pid(4242, "controller", timeout=0.01)
+
+class TestParkToImmediateDispatch:
+    """Park then dispatch, through the real claim-admission path.
+
+    The mocked dispatch test above proves which argv resume hands off; it says
+    nothing about whether that dispatch is *admissible*. `claim_issue` is what
+    refuses, and it refuses for a reason no amount of mocking would surface:
+    the chainlink CLI answers a same-agent re-claim with "You already hold the
+    lock" and rc=0, and that exact string is the trigger for the
+    duplicate-liveness guard.
+    """
+
+    @staticmethod
+    def _runner(calls: list[list[str]], *, held: bool, comments: tuple[str, ...]):
+        """A chainlink stub whose `locks claim` reflects whether the lock is held."""
+
+        def runner(args):
+            argv = list(args)
+            calls.append(argv)
+            if argv[1:3] == ["locks", "claim"]:
+                stdout = "You already hold the lock on issue #1783" if held else "claimed"
+                return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+            if argv[1:3] == ["issue", "show"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps({"comments": list(comments)}), stderr="",
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        return runner
+
+    def _claims(self, calls, *, held: bool):
+        now = datetime(2026, 9, 21, 3, 0, tzinfo=UTC)
+        fresh = ClaimRecord(
+            issue_id=1783, attempt=10, agent_id="mimir-worklink-epic",
+            claimed_at=now, heartbeat_at=now,
+        )
+        comments = (fresh.to_comment(),)
+        return ChainlinkClaims(
+            agent_id="mimir-worklink-epic",
+            runner=self._runner(calls, held=held, comments=comments),
+            clock=lambda: now,
+        ), comments
+
+    def test_an_unreleased_claim_refuses_the_resume_dispatch(self, tmp_path: Path) -> None:
+        """The failure mode being fixed: the stopped controller's own heartbeat
+        is still fresh, so its claim reads as a live duplicate."""
+        calls: list[list[str]] = []
+        claims, comments = self._claims(calls, held=True)
+
+        result = claims.claim_issue(1783, list(comments), home_path=tmp_path)
+
+        assert result.claimed is False
+        assert result.reason == "duplicate_run_live"
+
+    def test_a_released_claim_admits_the_resume_dispatch(self, tmp_path: Path) -> None:
+        """The same dispatch, after the park released the lock.
+
+        This is the half that makes the pair discriminating: without it, the
+        test above would pass just as well against a park that never releases.
+        """
+        calls: list[list[str]] = []
+        claims, comments = self._claims(calls, held=False)
+
+        result = claims.claim_issue(1783, list(comments), home_path=tmp_path)
+
+        assert result.claimed is True, result.reason
+
+    def test_park_releases_the_claim_and_clears_the_in_progress_label(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """And the park actually issues the release the pair above depends on."""
+        record = _record(tmp_path, phase="running", status="running")
+        home = tmp_path / "home"
+        home.mkdir()
+        save_factory_record(home, record)
+        _plane(Path(record.sandbox) / ".factory" / record.run_id)
+
+        statuses = iter([
+            _status("running", sandbox_path=record.sandbox),
+            _status(sandbox_path=record.sandbox),
+            _status(sandbox_path=record.sandbox),
+        ])
+        monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
+        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+        monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(list(cmd), 0, "{}", "")
+
+        monkeypatch.setattr(park, "_run", fake_run)
+
+        rc = park.main([
+            "--run-id", record.run_id, "--sandbox", record.sandbox,
+            "--home", str(home), "--launcher", record.launcher,
+            "--reason", "budget", "--controller-pid", "4242",
+        ])
+
+        assert rc == 0
+        assert ["chainlink", "locks", "release", "1783"] in calls
+        assert ["chainlink", "issue", "unlabel", "1783", "worklink:in-progress"] in calls
+
+    def test_a_failed_release_is_reported_rather_than_silently_parked(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        """A park whose claim is still held is not dispatchable, and an operator
+        must not have to discover that at resume time."""
+        record = _record(tmp_path, phase="running", status="running")
+        home = tmp_path / "home"
+        home.mkdir()
+        save_factory_record(home, record)
+        _plane(Path(record.sandbox) / ".factory" / record.run_id)
+
+        statuses = iter([
+            _status("running", sandbox_path=record.sandbox),
+            _status(sandbox_path=record.sandbox),
+            _status(sandbox_path=record.sandbox),
+        ])
+        monkeypatch.setattr(park, "factory_status", lambda *a, **k: next(statuses))
+        monkeypatch.setattr(park, "verify_controller", lambda pid, issue: "mimir worklink run-epic")
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+        monkeypatch.setattr(park, "publish_snapshot", lambda *a, **k: tmp_path / "snap")
+
+        def fake_run(cmd, **kwargs):
+            argv = list(cmd)
+            if argv[1:3] == ["locks", "release"]:
+                return subprocess.CompletedProcess(argv, 1, "", "lock held by another agent")
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        monkeypatch.setattr(park, "_run", fake_run)
+
+        rc = park.main([
+            "--run-id", record.run_id, "--sandbox", record.sandbox,
+            "--home", str(home), "--launcher", record.launcher,
+            "--reason", "budget", "--controller-pid", "4242",
+        ])
+
+        assert rc == 3
+        captured = capsys.readouterr()
+        assert "THE CLAIM IS STILL HELD" in captured.err
+        assert "locks release 1783" in captured.err
