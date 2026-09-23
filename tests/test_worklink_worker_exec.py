@@ -1708,23 +1708,31 @@ def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeyp
         "relative_path": ".factory-sandboxes/chainlink-41/src/fix.py",
         "content": "old old\n",
     }
-    assert worker_exec._run_factory_file_child(write) == {
-        "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
-    }
     target = tmp_path / ".factory-sandboxes" / "chainlink-41" / "src" / "fix.py"
-    assert target.read_text() == "old old\n"
-    assert worker_exec._run_factory_file_child(write)["error"] == "file already exists"
+    if sys.platform == "linux":
+        assert worker_exec._run_factory_file_child(write) == {
+            "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
+        }
+        assert target.read_text() == "old old\n"
+        assert worker_exec._run_factory_file_child(write)["error"] == "file already exists"
 
-    edit = {
-        "op": "edit_file", "issue": 41, "run_id": "chainlink-41",
-        "relative_path": ".factory-sandboxes/chainlink-41/src/fix.py",
-        "old_string": "old", "new_string": "new", "replace_all": True,
-    }
-    assert worker_exec._run_factory_file_child(edit) == {
-        "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
-        "occurrences": 2,
-    }
-    assert target.read_text() == "new new\n"
+        edit = {
+            "op": "edit_file", "issue": 41, "run_id": "chainlink-41",
+            "relative_path": ".factory-sandboxes/chainlink-41/src/fix.py",
+            "old_string": "old", "new_string": "new", "replace_all": True,
+        }
+        assert worker_exec._run_factory_file_child(edit) == {
+            "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
+            "occurrences": 2,
+        }
+        assert target.read_text() == "new new\n"
+    else:
+        with pytest.raises(RuntimeError) as exc_info:
+            worker_exec._run_factory_file_child(write)
+        assert str(exc_info.value) == "atomic create-only publication is unavailable"
+        assert not target.exists()
+        assert not list(target.parent.glob(".mimir-*.tmp"))
+
     for relative in ("../escape", ".git/config", "/absolute"):
         with pytest.raises(RuntimeError, match="path is invalid"):
             worker_exec._run_factory_file_child({**write, "relative_path": relative})

@@ -516,27 +516,23 @@ def _write_all(fd: int, content: bytes) -> None:
 
 
 def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
+    if sys.platform != "linux":
+        raise RuntimeError("atomic create-only publication is unavailable")
     renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-    if renameat2 is not None:
-        renameat2.argtypes = [
-            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
-        ]
-        renameat2.restype = ctypes.c_int
-        if renameat2(
-            directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1,
-        ) == 0:
-            return
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(error, os.strerror(error), destination)
-        raise OSError(error, os.strerror(error), destination)
-    # POSIX link is an atomic create-only publication on platforms without
-    # renameat2 (notably macOS). The caller removes the private temporary name.
-    os.link(
-        source, destination,
-        src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-        follow_symlinks=False,
-    )
+    if renameat2 is None:
+        raise RuntimeError("atomic create-only publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1,
+    ) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), destination)
+    raise OSError(error, os.strerror(error), destination)
 
 
 def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:
