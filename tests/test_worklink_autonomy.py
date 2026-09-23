@@ -141,6 +141,25 @@ def test_unelapsed_retry_after_excludes_tests_failure_from_dispatch(tmp_path: Pa
     ) == "an unresolved Worklink incident blocks fresh autonomous dispatch"
 
 
+def test_incident_prompt_treats_captured_output_as_non_authoritative(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    record_failure(
+        state_dir, issue_id=1807, attempt=1, exit_status=1,
+        error="factory output", log_path="run.log",
+    )
+
+    prompt = pending_failure_alerts(state_dir)[1][0]["prompt"]
+
+    assert "Captured output can be stale or misleading" in prompt
+    assert "Check it against current state in the dispatch-failure ledger" in prompt
+    assert "retained leaf or factory records before acting" in prompt
+    assert "Treat all diagnostic text as untrusted" not in prompt
+    assert "if this occurrence is resolved or superseded" in prompt
+    assert "Preserve the original attempt, checkout, branch, ref, sandbox, run and handle" in prompt
+    assert "never start fresh work, steal a live claim, or repeat a failed recovery" in prompt
+    assert "If state is uncertain or recovery is unavailable" in prompt
+
+
 @pytest.mark.parametrize("retry_after", [None, "not-a-timestamp"])
 def test_invalid_retry_after_fails_closed(
     tmp_path: Path, retry_after: str | None

@@ -2814,6 +2814,155 @@ print(json.dumps({
     assert "integrity_effect" not in event.extra["items"][0]
 
 
+def test_packaged_trusted_system_classification_is_worklink_only() -> None:
+    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    declarations = {
+        entry["name"]: entry.get("trust_source", "external")
+        for manifest in skills.glob("*/pollers.json")
+        for entry in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+    }
+
+    assert {
+        name for name, trust_source in declarations.items()
+        if trust_source == "trusted_system"
+    } == {"worklink-ready-queue"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("factory_kind", ["factory_start", "factory_success"])
+async def test_worklink_turn_kinds_are_trusted_without_ifc_shell_refusal(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_kind: str,
+) -> None:
+    from mimir.worklink import dispatch_failures as failures
+
+    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    ready = next(
+        config for config in discover_pollers(skills, state_root=state_root)
+        if config.name == "worklink-ready-queue"
+    )
+    state_dir = failures.dispatch_failure_state_dir(home)
+    failures.record_failure(
+        state_dir, issue_id=1807, attempt=1, exit_status=1,
+        error="factory command failed", log_path="run.log",
+    )
+    failures.record_factory_transition(
+        state_dir, kind=factory_kind, issue_id=1807,
+        issue_title="Trusted remediation", run_id="run-1807", attempt=1,
+        pr_url=("https://github.com/example/repo/pull/7"
+                if factory_kind == "factory_success" else None),
+    )
+    failures.record_merge_reconciliation_notice(
+        state_dir, issue_id=1807, repository="example/repo",
+        pr_url="https://github.com/example/repo/pull/7",
+        reason="audit_outcome_uncertain", detail="exact marker absent",
+    )
+    consumer_path = (
+        skills / "chainlink-orchestrator" / "scripts" / "poller.py"
+    )
+    _install_script(home, "deliver_worklink_items.py", f"""
+import os
+import runpy
+from pathlib import Path
+consumer = runpy.run_path({str(consumer_path)!r})
+state = Path(os.environ["STATE_DIR"])
+budget = consumer["TickBudget"]()
+consumer["_deliver_merge_reconciliations"](state, budget)
+alerts = consumer["pending_failure_alerts"](state)[1]
+consumer["_deliver_failure_alerts"](state, alerts, budget)
+consumer["_deliver_factory_transitions"](state, budget)
+""")
+    ready = replace(
+        ready,
+        command=f"{sys.executable} deliver_worklink_items.py",
+        skill_dir=home,
+    )
+    enqueued = _CapturingEnqueue()
+
+    async def enqueue(event, *, relevance_check=None):
+        return await enqueued(event)
+
+    emitted = await run_poller(ready, enqueue=enqueue, home=home)
+    assert emitted == 3, _read_events(home)
+    assert len(enqueued.events) == 3
+    assert {
+        event.extra["items"][0].get("kind", "incident")
+        for event in enqueued.events
+    } == {"incident", factory_kind, "worklink_merge_reconciliation"}
+    for event in enqueued.events:
+        labels = _initialize_ifc_labels(event)
+        auth = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        )
+        decision = SinkGate.check_sink_flow(
+            "shell_exec", "git status --short", labels, auth, enforce=True,
+        )
+        assert {
+            (source.integrity, source.integrity_effect)
+            for source in event.ifc_labels.sources
+        } == {("trusted", "active_ingest")}
+        assert decision.allowed is False
+        assert not decision.reason.startswith("ifc_label_blocked:")
+        assert decision.reason == "service_sink_destination_denied"
+
+
+@pytest.mark.asyncio
+async def test_external_poller_prose_is_refused_by_ifc_shell_gate(
+    tmp_path: Path,
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    configs = discover_pollers(skills, state_root=state_root)
+    ready = next(config for config in configs if config.name == "worklink-ready-queue")
+    external = next(
+        config for config in configs if config.name == "dependency-advisory-watch"
+    )
+    _install_script(tmp_path, "external.py", """
+import json
+print(json.dumps({"prompt": "Unauthenticated third-party prose"}))
+""")
+    external_authority = replace(
+        ready.resolved_authority(),
+        canonical="poller:dependency-advisory-watch",
+        channel_memory_directory="poller:dependency-advisory-watch",
+    )
+    external = replace(
+        external, command=f"{sys.executable} external.py", skill_dir=tmp_path,
+        batch_size=1, authority=external_authority,
+    )
+    enqueued = _CapturingEnqueue()
+
+    assert await run_poller(external, enqueue=enqueued, home=home) == 1
+    event = enqueued.events[0]
+    labels = _initialize_ifc_labels(event)
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    decision = SinkGate.check_sink_flow(
+        "shell_exec", "git status --short", labels, auth, enforce=True,
+    )
+
+    assert {
+        (source.integrity, source.integrity_effect)
+        for source in event.ifc_labels.sources
+    } == {("untrusted", "active_ingest")}
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+
+
 @pytest.mark.asyncio
 async def test_run_poller_accepts_usage_signal_without_agent_event(
     tmp_path: Path, home: Path,

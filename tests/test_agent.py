@@ -5856,8 +5856,9 @@ async def test_real_worklink_consumer_dispatcher_agent_failure_is_not_replayed(
     ):
         assert pointer in agent_input
     assert (
-        "Read the current dispatch-failure ledger and retained leaf or factory state "
-        "before acting; if this occurrence is resolved or superseded, take no recovery action."
+        "Captured output can be stale or misleading. Check it against current state in the "
+        "dispatch-failure ledger and retained leaf or factory records before acting; if this "
+        "occurrence is resolved or superseded, take no recovery action."
     ) in agent_input
     assert (
         "never start fresh work, steal a live claim, or repeat a failed recovery"
