@@ -1349,7 +1349,7 @@ def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
     )
     save_factory_record(tmp_path, record)
 
-    assert list_factory_records(tmp_path) == [record]
+    assert list_factory_records(tmp_path).records == (record,)
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
     assert sandbox.is_dir()
 
@@ -1370,7 +1370,7 @@ def test_prune_checks_live_record_after_dead_record_for_same_checkout(tmp_path: 
     save_factory_record(tmp_path, dead)
     save_factory_record(tmp_path, live)
 
-    assert list_factory_records(tmp_path) == [dead, live]
+    assert list_factory_records(tmp_path).records == (dead, live)
     assert autonomy._attempt_is_active(child, [dead, live]) is True
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
     assert Path(dead.sandbox).is_dir()

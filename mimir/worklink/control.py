@@ -16,7 +16,8 @@ from typing import Any, Callable, Iterator, Sequence
 
 from .compute import LaunchHandle, LocalSubprocessComputeBackend
 from .factory_state import (
-    archive_factory_record,
+    archive_factory_record_for_issue,
+    factory_record_run_ids,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     load_factory_records_for_issue,
@@ -276,15 +277,17 @@ def archive_worklink_factory_records(
     """Archive canonical and legacy records for an epic under the claim mutex."""
     archived: list[Path] = []
     with _claim_mutex(home):
-        for record in load_factory_records_for_issue(home, issue_id):
-            destination = archive_factory_record(
+        for run_id in factory_record_run_ids(issue_id):
+            destination = archive_factory_record_for_issue(
                 home,
-                record,
+                run_id,
+                issue_id,
                 event_logger=event_logger,
                 source_kind="operator_command",
                 reason="operator requested archival",
             )
-            archived.append(destination)
+            if destination is not None:
+                archived.append(destination)
     return archived
 
 

@@ -1606,7 +1606,7 @@ def register_routes(
         if home is None:
             return []
         try:
-            records = list_factory_records(home)
+            records = list_factory_records(home).records
         except FactoryRecordError:
             return []
         return [_serialize_factory_run_summary(record) for record in records[:1000]]

@@ -38,10 +38,12 @@ from mimir.worklink.backends.feature_factory import (
     parse_factory_status,
 )
 from mimir.worklink.factory_state import (
+    FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
     factory_checkout_interlock,
     load_factory_record,
+    load_factory_records_for_issue,
     save_factory_record,
 )
 from mimir.worklink.run_state import WorklinkRunState, load_run_state, save_run_state
@@ -1128,6 +1130,52 @@ def test_epic_dispatch_failure_clears_ledger_only_after_success(
     run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=False)
     entry = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
     assert entry["active"] is False
+
+
+def test_unparseable_retained_factory_record_incident_names_path_and_archive_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+
+    sandbox = tmp_path / "chainlink-700"
+    retained = FactoryRunRecord(
+        run_id="chainlink-700",
+        issue_id=700,
+        attempt=1,
+        repository="owner/repo",
+        base_ref="main",
+        branch="feature/chainlink-700",
+        launcher="/opt/factory/bin/factory.js",
+        sandbox=str(sandbox),
+        session="session-1",
+        handle=None,
+        status=replace(
+            _factory_lifecycle_status(sandbox, status="terminal"),
+            run_id="chainlink-700",
+        ),
+        observed_at="2026-09-23T00:00:00+00:00",
+        controller_phase="terminal",
+    )
+    path = save_factory_record(tmp_path, retained)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["status"]["slices"] = [
+        {"id": "factory-070-migration", "status": "completed", "attempts": 1}
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    async def dispatch(self: WorklinkRunner, issue_id: int, **kwargs: object) -> WorklinkRunResult:
+        load_factory_records_for_issue(self.home, issue_id)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", dispatch)
+
+    with pytest.raises(FactoryRecordError, match="slices.extra_attempts missing"):
+        run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=700, autonomous=True)
+
+    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
+    assert incident["failure_kind"] == "operator_required"
+    assert str(path) in incident["terminal_error"]
+    assert "mimir worklink archive-factory-run 700" in incident["terminal_error"]
 
 
 def test_validate_leaf_refuses_missing_planner_template() -> None:
