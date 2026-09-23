@@ -279,6 +279,30 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    canonical_sandbox = tmp_path / "chainlink-700"
+    status = parse_factory_status({
+        "run_id": "chainlink-700",
+        "issue_key": "700",
+        "valid": True,
+        "sandbox_path": str(canonical_sandbox),
+        "status": "terminal",
+        "mode": "autonomous",
+        "branch": "feature/chainlink-700",
+        "pr_base": "main",
+        "pr_draft": False,
+        "lock": "absent",
+        "dead_lock": False,
+        "lock_session": None,
+        "gates": {},
+        "steps": [{"agent": "implementation", "status": "completed", "attempts": 1}],
+        "slices": [{
+            "id": "factory-070-migration", "status": "completed", "attempts": 1,
+            "extra_attempts": 0, "retry_limit": 5,
+        }],
+        "validator": None,
+        "pr_url": None,
+        "terminal_result": {"reason": "completed"},
+    })
     canonical = FactoryRunRecord(
         run_id="chainlink-700",
         issue_id=700,
@@ -287,11 +311,11 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
         base_ref="main",
         branch="feature/chainlink-700",
         launcher="/opt/factory/bin/factory.js",
-        sandbox=str(tmp_path / "chainlink-700"),
+        sandbox=str(canonical_sandbox),
         session="session-2",
         handle=None,
-        status=None,
-        observed_at=None,
+        status=status,
+        observed_at="2026-09-23T00:00:00+00:00",
         controller_phase="stopped",
     )
     legacy = replace(
@@ -301,9 +325,17 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
         branch="epic/700",
         sandbox=str(tmp_path / "legacy"),
         session="session-1",
+        status=None,
+        observed_at=None,
     )
     save_factory_record(tmp_path, canonical)
     save_factory_record(tmp_path, legacy)
+    canonical_path = tmp_path / "state/worklink/factory-runs/chainlink-700.json"
+    old_payload = json.loads(canonical_path.read_text(encoding="utf-8"))
+    old_payload["status"]["slices"] = [
+        {"id": "factory-070-migration", "status": "completed", "attempts": 1}
+    ]
+    canonical_path.write_text(json.dumps(old_payload), encoding="utf-8")
     events: list[tuple[str, dict[str, object]]] = []
     import mimir.commands.worklink as worklink_cmd
 
@@ -324,6 +356,8 @@ def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(
     assert load_factory_record(tmp_path, "700") is None
     archives = sorted((tmp_path / "state/worklink/factory-runs/archive").glob("*.json"))
     assert len(archives) == 2
+    archived_canonical = next(path for path in archives if path.name.startswith("chainlink-700-"))
+    assert json.loads(archived_canonical.read_text(encoding="utf-8")) == old_payload
     assert [(event, payload["source"], payload["reason"]) for event, payload in events] == [
         (
             "worklink_factory_record_archived",

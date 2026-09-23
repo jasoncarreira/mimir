@@ -278,9 +278,12 @@ def prune_stale_attempt_checkouts_for_home(
         if not acquired:
             return []
         try:
-            factory_records = list_factory_records(home)
+            listing = list_factory_records(home)
         except Exception:
             return []
+        if listing.failures:
+            return []
+        factory_records = listing.records
         retained_run_paths = {
             Path(state.checkout).resolve() for state in list_run_states(home) if state.checkout
         }

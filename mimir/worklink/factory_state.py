@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 from .._atomic import atomic_write_json
 from .backends.feature_factory import FactoryStatus, epic_run_id, parse_factory_status
@@ -37,6 +37,18 @@ def _valid_record_run_id(run_id: str) -> bool:
 
 class FactoryRecordError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class FactoryRecordLoadFailure:
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class FactoryRecordListing:
+    records: tuple[FactoryRunRecord, ...]
+    failures: tuple[FactoryRecordLoadFailure, ...]
 
 
 @dataclass(frozen=True)
@@ -320,7 +332,7 @@ def save_factory_record(home: Path, record: FactoryRunRecord) -> Path:
     return path
 
 
-def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
+def _read_factory_record(home: Path, run_id: str) -> tuple[dict[str, Any], bytes] | None:
     if not _require_safe_directory(factory_records_dir(home), create=False):
         return None
     path = factory_record_path(home, run_id)
@@ -330,15 +342,30 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
         return None
     except OSError as exc:
         raise FactoryRecordError("factory record is unavailable") from exc
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISREG(value.st_mode) or value.st_size > _MAX_RECORD_BYTES:
+    if (
+        stat.S_ISLNK(value.st_mode)
+        or not stat.S_ISREG(value.st_mode)
+        or value.st_size > _MAX_RECORD_BYTES
+        or value.st_uid != os.geteuid()
+    ):
         raise FactoryRecordError("factory record is not a bounded regular file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(path, flags)
         try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size > _MAX_RECORD_BYTES
+                or opened.st_uid != os.geteuid()
+                or (opened.st_dev, opened.st_ino) != (value.st_dev, value.st_ino)
+            ):
+                raise FactoryRecordError("factory record changed before it could be read")
             raw = os.read(fd, _MAX_RECORD_BYTES + 1)
         finally:
             os.close(fd)
+    except FactoryRecordError:
+        raise
     except OSError as exc:
         raise FactoryRecordError("factory record cannot be read") from exc
     if len(raw) > _MAX_RECORD_BYTES or b"\x00" in raw:
@@ -347,6 +374,16 @@ def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
         data = json.loads(raw.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FactoryRecordError("factory record is malformed") from exc
+    if not isinstance(data, dict):
+        raise FactoryRecordError("factory record must be a JSON object")
+    return data, raw
+
+
+def load_factory_record(home: Path, run_id: str) -> FactoryRunRecord | None:
+    loaded = _read_factory_record(home, run_id)
+    if loaded is None:
+        return None
+    data, _ = loaded
     return FactoryRunRecord.from_json(data)
 
 
@@ -355,11 +392,19 @@ def load_factory_records_for_issue(home: Path, issue_id: int) -> list[FactoryRun
     canonical, legacy = factory_record_run_ids(issue_id)
     # Canonical-first construction is deliberate: it is a stable-sort fallback for
     # the explicit canonical tie-break below, not an interchangeable iteration order.
-    records = [
-        record
-        for run_id in (canonical, legacy)
-        if (record := load_factory_record(home, run_id)) is not None
-    ]
+    records = []
+    for run_id in (canonical, legacy):
+        try:
+            record = load_factory_record(home, run_id)
+        except Exception as exc:
+            path = factory_record_path(home, run_id)
+            raise FactoryRecordError(
+                f"factory record {path} cannot be loaded: {type(exc).__name__}: {exc}; "
+                f"archive it with 'mimir worklink archive-factory-run {issue_id} "
+                f"--home {home}'"
+            ) from exc
+        if record is not None:
+            records.append(record)
     records.sort(
         key=lambda record: (record.attempt, record.run_id == canonical),
         reverse=True,
@@ -375,10 +420,73 @@ def archive_factory_record(
     source_kind: str | None = None,
     reason: str | None = None,
 ) -> Path:
-    source = factory_record_path(home, record.run_id)
-    loaded = load_factory_record(home, record.run_id)
-    if loaded != record:
+    return _archive_factory_record(
+        home,
+        record,
+        event_logger=event_logger,
+        source_kind=source_kind,
+        reason=reason,
+        verify_loaded=True,
+    )
+
+
+def archive_factory_record_for_issue(
+    home: Path,
+    run_id: str,
+    issue_id: int,
+    *,
+    event_logger: Callable[..., None] | None = None,
+    source_kind: str | None = None,
+    reason: str | None = None,
+) -> Path | None:
+    """Archive a record by trusted identity without parsing its cached status."""
+    if run_id not in factory_record_run_ids(issue_id):
+        raise FactoryRecordError("factory record identity is invalid")
+    loaded = _read_factory_record(home, run_id)
+    if loaded is None:
+        return None
+    data, raw = loaded
+    if (
+        not isinstance(data.get("run_id"), str)
+        or data["run_id"] != run_id
+        or not isinstance(data.get("issue_id"), int)
+        or isinstance(data["issue_id"], bool)
+        or data["issue_id"] != issue_id
+        or not isinstance(data.get("attempt"), int)
+        or isinstance(data["attempt"], bool)
+        or data["attempt"] <= 0
+    ):
+        raise FactoryRecordError("factory record identity is invalid")
+    metadata = dict(data)
+    metadata["status"] = None
+    record = FactoryRunRecord.from_json(metadata)
+    current = _read_factory_record(home, run_id)
+    if current is None or current[1] != raw:
         raise FactoryRecordError("factory record changed before archival")
+    return _archive_factory_record(
+        home,
+        record,
+        event_logger=event_logger,
+        source_kind=source_kind,
+        reason=reason,
+        verify_loaded=False,
+    )
+
+
+def _archive_factory_record(
+    home: Path,
+    record: FactoryRunRecord,
+    *,
+    event_logger: Callable[..., None] | None,
+    source_kind: str | None,
+    reason: str | None,
+    verify_loaded: bool,
+) -> Path:
+    source = factory_record_path(home, record.run_id)
+    if verify_loaded:
+        loaded = load_factory_record(home, record.run_id)
+        if loaded != record:
+            raise FactoryRecordError("factory record changed before archival")
     directory = factory_record_archive_dir(home)
     _require_safe_directory(directory, create=True)
     stem = f"{record.run_id}-attempt-{record.attempt}"
@@ -420,16 +528,25 @@ def archive_factory_record(
     return destination
 
 
-def list_factory_records(home: Path) -> list[FactoryRunRecord]:
+def list_factory_records(home: Path) -> FactoryRecordListing:
     directory = factory_records_dir(home)
     if not _require_safe_directory(directory, create=False):
-        return []
+        return FactoryRecordListing((), ())
     records: list[FactoryRunRecord] = []
+    failures: list[FactoryRecordLoadFailure] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         if not path.name.endswith(".json") or not _valid_record_run_id(path.stem):
             continue
-        records.append(load_factory_record(home, path.stem))
-    return [record for record in records if record is not None]
+        try:
+            record = load_factory_record(home, path.stem)
+        except Exception as exc:
+            failures.append(
+                FactoryRecordLoadFailure(path, f"{type(exc).__name__}: {exc}")
+            )
+            continue
+        if record is not None:
+            records.append(record)
+    return FactoryRecordListing(tuple(records), tuple(failures))
 
 
 def factory_manifest_candidates(record: FactoryRunRecord) -> tuple[Path, Path]:
@@ -449,13 +566,23 @@ def report_retained_factory_records(
     home: Path,
     *,
     event_logger: Callable[..., None] | None = None,
+    records: Sequence[FactoryRunRecord] | None = None,
 ) -> None:
     """Report factory runs whose control plane remains retained for recovery."""
     if event_logger is None:
         from ..event_logger import log_event_sync
 
         event_logger = log_event_sync
-    for record in list_factory_records(home):
+    if records is None:
+        listing = list_factory_records(home)
+        records = listing.records
+        for failure in listing.failures:
+            event_logger(
+                "worklink_factory_record_load_failed",
+                path=str(failure.path),
+                error=failure.reason,
+            )
+    for record in records:
         if record.controller_phase not in RETAINED_CONTROLLER_PHASES and not (
             record.controller_phase in LIVE_CONTROLLER_PHASES
             and factory_process_is_verified_dead(record)

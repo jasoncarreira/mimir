@@ -16,6 +16,7 @@ from mimir.worklink.factory_state import (
     FactoryRecordError,
     FactoryRunRecord,
     archive_factory_record,
+    archive_factory_record_for_issue,
     factory_manifest_candidates,
     load_factory_records_for_issue,
     list_factory_records,
@@ -76,7 +77,7 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
     path = save_factory_record(tmp_path, expected)
     assert path == tmp_path / "state" / "worklink" / "factory-runs" / "1551.json"
     assert load_factory_record(tmp_path, "1551") == expected
-    assert list_factory_records(tmp_path) == [expected]
+    assert list_factory_records(tmp_path).records == (expected,)
     assert "cost" not in path.read_text(encoding="utf-8")
     assert not list(path.parent.glob("*.tmp"))
 
@@ -284,6 +285,150 @@ def test_issue_lookup_reads_both_keys_without_legacy_shadowing_canonical(
     save_factory_record(tmp_path, canonical)
 
     assert load_factory_records_for_issue(tmp_path, 1551) == [canonical, legacy]
+
+
+def test_factory_record_listing_isolates_unparseable_010_status(tmp_path: Path) -> None:
+    expected = record(tmp_path)
+    save_factory_record(tmp_path, expected)
+    bad_path = expected_path = tmp_path / "state/worklink/factory-runs/chainlink-1552.json"
+    payload = json.loads(json.dumps(expected.to_json()))
+    payload.update({
+        "run_id": "chainlink-1552",
+        "issue_id": 1552,
+        "branch": "feature/chainlink-1552",
+        "sandbox": str(tmp_path / "chainlink-1552"),
+    })
+    payload["status"]["run_id"] = "chainlink-1552"
+    payload["status"]["sandbox_path"] = str(tmp_path / "chainlink-1552")
+    for row in payload["status"]["slices"]:
+        row.pop("extra_attempts")
+        row.pop("retry_limit")
+    bad_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    listing = list_factory_records(tmp_path)
+
+    assert listing.records == (expected,)
+    assert len(listing.failures) == 1
+    assert listing.failures[0].path == expected_path
+    assert "FactoryContractError: factory status slices.extra_attempts missing" in listing.failures[0].reason
+
+
+def test_archive_factory_record_for_issue_skips_only_status_parsing(tmp_path: Path) -> None:
+    expected = record(tmp_path)
+    source = save_factory_record(tmp_path, expected)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    for row in payload["status"]["slices"]:
+        row.pop("extra_attempts")
+        row.pop("retry_limit")
+    source.write_text(json.dumps(payload), encoding="utf-8")
+    events: list[tuple[str, dict[str, object]]] = []
+
+    archived = archive_factory_record_for_issue(
+        tmp_path,
+        "1551",
+        1551,
+        event_logger=lambda event, **fields: events.append((event, fields)),
+        source_kind="operator_command",
+        reason="operator requested archival",
+    )
+
+    assert archived == source.parent / "archive/1551-attempt-1.json"
+    assert json.loads(archived.read_text(encoding="utf-8")) == payload
+    assert events[0][0] == "worklink_factory_record_archived"
+    assert events[0][1]["run_id"] == "1551"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("run_id", "chainlink-1551"), ("issue_id", 1552), ("attempt", True)],
+)
+def test_archive_factory_record_for_issue_rejects_tampered_identity(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload[field] = value
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(FactoryRecordError, match="identity is invalid"):
+        archive_factory_record_for_issue(tmp_path, "1551", 1551)
+    assert source.is_file()
+
+
+def test_archive_factory_record_for_issue_binds_identity_to_filename(tmp_path: Path) -> None:
+    canonical_sandbox = tmp_path / "chainlink-1551"
+    source = save_factory_record(
+        tmp_path,
+        replace(record(tmp_path), sandbox=str(canonical_sandbox), status=None),
+    )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["run_id"] = "chainlink-1551"
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(FactoryRecordError, match="identity is invalid"):
+        archive_factory_record_for_issue(tmp_path, "1551", 1551)
+    assert source.is_file()
+
+
+def test_factory_record_refuses_foreign_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
+    owner = source.stat().st_uid
+    monkeypatch.setattr("mimir.worklink.factory_state.os.geteuid", lambda: owner + 1)
+
+    with pytest.raises(FactoryRecordError, match="bounded regular file"):
+        archive_factory_record_for_issue(tmp_path, "1551", 1551)
+    assert source.is_file()
+
+
+@pytest.mark.parametrize("unsafe", ["malformed", "oversized", "symlink", "directory"])
+def test_archive_factory_record_for_issue_refuses_unsafe_source(
+    tmp_path: Path, unsafe: str,
+) -> None:
+    source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
+    if unsafe == "malformed":
+        source.write_text("{not-json", encoding="utf-8")
+    elif unsafe == "oversized":
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload["status"] = "x" * (2 * 1024 * 1024)
+        source.write_text(json.dumps(payload), encoding="utf-8")
+    elif unsafe == "symlink":
+        outside = tmp_path / "outside.json"
+        outside.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        source.unlink()
+        source.symlink_to(outside)
+    else:
+        source.unlink()
+        source.mkdir()
+
+    with pytest.raises(FactoryRecordError):
+        archive_factory_record_for_issue(tmp_path, "1551", 1551)
+    assert source.exists() or source.is_symlink()
+
+
+def test_archive_factory_record_for_issue_rejects_changed_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.factory_state as factory_state
+
+    source = save_factory_record(tmp_path, replace(record(tmp_path), status=None))
+    real_read = factory_state._read_factory_record
+    reads = 0
+
+    def change_between_reads(home: Path, run_id: str):
+        nonlocal reads
+        loaded = real_read(home, run_id)
+        reads += 1
+        if reads == 1:
+            source.write_text(source.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        return loaded
+
+    monkeypatch.setattr(factory_state, "_read_factory_record", change_between_reads)
+
+    with pytest.raises(FactoryRecordError, match="changed before archival"):
+        archive_factory_record_for_issue(tmp_path, "1551", 1551)
+    assert source.is_file()
 
 
 def test_archive_factory_record_preserves_evidence_and_vacates_active_slot(

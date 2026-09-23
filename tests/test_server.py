@@ -84,7 +84,11 @@ def test_server_startup_routes_factory_recovery_to_run_epic(
     )
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
-    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((record,), ()),
+    )
     monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
     spawned: list[tuple[list[str], dict[str, Any]]] = []
 
@@ -126,7 +130,11 @@ def test_server_factory_spawn_failure_records_all_recovery_pointers(
     )
     monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
     monkeypatch.setattr(control, "reconcile_run_states", lambda *args, **kwargs: [])
-    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [record])
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((record,), ()),
+    )
     monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda value: True)
 
     def fail_spawn(argv: list[str], **kwargs: Any) -> object:
@@ -174,7 +182,11 @@ def test_server_leaf_spawn_failure_records_retained_identity_and_actual_log(
     monkeypatch.setattr(
         control, "reconcile_run_states", lambda *args, **kwargs: [state]
     )
-    monkeypatch.setattr(factory_state, "list_factory_records", lambda home: [])
+    monkeypatch.setattr(
+        factory_state,
+        "list_factory_records",
+        lambda home: factory_state.FactoryRecordListing((), ()),
+    )
 
     def fail_spawn(argv: list[str], **kwargs: Any) -> object:
         expected = tmp_path / "state" / "worklink" / "runs" / "reattach-441.log"

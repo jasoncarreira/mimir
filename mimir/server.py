@@ -1033,10 +1033,22 @@ def reattach_inflight_worklink_runs(
     # event and never abort startup.
     states = reconcile_run_states(home, event_logger=emit)
     try:
-        report_retained_factory_records(home, event_logger=emit)
+        listing = list_factory_records(home)
+        report_retained_factory_records(
+            home, event_logger=emit, records=listing.records,
+        )
+        for record_failure in listing.failures:
+            failure = {
+                "issue_id": None,
+                "reason": "factory_record_load_failed",
+                "path": str(record_failure.path),
+                "error": record_failure.reason[:500],
+            }
+            failures.append(failure)
+            emit("worklink_reattach_dispatch_failed", **failure)
         factory_records = [
             record
-            for record in list_factory_records(home)
+            for record in listing.records
             if factory_process_is_verified_dead(record)
             and record.controller_phase not in {"failed", "parked", "terminal", "stopped"}
             and (record.status is None or not record.status.is_terminal)

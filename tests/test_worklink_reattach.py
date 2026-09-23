@@ -1429,6 +1429,53 @@ def test_factory_startup_recovery_does_not_spawn_run_epic_for_failed_record(
     assert spawned == []
 
 
+def test_factory_startup_recovery_isolates_unparseable_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import server
+
+    valid = _factory_restart_record(tmp_path, status="running", ticks=1)
+    valid_path = tmp_path / "state/worklink/factory-runs/700.json"
+    payload = json.loads(valid_path.read_text(encoding="utf-8"))
+    bad_sandbox = tmp_path / "chainlink-701"
+    payload.update({
+        "run_id": "chainlink-701",
+        "issue_id": 701,
+        "branch": "feature/chainlink-701",
+        "sandbox": str(bad_sandbox),
+    })
+    payload["status"]["run_id"] = "chainlink-701"
+    payload["status"]["sandbox_path"] = str(bad_sandbox)
+    payload["status"]["slices"] = [
+        {"id": "factory-070-migration", "status": "ready", "attempts": 0}
+    ]
+    bad_path = valid_path.with_name("chainlink-701.json")
+    bad_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("WORKLINK_REPO", "/workspace/mimir")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", "mimir")
+    events: list[tuple[str, dict[str, object]]] = []
+    spawned: list[list[str]] = []
+
+    dispatched = server.reattach_inflight_worklink_runs(
+        tmp_path,
+        popen=lambda argv, **kwargs: spawned.append(list(argv)) or object(),
+        event_logger=lambda event, **fields: events.append((event, fields)),
+    )
+
+    assert dispatched == [valid.issue_id]
+    assert len(spawned) == 1
+    failure = next(
+        fields for event, fields in events
+        if event == "worklink_reattach_dispatch_failed"
+        and fields["reason"] == "factory_record_load_failed"
+    )
+    assert failure["path"] == str(bad_path)
+    assert "slices.extra_attempts missing" in str(failure["error"])
+    attempted = next(fields for event, fields in events if event == "worklink_reattach_attempted")
+    assert attempted["examined"] == 1
+
+
 def test_part_b_startup_recovery_emits_for_all_five_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
