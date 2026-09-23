@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.4. This is a
+  pin-only update and changes no contract consumed by mimir.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.2 and accept
   the release's `extra_attempts` and `retry_limit` slice status fields.
 
