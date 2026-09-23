@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from mimir import access_control as ac
 from mimir._context import reset_current_turn, set_current_turn
-from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel
+from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+from mimir.event_logger import init_logger
+from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel, TurnContext
+from mimir.pollers import discover_pollers, run_poller
 from mimir.read_policy import resolve_non_admin_read_target
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
 
@@ -104,6 +109,117 @@ def _read_labels(reader, path: Path) -> InformationFlowLabels:
     )
     assert labels is not None
     return labels
+
+
+class _CapturingEnqueue:
+    def __init__(self) -> None:
+        self.events = []
+
+    async def __call__(self, event, **_kwargs) -> bool:
+        self.events.append(event)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink import dispatch_failures as failures
+    from mimir.worklink import worker_client
+
+    home = tmp_path / "home"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    init_logger(home / "logs" / "events.jsonl", session_id="retained-real-turn")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    retained = tmp_path / "worklink"
+    checkout = retained / "mimir" / "1806-1" / "checkout"
+    checkout.mkdir(parents=True)
+    retained_target = checkout / "issue.txt"
+    retained_target.write_text("retained needle\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    external_target = external / "input.txt"
+    external_target.write_text("external instructions\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{external}:ro")
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+
+    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    ready = next(
+        config for config in discover_pollers(skills, state_root=state_root)
+        if config.name == "worklink-ready-queue"
+    )
+    failures.record_failure(
+        failures.dispatch_failure_state_dir(home),
+        issue_id=1806,
+        attempt=1,
+        exit_status=1,
+        error="retained checkout requires remediation",
+        log_path="run.log",
+        work_path=str(checkout),
+    )
+    ready = replace(
+        ready,
+        command=f"{sys.executable} scripts/poller.py",
+    )
+    enqueued = _CapturingEnqueue()
+
+    emitted = await run_poller(ready, enqueue=enqueued, home=home)
+    event_log = home / "logs" / "events.jsonl"
+    assert emitted == 1, event_log.read_text(encoding="utf-8")
+    [event] = enqueued.events
+    labels = _initialize_ifc_labels(event)
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    turn = TurnContext(
+        turn_id="real-worklink-remediation",
+        session_id=event.channel_id,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        started_at=0.0,
+        auth_context=auth,
+        ifc_labels=labels,
+    )
+    token = set_current_turn(turn)
+    try:
+        service = ac.get_trusted_service_from_auth_context(auth)
+        assert service is not None
+        assert service.canonical == "poller:worklink-ready-queue"
+        assert retained in ac.service_filesystem_read_roots(
+            service, auth_context=auth,
+        )
+        decision = ac.ToolRegistry().authorize_tool(
+            "read_file", auth, enforce=True,
+            arguments={"file_path": str(retained_target)},
+        )
+        assert decision.allowed, decision
+        backend = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"], guard_outside_root=True),
+            routes=build_file_tool_routes([
+                (str(external), "ro"),
+                (str(retained), "ro"),
+            ]),
+        )
+        reader = SimpleNamespace(backend=backend, auth=auth, state=auth.ifc_state)
+        retained_labels = auth.ifc_state.merge(_read_labels(reader, retained_target))
+        retained_sink = ac.SinkGate.check_sink_flow(
+            "shell_exec", "git status --short", retained_labels, auth, enforce=True,
+        )
+        assert retained_labels.has_untrusted_active_ingest is False
+        assert not retained_sink.reason.startswith("ifc_label_blocked:")
+
+        external_labels = auth.ifc_state.merge(_read_labels(reader, external_target))
+        external_sink = ac.SinkGate.check_sink_flow(
+            "shell_exec", "git status --short", external_labels, auth, enforce=True,
+        )
+        assert external_labels.has_untrusted_active_ingest is True
+        assert external_sink.reason == "ifc_label_blocked:shell_process"
+    finally:
+        reset_current_turn(token)
 
 
 @pytest.mark.asyncio
