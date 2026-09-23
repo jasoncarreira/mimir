@@ -1355,6 +1355,32 @@ def test_prune_preserves_unknown_factory_phase(tmp_path: Path) -> None:
 
 
 @pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_fails_closed_when_factory_record_is_unparseable(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    source = save_factory_record(
+        tmp_path,
+        _factory_record(sandbox, phase="running", status="running", process="dead"),
+    )
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["status"]["slices"] = [
+        {"id": "factory-070-migration", "status": "ready", "attempts": 0}
+    ]
+    source.write_text(json.dumps(payload), encoding="utf-8")
+
+    listing = list_factory_records(tmp_path)
+    assert listing.records == ()
+    assert len(listing.failures) == 1
+    assert "slices.extra_attempts missing" in listing.failures[0].reason
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.is_dir()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_checks_live_record_after_dead_record_for_same_checkout(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
