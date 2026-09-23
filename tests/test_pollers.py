@@ -372,21 +372,26 @@ def test_valid_state_poller_creates_and_grants_only_its_instance_root(
     assert granted_roots == [expected]
 
 
-def test_reserved_github_activity_name_requires_github_poller_skill(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize(("name", "skill"), [
+    ("github-activity", "github-poller"),
+    ("worklink-ready-queue", "chainlink-orchestrator"),
+])
+def test_reserved_poller_name_requires_shipped_skill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, name: str, skill: str,
 ) -> None:
     skills = tmp_path / "skills"
     manifest = skills / "arbitrary" / "pollers.json"
     _write_pollers_json(manifest.parent, [
-        {"name": "github-activity", "command": "true", "cron": "* * * * *"},
+        {"name": name, "command": "true", "cron": "* * * * *"},
     ])
 
     assert discover_pollers(skills, state_root=tmp_path / "state" / "pollers") == []
     assert any(
         "poller_invalid_name" in record.getMessage()
         and str(manifest) in record.getMessage()
-        and "name='github-activity'" in record.getMessage()
+        and f"name={name!r}" in record.getMessage()
         and "reserved poller name" in record.getMessage()
+        and skill in record.getMessage()
         for record in caplog.records
     )
 
@@ -7937,7 +7942,7 @@ def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
 
     skills = home / "skills"
     manifest = skills / "github-poller" / "pollers.json"
-    names = ["github-activity", "github-ci-watch", "worklink-ready-queue", "default", "typo"]
+    names = ["github-activity", "github-ci-watch", "remediation-ready-queue", "default", "typo"]
     _write_pollers_json(manifest.parent, [
         {"name": name, "command": "echo", "cron": "0 * * * *"} for name in names
     ])

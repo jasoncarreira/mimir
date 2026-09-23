@@ -925,6 +925,26 @@ def current_turn_scratch_root() -> Path | None:
     return (Path(home).resolve() / "scratch" / "turns" / turn_id).resolve()
 
 
+def worklink_retained_checkout_root() -> Path:
+    """Return Worklink's code-defined retained-checkout root."""
+    from .worklink.worker_client import WORKLINK_CHECKOUT_ROOT
+
+    return WORKLINK_CHECKOUT_ROOT
+
+
+def _is_worklink_retained_checkout_service(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> bool:
+    """Bind retained-checkout authority to the authenticated reserved poller."""
+    return (
+        isinstance(service, ServicePrincipal)
+        and service.canonical == "poller:worklink-ready-queue"
+        and service.trigger == "poller"
+        and service.authority_profile == "github"
+        and service == get_trusted_service_from_auth_context(auth_context)
+    )
+
+
 def service_filesystem_read_roots(
     service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
 ) -> tuple[Path, ...]:
@@ -968,6 +988,8 @@ def service_filesystem_read_roots(
             lease = getattr(state, "checkout_lease", None)
             if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
                 roots.append(Path(lease.path))
+    if _is_worklink_retained_checkout_service(service, auth_context=auth_context):
+        roots.append(worklink_retained_checkout_root())
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -984,6 +1006,23 @@ def service_filesystem_read_roots(
         if proposal_root is not None:
             roots.append(proposal_root)
     return tuple(dict.fromkeys(roots))
+
+
+def service_shell_filesystem_read_roots(
+    service: ServicePrincipal | None, *, auth_context: AuthContext | None = None,
+) -> tuple[Path, ...]:
+    """Return service read roots without file-tool-only retained checkouts."""
+    roots = service_filesystem_read_roots(service, auth_context=auth_context)
+    if not _is_worklink_retained_checkout_service(service, auth_context=auth_context):
+        return roots
+    retained = worklink_retained_checkout_root().resolve(strict=False)
+    static_roots = {
+        Path(root).resolve(strict=False)
+        for root in getattr(service, "filesystem_read_roots", ())
+    }
+    if retained in static_roots:
+        return roots
+    return tuple(root for root in roots if root.resolve(strict=False) != retained)
 
 
 def _configured_file_write_roots() -> list[Path]:
@@ -4339,6 +4378,7 @@ def _service_shell_read_operand_refusal(
         tool_name = "ls" if resolved.is_dir() else "read_file" if reads_content else "ls"
         if not _trigger_service_read_target_is_allowed(
             service, tool_name, {"path": str(candidate)}, auth_context=auth_context,
+            shell_roots=True,
         ):
             return "a filesystem operand is outside the read roots or withheld"
         if not resolved.is_dir():
@@ -4395,6 +4435,7 @@ def _service_shell_read_operand_refusal(
                             child_tool,
                             {"path": str(child)},
                             auth_context=auth_context,
+                            shell_roots=True,
                         ):
                             return f"recursive read preflight withheld {child}"
                         if child_is_directory:
@@ -4952,6 +4993,7 @@ def _trigger_service_read_target_is_allowed(
     arguments: dict[str, Any] | None,
     *,
     auth_context: "AuthContext | None" = None,
+    shell_roots: bool = False,
 ) -> bool:
     """Authorize a service read against frozen roots and verified ownership."""
     from .read_policy import (
@@ -4971,7 +5013,11 @@ def _trigger_service_read_target_is_allowed(
     if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
         return False
     candidate = Path(raw)
-    roots = service_filesystem_read_roots(service, auth_context=auth_context)
+    roots = (
+        service_shell_filesystem_read_roots(service, auth_context=auth_context)
+        if shell_roots
+        else service_filesystem_read_roots(service, auth_context=auth_context)
+    )
     home = os.environ.get("MIMIR_HOME", "").strip()
     if home:
         home_root = Path(home).resolve()
@@ -9503,8 +9549,21 @@ def protected_result_source(
             and getattr(scope, "observed_head_sha", "").lower()
             == lease.head_sha.lower()
         )
+        retained_checkout = False
+        service = get_trusted_service_from_auth_context(auth_context)
+        if _is_worklink_retained_checkout_service(
+            service, auth_context=auth_context,
+        ):
+            try:
+                retained_root = worklink_retained_checkout_root().resolve(strict=True)
+                retained_resource = Path(resource_id).resolve(strict=True)
+                retained_checkout = retained_resource.is_relative_to(retained_root)
+            except (OSError, RuntimeError, ValueError):
+                retained_checkout = False
         anchor = _filesystem_read_trust_anchor(
-            resource_id, author_attested=trusted_lease,
+            resource_id,
+            author_attested=trusted_lease,
+            retained_checkout=retained_checkout,
         )
         integrity, integrity_effect = anchor.integrity
         if anchor is FilesystemReadTrust.AUTHOR_ATTESTATION:
@@ -9560,6 +9619,7 @@ class FilesystemReadTrust(StrEnum):
     """
 
     AUTHOR_ATTESTATION = "author_attestation"
+    RETAINED_CHECKOUT = "retained_checkout"
     HOME_CARVE_OUT = "home_carve_out"
     WRITE_SIDE_GATING = "write_side_gating"
     HOME_UNANCHORED = "home_unanchored"
@@ -9569,7 +9629,8 @@ class FilesystemReadTrust(StrEnum):
     @property
     def integrity(self) -> tuple[str, str]:
         if self in {
-            self.AUTHOR_ATTESTATION, self.WRITE_SIDE_GATING, self.ROOT_MEMBERSHIP,
+            self.AUTHOR_ATTESTATION, self.RETAINED_CHECKOUT,
+            self.WRITE_SIDE_GATING, self.ROOT_MEMBERSHIP,
         }:
             return "trusted", "informational"
         return "untrusted", "active_ingest"
@@ -9579,6 +9640,7 @@ class FilesystemReadTrust(StrEnum):
 # all HOME decisions (including denials) override overlapping source checkouts.
 _FILESYSTEM_READ_TRUST_PRECEDENCE = (
     FilesystemReadTrust.AUTHOR_ATTESTATION,
+    FilesystemReadTrust.RETAINED_CHECKOUT,
     FilesystemReadTrust.HOME_CARVE_OUT,
     FilesystemReadTrust.WRITE_SIDE_GATING,
     FilesystemReadTrust.HOME_UNANCHORED,
@@ -9589,6 +9651,7 @@ _FILESYSTEM_READ_TRUST_PRECEDENCE = (
 
 def _filesystem_read_trust_anchor(
     resource_id: str, *, author_attested: bool = False,
+    retained_checkout: bool = False,
 ) -> FilesystemReadTrust:
     """Return the winning anchor/boundary for diagnostics and label construction.
 
@@ -9600,6 +9663,8 @@ def _filesystem_read_trust_anchor(
     applicable = {FilesystemReadTrust.UNANCHORED}
     if author_attested:
         applicable.add(FilesystemReadTrust.AUTHOR_ATTESTATION)
+    if retained_checkout:
+        applicable.add(FilesystemReadTrust.RETAINED_CHECKOUT)
     home_value = os.environ.get("MIMIR_HOME", "").strip()
     source_repo_value = os.environ.get("MIMIR_SOURCE_REPO", "").strip()
     try:

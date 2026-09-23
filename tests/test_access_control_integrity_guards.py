@@ -174,6 +174,7 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
 def test_named_anchor_integrity_projection(decision):
     trusted = decision in {
         ac.FilesystemReadTrust.AUTHOR_ATTESTATION,
+        ac.FilesystemReadTrust.RETAINED_CHECKOUT,
         ac.FilesystemReadTrust.WRITE_SIDE_GATING,
         ac.FilesystemReadTrust.ROOT_MEMBERSHIP,
     }

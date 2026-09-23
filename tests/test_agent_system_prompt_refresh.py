@@ -123,6 +123,29 @@ async def test_build_agent_routes_lease_root_created_after_first_build(
 
 
 @pytest.mark.asyncio
+async def test_build_agent_always_routes_worklink_root_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.worklink import worker_client
+
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    target = retained / "issue.txt"
+    target.write_text("retained", encoding="utf-8")
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    agent = _make_agent(tmp_path, monkeypatch)
+    _stub_deepagent_build(monkeypatch)
+
+    await agent._build_agent_if_needed()
+
+    assert str(retained) + "/" in agent._backend.routes
+    assert agent._backend.read(str(target)).error is None
+    assert agent._backend.write(str(retained / "new.txt"), "blocked").error
+    assert not (retained / "new.txt").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid", ["symlink", "relative", "missing", "file"])
 async def test_build_agent_does_not_route_invalid_lease_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str,
