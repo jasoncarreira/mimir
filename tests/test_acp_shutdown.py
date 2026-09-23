@@ -207,6 +207,54 @@ async def _diagnostic_command(*argv: str) -> str:
     return text or "<empty>"
 
 
+def _capture_linux_process(pid: int) -> list[str]:
+    """Read procfs off the event loop so the caller's timeout can interrupt the wait."""
+    sections = []
+    proc = Path("/proc") / str(pid)
+    task_root = proc / "task"
+    try:
+        tasks = sorted(task_root.iterdir(), key=lambda path: int(path.name))
+    except OSError as exc:
+        sections.append(f"process state capture failed: {type(exc).__name__}: {exc}")
+    else:
+        thread_details = []
+        signal_fields = {"State", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"}
+        for task in tasks:
+            try:
+                status = [
+                    line for line in (task / "status").read_text().splitlines()
+                    if line.partition(":")[0] in signal_fields
+                ]
+                wchan = (task / "wchan").read_text().strip()
+                try:
+                    syscall = (task / "syscall").read_text().strip()
+                except OSError as exc:
+                    syscall = f"<capture failed: {type(exc).__name__}: {exc}>"
+                try:
+                    kernel_stack = (task / "stack").read_text().strip()
+                except OSError as exc:
+                    kernel_stack = f"<capture failed: {type(exc).__name__}: {exc}>"
+                thread_details.append(
+                    f"thread {task.name}:\n" + "\n".join(status)
+                    + f"\nwchan: {wchan or '<empty>'}\nsyscall: {syscall}"
+                    + f"\nkernel stack:\n{kernel_stack or '<empty>'}"
+                )
+            except OSError as exc:
+                thread_details.append(
+                    f"thread {task.name}: capture failed: {type(exc).__name__}: {exc}"
+                )
+        sections.append("per-thread signal masks and kernel waits:\n" + "\n".join(thread_details))
+    try:
+        descriptors = [
+            f"fd {entry.name}: {os.readlink(entry)}"
+            for entry in sorted((proc / "fd").iterdir(), key=lambda path: int(path.name))
+        ]
+        sections.append("open file descriptors:\n" + ("\n".join(descriptors) or "<none>"))
+    except OSError as exc:
+        sections.append(f"file descriptor capture failed: {type(exc).__name__}: {exc}")
+    return sections
+
+
 async def _capture_expired_child(process: asyncio.subprocess.Process, progress: Path) -> str:
     """Capture live child state without allowing diagnostics to become a hang."""
     sections = []
@@ -218,53 +266,12 @@ async def _capture_expired_child(process: asyncio.subprocess.Process, progress: 
         sections.append("per-thread Python stack capture failed: periodic snapshot is empty")
 
     if sys.platform.startswith("linux"):
-        proc = Path("/proc") / str(process.pid)
-        task_root = proc / "task"
-        try:
-            tasks = sorted(task_root.iterdir(), key=lambda path: int(path.name))
-        except OSError as exc:
-            sections.append(f"process state capture failed: {type(exc).__name__}: {exc}")
-        else:
-            thread_details = []
-            signal_fields = {"State", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"}
-            for task in tasks:
-                try:
-                    status = [
-                        line for line in (task / "status").read_text().splitlines()
-                        if line.partition(":")[0] in signal_fields
-                    ]
-                    wchan = (task / "wchan").read_text().strip()
-                    try:
-                        syscall = (task / "syscall").read_text().strip()
-                    except OSError as exc:
-                        syscall = f"<capture failed: {type(exc).__name__}: {exc}>"
-                    try:
-                        kernel_stack = (task / "stack").read_text().strip()
-                    except OSError as exc:
-                        kernel_stack = f"<capture failed: {type(exc).__name__}: {exc}>"
-                    thread_details.append(
-                        f"thread {task.name}:\n" + "\n".join(status)
-                        + f"\nwchan: {wchan or '<empty>'}\nsyscall: {syscall}"
-                        + f"\nkernel stack:\n{kernel_stack or '<empty>'}"
-                    )
-                except OSError as exc:
-                    thread_details.append(
-                        f"thread {task.name}: capture failed: {type(exc).__name__}: {exc}"
-                    )
-            sections.append("per-thread signal masks and kernel waits:\n" + "\n".join(thread_details))
-        try:
-            descriptors = [
-                f"fd {entry.name}: {os.readlink(entry)}"
-                for entry in sorted((proc / "fd").iterdir(), key=lambda path: int(path.name))
-            ]
-            sections.append("open file descriptors:\n" + ("\n".join(descriptors) or "<none>"))
-        except OSError as exc:
-            sections.append(f"file descriptor capture failed: {type(exc).__name__}: {exc}")
+        sections.extend(await asyncio.to_thread(_capture_linux_process, process.pid))
     elif sys.platform == "darwin":
         pid = str(process.pid)
         ps, sample, lsof = await asyncio.gather(
             _diagnostic_command(
-                "/bin/ps", "-o", "pid=,state=,wchan=,sig=,sigmask=,caught=,ignored=", "-p", pid,
+                "/bin/ps", "-o", "pid=,state=,wchan=,sig=,sigmask=", "-p", pid,
             ),
             _diagnostic_command("/usr/bin/sample", pid, "1", "1"),
             _diagnostic_command("/usr/sbin/lsof", "-nP", "-p", pid),
@@ -1227,6 +1234,50 @@ blocked_after_exit_ready()
         assert "open file descriptors:" in message
         assert "stacks:" in message
         assert "in blocked_after_exit_ready" in message
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform != "darwin", reason="asserts macOS ps and sample diagnostics")
+async def test_shutdown_ceiling_captures_live_blocking_condition_on_macos(
+    tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+faulthandler.cancel_dump_traceback_later()
+faulthandler.dump_traceback_later(0.01, repeat=True, file=_stack_fd)
+def blocked_after_exit_ready():
+    record(b'exit-ready')
+    os.write(1, b'exit-ready\n')
+    threading.Event().wait()
+
+blocked_after_exit_ready()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        assert await process.stdout.readline() == b"exit-ready\n"
+        with pytest.raises(pytest.fail.Exception) as failure:
+            async with _shutdown_ceiling(
+                process, progress, lambda: "exit-ready", timeout=0.1,
+            ):
+                await process.wait()
+        message = str(failure.value)
+        assert "ACP shutdown ceiling expired: outstanding=exit-ready" in message
+        signal_section, stack_section = message.split(
+            "per-thread native stacks and syscalls:\n", maxsplit=1,
+        )
+        assert "process signal masks and wait channel:" in signal_section
+        assert "capture failed" not in signal_section
+        assert "blocked_after_exit_ready" in stack_section
+        assert "open file descriptors:" in stack_section
     finally:
         if process.returncode is None:
             process.kill()
