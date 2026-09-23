@@ -26,7 +26,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-scope"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -253,6 +253,69 @@ class WorkerClient:
         except Exception:
             sock.close()
             raise
+
+    def factory_file_operation(
+        self,
+        operation: str,
+        relative_path: str,
+        *,
+        run_id: str,
+        content: str | None = None,
+        old_string: str | None = None,
+        new_string: str | None = None,
+        replace_all: bool = False,
+    ) -> dict[str, object]:
+        """Perform one typed file mutation as the retained checkout owner."""
+        if self.path_checkout is None or self._launch_op != "launch_factory":
+            raise ValueError("factory file operation requires a factory checkout")
+        relative = PurePosixPath(relative_path)
+        if (
+            operation not in {"write_file", "edit_file"}
+            or relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError("factory file operation path is invalid")
+        request: dict[str, object] = {
+            "version": 1,
+            "op": operation,
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "path": str(self.path_checkout),
+            "issue": self.issue_id,
+            "attempt": self.attempt,
+            "run_uid": self.run_uid,
+            "run_id": run_id,
+            "relative_path": relative.as_posix(),
+        }
+        if operation == "write_file":
+            if not isinstance(content, str):
+                raise ValueError("factory write content is invalid")
+            request["content"] = content
+        else:
+            if not isinstance(old_string, str) or not isinstance(new_string, str):
+                raise ValueError("factory edit strings are invalid")
+            request.update({
+                "old_string": old_string,
+                "new_string": new_string,
+                "replace_all": replace_all,
+            })
+        payload = json.dumps(request, separators=(",", ":")).encode()
+        if len(payload) > MAX_REQUEST_BYTES:
+            raise ValueError("worker request exceeds size limit")
+        sock = self._connect(30)
+        try:
+            sock.send(payload)
+            response = json.loads(sock.recv(MAX_REQUEST_BYTES + 1))
+        finally:
+            sock.close()
+        if not isinstance(response, dict):
+            raise RuntimeError("worker executor returned an invalid file result")
+        if "error" in response and any(
+            marker in str(response["error"])
+            for marker in ("exact contract", "stale root executor image", "unsupported worker operation")
+        ):
+            raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+        return response
 
     async def launch(
         self,

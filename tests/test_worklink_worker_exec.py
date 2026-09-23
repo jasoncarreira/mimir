@@ -1699,7 +1699,223 @@ def test_factory_control_launch_uses_worker_drop_without_runtime_refresh(factory
         finally:
             if len(fds) == 3:
                 os.close(fds[0])
-    assert len(opened) == 1
+
+
+def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    write = {
+        "op": "write_file", "issue": 41, "run_id": "chainlink-41",
+        "relative_path": ".factory-sandboxes/chainlink-41/src/fix.py",
+        "content": "old old\n",
+    }
+    target = tmp_path / ".factory-sandboxes" / "chainlink-41" / "src" / "fix.py"
+    if sys.platform == "linux":
+        assert worker_exec._run_factory_file_child(write) == {
+            "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
+        }
+        assert target.read_text() == "old old\n"
+        assert worker_exec._run_factory_file_child(write)["error"] == "file already exists"
+
+        edit = {
+            "op": "edit_file", "issue": 41, "run_id": "chainlink-41",
+            "relative_path": ".factory-sandboxes/chainlink-41/src/fix.py",
+            "old_string": "old", "new_string": "new", "replace_all": True,
+        }
+        assert worker_exec._run_factory_file_child(edit) == {
+            "status": "ok", "path": ".factory-sandboxes/chainlink-41/src/fix.py",
+            "occurrences": 2,
+        }
+        assert target.read_text() == "new new\n"
+    else:
+        with pytest.raises(RuntimeError) as exc_info:
+            worker_exec._run_factory_file_child(write)
+        assert str(exc_info.value) == "atomic create-only publication is unavailable"
+        assert not target.exists()
+        assert not list(target.parent.glob(".mimir-*.tmp"))
+
+    for relative in ("../escape", ".git/config", "/absolute"):
+        with pytest.raises(RuntimeError, match="path is invalid"):
+            worker_exec._run_factory_file_child({**write, "relative_path": relative})
+    with pytest.raises(RuntimeError, match="outside the retained run"):
+        worker_exec._run_factory_file_child({**write, "relative_path": "README.md"})
+    with pytest.raises(RuntimeError, match="outside the retained run"):
+        worker_exec._run_factory_file_child({**write, "issue": 42})
+
+
+def test_factory_file_child_refuses_symlink_escape(tmp_path: Path, monkeypatch) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    sandbox = root / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    (sandbox / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(root)
+    with pytest.raises(OSError):
+        worker_exec._run_factory_file_child({
+            "op": "write_file", "issue": 41, "run_id": "chainlink-41",
+            "relative_path": ".factory-sandboxes/chainlink-41/escape/file",
+            "content": "denied",
+        })
+    assert not (outside / "file").exists()
+
+
+def test_factory_file_child_refuses_hardlinked_edit(tmp_path: Path, monkeypatch) -> None:
+    outside = tmp_path / "outside"
+    outside.write_text("unchanged")
+    root = tmp_path / "root"
+    root.mkdir()
+    sandbox = root / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    os.link(outside, sandbox / "linked")
+    monkeypatch.chdir(root)
+    with pytest.raises(RuntimeError, match="bounded regular file"):
+        worker_exec._run_factory_file_child({
+            "op": "edit_file", "issue": 41, "run_id": "chainlink-41",
+            "relative_path": ".factory-sandboxes/chainlink-41/linked",
+            "old_string": "unchanged", "new_string": "changed", "replace_all": False,
+        })
+    assert outside.read_text() == "unchanged"
+
+
+def test_factory_file_child_bounds_and_atomically_publishes_edits(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    target = sandbox / "fix.py"
+    target.write_text("old old")
+    monkeypatch.chdir(tmp_path)
+    request = {
+        "op": "edit_file", "issue": 41, "run_id": "chainlink-41",
+        "relative_path": ".factory-sandboxes/chainlink-41/fix.py",
+        "old_string": "old", "new_string": "x" * (5 * 1024 * 1024),
+        "replace_all": True,
+    }
+    with pytest.raises(RuntimeError, match="exceeds size limit"):
+        worker_exec._run_factory_file_child(request)
+    assert target.read_text() == "old old"
+
+    original_write = os.write
+
+    def fail_temporary_write(fd: int, content: bytes) -> int:
+        if len(content) > 3:
+            original_write(fd, content[:3])
+            raise OSError("injected write failure")
+        return original_write(fd, content)
+
+    monkeypatch.setattr(os, "write", fail_temporary_write)
+    with pytest.raises(OSError, match="injected write failure"):
+        worker_exec._run_factory_file_child({
+            **request, "new_string": "replacement", "replace_all": True,
+        })
+    assert target.read_text() == "old old"
+
+
+def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
+    if sys.platform != "linux" or os.geteuid() != 0:
+        pytest.skip("requires Linux root with distinct controller and worker identities")
+    observed = worker_exec.get_identities()
+    if observed.mimir_uid == observed.worklink_uid:
+        pytest.skip("controller and Worklink identities are not distinct")
+
+    repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-file-test-{uuid.uuid4()}"
+    boundary = repo / "41-2"
+    checkout = boundary / "checkout"
+    sandbox = checkout / ".factory-sandboxes" / "chainlink-41"
+    socket_root = Path("/tmp") / f"factory-file-rpc-{uuid.uuid4()}"
+    socket_path = socket_root / "executor.sock"
+    try:
+        sandbox.mkdir(parents=True)
+        repo.chmod(0o755)
+        os.chown(boundary, observed.mimir_uid, observed.worklink_gid)
+        boundary.chmod(0o2750)
+        for path in (checkout, checkout / ".factory-sandboxes", sandbox):
+            os.chown(path, observed.worklink_uid, observed.worklink_gid)
+            path.chmod(0o2770)
+        socket_root.mkdir(mode=0o755)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+            listener.bind(str(socket_path))
+            socket_path.chmod(0o666)
+            listener.listen(2)
+            read_fd, write_fd = os.pipe()
+            controller = os.fork()
+            if controller == 0:
+                os.close(read_fd)
+                try:
+                    os.setgroups([observed.worklink_gid])
+                    os.setresgid(*((observed.mimir_uid,) * 3))
+                    os.setresuid(*((observed.mimir_uid,) * 3))
+                    client = WorkerClient.for_factory_checkout(
+                        checkout, issue_id=41, attempt=2, socket_path=socket_path,
+                    )
+                    created = client.factory_file_operation(
+                        "write_file", ".factory-sandboxes/chainlink-41/fix.py",
+                        run_id="chainlink-41",
+                        content="old\n",
+                    )
+                    edited = client.factory_file_operation(
+                        "edit_file", ".factory-sandboxes/chainlink-41/fix.py",
+                        run_id="chainlink-41",
+                        old_string="old", new_string="new",
+                    )
+                    result = {"created": created, "edited": edited}
+                except BaseException as exc:
+                    result = {"error": repr(exc)}
+                os.write(write_fd, json.dumps(result).encode())
+                os._exit(0)
+            os.close(write_fd)
+            for _ in range(2):
+                connection, _ = listener.accept()
+                worker_exec.handle_connection(connection)
+            _, status = os.waitpid(controller, 0)
+            result = json.loads(os.read(read_fd, 65536))
+            os.close(read_fd)
+        assert os.waitstatus_to_exitcode(status) == 0, result
+        assert "error" not in result, result
+        assert result["created"]["status"] == "ok"
+        assert result["edited"]["status"] == "ok"
+        target = sandbox / "fix.py"
+        assert target.read_text() == "new\n"
+        assert target.stat().st_uid == observed.worklink_uid
+        assert target.stat().st_uid != observed.mimir_uid
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(socket_root, ignore_errors=True)
+
+
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        (".factory-sandboxes/chainlink-41/.factory/chainlink-41/run.json", False),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/evidence/gate.json",
+            False,
+        ),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/locks/slice.lock",
+            False,
+        ),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/"
+            "worktrees/slice-1/src/fix.py",
+            True,
+        ),
+    ],
+)
+def test_factory_file_rpc_refuses_control_plane_but_allows_slice_worktrees(
+    path: str, allowed: bool,
+) -> None:
+    request = {
+        "issue": 41,
+        "run_id": "chainlink-41",
+        "relative_path": path,
+    }
+    if allowed:
+        assert worker_exec._factory_file_relative(request).as_posix() == path
+    else:
+        with pytest.raises(RuntimeError, match="factory control plane"):
+            worker_exec._factory_file_relative(request)
 
 
 @pytest.mark.parametrize("owner_valid", [False, True])

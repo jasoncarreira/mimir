@@ -1261,6 +1261,69 @@ class RepoPRScopeRegistry:
         return None
 
 
+@dataclass(frozen=True)
+class RetainedFactoryScope:
+    """Server-derived authority for one retained factory incident."""
+
+    issue_id: int
+    signature: str
+    occurrence_id: str
+    run_id: str
+    attempt: int
+    session: str
+    repository: str
+    branch: str
+    sandbox: str
+    scope_id: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.issue_id, int)
+            or isinstance(self.issue_id, bool)
+            or self.issue_id < 1
+            or not isinstance(self.attempt, int)
+            or isinstance(self.attempt, bool)
+            or self.attempt < 1
+            or any(
+                not isinstance(value, str) or not value or "\x00" in value
+                for value in (
+                    self.signature, self.occurrence_id, self.run_id, self.session,
+                    self.repository, self.branch, self.sandbox,
+                )
+            )
+            or not Path(self.sandbox).is_absolute()
+        ):
+            raise ValueError("retained factory scope identity is invalid")
+        authority = {
+            "issue_id": self.issue_id,
+            "signature": self.signature,
+            "occurrence_id": self.occurrence_id,
+            "run_id": self.run_id,
+            "attempt": self.attempt,
+            "session": self.session,
+            "repository": self.repository,
+            "branch": self.branch,
+            "sandbox": self.sandbox,
+        }
+        encoded = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
+        object.__setattr__(self, "scope_id", hashlib.sha256(encoded).hexdigest())
+
+    def resolve_path(self, path: object, *, strict: bool = False) -> Path | None:
+        """Resolve one absolute path inside this exact retained sandbox."""
+        if not isinstance(path, (str, Path)):
+            return None
+        candidate = Path(path)
+        if not candidate.is_absolute() or ".." in candidate.parts:
+            return None
+        try:
+            root = Path(self.sandbox).resolve(strict=True)
+            resolved = candidate.resolve(strict=strict)
+            relative = resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return resolved if relative.parts else None
+
+
 @dataclass
 class ServerDiscoveredPRStates:
     """Per-turn cache of review states derived from live provider snapshots."""
@@ -1500,6 +1563,12 @@ class AuthContext(_AuthContextAuthoritySlot):
     # Agent-owned server provenance retained across turns. It contains only
     # immutable scopes, never mutable checkout state, and is not model input.
     server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = field(
+        default=None, repr=False, compare=False,
+    )
+    retained_factory_scope: RetainedFactoryScope | None = field(
+        default=None, repr=False, compare=False,
+    )
+    retained_factory_scope_refusal: str | None = field(
         default=None, repr=False, compare=False,
     )
     # Resource ACL for outputs derived by a trusted synthesis turn. This does

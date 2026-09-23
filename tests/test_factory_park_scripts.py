@@ -25,6 +25,8 @@ from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
+    factory_checkout_interlock,
+    factory_issue_resource_lock,
     load_factory_record,
     factory_process_is_alive,
     save_factory_record,
@@ -597,6 +599,29 @@ class TestParkStopsTheControllerFirst:
             record, home, monkeypatch, _park_stub([], _claim_history(1)), tmp_path,
         ) == 0
         assert order == ["controller", "recorded driver", "residual"]
+
+    def test_record_reconcile_holds_checkout_then_issue_resource_lock(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        record = _record(tmp_path, phase="running", status="running")
+        home = _home_with(record, tmp_path)
+        monkeypatch.setattr(park, "stop_pid", lambda pid, label, **k: None)
+        monkeypatch.setattr(park, "stop_residual_compute", lambda run_id, **k: [])
+        monkeypatch.setattr(park, "factory_process_is_alive", lambda rec: False)
+        monkeypatch.setattr(park, "factory_process_is_verified_dead", lambda rec: True)
+        original_save = park.save_factory_record
+
+        def save_under_both_locks(home_path: Path, reconciled: FactoryRunRecord) -> None:
+            with factory_checkout_interlock(home_path, pruning=True) as checkout_acquired:
+                assert checkout_acquired is False
+            with factory_issue_resource_lock(home_path, reconciled.issue_id) as issue_acquired:
+                assert issue_acquired is False
+            original_save(home_path, reconciled)
+
+        monkeypatch.setattr(park, "save_factory_record", save_under_both_locks)
+        assert _park_main(
+            record, home, monkeypatch, _park_stub([], _claim_history(1)), tmp_path,
+        ) == 0
 
     def test_a_park_refuses_when_the_recorded_process_cannot_be_proven_dead(
         self, tmp_path: Path, monkeypatch

@@ -4742,6 +4742,13 @@ def _target_within_trigger_service_write_roots(
             return False
         roots = [Path(path).resolve() for path in raw]
         service = get_trusted_service_from_auth_context(auth_context)
+        retained_scope = getattr(auth_context, "retained_factory_scope", None)
+        if (
+            _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+            and retained_scope is not None
+            and retained_scope.resolve_path(target, strict=False) is not None
+        ):
+            return _target_within_retained_factory_scope(target, auth_context)
         if not roots and not _is_research_proposal_poller(service):
             return False
         turn_scratch = (
@@ -4830,6 +4837,48 @@ def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> b
         WriteResourceAdapter._is_protected_path(lexical)
         or WriteResourceAdapter._is_protected_path(relative)
         or _is_static_service_protected_write_path(relative)
+    )
+
+
+def _target_within_retained_factory_scope(
+    target: str, auth_context: AuthContext | None,
+) -> bool:
+    """Admit only an unprotected path in this turn's exact retained sandbox."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        not _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+        or scope is None
+    ):
+        return False
+    resolved = scope.resolve_path(target, strict=False)
+    if resolved is None:
+        return False
+    root = Path(scope.sandbox).resolve(strict=True)
+    try:
+        lexical = Path(target).relative_to(Path(scope.sandbox))
+        relative = resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    if (
+        WriteResourceAdapter._is_protected_path(lexical)
+        or WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(relative)
+    ):
+        return False
+    factory_parts = tuple(part.lower() for part in relative.parts)
+    try:
+        factory_index = factory_parts.index(".factory")
+    except ValueError:
+        return True
+    # The factory owns its control plane. Only slice worktrees below
+    # .factory/<run>/worktrees/<slice>/ contain agent-editable source code.
+    suffix = relative.parts[factory_index + 1:]
+    return (
+        len(suffix) >= 4
+        and suffix[0] == scope.run_id
+        and suffix[1].lower() == "worktrees"
+        and bool(suffix[2])
     )
 
 
@@ -4951,8 +5000,13 @@ def resolve_trigger_service_write_target(
         target, destination, auth_context=auth_context,
     ):
         raise PathOutsideHomeError("target is outside trigger-service write grants")
-    candidate = _resolve_file_tool_target(
-        target, home, physical_roots=map(Path, json.loads(destination)),
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    retained = _target_within_retained_factory_scope(target, auth_context)
+    candidate = (
+        scope.resolve_path(target, strict=False)
+        if retained else _resolve_file_tool_target(
+            target, home, physical_roots=map(Path, json.loads(destination)),
+        )
     )
     if candidate is None:
         raise PathOutsideHomeError("invalid trigger-service write target")
@@ -11246,6 +11300,12 @@ def create_auth_context(
     )
     action_scope = single_state.action_scope if single_state is not None else None
 
+    from .worklink.retained_scope import derive_retained_factory_scope
+
+    retained_resolution = derive_retained_factory_scope(
+        event, registered_service if is_service else None,
+    )
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -11260,6 +11320,8 @@ def create_auth_context(
         repo_pr_scope_registry=repo_pr_scope_registry,
         repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
+        retained_factory_scope=retained_resolution.scope,
+        retained_factory_scope_refusal=retained_resolution.refusal_reason,
         enforcement_enabled=enforce,
         source_session_acl=(
             event.source_session_acl

@@ -130,6 +130,29 @@ def current_failure_identity(state_dir: Path, issue_id: int) -> tuple[str, str] 
     return signature, occurrence
 
 
+def current_failure_record(state_dir: Path, issue_id: int) -> dict[str, Any] | None:
+    """Return a copy of one active incident without forgiving corrupt state."""
+    state = _read_failure_state_strict(state_dir)
+    if state is None:
+        return None
+    entry = state["issues"].get(str(issue_id))
+    if entry is None:
+        return None
+    if isinstance(entry, dict) and entry.get("active") is False:
+        return None
+    if (
+        not isinstance(entry, dict)
+        or entry.get("active") is not True
+        or entry.get("issue_id") != issue_id
+        or not isinstance(entry.get("signature"), str)
+        or not entry["signature"]
+        or not isinstance(entry.get("occurrence_id"), str)
+        or not entry["occurrence_id"]
+    ):
+        raise ValueError("dispatch failure state unavailable: invalid issue record")
+    return dict(entry)
+
+
 def active_failure_identities(
     state_dir: Path,
     *,

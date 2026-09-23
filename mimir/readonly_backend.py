@@ -2191,6 +2191,82 @@ class ReadOnlyFilesystemBackend:
         return self.upload_files(files)
 
 
+class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
+    """Read retained files normally and mutate them only through their owner."""
+
+    def __init__(self, root_dir: Path) -> None:
+        super().__init__(root_dir)
+        self._root = Path(root_dir)
+
+    def _binding(self, file_path: str):
+        from ._context import get_current_turn
+        from .access_control import _target_within_retained_factory_scope
+
+        turn = get_current_turn()
+        auth = getattr(turn, "auth_context", None)
+        absolute = self._root / file_path.lstrip("/")
+        scope = getattr(auth, "retained_factory_scope", None)
+        if scope is None or not _target_within_retained_factory_scope(str(absolute), auth):
+            return None, None, absolute
+        return auth, scope, absolute
+
+    def _operate(self, operation: str, file_path: str, **arguments: object) -> dict[str, object]:
+        from .worklink.retained_scope import retained_factory_effect_lease
+        from .worklink.worker_client import WorkerClient, factory_checkout_for_path
+
+        auth, scope, absolute = self._binding(file_path)
+        if scope is None:
+            return {"error": "retained factory scope does not authorize this path"}
+        home_value = os.environ.get("MIMIR_HOME", "").strip()
+        binding = factory_checkout_for_path(Path(scope.sandbox))
+        if not home_value or binding is None:
+            return {"error": "retained factory checkout binding is unavailable"}
+        checkout, issue_id, attempt = binding
+        with retained_factory_effect_lease(Path(home_value), scope) as lease:
+            if lease.scope is None:
+                return {"error": lease.refusal_reason or "retained factory lease refused"}
+            relative = absolute.relative_to(checkout).as_posix()
+            client = WorkerClient.for_factory_checkout(
+                checkout, issue_id=issue_id, attempt=attempt,
+            )
+            return client.factory_file_operation(
+                operation, relative, run_id=scope.run_id, **arguments,
+            )
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        result = self._operate("write_file", file_path, content=content)
+        if result.get("status") == "ok":
+            return WriteResult(path=file_path)
+        error = str(result.get("error") or "retained factory write failed")
+        if error == "file already exists":
+            error = _collision_error(str(self._root / file_path.lstrip("/")))
+        return WriteResult(error=error)
+
+    async def awrite(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.write, file_path, content)
+
+    def edit(
+        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
+    ) -> EditResult:
+        result = self._operate(
+            "edit_file", file_path, old_string=old_string,
+            new_string=new_string, replace_all=replace_all,
+        )
+        if result.get("status") == "ok":
+            return EditResult(
+                path=file_path,
+                occurrences=int(result.get("occurrences", 0)),
+            )
+        return EditResult(error=str(result.get("error") or "retained factory edit failed"))
+
+    async def aedit(
+        self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
+    ) -> EditResult:
+        return await asyncio.to_thread(
+            self.edit, file_path, old_string, new_string, replace_all,
+        )
+
+
 def build_file_tool_routes(roots: Iterable[tuple[str, str]]) -> dict[str, Any]:
     """Build ``CompositeBackend`` routes from validated ``(abs_path, mode)`` pairs
     (chainlink #650).
@@ -2205,6 +2281,8 @@ def build_file_tool_routes(roots: Iterable[tuple[str, str]]) -> dict[str, Any]:
         prefix = str(Path(path)).rstrip("/") + "/"
         if mode == "ro":
             routes[prefix] = ReadOnlyFilesystemBackend(Path(path))
+        elif mode == "retained":
+            routes[prefix] = RetainedCheckoutFilesystemBackend(Path(path))
         else:
             routes[prefix] = _RootAwareFilesystemBackend(root_dir=Path(path), virtual_mode=True)
     return routes

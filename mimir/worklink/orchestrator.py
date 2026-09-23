@@ -87,6 +87,7 @@ from .backends.opencode import transcript_path, write_transcript
 from .factory_state import (
     FactoryRunRecord,
     factory_checkout_interlock,
+    factory_issue_resource_lock,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     factory_record_run_ids,
@@ -887,6 +888,7 @@ class WorklinkRunner:
     _incident_owner: _IncidentOwner | None = field(
         default=None, repr=False, compare=False
     )
+    _factory_lease_held: bool = field(default=False, repr=False, compare=False)
 
     def _begin_incident_invocation(self, autonomous: bool) -> _IncidentOwner:
         owner = self._incident_owner
@@ -2268,14 +2270,22 @@ class WorklinkRunner:
         *,
         autonomous: bool,
     ) -> WorklinkRunResult:
+        if self._factory_lease_held:
+            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
         with factory_checkout_interlock(self.home) as acquired:
             if not acquired:
                 return WorklinkRunResult(
                     issue_id, None, "refused", reason="factory checkout interlock unavailable"
                 )
-            # Keep checkout protection even after the worker dies, until failure
-            # preservation, terminal handling and claim cleanup have finished.
-            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+            with factory_issue_resource_lock(self.home, issue_id) as resource_acquired:
+                if not resource_acquired:
+                    return WorklinkRunResult(
+                        issue_id, None, "refused",
+                        reason="factory issue resource lock unavailable",
+                    )
+                # Keep both protections through launch/recovery, durable record
+                # publication, failure preservation and claim cleanup.
+                return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
 
     async def _run_factory_070_locked(
         self,
@@ -4552,6 +4562,29 @@ def run_worklink_epic(
     issue_id: int,
     autonomous: bool = False,
 ) -> WorklinkRunResult:
+    """Run and publish one complete factory lifecycle under both leases."""
+    with factory_checkout_interlock(home) as checkout_acquired:
+        if not checkout_acquired:
+            return WorklinkRunResult(
+                issue_id, None, "refused", reason="factory checkout interlock unavailable"
+            )
+        with factory_issue_resource_lock(home, issue_id) as resource_acquired:
+            if not resource_acquired:
+                return WorklinkRunResult(
+                    issue_id, None, "refused", reason="factory issue resource lock unavailable"
+                )
+            return _run_worklink_epic_under_lease(
+                home=home, repo=repo, issue_id=issue_id, autonomous=autonomous,
+            )
+
+
+def _run_worklink_epic_under_lease(
+    *,
+    home: Path,
+    repo: Path,
+    issue_id: int,
+    autonomous: bool = False,
+) -> WorklinkRunResult:
     from .dispatch_failures import (
         current_failure_identity,
         dispatch_failure_state_dir,
@@ -4567,13 +4600,14 @@ def run_worklink_epic(
     try:
         result = asyncio.run(
             WorklinkRunner(
-                home=home, repo=repo, _incident_owner=incident_owner
+                home=home, repo=repo, _incident_owner=incident_owner,
+                _factory_lease_held=True,
             ).run_epic(
                 issue_id,
                 autonomous=autonomous,
             )
         )
-    except Exception as exc:
+    except BaseException as exc:
         if not _exception_incident_handled(exc) and not incident_owner.owns_terminal_failure:
             try:
                 records = load_factory_records_for_issue(home, issue_id)
