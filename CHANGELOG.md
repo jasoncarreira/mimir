@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.2 and accept
+  the release's `extra_attempts` and `retry_limit` slice status fields.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.0. Remove the
   `.factory.json` `publish` override so the factory's default publisher honors
   `PR_DRAFT` and validates the resulting URL. The sibling

@@ -668,7 +668,10 @@ async def test_factory_runs_list_with_runs(tmp_path: Path, monkeypatch: pytest.M
             "brief": {"status": "pending", "at": None, "artifact": None, "reviewed_head": None},
         },
         "steps": [{"agent": "spec-writer", "status": "accepted", "attempts": 1}],
-        "slices": [{"id": "s1", "status": "merged", "attempts": 2}],
+        "slices": [{
+            "id": "s1", "status": "merged", "attempts": 2,
+            "extra_attempts": 0, "retry_limit": 5,
+        }],
         "validator": None,
         "terminal_result": None,
         "next": "brief",
@@ -807,7 +810,10 @@ async def test_factory_runs_detail(tmp_path: Path, monkeypatch: pytest.MonkeyPat
             {"agent": "spec-writer", "status": "accepted", "attempts": 1},
             {"agent": "work-decomposer", "status": "completed", "attempts": 2},
         ],
-        "slices": [{"id": "s1", "status": "merged", "attempts": 3}],
+        "slices": [{
+            "id": "s1", "status": "merged", "attempts": 3,
+            "extra_attempts": 0, "retry_limit": 5,
+        }],
         "validator": {"verdict": "GO", "report": "validator.md", "reviewed_head": "abc123", "loops": 1},
         "terminal_result": {
             "status": "completed",
