@@ -78,6 +78,7 @@ from mimir.worklink.claims import (  # noqa: E402
 )
 from mimir.worklink.factory_state import (  # noqa: E402
     factory_checkout_interlock,
+    factory_issue_resource_lock,
     factory_process_is_alive,
     factory_process_is_verified_dead,
     load_factory_record,
@@ -676,14 +677,20 @@ def main(argv: list[str] | None = None) -> int:
                 "could not acquire the factory checkout interlock; the park is published but "
                 "mimir's record still reads stale. Re-run to reconcile before cleanup runs."
             )
-        current = load_factory_record(args.home, args.run_id)
-        if current is None:
-            raise ParkError("retained record vanished while parking")
-        reconciled = replace(
-            current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
-            controller_phase="parked",
-        )
-        save_factory_record(args.home, reconciled)
+        with factory_issue_resource_lock(args.home, record.issue_id) as issue_acquired:
+            if not issue_acquired:
+                raise ParkError(
+                    "could not acquire the factory issue resource lock; the park is published "
+                    "but mimir's record still reads stale. Re-run to reconcile before cleanup runs."
+                )
+            current = load_factory_record(args.home, args.run_id)
+            if current is None:
+                raise ParkError("retained record vanished while parking")
+            reconciled = replace(
+                current.observed(parse_factory_status(after), datetime.now(UTC).isoformat()),
+                controller_phase="parked",
+            )
+            save_factory_record(args.home, reconciled)
     print("reconciled : controller_phase=parked, observed status=needs-human")
 
     print()

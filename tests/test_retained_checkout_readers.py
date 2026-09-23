@@ -54,10 +54,10 @@ def retained_reader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         capabilities=tuple(manifest["authority"]["capabilities"]),
         creation_path="mimir.pollers.run_poller:chainlink-orchestrator/pollers.json",
     )
-    initial = InformationFlowLabels().with_channel(service.canonical).with_source(SourceLabel(
+    initial = InformationFlowLabels().with_source(SourceLabel(
         principal="worklink", domain="poller_payload", resource_id="incident:1806",
         bridge_instance="service:poller:worklink-ready-queue",
-        sensitivity="internal", integrity="trusted", integrity_effect="informational",
+        sensitivity="internal", integrity="trusted", integrity_effect="active_ingest",
     ))
     state = InformationFlowState(labels=initial)
     auth = SimpleNamespace(
@@ -209,7 +209,7 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
         service = ac.get_trusted_service_from_auth_context(auth)
         assert service is not None
         assert service.canonical == "poller:worklink-ready-queue"
-        assert sandbox in ac.service_filesystem_read_roots(
+        assert retained in ac.service_filesystem_read_roots(
             service, auth_context=auth,
         )
         decision = ac.ToolRegistry().authorize_tool(
@@ -254,13 +254,34 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
         reset_current_turn(token)
 
 
+def test_retained_read_root_and_anchor_do_not_require_an_edit_scope(retained_reader) -> None:
+    reader = retained_reader
+    reader.auth.retained_factory_scope = None
+
+    assert reader.retained in ac.service_filesystem_read_roots(
+        reader.service, auth_context=reader.auth,
+    )
+    decision = ac.ToolRegistry().authorize_tool(
+        "read_file", reader.auth, enforce=True,
+        arguments={"file_path": str(reader.target)},
+    )
+    assert decision.allowed, (decision.reason, decision.refusal_detail)
+    source = ac.protected_result_source(
+        reader.auth, principal="filesystem", domain="filesystem",
+        resource_id=str(reader.target), bridge_instance="filesystem",
+    )
+    assert (source.integrity, source.integrity_effect) == (
+        "trusted", "informational",
+    )
+
+
 @pytest.mark.asyncio
 async def test_retained_route_reads_nested_factory_sandbox_without_configured_root(
     retained_reader,
 ) -> None:
     reader = retained_reader
     assert str(reader.retained) not in str(reader.external)
-    assert reader.sandbox in ac.service_filesystem_read_roots(
+    assert reader.retained in ac.service_filesystem_read_roots(
         reader.service, auth_context=reader.auth,
     )
     registry = ac.ToolRegistry()
@@ -345,7 +366,7 @@ def test_retained_root_and_anchor_are_exclusive_to_reserved_service(retained_rea
     non_poller.trigger = "scheduled_tick"
 
     for auth, service in ((other_poller, other_service), (non_poller, non_poller_service)):
-        assert reader.sandbox not in ac.service_filesystem_read_roots(
+        assert reader.retained not in ac.service_filesystem_read_roots(
             service, auth_context=auth,
         )
         source = ac.protected_result_source(
@@ -367,7 +388,7 @@ def test_retained_root_does_not_expand_shell_or_write_authority(
         "mimir.read_policy.configured_non_admin_read_roots",
         lambda: (reader.external,),
     )
-    assert reader.sandbox not in ac.service_shell_filesystem_read_roots(
+    assert reader.retained not in ac.service_shell_filesystem_read_roots(
         reader.service, auth_context=reader.auth,
     )
     resolved, refusal = _resolve_service_shell_cwd(
@@ -399,6 +420,13 @@ def test_retained_scope_centrally_authorizes_only_exact_unprotected_writes(
     sibling = reader.sandbox.parent / "other-run" / "fix.py"
     escaped = reader.sandbox / ".." / "other-run" / "fix.py"
     protected = reader.sandbox / ".git" / "config"
+    factory_run = reader.sandbox / ".factory" / reader.auth.retained_factory_scope.run_id
+    factory_control = (
+        factory_run / "run.json",
+        factory_run / "evidence" / "gate.json",
+        factory_run / "locks" / "slice.lock",
+    )
+    slice_worktree = factory_run / "worktrees" / "slice-1" / "src" / "fix.py"
 
     for tool in ("write_file", "edit_file"):
         policy = reader.service.sink_policy_for(tool)
@@ -411,7 +439,15 @@ def test_retained_scope_centrally_authorizes_only_exact_unprotected_writes(
             arguments={"file_path": str(inside)}, ifc_labels=InformationFlowLabels(),
         )
         assert decision.allowed, (decision.reason, decision.refusal_detail)
-        for target in (sibling, escaped, protected):
+        worktree_decision = registry.authorize_tool(
+            tool, reader.auth, enforce=True, target_channel=str(slice_worktree),
+            arguments={"file_path": str(slice_worktree)},
+            ifc_labels=InformationFlowLabels(),
+        )
+        assert worktree_decision.allowed, (
+            worktree_decision.reason, worktree_decision.refusal_detail,
+        )
+        for target in (sibling, escaped, protected, *factory_control):
             assert not registry.authorize_tool(
                 tool, reader.auth, enforce=True, target_channel=str(target),
                 arguments={"file_path": str(target)}, ifc_labels=InformationFlowLabels(),

@@ -470,6 +470,18 @@ def _factory_file_relative(request: dict[str, Any]) -> PurePosixPath:
         or relative.parts[:2] != (".factory-sandboxes", run_id)
     ):
         raise RuntimeError("factory file path is outside the retained run")
+    sandbox_relative = relative.parts[2:]
+    lowered = tuple(part.lower() for part in sandbox_relative)
+    if ".factory" in lowered:
+        factory_index = lowered.index(".factory")
+        suffix = sandbox_relative[factory_index + 1:]
+        if not (
+            len(suffix) >= 4
+            and suffix[0] == run_id
+            and suffix[1].lower() == "worktrees"
+            and bool(suffix[2])
+        ):
+            raise RuntimeError("factory file path targets the factory control plane")
     return relative
 
 
@@ -505,19 +517,26 @@ def _write_all(fd: int, content: bytes) -> None:
 
 def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
     renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
-    if renameat2 is None:
-        raise RuntimeError("atomic create-only publication is unavailable")
-    renameat2.argtypes = [
-        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    if renameat2(
-        directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1,
-    ) != 0:
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        if renameat2(
+            directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1,
+        ) == 0:
+            return
         error = ctypes.get_errno()
         if error == errno.EEXIST:
             raise FileExistsError(error, os.strerror(error), destination)
         raise OSError(error, os.strerror(error), destination)
+    # POSIX link is an atomic create-only publication on platforms without
+    # renameat2 (notably macOS). The caller removes the private temporary name.
+    os.link(
+        source, destination,
+        src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
 
 
 def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:

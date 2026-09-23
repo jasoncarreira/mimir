@@ -989,9 +989,7 @@ def service_filesystem_read_roots(
             if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
                 roots.append(Path(lease.path))
     if _is_worklink_retained_checkout_service(service, auth_context=auth_context):
-        retained_scope = getattr(auth_context, "retained_factory_scope", None)
-        if retained_scope is not None:
-            roots.append(Path(retained_scope.sandbox))
+        roots.append(worklink_retained_checkout_root())
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -1017,11 +1015,7 @@ def service_shell_filesystem_read_roots(
     roots = service_filesystem_read_roots(service, auth_context=auth_context)
     if not _is_worklink_retained_checkout_service(service, auth_context=auth_context):
         return roots
-    retained_scope = getattr(auth_context, "retained_factory_scope", None)
-    retained = (
-        Path(retained_scope.sandbox).resolve(strict=False)
-        if retained_scope is not None else worklink_retained_checkout_root().resolve(strict=False)
-    )
+    retained = worklink_retained_checkout_root().resolve(strict=False)
     static_roots = {
         Path(root).resolve(strict=False)
         for root in getattr(service, "filesystem_read_roots", ())
@@ -4752,8 +4746,9 @@ def _target_within_trigger_service_write_roots(
         if (
             _is_worklink_retained_checkout_service(service, auth_context=auth_context)
             and retained_scope is not None
+            and retained_scope.resolve_path(target, strict=False) is not None
         ):
-            roots.append(Path(retained_scope.sandbox).resolve(strict=True))
+            return _target_within_retained_factory_scope(target, auth_context)
         if not roots and not _is_research_proposal_poller(service):
             return False
         turn_scratch = (
@@ -4865,10 +4860,25 @@ def _target_within_retained_factory_scope(
         relative = resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
-    return not (
+    if (
         WriteResourceAdapter._is_protected_path(lexical)
         or WriteResourceAdapter._is_protected_path(relative)
         or _is_static_service_protected_write_path(relative)
+    ):
+        return False
+    factory_parts = tuple(part.lower() for part in relative.parts)
+    try:
+        factory_index = factory_parts.index(".factory")
+    except ValueError:
+        return True
+    # The factory owns its control plane. Only slice worktrees below
+    # .factory/<run>/worktrees/<slice>/ contain agent-editable source code.
+    suffix = relative.parts[factory_index + 1:]
+    return (
+        len(suffix) >= 4
+        and suffix[0] == scope.run_id
+        and suffix[1].lower() == "worktrees"
+        and bool(suffix[2])
     )
 
 
@@ -9599,11 +9609,9 @@ def protected_result_source(
             service, auth_context=auth_context,
         ):
             try:
-                retained_scope = getattr(auth_context, "retained_factory_scope", None)
-                retained_checkout = bool(
-                    retained_scope is not None
-                    and retained_scope.resolve_path(resource_id, strict=True) is not None
-                )
+                retained_root = worklink_retained_checkout_root().resolve(strict=True)
+                retained_resource = Path(resource_id).resolve(strict=True)
+                retained_checkout = retained_resource.is_relative_to(retained_root)
             except (OSError, RuntimeError, ValueError):
                 retained_checkout = False
         anchor = _filesystem_read_trust_anchor(

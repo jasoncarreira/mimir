@@ -1876,6 +1876,40 @@ def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
         shutil.rmtree(socket_root, ignore_errors=True)
 
 
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        (".factory-sandboxes/chainlink-41/.factory/chainlink-41/run.json", False),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/evidence/gate.json",
+            False,
+        ),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/locks/slice.lock",
+            False,
+        ),
+        (
+            ".factory-sandboxes/chainlink-41/.factory/chainlink-41/"
+            "worktrees/slice-1/src/fix.py",
+            True,
+        ),
+    ],
+)
+def test_factory_file_rpc_refuses_control_plane_but_allows_slice_worktrees(
+    path: str, allowed: bool,
+) -> None:
+    request = {
+        "issue": 41,
+        "run_id": "chainlink-41",
+        "relative_path": path,
+    }
+    if allowed:
+        assert worker_exec._factory_file_relative(request).as_posix() == path
+    else:
+        with pytest.raises(RuntimeError, match="factory control plane"):
+            worker_exec._factory_file_relative(request)
+
+
 @pytest.mark.parametrize("owner_valid", [False, True])
 def test_factory_recovery_requires_worker_owner_without_privileged_walk(factory_request, monkeypatch, owner_valid):
     path = Path(factory_request["path"])
