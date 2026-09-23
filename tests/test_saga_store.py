@@ -10,6 +10,7 @@ port in tier 5 v2.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from dataclasses import replace
 
@@ -51,8 +52,10 @@ def _patch_provider(monkeypatch, *, enable_session_boundary_rrf: bool = False):
 
     class _StubProvider:
         def embed(self, text, *, input_type="passage"):
-            h = abs(hash(text)) % 1000
-            return [float(h % 7), float(h % 11), float(h % 13), float(h % 17)]
+            # Built-in hash() is randomized per process and can occasionally
+            # produce an all-zero query vector, making retrieval tests flaky.
+            digest = hashlib.sha256(text.encode()).digest()
+            return [float(digest[i] % 17 + 1) for i in range(4)]
 
         def dimensions(self):
             return 4
