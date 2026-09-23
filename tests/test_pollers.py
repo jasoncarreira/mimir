@@ -2828,29 +2828,9 @@ def test_packaged_trusted_system_classification_is_worklink_only() -> None:
     } == {"worklink-ready-queue"}
 
 
-def _worklink_test_review_registry(root: Path) -> RepoPRScopeRegistry:
-    return RepoPRScopeRegistry((RepoReviewState(RepoPRActionScope(
-        provenance="poller_payload",
-        canonical_repo="example/repo",
-        canonical_root=str(root),
-        canonical_origin="https://github.com/example/repo.git",
-        principal="mimir-bot",
-        event_type="pr_changes_requested_stale",
-        allowed_operations=frozenset(action.value for action in RepoPRAction),
-        pr_number=7,
-        head_repo="example/repo",
-        head_remote="origin",
-        destination_ref="refs/heads/worklink/1807",
-        observed_head_sha="a" * 40,
-        base_ref="main",
-        observed_base_sha="b" * 40,
-        pull_request_author="mimir-bot",
-    )),))
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("factory_kind", ["factory_start", "factory_success"])
-async def test_worklink_turn_kinds_are_trusted_and_keep_shell_available(
+async def test_worklink_turn_kinds_are_trusted_without_ifc_shell_refusal(
     tmp_path: Path,
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2921,11 +2901,6 @@ consumer["_deliver_factory_transitions"](state, budget)
         auth = _create_turn_auth_context(
             event, None, policy_version=None, enforce=True, ifc_labels=labels,
         )
-        registry = _worklink_test_review_registry(repo)
-        auth = replace(
-            auth, repo_pr_scope_registry=registry,
-            repo_review_state=registry.review_states[0],
-        )
         decision = SinkGate.check_sink_flow(
             "shell_exec", "git status --short", labels, auth, enforce=True,
         )
@@ -2933,15 +2908,13 @@ consumer["_deliver_factory_transitions"](state, budget)
             (source.integrity, source.integrity_effect)
             for source in event.ifc_labels.sources
         } == {("trusted", "active_ingest")}
-        assert decision.allowed is True, (
-            decision.reason,
-            [(source.integrity, source.integrity_effect, source.resource_id)
-             for source in labels.sources],
-        )
+        assert decision.allowed is False
+        assert not decision.reason.startswith("ifc_label_blocked:")
+        assert decision.reason == "service_sink_destination_denied"
 
 
 @pytest.mark.asyncio
-async def test_external_poller_prose_stays_untrusted_and_loses_shell(
+async def test_external_poller_prose_is_refused_by_ifc_shell_gate(
     tmp_path: Path,
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2977,11 +2950,6 @@ print(json.dumps({"prompt": "Unauthenticated third-party prose"}))
     labels = _initialize_ifc_labels(event)
     auth = _create_turn_auth_context(
         event, None, policy_version=None, enforce=True, ifc_labels=labels,
-    )
-    registry = _worklink_test_review_registry(repo)
-    auth = replace(
-        auth, repo_pr_scope_registry=registry,
-        repo_review_state=registry.review_states[0],
     )
     decision = SinkGate.check_sink_flow(
         "shell_exec", "git status --short", labels, auth, enforce=True,
