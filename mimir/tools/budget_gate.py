@@ -148,7 +148,7 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
 })
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review",
+    "pr_rerequest_review", "write_file", "edit_file",
 })
 
 

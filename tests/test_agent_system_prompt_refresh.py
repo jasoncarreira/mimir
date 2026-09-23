@@ -147,7 +147,7 @@ async def test_build_agent_always_routes_worklink_root_read_only(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("configured_root", ["same", "parent"])
-async def test_build_agent_preserves_operator_rw_route_covering_worklink_root(
+async def test_build_agent_retained_route_overrides_operator_rw_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     configured_root: str,
@@ -165,11 +165,10 @@ async def test_build_agent_preserves_operator_rw_route_covering_worklink_root(
     await agent._build_agent_if_needed()
 
     assert str(operator_root) + "/" in agent._backend.routes
+    assert str(retained) + "/" in agent._backend.routes
     target = retained / "new.txt"
-    assert agent._backend.write(str(target), "operator rw survives").error is None
-    assert target.read_text(encoding="utf-8") == "operator rw survives"
-    if configured_root == "parent":
-        assert str(retained) + "/" not in agent._backend.routes
+    assert agent._backend.write(str(target), "blocked").error
+    assert not target.exists()
 
 
 @pytest.mark.asyncio

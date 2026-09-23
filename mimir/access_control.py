@@ -989,7 +989,9 @@ def service_filesystem_read_roots(
             if lease is not None and _target_within_active_pr_checkout_lease(str(lease.path), state):
                 roots.append(Path(lease.path))
     if _is_worklink_retained_checkout_service(service, auth_context=auth_context):
-        roots.append(worklink_retained_checkout_root())
+        retained_scope = getattr(auth_context, "retained_factory_scope", None)
+        if retained_scope is not None:
+            roots.append(Path(retained_scope.sandbox))
     if (
         getattr(service, "trigger", None) == "poller"
         and str(getattr(service, "canonical", "")).startswith("poller:")
@@ -1015,7 +1017,11 @@ def service_shell_filesystem_read_roots(
     roots = service_filesystem_read_roots(service, auth_context=auth_context)
     if not _is_worklink_retained_checkout_service(service, auth_context=auth_context):
         return roots
-    retained = worklink_retained_checkout_root().resolve(strict=False)
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    retained = (
+        Path(retained_scope.sandbox).resolve(strict=False)
+        if retained_scope is not None else worklink_retained_checkout_root().resolve(strict=False)
+    )
     static_roots = {
         Path(root).resolve(strict=False)
         for root in getattr(service, "filesystem_read_roots", ())
@@ -4742,6 +4748,12 @@ def _target_within_trigger_service_write_roots(
             return False
         roots = [Path(path).resolve() for path in raw]
         service = get_trusted_service_from_auth_context(auth_context)
+        retained_scope = getattr(auth_context, "retained_factory_scope", None)
+        if (
+            _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+            and retained_scope is not None
+        ):
+            roots.append(Path(retained_scope.sandbox).resolve(strict=True))
         if not roots and not _is_research_proposal_poller(service):
             return False
         turn_scratch = (
@@ -4824,6 +4836,33 @@ def _target_within_active_pr_checkout_lease(target: str, review_state: Any) -> b
             return False
         resolved = candidate.resolve(strict=False)
         relative = resolved.relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not (
+        WriteResourceAdapter._is_protected_path(lexical)
+        or WriteResourceAdapter._is_protected_path(relative)
+        or _is_static_service_protected_write_path(relative)
+    )
+
+
+def _target_within_retained_factory_scope(
+    target: str, auth_context: AuthContext | None,
+) -> bool:
+    """Admit only an unprotected path in this turn's exact retained sandbox."""
+    service = get_trusted_service_from_auth_context(auth_context)
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        not _is_worklink_retained_checkout_service(service, auth_context=auth_context)
+        or scope is None
+    ):
+        return False
+    resolved = scope.resolve_path(target, strict=False)
+    if resolved is None:
+        return False
+    root = Path(scope.sandbox).resolve(strict=True)
+    try:
+        lexical = Path(target).relative_to(Path(scope.sandbox))
+        relative = resolved.relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
     return not (
@@ -4951,8 +4990,13 @@ def resolve_trigger_service_write_target(
         target, destination, auth_context=auth_context,
     ):
         raise PathOutsideHomeError("target is outside trigger-service write grants")
-    candidate = _resolve_file_tool_target(
-        target, home, physical_roots=map(Path, json.loads(destination)),
+    scope = getattr(auth_context, "retained_factory_scope", None)
+    retained = _target_within_retained_factory_scope(target, auth_context)
+    candidate = (
+        scope.resolve_path(target, strict=False)
+        if retained else _resolve_file_tool_target(
+            target, home, physical_roots=map(Path, json.loads(destination)),
+        )
     )
     if candidate is None:
         raise PathOutsideHomeError("invalid trigger-service write target")
@@ -9555,9 +9599,11 @@ def protected_result_source(
             service, auth_context=auth_context,
         ):
             try:
-                retained_root = worklink_retained_checkout_root().resolve(strict=True)
-                retained_resource = Path(resource_id).resolve(strict=True)
-                retained_checkout = retained_resource.is_relative_to(retained_root)
+                retained_scope = getattr(auth_context, "retained_factory_scope", None)
+                retained_checkout = bool(
+                    retained_scope is not None
+                    and retained_scope.resolve_path(resource_id, strict=True) is not None
+                )
             except (OSError, RuntimeError, ValueError):
                 retained_checkout = False
         anchor = _filesystem_read_trust_anchor(
@@ -11246,6 +11292,12 @@ def create_auth_context(
     )
     action_scope = single_state.action_scope if single_state is not None else None
 
+    from .worklink.retained_scope import derive_retained_factory_scope
+
+    retained_resolution = derive_retained_factory_scope(
+        event, registered_service if is_service else None,
+    )
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -11260,6 +11312,8 @@ def create_auth_context(
         repo_pr_scope_registry=repo_pr_scope_registry,
         repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
+        retained_factory_scope=retained_resolution.scope,
+        retained_factory_scope_refusal=retained_resolution.refusal_reason,
         enforcement_enabled=enforce,
         source_session_acl=(
             event.source_session_acl

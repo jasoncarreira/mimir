@@ -16,13 +16,18 @@ import pytest
 
 from mimir.cli import main
 from mimir.worklink.orchestrator import WorklinkRunResult
-from mimir.worklink.control import reconcile_run_states, stop_worklink, worklink_status
+from mimir.worklink.control import (
+    archive_worklink_factory_records, reconcile_run_states, stop_worklink, worklink_status,
+)
 from mimir.worklink import autonomy
 from mimir.worklink.autonomy import check_concurrency
 from mimir.worklink.backends.feature_factory import parse_factory_status
 from mimir.worklink.claims import ChainlinkClaims
 from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
+from mimir.worklink.factory_state import (
+    FactoryRunRecord, factory_checkout_interlock, factory_issue_resource_lock,
+    load_factory_record, save_factory_record,
+)
 from mimir.worklink.run_state import (
     OrphanBlockRecord,
     WorklinkRunState,
@@ -272,6 +277,17 @@ def test_worklink_cli_has_no_factory_cancel_transition() -> None:
 
     with pytest.raises(SystemExit):
         parser.parse_args(["worklink", "factory-cancel", "700"])
+
+
+def test_archive_factory_run_refuses_busy_checkout_and_issue_locks(tmp_path: Path) -> None:
+    with factory_checkout_interlock(tmp_path, pruning=True) as acquired:
+        assert acquired
+        with pytest.raises(RuntimeError, match="checkout interlock unavailable"):
+            archive_worklink_factory_records(tmp_path, 700)
+    with factory_issue_resource_lock(tmp_path, 700) as acquired:
+        assert acquired
+        with pytest.raises(RuntimeError, match="issue resource lock unavailable"):
+            archive_worklink_factory_records(tmp_path, 700)
 
 
 def test_worklink_archive_factory_run_cli_archives_canonical_and_legacy_records(

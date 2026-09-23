@@ -17,6 +17,8 @@ from typing import Any, Callable, Iterator, Sequence
 from .compute import LaunchHandle, LocalSubprocessComputeBackend
 from .factory_state import (
     archive_factory_record_for_issue,
+    factory_checkout_interlock,
+    factory_issue_resource_lock,
     factory_record_run_ids,
     factory_process_is_alive,
     factory_process_is_verified_dead,
@@ -274,7 +276,24 @@ def archive_worklink_factory_records(
     *,
     event_logger: EventLogger | None = None,
 ) -> list[Path]:
-    """Archive canonical and legacy records for an epic under the claim mutex."""
+    """Archive records under checkout, issue, then claim locks."""
+    with factory_checkout_interlock(home) as checkout_acquired:
+        if not checkout_acquired:
+            raise RuntimeError("factory checkout interlock unavailable")
+        with factory_issue_resource_lock(home, issue_id) as resource_acquired:
+            if not resource_acquired:
+                raise RuntimeError("factory issue resource lock unavailable")
+            return _archive_worklink_factory_records_locked(
+                home, issue_id, event_logger=event_logger,
+            )
+
+
+def _archive_worklink_factory_records_locked(
+    home: Path,
+    issue_id: int,
+    *,
+    event_logger: EventLogger | None = None,
+) -> list[Path]:
     archived: list[Path] = []
     with _claim_mutex(home):
         for run_id in factory_record_run_ids(issue_id):

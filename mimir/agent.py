@@ -1768,13 +1768,9 @@ class Agent:
                 if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
                     roots = (*roots, (str(candidate.resolve()), "rw"))
             retained_root = worklink_retained_checkout_root().resolve(strict=False)
-            retained_is_configured = any(
-                retained_root == Path(root).resolve(strict=False)
-                or retained_root.is_relative_to(Path(root).resolve(strict=False))
-                for root, _mode in roots
-            )
-            if not retained_is_configured:
-                roots = (*roots, (str(retained_root), "ro"))
+            # The exact retained route must override even an operator-declared
+            # writable parent; retained effects always require a live lease.
+            roots = (*roots, (str(retained_root), "retained"))
             routes = build_file_tool_routes(roots) if roots else {}
             if routes:
                 self._backend = FileToolRouter(default=home_backend, routes=routes)

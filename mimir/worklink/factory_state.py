@@ -278,6 +278,55 @@ def factory_checkout_interlock(home: Path, *, pruning: bool = False) -> Iterator
             os.close(directory_fd)
 
 
+@contextmanager
+def factory_issue_resource_lock(home: Path, issue_id: int) -> Iterator[bool]:
+    """Try the stable per-issue factory resource lock without waiting."""
+    if not isinstance(issue_id, int) or isinstance(issue_id, bool) or issue_id < 1:
+        raise ValueError("factory resource lock issue id must be positive")
+    directory_fd: int | None = None
+    lock_fd: int | None = None
+    acquired = False
+    try:
+        try:
+            directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            directory = home.absolute() / "state" / "worklink"
+            for component in directory.parts[1:]:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+                os.close(directory_fd)
+                directory_fd = child_fd
+            lock_fd = os.open(
+                f"factory-issue-{issue_id}.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            value = os.fstat(lock_fd)
+            if (
+                stat.S_ISREG(value.st_mode)
+                and value.st_nlink == 1
+                and value.st_uid == os.geteuid()
+                and stat.S_IMODE(value.st_mode) == 0o600
+            ):
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+        except OSError:
+            pass
+        yield acquired
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def factory_record_run_ids(issue_id: int) -> tuple[str, str]:
     """Return canonical and legacy record keys for an epic issue."""
     return epic_run_id(issue_id), str(issue_id)
@@ -420,14 +469,20 @@ def archive_factory_record(
     source_kind: str | None = None,
     reason: str | None = None,
 ) -> Path:
-    return _archive_factory_record(
-        home,
-        record,
-        event_logger=event_logger,
-        source_kind=source_kind,
-        reason=reason,
-        verify_loaded=True,
-    )
+    with factory_checkout_interlock(home) as checkout_acquired:
+        if not checkout_acquired:
+            raise FactoryRecordError("factory checkout interlock unavailable")
+        with factory_issue_resource_lock(home, record.issue_id) as resource_acquired:
+            if not resource_acquired:
+                raise FactoryRecordError("factory issue resource lock unavailable")
+            return _archive_factory_record(
+                home,
+                record,
+                event_logger=event_logger,
+                source_kind=source_kind,
+                reason=reason,
+                verify_loaded=True,
+            )
 
 
 def archive_factory_record_for_issue(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import ctypes
+import errno
 import fcntl
 from dataclasses import dataclass, field
 import json
@@ -40,7 +41,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v9-factory-ownership"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-scope"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -70,6 +71,14 @@ _PATH_LAUNCH_FIELDS = frozenset({
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
+_FACTORY_WRITE_FIELDS = frozenset({
+    "version", "op", "executor_identity", "path", "issue", "attempt", "run_uid",
+    "run_id", "relative_path", "content",
+})
+_FACTORY_EDIT_FIELDS = frozenset({
+    "version", "op", "executor_identity", "path", "issue", "attempt", "run_uid",
+    "run_id", "relative_path", "old_string", "new_string", "replace_all",
+})
 _jobs: dict[str, subprocess.Popen[bytes] | _FactoryProcess] = {}
 _launching: set[str] = set()
 _jobs_lock = threading.Lock()
@@ -350,7 +359,9 @@ def _open_path_checkout(request: dict[str, Any]) -> int:
     )
 
 
-def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False) -> int:
+def _open_factory_checkout(
+    request: dict[str, Any], *, for_launch: bool = False, hold_boundary: bool = False,
+) -> int | tuple[int, int]:
     """Validate, then transfer/reopen; launch platform checks precede mutation."""
     issue = _positive_integer(request, "issue")
     attempt = _positive_integer(request, "attempt")
@@ -406,7 +417,9 @@ def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False)
             or stat.S_IMODE(checkout.st_mode) != 0o2770
         ):
             raise RuntimeError("factory checkout ownership or mode is invalid")
-        if mode == 0o2700 and request.get("op") == "launch_factory_control":
+        if mode == 0o2700 and request.get("op") in {
+            "launch_factory_control", "write_file", "edit_file",
+        }:
             raise RuntimeError("factory control requires an already transferred checkout")
         # Keep contract guards platform-independent, but refuse unsupported
         # launches while the validated tree is still private and unmodified.
@@ -419,12 +432,220 @@ def _open_factory_checkout(request: dict[str, Any], *, for_launch: bool = False)
                 checkout_fd, owner_uid=identities.worklink_uid, group_gid=identities.worklink_gid,
             )
             os.fchmod(boundary_fd, 0o2750)
-        result = checkout_fd
+        result: int | tuple[int, int] = (
+            (checkout_fd, boundary_fd) if hold_boundary else checkout_fd
+        )
         checkout_fd = -1
+        if hold_boundary:
+            boundary_fd = -1
         return result
     finally:
         if checkout_fd >= 0:
             os.close(checkout_fd)
+        if boundary_fd >= 0:
+            os.close(boundary_fd)
+
+
+def _factory_file_relative(request: dict[str, Any]) -> PurePosixPath:
+    raw = request.get("relative_path")
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        raise RuntimeError("factory file path is invalid")
+    relative = PurePosixPath(raw)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(part.lower() == ".git" for part in relative.parts)
+    ):
+        raise RuntimeError("factory file path is invalid")
+    run_id = request.get("run_id")
+    issue = request.get("issue")
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not isinstance(issue, int)
+        or isinstance(issue, bool)
+        or run_id not in {str(issue), f"chainlink-{issue}"}
+        or len(relative.parts) < 3
+        or relative.parts[:2] != (".factory-sandboxes", run_id)
+    ):
+        raise RuntimeError("factory file path is outside the retained run")
+    return relative
+
+
+def _factory_file_parent(relative: PurePosixPath, *, create: bool) -> tuple[list[int], str]:
+    opened = [os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)]
+    try:
+        for component in relative.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, 0o775, dir_fd=opened[-1])
+                except FileExistsError:
+                    pass
+            opened.append(os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=opened[-1],
+            ))
+        return opened, relative.parts[-1]
+    except Exception:
+        for fd in reversed(opened):
+            os.close(fd)
+        raise
+
+
+def _write_all(fd: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise RuntimeError("incomplete factory file write")
+        view = view[written:]
+
+
+def _rename_noreplace(directory_fd: int, source: str, destination: str) -> None:
+    renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic create-only publication is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        directory_fd, os.fsencode(source), directory_fd, os.fsencode(destination), 1,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
+
+
+def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:
+    relative = _factory_file_relative(request)
+    operation = request["op"]
+    opened, name = _factory_file_parent(relative, create=operation == "write_file")
+    fd = -1
+    temporary = f".mimir-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+    try:
+        if operation == "write_file":
+            content = request.get("content")
+            if not isinstance(content, str):
+                raise RuntimeError("factory write content is invalid")
+            fd = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644, dir_fd=opened[-1],
+            )
+            encoded = content.encode("utf-8")
+            _write_all(fd, encoded)
+            os.close(fd)
+            fd = -1
+            try:
+                _rename_noreplace(opened[-1], temporary, name)
+            except FileExistsError:
+                return {"status": "error", "error": "file already exists"}
+            return {"status": "ok", "path": relative.as_posix()}
+        old = request.get("old_string")
+        new = request.get("new_string")
+        replace_all = request.get("replace_all")
+        if (
+            not isinstance(old, str) or not old
+            or not isinstance(new, str)
+            or not isinstance(replace_all, bool)
+        ):
+            raise RuntimeError("factory edit arguments are invalid")
+        fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=opened[-1])
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_size > 8 * 1024 * 1024
+        ):
+            raise RuntimeError("factory edit target is not a bounded regular file")
+        raw = b""
+        while len(raw) <= metadata.st_size:
+            chunk = os.read(fd, min(65536, metadata.st_size + 1 - len(raw)))
+            if not chunk:
+                break
+            raw += chunk
+        text = raw.decode("utf-8", "strict")
+        occurrences = text.count(old)
+        if occurrences == 0:
+            return {"status": "error", "error": "old_string not found"}
+        if occurrences > 1 and not replace_all:
+            return {"status": "error", "error": "old_string is not unique"}
+        replacements = occurrences if replace_all else 1
+        output_size = len(raw) + replacements * (
+            len(new.encode("utf-8")) - len(old.encode("utf-8"))
+        )
+        if output_size > 8 * 1024 * 1024:
+            raise RuntimeError("factory edit result exceeds size limit")
+        updated = text.replace(old, new, -1 if replace_all else 1).encode("utf-8")
+        replacement_fd = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            stat.S_IMODE(metadata.st_mode), dir_fd=opened[-1],
+        )
+        try:
+            _write_all(replacement_fd, updated)
+        finally:
+            os.close(replacement_fd)
+        current = os.stat(name, dir_fd=opened[-1], follow_symlinks=False)
+        if (
+            current.st_dev != metadata.st_dev
+            or current.st_ino != metadata.st_ino
+            or current.st_nlink != 1
+        ):
+            raise RuntimeError("factory edit target changed during operation")
+        os.rename(temporary, name, src_dir_fd=opened[-1], dst_dir_fd=opened[-1])
+        return {"status": "ok", "path": relative.as_posix(), "occurrences": occurrences}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary, dir_fd=opened[-1])
+        except FileNotFoundError:
+            pass
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
+def _handle_factory_file(
+    connection: socket.socket, request: dict[str, Any], fds: list[int],
+) -> None:
+    expected = _FACTORY_WRITE_FIELDS if request.get("op") == "write_file" else _FACTORY_EDIT_FIELDS
+    if fds or set(request) != expected:
+        raise RuntimeError("factory file request must carry the exact contract and no FDs")
+    _validate_executor_identity(request)
+    _factory_file_relative(request)
+    opened = _open_factory_checkout(request, hold_boundary=True)
+    assert isinstance(opened, tuple)
+    checkout_fd, boundary_fd = opened
+    try:
+        payload = json.dumps(request, separators=(",", ":")).encode()
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-m", "mimir.worklink.worker_exec", "--factory-file-child"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={},
+            preexec_fn=lambda: _drop_worker(checkout_fd),
+            close_fds=True,
+            pass_fds=(checkout_fd,),
+        )
+        try:
+            stdout, _ = proc.communicate(payload, timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=_PROCESS_REAP_TIMEOUT_S)
+            raise RuntimeError("factory file worker timed out") from None
+        if proc.returncode != 0 or len(stdout) > MAX_REQUEST_BYTES:
+            raise RuntimeError("factory file worker failed")
+        response = json.loads(stdout)
+        if not isinstance(response, dict) or response.get("status") not in {"ok", "error"}:
+            raise RuntimeError("factory file worker returned an invalid result")
+        _send(connection, response)
+    finally:
+        os.close(checkout_fd)
         os.close(boundary_fd)
 
 
@@ -991,6 +1212,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_cancel(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)
+        elif request.get("op") in {"write_file", "edit_file"}:
+            _handle_factory_file(connection, request, fds)
         else:
             raise RuntimeError("unsupported worker operation")
     except Exception as exc:
@@ -1053,4 +1276,13 @@ def serve(socket_path: Path = DEFAULT_EXECUTOR_SOCKET) -> None:
 
 
 if __name__ == "__main__":
-    serve()
+    if sys.argv[1:] == ["--factory-file-child"]:
+        try:
+            child_request = json.loads(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))
+            if not isinstance(child_request, dict):
+                raise RuntimeError("invalid factory file child request")
+            sys.stdout.write(json.dumps(_run_factory_file_child(child_request), separators=(",", ":")))
+        except Exception as exc:
+            sys.stdout.write(json.dumps({"status": "error", "error": str(exc)}))
+    else:
+        serve()

@@ -42,6 +42,7 @@ from mimir.worklink.factory_state import (
     FactoryRunRecord,
     archive_factory_record,
     factory_checkout_interlock,
+    factory_issue_resource_lock,
     load_factory_record,
     load_factory_records_for_issue,
     save_factory_record,
@@ -154,6 +155,32 @@ def test_factory_run_interlock_refuses_busy_and_releases_on_exit(
         assert acquired
 
 
+def test_factory_run_resource_lock_is_outer_to_claim_and_held_to_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[int] = []
+
+    async def run_locked(self: WorklinkRunner, issue_id: int, *, autonomous: bool):
+        calls.append(issue_id)
+        with factory_issue_resource_lock(tmp_path, issue_id) as acquired:
+            assert acquired is False
+        return WorklinkRunResult(issue_id, 1, "failed")
+
+    monkeypatch.setattr(WorklinkRunner, "_run_factory_070_locked", run_locked)
+    runner = WorklinkRunner(home=tmp_path, repo=tmp_path)
+    with factory_issue_resource_lock(tmp_path, 700) as acquired:
+        assert acquired
+        result = asyncio.run(runner._run_factory_070(700, autonomous=False))
+        assert result.status == "refused"
+        assert result.reason == "factory issue resource lock unavailable"
+        assert calls == []
+    result = asyncio.run(runner._run_factory_070(700, autonomous=False))
+    assert result.status == "failed"
+    assert calls == [700]
+    with factory_issue_resource_lock(tmp_path, 700) as acquired:
+        assert acquired
+
+
 @pytest.mark.parametrize("value", [None, "invalid", "0", "-1"])
 def test_factory_timeout_defaults_and_falls_back_to_twelve_hours(
     monkeypatch: pytest.MonkeyPatch, value: str | None
@@ -184,6 +211,10 @@ def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
     recorded: list[dict[str, object]] = []
 
     async def fail(self: WorklinkRunner, issue_id: int, *, autonomous: bool = False):
+        with factory_checkout_interlock(tmp_path, pruning=True) as checkout_acquired:
+            assert checkout_acquired is False
+        with factory_issue_resource_lock(tmp_path, issue_id) as resource_acquired:
+            assert resource_acquired is False
         raise RuntimeError("factory crashed")
 
     monkeypatch.setattr(WorklinkRunner, "run_epic", fail)
@@ -203,6 +234,32 @@ def test_run_worklink_epic_records_unhandled_failure_at_sync_boundary(
     assert recorded[0]["exit_status"] == 1
     assert recorded[0]["autonomous"] is True
     assert isinstance(recorded[0]["error"], RuntimeError)
+    with factory_issue_resource_lock(tmp_path, 1395) as acquired:
+        assert acquired
+
+
+def test_run_worklink_epic_records_interrupt_before_releasing_resource_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    recorded: list[dict[str, object]] = []
+
+    async def interrupt(self: WorklinkRunner, issue_id: int, *, autonomous: bool = False):
+        raise KeyboardInterrupt
+
+    def record(**fields: object) -> None:
+        with factory_issue_resource_lock(tmp_path, 1395) as acquired:
+            assert acquired is False
+        recorded.append(fields)
+
+    monkeypatch.setattr(WorklinkRunner, "run_epic", interrupt)
+    monkeypatch.setattr(orchestrator, "_record_run_failure", record)
+    with pytest.raises(KeyboardInterrupt):
+        run_worklink_epic(home=tmp_path, repo=tmp_path, issue_id=1395, autonomous=True)
+    assert len(recorded) == 1
+    with factory_issue_resource_lock(tmp_path, 1395) as acquired:
+        assert acquired
 
 
 def test_finalize_primary_incident_survives_secondary_transition_failure(
