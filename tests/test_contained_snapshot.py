@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -154,6 +155,31 @@ def test_overlays_tracked_deletion(repository: Path, tmp_path: Path) -> None:
     destination = tmp_path / "snapshot"
     create_git_snapshot(repository, destination)
     assert not (destination / "tracked.txt").exists()
+
+
+def test_factory_control_plane_is_the_only_permitted_snapshot_exclusion(
+    repository: Path, tmp_path: Path,
+) -> None:
+    factory = repository / ".factory" / "chainlink-1808" / "worktrees" / "slice"
+    nested = repository / "vendor"
+    factory.mkdir(parents=True)
+    nested.mkdir()
+    git(factory, "init", "-q")
+    git(nested, "init", "-q")
+
+    with pytest.raises(SnapshotEmbeddedRepository):
+        preflight_git_snapshot(repository, excluded_prefixes=(b".factory",))
+    with pytest.raises(ValueError, match="top-level"):
+        preflight_git_snapshot(
+            repository, excluded_prefixes=(b".factory/chainlink-1808",),
+        )
+
+    shutil.rmtree(nested)
+    destination = tmp_path / "snapshot"
+    create_git_snapshot(
+        repository, destination, excluded_prefixes=(b".factory",),
+    )
+    assert not (destination / ".factory").exists()
 
 
 @pytest.mark.parametrize("target", ["/etc/passwd", "../../outside"])

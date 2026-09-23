@@ -360,13 +360,34 @@ def _inspect_entry(
     raise SnapshotUnsafeEntry("Snapshot contains an unsafe entry")
 
 
-def _refuse_special_files(source: bytes) -> None:
+def _excluded(relative: bytes, excluded_prefixes: tuple[bytes, ...]) -> bool:
+    return any(
+        relative == prefix or relative.startswith(prefix + b"/")
+        for prefix in excluded_prefixes
+    )
+
+
+def _validated_excluded_prefixes(values: Iterable[bytes]) -> tuple[bytes, ...]:
+    result = tuple(values)
+    for value in result:
+        _validate_relative_path(value)
+        if b"/" in value or value == b".git":
+            raise ValueError("snapshot exclusions must name exact top-level directories")
+    if len(set(result)) != len(result):
+        raise ValueError("snapshot exclusions must be unique")
+    return result
+
+
+def _refuse_special_files(source: bytes, excluded_prefixes: tuple[bytes, ...]) -> None:
     def unavailable(_error: OSError) -> None:
         raise SnapshotSourceChanged("Snapshot source changed")
 
     for directory, names, files in os.walk(source, topdown=True, followlinks=False, onerror=unavailable):
         if directory == source:
-            names[:] = [name for name in names if name != b".git"]
+            names[:] = [
+                name for name in names
+                if name != b".git" and not _excluded(name, excluded_prefixes)
+            ]
         for name in [*names, *files]:
             path = os.path.join(directory, name)
             try:
@@ -382,9 +403,11 @@ def preflight_git_snapshot(
     *,
     known_sensitive: Iterable[bytes] = (),
     scan_tracked_credentials: bool = True,
+    excluded_prefixes: Iterable[bytes] = (),
 ) -> tuple[SnapshotEntry, ...]:
     source_bytes = os.fsencode(os.path.abspath(os.fspath(source)))
-    _refuse_special_files(source_bytes)
+    excluded = _validated_excluded_prefixes(excluded_prefixes)
+    _refuse_special_files(source_bytes, excluded)
     sensitive = tuple(value for value in known_sensitive if value)
     inventories = {kind: _inventory(source_bytes, kind) for kind in ("tracked", "untracked", "ignored")}
     seen: set[bytes] = set()
@@ -392,6 +415,8 @@ def preflight_git_snapshot(
     credential_count = 0
     for kind in ("tracked", "untracked", "ignored"):
         for relative in inventories[kind]:
+            if _excluded(relative.rstrip(b"/"), excluded):
+                continue
             if relative in seen:
                 raise SnapshotUnavailable("Snapshot unavailable")
             seen.add(relative)
@@ -499,6 +524,7 @@ def create_git_snapshot(
     *,
     known_sensitive: Iterable[bytes] = (),
     scan_tracked_credentials: bool = True,
+    excluded_prefixes: Iterable[bytes] = (),
 ) -> SnapshotResult:
     try:
         source_path = Path(source).resolve(strict=True)
@@ -515,10 +541,12 @@ def create_git_snapshot(
     source_bytes = os.fsencode(source_path)
     destination_bytes = os.fsencode(destination_path)
     revision = _head_revision(source_bytes)
+    excluded = _validated_excluded_prefixes(excluded_prefixes)
     entries = preflight_git_snapshot(
         source_path,
         known_sensitive=known_sensitive,
         scan_tracked_credentials=scan_tracked_credentials,
+        excluded_prefixes=excluded,
     )
     try:
         completed = subprocess.run(
@@ -539,12 +567,15 @@ def create_git_snapshot(
         )
         if checkout.returncode != 0:
             raise SnapshotSourceChanged("Snapshot source changed")
+        for prefix in excluded:
+            _remove_destination_entry(os.path.join(destination_bytes, prefix))
         for entry in entries:
             _overlay_entry(source_bytes, destination_bytes, entry)
         verified_entries = preflight_git_snapshot(
             source_path,
             known_sensitive=known_sensitive,
             scan_tracked_credentials=scan_tracked_credentials,
+            excluded_prefixes=excluded,
         )
         if _head_revision(source_bytes) != revision or verified_entries != entries:
             raise SnapshotSourceChanged("Snapshot source changed")

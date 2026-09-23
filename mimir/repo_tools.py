@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 
 from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-from .models import RepoPRAction, RepoPRActionScope, RepoReviewState
+from .models import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
 from .pr_checkout_lease import PUBLISHED_HEAD_REF, _METADATA, _metadata
 from .redaction import redact_text
 
@@ -323,6 +323,31 @@ def _bounded_subprocess_runner(
     return GitProcessResult(returncode, stdout, stderr, timed_out, output_limited)
 
 
+def retained_factory_git_runner(
+    argv: tuple[str, ...],
+    *,
+    env: dict[str, str],
+    timeout: float,
+    output_limit: int,
+) -> GitProcessResult:
+    """Run the shared hardened Git argv through the checkout owner's control path."""
+    from .worklink.worker_client import run_factory_control
+
+    try:
+        checkout_index = argv.index("-C") + 1
+        checkout = Path(argv[checkout_index])
+    except (ValueError, IndexError) as exc:
+        raise ValueError("hardened Git argv has no checkout") from exc
+    result = run_factory_control(
+        checkout, argv, env=env, timeout=timeout, output_limit=output_limit,
+    )
+    return GitProcessResult(
+        result.returncode,
+        result.stdout.decode("utf-8", "replace"),
+        result.stderr.decode("utf-8", "replace"),
+    )
+
+
 def _validate_path(path: str) -> str:
     candidate = PurePosixPath(path)
     if (
@@ -350,18 +375,21 @@ def _validated_paths(paths: tuple[str, ...], *, required: bool) -> tuple[str, ..
 
 
 class RepoGitTools:
-    """Execute closed Git operations against one active PR checkout lease."""
+    """Execute closed Git operations against one active repository scope."""
 
     def __init__(
         self,
-        review_state: RepoReviewState,
+        review_state: RepoReviewState | None = None,
         *,
+        retained_scope: RetainedFactoryScope | None = None,
         git_executable: Path = _DEFAULT_GIT,
         runner: GitRunner = _bounded_subprocess_runner,
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         output_limit: int = _DEFAULT_OUTPUT_BYTES,
         enforce: bool = True,
     ) -> None:
+        if (review_state is None) == (retained_scope is None):
+            raise ValueError("exactly one repository scope is required")
         if timeout <= 0 or output_limit <= 0:
             raise ValueError("Git timeout and output limit must be positive")
         if not git_executable.is_absolute():
@@ -373,7 +401,10 @@ class RepoGitTools:
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise ValueError("Git executable pin is not executable")
         self._state = review_state
-        self._scope = review_state.action_scope
+        self._scope = (
+            review_state.action_scope if review_state is not None else retained_scope
+        )
+        self._retained = retained_scope is not None
         self._git = str(executable)
         self._runner = runner
         self._timeout = timeout
@@ -385,7 +416,7 @@ class RepoGitTools:
         self._validate_scope()
         self._expected_head = (
             review_state.git_expected_head or self._scope.observed_head_sha
-        ).lower()
+        ).lower() if review_state is not None else ""
 
     @property
     def environment(self) -> dict[str, str]:
@@ -398,6 +429,9 @@ class RepoGitTools:
         return self._execution_started
 
     def _validate_scope(self) -> None:
+        if self._retained:
+            return
+        assert isinstance(self._scope, RepoPRActionScope)
         if not _SHA_RE.fullmatch(self._scope.observed_head_sha):
             raise GitRefusal("invalid_scope", "scope head is not a full commit id")
         if not _SHA_RE.fullmatch(self._scope.observed_base_sha):
@@ -415,6 +449,28 @@ class RepoGitTools:
             raise GitRefusal("invalid_scope", "scope remote is not server-bound origin")
 
     def _validate_lease(self) -> Path:
+        if self._retained:
+            assert isinstance(self._scope, RetainedFactoryScope)
+            from .worklink.worker_client import factory_checkout_for_path
+
+            path = Path(self._scope.sandbox)
+            binding = factory_checkout_for_path(path)
+            try:
+                root = path.resolve(strict=True)
+            except OSError as exc:
+                raise GitRefusal("invalid_checkout", "retained checkout is unavailable") from exc
+            if (
+                root != path
+                or not root.is_dir()
+                or root.parent.name != ".factory-sandboxes"
+                or root.name != self._scope.run_id
+                or binding is None
+                or binding[1:] != (self._scope.issue_id, self._scope.attempt)
+            ):
+                raise GitRefusal("invalid_checkout", "retained checkout identity is invalid")
+            return root
+        assert self._state is not None
+        assert isinstance(self._scope, RepoPRActionScope)
         lease = self._state.checkout_lease
         if (
             lease is None
@@ -436,6 +492,17 @@ class RepoGitTools:
         return root
 
     def _require(self, tool_name: str, *actions: RepoPRAction) -> None:
+        if self._retained:
+            if tool_name not in {
+                "repo_status", "repo_diff", "repo_stage", "repo_commit",
+            }:
+                raise GitRefusal(
+                    "scope_action_denied",
+                    "retained factory scope does not grant this repository operation",
+                    execution_started=False,
+                )
+            return
+        assert isinstance(self._scope, RepoPRActionScope)
         decision = authorize_repo_pr_tool(
             tool_name,
             self._scope,
@@ -593,8 +660,17 @@ class RepoGitTools:
 
     def _assert_checkout_identity(self, *, allow_in_progress: bool = False) -> None:
         top = self._command(("rev-parse", "--show-toplevel")).stdout.strip()
+        if Path(top).resolve(strict=False) != self._root:
+            raise GitRefusal("cross_pr_checkout", "checkout identity no longer matches the scope")
+        if self._retained:
+            assert isinstance(self._scope, RetainedFactoryScope)
+            branch = self._command(("symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
+            if branch != self._scope.branch:
+                raise GitRefusal("cross_pr_checkout", "checkout identity no longer matches the retained scope")
+            return
+        assert isinstance(self._scope, RepoPRActionScope)
         origin = self._command(("remote", "get-url", "origin")).stdout.strip()
-        if Path(top).resolve(strict=False) != self._root or origin != self._scope.canonical_origin:
+        if origin != self._scope.canonical_origin:
             raise GitRefusal("cross_pr_checkout", "checkout identity no longer matches the PR scope")
         if allow_in_progress and self._has_in_progress_merge_or_rebase():
             return
@@ -605,7 +681,8 @@ class RepoGitTools:
 
     def _refresh_expected_head(self) -> None:
         self._expected_head = self._command(("rev-parse", "--verify", "HEAD")).stdout.strip().lower()
-        self._state.record_git_head(self._scope.scope_id, self._expected_head)
+        if self._state is not None:
+            self._state.record_git_head(self._scope.scope_id, self._expected_head)
 
     @staticmethod
     def _conflict_evidence(operation: GitRebase) -> tuple[str, str, str, str]:
@@ -757,6 +834,14 @@ class RepoGitTools:
 
     def execute(self, operation: GitOperation) -> GitOperationResult:
         """Authorize one typed operation and execute only server-built argv."""
+        if self._retained and not isinstance(
+            operation, (GitStatus, GitDiff, GitStage, GitCommit),
+        ):
+            raise GitRefusal(
+                "scope_action_denied",
+                "retained factory scope does not grant this repository operation",
+                execution_started=False,
+            )
         self._root = self._validate_lease()
         self._assert_checkout_identity(allow_in_progress=isinstance(
             operation,
@@ -816,6 +901,13 @@ class RepoGitTools:
             if operation.mode == "staged":
                 revisions = ("--cached",)
             elif operation.mode == "base":
+                if self._retained:
+                    raise GitRefusal(
+                        "invalid_shape",
+                        "base diff is unavailable for a retained factory scope",
+                        execution_started=False,
+                    )
+                assert self._state is not None
                 revisions = (f"{self._state.checkout_lease.base_sha}...HEAD",)
             pathspecs = tuple(_validate_path(path) for path in paths)
             separator = ("--", *pathspecs) if pathspecs else ()
@@ -1068,5 +1160,5 @@ __all__ = [
     "GitOperation", "GitOperationResult", "GitProcessResult", "GitPush",
     "GitRebase", "GitRebaseAbort", "GitRefusal", "GitRevert",
     "GitRevertAbort", "GitStage", "GitStatus", "GitUnmerged", "RepoGitTools",
-    "was_agent_push",
+    "retained_factory_git_runner", "was_agent_push",
 ]

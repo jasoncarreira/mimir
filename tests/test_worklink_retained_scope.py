@@ -4,12 +4,16 @@ from dataclasses import replace
 import fcntl
 import os
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from mimir import access_control as ac
+from mimir.contained_execution import CollectedExecutionResult
 from mimir.models import RetainedFactoryScope
+from mimir.project_tests import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
@@ -96,6 +100,42 @@ def test_retained_file_effects_are_in_all_central_policy_inventories() -> None:
         assert ac.TRIGGER_CAPABILITY_TIERS[tool] is ac.CapabilityTier.SCOPE_CONTAINED
         assert tool in budget_gate._REMEDIATION_EFFECT_TOOLS
         assert tool in ac._NON_INGESTING_RESULT_TOOLS
+
+
+def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) -> None:
+    scope = derive_retained_factory_scope(
+        retained_incident.event, retained_incident.service,
+    ).scope
+    assert scope is not None
+    allowed = {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+    service = ac.ServicePrincipal(
+        canonical="poller:worklink-ready-queue", trigger="poller",
+        authority_profile="github", capabilities=tuple(sorted(allowed)),
+        readable_domains=("repository",),
+        sink_destinations=("bound_pull_request",),
+    )
+    for tool in ac._REPO_TOOL_ACTIONS:
+        decision = ac.authorize_repo_pr_tool(
+            tool, scope, service_principal=service, enforce=True,
+            flow_direction=ac.get_tool_flow_direction(tool),
+        )
+        assert decision.allowed is (tool in allowed)
+        assert decision.repo_pr_action_scope is scope
+        assert decision.result_integrity == ("trusted" if tool in allowed else "untrusted")
+
+    wrong_service = replace(service, canonical="poller:other")
+    wrong_trigger = replace(service, trigger="scheduled_tick")
+    wrong_profile = replace(service, authority_profile="custom")
+    missing_capability = replace(
+        service, capabilities=tuple(sorted(allowed - {"repo_commit"})),
+    )
+    for principal in (
+        wrong_service, wrong_trigger, wrong_profile, missing_capability,
+    ):
+        assert ac.authorize_repo_pr_tool(
+            "repo_commit", scope, service_principal=principal, enforce=True,
+            flow_direction=ac.ToolFlowDirection.SINK,
+        ).allowed is False
 
 
 @pytest.mark.parametrize(
@@ -358,3 +398,207 @@ def test_resource_lock_hardening_fails_closed(
     with factory_issue_resource_lock(tmp_path, 1810) as acquired:
         assert acquired is False
     assert lock.lstat().st_ino == inode
+
+
+def _git(path: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(path), *arguments],
+        check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _retained_runtime(scope: RetainedFactoryScope) -> SimpleNamespace:
+    return SimpleNamespace(context=SimpleNamespace(
+        retained_factory_scope=scope,
+        canonical_principal="poller:worklink-ready-queue",
+        is_service=True,
+    ))
+
+
+def _initialize_retained_repository(case: SimpleNamespace) -> None:
+    _git(case.sandbox, "init", "-q")
+    _git(case.sandbox, "config", "user.name", "untrusted")
+    _git(case.sandbox, "config", "user.email", "untrusted@example.invalid")
+    _git(case.sandbox, "checkout", "-q", "-b", case.record.branch)
+    (case.sandbox / ".gitignore").write_text(".factory/\n", encoding="utf-8")
+    (case.sandbox / "fix.txt").write_text("before\n", encoding="utf-8")
+    _git(case.sandbox, "add", ".gitignore", "fix.txt")
+    _git(case.sandbox, "commit", "-q", "-m", "seed")
+
+
+@pytest.mark.asyncio
+async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_control(
+    retained_incident, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    from mimir.tools import repo as repo_module
+    from mimir.worklink import worker_client
+
+    case = retained_incident
+    _initialize_retained_repository(case)
+    nested = case.sandbox / ".factory" / case.record.run_id / "worktrees" / "slice"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "-q")
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == case.sandbox
+        calls.append(tuple(argv))
+        return subprocess.run(argv, env=env, capture_output=True, check=False)
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    runtime = _retained_runtime(scope)
+    marker = case.sandbox / "controller-executed"
+    helper = case.sandbox / "malicious.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+    helper.chmod(0o755)
+    hooks = case.sandbox / "hooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").symlink_to(helper)
+    _git(case.sandbox, "config", "core.hooksPath", str(hooks))
+    _git(case.sandbox, "config", "core.fsmonitor", str(helper))
+    _git(case.sandbox, "config", "filter.evil.clean", str(helper))
+    (case.sandbox / ".gitattributes").write_text("fix.txt filter=evil\n", encoding="utf-8")
+    (case.sandbox / "fix.txt").write_text("after\n", encoding="utf-8")
+
+    status = repo_module.repo_status.func(scope.repository, scope.issue_id, runtime=runtime)
+    diff = repo_module.repo_diff.func(scope.repository, scope.issue_id, runtime=runtime)
+    assert "fix.txt" in status["stdout"]
+    assert "+after" in diff["stdout"]
+
+    async def passing_test(self, selectors, *, suite):
+        assert self._retained_scope == scope
+        return ProjectTestResult(True, "tests_passed", 0)
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", passing_test)
+    tested = await repo_module.repo_test.coroutine(
+        scope.repository, scope.issue_id, runtime=runtime,
+    )
+    assert tested["ok"] is True
+    repo_module.repo_stage.func(
+        scope.repository, scope.issue_id, ("fix.txt",), runtime=runtime,
+    )
+    committed = repo_module.repo_commit.func(
+        scope.repository, scope.issue_id, ("fix.txt",), "retained fix", runtime=runtime,
+    )
+
+    assert committed["provenance"] == {
+        "kind": "retained_factory_scope", "scope_id": scope.scope_id,
+        "repository": scope.repository, "issue_id": scope.issue_id,
+        "run_id": scope.run_id,
+    }
+    assert _git(case.sandbox, "branch", "--show-current") == scope.branch
+    assert _git(case.sandbox, "show", "-s", "--format=%an <%ae>") == (
+        f"{DEFAULT_USER_NAME} <{DEFAULT_USER_EMAIL}>"
+    )
+    assert (case.sandbox / "fix.txt").read_text(encoding="utf-8") == "after\n"
+    assert not marker.exists()
+    assert calls and all("core.hooksPath=/dev/null" in argv for argv in calls)
+
+
+@pytest.mark.asyncio
+async def test_retained_repo_test_excludes_only_factory_control_plane(
+    retained_incident, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import project_tests
+
+    case = retained_incident
+    _initialize_retained_repository(case)
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    (case.home / "worklink.yaml").write_text(
+        "defaults:\n  test_command: /usr/bin/true\n", encoding="utf-8",
+    )
+    checkout = SimpleNamespace(
+        path=case.sandbox,
+        capability=SimpleNamespace(path=case.sandbox),
+        close=lambda: None,
+    )
+    factory_arguments: list[dict[str, object]] = []
+
+    class GitTools:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def validated_checkout_root(self):
+            return case.sandbox
+
+    def checkout_factory(source, **kwargs):
+        assert source == case.sandbox
+        factory_arguments.append(kwargs)
+        return checkout
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
+
+    monkeypatch.setattr(project_tests, "RepoGitTools", GitTools)
+    result = await RepoProjectTests(
+        retained_scope=scope, runner=runner, checkout_factory=checkout_factory,
+    ).execute()
+
+    assert result.ok is True
+    assert factory_arguments == [{
+        "scope_id": scope.scope_id,
+        "pr_number": scope.issue_id,
+        "known_sensitive": (),
+        "excluded_prefixes": (b".factory",),
+    }]
+
+
+@pytest.mark.parametrize(
+    "name,arguments",
+    [
+        ("repo_checkout", ()), ("repo_fetch", ()), ("repo_push", ()),
+        ("repo_merge", ()), ("repo_rebase", ()),
+        ("repo_revert", ("a" * 40,)),
+    ],
+)
+def test_retained_scope_refuses_excluded_repo_operations(
+    retained_incident, monkeypatch: pytest.MonkeyPatch, name: str, arguments: tuple[str, ...],
+) -> None:
+    from mimir.tools import repo as repo_module
+
+    case = retained_incident
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    tool = getattr(repo_module, name)
+    with pytest.raises(Exception, match="retained factory scope does not grant"):
+        tool.func(scope.repository, scope.issue_id, *arguments, runtime=_retained_runtime(scope))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["status", "diff", "test", "stage", "commit"])
+async def test_each_retained_repo_operation_refuses_stale_occurrence_before_execution(
+    retained_incident, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    from mimir.tools import repo as repo_module
+    from mimir.worklink import worker_client
+
+    case = retained_incident
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    state = dispatch_failure_state_dir(case.home) / "dispatch_failures.json"
+    payload = __import__("json").loads(state.read_text())
+    payload["issues"]["1810"]["occurrence_id"] = "replacement"
+    state.write_text(__import__("json").dumps(payload))
+    control = Mock()
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+    runtime = _retained_runtime(scope)
+    tool = getattr(repo_module, f"repo_{operation}")
+    arguments = {
+        "stage": (("fix.txt",),),
+        "commit": (("fix.txt",), "message"),
+    }.get(operation, ())
+
+    with pytest.raises(Exception, match="incident occurrence is stale"):
+        if operation == "test":
+            await tool.coroutine(scope.repository, scope.issue_id, runtime=runtime)
+        else:
+            tool.func(scope.repository, scope.issue_id, *arguments, runtime=runtime)
+    control.assert_not_called()

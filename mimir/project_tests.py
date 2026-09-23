@@ -25,9 +25,9 @@ from .contained_snapshot import (
     SnapshotEmbeddedRepository,
 )
 from .event_logger import safe_log_event
-from .models import RepoPRAction, RepoReviewState
+from .models import RepoPRAction, RepoReviewState, RetainedFactoryScope
 from .redaction import redact_text
-from .repo_tools import GitRefusal, RepoGitTools
+from .repo_tools import GitRefusal, RepoGitTools, retained_factory_git_runner
 from .repository_config import RepositoryInventory, RepositoryTestSuite
 from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
@@ -501,16 +501,20 @@ class RepoProjectTests:
 
     def __init__(
         self,
-        review_state: RepoReviewState,
+        review_state: RepoReviewState | None = None,
         *,
+        retained_scope: RetainedFactoryScope | None = None,
         runner: ContainedRunner = execute_contained,
         checkout_factory: CheckoutFactory = create_repo_test_checkout,
         timeout: float = _TIMEOUT_SECONDS,
         output_limit: int = _CAPTURE_BYTES,
     ) -> None:
+        if (review_state is None) == (retained_scope is None):
+            raise ValueError("exactly one repository scope is required")
         if timeout <= 0 or output_limit <= 0:
             raise ValueError("project test timeout and output limit must be positive")
         self._state = review_state
+        self._retained_scope = retained_scope
         self._runner = runner
         self._checkout_factory = checkout_factory
         self._timeout = timeout
@@ -519,12 +523,22 @@ class RepoProjectTests:
     async def execute(
         self, selectors: tuple[str, ...] = (), *, suite: str | None = None,
     ) -> ProjectTestResult:
-        scope = self._state.action_scope
-        if RepoPRAction.TEST.value not in scope.allowed_operations:
+        scope = (
+            self._state.action_scope
+            if self._state is not None else self._retained_scope
+        )
+        assert scope is not None
+        retained = isinstance(scope, RetainedFactoryScope)
+        if not retained and RepoPRAction.TEST.value not in scope.allowed_operations:
             raise ProjectTestRefusal("scope_action_denied", "scope does not grant repo.test", execution_started=False)
         git_tools: RepoGitTools | None = None
         try:
-            git_tools = RepoGitTools(self._state)
+            git_tools = (
+                RepoGitTools(
+                    retained_scope=scope, runner=retained_factory_git_runner,
+                )
+                if retained else RepoGitTools(self._state)
+            )
             root = git_tools.validated_checkout_root()
         except GitRefusal as exc:
             raise ProjectTestRefusal(
@@ -535,8 +549,10 @@ class RepoProjectTests:
                 ),
             ) from exc
         try:
+            repository = scope.repository if retained else scope.canonical_repo
+            issue = scope.issue_id if retained else scope.pr_number
             command, configured_env, command_source, suite_name, is_default = _configured_command(
-                scope.canonical_repo, selectors, suite
+                repository, selectors, suite
             )
             selected = _validated_selectors(root, selectors, suite=suite_name)
         except ProjectTestRefusal as exc:
@@ -550,18 +566,20 @@ class RepoProjectTests:
             source_paths=(os.environ.get("MIMIR_HOME", ""),),
         )
         try:
-            checkout = self._checkout_factory(
-                root,
-                scope_id=scope.scope_id,
-                pr_number=scope.pr_number,
-                known_sensitive=(),
-            )
+            checkout_arguments = {
+                "scope_id": scope.scope_id,
+                "pr_number": issue,
+                "known_sensitive": (),
+            }
+            if retained:
+                checkout_arguments["excluded_prefixes"] = (b".factory",)
+            checkout = self._checkout_factory(root, **checkout_arguments)
         except SnapshotCredentialsRefused as exc:
             await safe_log_event(
                 "repo_test_containment_refused",
                 reason_code="snapshot_credentials",
-                repository=scope.canonical_repo,
-                pull_request=scope.pr_number,
+                repository=repository,
+                pull_request=issue,
             )
             raise ProjectTestRefusal(
                 "test_snapshot_credentials_refused",
@@ -576,8 +594,8 @@ class RepoProjectTests:
             await safe_log_event(
                 "repo_test_containment_refused",
                 reason_code="snapshot_embedded_repository",
-                repository=scope.canonical_repo,
-                pull_request=scope.pr_number,
+                repository=repository,
+                pull_request=issue,
             )
             raise ProjectTestRefusal(
                 "test_snapshot_embedded_repository",
@@ -588,8 +606,8 @@ class RepoProjectTests:
             await safe_log_event(
                 "repo_test_containment_refused",
                 reason_code="snapshot_unavailable",
-                repository=scope.canonical_repo,
-                pull_request=scope.pr_number,
+                repository=repository,
+                pull_request=issue,
             )
             raise ProjectTestRefusal(
                 "test_snapshot_unavailable",
@@ -627,8 +645,8 @@ class RepoProjectTests:
                 await safe_log_event(
                     "repo_test_containment_refused",
                     reason_code="cleanup_failed",
-                    repository=scope.canonical_repo,
-                    pull_request=scope.pr_number,
+                    repository=repository,
+                    pull_request=issue,
                 )
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
@@ -660,8 +678,8 @@ class RepoProjectTests:
                 await safe_log_event(
                     "repo_test_containment_refused",
                     reason_code="stale_root_executor",
-                    repository=scope.canonical_repo,
-                    pull_request=scope.pr_number,
+                    repository=repository,
+                    pull_request=issue,
                 )
                 raise ProjectTestRefusal(
                     "test_stale_root_executor",
@@ -674,8 +692,8 @@ class RepoProjectTests:
                     await safe_log_event(
                         "repo_test_containment_refused",
                         reason_code="path_permission_denied",
-                        repository=scope.canonical_repo,
-                        pull_request=scope.pr_number,
+                        repository=repository,
+                        pull_request=issue,
                         **diagnostic,
                     )
                     raise ProjectTestRefusal(
@@ -686,8 +704,8 @@ class RepoProjectTests:
                 await safe_log_event(
                     "repo_test_containment_refused",
                     reason_code="containment_unavailable",
-                    repository=scope.canonical_repo,
-                    pull_request=scope.pr_number,
+                    repository=repository,
+                    pull_request=issue,
                 )
                 raise ProjectTestRefusal(
                     "test_containment_unavailable",
@@ -700,8 +718,8 @@ class RepoProjectTests:
                     await safe_log_event(
                         "repo_test_containment_refused",
                         reason_code="path_permission_denied",
-                        repository=scope.canonical_repo,
-                        pull_request=scope.pr_number,
+                        repository=repository,
+                        pull_request=issue,
                         **diagnostic,
                     )
                     raise ProjectTestRefusal(
@@ -716,8 +734,8 @@ class RepoProjectTests:
                 await safe_log_event(
                     "repo_test_containment_refused",
                     reason_code="cleanup_failed",
-                    repository=scope.canonical_repo,
-                    pull_request=scope.pr_number,
+                    repository=repository,
+                    pull_request=issue,
                 )
                 raise ProjectTestRefusal(
                     "test_snapshot_cleanup_failed",
@@ -768,7 +786,8 @@ class RepoProjectTests:
                 git_context=_git_execution_context(),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
-        if not selectors and is_default:
+        if not retained and not selectors and is_default:
+            assert self._state is not None
             head = self._state.git_expected_head
             if head is None:
                 raise ProjectTestRefusal(
