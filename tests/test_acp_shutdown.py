@@ -183,6 +183,102 @@ proxy.threading.Timer = JournalTimer
 '''
 
 
+async def _diagnostic_command(*argv: str) -> str:
+    try:
+        command = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as exc:
+        return f"capture failed starting {argv[0]}: {type(exc).__name__}: {exc}"
+    try:
+        async with asyncio.timeout(2):
+            output, _ = await command.communicate()
+    except TimeoutError:
+        command.kill()
+        try:
+            async with asyncio.timeout(1):
+                await command.wait()
+        except TimeoutError:
+            pass
+        return f"capture failed: {' '.join(argv)} exceeded 2s"
+    text = output.decode(errors="replace").strip()
+    if command.returncode:
+        return f"capture failed ({command.returncode}): {' '.join(argv)}\n{text}"
+    return text or "<empty>"
+
+
+async def _capture_expired_child(process: asyncio.subprocess.Process, progress: Path) -> str:
+    """Capture live child state without allowing diagnostics to become a hang."""
+    sections = []
+    stacks = progress.with_suffix(".stacks")
+    if stacks.exists() and stacks.stat().st_size:
+        age = max(0.0, time.time() - stacks.stat().st_mtime)
+        sections.append(f"per-thread Python stacks: periodic snapshot {age:.3f}s before capture")
+    else:
+        sections.append("per-thread Python stack capture failed: periodic snapshot is empty")
+
+    if sys.platform.startswith("linux"):
+        proc = Path("/proc") / str(process.pid)
+        task_root = proc / "task"
+        try:
+            tasks = sorted(task_root.iterdir(), key=lambda path: int(path.name))
+        except OSError as exc:
+            sections.append(f"process state capture failed: {type(exc).__name__}: {exc}")
+        else:
+            thread_details = []
+            signal_fields = {"State", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt"}
+            for task in tasks:
+                try:
+                    status = [
+                        line for line in (task / "status").read_text().splitlines()
+                        if line.partition(":")[0] in signal_fields
+                    ]
+                    wchan = (task / "wchan").read_text().strip()
+                    try:
+                        syscall = (task / "syscall").read_text().strip()
+                    except OSError as exc:
+                        syscall = f"<capture failed: {type(exc).__name__}: {exc}>"
+                    try:
+                        kernel_stack = (task / "stack").read_text().strip()
+                    except OSError as exc:
+                        kernel_stack = f"<capture failed: {type(exc).__name__}: {exc}>"
+                    thread_details.append(
+                        f"thread {task.name}:\n" + "\n".join(status)
+                        + f"\nwchan: {wchan or '<empty>'}\nsyscall: {syscall}"
+                        + f"\nkernel stack:\n{kernel_stack or '<empty>'}"
+                    )
+                except OSError as exc:
+                    thread_details.append(
+                        f"thread {task.name}: capture failed: {type(exc).__name__}: {exc}"
+                    )
+            sections.append("per-thread signal masks and kernel waits:\n" + "\n".join(thread_details))
+        try:
+            descriptors = [
+                f"fd {entry.name}: {os.readlink(entry)}"
+                for entry in sorted((proc / "fd").iterdir(), key=lambda path: int(path.name))
+            ]
+            sections.append("open file descriptors:\n" + ("\n".join(descriptors) or "<none>"))
+        except OSError as exc:
+            sections.append(f"file descriptor capture failed: {type(exc).__name__}: {exc}")
+    elif sys.platform == "darwin":
+        pid = str(process.pid)
+        ps, sample, lsof = await asyncio.gather(
+            _diagnostic_command(
+                "/bin/ps", "-o", "pid=,state=,wchan=,sig=,sigmask=,caught=,ignored=", "-p", pid,
+            ),
+            _diagnostic_command("/usr/bin/sample", pid, "1", "1"),
+            _diagnostic_command("/usr/sbin/lsof", "-nP", "-p", pid),
+        )
+        sections.extend((
+            "process signal masks and wait channel:\n" + ps,
+            "per-thread native stacks and syscalls:\n" + sample,
+            "open file descriptors:\n" + lsof,
+        ))
+    else:
+        sections.append(f"OS process-state capture unavailable on {sys.platform}")
+    return "\n".join(sections)
+
+
 @asynccontextmanager
 async def _shutdown_ceiling(
     process: asyncio.subprocess.Process, progress: Path, outstanding: Callable[[], str],
@@ -192,6 +288,11 @@ async def _shutdown_ceiling(
         async with asyncio.timeout(timeout):
             yield
     except TimeoutError:
+        try:
+            async with asyncio.timeout(5):
+                expiry_diagnostic = await _capture_expired_child(process, progress)
+        except Exception as exc:
+            expiry_diagnostic = f"capture failed: {type(exc).__name__}: {exc}"
         state = progress.read_text() if progress.exists() else "<no child progress>"
         wakeup = Path(str(progress) + ".wakeup")
         delivery = (
@@ -207,6 +308,7 @@ async def _shutdown_ceiling(
             f"ACP shutdown ceiling expired: outstanding={outstanding()}, "
             f"pid={process.pid}, returncode={process.returncode}; child progress:\n{state}"
             f"\nsignal delivery: {delivery}"
+            f"\nexpiry process diagnostics:\n{expiry_diagnostic}"
             + "\n" + "\n".join(details)
         )
 
@@ -1085,6 +1187,71 @@ time.sleep(3600)
         if process.returncode is None:
             process.kill()
         await process.communicate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="asserts Linux /proc diagnostics")
+async def test_shutdown_ceiling_captures_live_blocking_condition(tmp_path: Path) -> None:
+    progress = tmp_path / "child-progress"
+    source = _journal_source(progress) + r'''
+faulthandler.cancel_dump_traceback_later()
+faulthandler.dump_traceback_later(0.01, repeat=True, file=_stack_fd)
+def blocked_after_exit_ready():
+    record(b'exit-ready')
+    os.write(1, b'exit-ready\n')
+    threading.Event().wait()
+
+blocked_after_exit_ready()
+'''
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", source,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    try:
+        assert await process.stdout.readline() == b"exit-ready\n"
+        with pytest.raises(pytest.fail.Exception) as failure:
+            async with _shutdown_ceiling(
+                process, progress, lambda: "exit-ready", timeout=0.1,
+            ):
+                await process.wait()
+        message = str(failure.value)
+        assert "ACP shutdown ceiling expired: outstanding=exit-ready" in message
+        assert "expiry process diagnostics:" in message
+        assert "per-thread Python stacks: periodic snapshot" in message
+        assert "per-thread signal masks and kernel waits:" in message
+        assert "SigBlk:" in message
+        assert "wchan:" in message
+        assert "syscall:" in message
+        assert "open file descriptors:" in message
+        assert "stacks:" in message
+        assert "in blocked_after_exit_ready" in message
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ceiling_reports_diagnostic_capture_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    progress = tmp_path / "child-progress"
+    progress.write_text("exit-ready\n")
+    process = SimpleNamespace(pid=1234, returncode=None)
+
+    async def fail_capture(*args: object) -> str:
+        raise PermissionError("diagnostics denied")
+
+    monkeypatch.setattr(sys.modules[__name__], "_capture_expired_child", fail_capture)
+    with pytest.raises(pytest.fail.Exception) as failure:
+        async with _shutdown_ceiling(process, progress, lambda: "exit-ready", timeout=0.01):
+            await asyncio.sleep(1)
+    message = str(failure.value)
+    assert "ACP shutdown ceiling expired: outstanding=exit-ready, pid=1234, returncode=None" in message
+    assert "child progress:\nexit-ready" in message
+    assert "capture failed: PermissionError: diagnostics denied" in message
 
 
 @pytest.mark.asyncio
