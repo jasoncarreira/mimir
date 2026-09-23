@@ -1900,9 +1900,15 @@ async def test_add_job_callable_with_empty_cron_disables(tmp_path: Path):
 # ---- pollers framework integration (chainlink #3) ----------------------
 
 
-def _drop_pollers_skill(skills_dir: Path, name: str, cron: str = "* * * * *") -> Path:
+def _drop_pollers_skill(
+    skills_dir: Path,
+    name: str,
+    cron: str = "* * * * *",
+    *,
+    skill_name: str | None = None,
+) -> Path:
     """Helper: build a minimal valid skill dir with a no-op poller."""
-    skill = skills_dir / name
+    skill = skills_dir / (skill_name or name)
     skill.mkdir(parents=True, exist_ok=True)
     (skill / "pollers.json").write_text(_json.dumps({
         "pollers": [{"name": name, "command": "true", "cron": cron}],
@@ -5027,7 +5033,9 @@ async def test_triggered_empty_scan_does_not_trigger_itself(tmp_path: Path, monk
 
     sched = Scheduler(scheduler_yaml=tmp_path / "s.yaml", enqueue=noop)
     skills = tmp_path / "skills"
-    _drop_pollers_skill(skills, "worklink-ready-queue")
+    _drop_pollers_skill(
+        skills, "worklink-ready-queue", skill_name="chainlink-orchestrator",
+    )
     sched.add_poller_jobs(skills)
     calls = 0
 
@@ -5056,7 +5064,9 @@ async def test_missed_completion_trigger_recovers_on_timed_fire(tmp_path: Path, 
         scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=home
     )
     skills = tmp_path / "skills"
-    _drop_pollers_skill(skills, "worklink-ready-queue")
+    _drop_pollers_skill(
+        skills, "worklink-ready-queue", skill_name="chainlink-orchestrator",
+    )
     sched.add_poller_jobs(skills)
     ran: list[str] = []
 
@@ -5266,7 +5276,9 @@ async def test_completion_fifo_reaches_triggered_poller(tmp_path: Path, monkeypa
         scheduler_yaml=tmp_path / "s.yaml", enqueue=noop, home=home
     )
     skills = tmp_path / "skills"
-    _drop_pollers_skill(skills, "worklink-ready-queue")
+    _drop_pollers_skill(
+        skills, "worklink-ready-queue", skill_name="chainlink-orchestrator",
+    )
     sched.add_poller_jobs(skills)
     ran = asyncio.Event()
 

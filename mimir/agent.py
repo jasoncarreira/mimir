@@ -1741,6 +1741,7 @@ class Agent:
                 build_file_tool_routes,
                 FileToolRouter,
             )
+            from .access_control import worklink_retained_checkout_root
             from .tools import all_mimir_tools
 
             # Per-directory write-permission enforcement (Config.folders).
@@ -1766,6 +1767,14 @@ class Agent:
                 candidate = Path(lease_root)
                 if candidate.is_absolute() and candidate.is_dir() and not candidate.is_symlink():
                     roots = (*roots, (str(candidate.resolve()), "rw"))
+            retained_root = worklink_retained_checkout_root().resolve(strict=False)
+            retained_is_configured = any(
+                retained_root == Path(root).resolve(strict=False)
+                or retained_root.is_relative_to(Path(root).resolve(strict=False))
+                for root, _mode in roots
+            )
+            if not retained_is_configured:
+                roots = (*roots, (str(retained_root), "ro"))
             routes = build_file_tool_routes(roots) if roots else {}
             if routes:
                 self._backend = FileToolRouter(default=home_backend, routes=routes)

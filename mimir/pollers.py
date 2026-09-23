@@ -1333,10 +1333,15 @@ def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
 
 def _validate_poller_identity(name: str, manifest_path: Path) -> None:
     """Bind names with special server-side authority to their shipped skill identity."""
-    if name == "github-activity" and manifest_path.parent.name != "github-poller":
+    reserved_skills = {
+        "github-activity": "github-poller",
+        "worklink-ready-queue": "chainlink-orchestrator",
+    }
+    required_skill = reserved_skills.get(name)
+    if required_skill is not None and manifest_path.parent.name != required_skill:
         raise ValueError(
-            "reserved poller name 'github-activity' may only be declared by "
-            "the 'github-poller' skill"
+            f"reserved poller name {name!r} may only be declared by "
+            f"the {required_skill!r} skill"
         )
 
 
