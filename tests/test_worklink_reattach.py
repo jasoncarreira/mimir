@@ -1326,7 +1326,10 @@ def _factory_restart_record(
             "lock_session": "session-1",
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
-            "slices": [{"id": "factory-070-migration", "status": "ready", "attempts": 0}],
+            "slices": [{
+                "id": "factory-070-migration", "status": "ready", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            }],
             "validator": None,
             "pr_url": None,
             "terminal_result": {"reason": "opaque"},

@@ -44,7 +44,10 @@ def record(tmp_path: Path) -> FactoryRunRecord:
             "lock_session": "session-1",
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
-            "slices": [{"id": "factory-070-migration", "status": "ready", "attempts": 0}],
+            "slices": [{
+                "id": "factory-070-migration", "status": "ready", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            }],
             "validator": None,
             "pr_url": None,
             "terminal_result": None,
@@ -231,7 +234,10 @@ def test_factory_record_round_trip_preserves_structured_status(tmp_path: Path) -
     status = replace(
         expected.status,
         steps=({"agent": "implementation", "status": "completed", "attempts": 2},),
-        slices=({"id": "factory-070-migration", "status": "merged", "attempts": 1},),
+        slices=({
+            "id": "factory-070-migration", "status": "merged", "attempts": 1,
+            "extra_attempts": 0, "retry_limit": 5,
+        },),
         gates={
             "pre_pr": {
                 "status": "passed",

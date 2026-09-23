@@ -58,8 +58,12 @@ def status_payload(**overrides: Any) -> dict[str, Any]:
             {"agent": "implementation", "status": "running", "attempts": 1},
         ],
         "slices": [
-            {"id": "factory-070-migration", "status": "pending", "attempts": 0},
+            {
+                "id": "factory-070-migration", "status": "pending", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            },
         ],
+        "retry_extensions": [],
         "validator": None,
         "pr_url": None,
         "terminal_result": None,
@@ -91,10 +95,13 @@ def package_entrypoint(tmp_path: Path) -> Path:
 
 
 def structured_status_payload() -> dict[str, Any]:
-    # 0.10.0 release shape, including Gate 3's commit binding, not a live probe.
+    # 0.10.2 release shape, including Gate 3's commit binding, not a live probe.
     return status_payload(
         steps=[{"agent": "spec-writer", "status": "blocked", "attempts": 2}],
-        slices=[{"id": "be-x", "status": "merged", "attempts": 5}],
+        slices=[{
+            "id": "be-x", "status": "merged", "attempts": 5,
+            "extra_attempts": 2, "retry_limit": 7,
+        }],
         gates={"story": {
             "status": "approved", "at": "2026-09-17T00:00:00Z",
             "artifact": "story.md", "reviewed_head": "abc123",
@@ -114,6 +121,17 @@ def test_status_089_live_failure_regression(wire: str) -> None:
     for field in ("steps", "slices", "gates", "validator", "next_action"):
         assert status.to_json()[field] == payload[field]
     assert parse_factory_status(status.to_json()) == status
+
+
+def test_status_accepts_0102_slice_fields_and_top_level_retry_extensions() -> None:
+    payload = structured_status_payload()
+
+    status = parse_factory_status(payload)
+
+    assert status.slices == ({
+        "id": "be-x", "status": "merged", "attempts": 5,
+        "extra_attempts": 2, "retry_limit": 7,
+    },)
 
 
 _STRUCTURED_ROWS = {
@@ -161,7 +179,13 @@ def test_status_bounds_every_structured_text_member(field: str, member: str, val
         parse_factory_status(row_payload(field, row))
 
 
-@pytest.mark.parametrize(("field", "member"), [("steps", "attempts"), ("slices", "attempts"), ("validator", "loops")])
+@pytest.mark.parametrize(("field", "member"), [
+    ("steps", "attempts"),
+    ("slices", "attempts"),
+    ("slices", "extra_attempts"),
+    ("slices", "retry_limit"),
+    ("validator", "loops"),
+])
 @pytest.mark.parametrize("value", [-1, True, 1.5, "2", None])
 def test_status_requires_nonnegative_integer_counts(field: str, member: str, value: object) -> None:
     with pytest.raises(FactoryContractError, match=rf"{field}\.{member}"):
@@ -172,6 +196,12 @@ def test_status_requires_nonnegative_integer_counts(field: str, member: str, val
 def test_status_rejects_unknown_row_members(field: str) -> None:
     with pytest.raises(FactoryContractError, match=rf"{field}\.unexpected"):
         parse_factory_status(row_payload(field, _STRUCTURED_ROWS[field] | {"unexpected": "value"}))
+
+
+def test_status_rejects_unknown_0102_slice_member() -> None:
+    row = _STRUCTURED_ROWS["slices"] | {"future_attempts": 1}
+    with pytest.raises(FactoryContractError, match=r"slices\.future_attempts is unknown"):
+        parse_factory_status(row_payload("slices", row))
 
 
 @pytest.mark.parametrize("field", ["steps", "slices", "gates"])
@@ -359,7 +389,10 @@ def test_status_parses_recorded_gate_pre_pr_validator_verdict() -> None:
                 for agent in ("story", "brief", "slices", "validator")
             ],
             "slices": [
-                {"id": f"slice-{index}", "status": "completed", "attempts": 1}
+                {
+                    "id": f"slice-{index}", "status": "completed", "attempts": 1,
+                    "extra_attempts": 0, "retry_limit": 5,
+                }
                 for index in range(1, 8)
             ],
             "validator": {
@@ -554,7 +587,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.10.0"
+    assert FACTORY_VERSION == "0.10.2"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 

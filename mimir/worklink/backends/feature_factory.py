@@ -20,7 +20,7 @@ from .base import Caps, CheckoutShape, RawResult, WorkOrder
 from .opencode import resolve_worklink_opencode_invocation
 
 
-FACTORY_VERSION = "0.10.0"
+FACTORY_VERSION = "0.10.2"
 DEFAULT_FACTORY_ENTRYPOINT = "/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js"
 FACTORY_COMMANDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("init", ("init",)),
@@ -237,7 +237,10 @@ def _opaque_dict(value: object, name: str, *, nullable: bool = False) -> dict[st
 
 _STATUS_ROW_FIELDS = {
     "steps": {"agent": "text", "status": "text", "attempts": "count"},
-    "slices": {"id": "text", "status": "text", "attempts": "count"},
+    "slices": {
+        "id": "text", "status": "text", "attempts": "count",
+        "extra_attempts": "count", "retry_limit": "count",
+    },
     "gates": {
         "status": "text", "at": "nullable", "artifact": "nullable",
         "reviewed_head": "nullable",

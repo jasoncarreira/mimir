@@ -5311,7 +5311,10 @@ def _run_factory_preflight_case(
                         },
                     },
                     "steps": [{"agent": "implementation", "status": "completed", "attempts": 1}],
-                    "slices": [{"id": "implementation", "status": "merged", "attempts": 1}],
+                    "slices": [{
+                        "id": "implementation", "status": "merged", "attempts": 1,
+                        "extra_attempts": 0, "retry_limit": 5,
+                    }],
                     "validator": None,
                     "pr_url": None,
                     "terminal_result": None,
@@ -5852,7 +5855,10 @@ def test_factory_failure_preservation_skips_runs_without_unpublished_merged_work
         slices=(
             record.status.slices
             if already_published
-            else ({"id": "implementation", "status": "ready", "attempts": 0},)
+            else ({
+                "id": "implementation", "status": "ready", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            },)
         ),
     )
     record = replace(record, status=status)
@@ -7275,7 +7281,10 @@ def _factory_lifecycle_status(
             "lock_session": session,
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
-            "slices": [{"id": "factory-070-migration", "status": "ready", "attempts": 0}],
+            "slices": [{
+                "id": "factory-070-migration", "status": "ready", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            }],
             "validator": None,
             "pr_url": None,
             "terminal_result": None,
@@ -7781,7 +7790,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     parked_status_reads = 0
     snapshot = str(sandbox / ".factory" / ".parked" / "700")
     slices = tuple(
-        {"id": f"slice-{index}", "status": value, "attempts": 1}
+        {
+            "id": f"slice-{index}", "status": value, "attempts": 1,
+            "extra_attempts": 0, "retry_limit": 5,
+        }
         for index, value in enumerate(
             ["merged"] * 9 + ["in-review"] + ["ready"] * 3,
             start=1,
@@ -8938,7 +8950,10 @@ def _completion_record(sandbox: Path) -> FactoryRunRecord:
             **_factory_lifecycle_status(sandbox, status="completed").to_json(),
             "lock": "absent",
             "lock_session": None,
-            "slices": [{"id": "implementation", "status": "merged", "attempts": 1}],
+            "slices": [{
+                "id": "implementation", "status": "merged", "attempts": 1,
+                "extra_attempts": 0, "retry_limit": 5,
+            }],
             "pr_url": "https://github.com/owner/repo/pull/42",
         }
     )
@@ -9154,7 +9169,10 @@ def test_factory_completion_rejection_matrix_persists_failed_evidence(
     elif case == "base":
         status_overrides["pr_base"] = "develop"
     elif case == "merged_slice":
-        status_overrides["slices"] = [{"id": "implementation", "status": "ready", "attempts": 0}]
+        status_overrides["slices"] = [{
+            "id": "implementation", "status": "ready", "attempts": 0,
+            "extra_attempts": 0, "retry_limit": 5,
+        }]
     elif case == "draft":
         status_overrides["pr_draft"] = True
     elif case == "url_missing":
@@ -9489,7 +9507,10 @@ print(json.dumps([str(path) for path in pruned]))
             "lock_session": None if lock_value == "absent" else "session-1",
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
-            "slices": [{"id": "factory-070-migration", "status": "ready", "attempts": 0}],
+            "slices": [{
+                "id": "factory-070-migration", "status": "ready", "attempts": 0,
+                "extra_attempts": 0, "retry_limit": 5,
+            }],
             "validator": None,
             "pr_url": None,
             "terminal_result": historical,
