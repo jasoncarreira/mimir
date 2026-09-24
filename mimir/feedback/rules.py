@@ -230,6 +230,7 @@ _EVENT_RULES: dict[str, tuple[Polarity, str]] = {
     "git_commit_failed": ("negative", "git_commit_failed"),
     "git_push_failed": ("negative", "git_push_failed"),
     "git_pull_blocked": ("negative", "git_pull_blocked"),
+    "git_index_lock_stale": ("negative", "git_index_lock_stale"),
     "git_home_invariant_violation": ("negative", "git_home_invariant_violation"),
     # PR 56 (shell-jobs): the cross-thread bridge from waiter thread
     # back to the dispatcher raised. Means a finished async shell job
@@ -524,6 +525,7 @@ _FIRST_OCCURRENCE_ONLY_KINDS: set[str] = {
     "git_commit_failed",
     "git_push_failed",
     "git_pull_blocked",
+    "git_index_lock_stale",
     "git_home_invariant_violation",
     # PR 56: a broken bridge fires on every async shell job that
     # completes. Same shape as git_*_failed — dedup so the operator
@@ -647,6 +649,10 @@ _AROUSAL_THRESHOLDS: dict[str, int] = {}
 # and don't need a separate escalation event).
 # ---------------------------------------------------------------------------
 _ESCALATION_THRESHOLDS: dict[str, int] = {
+    # A stale index lock already requires an operator-approved recovery action;
+    # repeated commit failures may indicate the same outage before it ages out.
+    "git_index_lock_stale": 1,
+    "git_commit_failed": 3,
     # Git: 3 push failures in a day signals a structural problem (auth,
     # network, dirty worktree) that self-correction hasn't caught.
     "git_push_failed": 3,

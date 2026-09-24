@@ -3219,6 +3219,66 @@ def test_alg3_below_threshold_no_escalation(tmp_path: Path):
         _reset_logger_for_tests()
 
 
+def test_git_index_lock_and_commit_failures_escalate_at_configured_thresholds(
+    tmp_path: Path,
+) -> None:
+    from mimir.event_logger import init_logger, _reset_logger_for_tests
+    from mimir.feedback import _ESCALATION_THRESHOLDS
+
+    assert _ESCALATION_THRESHOLDS["git_index_lock_stale"] == 1
+    assert _ESCALATION_THRESHOLDS["git_commit_failed"] == 3
+    events_path = tmp_path / "logs" / "events.jsonl"
+    _write_jsonl(events_path, [
+        {
+            "timestamp": _ts(0.1),
+            "type": "git_index_lock_stale",
+            "path": "/mimir-home/.git/index.lock",
+            "age_seconds": 700,
+            "failure_count": 1,
+        },
+        *[
+            {
+                "timestamp": _ts(0.2 + i / 100),
+                "type": "git_commit_failed",
+                "stage": "add",
+                "error": "index.lock exists",
+            }
+            for i in range(3)
+        ],
+    ])
+
+    init_logger(events_path, session_id="test-git-lock-escalation")
+    try:
+        FeedbackLog(
+            events_path=events_path,
+            turns_path=tmp_path / "logs" / "turns.jsonl",
+        ).recent()
+        escalated = {
+            record["kind"]
+            for record in map(json.loads, events_path.read_text().splitlines())
+            if record.get("type") == "algedonic_escalation"
+        }
+        assert {"git_index_lock_stale", "git_commit_failed"} <= escalated
+    finally:
+        _reset_logger_for_tests()
+
+
+def test_git_index_lock_stale_feedback_gives_operator_recovery_step() -> None:
+    from mimir.feedback.renderers import _render_event_line
+
+    line = _render_event_line("git_index_lock_stale", {
+        "path": "/mimir-home/.git/index.lock",
+        "age_seconds": 700,
+        "failure_count": 4,
+    })
+
+    assert "/mimir-home/.git/index.lock" in line
+    assert "700 seconds" in line
+    assert "4 commit/pull" in line
+    assert "Confirm no git process is using the repository" in line
+    assert "then remove the lock" in line
+
+
 # ---------------------------------------------------------------------------
 # chainlink #196 — poller circuit-breaker algedonic rendering
 # ---------------------------------------------------------------------------
