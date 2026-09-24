@@ -172,14 +172,14 @@ class WorkerClient:
         self,
         checkout: CheckoutCapability | None,
         *,
-        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+        socket_path: Path | None = None,
         path_checkout: Path | None = None,
         issue_id: int | None = None,
         attempt: int | None = None,
         run_uid: int | None = None,
     ) -> None:
         self.checkout = checkout
-        self.socket_path = socket_path
+        self.socket_path = socket_path or DEFAULT_EXECUTOR_SOCKET
         self.path_checkout = path_checkout
         self.issue_id = issue_id
         self.attempt = attempt
@@ -195,7 +195,7 @@ class WorkerClient:
         issue_id: int,
         attempt: int,
         run_uid: int,
-        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+        socket_path: Path | None = None,
     ) -> WorkerClient:
         if issue_id < 1 or attempt < 1 or run_uid < 0:
             raise ValueError("path-addressed worker launch identity is invalid")
@@ -215,7 +215,7 @@ class WorkerClient:
         *,
         issue_id: int,
         attempt: int,
-        socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+        socket_path: Path | None = None,
     ) -> WorkerClient:
         client = cls.for_path_checkout(
             path,
@@ -474,9 +474,10 @@ class WorkerClient:
 
 
 async def verify_executor_identity(
-    socket_path: Path = DEFAULT_EXECUTOR_SOCKET,
+    socket_path: Path | None = None,
 ) -> str:
     """Verify the image-owned executor before a launch contract is needed."""
+    socket_path = socket_path or DEFAULT_EXECUTOR_SOCKET
     client = object.__new__(WorkerClient)
     client.socket_path = socket_path
     sock = await asyncio.to_thread(client._connect)

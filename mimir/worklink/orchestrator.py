@@ -4654,7 +4654,10 @@ def _run_worklink_epic_under_lease(
     incident_owner = _IncidentOwner(autonomous=autonomous)
     try:
         runner = WorklinkRunner(
-                home=home, repo=repo, _incident_owner=incident_owner,
+                home=home,
+                repo=repo,
+                chainlink_bin=os.environ.get("MIMIR_WORKLINK_CHAINLINK_BIN") or "chainlink",
+                _incident_owner=incident_owner,
                 _factory_lease_held=True,
             )
         run_kwargs: dict[str, Any] = {"autonomous": autonomous}

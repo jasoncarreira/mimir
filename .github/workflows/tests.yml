@@ -452,15 +452,26 @@ jobs:
           chmod 600 "$HOME/.claude/.credentials.json"
           ls -ld "$HOME/.claude" "$HOME/.claude/.credentials.json"
 
-      - name: Create the non-owning worker uid and make the tree readable to it
-        # Matches the production account: no home directory, HOME=/nonexistent,
-        # nologin shell. The tree is group-READABLE only -- deliberately not
-        # group-writable. A writable tree stops reproducing the production shape and
-        # would mask the next defect of this class.
+      - name: Create distinct controller and worker identities and make the tree readable
+        # The focused root leg below needs production's real split: a `mimir`
+        # controller in the `worklink` group and a distinct fixed worker account.
+        # The whole-suite leg still runs as the non-owning worker with the tree only
+        # group-readable -- deliberately not group-writable.
         run: |
           set -euo pipefail
           sudo useradd --no-create-home --home-dir /nonexistent \
-            --shell /usr/sbin/nologin worklink
+            --shell /usr/sbin/nologin --user-group mimir
+          sudo useradd --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin --user-group worklink
+          sudo usermod --append --groups worklink mimir
+          mimir_uid="$(id -u mimir)"
+          worklink_uid="$(id -u worklink)"
+          worklink_gid="$(id -g worklink)"
+          test "$mimir_uid" != "$worklink_uid" \
+            || { echo "::error::mimir and worklink uids are not distinct"; exit 1; }
+          id -G mimir | tr ' ' '\n' | grep -qx "$worklink_gid" \
+            || { echo "::error::mimir is not in the worklink group"; exit 1; }
+          echo "controller uid=$mimir_uid worker uid=$worklink_uid worklink gid=$worklink_gid"
           sudo chgrp -R worklink .
           chmod -R g+rX .
           chmod g+s .
@@ -475,7 +486,22 @@ jobs:
           echo "worker uid can read and not write the checkout"
           evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"
           sudo install -d -m 700 -o worklink -g worklink "$evidence_root"
+          sudo install -d -m 700 -o root -g root "$evidence_root/remediation-root"
+          sudo install -d -m 700 -o worklink -g worklink "$evidence_root/main"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+
+      - name: Run retained-remediation coverage as root with distinct identities
+        run: |
+          set -euo pipefail
+          sudo env \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider \
+              --basetemp "$PYTEST_EVIDENCE_ROOT/remediation-root" \
+              tests/test_worklink_remediation_e2e.py::test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests \
+              tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller \
+              tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit
 
       - name: Run mimir test suite as the non-owning worker uid
         # `.venv/bin/python -m pytest`, not `uv run`: uv derives its cache from HOME,

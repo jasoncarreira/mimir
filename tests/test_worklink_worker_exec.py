@@ -66,6 +66,23 @@ def test_worker_projection_has_fixed_destination_json_and_size_contract() -> Non
         WorkerProjection(".config/opencode/opencode.json", b" " * (MAX_PROJECTION_BYTES + 1))
 
 
+def test_worker_clients_resolve_the_default_socket_at_call_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_worklink_identities,
+) -> None:
+    socket_path = tmp_path / "executor.sock"
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    monkeypatch.setattr("mimir.worklink.worker_client.DEFAULT_EXECUTOR_SOCKET", socket_path)
+    monkeypatch.setattr(identities, "get_identities", lambda: synthetic_worklink_identities)
+
+    assert WorkerClient(None).socket_path == socket_path
+    assert WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002,
+    ).socket_path == socket_path
+    assert WorkerClient.for_factory_checkout(
+        checkout, issue_id=41, attempt=2,
+    ).socket_path == socket_path
+
+
 def test_client_rejects_non_uuid_home_and_invalid_commands(tmp_path: Path) -> None:
     path = _issued(tmp_path)
     with _authorization(path) as checkout:
