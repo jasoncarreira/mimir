@@ -26,10 +26,12 @@ tainting it wholesale.
 - **feature-factory moves from 0.8.x to 0.10.4**, and the pin lives in an image
   layer. Rebuild the image; a pull and a restart are not enough. Exact-match
   admission refuses a mismatched install.
-- **Bundled skills changed**, including `chainlink-orchestrator`,
-  `github-poller`, `github-ci-watch`, `gmail-poller` and `pollers`. Skills
-  install into the agent home. Run `mimir skills update <name> --apply` for each
-  one the deployment has not already refreshed at boot.
+- **Skills changed**, including the optional `chainlink-orchestrator`,
+  `github-poller`, `github-ci-watch` and `gmail-poller`, and the bundled
+  `pollers`. A restart refreshes bundled skills and safely auto-updates installed
+  optional skills. Read the startup skill digest. Run
+  `mimir skills update <name>` only when it reports a partial update or remaining
+  drift, and inspect its diff before adding `--apply`.
 - **The console entry point is now `mimir.entrypoint:main`**, and
   `mimir-agent` is installed alongside `mimir`. Reinstall any wrapper script
   that imported `mimir.cli:main` directly.
@@ -38,8 +40,11 @@ tainting it wholesale.
 
 - **ACP:** mimir serves the Agent Client Protocol (`agent-client-protocol`
   0.12.0) for editors such as Zed. Hands are proxy-hosted with per-call client
-  authorization, session grants and a persistent Python REPL, confined on Linux
-  by an AppArmor backend. Confined Hands output no longer taints the turn.
+  authorization, session grants and a persistent Python REPL. Execution is
+  confined by macOS Seatbelt. A Linux AppArmor backend ships parser-checked in
+  CI, but its real-hardware enforcement is still unverified. Where no backend is
+  available, Hands runs unconfined only after the operator explicitly accepts
+  that risk. Confined Hands output no longer taints the turn.
 - **Worklink remediation:** the worklink controller and executor are split,
   with builds and factory runs executing as the agent uid. Retained checkouts
   sit behind an owner-controlled boundary. A retained remediation is proven end
