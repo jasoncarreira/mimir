@@ -313,7 +313,7 @@ async def _trusted_turn(case):
     auth = _create_turn_auth_context(
         event, None, policy_version=None, enforce=True, ifc_labels=labels,
     )
-    assert auth.retained_factory_scope is not None
+    assert auth.retained_factory_scope is not None, auth.retained_factory_scope_refusal
     return event, labels, auth
 
 
@@ -688,18 +688,6 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
             home=home,
             state_root=home / "state" / "pollers",
         )
-        event, labels, auth = asyncio.run(_trusted_turn(case))
-        scope = auth.retained_factory_scope
-        assert scope is not None
-        turn = TurnContext(
-            turn_id="retained-remediation-root-e2e",
-            session_id=event.channel_id,
-            trigger=event.trigger,
-            channel_id=event.channel_id,
-            started_at=0.0,
-            auth_context=auth,
-            ifc_labels=labels,
-        )
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
         monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
@@ -726,6 +714,18 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                     os.setresuid(identities.mimir_uid, identities.mimir_uid, identities.mimir_uid)
                     contained_execution.WorkerClient = lambda capability: worker_client.WorkerClient(
                         capability, socket_path=socket_path,
+                    )
+                    event, labels, auth = asyncio.run(_trusted_turn(case))
+                    scope = auth.retained_factory_scope
+                    assert scope is not None, auth.retained_factory_scope_refusal
+                    turn = TurnContext(
+                        turn_id="retained-remediation-root-e2e",
+                        session_id=event.channel_id,
+                        trigger=event.trigger,
+                        channel_id=event.channel_id,
+                        started_at=0.0,
+                        auth_context=auth,
+                        ifc_labels=labels,
                     )
                     backend = FileToolRouter(
                         default=WriteGuardBackend(home, ["state"], guard_outside_root=True),
