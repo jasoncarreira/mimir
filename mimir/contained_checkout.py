@@ -12,6 +12,7 @@ from typing import Callable, Iterable
 
 from ._rmtree import rmtree_missing_ok
 from .contained_snapshot import (
+    SnapshotBundleProvider,
     SnapshotGitRunner,
     SnapshotResult,
     create_git_snapshot,
@@ -120,6 +121,7 @@ def _issue_checkout(
     excluded_prefixes: Iterable[bytes] = (),
     source_git_runner: SnapshotGitRunner | None = None,
     clone_runner: SnapshotGitRunner | None = None,
+    bundle_provider: SnapshotBundleProvider | None = None,
     prepare: Callable[[Path], str | None] | None = None,
 ) -> tuple[SnapshotResult, CheckoutAuthorization, str | None]:
     boundary, destination = _prepare_boundary(root, scope, f"{issue_id}-{attempt}")
@@ -133,6 +135,7 @@ def _issue_checkout(
             excluded_prefixes=excluded_prefixes,
             source_git_runner=source_git_runner,
             clone_runner=clone_runner,
+            bundle_provider=bundle_provider,
         )
         prepared = prepare(destination) if prepare is not None else None
         relative = destination.relative_to(root)
@@ -163,6 +166,7 @@ def create_repo_test_checkout(
     excluded_prefixes: Iterable[bytes] = (),
     source_git_runner: SnapshotGitRunner | None = None,
     clone_runner: SnapshotGitRunner | None = None,
+    bundle_provider: SnapshotBundleProvider | None = None,
 ) -> ContainedCheckout:
     if type(pr_number) is not int or pr_number < 1:
         raise ValueError("pull request number must be positive")
@@ -188,6 +192,7 @@ def create_repo_test_checkout(
         excluded_prefixes=excluded_prefixes,
         source_git_runner=source_git_runner,
         clone_runner=clone_runner,
+        bundle_provider=bundle_provider,
     )
     return ContainedCheckout(snapshot.destination, authorization, snapshot)
 
