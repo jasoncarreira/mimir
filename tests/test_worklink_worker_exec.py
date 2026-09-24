@@ -1835,6 +1835,10 @@ def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
     observed = worker_exec.get_identities()
     if observed.mimir_uid == observed.worklink_uid:
         pytest.skip("controller and Worklink identities are not distinct")
+    try:
+        mimir_gid = pwd.getpwnam("mimir").pw_gid
+    except KeyError:
+        pytest.skip("requires the real mimir account")
 
     repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-file-test-{uuid.uuid4()}"
     boundary = repo / "41-2"
@@ -1861,7 +1865,7 @@ def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
                 os.close(read_fd)
                 try:
                     os.setgroups([observed.worklink_gid])
-                    os.setresgid(*((observed.mimir_uid,) * 3))
+                    os.setresgid(*((mimir_gid,) * 3))
                     os.setresuid(*((observed.mimir_uid,) * 3))
                     client = WorkerClient.for_factory_checkout(
                         checkout, issue_id=41, attempt=2, socket_path=socket_path,

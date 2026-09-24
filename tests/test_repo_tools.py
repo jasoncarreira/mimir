@@ -6,8 +6,10 @@ import base64
 from dataclasses import asdict, replace
 import json
 import functools
+import grp
 import os
 from pathlib import Path
+import pwd
 import shutil
 import socket
 import select
@@ -2842,6 +2844,18 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     import mimir.worklink.worker_exec as worker_exec
     from mimir.worklink.worker_client import WorkerClient
 
+    try:
+        controller = pwd.getpwnam("mimir")
+        worker = pwd.getpwnam("worklink")
+        worker_gid = grp.getgrnam("worklink").gr_gid
+    except KeyError:
+        pytest.skip("requires real mimir and worklink accounts and the worklink group")
+    controller_uid = controller.pw_uid
+    controller_gid = controller.pw_gid
+    worker_uid = worker.pw_uid
+    if controller_uid == worker_uid:
+        pytest.skip("controller and worker identities must be distinct")
+
     state = repo_tools[-2]
     lease = state.checkout_lease.path
     restored_modes: dict[Path, int] = {}
@@ -2860,19 +2874,19 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     boundary.chmod(0o755)
     checkout_root.mkdir(mode=0o771)
     checkout_root.chmod(0o771)
-    os.chown(checkout_root, 0, 1001)
+    os.chown(checkout_root, 0, controller_gid)
     home_root.mkdir(mode=0o710)
     home_root.chmod(0o710)
-    os.chown(home_root, 0, 1002)
+    os.chown(home_root, 0, worker_gid)
     uv_cache.mkdir(mode=0o555)
     cached_wheel = uv_cache / "cached-wheel"
     cached_wheel.write_text("pre-populated", encoding="utf-8")
     cached_wheel.chmod(0o444)
     controller_home.mkdir(mode=0o700)
-    os.chown(controller_home, 1001, 1001)
+    os.chown(controller_home, controller_uid, controller_gid)
     canary = controller_home / "repo-test-canary"
     canary.write_text("protected", encoding="utf-8")
-    os.chown(canary, 1001, 1001)
+    os.chown(canary, controller_uid, controller_gid)
     canary.chmod(0o600)
     config_home = boundary / "config"
     python_executable = shutil.which("python")
@@ -2897,14 +2911,14 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     fake_uv.chmod(0o755)
     _configure_worklink_test(config_home, f"{fake_uv} run pytest -q")
     for path in (config_home, *config_home.rglob("*"), lease, *lease.rglob("*")):
-        os.chown(path, 1001, 1001, follow_symlinks=False)
+        os.chown(path, controller_uid, controller_gid, follow_symlinks=False)
     monkeypatch.setenv("MIMIR_HOME", str(config_home))
     monkeypatch.setenv("HOME", str(controller_home))
     planted_conftest = _repo_test_conftest_payload(canary)
     _plant_repo_test_payload(lease, planted_conftest, python_executable)
     assert (lease / "conftest.py").read_bytes() == planted_conftest
     for path in (lease / "conftest.py", lease / "test_payload.py", lease / "run-tests.sh"):
-        os.chown(path, 1001, 1001)
+        os.chown(path, controller_uid, controller_gid)
     before = _recursive_metadata(lease)
 
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -2915,7 +2929,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     ready_read, ready_write = os.pipe()
     unsafe_root = boundary / "unsafe-snapshots"
     unsafe_root.mkdir()
-    os.chown(unsafe_root, 1001, 1001)
+    os.chown(unsafe_root, controller_uid, controller_gid)
     previous_roots = (
         contained_checkout.REPO_TEST_CHECKOUT_ROOT,
         worklink_checkout._REPO_TEST_CHECKOUT_ROOT,
@@ -2934,9 +2948,9 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
         os.close(result_read)
         os.close(ready_read)
         try:
-            os.setgroups([1002])
-            os.setresgid(1001, 1001, 1001)
-            os.setresuid(1001, 1001, 1001)
+            os.setgroups([worker_gid])
+            os.setresgid(controller_gid, controller_gid, controller_gid)
+            os.setresuid(controller_uid, controller_uid, controller_uid)
             assert os.access(lease, os.R_OK | os.X_OK)
             assert any(lease.iterdir())
             assert os.access(socket_path, os.W_OK)
@@ -3047,7 +3061,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             "3i",
             connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")),
         )
-        assert uid == 1001
+        assert uid == controller_uid
 
         def execution_deadline(_signum, _frame):
             raise TimeoutError("contained repo-test proof exceeded 30 seconds")
@@ -3071,7 +3085,7 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             if line.startswith("MIMIR_PAYLOAD=")
         )
         payload = json.loads(payload_line)
-        assert payload["uid"] == 1002
+        assert payload["uid"] == worker_uid
         assert Path(payload["home"]).parent == home_root
         assert payload["marker"] == "executed"
         assert payload["attacked"] is False

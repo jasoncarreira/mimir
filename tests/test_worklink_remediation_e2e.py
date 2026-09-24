@@ -28,13 +28,18 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from mimir import access_control as ac
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+from mimir.cli import main as cli_main
 from mimir.event_logger import init_logger
 from mimir.models import InformationFlowLabels, TurnContext
 from mimir.pollers import discover_pollers, run_poller
 from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
-from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
+from mimir.worklink.dispatch_failures import (
+    dispatch_failure_state_dir,
+    load_failure_state,
+    record_failure,
+)
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
 
 
@@ -298,6 +303,252 @@ async def _trusted_turn(case):
     )
     assert auth.retained_factory_scope is not None
     return event, labels, auth
+
+
+@pytest.mark.asyncio
+async def test_retained_remediation_reaches_effects_through_real_tool_surface(
+    remediation_case, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scripted incident turn crosses authorization, BudgetGate, and every tool."""
+    from deepagents import create_deep_agent
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    from mimir.project_tests import ProjectTestResult
+    from mimir.tools import repo as repo_module
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.registry import worklink_resume
+    from mimir.worklink import autonomy, detached_dispatch, worker_client
+
+    case = remediation_case
+    event, labels, auth = await _trusted_turn(case)
+    scope = auth.retained_factory_scope
+    assert scope is not None
+    assert labels.has_untrusted_active_ingest is False
+
+    owner_calls: list[tuple[str, ...]] = []
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == case.sandbox
+        owner_calls.append(tuple(argv))
+        return subprocess.run(
+            argv,
+            env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+            capture_output=True,
+            check=False,
+        )
+
+    class FileClient:
+        def factory_file_operation(self, operation, relative_path, **arguments):
+            target = case.checkout / relative_path
+            if operation == "write_file":
+                target.write_text(arguments["content"], encoding="utf-8")
+                return {"status": "ok", "path": relative_path}
+            old = arguments["old_string"]
+            content = target.read_text(encoding="utf-8")
+            assert content.count(old) == 1
+            target.write_text(content.replace(old, arguments["new_string"]), encoding="utf-8")
+            return {"status": "ok", "path": relative_path, "occurrences": 1}
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    monkeypatch.setattr(
+        worker_client.WorkerClient,
+        "for_factory_checkout",
+        lambda *args, **kwargs: FileClient(),
+    )
+
+    async def passing_test(self, selectors=(), *, suite=None):
+        assert self._retained_scope == scope
+        return ProjectTestResult(True, "tests_passed", 0)
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", passing_test)
+    monkeypatch.setattr(
+        autonomy,
+        "make_claims",
+        lambda home: SimpleNamespace(_active_worklink_lock_ids_for_scope=lambda **kwargs: set()),
+    )
+    launches: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        detached_dispatch,
+        "launch_detached_worklink",
+        lambda **kwargs: launches.append(kwargs)
+        or detached_dispatch.DetachedWorklinkProcess(
+            4321, dispatch_failure_state_dir(case.home) / "run-epic-1811.log",
+        ),
+    )
+
+    backend = FileToolRouter(
+        default=WriteGuardBackend(case.home, ["state"], guard_outside_root=True),
+        routes=build_file_tool_routes([
+            (str(case.external), "ro"),
+            (str(case.retained_root), "retained"),
+        ]),
+    )
+    calls = [
+        ("read_file", {"file_path": str(case.sandbox / "fix.txt")}),
+        ("write_file", {"file_path": str(case.sandbox / "new.txt"), "content": "new\n"}),
+        ("edit_file", {
+            "file_path": str(case.sandbox / "fix.txt"),
+            "old_string": "before",
+            "new_string": "after",
+        }),
+        ("repo_status", {"repository": scope.repository, "pull_request": scope.issue_id}),
+        ("repo_diff", {"repository": scope.repository, "pull_request": scope.issue_id}),
+        ("repo_test", {"repository": scope.repository, "pull_request": scope.issue_id}),
+        ("repo_stage", {
+            "repository": scope.repository,
+            "pull_request": scope.issue_id,
+            "paths": ["fix.txt", "new.txt"],
+        }),
+        ("repo_commit", {
+            "repository": scope.repository,
+            "pull_request": scope.issue_id,
+            "paths": ["fix.txt", "new.txt"],
+            "message": "retained remediation",
+        }),
+        ("worklink_resume", {}),
+    ]
+    messages = [
+        AIMessage(content="", tool_calls=[{
+            "name": name,
+            "args": arguments,
+            "id": f"remediation-{index}",
+            "type": "tool_call",
+        }])
+        for index, (name, arguments) in enumerate(calls)
+    ]
+    messages.append(AIMessage(content="recovery dispatched"))
+    install_deepagents_grep_context_tool()
+    tools = [
+        tool for tool in repo_module.REPO_TOOLS
+        if tool.name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+    ] + [worklink_resume]
+    graph = create_deep_agent(
+        model=_ScriptedModel(messages=iter(messages)),
+        tools=tools,
+        backend=backend,
+        middleware=[BudgetGateMiddleware()],
+        system_prompt="repair the retained factory checkout",
+        context_schema=type(auth),
+    )
+    turn = TurnContext(
+        turn_id="retained-remediation-e2e",
+        session_id=event.channel_id,
+        trigger=event.trigger,
+        channel_id=event.channel_id,
+        started_at=0.0,
+        auth_context=auth,
+        ifc_labels=labels,
+    )
+    token = set_current_turn(turn)
+    try:
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content="repair and resume")]}, context=auth,
+        )
+    finally:
+        reset_current_turn(token)
+
+    tool_messages = [message for message in result["messages"] if isinstance(message, ToolMessage)]
+    assert len(tool_messages) == len(calls)
+    assert all(message.status != "error" for message in tool_messages)
+    assert not any("ifc_label_blocked:" in str(message.content) for message in tool_messages)
+    assert case.sandbox.joinpath("fix.txt").read_text(encoding="utf-8") == "after\n"
+    assert case.sandbox.joinpath("new.txt").read_text(encoding="utf-8") == "new\n"
+    assert _git(case.sandbox, "status", "--short") == ""
+    assert _git(case.sandbox, "show", "-s", "--format=%s") == "retained remediation"
+    assert _git(case.sandbox, "show", "-s", "--format=%an <%ae>") == (
+        f"{DEFAULT_USER_NAME} <{DEFAULT_USER_EMAIL}>"
+    )
+    assert owner_calls
+    assert launches and launches[0]["recovery"] == detached_dispatch.FactoryRecoveryIdentity(
+        scope.signature, scope.occurrence_id, scope.run_id, scope.attempt, scope.session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target(
+    remediation_case, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise worklink_resume -> shared launcher -> CLI -> run_epic success."""
+    from mimir.tools import registry
+    from mimir.worklink import autonomy, detached_dispatch
+    from mimir.worklink.orchestrator import WorklinkRunResult, WorklinkRunner
+
+    case = remediation_case
+    _event, _labels, auth = await _trusted_turn(case)
+    scope = auth.retained_factory_scope
+    assert scope is not None
+    sibling = record_failure(
+        dispatch_failure_state_dir(case.home), issue_id=1812, attempt=7,
+        exit_status=1, error="sibling incident", log_path="sibling.log",
+        run_id="chainlink-1812", work_path=str(tmp_path / "sibling"),
+    )
+    before_sibling = json.dumps(sibling, sort_keys=True, separators=(",", ":")).encode()
+    captured_argv: list[str] = []
+
+    def popen(argv, **kwargs):
+        captured_argv[:] = list(argv)
+        assert kwargs["start_new_session"] is True
+        child_result: list[BaseException] = []
+
+        def run_child() -> None:
+            try:
+                cli_main(list(argv[3:]))
+            except BaseException as exc:
+                child_result.append(exc)
+
+        child = threading.Thread(target=run_child)
+        child.start()
+        child.join(timeout=30)
+        assert not child.is_alive()
+        assert len(child_result) == 1
+        assert isinstance(child_result[0], SystemExit)
+        assert child_result[0].code == 0
+        return SimpleNamespace(pid=4321)
+
+    async def successful_recovery(self, issue_id: int, **kwargs):
+        assert issue_id == scope.issue_id
+        assert kwargs["autonomous"] is True
+        assert kwargs["expected_recovery"] == detached_dispatch.FactoryRecoveryIdentity(
+            scope.signature, scope.occurrence_id, scope.run_id, scope.attempt, scope.session,
+        )
+        assert self.chainlink_bin == "fake-chainlink"
+        return WorklinkRunResult(issue_id, scope.attempt, "completed")
+
+    monkeypatch.setenv("CHAINLINK_BIN", "fake-chainlink")
+    monkeypatch.setenv("WORKLINK_RUN_BIN", f"{sys.executable} -m mimir")
+    monkeypatch.setattr(
+        autonomy,
+        "make_claims",
+        lambda home: SimpleNamespace(_active_worklink_lock_ids_for_scope=lambda **kwargs: set()),
+    )
+    real_launch = detached_dispatch.launch_detached_worklink
+    monkeypatch.setattr(
+        detached_dispatch,
+        "launch_detached_worklink",
+        lambda **kwargs: real_launch(**kwargs, popen=popen),
+    )
+    monkeypatch.setattr(WorklinkRunner, "run_epic", successful_recovery)
+
+    output = await registry.worklink_resume.coroutine(runtime=SimpleNamespace(context=auth))
+
+    assert "recovery dispatched" in output
+    assert captured_argv[:4] == [sys.executable, "-m", "mimir", "worklink"]
+    assert captured_argv[4:7] == ["run-epic", "1811", "--home"]
+    expected_flags = {
+        "--expected-signature": scope.signature,
+        "--expected-occurrence": scope.occurrence_id,
+        "--expected-run-id": scope.run_id,
+        "--expected-attempt": str(scope.attempt),
+        "--expected-session": scope.session,
+    }
+    for flag, value in expected_flags.items():
+        index = captured_argv.index(flag)
+        assert captured_argv[index + 1] == value
+    state = load_failure_state(dispatch_failure_state_dir(case.home))["issues"]
+    assert state["1811"]["active"] is False
+    after_sibling = json.dumps(state["1812"], sort_keys=True, separators=(",", ":")).encode()
+    assert after_sibling == before_sibling
 
 
 def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
