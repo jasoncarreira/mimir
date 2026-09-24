@@ -182,6 +182,9 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
         ("missing", "record is missing"),
         ("ambiguous", "record is ambiguous"),
         ("replaced", "target was replaced"),
+        ("replaced_branch", "target was replaced"),
+        ("replaced_repository", "target was replaced"),
+        ("replaced_sandbox", "target was replaced"),
         ("status", "not needs-human"),
         ("alive", "process is alive"),
         ("unverified", "death cannot be verified"),
@@ -209,6 +212,17 @@ async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
         records = [parked, parked]
     elif mutation == "replaced":
         records = [replace(parked, session="replacement")]
+    elif mutation == "replaced_branch":
+        records = [replace(parked, branch="replacement")]
+    elif mutation == "replaced_repository":
+        records = [replace(parked, repository="other/repository")]
+    elif mutation == "replaced_sandbox":
+        replacement = str(case.sandbox.parent.parent / "replacement" / case.sandbox.name)
+        records = [replace(
+            parked,
+            sandbox=replacement,
+            status=replace(parked.status, sandbox_path=replacement),
+        )]
     elif mutation == "status":
         records = [replace(parked, status=replace(parked.status, status="running"))]
     monkeypatch.setenv("WORKLINK_REPO", str(case.sandbox.parent))
@@ -439,7 +453,7 @@ def test_retained_backend_dispatches_both_effects_under_lease(
 
 
 @pytest.mark.parametrize(
-    "race", ["stale", "replaced", "alive", "unverifiable", "fresh", "interlock"],
+    "race", ["stale", "replaced", "legacy", "alive", "unverifiable", "fresh", "interlock"],
 )
 def test_effect_lease_refuses_operation_time_races(
     retained_incident, monkeypatch: pytest.MonkeyPatch, race: str,
@@ -466,6 +480,9 @@ def test_effect_lease_refuses_operation_time_races(
         state.write_text(__import__("json").dumps(payload))
     elif race == "replaced":
         save_factory_record(case.home, replace(case.record, branch="replacement"))
+    elif race == "legacy":
+        (case.home / "state/worklink/factory-runs/chainlink-1810.json").unlink()
+        save_factory_record(case.home, replace(case.record, run_id="1810"))
 
     if race == "interlock":
         from mimir.worklink.factory_state import factory_checkout_interlock
@@ -480,6 +497,7 @@ def test_effect_lease_refuses_operation_time_races(
             expected = {
                 "stale": "incident occurrence is stale",
                 "replaced": "retained factory target was replaced",
+                "legacy": "retained factory target was replaced",
                 "alive": "retained factory process is alive",
                 "unverifiable": "retained factory process death cannot be verified",
                 "fresh": "factory session lock is fresh",

@@ -3048,9 +3048,12 @@ async def worklink_resume(
             record.run_id != scope.run_id
             or record.attempt != scope.attempt
             or record.session != scope.session
+            or record.repository != scope.repository
+            or record.branch != scope.branch
+            or record.sandbox != scope.sandbox
             or incident.get("run_id") != scope.run_id
             or incident.get("attempt") != scope.attempt
-            or incident.get("work_path") != record.sandbox
+            or incident.get("work_path") != scope.sandbox
         ):
             return "worklink_resume refused: retained factory target was replaced"
         if record.status is None or record.status.status != "needs-human":
