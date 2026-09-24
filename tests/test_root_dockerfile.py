@@ -57,6 +57,8 @@ def test_apt_install_layer_includes_ripgrep() -> None:
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
+# Hang guard above the 300s build subprocess bound, so that bound reports first.
+@pytest.mark.timeout(420)
 def test_build_without_provenance_args_fails_with_named_error() -> None:
     """The canonical root image must never build without pinned provenance."""
     result = subprocess.run(
@@ -73,6 +75,10 @@ def test_build_without_provenance_args_fails_with_named_error() -> None:
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
+# Hang guard above the subprocess bounds this test already owns (60s ls-remote,
+# 1200s build, 60s run). The suite-wide 300s default killed a cold-cache image
+# build that was still inside its own 1200s bound.
+@pytest.mark.timeout(1500)
 def test_built_image_provides_process_tools() -> None:
     """The shipped artifact must provide the process tools used by runbooks."""
     image = f"mimir-process-tools-test:{os.getpid()}"
