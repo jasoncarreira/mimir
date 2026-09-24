@@ -6,6 +6,25 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-09-24
+
+Fixes the upgrade from 0.8.x. On 0.9.0, a SAGA store written by 0.8.x refused
+to migrate and every turn failed. Upgrade straight to 0.9.1; no manual step is
+needed.
+
+**Operator action:** a source deployment that runs the canonical image must
+rebuild it, because the feature-factory pins moved to 0.10.6.
+
+- **SAGA: an 0.8.x store now migrates to v14.** 0.8.x stored every atom with the
+  default label `integrity='untrusted'`, and v13 exists to relabel those rows
+  before v14 drops the column. The 0.9.0 pre-check refused them before v13 could
+  run, so an upgraded install failed every turn with
+  `migration v14 refused: atoms contain nontrusted rows`. The early refusal now
+  applies only once v13 has been applied. A store below v13 runs v12, v13 and v14
+  in order. v14's own guard still refuses empty or unknown labels, leaving the
+  column intact. If you relabelled a store by hand on 0.9.0, it is already at v14
+  and nothing changes.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.6. The 0.10.5
   release adds the `.factory.json` `max_retries` default and the read-only
   `factory identity` publishing-identity probe; this repository now declares a
@@ -13,6 +32,9 @@ All notable changes will land here. Format loosely follows
   workflow binds `KEY` only from the resolver's `run_id`, a ticket-key input, or
   not at all for free text, and never decorates it with `#`. Source deployments
   must rebuild the image to install the new package and adapter pins.
+- Size the pytest hang guard on the two Dockerfile build tests above the
+  subprocess bounds they own (1500s and 420s). The suite-wide 300s default had
+  killed a cold-cache image build that was still within its own 1200s bound.
 
 ## [0.9.0] — 2026-09-24
 
