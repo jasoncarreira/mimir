@@ -41,6 +41,7 @@ def _full_pr(number: int, *, author: str = "alice", head_repo: str = REPO) -> di
     """A PR shaped like the API returns it, with head and base populated."""
     return {
         "number": number,
+        "state": "open",
         "title": "Some PR",
         "created_at": "2026-06-01T00:00:00Z",
         "html_url": f"https://github.com/{REPO}/pull/{number}",
@@ -148,6 +149,8 @@ def test_pr_review_on_own_pr_grants_remediation_authority(monkeypatch, captured)
     event = _only_of(captured, "pr_review")
 
     assert event["author"] == SELF, "author must be the PR author, not the reviewer"
+    assert event["actor"] == "jasoncarreira"
+    assert event["pr_state"] == "open"
     assert event["reviewer"] == "jasoncarreira"
     assert "@jasoncarreira requested changes on" in event["prompt"]
 
@@ -155,6 +158,41 @@ def test_pr_review_on_own_pr_grants_remediation_authority(monkeypatch, captured)
     assert scope is not None
     for action in (RepoPRAction.WRITE, RepoPRAction.COMMIT, RepoPRAction.PUSH):
         assert action.value in scope.allowed_operations
+
+
+@pytest.mark.parametrize("event_type", ["issue_comment", "pr_review_comment"])
+def test_pr_comment_emits_live_scope_snapshot(monkeypatch, captured, event_type):
+    pr = _full_pr(12, author=SELF)
+    monkeypatch.setattr(
+        poller,
+        "_gh_api",
+        lambda endpoint, token: [] if endpoint.endswith("/reviews") else pr,
+    )
+
+    assert poller._emit_pr_review_needed(
+        "please fix",
+        token="token",
+        reviewer=SELF,
+        activity_at="2026-06-02T00:00:00Z",
+        event_type=event_type,
+        repo=REPO,
+        number="12",
+        url=(
+            f"https://github.com/{REPO}/pull/12#issuecomment-1"
+            if event_type == "issue_comment"
+            else f"https://github.com/{REPO}/pull/12#discussion_r1"
+        ),
+        author="jasoncarreira",
+    ) is True
+
+    event = _only_of(captured, event_type)
+    assert event["actor"] == "jasoncarreira"
+    assert event["author"] == SELF
+    assert event["number"] == 12
+    assert event["pr_state"] == "open"
+    scope = _scope_from(event)
+    assert scope is not None
+    assert scope.observed_head_sha == "a" * 40
 
 
 def test_pr_review_from_a_fork_reports_the_source_remote(monkeypatch, captured):

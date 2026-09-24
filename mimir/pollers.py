@@ -3307,6 +3307,10 @@ async def run_poller(
                         trusted = resolved_trust
                         if resolved_trust is not None:
                             github_trust_cache[cache_key] = resolved_trust
+                    # Replace any subprocess claims with the server-attested
+                    # actor and verdict consumed by PR scope authorization.
+                    item_extras["actor"] = author
+                    item_extras["author_is_trusted"] = trusted is True
             item_labels = item_labels.with_source(SourceLabel(
                 principal=service_principal,
                 domain="channel",

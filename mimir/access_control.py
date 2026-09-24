@@ -1326,6 +1326,9 @@ def _repo_pr_scope_resolution(
     base_ref: object,
     base_sha: object,
     review_state: object = None,
+    actor: object = None,
+    author_is_trusted: object = None,
+    pr_state: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
@@ -1334,13 +1337,28 @@ def _repo_pr_scope_resolution(
         and review_state == "CHANGES_REQUESTED"
         and principal == self_login
     )
-    is_remediation = is_fresh_changes_requested_remediation or event_type in {
-        "heartbeat_pr_maintenance",
-        "pr_changes_requested_stale",
-        "pr_ci_failure",
-        "pr_mergeability_rebase",
-        "pr_mergeability_conflicting",
-    }
+    is_trusted_comment_remediation = (
+        (
+            event_type in {"issue_comment", "pr_review_comment"}
+            or (event_type == "pr_review" and review_state == "COMMENTED")
+        )
+        and principal == self_login
+        and author_is_trusted is True
+        and isinstance(actor, str)
+        and actor.lower() != self_login.lower()
+        and pr_state == "open"
+    )
+    is_remediation = (
+        is_fresh_changes_requested_remediation
+        or is_trusted_comment_remediation
+        or event_type in {
+            "heartbeat_pr_maintenance",
+            "pr_changes_requested_stale",
+            "pr_ci_failure",
+            "pr_mergeability_rebase",
+            "pr_mergeability_conflicting",
+        }
+    )
     if (
         not self_login
         or (is_remediation and principal != self_login)
@@ -1551,6 +1569,9 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             principal=item.get("author"),
             event_type=item.get("event_type"),
             review_state=item.get("state"),
+            actor=item.get("actor"),
+            author_is_trusted=item.get("author_is_trusted"),
+            pr_state=item.get("pr_state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),
             head_remote=item.get("head_remote"),

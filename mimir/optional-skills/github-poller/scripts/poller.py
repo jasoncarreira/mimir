@@ -1983,12 +1983,25 @@ def _emit_pr_review_needed(
     a current-head review is known.
     """
     reviewed = current_head_reviewed
+    pr = None
+    repo = extras.get("repo")
+    number = extras.get("number")
+    if (
+        extras.get("event_type") in {"issue_comment", "pr_review_comment"}
+        and isinstance(repo, str)
+        and number is not None
+    ):
+        pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
+        if isinstance(pr, dict):
+            extras["actor"] = extras.get("author")
+            extras["author"] = (pr.get("user") or {}).get("login")
+            extras["number"] = pr.get("number")
+            extras["pr_state"] = pr.get("state")
+            extras.update(_pr_scope_fields(pr, repo))
     if reviewed is None and reviewer:
-        repo = extras.get("repo")
-        number = extras.get("number")
         head_sha = extras.get("head_sha") or extras.get("new_head")
         if not head_sha and isinstance(repo, str) and number is not None:
-            pr = _gh_api(f"repos/{repo}/pulls/{number}", token)
+            pr = pr or _gh_api(f"repos/{repo}/pulls/{number}", token)
             if isinstance(pr, dict):
                 head_sha = (pr.get("head") or {}).get("sha")
         reviewed = bool(
@@ -3266,7 +3279,8 @@ def _check_pr_reviews(
             _emit(prompt, event_type="pr_review",
                   repo=repo, number=pr_number, url=url, state=state,
                   author=(pr.get("user") or {}).get("login"),
-                  reviewer=reviewer_login,
+                  actor=reviewer_login, reviewer=reviewer_login,
+                  pr_state=pr.get("state") or "open",
                   **_pr_scope_fields(pr, repo))
             count += 1
     return count
