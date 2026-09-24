@@ -657,7 +657,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         launcher.write_text("", encoding="utf-8")
         for package in (launcher.parent.parent, adapter):
             (package / "package.json").write_text(
-                json.dumps({"version": "0.10.4"}), encoding="utf-8",
+                json.dumps({"version": "0.10.6"}), encoding="utf-8",
             )
         incident = record_failure(
             dispatch_failure_state_dir(home), issue_id=1811, attempt=1,

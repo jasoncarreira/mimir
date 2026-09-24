@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from mimir.worklink.backends.feature_factory import _DEFAULT_FACTORY_MAX_RETRIES
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DECLARATION = REPO_ROOT / ".factory.json"
 
@@ -117,7 +119,12 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # before any gate instead of discovering they are absent. `publish` is intentionally absent:
     # feature-factory's default publisher honors `pr_draft` and validates its own output.
     assert set(data) == {
-        "resolve", "verify", "verify_timeout_ms", "bootstrap", "pr_draft",
+        "resolve",
+        "verify",
+        "verify_timeout_ms",
+        "bootstrap",
+        "max_retries",
+        "pr_draft",
     }
     # `verify_timeout_ms` is declared because the factory default of 900000 (15 min) is
     # shorter than this suite. A canonical run reached ~79% of 8937 tests before the
@@ -125,6 +132,12 @@ def test_declaration_is_valid_json_with_exactly_the_expected_keys() -> None:
     # timeout -- which then blocks relaunching the run on the same SHA. The suite takes
     # 8.5-15 min here, so 30 min is headroom rather than a guess at the current runtime.
     assert data["verify_timeout_ms"] == 1800000
+    assert (
+        isinstance(data["max_retries"], int)
+        and not isinstance(data["max_retries"], bool)
+        and data["max_retries"] > 0
+        and data["max_retries"] == _DEFAULT_FACTORY_MAX_RETRIES
+    )
     # The value, not merely the key. A draft is invisible to a poller that acts on open PRs and
     # `gh pr merge` refuses it.
     assert data["pr_draft"] is False
