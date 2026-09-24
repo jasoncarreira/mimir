@@ -271,6 +271,7 @@ testpaths = ["tests"]
 addopts = "-n auto"
 markers = [
     "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
+    "real_worklink_identities: use provisioned mimir/worklink accounts instead of synthetic IDs",
 ]
 # Fail stalled tests individually, preserving their node ids and the session.
 # The thread method exits the worker instead of reporting a normal failure.

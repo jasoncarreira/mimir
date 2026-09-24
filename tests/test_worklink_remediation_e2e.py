@@ -551,6 +551,7 @@ async def test_worklink_resume_shared_launcher_runs_epic_and_retires_only_target
     assert after_sibling == before_sibling
 
 
+@pytest.mark.real_worklink_identities
 def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

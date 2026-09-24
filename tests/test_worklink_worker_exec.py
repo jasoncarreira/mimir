@@ -1829,6 +1829,7 @@ def test_factory_file_child_bounds_and_atomically_publishes_edits(
     assert target.read_text() == "old old"
 
 
+@pytest.mark.real_worklink_identities
 def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root with distinct controller and worker identities")

@@ -2832,6 +2832,7 @@ async def test_project_test_snapshot_cleanup_failure_is_not_silent(
     assert str(state.checkout_lease.path) not in str(refusal.value)
 
 
+@pytest.mark.real_worklink_identities
 def test_project_test_real_executor_preserves_active_lease_for_later_commit(
     repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
