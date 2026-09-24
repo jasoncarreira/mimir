@@ -641,12 +641,12 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 
         (home / "worklink.yaml").write_text(
             "defaults:\n"
-            "  test_command: ./verify-remediation\n"
+            "  test_command: sh verify-remediation\n"
             "backends:\n"
             "  opencode:\n"
             "    bash_allowlist:\n"
             "      - git *\n"
-            "      - ./verify-remediation\n",
+            "      - sh verify-remediation\n",
             encoding="utf-8",
         )
         os.chown(home / "worklink.yaml", identities.mimir_uid, identities.mimir_gid)
