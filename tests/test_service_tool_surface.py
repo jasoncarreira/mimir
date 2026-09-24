@@ -7,11 +7,13 @@ from typing import Any
 
 import pytest
 from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
+from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
 from pydantic import PrivateAttr
@@ -27,7 +29,10 @@ from mimir.access_control import (
 )
 from mimir.models import AuthContext
 from mimir.tools.budget_gate import BudgetGateMiddleware
-from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+from mimir.tools.service_tool_surface import (
+    ServiceToolSurfaceMiddleware,
+    ServiceToolSurfaceState,
+)
 
 
 def auth(service: ServicePrincipal | None = None, **changes: Any) -> AuthContext:
@@ -107,6 +112,136 @@ class RecordingModel(BaseChatModel):
 
     async def _agenerate(self, messages: list[Any], **kwargs: Any) -> ChatResult:
         return self._generate(messages, **kwargs)
+
+
+def test_surface_state_accepts_parallel_last_value_writes():
+    builder = StateGraph(ServiceToolSurfaceState)
+    builder.add_node("first", lambda _state: {"service_tool_surface_names": ["first"]})
+    builder.add_node("second", lambda _state: {"service_tool_surface_names": ["second"]})
+    builder.add_edge(START, "first")
+    builder.add_edge(START, "second")
+    builder.add_edge("first", END)
+    builder.add_edge("second", END)
+
+    result = builder.compile().invoke({"messages": []})
+
+    assert result["service_tool_surface_names"] in (["first"], ["second"])
+
+
+@pytest.mark.asyncio
+async def test_parallel_service_subagents_keep_parent_surface_private():
+    from deepagents import create_deep_agent
+    from deepagents.backends import StateBackend
+
+    from mimir._deepagents_patches import install_deepagents_grep_context_tool
+    from mimir._deepagents_subagent_auth import install_subagent_auth_context_patch
+
+    parent_states: list[list[str] | None] = []
+
+    class _CaptureParentSurface(AgentMiddleware):
+        def before_model(self, state, runtime):  # noqa: ARG002
+            names = state.get("service_tool_surface_names")
+            parent_states.append(list(names) if names is not None else None)
+
+    class _ParallelTaskModel(BaseChatModel):
+        _child_completions: list[str] = PrivateAttr(default_factory=list)
+        _parent_surfaces: list[list[str]] = PrivateAttr(default_factory=list)
+        _children_seen_on_resume: list[int] = PrivateAttr(default_factory=list)
+
+        @property
+        def _llm_type(self) -> str:
+            return "parallel-service-subagent-test"
+
+        def bind_tools(self, tools: list[Any], **kwargs: Any):  # noqa: ARG002
+            return self
+
+        def _response(self, messages: list[Any]) -> ChatResult:
+            human_text = next(
+                (message.text for message in messages if message.type == "human"), "",
+            )
+            if human_text in {"child one", "child two"}:
+                self._child_completions.append(human_text)
+                response = AIMessage(content=f"completed {human_text}")
+            else:
+                system = next(message.text for message in messages if message.type == "system")
+                marker = "Available tools: "
+                surface = system.split(marker, 1)[1].split(".", 1)[0].split(", ")
+                self._parent_surfaces.append(surface)
+                task_results = [
+                    message for message in messages
+                    if isinstance(message, ToolMessage) and message.tool_call_id.startswith("task-")
+                ]
+                invalid_results = [
+                    message for message in messages
+                    if isinstance(message, ToolMessage) and message.tool_call_id == "parent-invalid"
+                ]
+                if invalid_results:
+                    response = AIMessage(content="parent done")
+                elif task_results:
+                    self._children_seen_on_resume.append(len(self._child_completions))
+                    response = AIMessage(content="", tool_calls=[{
+                        "name": "parent_missing", "args": {}, "id": "parent-invalid",
+                        "type": "tool_call",
+                    }])
+                else:
+                    response = AIMessage(content="", tool_calls=[
+                        {
+                            "name": "task",
+                            "args": {"description": "child one", "subagent_type": "worker"},
+                            "id": "task-one", "type": "tool_call",
+                        },
+                        {
+                            "name": "task",
+                            "args": {"description": "child two", "subagent_type": "worker"},
+                            "id": "task-two", "type": "tool_call",
+                        },
+                    ])
+            return ChatResult(generations=[ChatGeneration(message=response)])
+
+        def _generate(self, messages: list[Any], **kwargs: Any) -> ChatResult:
+            return self._response(messages)
+
+        async def _agenerate(self, messages: list[Any], **kwargs: Any) -> ChatResult:
+            await asyncio.sleep(0)
+            return self._response(messages)
+
+    model = _ParallelTaskModel()
+    install_subagent_auth_context_patch()
+    install_deepagents_grep_context_tool()
+    agent = create_deep_agent(
+        model=model,
+        tools=tools("web_search"),
+        backend=StateBackend(),
+        middleware=[_CaptureParentSurface(), ServiceToolSurfaceMiddleware()],
+        subagents=[{
+            "name": "worker",
+            "description": "service surface test child",
+            "system_prompt": "Complete the delegated task.",
+            "tools": tools("memory_query"),
+            "middleware": [ServiceToolSurfaceMiddleware()],
+        }],
+        context_schema=AuthContext,
+    )
+
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "delegate both children"}]},
+        context=service_context("research"),
+    )
+
+    assert sorted(model._child_completions) == ["child one", "child two"]
+    assert model._children_seen_on_resume == [2]
+    assert parent_states[0] == []
+    assert parent_states[1] == model._parent_surfaces[0]
+    assert "web_search" in parent_states[1]
+    assert "memory_query" not in parent_states[1]
+    error = next(
+        message for message in result["messages"]
+        if isinstance(message, ToolMessage) and message.tool_call_id == "parent-invalid"
+    )
+    assert error.content == (
+        "Error: parent_missing is not a valid tool. Available tools: "
+        + ", ".join(model._parent_surfaces[0]) + "."
+    )
 
 
 @pytest.mark.parametrize("kind", ["research", "code_execution", "admin"])
