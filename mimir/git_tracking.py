@@ -39,6 +39,7 @@ import logging
 import os
 import random
 import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,16 @@ _push_retry_tasks: dict[str, asyncio.Task | None] = {}
 # Latest successful proposal cleanup observation, kept in memory so a restart
 # announces the current state again rather than inheriting stale suppression.
 _proposal_cleanup_skip_reasons: dict[str, dict[str, str]] = {}
+
+
+@dataclass
+class _IndexLockEpisode:
+    blocked_commits: int = 0
+    blocked_pulls: int = 0
+    stale_emitted: bool = False
+
+
+_index_lock_episodes: dict[str, _IndexLockEpisode] = {}
 
 # Retry schedule after a push failure. Tests monkeypatch this.
 PUSH_RETRY_DELAYS: tuple[float, ...] = (300.0, 900.0, 2700.0)  # 5m, 15m, 45m
@@ -115,6 +126,7 @@ COMMAND_TIMEOUT_SECONDS = 10.0
 # both the schedule and jitter.
 INDEX_LOCK_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.15, 0.35)
 INDEX_LOCK_RETRY_JITTER_SECONDS = 0.025
+INDEX_LOCK_STALE_SECONDS = 10 * 60
 _INDEX_TOUCHING_SUBCOMMANDS = frozenset({"add", "commit", "fetch", "pull", "reset"})
 _INDEX_LOCK_COLLISION_MARKERS = (
     "file exists",
@@ -155,6 +167,7 @@ def reset_module_state() -> None:
     _push_retry_tasks.clear()
     _push_debounce_locks.clear()
     _proposal_cleanup_skip_reasons.clear()
+    _index_lock_episodes.clear()
 
 
 # ─── git error type + subprocess wrapper ─────────────────────────────
@@ -393,6 +406,59 @@ async def _git(
             await asyncio.sleep(delay)
 
 
+async def _record_index_lock_block(
+    *, home: Path, turn_id: str, operation: str, exc: BaseException,
+) -> None:
+    """Track an exhausted home-repo index-lock collision and surface staleness."""
+    if not isinstance(exc, GitError) or not _is_index_lock_collision(
+        returncode=exc.returncode,
+        stderr=exc.stderr,
+        args=exc.cmd,
+    ):
+        return
+
+    key = _home_key(home)
+    episode = _index_lock_episodes.setdefault(key, _IndexLockEpisode())
+    if operation == "commit":
+        episode.blocked_commits += 1
+    else:
+        episode.blocked_pulls += 1
+
+    lock_path = home / ".git" / "index.lock"
+    try:
+        age_seconds = max(0.0, time.time() - lock_path.stat().st_mtime)
+    except OSError:
+        return
+    if episode.stale_emitted or age_seconds < INDEX_LOCK_STALE_SECONDS:
+        return
+
+    episode.stale_emitted = True
+    await log_event(
+        "git_index_lock_stale",
+        turn_id=turn_id,
+        path=str(lock_path),
+        age_seconds=round(age_seconds, 1),
+        failure_count=episode.blocked_commits + episode.blocked_pulls,
+        blocked_commits=episode.blocked_commits,
+        blocked_pulls=episode.blocked_pulls,
+    )
+
+
+async def _recover_index_lock_episode(*, home: Path, turn_id: str) -> None:
+    """End an index-lock episode after a commit proves the index is writable."""
+    episode = _index_lock_episodes.pop(_home_key(home), None)
+    if episode is None or not episode.stale_emitted:
+        return
+    await log_event(
+        "git_index_lock_recovered",
+        turn_id=turn_id,
+        path=str(home / ".git" / "index.lock"),
+        failure_count=episode.blocked_commits + episode.blocked_pulls,
+        blocked_commits=episode.blocked_commits,
+        blocked_pulls=episode.blocked_pulls,
+    )
+
+
 def _schedule_push_retry_locked(
     *,
     key: str,
@@ -535,6 +601,9 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
     try:
         await _git("add", "-A", cwd=home)
     except (GitError, asyncio.TimeoutError, OSError) as exc:
+        await _record_index_lock_block(
+            home=home, turn_id=turn_id, operation="commit", exc=exc,
+        )
         await log_event(
             "git_commit_failed",
             stage="add",
@@ -580,6 +649,9 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
             error=_short_err(exc),
             attempts=getattr(exc, "attempts", 1),
         )
+        await _record_index_lock_block(
+            home=home, turn_id=turn_id, operation="commit", exc=exc,
+        )
         return False
     except (asyncio.TimeoutError, OSError) as exc:
         await log_event(
@@ -590,6 +662,7 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
             attempts=getattr(exc, "attempts", 1),
         )
         return False
+    await _recover_index_lock_episode(home=home, turn_id=turn_id)
     return True
 
 
@@ -938,6 +1011,9 @@ async def _sync_remote_before_push(
         )
         return True
     except (GitError, asyncio.TimeoutError, OSError, asyncio.CancelledError) as exc:
+        await _record_index_lock_block(
+            home=home, turn_id=turn_id, operation="pull", exc=exc,
+        )
         # Distinguish a rebase CONFLICT from a transient/remote failure: if
         # ``rebase --abort`` succeeds there WAS a rebase in progress.
         aborted = False

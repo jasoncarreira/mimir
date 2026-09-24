@@ -456,6 +456,16 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
             f"Tracked-state changes from this turn are NOT staged. "
             f"Investigate /mimir-home git status; next successful turn re-tries."
         )
+    if rule_kind == "git_index_lock_stale":
+        path = _sanitize_field(ev.get("path") or "/mimir-home/.git/index.lock")
+        age = ev.get("age_seconds")
+        age_str = f"{float(age):.0f} seconds" if isinstance(age, (int, float)) else "unknown"
+        failures = ev.get("failure_count", "?")
+        return (
+            f"Stale git index lock at {path} is {age_str} old and has blocked "
+            f"{failures} commit/pull operation(s). Confirm no git process is "
+            f"using the repository, then remove the lock."
+        )
     if rule_kind == "ignored_write":
         count = ev.get("count", "?")
         paths = ev.get("paths") or []

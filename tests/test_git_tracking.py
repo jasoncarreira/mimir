@@ -28,6 +28,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1308,7 +1309,7 @@ async def test_exhausted_index_lock_retries_report_attempts_without_deleting_loc
 ) -> None:
     """A persistent lock fails closed and leaves the lock untouched."""
     lock_path = home_repo / ".git" / "index.lock"
-    lock_path.write_bytes(b"")
+    lock_path.write_bytes(b"owner marker")
     monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0, 0.0))
     monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
 
@@ -1330,7 +1331,117 @@ async def test_exhausted_index_lock_retries_report_attempts_without_deleting_loc
     assert failures[0]["attempts"] == 3
     assert "after 3 attempts" in failures[0]["error"]
     assert lock_path.exists()
+    assert lock_path.read_bytes() == b"owner marker"
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
     assert git_tracking._pending_push_task is None
+
+
+@pytest.mark.asyncio
+async def test_stale_index_lock_episode_emits_once_recovers_and_can_recur(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"owner marker")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    (home_repo / "memory").mkdir()
+    note = home_repo / "memory" / "blocked.md"
+    note.write_text("blocked\n")
+
+    # A live-looking lock retains the existing retry/failure behavior but does
+    # not begin an operator-visible stale episode.
+    await git_tracking.commit_turn_changes(
+        turn_id="young", trigger="user_message", home=home_repo, enabled=True,
+    )
+    assert not [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+
+    old_mtime = time.time() - git_tracking.INDEX_LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (old_mtime, old_mtime))
+    await git_tracking.commit_turn_changes(
+        turn_id="stale", trigger="user_message", home=home_repo, enabled=True,
+    )
+    await git_tracking.commit_turn_changes(
+        turn_id="same-episode", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["path"] == str(lock_path)
+    assert stale[0]["age_seconds"] >= git_tracking.INDEX_LOCK_STALE_SECONDS
+    assert stale[0]["failure_count"] == 2
+    assert stale[0]["blocked_commits"] == 2
+    assert stale[0]["blocked_pulls"] == 0
+    assert lock_path.read_bytes() == b"owner marker"
+
+    lock_path.unlink()
+    await git_tracking.commit_turn_changes(
+        turn_id="recovered", trigger="user_message", home=home_repo, enabled=True,
+    )
+    recovered = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_recovered"
+    ]
+    assert len(recovered) == 1
+    assert recovered[0]["failure_count"] == 3
+
+    note.write_text("blocked again\n")
+    lock_path.write_bytes(b"new owner")
+    os.utime(lock_path, (old_mtime, old_mtime))
+    await git_tracking.commit_turn_changes(
+        turn_id="new-episode", trigger="user_message", home=home_repo, enabled=True,
+    )
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 2
+    assert stale[1]["failure_count"] == 1
+    assert lock_path.read_bytes() == b"new owner"
+
+
+@pytest.mark.asyncio
+async def test_stale_index_lock_counts_blocked_pulls_and_commits(
+    home_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = home_repo / ".git" / "index.lock"
+    lock_path.write_bytes(b"owner")
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(git_tracking, "INDEX_LOCK_RETRY_JITTER_SECONDS", 0.0)
+
+    await git_tracking._record_index_lock_block(
+        home=home_repo,
+        turn_id="pull",
+        operation="pull",
+        exc=git_tracking.GitError(128, _INDEX_LOCK_ERROR, ("pull", "--rebase"), attempts=2),
+    )
+
+    old_mtime = time.time() - git_tracking.INDEX_LOCK_STALE_SECONDS - 1
+    os.utime(lock_path, (old_mtime, old_mtime))
+    (home_repo / "memory").mkdir()
+    (home_repo / "memory" / "blocked.md").write_text("blocked\n")
+    await git_tracking.commit_turn_changes(
+        turn_id="commit", trigger="user_message", home=home_repo, enabled=True,
+    )
+
+    stale = [
+        event for event in _read_events(tmp_path)
+        if event["type"] == "git_index_lock_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["failure_count"] == 2
+    assert stale[0]["blocked_commits"] == 1
+    assert stale[0]["blocked_pulls"] == 1
+    assert lock_path.read_bytes() == b"owner"
 
 
 @pytest.mark.asyncio
