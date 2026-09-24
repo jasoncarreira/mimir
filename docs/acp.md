@@ -2,7 +2,7 @@
 
 ## Experimental status
 
-**ACP and Hands are experimental in 0.9.0.** Do not depend on them for
+**ACP and Hands are experimental in 0.9.x.** Do not depend on them for
 multi-client access, filesystem sandboxing, or durable Python state. Current
 operator-visible limits are:
 
@@ -64,7 +64,7 @@ response.
 Prerequisites are a macOS or Linux client with a native OS credential store and
 `uvx` installed, plus a matching `mimir-agent` artifact published or provisioned
 in your environment. The server needs an initialized Mimir home and configured
-model. The registry's 0.9.0 candidate is not evidence that the package is
+model. The registry's 0.9.1 candidate is not evidence that the package is
 available from PyPI.
 
 Know the machine boundary before starting. Native Mimir file, shell, and memory
@@ -109,7 +109,7 @@ but do not contact the daemon or validate server credentials.
 printed by `command -v uvx` and replacing `PROFILE` with the profile name:
 
 ```jsonc
-{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
+{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.1","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
 ```
 
 Success means the editor lists Mimir, authentication completes, a session
@@ -245,13 +245,13 @@ These configurations support macOS and Linux proxy/client hosts. Windows client 
 Save this as `~/.jetbrains/acp.json`. The display/id is `mimir`. The providerless configuration disables both integrated MCP sources; ordinary IntelliJ MCP servers are not compatible with Mimir Hands.
 
 ```json
-{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
+{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.1","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
 ```
 
 ### Zed
 
 ```json
-{"agent_servers":{"mimir":{"type":"custom","command":"uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
+{"agent_servers":{"mimir":{"type":"custom","command":"uvx","args":["mimir-agent==0.9.1","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
 ```
 
 ### VS Code
@@ -259,12 +259,12 @@ Save this as `~/.jetbrains/acp.json`. The display/id is `mimir`. The providerles
 This example uses community extension `formulahendry.acp-client` version `0.2.0`, source commit `e7371659e3ac100db842b419b1361205a193032e`, and its `acp.agents` setting:
 
 ```json
-{"acp.agents":{"mimir":{"command":"uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
+{"acp.agents":{"mimir":{"command":"uvx","args":["mimir-agent==0.9.1","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}
 ```
 
 As the accepted premise measured 2026-08-09, Microsoft's native VS Code agent system uses AHP, not this community ACP-client integration.
 
-The registry candidate renders the launch shape `uvx mimir-agent==0.9.0 acp`. It is an offline review candidate and does not claim that unpublished version 0.9.0 is already installable. PyPI publication and registry submission remain separately authorized and release-gated after publication and manual smoke testing.
+The registry candidate renders the launch shape `uvx mimir-agent==0.9.1 acp`. It is an offline review candidate and does not claim that version 0.9.1 is installable in your environment. PyPI publication and registry submission remain separately authorized and release-gated after publication and manual smoke testing.
 
 ### Registry eligibility
 
@@ -375,7 +375,7 @@ These commands do not widen permissions. Shell and Python children run under OS-
 
 The proxy intentionally reports the generic diagnostic `error: connection-failed`. Confirm the selected profile, then confirm `mimir run` is running with `MIMIR_ACP_ENABLED=true`. As the owner UID, inspect `<MIMIR_HOME>/.mimir/acp`: the directory must be mode `0700`, and `daemon.sock` must be mode `0600`. Start or restart `mimir run` if the daemon is missing or disabled; the proxy will not start it.
 
-For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.0, it is on the noninteractive PATH, identity and known-hosts permissions are correct, the host-key entry matches, and remote stdout is banner-free.
+For SSH profiles, additionally confirm the remote `mimir-agent` version is 0.9.1, it is on the noninteractive PATH, identity and known-hosts permissions are correct, the host-key entry matches, and remote stdout is banner-free.
 
 
 ### Hands execution scope

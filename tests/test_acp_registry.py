@@ -16,12 +16,12 @@ DOCS = (ROOT / "docs/acp.md").read_text()
 EXPECTED_MANIFEST = {
     "id": "mimir",
     "name": "Mimir",
-    "version": "0.9.0",
+    "version": "0.9.1",
     "description": "Memory-centric AI agent accessible through the Agent Client Protocol.",
     "repository": "https://github.com/jasoncarreira/mimir",
     "authors": ["Jason Carreira"],
     "license": "MIT",
-    "distribution": {"uvx": {"package": "mimir-agent==0.9.0", "args": ["acp"]}},
+    "distribution": {"uvx": {"package": "mimir-agent==0.9.1", "args": ["acp"]}},
 }
 EXPECTED_ICON = b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 13V3l5 5 5-5v10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>\n'
 PROFILE_COMMANDS = [
@@ -51,7 +51,7 @@ QUICK_START_CONSOLE = [
         ]
     ),
 ]
-QUICK_START_JETBRAINS = '{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.0","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}'
+QUICK_START_JETBRAINS = '{"default_mcp_settings":{"use_idea_mcp":false,"use_custom_mcp":false},"agent_servers":{"mimir":{"command":"/absolute/path/to/uvx","args":["mimir-agent==0.9.1","acp"],"env":{"MIMIR_ACP_PROFILE":"PROFILE"}}}}'
 
 
 def section(start: str, end: str) -> str:
@@ -68,7 +68,7 @@ def test_manifest_exact() -> None:
     assert manifest == EXPECTED_MANIFEST
     assert path.parent.name == manifest["id"]
     assert "authMethods" not in manifest
-    assert f"uvx {manifest['distribution']['uvx']['package']} {' '.join(manifest['distribution']['uvx']['args'])}" == "uvx mimir-agent==0.9.0 acp"
+    assert f"uvx {manifest['distribution']['uvx']['package']} {' '.join(manifest['distribution']['uvx']['args'])}" == "uvx mimir-agent==0.9.1 acp"
 
 
 def test_schema_digest_then_validation() -> None:
@@ -125,7 +125,7 @@ def test_icon_exact() -> None:
 def test_metadata_lock_and_launch_shape() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
-    assert project["project"]["version"] == "0.9.0"
+    assert project["project"]["version"] == "0.9.1"
     assert project["project"]["optional-dependencies"]["dev"].count("jsonschema==4.26.0") == 1
     assert project["dependency-groups"]["dev"].count("jsonschema==4.26.0") == 1
     assert "jsonschema==4.26.0" not in project["project"]["dependencies"]
@@ -135,7 +135,7 @@ def test_metadata_lock_and_launch_shape() -> None:
     assert '"mimir-agent": "mimir.entrypoint:main"' in packaging_proof
     assert '"mimir-agent": "mimir.entrypoint:main"' in installed_proof
     root = next(package for package in lock["package"] if package["name"] == "mimir-agent")
-    assert root["version"] == "0.9.0"
+    assert root["version"] == "0.9.1"
     assert {item["name"]: item.get("specifier") for item in root["metadata"]["requires-dev"]["dev"]}["jsonschema"] == "==4.26.0"
     pinned_extra = [item for item in root["metadata"]["requires-dist"] if item["name"] == "jsonschema"]
     assert pinned_extra == [{"name": "jsonschema", "marker": "extra == 'dev'", "specifier": "==4.26.0"}]
@@ -260,9 +260,9 @@ def test_ssh_policy_and_trust_boundary() -> None:
 def test_stock_client_examples_exact() -> None:
     objects = [json.loads(value) for value in fenced("json")]
     assert objects == [
-        {"default_mcp_settings": {"use_idea_mcp": False, "use_custom_mcp": False}, "agent_servers": {"mimir": {"command": "/absolute/path/to/uvx", "args": ["mimir-agent==0.9.0", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
-        {"agent_servers": {"mimir": {"type": "custom", "command": "uvx", "args": ["mimir-agent==0.9.0", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
-        {"acp.agents": {"mimir": {"command": "uvx", "args": ["mimir-agent==0.9.0", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+        {"default_mcp_settings": {"use_idea_mcp": False, "use_custom_mcp": False}, "agent_servers": {"mimir": {"command": "/absolute/path/to/uvx", "args": ["mimir-agent==0.9.1", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+        {"agent_servers": {"mimir": {"type": "custom", "command": "uvx", "args": ["mimir-agent==0.9.1", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
+        {"acp.agents": {"mimir": {"command": "uvx", "args": ["mimir-agent==0.9.1", "acp"], "env": {"MIMIR_ACP_PROFILE": "PROFILE"}}}},
     ]
     text = section("## Stock clients", "## Connections")
     for value in [
@@ -382,7 +382,7 @@ def test_troubleshooting_contract() -> None:
         "mode `0700`",
         "`daemon.sock` must be mode `0600`",
         "Start or restart `mimir run`",
-        "remote `mimir-agent` version is 0.9.0",
+        "remote `mimir-agent` version is 0.9.1",
         "noninteractive PATH",
         "host-key entry matches",
         "banner-free",
