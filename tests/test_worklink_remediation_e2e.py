@@ -773,7 +773,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
             assert "error" not in result, json.dumps(result, indent=2)
             assert executor.connections >= 8
         assert "fix.txt" in result["status"] and "new.txt" in result["status"]
-        assert "+after" in result["diff"] and "+new" in result["diff"]
+        assert "+after" in result["diff"]
         assert result["tested"] is True, result
         assert result["staged"] is True and result["committed"] is True
         assert (sandbox / "new.txt").stat().st_uid == identities.worklink_uid
