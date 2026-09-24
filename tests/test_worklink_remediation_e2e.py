@@ -666,6 +666,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         monkeypatch.setenv("HOME", str(controller_home))
         monkeypatch.setenv("WORKLINK_REPO", str(controller_repo))
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+        init_logger(home / "logs" / "events.jsonl", session_id="remediation-root-e2e")
         case = SimpleNamespace(
             home=home,
             state_root=home / "state" / "pollers",
