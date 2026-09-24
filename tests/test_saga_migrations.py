@@ -1878,8 +1878,36 @@ class TestV13TrustedBoundaryMigration:
 
 class TestV14IntegrityRemoval:
     @staticmethod
-    def _database(version: int = 13) -> sqlite3.Connection:
-        conn = sqlite3.connect(":memory:")
+    def _v11_database(db_path: str | Path = ":memory:") -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
+        conn.executescript(Path("mimir/saga/schema.sql").read_text())
+        # v14 only removed integrity from the shipped v11 schema. Restoring its
+        # exact definition reconstructs the on-disk schema produced by 0.8.8.
+        conn.execute(
+            "ALTER TABLE atoms ADD COLUMN integrity TEXT NOT NULL DEFAULT 'untrusted' "
+            "CHECK(integrity IN ('trusted', 'untrusted'))"
+        )
+        conn.executemany(
+            "INSERT INTO schema_version VALUES (?, '2026-08-01T00:00:00+00:00')",
+            [(version,) for version in range(1, 12)],
+        )
+        conn.executemany(
+            "INSERT INTO atoms (id, content, content_hash, created_at, tombstoned) "
+            "VALUES (?, ?, ?, '2020-01-01', ?)",
+            [
+                ("live", "searchable live", "h1", 0),
+                ("dead", "searchable tombstone", "h2", 1),
+            ],
+        )
+        conn.commit()
+        assert m.detect_schema_version(conn) == 11
+        return conn
+
+    @staticmethod
+    def _database(
+        version: int = 13, db_path: str | Path = ":memory:"
+    ) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path)
         conn.executescript(Path("mimir/saga/schema.sql").read_text())
         conn.execute("PRAGMA foreign_keys=ON")
         # Nullable to also exercise fail-closed handling of malformed legacy data.
@@ -1914,6 +1942,48 @@ class TestV14IntegrityRemoval:
         conn.commit()
         assert m.detect_schema_version(conn) == version
         return conn
+
+    def test_v11_default_untrusted_atoms_migrate_through_v14(self) -> None:
+        conn = self._v11_database()
+        before = conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall()
+
+        m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert conn.execute(
+            "SELECT version FROM schema_version WHERE version >= 12 ORDER BY version"
+        ).fetchall() == [(12,), (13,), (14,)]
+        assert "integrity" not in {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+        }
+        conn.close()
+
+    def test_saga_store_opens_v11_default_untrusted_atoms(self, tmp_path: Path) -> None:
+        from mimir.saga.client import SagaStore
+
+        db_path = tmp_path / "v11-default-untrusted.db"
+        conn = self._v11_database(db_path)
+        expected = conn.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall()
+        conn.close()
+
+        migrated = SagaStore(db_path=db_path)._ensure_conn()
+
+        assert migrated.execute(
+            "SELECT id, content, tombstoned FROM atoms ORDER BY id"
+        ).fetchall() == expected
+        assert migrated.execute(
+            "SELECT version FROM schema_version WHERE version >= 12 ORDER BY version"
+        ).fetchall() == [(12,), (13,), (14,)]
+        assert "integrity" not in {
+            row[1] for row in migrated.execute("PRAGMA table_info(atoms)")
+        }
+        migrated.close()
 
     @pytest.mark.parametrize("version", [10, 11, 12, 13])
     def test_trusted_rows_and_dependents_survive(self, version: int) -> None:
@@ -1960,7 +2030,7 @@ class TestV14IntegrityRemoval:
         assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (14,)
         conn.close()
 
-    @pytest.mark.parametrize("version", [10, 11, 12, 13])
+    @pytest.mark.parametrize("version", [13])
     @pytest.mark.parametrize("stamps", ["present", "empty", "missing"])
     @pytest.mark.parametrize("atom_id", ["live", "dead"])
     @pytest.mark.parametrize("integrity", ["untrusted", None, "unknown"])
@@ -1983,6 +2053,34 @@ class TestV14IntegrityRemoval:
         assert list(conn.iterdump()) == before
         assert not conn.in_transaction
         assert conn.execute("PRAGMA foreign_keys").fetchone() == (1,)
+        conn.close()
+
+    @pytest.mark.parametrize("version", [10, 11, 12])
+    @pytest.mark.parametrize("atom_id", ["live", "dead"])
+    @pytest.mark.parametrize("integrity", [None, "unknown"])
+    def test_pre_v13_malformed_integrity_reaches_v14_guard(
+        self, version: int, atom_id: str, integrity: str | None
+    ) -> None:
+        conn = self._database(version)
+        conn.execute("UPDATE atoms SET integrity = ? WHERE id = ?", (integrity, atom_id))
+        conn.commit()
+        before = conn.execute(
+            "SELECT id, content, tombstoned, integrity FROM atoms ORDER BY id"
+        ).fetchall()
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="migration_v14_refused_nontrusted_atoms",
+        ):
+            m.apply_pending_migrations(conn, fresh=False)
+
+        assert conn.execute(
+            "SELECT id, content, tombstoned, integrity FROM atoms ORDER BY id"
+        ).fetchall() == before
+        assert "integrity" in {
+            row[1] for row in conn.execute("PRAGMA table_info(atoms)")
+        }
+        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone() == (13,)
         conn.close()
 
     @pytest.mark.parametrize("atom_id", ["live", "dead"])
