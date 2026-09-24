@@ -7,7 +7,7 @@ from pathlib import Path
 import stat
 import subprocess
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -183,6 +183,9 @@ async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.M
         ("missing", "record is missing"),
         ("ambiguous", "record is ambiguous"),
         ("replaced", "target was replaced"),
+        ("replaced_branch", "target was replaced"),
+        ("replaced_repository", "target was replaced"),
+        ("replaced_sandbox", "target was replaced"),
         ("status", "not needs-human"),
         ("alive", "process is alive"),
         ("unverified", "death cannot be verified"),
@@ -210,6 +213,17 @@ async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
         records = [parked, parked]
     elif mutation == "replaced":
         records = [replace(parked, session="replacement")]
+    elif mutation == "replaced_branch":
+        records = [replace(parked, branch="replacement")]
+    elif mutation == "replaced_repository":
+        records = [replace(parked, repository="other/repository")]
+    elif mutation == "replaced_sandbox":
+        replacement = str(case.sandbox.parent.parent / "replacement" / case.sandbox.name)
+        records = [replace(
+            parked,
+            sandbox=replacement,
+            status=replace(parked.status, sandbox_path=replacement),
+        )]
     elif mutation == "status":
         records = [replace(parked, status=replace(parked.status, status="running"))]
     monkeypatch.setenv("WORKLINK_REPO", str(case.sandbox.parent))
@@ -440,7 +454,7 @@ def test_retained_backend_dispatches_both_effects_under_lease(
 
 
 @pytest.mark.parametrize(
-    "race", ["stale", "replaced", "alive", "unverifiable", "fresh", "interlock"],
+    "race", ["stale", "replaced", "legacy", "alive", "unverifiable", "fresh", "interlock"],
 )
 def test_effect_lease_refuses_operation_time_races(
     retained_incident, monkeypatch: pytest.MonkeyPatch, race: str,
@@ -467,6 +481,9 @@ def test_effect_lease_refuses_operation_time_races(
         state.write_text(__import__("json").dumps(payload))
     elif race == "replaced":
         save_factory_record(case.home, replace(case.record, branch="replacement"))
+    elif race == "legacy":
+        (case.home / "state/worklink/factory-runs/chainlink-1810.json").unlink()
+        save_factory_record(case.home, replace(case.record, run_id="1810"))
 
     if race == "interlock":
         from mimir.worklink.factory_state import factory_checkout_interlock
@@ -481,12 +498,114 @@ def test_effect_lease_refuses_operation_time_races(
             expected = {
                 "stale": "incident occurrence is stale",
                 "replaced": "retained factory target was replaced",
+                "legacy": "retained factory target was replaced",
                 "alive": "retained factory process is alive",
                 "unverifiable": "retained factory process death cannot be verified",
                 "fresh": "factory session lock is fresh",
                 "interlock": "factory checkout interlock unavailable",
             }[race]
             assert lease.refusal_reason == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["write", "edit", "test", "stage", "commit"])
+@pytest.mark.parametrize("race", ["replaced", "live", "interlock", "legacy"])
+async def test_each_retained_effect_refuses_operation_time_race_without_mutation(
+    retained_incident,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    race: str,
+) -> None:
+    """Every mutating seam reacquires the exact lease before its downstream effect."""
+    from mimir.tools import repo as repo_module
+    from mimir.worklink import worker_client
+
+    case = retained_incident
+    _initialize_retained_repository(case)
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope.factory_process_is_alive",
+        lambda _record: race == "live",
+    )
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope.factory_process_is_verified_dead", lambda _record: True,
+    )
+    if race == "replaced":
+        save_factory_record(case.home, replace(case.record, branch="replacement"))
+    elif race == "legacy":
+        (case.home / "state/worklink/factory-runs/chainlink-1810.json").unlink()
+        save_factory_record(case.home, replace(case.record, run_id="1810"))
+
+    files_before = {
+        path.relative_to(case.sandbox).as_posix(): (path.stat().st_mode, path.read_bytes())
+        for path in case.sandbox.rglob("*")
+        if path.is_file() and ".git" not in path.relative_to(case.sandbox).parts
+    }
+    index_before = (case.sandbox / ".git" / "index").read_bytes()
+    refs_before = _git(case.sandbox, "show-ref")
+    head_before = _git(case.sandbox, "rev-parse", "HEAD")
+    owner_rpc = Mock(side_effect=AssertionError("refused effect reached owner RPC"))
+    file_rpc = Mock(side_effect=AssertionError("refused effect reached file RPC"))
+    project_test = AsyncMock(side_effect=AssertionError("refused effect launched tests"))
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_rpc)
+    monkeypatch.setattr(worker_client.WorkerClient, "for_factory_checkout", file_rpc)
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", project_test)
+
+    if race == "interlock":
+        from mimir.worklink.factory_state import factory_checkout_interlock
+
+        outer = factory_checkout_interlock(case.home, pruning=True)
+    else:
+        outer = __import__("contextlib").nullcontext(True)
+    expected = {
+        "replaced": "retained factory target was replaced",
+        "live": "retained factory process is alive",
+        "interlock": "factory checkout interlock unavailable",
+        "legacy": "retained factory target was replaced",
+    }[race]
+    backend = RetainedCheckoutFilesystemBackend(case.root)
+    target = case.sandbox / "fix.txt"
+    monkeypatch.setattr(
+        backend, "_binding", lambda _path: (SimpleNamespace(), scope, target),
+    )
+    runtime = _retained_runtime(scope)
+
+    with outer as acquired:
+        assert acquired
+        if operation == "write":
+            outcome = backend.write(str(case.sandbox / "blocked.txt"), "blocked\n")
+            assert expected in (outcome.error or "")
+        elif operation == "edit":
+            outcome = backend.edit(str(target), "before", "after")
+            assert expected in (outcome.error or "")
+        else:
+            tool = getattr(repo_module, f"repo_{operation}")
+            arguments = {
+                "stage": (("fix.txt",),),
+                "commit": (("fix.txt",), "must not commit"),
+            }.get(operation, ())
+            with pytest.raises(Exception, match=expected):
+                if operation == "test":
+                    await tool.coroutine(scope.repository, scope.issue_id, runtime=runtime)
+                else:
+                    tool.func(scope.repository, scope.issue_id, *arguments, runtime=runtime)
+
+    files_after = {
+        path.relative_to(case.sandbox).as_posix(): (path.stat().st_mode, path.read_bytes())
+        for path in case.sandbox.rglob("*")
+        if path.is_file() and ".git" not in path.relative_to(case.sandbox).parts
+    }
+    assert files_after == files_before
+    assert (case.sandbox / ".git" / "index").read_bytes() == index_before
+    assert _git(case.sandbox, "show-ref") == refs_before
+    assert _git(case.sandbox, "rev-parse", "HEAD") == head_before
+    owner_rpc.assert_not_called()
+    file_rpc.assert_not_called()
+    project_test.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

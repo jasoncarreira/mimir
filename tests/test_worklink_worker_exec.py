@@ -6,6 +6,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 from types import SimpleNamespace
 import signal
@@ -64,6 +65,23 @@ def test_worker_projection_has_fixed_destination_json_and_size_contract() -> Non
         WorkerProjection(".config/opencode/opencode.json", b"invalid")
     with pytest.raises(ValueError, match="size"):
         WorkerProjection(".config/opencode/opencode.json", b" " * (MAX_PROJECTION_BYTES + 1))
+
+
+def test_worker_clients_resolve_the_default_socket_at_call_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_worklink_identities,
+) -> None:
+    socket_path = tmp_path / "executor.sock"
+    checkout = tmp_path / ".worklink" / "repo" / "41-2"
+    monkeypatch.setattr("mimir.worklink.worker_client.DEFAULT_EXECUTOR_SOCKET", socket_path)
+    monkeypatch.setattr(identities, "get_identities", lambda: synthetic_worklink_identities)
+
+    assert WorkerClient(None).socket_path == socket_path
+    assert WorkerClient.for_path_checkout(
+        checkout, issue_id=41, attempt=2, run_uid=1002,
+    ).socket_path == socket_path
+    assert WorkerClient.for_factory_checkout(
+        checkout, issue_id=41, attempt=2,
+    ).socket_path == socket_path
 
 
 def test_client_rejects_non_uuid_home_and_invalid_commands(tmp_path: Path) -> None:
@@ -1812,12 +1830,17 @@ def test_factory_file_child_bounds_and_atomically_publishes_edits(
     assert target.read_text() == "old old"
 
 
+@pytest.mark.real_worklink_identities
 def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
     if sys.platform != "linux" or os.geteuid() != 0:
         pytest.skip("requires Linux root with distinct controller and worker identities")
     observed = worker_exec.get_identities()
     if observed.mimir_uid == observed.worklink_uid:
         pytest.skip("controller and Worklink identities are not distinct")
+    try:
+        mimir_gid = pwd.getpwnam("mimir").pw_gid
+    except KeyError:
+        pytest.skip("requires the real mimir account")
 
     repo = worker_exec.WORKLINK_CHECKOUT_ROOT / f"factory-file-test-{uuid.uuid4()}"
     boundary = repo / "41-2"
@@ -1844,7 +1867,7 @@ def test_factory_file_rpc_creates_as_worklink_not_controller() -> None:
                 os.close(read_fd)
                 try:
                     os.setgroups([observed.worklink_gid])
-                    os.setresgid(*((observed.mimir_uid,) * 3))
+                    os.setresgid(*((mimir_gid,) * 3))
                     os.setresuid(*((observed.mimir_uid,) * 3))
                     client = WorkerClient.for_factory_checkout(
                         checkout, issue_id=41, attempt=2, socket_path=socket_path,

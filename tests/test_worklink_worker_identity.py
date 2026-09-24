@@ -262,7 +262,15 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
                 assert "${{ env.PYTEST_EVIDENCE_ROOT }}/**/child-progress" + suffix in paths
     assert evidence_jobs == 7
     worker_runs = "\n".join(step.get("run", "") for step in _worker_uid_job()["steps"])
-    assert 'sudo install -d -m 700 -o worklink -g worklink "$evidence_root"' in worker_runs
+    assert 'sudo install -d -m 710 -o worklink -g worklink "$evidence_root"' in worker_runs
+    assert (
+        'sudo install -d -m 750 -o root -g mimir '
+        '"$evidence_root/remediation-root"'
+    ) in worker_runs
+    assert (
+        'sudo install -d -m 700 -o worklink -g worklink "$evidence_root/main"'
+        in worker_runs
+    )
     assert 'evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"' in worker_runs
     assert 'sudo chmod o+x "$RUNNER_TEMP"' not in worker_runs
 

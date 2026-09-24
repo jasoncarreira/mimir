@@ -131,14 +131,18 @@ def _disable_git_auto_maintenance():
 
 
 @pytest.fixture(autouse=True)
-def synthetic_worklink_identities(monkeypatch):
+def synthetic_worklink_identities(monkeypatch, request):
     """Keep containment tests independent of deployment-local accounts.
 
     Dedicated identity-resolution tests invoke the real accessor in child
     processes with their own injected pwd/grp implementations. All other tests
     receive non-production synthetic values, so they still catch regressions to
     the former 1001/1002 literals without requiring host account provisioning.
+    Privileged integration tests opt out because their subject is the real split
+    between the provisioned ``mimir`` and ``worklink`` accounts.
     """
+    if request.node.get_closest_marker("real_worklink_identities") is not None:
+        return None
     identities = SimpleNamespace(
         mimir_uid=SYNTHETIC_MIMIR_UID,
         worklink_uid=SYNTHETIC_WORKLINK_UID,

@@ -47,6 +47,7 @@ from .compute import (
     with_worker_environment,
 )
 from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
+from .autonomy import chainlink_bin
 from .evidence import (
     EvidenceValidation,
     TestResult,
@@ -4654,9 +4655,12 @@ def _run_worklink_epic_under_lease(
     incident_owner = _IncidentOwner(autonomous=autonomous)
     try:
         runner = WorklinkRunner(
-                home=home, repo=repo, _incident_owner=incident_owner,
-                _factory_lease_held=True,
-            )
+            home=home,
+            repo=repo,
+            chainlink_bin=chainlink_bin(),
+            _incident_owner=incident_owner,
+            _factory_lease_held=True,
+        )
         run_kwargs: dict[str, Any] = {"autonomous": autonomous}
         if expected_recovery is not None:
             run_kwargs["expected_recovery"] = expected_recovery
