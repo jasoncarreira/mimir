@@ -1196,9 +1196,34 @@ def apply_pending_migrations(
     if detector is None:
         detector = detect_schema_version
 
-    # Run before even creating/stamping schema_version or repairing boundaries:
-    # v12/v13 would otherwise launder existing nontrusted rows on the way to v14.
-    if target_version >= 14 and _column_exists(conn, "atoms", "integrity"):
+    applied: set[int] = set()
+    inferred_baselines: set[int] = set()
+    schema_version_exists = True
+    try:
+        for (v,) in conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchall():
+            applied.add(int(v))
+    except sqlite3.OperationalError:
+        schema_version_exists = False
+
+    inferred: int | None = None
+    if not applied and not fresh:
+        inferred = detector(conn)
+
+    # Run before creating/stamping schema_version or repairing boundaries. Once
+    # v13 has applied, any nontrusted row appeared after its correction and must
+    # not be laundered on the way to v14. Older stores must first receive the
+    # documented v12/v13 corrections; v14's SQL guard still rejects anything
+    # those corrections do not accept.
+    v13_applied = max(applied, default=0) >= 13 or (
+        inferred is not None and inferred >= 13
+    )
+    if (
+        target_version >= 14
+        and v13_applied
+        and _column_exists(conn, "atoms", "integrity")
+    ):
         nontrusted = conn.execute(
             "SELECT integrity, COUNT(*) FROM atoms WHERE integrity IS NOT 'trusted' "
             "GROUP BY integrity ORDER BY integrity"
@@ -1210,14 +1235,7 @@ def apply_pending_migrations(
                 + ", ".join(f"{value!r}={count}" for value, count in nontrusted)
             )
 
-    applied: set[int] = set()
-    inferred_baselines: set[int] = set()
-    try:
-        for (v,) in conn.execute(
-            "SELECT version FROM schema_version"
-        ).fetchall():
-            applied.add(int(v))
-    except sqlite3.OperationalError:
+    if not schema_version_exists:
         # schema.sql guarantees the table exists, but a pre-1.0
         # DB might be missing it. Create it lazily then stamp.
         conn.execute(
@@ -1256,7 +1274,7 @@ def apply_pending_migrations(
             return
 
         # Scenario B: introspect to figure out where we actually are.
-        inferred = detector(conn)
+        assert inferred is not None
         applied = set(range(1, inferred + 1))
         inferred_baselines = set(applied)
         # Else fall through to the migrations loop below, which
