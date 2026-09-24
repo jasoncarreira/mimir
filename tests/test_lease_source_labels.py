@@ -272,6 +272,34 @@ def test_attested_lease_cached_verdict_rejects_unrecorded_foreign_commit(
     assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
 
 
+def test_attested_lease_rejects_unrecorded_server_identity_commit(
+    tmp_path: Path,
+) -> None:
+    auth, scope, lease, target, server_identity = _real_attested_lease(tmp_path)
+
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+    target.write_text("unrecorded server remediation\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path),
+        "-c", f"user.name={server_identity[0]}",
+        "-c", f"user.email={server_identity[1]}",
+        "commit", "-qm", "unrecorded server remediation",
+    ], check=True)
+
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
+def test_attested_lease_rejects_checkout_observation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(access_control_module, "_observed_checkout_state", lambda _: None)
+
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
 def test_attested_lease_head_rejects_foreign_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
 ) -> None:
