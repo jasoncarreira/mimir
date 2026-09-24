@@ -2333,6 +2333,24 @@ print(json.dumps({"poller": "x", "prompt": "untrusted", "event_type": "issue_ope
         ("acme/widget", "alice", "server-token"),
         ("acme/widget", "mallory", "server-token"),
     ]
+    assert enq.events[0].extra["items"] == [
+        {
+            "event_type": "issue_opened",
+            "repo": "acme/widget",
+            "url": "https://github.com/acme/widget/issues/1",
+            "author": "mallory",
+            "actor": "alice",
+            "author_is_trusted": True,
+        },
+        {
+            "event_type": "issue_opened",
+            "repo": "acme/widget",
+            "url": "https://github.com/acme/widget/issues/2",
+            "author": "alice",
+            "actor": "mallory",
+            "author_is_trusted": False,
+        },
+    ]
 
 
 @pytest.mark.asyncio

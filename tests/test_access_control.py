@@ -8902,7 +8902,9 @@ def _github_scope_test_setup(
     authority = build_trigger_service_principal(
         canonical="poller:github-activity", trigger="poller", profile="github",
         tier=CapabilityTier.CODE_EXECUTION,
-        capabilities=("shell_exec", "write_file", "bash_jobs_list", "bash_job_output"),
+        capabilities=(
+            "shell_exec", "write_file", "edit_file", "bash_jobs_list", "bash_job_output",
+        ),
         creation_path="test",
     )
     item: dict[str, object] = {
@@ -8960,6 +8962,92 @@ def test_fresh_changes_requested_review_mints_remediation_authority(
         )
         assert decision.allowed is False
         assert decision.reason == "repo_pr_scope_denied"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "state"),
+    [
+        ("issue_comment", None),
+        ("pr_review", "COMMENTED"),
+        ("pr_review_comment", None),
+    ],
+    ids=["conversation-comment", "commented-review", "review-comment"],
+)
+def test_trusted_collaborator_comment_on_own_open_pr_mints_remediation_authority(
+    event_type: str,
+    state: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(
+        event_type=event_type,
+        state=state,
+        actor="trusted-collaborator",
+        author_is_trusted=True,
+        pr_state="open",
+    )
+
+    auth = _github_poller_auth(authority, item)
+    scope = auth.repo_pr_action_scope
+
+    assert scope is not None
+    assert scope.allowed_operations == access_control._REPO_PR_REMEDIATION_ACTIONS
+    registry = ToolRegistry()
+    arguments = {"repository": "o/r", "pull_request": 42}
+    for tool_name in ("repo_commit", "repo_push"):
+        assert registry.authorize_tool(
+            tool_name, auth, enforce=True, arguments=arguments,
+        ).allowed is True
+
+    assert auth.repo_review_state is not None
+    checkout = _attach_test_checkout_lease(
+        auth.repo_review_state, tmp_path / "leases", "trusted-comment",
+    )
+    assert registry.authorize_tool(
+        "edit_file", auth, enforce=True,
+        target_channel=str(checkout / "fix.py"),
+    ).allowed is True
+
+
+@pytest.mark.parametrize(
+    ("change", "value"),
+    [
+        ("author_is_trusted", False),
+        ("author_is_trusted", None),
+        ("actor", "mimir-bot"),
+        ("actor", "MIMIR-BOT"),
+        ("actor", None),
+        ("author", "someone-else"),
+        ("pr_state", "closed"),
+        ("event_type", "pr_opened"),
+        ("event_type", "pr_review"),
+    ],
+    ids=[
+        "untrusted", "unknown", "self-comment", "case-varied-self-comment",
+        "unknown-actor", "foreign-pr", "closed-pr", "non-comment-event",
+        "non-commented-review",
+    ],
+)
+def test_comment_remediation_guards_remain_review_only(
+    change: str,
+    value: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(
+        event_type="issue_comment",
+        actor="trusted-collaborator",
+        author_is_trusted=True,
+        pr_state="open",
+    )
+    item[change] = value
+
+    scope = _github_poller_auth(authority, item).repo_pr_action_scope
+
+    assert scope is not None
+    assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
 
 
 @pytest.mark.parametrize(
