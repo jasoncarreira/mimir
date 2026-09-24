@@ -3,5 +3,6 @@
   "verify": "uv run pytest -q --tb=short",
   "verify_timeout_ms": 1800000,
   "bootstrap": "uv sync --locked --extra dev --extra bench",
+  "max_retries": 5,
   "pr_draft": false
 }

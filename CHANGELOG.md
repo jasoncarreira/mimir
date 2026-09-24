@@ -6,6 +6,14 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.6. The 0.10.5
+  release adds the `.factory.json` `max_retries` default and the read-only
+  `factory identity` publishing-identity probe; this repository now declares a
+  retry budget of 5 so direct `/feature` runs match Worklink launches. The 0.10.6
+  workflow binds `KEY` only from the resolver's `run_id`, a ticket-key input, or
+  not at all for free text, and never decorates it with `#`. Source deployments
+  must rebuild the image to install the new package and adapter pins.
+
 ## [0.9.0] — 2026-09-24
 
 Five hundred and seventeen commits since 0.8.8. Three threads run through them:
