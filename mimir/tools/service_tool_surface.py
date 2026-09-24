@@ -8,10 +8,15 @@ The gate's own model-surface filter is ACP-only, not a service-turn modifier.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
-from langchain.agents.middleware.types import ExtendedModelResponse, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+    PrivateStateAttr,
+)
 from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
@@ -26,8 +31,14 @@ from mimir.access_control import (
 from mimir.models import AuthContext
 
 
+def _latest_surface(_current: list[str], update: list[str]) -> list[str]:
+    return update
+
+
 class ServiceToolSurfaceState(AgentState):
-    service_tool_surface_names: NotRequired[list[str]]
+    service_tool_surface_names: Annotated[
+        NotRequired[list[str]], PrivateStateAttr, _latest_surface,
+    ]
 
 
 def _is_service(context: Any) -> bool:
