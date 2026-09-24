@@ -558,7 +558,6 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     """Run the production remediation effect paths across real Linux identities."""
     from mimir import contained_checkout, contained_execution
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from mimir.models import RetainedFactoryScope
     from mimir.project_tests import RepoProjectTests
     from mimir.repo_tools import (
         GitCommit,
@@ -568,7 +567,6 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         RepoGitTools,
         retained_factory_git_runner,
     )
-    from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
     from mimir.worklink import worker_client, worker_exec
 
     identities = _system_identities()
@@ -578,6 +576,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
     sandbox = checkout / ".factory-sandboxes" / "chainlink-1811"
     home = boundary / "home"
     controller_home = boundary / "controller-home"
+    controller_repo = boundary / "controller-repo"
     executor_homes = boundary / "executor-homes"
     snapshots = boundary / "repo-test-checkouts"
     uv_cache = boundary / "uv-cache"
@@ -586,6 +585,7 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         sandbox.mkdir(parents=True)
         home.mkdir()
         controller_home.mkdir()
+        controller_repo.mkdir()
         executor_homes.mkdir()
         snapshots.mkdir()
         uv_cache.mkdir()
@@ -662,25 +662,25 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         )
         save_factory_record(home, record)
         _chown_tree(home, identities.mimir_uid, identities.mimir_gid)
-        scope = RetainedFactoryScope(
-            issue_id=1811,
-            signature=incident["signature"],
-            occurrence_id=incident["occurrence_id"],
-            run_id="chainlink-1811",
-            attempt=1,
-            session="session-1",
-            repository="owner/mimir",
-            branch="feature/chainlink-1811",
-            sandbox=str(sandbox),
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        monkeypatch.setenv("HOME", str(controller_home))
+        monkeypatch.setenv("WORKLINK_REPO", str(controller_repo))
+        monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+        case = SimpleNamespace(
+            home=home,
+            state_root=home / "state" / "pollers",
         )
-        auth = SimpleNamespace(retained_factory_scope=scope)
+        event, labels, auth = asyncio.run(_trusted_turn(case))
+        scope = auth.retained_factory_scope
+        assert scope is not None
         turn = TurnContext(
             turn_id="retained-remediation-root-e2e",
-            session_id="poller:worklink-ready-queue",
-            trigger="poller",
-            channel_id="poller:worklink-ready-queue",
+            session_id=event.channel_id,
+            trigger=event.trigger,
+            channel_id=event.channel_id,
             started_at=0.0,
             auth_context=auth,
+            ifc_labels=labels,
         )
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
@@ -693,8 +693,6 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
         monkeypatch.setattr(
             "mimir.worklink.checkout._REPO_TEST_CHECKOUT_ROOT", snapshots,
         )
-        monkeypatch.setenv("MIMIR_HOME", str(home))
-        monkeypatch.setenv("HOME", str(controller_home))
         monkeypatch.setattr(
             "mimir.worklink.retained_scope._factory_session_lock_is_fresh",
             lambda _record: False,
@@ -711,7 +709,10 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
                     contained_execution.WorkerClient = lambda capability: worker_client.WorkerClient(
                         capability, socket_path=socket_path,
                     )
-                    backend = RetainedCheckoutFilesystemBackend(retained_root)
+                    backend = FileToolRouter(
+                        default=WriteGuardBackend(home, ["state"], guard_outside_root=True),
+                        routes=build_file_tool_routes([(str(retained_root), "retained")]),
+                    )
                     token = set_current_turn(turn)
                     try:
                         written = backend.write(str(sandbox / "new.txt"), "new\n")
