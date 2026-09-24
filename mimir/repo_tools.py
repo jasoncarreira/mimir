@@ -323,6 +323,34 @@ def _bounded_subprocess_runner(
     return GitProcessResult(returncode, stdout, stderr, timed_out, output_limited)
 
 
+def retained_factory_subprocess_runner(
+    argv: tuple[str, ...],
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    output_limit: int = _DEFAULT_OUTPUT_BYTES,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one retained-tree argv through the checkout owner's control path."""
+    from .worklink.worker_client import run_factory_control
+
+    try:
+        if "clone" in argv and "--" in argv:
+            separator = argv.index("--")
+            checkout = Path(argv[separator + 1])
+        else:
+            checkout_index = argv.index("-C") + 1
+            checkout = Path(argv[checkout_index])
+    except (ValueError, IndexError) as exc:
+        raise ValueError("hardened Git argv has no checkout") from exc
+    return run_factory_control(
+        checkout,
+        argv,
+        env=env or _sanitized_git_env(),
+        timeout=timeout,
+        output_limit=output_limit,
+    )
+
+
 def retained_factory_git_runner(
     argv: tuple[str, ...],
     *,
@@ -330,16 +358,9 @@ def retained_factory_git_runner(
     timeout: float,
     output_limit: int,
 ) -> GitProcessResult:
-    """Run the shared hardened Git argv through the checkout owner's control path."""
-    from .worklink.worker_client import run_factory_control
-
-    try:
-        checkout_index = argv.index("-C") + 1
-        checkout = Path(argv[checkout_index])
-    except (ValueError, IndexError) as exc:
-        raise ValueError("hardened Git argv has no checkout") from exc
-    result = run_factory_control(
-        checkout, argv, env=env, timeout=timeout, output_limit=output_limit,
+    """Adapt owner-side retained execution to the repository tool result type."""
+    result = retained_factory_subprocess_runner(
+        argv, env=env, timeout=timeout, output_limit=output_limit,
     )
     return GitProcessResult(
         result.returncode,
@@ -1160,5 +1181,5 @@ __all__ = [
     "GitOperation", "GitOperationResult", "GitProcessResult", "GitPush",
     "GitRebase", "GitRebaseAbort", "GitRefusal", "GitRevert",
     "GitRevertAbort", "GitStage", "GitStatus", "GitUnmerged", "RepoGitTools",
-    "retained_factory_git_runner", "was_agent_push",
+    "retained_factory_git_runner", "retained_factory_subprocess_runner", "was_agent_push",
 ]

@@ -377,7 +377,7 @@ def test_credential_commit_between_preflight_and_clone_is_refused_and_removed(
 
     def commit_before_clone(argv: list[bytes], *args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
         nonlocal committed
-        if len(argv) > 1 and argv[1:3] == [b"clone", b"--no-hardlinks"] and not committed:
+        if b"clone" in argv and b"--no-hardlinks" in argv and not committed:
             committed = True
             (repository / ".env").write_text("benign-looking-content\n")
             git(repository, "add", ".env")

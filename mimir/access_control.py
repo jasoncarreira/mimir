@@ -6738,9 +6738,13 @@ class SinkGate:
 
         if sink_category is SinkCategory.FORGE:
             forge_scope_mismatch: dict[str, Any] = {}
-            mismatch = _forge_repository_scope_mismatch(
-                ifc_labels, repo_pr_action_scope,
-                audit_fields=forge_scope_mismatch,
+            mismatch = (
+                None
+                if isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                else _forge_repository_scope_mismatch(
+                    ifc_labels, repo_pr_action_scope,
+                    audit_fields=forge_scope_mismatch,
+                )
             )
             if mismatch is not None:
                 source_repo, source_pr, mismatch_component = mismatch
@@ -6990,8 +6994,20 @@ class SinkGate:
             and isinstance(sources, tuple)
             and bool(sources)
             and all(
-                source.domain == "repository"
-                and source.domain_qualifier is None
+                (
+                    source.domain == "repository"
+                    and source.domain_qualifier is None
+                )
+                or (
+                    isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                    and source.domain == "worklink_retained_repository"
+                    and source.resource_id == (
+                        f"{repo_pr_action_scope.repository}"
+                        f"#issue/{repo_pr_action_scope.issue_id}"
+                        f"@retained/{repo_pr_action_scope.scope_id}"
+                    )
+                    and source.integrity == "trusted"
+                )
                 or (
                     (
                         (tool_name != "pr_submit_review" and repo_pr_action_scope is not None)
@@ -7006,10 +7022,13 @@ class SinkGate:
                 )
                 for source in sources
             )
-            and _forge_repository_scope_mismatch(
-                ifc_labels,
-                repo_pr_action_scope,
-            ) is None
+            and (
+                isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                or _forge_repository_scope_mismatch(
+                    ifc_labels,
+                    repo_pr_action_scope,
+                ) is None
+            )
         ):
             # Repository command output may flow only back to the immutable
             # PR/head scope from which it was produced. An interactive forge turn
@@ -9983,6 +10002,35 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+        and retained_scope is not None
+        and args.get("repository") == retained_scope.repository
+        and args.get("pull_request") == retained_scope.issue_id
+    ):
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain="worklink_retained_repository",
+            resource_id=(
+                f"{retained_scope.repository}#issue/{retained_scope.issue_id}"
+                f"@retained/{retained_scope.scope_id}"
+            ),
+            bridge_instance="worklink",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="trusted",
+            integrity_effect="active_ingest",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
         if scope is None:

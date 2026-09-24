@@ -7,7 +7,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 
 from ._rmtree import rmtree_missing_ok
 
@@ -60,6 +60,7 @@ class SnapshotUnavailable(ContainedSnapshotError):
 
 
 GitInventoryClass = Literal["tracked", "untracked", "ignored"]
+SnapshotGitRunner = Callable[[tuple[str, ...]], subprocess.CompletedProcess[bytes]]
 
 
 @dataclass(frozen=True)
@@ -106,17 +107,37 @@ _SECRET_LINE = re.compile(
 )
 _PRIVATE_KEY_HEADER = re.compile(rb"-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY-----")
 _CHUNK_SIZE = 64 * 1024
+_SOURCE_GIT_CONFIG = (
+    "-c", "core.fsmonitor=",
+    "-c", "core.hooksPath=/dev/null",
+    "-c", "diff.external=",
+    "-c", "filter.evil.clean=cat",
+    "-c", "filter.evil.smudge=cat",
+)
 
 
-def _run_git(source: bytes, args: Sequence[bytes]) -> bytes:
+def _subprocess_git_runner(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+def _run_git(
+    source: bytes,
+    args: Sequence[bytes],
+    *,
+    git_runner: SnapshotGitRunner | None = None,
+) -> bytes:
+    argv = (
+        "git", "-C", os.fsdecode(source), *_SOURCE_GIT_CONFIG,
+        *(os.fsdecode(value) for value in args),
+    )
     try:
-        completed = subprocess.run(
-            [b"git", b"-C", source, *args],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        completed = (git_runner or _subprocess_git_runner)(argv)
     except OSError as exc:
         raise SnapshotUnavailable("Snapshot unavailable") from exc
     if completed.returncode != 0:
@@ -124,7 +145,12 @@ def _run_git(source: bytes, args: Sequence[bytes]) -> bytes:
     return completed.stdout
 
 
-def _inventory(source: bytes, kind: GitInventoryClass) -> tuple[bytes, ...]:
+def _inventory(
+    source: bytes,
+    kind: GitInventoryClass,
+    *,
+    git_runner: SnapshotGitRunner | None = None,
+) -> tuple[bytes, ...]:
     args: dict[GitInventoryClass, tuple[bytes, ...]] = {
         "tracked": (b"ls-files", b"-z"),
         "untracked": (b"ls-files", b"-z", b"--others", b"--exclude-standard"),
@@ -136,15 +162,26 @@ def _inventory(source: bytes, kind: GitInventoryClass) -> tuple[bytes, ...]:
             b"--exclude-standard",
         ),
     }
-    output = _run_git(source, args[kind])
+    output = (
+        _run_git(source, args[kind])
+        if git_runner is None
+        else _run_git(source, args[kind], git_runner=git_runner)
+    )
     if output and not output.endswith(b"\0"):
         raise SnapshotUnavailable("Snapshot unavailable")
     entries = output.split(b"\0")
     return tuple(entries[:-1] if output else ())
 
 
-def _head_revision(source: bytes) -> bytes:
-    revision = _run_git(source, (b"rev-parse", b"--verify", b"HEAD")).strip()
+def _head_revision(
+    source: bytes, *, git_runner: SnapshotGitRunner | None = None,
+) -> bytes:
+    arguments = (b"rev-parse", b"--verify", b"HEAD")
+    revision = (
+        _run_git(source, arguments)
+        if git_runner is None
+        else _run_git(source, arguments, git_runner=git_runner)
+    ).strip()
     if not re.fullmatch(rb"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
         raise SnapshotUnavailable("Snapshot unavailable")
     return revision.lower()
@@ -404,12 +441,16 @@ def preflight_git_snapshot(
     known_sensitive: Iterable[bytes] = (),
     scan_tracked_credentials: bool = True,
     excluded_prefixes: Iterable[bytes] = (),
+    git_runner: SnapshotGitRunner | None = None,
 ) -> tuple[SnapshotEntry, ...]:
     source_bytes = os.fsencode(os.path.abspath(os.fspath(source)))
     excluded = _validated_excluded_prefixes(excluded_prefixes)
     _refuse_special_files(source_bytes, excluded)
     sensitive = tuple(value for value in known_sensitive if value)
-    inventories = {kind: _inventory(source_bytes, kind) for kind in ("tracked", "untracked", "ignored")}
+    inventories = {
+        kind: _inventory(source_bytes, kind, git_runner=git_runner)
+        for kind in ("tracked", "untracked", "ignored")
+    }
     seen: set[bytes] = set()
     result: list[SnapshotEntry] = []
     credential_count = 0
@@ -525,6 +566,8 @@ def create_git_snapshot(
     known_sensitive: Iterable[bytes] = (),
     scan_tracked_credentials: bool = True,
     excluded_prefixes: Iterable[bytes] = (),
+    source_git_runner: SnapshotGitRunner | None = None,
+    clone_runner: SnapshotGitRunner | None = None,
 ) -> SnapshotResult:
     try:
         source_path = Path(source).resolve(strict=True)
@@ -540,26 +583,41 @@ def create_git_snapshot(
         raise SnapshotUnavailable("Snapshot unavailable")
     source_bytes = os.fsencode(source_path)
     destination_bytes = os.fsencode(destination_path)
-    revision = _head_revision(source_bytes)
+    revision = _head_revision(source_bytes, git_runner=source_git_runner)
     excluded = _validated_excluded_prefixes(excluded_prefixes)
     entries = preflight_git_snapshot(
         source_path,
         known_sensitive=known_sensitive,
         scan_tracked_credentials=scan_tracked_credentials,
         excluded_prefixes=excluded,
+        git_runner=source_git_runner,
     )
+    inventory_paths = tuple(entry.relative_path for entry in entries)
     try:
-        completed = subprocess.run(
-            [b"git", b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet", b"--", source_bytes, destination_bytes],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        clone_argv = (
+            b"git", *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
+            b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet",
+            b"--", source_bytes, destination_bytes,
+        )
+        completed = (
+            subprocess.run(
+                clone_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if clone_runner is None
+            else clone_runner(tuple(os.fsdecode(part) for part in clone_argv))
         )
         if completed.returncode != 0:
             raise SnapshotUnavailable("Snapshot unavailable")
         checkout = subprocess.run(
-            [b"git", b"-C", destination_bytes, b"checkout", b"--detach", b"--force", b"--quiet", revision],
+            [
+                b"git", b"-C", destination_bytes,
+                *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
+                b"checkout", b"--detach", b"--force", b"--quiet", revision,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -576,8 +634,12 @@ def create_git_snapshot(
             known_sensitive=known_sensitive,
             scan_tracked_credentials=scan_tracked_credentials,
             excluded_prefixes=excluded,
+            git_runner=source_git_runner,
         )
-        if _head_revision(source_bytes) != revision or verified_entries != entries:
+        if (
+            _head_revision(source_bytes, git_runner=source_git_runner) != revision
+            or tuple(entry.relative_path for entry in verified_entries) != inventory_paths
+        ):
             raise SnapshotSourceChanged("Snapshot source changed")
     except ContainedSnapshotError:
         shutil.rmtree(destination_path, ignore_errors=True)

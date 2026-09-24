@@ -27,7 +27,12 @@ from .contained_snapshot import (
 from .event_logger import safe_log_event
 from .models import RepoPRAction, RepoReviewState, RetainedFactoryScope
 from .redaction import redact_text
-from .repo_tools import GitRefusal, RepoGitTools, retained_factory_git_runner
+from .repo_tools import (
+    GitRefusal,
+    RepoGitTools,
+    retained_factory_git_runner,
+    retained_factory_subprocess_runner,
+)
 from .repository_config import RepositoryInventory, RepositoryTestSuite
 from .worklink.backends.registry import WorklinkConfig
 from .worklink.identities import get_identities
@@ -572,7 +577,11 @@ class RepoProjectTests:
                 "known_sensitive": (),
             }
             if retained:
-                checkout_arguments["excluded_prefixes"] = (b".factory",)
+                checkout_arguments.update(
+                    excluded_prefixes=(b".factory",),
+                    source_git_runner=retained_factory_subprocess_runner,
+                    clone_runner=retained_factory_subprocess_runner,
+                )
             checkout = self._checkout_factory(root, **checkout_arguments)
         except SnapshotCredentialsRefused as exc:
             await safe_log_event(

@@ -450,7 +450,12 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     def owner_control(checkout, argv, *, env, timeout, output_limit):
         assert checkout == case.sandbox
         calls.append(tuple(argv))
-        return subprocess.run(argv, env=env, capture_output=True, check=False)
+        return subprocess.run(
+            argv,
+            env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+            capture_output=True,
+            check=False,
+        )
 
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
     runtime = _retained_runtime(scope)
@@ -460,7 +465,8 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     helper.chmod(0o755)
     hooks = case.sandbox / "hooks"
     hooks.mkdir()
-    (hooks / "pre-commit").symlink_to(helper)
+    (hooks / "pre-commit").write_text(helper.read_text(encoding="utf-8"), encoding="utf-8")
+    (hooks / "pre-commit").chmod(0o755)
     _git(case.sandbox, "config", "core.hooksPath", str(hooks))
     _git(case.sandbox, "config", "core.fsmonitor", str(helper))
     _git(case.sandbox, "config", "filter.evil.clean", str(helper))
@@ -500,6 +506,77 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
     assert (case.sandbox / "fix.txt").read_text(encoding="utf-8") == "after\n"
     assert not marker.exists()
     assert calls and all("core.hooksPath=/dev/null" in argv for argv in calls)
+
+
+@pytest.mark.asyncio
+async def test_retained_repo_test_runs_source_git_through_owner_control(
+    retained_incident, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import contained_checkout, project_tests
+    from mimir.worklink import worker_client
+
+    case = retained_incident
+    _initialize_retained_repository(case)
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    (case.home / "worklink.yaml").write_text(
+        "defaults:\n  test_command: /usr/bin/true\n", encoding="utf-8",
+    )
+    marker = case.sandbox / "controller-executed"
+    helper = case.sandbox / "malicious.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n", encoding="utf-8")
+    helper.chmod(0o755)
+    hooks = case.sandbox / "hooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text(helper.read_text(encoding="utf-8"), encoding="utf-8")
+    (hooks / "pre-commit").chmod(0o755)
+    _git(case.sandbox, "config", "core.hooksPath", str(hooks))
+    _git(case.sandbox, "config", "core.fsmonitor", str(helper))
+    _git(case.sandbox, "config", "filter.evil.clean", str(helper))
+    (case.sandbox / ".gitattributes").write_text("fix.txt filter=evil\n", encoding="utf-8")
+    _git(case.sandbox, "add", ".gitattributes", "hooks/pre-commit", "malicious.sh")
+    _git(case.sandbox, "commit", "-q", "--no-verify", "-m", "adversarial config fixture")
+    marker.unlink(missing_ok=True)
+
+    calls: list[tuple[str, ...]] = []
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == case.sandbox
+        calls.append(tuple(argv))
+        return subprocess.run(
+            argv,
+            env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+            capture_output=True,
+            check=False,
+        )
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    monkeypatch.setattr(
+        project_tests.RepoGitTools, "validated_checkout_root",
+        lambda _self: case.sandbox,
+    )
+    checkout_root = case.home / "repo-test-checkouts"
+    checkout_root.mkdir()
+    monkeypatch.setattr(contained_checkout, "REPO_TEST_CHECKOUT_ROOT", checkout_root)
+    monkeypatch.setattr(
+        contained_checkout, "_open_repo_test_checkout",
+        lambda relative: os.open(checkout_root / relative, os.O_RDONLY | os.O_DIRECTORY),
+    )
+    monkeypatch.setattr(contained_checkout.os, "chown", lambda *_a, **_k: None)
+    monkeypatch.setattr(contained_checkout.os, "fchown", lambda *_a, **_k: None)
+    monkeypatch.setattr(contained_checkout, "_normalize_checkout_fd", lambda *_a, **_k: None)
+
+    async def runner(*args, **kwargs):
+        return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(retained_scope=scope, runner=runner).execute()
+
+    assert result.ok is True
+    assert not marker.exists()
+    source_calls = [argv for argv in calls if argv[:3] == ("git", "-C", str(case.sandbox))]
+    assert any("ls-files" in argv for argv in source_calls)
+    assert any("rev-parse" in argv for argv in source_calls)
+    assert all(argv[0:3] == ("git", "-C", str(case.sandbox)) for argv in source_calls)
 
 
 @pytest.mark.asyncio
@@ -548,6 +625,8 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
         "pr_number": scope.issue_id,
         "known_sensitive": (),
         "excluded_prefixes": (b".factory",),
+        "source_git_runner": project_tests.retained_factory_subprocess_runner,
+        "clone_runner": project_tests.retained_factory_subprocess_runner,
     }]
 
 

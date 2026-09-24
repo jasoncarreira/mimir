@@ -327,7 +327,11 @@ def repo_status(
     include_untracked: bool = True,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read porcelain status from the active bound checkout."""
+    """Read porcelain status from the active bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
 
 
@@ -339,8 +343,12 @@ async def repo_test(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
     suite: str | None = None,
 ) -> dict[str, Any]:
-    """Run configured tests in a contained PR snapshot. Pass suite='frontend'
-    for Vitest, or omit suite to infer it from selectors (no selectors: default).
+    """Run configured tests in a contained repository snapshot.
+
+    Pass suite='frontend' for Vitest, or omit suite to infer it from selectors
+    (no selectors: default). On a retained Worklink remediation turn,
+    ``repository`` is the retained run's repository and ``pull_request`` is the
+    incident's Chainlink issue id.
     """
     try:
         retained = _retained_scope(runtime, repository, pull_request)
@@ -426,7 +434,12 @@ def repo_diff(
     paths: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read a bounded working, staged, or base diff from the bound checkout."""
+    """Read a bounded working, staged, or base diff from the bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id;
+    retained scopes do not support ``mode='base'``.
+    """
     return _execute(runtime, repository, pull_request, GitDiff(mode, paths))
 
 
@@ -446,7 +459,11 @@ def repo_stage(
     paths: tuple[str, ...],
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Stage only explicit repository-relative paths in the bound checkout."""
+    """Stage only explicit repository-relative paths in the bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitStage(paths))
 
 
@@ -458,7 +475,11 @@ def repo_commit(
     message: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Stage explicit paths and commit them with server-owned Git identity."""
+    """Stage explicit paths and commit them with server-owned Git identity.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitCommit(paths, message))
 
 

@@ -164,6 +164,14 @@ def _resolve_standing_review(
         or not isinstance(arguments, Mapping)
     ):
         return None
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+        and retained_scope is not None
+        and arguments.get("repository") == retained_scope.repository
+        and arguments.get("pull_request") == retained_scope.issue_id
+    ):
+        return None
     from .forge import (
         revalidate_review_head_for_context,
         resolve_review_state_for_context,
