@@ -291,6 +291,18 @@ async def _trusted_turn(case):
         enqueue=capture,
         home=case.home,
     )
+    events_path = case.home / "logs" / "events.jsonl"
+    events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    misconfigured = [
+        event
+        for event in events
+        if event.get("type") == "worklink_poller_misconfigured"
+    ]
+    assert not misconfigured, [event.get("reason") for event in misconfigured]
     assert emitted >= 1
     [event] = [
         candidate
@@ -629,7 +641,12 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
 
         (home / "worklink.yaml").write_text(
             "defaults:\n"
-            "  test_command: ./verify-remediation\n",
+            "  test_command: ./verify-remediation\n"
+            "backends:\n"
+            "  opencode:\n"
+            "    bash_allowlist:\n"
+            "      - git *\n"
+            "      - ./verify-remediation\n",
             encoding="utf-8",
         )
         os.chown(home / "worklink.yaml", identities.mimir_uid, identities.mimir_gid)
