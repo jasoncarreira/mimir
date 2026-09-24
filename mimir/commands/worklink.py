@@ -22,6 +22,7 @@ from ..worklink.orchestrator import (
     run_worklink_epic,
     run_worklink_reattach,
 )
+from ..worklink.detached_dispatch import FactoryRecoveryIdentity
 
 
 def add_argparse(
@@ -114,6 +115,11 @@ def add_argparse(
         default=None,
         help="Agent home (overrides MIMIR_HOME; default: cwd).",
     )
+    run_epic_p.add_argument("--expected-signature")
+    run_epic_p.add_argument("--expected-occurrence")
+    run_epic_p.add_argument("--expected-run-id")
+    run_epic_p.add_argument("--expected-attempt", type=int)
+    run_epic_p.add_argument("--expected-session")
     run_epic_p.add_argument(
         "--repo",
         type=Path,
@@ -349,13 +355,35 @@ def _run_epic(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         )
     except Exception:
         pass
+    expected_values = (
+        args.expected_signature, args.expected_occurrence, args.expected_run_id,
+        args.expected_attempt, args.expected_session,
+    )
+    if any(value is not None for value in expected_values) and not all(
+        value is not None for value in expected_values
+    ):
+        parser.error("run-epic expected recovery options must be supplied together")
+    expected_recovery = (
+        FactoryRecoveryIdentity(
+            signature=args.expected_signature,
+            occurrence_id=args.expected_occurrence,
+            run_id=args.expected_run_id,
+            attempt=args.expected_attempt,
+            session=args.expected_session,
+        )
+        if all(value is not None for value in expected_values)
+        else None
+    )
     try:
-        result = run_worklink_epic(
+        epic_kwargs = dict(
             home=home,
             repo=repo,
             issue_id=args.issue_id,
             autonomous=args.autonomous,
         )
+        if expected_recovery is not None:
+            epic_kwargs["expected_recovery"] = expected_recovery
+        result = run_worklink_epic(**epic_kwargs)
     except LeafValidationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

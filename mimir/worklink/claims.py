@@ -8,6 +8,7 @@ as atomic during chainlink #438).
 
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import fcntl
@@ -58,6 +59,9 @@ REAPER_SKIP_SAMPLE_LIMIT = 20
 CLAIM_CONTENTION_MAX_ATTEMPTS = 7
 CLAIM_CONTENTION_INITIAL_BACKOFF_S = 0.1
 CLAIM_CONTENDED_RESOURCE = "chainlink_locks_worktree"
+_CLAIM_CRITICAL_SECTION: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "worklink_claim_critical_section", default=False,
+)
 
 _GIT_CONTENTION_PATTERNS = (
     re.compile(
@@ -421,111 +425,109 @@ class ChainlinkClaims:
             )
             return ClaimResult(False, reason="review_ready_evidence_exists")
 
-        try:
-            lock = self._claim_lock_with_retry(
-                issue_id, home_path=claim_home, before_claim=before_claim
-            )
-        except _ChainlinkContentionExhausted:
-            return ClaimResult(False, reason="claim_contention_exhausted")
-        if lock.returncode != 0:
-            return ClaimResult(False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed")
-        if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
-            # chainlink #822: the chainlink CLI treats a same-agent re-claim as
-            # idempotent success ("You already hold the lock", rc=0). All poller
-            # dispatches share one agent identity, so without this guard a
-            # duplicate run-epic sails through and wrecks the live run (epic
-            # #783 run 12). A FRESH claim-comment heartbeat means another live
-            # process owns this run — refuse without touching any state. A
-            # stale one is a crashed predecessor: steal explicitly and proceed.
-            latest: ClaimRecord | None = None
-            # Read comments through our own JSON reader rather than trusting the
-            # caller's parse — a caller-side key mismatch here means stealing a
-            # LIVE run's lock (exactly how the guard's first live test failed).
-            guard_outcome = "claim_record_missing"
-            try:
-                guard_comments = self._issue_comments(issue_id, strict=True)
-            except Exception as exc:
-                guard_outcome = "degraded"
-                if self.event_logger is not None:
-                    self.event_logger(
-                        "worklink_claim_guard_degraded",
-                        issue_id=issue_id,
-                        error=f"{type(exc).__name__}: {exc}"[:500],
-                    )
-                return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
-            for existing in claim_records_from_comments(guard_comments):
-                if existing.issue_id != issue_id:
-                    continue
-                if latest is None or _claim_is_newer(existing, latest):
-                    latest = existing
-            if latest is not None:
-                anchor = latest.heartbeat_at or latest.claimed_at
-                age_s = (self.clock() - anchor).total_seconds()
-                if age_s < self.duplicate_freshness_s:
-                    return ClaimResult(False, reason="duplicate_run_live")
-                guard_outcome = "stale_heartbeat"
-            steal = self._run("locks", "steal", str(issue_id), check=False)
-            self._emit_claim_stolen(
-                issue_id=issue_id,
-                prior=latest,
-                now=self.clock(),
-                guard_outcome=guard_outcome,
-                result=steal,
-            )
-
-        # chainlink #825: exhaustion is judged AFTER the duplicate-liveness
-        # guard — a duplicate bouncing off a LIVE final-attempt run must yield
-        # duplicate_run_live above, never label the epic blocked (a poller
-        # duplicate did exactly that to run 15's healthy attempt-3 claim).
-        # Reaching here means we genuinely own the (fresh or stolen) lock.
-        attempt = self.next_attempt(comments)
-        attempts_used = self.attempts_used(comments)
-        if attempts_used >= self.max_attempts:
-            self.release_issue(issue_id)
-            self._attempts_exhausted(issue_id, attempts_used)
-            return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
-
-        if max_active_locks is not None:
-            try:
-                active_ids = self._active_worklink_lock_ids_for_scope(
-                    label=active_label,
-                    exclude_label=exclude_active_label,
+        def finish_claim(lock: subprocess.CompletedProcess[str]) -> ClaimResult:
+            if lock.returncode != 0:
+                return ClaimResult(
+                    False, reason=(lock.stderr or lock.stdout).strip() or "claim_failed"
                 )
-                active = len(active_ids)
+            if "already hold" in ((lock.stdout or "") + (lock.stderr or "")).lower():
+                # The CLI treats a same-agent re-claim as idempotent success.
+                # Keep this liveness guard and its authoritative comment read
+                # inside the same mutex as acquisition and publication.
+                latest: ClaimRecord | None = None
+                # Never trust the caller's earlier comment snapshot here.
+                guard_outcome = "claim_record_missing"
+                try:
+                    guard_comments = self._issue_comments(issue_id, strict=True)
+                except Exception as exc:
+                    guard_outcome = "degraded"
+                    if self.event_logger is not None:
+                        self.event_logger(
+                            "worklink_claim_guard_degraded",
+                            issue_id=issue_id,
+                            error=f"{type(exc).__name__}: {exc}"[:500],
+                        )
+                    return ClaimResult(False, reason=f"claim_guard_{guard_outcome}")
+                for existing in claim_records_from_comments(guard_comments):
+                    if existing.issue_id != issue_id:
+                        continue
+                    if latest is None or _claim_is_newer(existing, latest):
+                        latest = existing
+                if latest is not None:
+                    anchor = latest.heartbeat_at or latest.claimed_at
+                    age_s = (self.clock() - anchor).total_seconds()
+                    if age_s < self.duplicate_freshness_s:
+                        return ClaimResult(False, reason="duplicate_run_live")
+                    guard_outcome = "stale_heartbeat"
+                steal = self._run("locks", "steal", str(issue_id), check=False)
+                self._emit_claim_stolen(
+                    issue_id=issue_id,
+                    prior=latest,
+                    now=self.clock(),
+                    guard_outcome=guard_outcome,
+                    result=steal,
+                )
+
+            # Judge exhaustion only after duplicate liveness, so a live final
+            # attempt is refused as a duplicate instead of being blocked.
+            attempt = self.next_attempt(comments)
+            attempts_used = self.attempts_used(comments)
+            if attempts_used >= self.max_attempts:
+                self.release_issue(issue_id)
+                self._attempts_exhausted(issue_id, attempts_used)
+                return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
+
+            if max_active_locks is not None:
+                try:
+                    active_ids = self._active_worklink_lock_ids_for_scope(
+                        label=active_label,
+                        exclude_label=exclude_active_label,
+                    )
+                    active = len(active_ids)
+                except Exception:
+                    self.release_issue(issue_id)
+                    raise
+                if active > max_active_locks:
+                    self.release_issue(issue_id)
+                    consuming_ids = sorted(
+                        lock_id
+                        for lock_id in active_ids
+                        if lock_id > 0 and lock_id != issue_id
+                    )
+                    ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
+                    return ClaimResult(
+                        False,
+                        reason=(
+                            f"concurrency cap reached ({active - 1}/{max_active_locks} active "
+                            f"claims before this reservation{ids_suffix})"
+                        ),
+                    )
+
+            record = ClaimRecord(
+                issue_id=issue_id,
+                attempt=attempt,
+                agent_id=self.agent_id,
+                claimed_at=self.clock(),
+                budget_attempt=attempts_used + 1,
+            )
+            try:
+                self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
+                self._run("issue", "label", str(issue_id), "worklink:in-progress")
+                self._run("issue", "comment", str(issue_id), record.to_comment())
             except Exception:
                 self.release_issue(issue_id)
                 raise
-            if active > max_active_locks:
-                self.release_issue(issue_id)
-                consuming_ids = sorted(
-                    lock_id
-                    for lock_id in active_ids
-                    if lock_id > 0 and lock_id != issue_id
-                )
-                ids_suffix = f"; active issue ids: {consuming_ids}" if consuming_ids else ""
-                return ClaimResult(
-                    False,
-                    reason=(
-                        f"concurrency cap reached ({active - 1}/{max_active_locks} active "
-                        f"claims before this reservation{ids_suffix})"
-                    ),
-                )
+            return ClaimResult(True, record=record)
 
-        record = ClaimRecord(
-            issue_id=issue_id,
-            attempt=attempt,
-            agent_id=self.agent_id,
-            claimed_at=self.clock(),
-            budget_attempt=attempts_used + 1,
-        )
         try:
-            self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
-            self._run("issue", "label", str(issue_id), "worklink:in-progress")
-            self._run("issue", "comment", str(issue_id), record.to_comment())
-        except Exception:
-            self.release_issue(issue_id)
-            raise
-        return ClaimResult(True, record=record)
+            return self._claim_lock_with_retry(
+                issue_id,
+                home_path=claim_home,
+                before_claim=before_claim,
+                after_claim=finish_claim,
+            )
+        except _ChainlinkContentionExhausted:
+            return ClaimResult(False, reason="claim_contention_exhausted")
 
     def _claim_lock_with_retry(
         self,
@@ -533,10 +535,11 @@ class ChainlinkClaims:
         *,
         home_path: Path | None,
         before_claim: Callable[[], None] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
+        after_claim: Callable[[subprocess.CompletedProcess[str]], ClaimResult] | None = None,
+    ) -> subprocess.CompletedProcess[str] | ClaimResult:
         return self._run_with_retry(
             "locks", "claim", str(issue_id), home_path=home_path,
-            before_claim=before_claim,
+            before_claim=before_claim, after_claim=after_claim,
         )
 
     def _run_with_retry(
@@ -544,13 +547,29 @@ class ChainlinkClaims:
         *args: str,
         home_path: Path | None,
         before_claim: Callable[[], None] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        """One mutex acquisition per invocation; the claim never wraps _run.
+        after_claim: Callable[[subprocess.CompletedProcess[str]], ClaimResult] | None = None,
+    ) -> subprocess.CompletedProcess[str] | ClaimResult:
+        """Run with bounded contention; claim finalization may stay under the mutex.
 
         Local mutex waits and external Git contention share one bounded budget.
-        The callback runs once, after acquisition and before the first CLI call.
+        The callbacks run once around the successful claim command.
         """
         issue_id = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+        if _CLAIM_CRITICAL_SECTION.get():
+            result: subprocess.CompletedProcess[str] | None = None
+            for attempt in range(1, self.contention_max_attempts + 1):
+                result = self.runner([self.chainlink_bin, *args])
+                if not _is_git_contention(result):
+                    if attempt > 1 and result.returncode == 0:
+                        self._emit_claim_contention(issue_id, attempt, "succeeded")
+                    return after_claim(result) if after_claim is not None else result
+                if attempt < self.contention_max_attempts:
+                    self._emit_claim_contention(issue_id, attempt, "retrying")
+                    self.sleeper(self.contention_initial_backoff_s * (2 ** (attempt - 1)))
+            self._emit_claim_contention(issue_id, self.contention_max_attempts, "exhausted")
+            raise _ChainlinkContentionExhausted(
+                "chainlink contention exhausted (chainlink_locks_worktree)"
+            )
         lock_path: Path | None = None
         if home_path is None:
             log.warning(
@@ -577,6 +596,10 @@ class ChainlinkClaims:
                     before_claim()
                 prepared = True
                 result = self.runner([self.chainlink_bin, *args])
+                if not _is_git_contention(result):
+                    if attempt > 1 and result.returncode == 0:
+                        self._emit_claim_contention(issue_id, attempt, "succeeded")
+                    return after_claim(result) if after_claim is not None else result
             else:
                 with lock_path.open("a", encoding="utf-8") as handle:
                     try:
@@ -589,6 +612,16 @@ class ChainlinkClaims:
                                 before_claim()
                             prepared = True
                             result = self.runner([self.chainlink_bin, *args])
+                            if not _is_git_contention(result):
+                                if attempt > 1 and result.returncode == 0:
+                                    self._emit_claim_contention(issue_id, attempt, "succeeded")
+                                if after_claim is None:
+                                    return result
+                                token = _CLAIM_CRITICAL_SECTION.set(True)
+                                try:
+                                    return after_claim(result)
+                                finally:
+                                    _CLAIM_CRITICAL_SECTION.reset(token)
                         finally:
                             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 

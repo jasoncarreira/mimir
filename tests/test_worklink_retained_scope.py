@@ -16,6 +16,7 @@ from mimir.models import RetainedFactoryScope
 from mimir.project_tests import ProjectTestResult, RepoProjectTests
 from mimir.readonly_backend import RetainedCheckoutFilesystemBackend
 from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, record_failure
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
@@ -100,6 +101,148 @@ def test_retained_file_effects_are_in_all_central_policy_inventories() -> None:
         assert ac.TRIGGER_CAPABILITY_TIERS[tool] is ac.CapabilityTier.SCOPE_CONTAINED
         assert tool in budget_gate._REMEDIATION_EFFECT_TOOLS
         assert tool in ac._NON_INGESTING_RESULT_TOOLS
+
+
+def test_worklink_resume_is_exact_spawn_capability() -> None:
+    from mimir.tools import budget_gate
+
+    assert ac.get_sink_category("worklink_resume") is ac.SinkCategory.SPAWN
+    assert ac.get_tool_flow_direction("worklink_resume") is ac.ToolFlowDirection.BOTH
+    assert ac.TRIGGER_CAPABILITY_TIERS["worklink_resume"] is ac.CapabilityTier.CODE_EXECUTION
+    assert "worklink_resume" in budget_gate._REMEDIATION_EFFECT_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_worklink_resume_dispatches_exact_scope_detached(
+    retained_incident, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import registry
+    from mimir.worklink import autonomy, detached_dispatch, factory_state
+
+    case = retained_incident
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    parked = replace(case.record, status=FactoryStatus(
+        run_id=case.record.run_id, valid=True, sandbox_path=case.record.sandbox,
+        status="needs-human",
+    ))
+    save_factory_record(case.home, parked)
+    monkeypatch.setenv("WORKLINK_REPO", str(case.sandbox.parent))
+    monkeypatch.setattr(factory_state, "factory_process_is_alive", lambda record: False)
+    monkeypatch.setattr(factory_state, "factory_process_is_verified_dead", lambda record: True)
+    monkeypatch.setattr(
+        autonomy, "make_claims",
+        lambda home: SimpleNamespace(_active_worklink_lock_ids_for_scope=lambda **kwargs: set()),
+    )
+    launches: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        detached_dispatch,
+        "launch_detached_worklink",
+        lambda **kwargs: launches.append(kwargs) or detached_dispatch.DetachedWorklinkProcess(
+            4321, dispatch_failure_state_dir(case.home) / "run-epic-1810.log",
+        ),
+    )
+
+    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+
+    assert "recovery dispatched" in output
+    assert "run_id=chainlink-1810" in output
+    assert "retained_attempt=1" in output
+    assert "pid=4321" in output
+    assert "child may still refuse" in output
+    assert "only a successful child claim consumes" in output
+    assert launches[0]["recovery"] == detached_dispatch.FactoryRecoveryIdentity(
+        scope.signature, scope.occurrence_id, scope.run_id, scope.attempt, scope.session,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worklink_resume_refuses_leaf_without_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.tools import registry
+    from mimir.worklink import detached_dispatch
+
+    monkeypatch.setattr(
+        detached_dispatch, "launch_detached_worklink",
+        Mock(side_effect=AssertionError("leaf incident launched")),
+    )
+    runtime = SimpleNamespace(context=SimpleNamespace(
+        retained_factory_scope=None,
+        retained_factory_scope_refusal="incident is not a retained factory run",
+    ))
+    output = await registry.worklink_resume.coroutine(runtime=runtime)
+    assert "refused" in output
+    assert "leaf incidents must be diagnosed and reported" in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("stale", "incident occurrence is not current"),
+        ("missing", "record is missing"),
+        ("ambiguous", "record is ambiguous"),
+        ("replaced", "target was replaced"),
+        ("status", "not needs-human"),
+        ("alive", "process is alive"),
+        ("unverified", "death cannot be verified"),
+        ("same_issue", "another run for this issue is live"),
+        ("cap", "concurrency cap reached"),
+    ],
+)
+async def test_worklink_resume_preflight_refuses_changed_state_without_launch(
+    retained_incident, monkeypatch: pytest.MonkeyPatch, mutation: str, reason: str,
+) -> None:
+    from mimir.tools import registry
+    from mimir.worklink import autonomy, detached_dispatch, dispatch_failures, factory_state
+
+    case = retained_incident
+    scope = derive_retained_factory_scope(case.event, case.service).scope
+    assert scope is not None
+    parked = replace(case.record, status=FactoryStatus(
+        run_id=case.record.run_id, valid=True, sandbox_path=case.record.sandbox,
+        status="needs-human",
+    ))
+    records = [parked]
+    if mutation == "missing":
+        records = []
+    elif mutation == "ambiguous":
+        records = [parked, parked]
+    elif mutation == "replaced":
+        records = [replace(parked, session="replacement")]
+    elif mutation == "status":
+        records = [replace(parked, status=replace(parked.status, status="running"))]
+    monkeypatch.setenv("WORKLINK_REPO", str(case.sandbox.parent))
+    monkeypatch.setattr(factory_state, "load_factory_records_for_issue", lambda *args: records)
+    monkeypatch.setattr(
+        dispatch_failures, "current_failure_record",
+        (
+            lambda *args: {**case.incident, "occurrence_id": "replacement-occurrence"}
+            if mutation == "stale" else case.incident
+        ),
+    )
+    monkeypatch.setattr(
+        factory_state, "factory_process_is_alive", lambda record: mutation == "alive",
+    )
+    monkeypatch.setattr(
+        factory_state, "factory_process_is_verified_dead",
+        lambda record: mutation not in {"alive", "unverified"},
+    )
+    active = (
+        {scope.issue_id} if mutation == "same_issue"
+        else {999} if mutation == "cap" else set()
+    )
+    monkeypatch.setattr(
+        autonomy, "make_claims",
+        lambda home: SimpleNamespace(_active_worklink_lock_ids_for_scope=lambda **kwargs: active),
+    )
+    monkeypatch.setattr(autonomy, "factory_max_concurrent", lambda: 1)
+    launch = Mock(side_effect=AssertionError("refused recovery launched"))
+    monkeypatch.setattr(detached_dispatch, "launch_detached_worklink", launch)
+
+    output = await registry.worklink_resume.coroutine(runtime=_retained_runtime(scope))
+
+    assert reason in output
+    launch.assert_not_called()
 
 
 def test_central_policy_grants_only_five_retained_repo_tools(retained_incident) -> None:

@@ -53,6 +53,7 @@ from .registry import (
     set_spawn_config,
     spawn_open_code,
     worklink_run,
+    worklink_resume,
 )
 from .web import (
     fetch_url,
@@ -199,6 +200,7 @@ __all__ = [
     "set_arbiter",
     # Worklink in-turn dispatch (#444)
     "worklink_run",
+    "worklink_resume",
     # Aggregate
     "all_mimir_tools",
 ]

@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import re
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -57,7 +58,7 @@ from ..pollers import (
     PollerOverridesValidationError,
     validate_poller_overrides_text,
 )
-from ..models import AuthContext, Integrity, IntegrityEffect, TurnInteractivity
+from ..models import AuthContext, Integrity, IntegrityEffect, RetainedFactoryScope, TurnInteractivity
 from ..scheduler import SchedulerJob
 
 # Per-task ContextVar for channel_id — isolated across concurrent asyncio
@@ -2971,6 +2972,131 @@ async def worklink_run(
     return " ".join(parts)
 
 
+@tool
+async def worklink_resume(
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Dispatch exact recovery of the factory run bound to this incident turn.
+
+    This tool takes no run identity arguments. It uses only the server-derived
+    retained factory scope and returns promptly after launching a detached child.
+    Leaf incidents cannot be resumed; diagnose them and notify the operator.
+    """
+    context = getattr(runtime, "context", None)
+    scope = getattr(context, "retained_factory_scope", None)
+    if not isinstance(scope, RetainedFactoryScope):
+        reason = getattr(context, "retained_factory_scope_refusal", None)
+        return (
+            "worklink_resume refused: "
+            f"{reason or 'this turn has no exact retained factory incident'}; "
+            "leaf incidents must be diagnosed and reported to the operator"
+        )
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return "worklink_resume refused: MIMIR_HOME not set"
+    home = Path(home_value)
+
+    from ..worklink.autonomy import (
+        factory_max_concurrent, make_claims, worklink_priority, worklink_repo,
+    )
+    from ..worklink.claims import WORKLINK_EPIC_LABEL
+    from ..worklink.detached_dispatch import (
+        FactoryRecoveryIdentity, launch_detached_worklink,
+    )
+    from ..worklink.dispatch_failures import current_failure_record, dispatch_failure_state_dir
+    from ..worklink.factory_state import (
+        factory_process_is_alive, factory_process_is_verified_dead,
+        load_factory_records_for_issue,
+    )
+
+    try:
+        repo = Path(worklink_repo())
+    except Exception as exc:
+        return f"worklink_resume refused: {exc}"
+
+    arbiter = _STATE.get("arbiter")
+    if arbiter is not None:
+        try:
+            priority = worklink_priority(home)
+        except Exception:
+            priority = "normal"
+        try:
+            loop = asyncio.get_running_loop()
+            decision = await asyncio.to_thread(
+                arbiter.should_fire, priority=priority, event_loop=loop,
+            )
+        except Exception as exc:
+            log.warning("worklink_resume arbiter check failed: %s", exc)
+            decision = None
+        if decision is not None and not decision.fire:
+            return f"worklink_resume shed: resource pressure {decision.severity.name}: {decision.reason}"
+
+    try:
+        incident = current_failure_record(dispatch_failure_state_dir(home), scope.issue_id)
+        records = load_factory_records_for_issue(home, scope.issue_id)
+        if incident is None or (
+            incident["signature"] != scope.signature
+            or incident["occurrence_id"] != scope.occurrence_id
+        ):
+            return "worklink_resume refused: incident occurrence is not current"
+        if not records:
+            return "worklink_resume refused: retained factory record is missing"
+        if len(records) != 1:
+            return "worklink_resume refused: retained factory record is ambiguous"
+        record = records[0]
+        if (
+            record.run_id != scope.run_id
+            or record.attempt != scope.attempt
+            or record.session != scope.session
+            or incident.get("run_id") != scope.run_id
+            or incident.get("attempt") != scope.attempt
+            or incident.get("work_path") != record.sandbox
+        ):
+            return "worklink_resume refused: retained factory target was replaced"
+        if record.status is None or record.status.status != "needs-human":
+            return "worklink_resume refused: retained factory run is not needs-human"
+        if factory_process_is_alive(record):
+            return "worklink_resume refused: retained factory process is alive"
+        if not factory_process_is_verified_dead(record):
+            return "worklink_resume refused: retained factory process death cannot be verified"
+        claims = make_claims(home)
+        active_ids = claims._active_worklink_lock_ids_for_scope(label=WORKLINK_EPIC_LABEL)
+        if scope.issue_id in active_ids:
+            return "worklink_resume refused: another run for this issue is live"
+        cap = factory_max_concurrent()
+        if len(active_ids) >= cap:
+            return f"worklink_resume refused: factory concurrency cap reached ({len(active_ids)}/{cap})"
+    except Exception as exc:
+        return f"worklink_resume refused: recovery preflight failed: {exc}"
+
+    state_dir = dispatch_failure_state_dir(home)
+    try:
+        launched = launch_detached_worklink(
+            command="run-epic",
+            issue_id=scope.issue_id,
+            home=home,
+            repo=repo,
+            state_dir=state_dir,
+            run_bin=shlex.split(os.environ.get("WORKLINK_RUN_BIN") or "mimir"),
+            recovery=FactoryRecoveryIdentity(
+                signature=scope.signature,
+                occurrence_id=scope.occurrence_id,
+                run_id=scope.run_id,
+                attempt=scope.attempt,
+                session=scope.session,
+            ),
+            env_overrides={"STATE_DIR": str(state_dir)},
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return f"worklink_resume failed: detached recovery dispatch failed: {exc}"
+    return (
+        f"worklink_resume: recovery dispatched run_id={scope.run_id} "
+        f"retained_attempt={scope.attempt} pid={launched.pid} log={launched.log_path}. "
+        "The child may still refuse under the claim; only a successful child claim "
+        "consumes a new Chainlink claim attempt."
+    )
+
+
 def all_mimir_tools(
     model_spec: str | None = None,
     *,
@@ -3062,7 +3188,7 @@ def all_mimir_tools(
         commitment_dismiss, commitment_list,
         # Worklink in-turn dispatch (#444). Core tool (no skill mechanism);
         # arbiter- + cap-gated autonomous dispatch to the deterministic executor.
-        worklink_run,
+        worklink_run, worklink_resume,
         # Mimir-package self-update (operator-approved, applied on
         # next restart). See mimir/update_on_start.py.
         request_mimir_update,

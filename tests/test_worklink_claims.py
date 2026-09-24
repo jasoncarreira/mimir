@@ -163,6 +163,81 @@ def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> 
     assert all(result.claimed and result.record is not None for result in results)
 
 
+@pytest.mark.timeout(30)
+def test_same_issue_claim_is_serialized_through_durable_publication(tmp_path: Path) -> None:
+    published: list[str] = []
+    claim_calls = 0
+    record_clock_entered = threading.Event()
+    release_record_clock = threading.Event()
+    first_finished = threading.Event()
+    second_claim_reached = threading.Event()
+    results: list[ClaimResult] = []
+    guard = threading.Lock()
+    now = datetime(2026, 9, 24, tzinfo=UTC)
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            with guard:
+                claim_calls += 1
+                ordinal = claim_calls
+            if ordinal > 1:
+                second_claim_reached.set()
+            return subprocess.CompletedProcess(
+                call, 0, stdout=("You already hold the lock" if ordinal > 1 else ""), stderr="",
+            )
+        if call[1:4] == ["issue", "comment", "1709"]:
+            published.append(call[-1])
+            return completed(call)
+        if call[1:4] == ["issue", "show", "1709"]:
+            return subprocess.CompletedProcess(call, 0, stdout=json.dumps({
+                "labels": ["worklink:ready"],
+                "comments": [{"content": value} for value in published],
+            }), stderr="")
+        return completed(call)
+
+    def claim(block_record_clock: bool) -> None:
+        clock_calls = 0
+
+        def clock() -> datetime:
+            nonlocal clock_calls
+            clock_calls += 1
+            if block_record_clock and clock_calls == 1:
+                # This point is after `locks claim` returned but before the
+                # ClaimRecord or its durable comment exists. It was outside the
+                # global mutex before finish_claim moved under after_claim.
+                record_clock_entered.set()
+                assert release_record_clock.wait(timeout=10)
+            return now
+
+        claims = ChainlinkClaims(
+            agent_id="same-agent", runner=runner, home_path=tmp_path, clock=clock,
+            sleeper=lambda _: first_finished.wait(timeout=10),
+        )
+        result = claims.claim_issue(1709, labels=["worklink:ready"])
+        results.append(result)
+        if result.claimed:
+            first_finished.set()
+
+    first = threading.Thread(target=claim, args=(True,))
+    second = threading.Thread(target=claim, args=(False,))
+    first.start()
+    assert record_clock_entered.wait(timeout=10)
+    second.start()
+    assert not second_claim_reached.wait(timeout=0.2)
+    assert claim_calls == 1
+    assert published == []
+    release_record_clock.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert second_claim_reached.is_set()
+    assert sum(result.claimed for result in results) == 1
+    assert sorted(result.reason or "" for result in results) == ["", "duplicate_run_live"]
+
+
 @pytest.mark.parametrize("winner_duration_s", [3.469, 5.0])
 def test_claim_loser_outlasts_realistic_winner(tmp_path: Path, winner_duration_s: float) -> None:
     lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"

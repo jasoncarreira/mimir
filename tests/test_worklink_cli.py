@@ -268,6 +268,43 @@ def test_worklink_run_epic_cli_rejects_base_flag() -> None:
         parser.parse_args(["worklink", "run-epic", "700", "--base", "feature/acp"])
 
 
+def test_worklink_run_epic_cli_forwards_complete_recovery_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.commands.worklink as worklink_cmd
+    from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        worklink_cmd,
+        "run_worklink_epic",
+        lambda **kwargs: calls.append(kwargs) or WorklinkRunResult(700, 2, "needs-human"),
+    )
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink", "run-epic", "700", "--home", str(tmp_path / "home"),
+            "--repo", str(tmp_path / "repo"), "--autonomous",
+            "--expected-signature", "sig", "--expected-occurrence", "occ",
+            "--expected-run-id", "chainlink-700", "--expected-attempt", "2",
+            "--expected-session", "session-2",
+        ])
+    assert exc.value.code == 1
+    assert calls[0]["expected_recovery"] == FactoryRecoveryIdentity(
+        "sig", "occ", "chainlink-700", 2, "session-2",
+    )
+
+
+def test_worklink_run_epic_cli_rejects_partial_recovery_identity(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "worklink", "run-epic", "700", "--home", str(tmp_path),
+            "--repo", str(tmp_path), "--expected-run-id", "chainlink-700",
+        ])
+    assert exc.value.code == 2
+
+
 def test_worklink_cli_has_no_factory_cancel_transition() -> None:
     import mimir.commands.worklink as worklink_cmd
 

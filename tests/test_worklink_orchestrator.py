@@ -32,6 +32,7 @@ from mimir.worklink.backends.registry import BackendRegistry, WorklinkConfig, Wo
 from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, ClaimResult, claim_records_from_comments
 from mimir.worklink.compute import LaunchHandle, WorkSpec
 from mimir.worklink.checkout import CheckoutLease
+from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
 from mimir.worklink.backends.feature_factory import (
     _FACTORY_PERMISSION,
     FeatureFactoryBackend,
@@ -7359,6 +7360,133 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
         "max_active_locks": 1,
         "active_label": "worklink:epic",
     }]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("missing", "target is missing"),
+        ("stale", "incident occurrence is stale"),
+        ("ambiguous", "target is ambiguous"),
+        ("replaced", "target was replaced"),
+    ],
+)
+def test_expected_factory_recovery_rechecks_identity_inside_claim_without_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    import mimir.worklink.dispatch_failures as failures
+    import mimir.worklink.orchestrator as orchestrator
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    (sandbox / ".git").mkdir()
+    (tmp_path / "worklink.yaml").write_text(
+        "defaults:\n  allow_autonomous_local_subprocess: true\n",
+        encoding="utf-8",
+    )
+    epic = json.dumps({
+        "id": 700,
+        "title": "epic",
+        "description": "build",
+        "labels": ["worklink", "worklink:epic", "worklink:ready"],
+        "comments": [],
+    })
+    retained = _factory_lifecycle_record(
+        sandbox, LaunchHandle("local_subprocess", "999999999", 1)
+    ).observed(
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+        datetime.now(UTC).isoformat(),
+    )
+    save_factory_record(tmp_path, retained)
+    state_dir = failures.dispatch_failure_state_dir(tmp_path)
+    incident = failures.record_failure(
+        state_dir,
+        issue_id=700,
+        attempt=retained.attempt,
+        exit_status=1,
+        error="retained factory needs recovery",
+        log_path="factory.log",
+        run_id=retained.run_id,
+        work_path=retained.sandbox,
+    )
+    expected = FactoryRecoveryIdentity(
+        incident["signature"], incident["occurrence_id"], retained.run_id,
+        retained.attempt, retained.session or "",
+    )
+
+    commands: list[list[str]] = []
+
+    def runner(args: Sequence[str] | str, **_: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(args, list):
+            commands.append(args)
+        if isinstance(args, list) and args[:4] == ["chainlink", "issue", "show", "700"]:
+            return cp(args, stdout=epic)
+        if isinstance(args, list) and args[:4] == ["git", "-C", str(repo), "config"]:
+            return cp(args, stdout="git@github.com:owner/repo.git\n")
+        return cp(args)
+
+    preflight_reads = 0
+
+    def load_records(home: Path, issue_id: int) -> list[FactoryRunRecord]:
+        nonlocal preflight_reads
+        preflight_reads += 1
+        if preflight_reads == 1:
+            return [retained]
+        if mutation == "missing":
+            return []
+        if mutation == "ambiguous":
+            return [retained, replace(retained, session="second-session")]
+        if mutation == "replaced":
+            return [replace(retained, session="replacement-session")]
+        return [retained]
+
+    incident_reads = 0
+
+    def current_incident(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal incident_reads
+        incident_reads += 1
+        if mutation == "stale":
+            return {**incident, "occurrence_id": "replacement-occurrence"}
+        return incident
+
+    claim_calls = 0
+
+    def claim_issue(self: ChainlinkClaims, *args: object, **kwargs: object) -> ClaimResult:
+        nonlocal claim_calls
+        claim_calls += 1
+        kwargs["before_claim"]()
+        raise AssertionError("exact recovery identity recheck allowed claim publication")
+
+    async def launch(*args: object, **kwargs: object) -> LaunchHandle:
+        raise AssertionError("exact recovery identity recheck allowed factory launch")
+
+    monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
+    monkeypatch.setattr(orchestrator, "load_factory_records_for_issue", load_records)
+    monkeypatch.setattr(failures, "current_failure_record", current_incident)
+    monkeypatch.setattr(orchestrator.ChainlinkClaims, "claim_issue", claim_issue)
+    monkeypatch.setattr(orchestrator.LocalSubprocessComputeBackend, "launch", launch)
+
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=repo, runner=runner, agent_id="agent").run_epic(
+            700, autonomous=True, expected_recovery=expected,
+        )
+    )
+
+    assert result.status in {"blocked", "refused"}
+    assert result.reason is not None and expected_reason in result.reason
+    assert claim_calls == 1
+    assert preflight_reads == 2
+    assert incident_reads == 1
+    assert not any(call[1:3] == ["locks", "claim"] for call in commands)
+    assert not any(
+        call[1:3] == ["issue", "comment"] and "WORKLINK_CLAIM" in call[-1]
+        for call in commands
+    )
 
 
 def _factory_lifecycle_status(
