@@ -370,7 +370,7 @@ def retained_factory_snapshot_bundle(source: Path) -> Iterator[Path]:
     finally:
         removed = run_factory_control(
             source,
-            ("/usr/bin/rm", "-f", "--", str(artifact)),
+            ("/bin/rm", "-f", "--", str(artifact)),
             env=_sanitized_git_env(),
             timeout=_DEFAULT_TIMEOUT_SECONDS,
             output_limit=_DEFAULT_OUTPUT_BYTES,

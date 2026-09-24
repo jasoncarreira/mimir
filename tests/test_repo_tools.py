@@ -1936,6 +1936,7 @@ def test_retained_snapshot_bundle_is_removed_on_success_and_creation_refusal(
 
     def control(checkout, argv, **_kwargs):
         assert checkout == source
+        assert argv[:3] == ("/bin/rm", "-f", "--")
         artifact = Path(argv[-1])
         artifact.unlink(missing_ok=True)
         removed.append(artifact)
