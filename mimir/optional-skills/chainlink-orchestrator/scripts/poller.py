@@ -56,6 +56,7 @@ from mimir.worklink.dispatch_failures import (
     pending_failure_alerts,
     record_failure,
 )
+from mimir.worklink.detached_dispatch import launch_detached_worklink
 
 
 READY_LABEL = "worklink:ready"
@@ -338,35 +339,17 @@ def _dispatch(
     factory_cap: int,
 ) -> bool:
     effective_coding_enabled = coding_enabled()
-    argv = [
-        *run_bin,
-        "worklink",
-        item.command,
-        str(item.issue_id),
-        "--home",
-        str(home),
-        "--repo",
-        repo,
-        "--autonomous",
-    ]
     log_path = state_dir / f"{item.command}-{item.issue_id}.log"
     try:
-        log_fh = log_path.open("ab")
-    except OSError:
-        log_fh = subprocess.DEVNULL
-    try:
-        subprocess.Popen(
-            argv,
-            cwd=repo,
-            env={
-                **os.environ,
-                "STATE_DIR": str(state_dir),
-                "WORKLINK_RUN_LOG": str(log_path),
-            },
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=log_fh,
-            start_new_session=True,
+        launch_detached_worklink(
+            command=item.command,
+            issue_id=item.issue_id,
+            home=home,
+            repo=repo,
+            state_dir=state_dir,
+            run_bin=run_bin,
+            env_overrides={"STATE_DIR": str(state_dir)},
+            popen=subprocess.Popen,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         record_failure(
@@ -387,12 +370,6 @@ def _dispatch(
             }
         )
         return False
-    finally:
-        if log_fh not in (subprocess.DEVNULL, None):
-            try:
-                log_fh.close()
-            except OSError:
-                pass
     _emit(
         {
             "signal": "worklink_dispatched",

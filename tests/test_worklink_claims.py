@@ -163,6 +163,67 @@ def test_simultaneous_claims_are_serialized_and_both_succeed(tmp_path: Path) -> 
     assert all(result.claimed and result.record is not None for result in results)
 
 
+@pytest.mark.timeout(30)
+def test_same_issue_claim_is_serialized_through_durable_publication(tmp_path: Path) -> None:
+    published: list[str] = []
+    claim_calls = 0
+    publication_entered = threading.Event()
+    release_publication = threading.Event()
+    first_finished = threading.Event()
+    second_claim_reached = threading.Event()
+    results: list[ClaimResult] = []
+    guard = threading.Lock()
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal claim_calls
+        call = list(args)
+        if call[1:3] == ["locks", "claim"]:
+            with guard:
+                claim_calls += 1
+                ordinal = claim_calls
+            if ordinal > 1:
+                second_claim_reached.set()
+            return subprocess.CompletedProcess(
+                call, 0, stdout=("You already hold the lock" if ordinal > 1 else ""), stderr="",
+            )
+        if call[1:4] == ["issue", "comment", "1709"]:
+            published.append(call[-1])
+            publication_entered.set()
+            release_publication.wait(timeout=10)
+            return completed(call)
+        if call[1:4] == ["issue", "show", "1709"]:
+            return subprocess.CompletedProcess(call, 0, stdout=json.dumps({
+                "labels": ["worklink:ready"],
+                "comments": [{"content": value} for value in published],
+            }), stderr="")
+        return completed(call)
+
+    def claim() -> None:
+        claims = ChainlinkClaims(
+            agent_id="same-agent", runner=runner, home_path=tmp_path,
+            sleeper=lambda _: first_finished.wait(timeout=10),
+        )
+        result = claims.claim_issue(1709, labels=["worklink:ready"])
+        results.append(result)
+        if result.claimed:
+            first_finished.set()
+
+    first = threading.Thread(target=claim)
+    second = threading.Thread(target=claim)
+    first.start()
+    assert publication_entered.wait(timeout=10)
+    second.start()
+    assert not second_claim_reached.wait(timeout=0.2)
+    assert claim_calls == 1
+    release_publication.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert sum(result.claimed for result in results) == 1
+    assert sorted(result.reason or "" for result in results) == ["", "duplicate_run_live"]
+
+
 @pytest.mark.parametrize("winner_duration_s", [3.469, 5.0])
 def test_claim_loser_outlasts_realistic_winner(tmp_path: Path, winner_duration_s: float) -> None:
     lock_path = tmp_path / "state" / "worklink" / "chainlink-claim.lock"

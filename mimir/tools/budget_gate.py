@@ -148,7 +148,7 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
 })
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review", "write_file", "edit_file",
+    "pr_rerequest_review", "write_file", "edit_file", "worklink_resume",
 })
 
 
@@ -213,6 +213,7 @@ _ADMIN_TOOL_NAMES: frozenset[str] = frozenset(
         "abandon_proposal",
         "request_mimir_update",
         "worklink_run",
+        "worklink_resume",
         "shell_exec",
         "bash_async",
         "saga_forget",
@@ -560,7 +561,7 @@ def _extract_sink_target(
         target = args.get("command")
     elif tool_name == "spawn_open_code":
         target = args.get("cwd") or os.environ.get("MIMIR_HOME")
-    elif tool_name == "worklink_run":
+    elif tool_name in {"worklink_run", "worklink_resume"}:
         target = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
     elif tool_name in {"fetch_url", "http_request", "webhook"}:
         target = args.get("url")
@@ -2214,6 +2215,10 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
     if tool_name == "worklink_run" and re.match(
         r"worklink_run #\d+: (?:blocked|failed)(?:\s|$)", text,
     ):
+        return True
+    if tool_name == "worklink_resume" and text.startswith((
+        "worklink_resume shed:", "worklink_resume refused:", "worklink_resume failed:",
+    )):
         return True
     if tool_name == "bash_job_output" and text.startswith("unknown job_id:"):
         return True

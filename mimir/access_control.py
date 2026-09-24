@@ -206,6 +206,7 @@ _SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
     "hands_python": SinkCategory.SHELL_PROCESS,
     "spawn_open_code": SinkCategory.SPAWN,
     "worklink_run": SinkCategory.SPAWN,
+    "worklink_resume": SinkCategory.SPAWN,
     "ntfy_send": SinkCategory.NOTIFICATION,
     "write_file": SinkCategory.FILE,
     "edit_file": SinkCategory.FILE,
@@ -306,6 +307,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "commitment_dismiss": ToolFlowDirection.SINK,
     "commitment_list": ToolFlowDirection.SOURCE,
     "worklink_run": ToolFlowDirection.BOTH,
+    "worklink_resume": ToolFlowDirection.BOTH,
     "request_mimir_update": ToolFlowDirection.SINK,
     "web_search": ToolFlowDirection.BOTH,
     "fetch_url": ToolFlowDirection.BOTH,
@@ -509,6 +511,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "saga_record_skill_learning": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "worklink_run": CapabilityTier.CODE_EXECUTION,
+    "worklink_resume": CapabilityTier.CODE_EXECUTION,
     "spawn_open_code": CapabilityTier.CODE_EXECUTION,
     "fetch_url": CapabilityTier.UNBOUNDED,
     "web_search": CapabilityTier.UNBOUNDED,
@@ -594,7 +597,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "open_proposal", "submit_proposal", "abandon_proposal",
     }),
     "github": frozenset({
-        "worklink_run", "write_file", "edit_file", "shell_exec",
+        "worklink_run", "worklink_resume", "write_file", "edit_file", "shell_exec",
         "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
         "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
         "file_search", "get_turn", "mimir_get_turn", "send_message",
@@ -775,7 +778,7 @@ def build_trigger_service_principal(
                 profile, "scheduler_read_only",
             )
             policies.append(ServiceSinkPolicy(operation, "shell_profile", shell_profile))
-        elif operation == "worklink_run":
+        elif operation in {"worklink_run", "worklink_resume"}:
             policies.append(ServiceSinkPolicy(operation, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"))
         elif operation == "fetch_url":
             fetch_policy = _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE.get(profile)
@@ -6168,7 +6171,7 @@ class SinkGate:
                     None,
                 )
             return (
-                tool_name == "worklink_run"
+                tool_name in {"worklink_run", "worklink_resume"}
                 and not has_untrusted_active_ingest,
                 None,
             )
@@ -7595,7 +7598,7 @@ class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
     _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
-    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run"}
+    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
@@ -7745,7 +7748,7 @@ class WriteResourceAdapter:
             and cls._human_target_is_allowed(target)
         )
         reason = None if in_scope else (
-            "admin_required" if tool_name == "worklink_run" else "write_scope"
+            "admin_required" if tool_name in {"worklink_run", "worklink_resume"} else "write_scope"
         )
         return ToolAuthorization(
             tool_name=tool_name,
@@ -9388,6 +9391,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "execute": "shell",
     "web_search": "web",
     "worklink_run": "worklink",
+    "worklink_resume": "worklink",
     "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
     "pr_files": "repository",
@@ -10558,6 +10562,7 @@ _OPERATION_SINK_DESTINATION: dict[str, str] = {
     "operator_alert": "notification",
     "saga_end_session": "session_boundary",
     "worklink_run": "worklink",
+    "worklink_resume": "worklink",
     "react": "message",
     "web_search": "network",
     "fetch_url": "network",

@@ -94,6 +94,7 @@ from .factory_state import (
     load_factory_records_for_issue,
     save_factory_record,
 )
+from .detached_dispatch import FactoryRecoveryIdentity
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 _CLAIM_HEARTBEAT_INTERVAL_S = 60.0
@@ -451,7 +452,7 @@ class _AutonomousAdmissionRefused(WorklinkError):
 class FactoryRecoveryBlocked(WorklinkError):
     """A retained factory run exists but cannot be safely rebound."""
 
-    def __init__(self, record: FactoryRunRecord, reason: str) -> None:
+    def __init__(self, record: FactoryRunRecord | None, reason: str) -> None:
         super().__init__(reason)
         self.record = record
 
@@ -2260,18 +2261,25 @@ class WorklinkRunner:
         issue_id: int,
         *,
         autonomous: bool = False,
+        expected_recovery: FactoryRecoveryIdentity | None = None,
     ) -> WorklinkRunResult:
         self._begin_incident_invocation(autonomous)
-        return await self._run_factory_070(issue_id, autonomous=autonomous)
+        return await self._run_factory_070(
+            issue_id, autonomous=autonomous, expected_recovery=expected_recovery,
+        )
 
     async def _run_factory_070(
         self,
         issue_id: int,
         *,
         autonomous: bool,
+        expected_recovery: FactoryRecoveryIdentity | None = None,
     ) -> WorklinkRunResult:
+        locked_kwargs: dict[str, Any] = {"autonomous": autonomous}
+        if expected_recovery is not None:
+            locked_kwargs["expected_recovery"] = expected_recovery
         if self._factory_lease_held:
-            return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+            return await self._run_factory_070_locked(issue_id, **locked_kwargs)
         with factory_checkout_interlock(self.home) as acquired:
             if not acquired:
                 return WorklinkRunResult(
@@ -2285,13 +2293,14 @@ class WorklinkRunner:
                     )
                 # Keep both protections through launch/recovery, durable record
                 # publication, failure preservation and claim cleanup.
-                return await self._run_factory_070_locked(issue_id, autonomous=autonomous)
+                return await self._run_factory_070_locked(issue_id, **locked_kwargs)
 
     async def _run_factory_070_locked(
         self,
         issue_id: int,
         *,
         autonomous: bool,
+        expected_recovery: FactoryRecoveryIdentity | None = None,
     ) -> WorklinkRunResult:
         from .autonomy import factory_max_concurrent
 
@@ -2406,6 +2415,37 @@ class WorklinkRunner:
         def prepare_factory_claim() -> None:
             nonlocal retained
             candidates = load_factory_records_for_issue(self.home, issue_id)
+            if expected_recovery is not None:
+                from .dispatch_failures import current_failure_record, dispatch_failure_state_dir
+
+                incident = current_failure_record(dispatch_failure_state_dir(self.home), issue_id)
+                fallback = candidates[0] if candidates else initial_retained[0] if initial_retained else None
+                if fallback is None:
+                    raise FactoryRecoveryBlocked(
+                        None,
+                        "expected retained factory recovery target is missing",
+                    )
+                if incident is None or (
+                    incident["signature"] != expected_recovery.signature
+                    or incident["occurrence_id"] != expected_recovery.occurrence_id
+                ):
+                    raise FactoryRecoveryBlocked(fallback, "incident occurrence is stale")
+                if len(candidates) != 1:
+                    raise FactoryRecoveryBlocked(
+                        fallback,
+                        "expected retained factory recovery target is ambiguous"
+                        if candidates else "expected retained factory recovery target is missing",
+                    )
+                exact = candidates[0]
+                if (
+                    exact.run_id != expected_recovery.run_id
+                    or exact.attempt != expected_recovery.attempt
+                    or exact.session != expected_recovery.session
+                    or incident.get("run_id") != expected_recovery.run_id
+                    or incident.get("attempt") != expected_recovery.attempt
+                    or incident.get("work_path") != exact.sandbox
+                ):
+                    raise FactoryRecoveryBlocked(exact, "expected retained factory recovery target was replaced")
             if not candidates:
                 if initial_retained:
                     raise FactoryRecoveryBlocked(
@@ -2453,27 +2493,33 @@ class WorklinkRunner:
         except FactoryRecoveryBlocked as exc:
             incident_owner = self._incident_owner
             assert incident_owner is not None
-            reason = f"retained factory sandbox {exc.record.sandbox}: {exc}"
+            record = exc.record
+            reason = (
+                f"retained factory sandbox {record.sandbox}: {exc}"
+                if record is not None else str(exc)
+            )
             _log_event(
                 "worklink_factory_recovery_blocked",
                 issue_id=issue_id,
-                attempt=exc.record.attempt,
-                sandbox=exc.record.sandbox,
+                attempt=record.attempt if record is not None else None,
+                sandbox=record.sandbox if record is not None else None,
                 reason=str(exc),
             )
+            if record is None:
+                return WorklinkRunResult(issue_id, None, "refused", reason=reason)
             try:
                 incident_owner.record(
                     producer="factory_recovery",
                     home=self.home,
                     issue_id=issue_id,
-                    attempt=exc.record.attempt,
+                    attempt=record.attempt,
                     error=reason,
                     exit_status=1,
                     autonomous=autonomous,
-                    preserved_ref=exc.record.branch,
-                    run_id=exc.record.run_id,
-                    work_path=exc.record.sandbox,
-                    transcript_path=exc.record.transcript,
+                    preserved_ref=record.branch,
+                    run_id=record.run_id,
+                    work_path=record.sandbox,
+                    transcript_path=record.transcript,
                     work_started=False,
                 )
             except OSError as write_exc:
@@ -4561,6 +4607,7 @@ def run_worklink_epic(
     repo: Path,
     issue_id: int,
     autonomous: bool = False,
+    expected_recovery: FactoryRecoveryIdentity | None = None,
 ) -> WorklinkRunResult:
     """Run and publish one complete factory lifecycle under both leases."""
     with factory_checkout_interlock(home) as checkout_acquired:
@@ -4573,9 +4620,12 @@ def run_worklink_epic(
                 return WorklinkRunResult(
                     issue_id, None, "refused", reason="factory issue resource lock unavailable"
                 )
-            return _run_worklink_epic_under_lease(
+            kwargs: dict[str, Any] = dict(
                 home=home, repo=repo, issue_id=issue_id, autonomous=autonomous,
             )
+            if expected_recovery is not None:
+                kwargs["expected_recovery"] = expected_recovery
+            return _run_worklink_epic_under_lease(**kwargs)
 
 
 def _run_worklink_epic_under_lease(
@@ -4584,6 +4634,7 @@ def _run_worklink_epic_under_lease(
     repo: Path,
     issue_id: int,
     autonomous: bool = False,
+    expected_recovery: FactoryRecoveryIdentity | None = None,
 ) -> WorklinkRunResult:
     from .dispatch_failures import (
         current_failure_identity,
@@ -4593,20 +4644,23 @@ def _run_worklink_epic_under_lease(
 
     failure_state_dir = dispatch_failure_state_dir(home)
     try:
-        captured_incident = current_failure_identity(failure_state_dir, issue_id)
+        captured_incident = (
+            (expected_recovery.signature, expected_recovery.occurrence_id)
+            if expected_recovery is not None
+            else current_failure_identity(failure_state_dir, issue_id)
+        )
     except ValueError:
         captured_incident = None
     incident_owner = _IncidentOwner(autonomous=autonomous)
     try:
-        result = asyncio.run(
-            WorklinkRunner(
+        runner = WorklinkRunner(
                 home=home, repo=repo, _incident_owner=incident_owner,
                 _factory_lease_held=True,
-            ).run_epic(
-                issue_id,
-                autonomous=autonomous,
             )
-        )
+        run_kwargs: dict[str, Any] = {"autonomous": autonomous}
+        if expected_recovery is not None:
+            run_kwargs["expected_recovery"] = expected_recovery
+        result = asyncio.run(runner.run_epic(issue_id, **run_kwargs))
     except BaseException as exc:
         if not _exception_incident_handled(exc) and not incident_owner.owns_terminal_failure:
             try:

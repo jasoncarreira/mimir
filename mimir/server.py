@@ -1090,18 +1090,12 @@ def reattach_inflight_worklink_runs(
         argv = reattach_dispatch_argv(run_bin, home, repo, state.issue_id)
         log_path = state_dir / f"reattach-{state.issue_id}.log"
         try:
-            log_fh: Any = log_path.open("ab")
-        except OSError:
-            log_fh = subprocess.DEVNULL
-        try:
-            spawn(
-                argv,
-                cwd=repo,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=log_fh,
-                env={**os.environ, "WORKLINK_RUN_LOG": str(log_path)},
-                start_new_session=True,  # detach: survive this startup + outlive it
+            from .worklink.detached_dispatch import launch_detached_worklink
+
+            launch_detached_worklink(
+                command="run", issue_id=state.issue_id, home=home, repo=repo,
+                state_dir=state_dir, run_bin=run_bin, popen=spawn, argv=argv,
+                log_name=f"reattach-{state.issue_id}.log",
             )
         except (OSError, subprocess.SubprocessError) as exc:
             record_failure(
@@ -1122,12 +1116,6 @@ def reattach_inflight_worklink_runs(
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
             continue
-        finally:
-            if log_fh not in (subprocess.DEVNULL, None):
-                try:
-                    log_fh.close()
-                except OSError:
-                    pass
         dispatched.append(state.issue_id)
     for record in factory_records:
         argv = [
@@ -1143,18 +1131,12 @@ def reattach_inflight_worklink_runs(
         ]
         log_path = state_dir / f"factory-recover-{record.issue_id}.log"
         try:
-            log_fh = log_path.open("ab")
-        except OSError:
-            log_fh = subprocess.DEVNULL
-        try:
-            spawn(
-                argv,
-                cwd=repo,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=log_fh,
-                env={**os.environ, "WORKLINK_RUN_LOG": str(log_path)},
-                start_new_session=True,
+            from .worklink.detached_dispatch import launch_detached_worklink
+
+            launch_detached_worklink(
+                command="run-epic", issue_id=record.issue_id, home=home, repo=repo,
+                state_dir=state_dir, run_bin=run_bin, popen=spawn, argv=argv,
+                log_name=f"factory-recover-{record.issue_id}.log",
             )
         except (OSError, subprocess.SubprocessError) as exc:
             record_failure(
@@ -1180,12 +1162,6 @@ def reattach_inflight_worklink_runs(
             failures.append(failure)
             emit("worklink_reattach_dispatch_failed", **failure)
             continue
-        finally:
-            if log_fh not in (subprocess.DEVNULL, None):
-                try:
-                    log_fh.close()
-                except OSError:
-                    pass
         dispatched.append(record.issue_id)
     emit(
         "worklink_reattach_attempted",
