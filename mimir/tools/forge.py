@@ -706,8 +706,10 @@ def _publish_author_attestation(
 
     Missing actors/adapters and unavailable attestation fail closed for this
     result. Only definitive verdicts enter the turn-local cache; no PR-level
-    verdict is persisted. Logs, checks and mutation output are not author text
-    and deliberately do not use this exemption.
+    verdict is persisted. Contained ``repo_test`` output is a function of the
+    attested checked-in checkout and inherits its lease attestation. CI logs,
+    checks, and forge mutation output are not author text and deliberately do
+    not use this exemption.
     """
     from ..access_control import publish_protected_result
     from ..models import SourceLabel

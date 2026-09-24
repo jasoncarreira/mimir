@@ -1501,6 +1501,9 @@ def test_attested_author_active_lease_is_trusted_but_arbitrary_root_is_not(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "mimir.access_control._lease_head_is_author_attested", lambda *args: True,
+    )
     home = tmp_path / "home"
     lease_root = tmp_path / "pr-checkout-leases"
     checkout = lease_root / "lease-7"
@@ -1575,6 +1578,9 @@ def test_active_lease_does_not_trust_sibling_path_within_lease_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "mimir.access_control._lease_head_is_author_attested", lambda *args: True,
+    )
     home = tmp_path / "home"
     lease_root = tmp_path / "pr-checkout-leases"
     checkout = lease_root / "lease-7"
@@ -1635,6 +1641,9 @@ def test_active_lease_record_supersedes_generic_file_integrity_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "mimir.access_control._lease_head_is_author_attested", lambda *args: True,
+    )
     home = tmp_path / "home"
     lease_root = tmp_path / "server-leases"
     checkout = lease_root / "lease-8"

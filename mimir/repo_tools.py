@@ -263,6 +263,28 @@ def _sanitized_git_env() -> dict[str, str]:
     return env
 
 
+def hardened_git_command(
+    root: Path,
+    arguments: tuple[str, ...],
+    *,
+    timeout: float = _DEFAULT_TIMEOUT_SECONDS,
+    output_limit: int = _DEFAULT_OUTPUT_BYTES,
+    runner: GitRunner | None = None,
+) -> GitProcessResult:
+    """Run a local Git read with the repository tools' hardened configuration."""
+    argv = (
+        str(_DEFAULT_GIT), "-C", str(root), *_BASE_CONFIG,
+        "--no-pager", "--no-optional-locks", *arguments,
+    )
+    run = runner or _bounded_subprocess_runner
+    return run(
+        argv,
+        env=_sanitized_git_env(),
+        timeout=timeout,
+        output_limit=output_limit,
+    )
+
+
 def _bounded_subprocess_runner(
     argv: tuple[str, ...],
     *,
@@ -1209,6 +1231,6 @@ __all__ = [
     "GitOperation", "GitOperationResult", "GitProcessResult", "GitPush",
     "GitRebase", "GitRebaseAbort", "GitRefusal", "GitRevert",
     "GitRevertAbort", "GitStage", "GitStatus", "GitUnmerged", "RepoGitTools",
-    "retained_factory_git_runner", "retained_factory_snapshot_bundle",
+    "hardened_git_command", "retained_factory_git_runner", "retained_factory_snapshot_bundle",
     "retained_factory_subprocess_runner", "was_agent_push",
 ]

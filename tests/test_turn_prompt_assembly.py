@@ -2044,6 +2044,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
         # Retained remediation results preserve their exact factory authority.
         ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
+        # PR checkout reads inherit exact-scope author attestation.
+        ("producer", "mimir/tools/repo.py", "_publish_attested_lease_result", "SourceLabel"): 1,
         ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,

@@ -141,6 +141,35 @@ def _retained_refusal(operation: str) -> ToolPolicyRefusal:
     )
 
 
+def _publish_attested_lease_result(
+    runtime: ToolRuntime[AuthContext] | None,
+    state: RepoReviewState,
+) -> None:
+    """Publish exact-scope provenance when the checkout remains author-attested."""
+    from ..access_control import _attested_pr_checkout_lease, publish_protected_result
+
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    if context is None:
+        return
+    scope = state.action_scope
+    if not _attested_pr_checkout_lease(context, scope, state.checkout_lease):
+        return
+    principal = getattr(context, "canonical_principal", None)
+    if getattr(context, "is_service", False) and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal,
+        domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        bridge_instance="forge",
+        sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    ),))
+
+
 def _enforcement_enabled(
     runtime: ToolRuntime[AuthContext] | None,
     *,
@@ -210,9 +239,10 @@ def _execute(
                 pull_request=pull_request,
             ),
         )
-        return asdict(
-            git_tools.execute(operation)
-        )
+        result = asdict(git_tools.execute(operation))
+        if isinstance(operation, (GitStatus, GitDiff, GitUnmerged)):
+            _publish_attested_lease_result(runtime, state)
+        return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
         execution_started = bool(
@@ -371,9 +401,11 @@ async def repo_test(
                     result["code"], scoped=bool(selectors),
                 )
                 return result
+        state = _state(runtime, repository, pull_request)
         result = asdict(
-            await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors, suite=suite)
+            await RepoProjectTests(state).execute(selectors, suite=suite)
         )
+        _publish_attested_lease_result(runtime, state)
         result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
         return result
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
