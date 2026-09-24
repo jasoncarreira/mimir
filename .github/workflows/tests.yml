@@ -485,8 +485,8 @@ jobs:
             || { echo "::error::worker uid cannot execute the venv interpreter"; exit 1; }
           echo "worker uid can read and not write the checkout"
           evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"
-          sudo install -d -m 700 -o worklink -g worklink "$evidence_root"
-          sudo install -d -m 700 -o root -g root "$evidence_root/remediation-root"
+          sudo install -d -m 710 -o worklink -g worklink "$evidence_root"
+          sudo install -d -m 750 -o root -g mimir "$evidence_root/remediation-root"
           sudo install -d -m 700 -o worklink -g worklink "$evidence_root/main"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 

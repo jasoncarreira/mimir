@@ -674,7 +674,14 @@ def test_retained_remediation_uses_real_owner_rpc_git_and_contained_tests(
             sandbox=str(sandbox),
         )
         auth = SimpleNamespace(retained_factory_scope=scope)
-        turn = SimpleNamespace(auth_context=auth)
+        turn = TurnContext(
+            turn_id="retained-remediation-root-e2e",
+            session_id="poller:worklink-ready-queue",
+            trigger="poller",
+            channel_id="poller:worklink-ready-queue",
+            started_at=0.0,
+            auth_context=auth,
+        )
 
         monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained_root)
         monkeypatch.setattr(worker_client, "DEFAULT_EXECUTOR_SOCKET", socket_path)
