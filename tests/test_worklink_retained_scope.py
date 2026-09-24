@@ -4,6 +4,7 @@ from dataclasses import replace
 import fcntl
 import os
 from pathlib import Path
+import stat
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -774,7 +775,7 @@ async def test_retained_repo_tools_complete_real_multistep_flow_under_owner_cont
 async def test_retained_repo_test_runs_source_git_through_owner_control(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from mimir import contained_checkout, project_tests
+    from mimir import contained_checkout, contained_snapshot, project_tests
     from mimir.worklink import worker_client
 
     case = retained_incident
@@ -801,18 +802,25 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
     marker.unlink(missing_ok=True)
 
     calls: list[tuple[str, ...]] = []
+    controller_git_calls: list[tuple[str, ...]] = []
+    subprocess_run = subprocess.run
 
     def owner_control(checkout, argv, *, env, timeout, output_limit):
         assert checkout == case.sandbox
         calls.append(tuple(argv))
-        return subprocess.run(
+        return subprocess_run(
             argv,
             env={**env, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
             capture_output=True,
             check=False,
         )
 
+    def controller_subprocess(argv, *args, **kwargs):
+        controller_git_calls.append(tuple(os.fsdecode(part) for part in argv))
+        return subprocess_run(argv, *args, **kwargs)
+
     monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+    monkeypatch.setattr(contained_snapshot.subprocess, "run", controller_subprocess)
     monkeypatch.setattr(
         project_tests.RepoGitTools, "validated_checkout_root",
         lambda _self: case.sandbox,
@@ -829,6 +837,8 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
     monkeypatch.setattr(contained_checkout, "_normalize_checkout_fd", lambda *_a, **_k: None)
 
     async def runner(*args, **kwargs):
+        capability = args[1]
+        assert stat.S_IMODE(capability.path.parent.stat().st_mode) == 0o700
         return CollectedExecutionResult(0, b"passed", b"", False, False, 0, 0)
 
     result = await RepoProjectTests(retained_scope=scope, runner=runner).execute()
@@ -838,7 +848,13 @@ async def test_retained_repo_test_runs_source_git_through_owner_control(
     source_calls = [argv for argv in calls if argv[:3] == ("git", "-C", str(case.sandbox))]
     assert any("ls-files" in argv for argv in source_calls)
     assert any("rev-parse" in argv for argv in source_calls)
+    assert any("bundle" in argv and "create" in argv for argv in source_calls)
     assert all(argv[0:3] == ("git", "-C", str(case.sandbox)) for argv in source_calls)
+    assert not any(
+        len(argv) >= 3 and argv[:3] == ("git", "-C", str(case.sandbox))
+        for argv in controller_git_calls
+    )
+    assert not tuple(case.sandbox.glob(".mimir-repo-test-*.bundle"))
 
 
 @pytest.mark.asyncio
@@ -888,7 +904,7 @@ async def test_retained_repo_test_excludes_only_factory_control_plane(
         "known_sensitive": (),
         "excluded_prefixes": (b".factory",),
         "source_git_runner": project_tests.retained_factory_subprocess_runner,
-        "clone_runner": project_tests.retained_factory_subprocess_runner,
+        "bundle_provider": project_tests.retained_factory_snapshot_bundle,
     }]
 
 

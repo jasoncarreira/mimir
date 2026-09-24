@@ -69,6 +69,7 @@ from mimir.repo_tools import (
     GitUnmerged,
     RepoGitTools,
     _bounded_subprocess_runner,
+    retained_factory_snapshot_bundle,
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
@@ -1917,6 +1918,46 @@ def _snapshot_checkout_factory(root: Path, issued: list[Path]):
         )
 
     return factory
+
+
+@pytest.mark.parametrize("creation_returncode", [0, 1])
+def test_retained_snapshot_bundle_is_removed_on_success_and_creation_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, creation_returncode: int,
+) -> None:
+    from mimir import repo_tools as repo_tools_module
+    from mimir.worklink import worker_client
+
+    source = tmp_path / "checkout"
+    source.mkdir()
+    removed: list[Path] = []
+
+    def create(argv, **_kwargs):
+        artifact = Path(argv[-2])
+        artifact.write_bytes(b"partial bundle")
+        return subprocess.CompletedProcess(argv, creation_returncode, b"", b"")
+
+    def control(checkout, argv, **_kwargs):
+        assert checkout == source
+        assert argv[:3] == ("/bin/rm", "-f", "--")
+        artifact = Path(argv[-1])
+        artifact.unlink(missing_ok=True)
+        removed.append(artifact)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(repo_tools_module, "retained_factory_subprocess_runner", create)
+    monkeypatch.setattr(worker_client, "run_factory_control", control)
+
+    if creation_returncode:
+        with pytest.raises(OSError, match="bundle creation failed"):
+            with retained_factory_snapshot_bundle(source):
+                pytest.fail("failed bundle creation yielded an artifact")
+    else:
+        with retained_factory_snapshot_bundle(source) as artifact:
+            assert artifact.exists()
+        assert not artifact.exists()
+
+    assert len(removed) == 1
+    assert not tuple(source.glob(".mimir-repo-test-*.bundle"))
 
 
 def _recursive_metadata(root: Path) -> dict[str, tuple[int, int, int]]:
