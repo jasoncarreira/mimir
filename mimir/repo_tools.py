@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path, PurePosixPath
@@ -19,7 +20,8 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Literal, Protocol, TypeAlias
+from typing import Iterator, Literal, Protocol, TypeAlias
+import uuid
 from urllib.parse import urlsplit
 
 from .access_control import ToolFlowDirection, authorize_repo_pr_tool
@@ -349,6 +351,32 @@ def retained_factory_subprocess_runner(
         timeout=timeout,
         output_limit=output_limit,
     )
+
+
+@contextmanager
+def retained_factory_snapshot_bundle(source: Path) -> Iterator[Path]:
+    """Export retained history owner-side and remove the handoff owner-side."""
+    from .worklink.worker_client import run_factory_control
+
+    artifact = source / f".mimir-repo-test-{uuid.uuid4().hex}.bundle"
+    try:
+        create = retained_factory_subprocess_runner((
+            "git", "-C", str(source), *_BASE_CONFIG,
+            "bundle", "create", str(artifact), "--all",
+        ))
+        if create.returncode != 0:
+            raise OSError("retained snapshot bundle creation failed")
+        yield artifact
+    finally:
+        removed = run_factory_control(
+            source,
+            ("/usr/bin/rm", "-f", "--", str(artifact)),
+            env=_sanitized_git_env(),
+            timeout=_DEFAULT_TIMEOUT_SECONDS,
+            output_limit=_DEFAULT_OUTPUT_BYTES,
+        )
+        if removed.returncode != 0:
+            raise OSError("retained snapshot bundle cleanup failed")
 
 
 def retained_factory_git_runner(
@@ -1181,5 +1209,6 @@ __all__ = [
     "GitOperation", "GitOperationResult", "GitProcessResult", "GitPush",
     "GitRebase", "GitRebaseAbort", "GitRefusal", "GitRevert",
     "GitRevertAbort", "GitStage", "GitStatus", "GitUnmerged", "RepoGitTools",
-    "retained_factory_git_runner", "retained_factory_subprocess_runner", "was_agent_push",
+    "retained_factory_git_runner", "retained_factory_snapshot_bundle",
+    "retained_factory_subprocess_runner", "was_agent_push",
 ]

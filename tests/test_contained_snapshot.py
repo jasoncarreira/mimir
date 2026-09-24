@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -217,6 +218,58 @@ def test_refuses_source_change_between_preflight_and_copy(
     monkeypatch.setattr(snapshot, "_overlay_entry", mutate_then_overlay)
     with pytest.raises(SnapshotSourceChanged, match="^Snapshot source changed$"):
         create_git_snapshot(repository, tmp_path / "snapshot")
+    assert not (tmp_path / "snapshot").exists()
+
+
+def test_bundle_snapshot_binds_head_and_cleans_artifact(
+    repository: Path, tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "handoff.bundle"
+
+    @contextmanager
+    def bundle_provider(source: Path):
+        git(source, "bundle", "create", str(artifact), "--all")
+        try:
+            yield artifact
+        finally:
+            artifact.unlink(missing_ok=True)
+
+    destination = tmp_path / "snapshot"
+    expected = git(repository, "rev-parse", "HEAD").strip()
+    create_git_snapshot(repository, destination, bundle_provider=bundle_provider)
+
+    assert git(destination, "rev-parse", "HEAD").strip() == expected
+    assert not artifact.exists()
+
+
+def test_bundle_snapshot_refuses_wrong_head_and_cleans_artifact(
+    repository: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "handoff.bundle"
+    clone_calls = 0
+    subprocess_run = subprocess.run
+
+    def capture_clone(argv, *args, **kwargs):
+        nonlocal clone_calls
+        if b"clone" in argv:
+            clone_calls += 1
+        return subprocess_run(argv, *args, **kwargs)
+
+    git(repository, "bundle", "create", str(artifact), "--all")
+    git(repository, "commit", "--allow-empty", "-qm", "advance head")
+
+    @contextmanager
+    def stale_bundle(_source: Path):
+        try:
+            yield artifact
+        finally:
+            artifact.unlink(missing_ok=True)
+
+    monkeypatch.setattr("mimir.contained_snapshot.subprocess.run", capture_clone)
+    with pytest.raises(SnapshotSourceChanged, match="^Snapshot source changed$"):
+        create_git_snapshot(repository, tmp_path / "snapshot", bundle_provider=stale_bundle)
+    assert clone_calls == 0
+    assert not artifact.exists()
     assert not (tmp_path / "snapshot").exists()
 
 

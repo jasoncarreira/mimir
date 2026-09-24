@@ -7,7 +7,7 @@ import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Literal, Sequence
+from typing import Callable, ContextManager, Iterable, Literal, Sequence
 
 from ._rmtree import rmtree_missing_ok
 
@@ -61,6 +61,7 @@ class SnapshotUnavailable(ContainedSnapshotError):
 
 GitInventoryClass = Literal["tracked", "untracked", "ignored"]
 SnapshotGitRunner = Callable[[tuple[str, ...]], subprocess.CompletedProcess[bytes]]
+SnapshotBundleProvider = Callable[[Path], ContextManager[Path]]
 
 
 @dataclass(frozen=True)
@@ -566,6 +567,7 @@ def create_git_snapshot(
     excluded_prefixes: Iterable[bytes] = (),
     source_git_runner: SnapshotGitRunner | None = None,
     clone_runner: SnapshotGitRunner | None = None,
+    bundle_provider: SnapshotBundleProvider | None = None,
 ) -> SnapshotResult:
     try:
         source_path = Path(source).resolve(strict=True)
@@ -591,22 +593,50 @@ def create_git_snapshot(
         git_runner=source_git_runner,
     )
     try:
-        clone_argv = (
-            b"git", *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
-            b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet",
-            b"--", source_bytes, destination_bytes,
-        )
-        completed = (
-            subprocess.run(
-                clone_argv,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+        clone_source = source_bytes
+        bundle_context = bundle_provider(source_path) if bundle_provider is not None else None
+        if bundle_context is not None:
+            with bundle_context as bundle_path:
+                bundle_bytes = os.fsencode(bundle_path)
+                listed = subprocess.run(
+                    [b"git", b"bundle", b"list-heads", bundle_bytes, b"HEAD"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if listed.returncode != 0 or listed.stdout != revision + b" HEAD\n":
+                    raise SnapshotSourceChanged("Snapshot source changed")
+                clone_source = bundle_bytes
+                clone_argv = (
+                    b"git", *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
+                    b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet",
+                    b"--", clone_source, destination_bytes,
+                )
+                completed = subprocess.run(
+                    clone_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        else:
+            clone_argv = (
+                b"git", *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
+                b"clone", b"--no-hardlinks", b"--no-checkout", b"--quiet",
+                b"--", clone_source, destination_bytes,
             )
-            if clone_runner is None
-            else clone_runner(tuple(os.fsdecode(part) for part in clone_argv))
-        )
+            completed = (
+                subprocess.run(
+                    clone_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if clone_runner is None
+                else clone_runner(tuple(os.fsdecode(part) for part in clone_argv))
+            )
         if completed.returncode != 0:
             raise SnapshotUnavailable("Snapshot unavailable")
         checkout = subprocess.run(

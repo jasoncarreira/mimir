@@ -32,6 +32,7 @@ from .repo_tools import (
     RepoGitTools,
     retained_factory_git_runner,
     retained_factory_subprocess_runner,
+    retained_factory_snapshot_bundle,
 )
 from .repository_config import RepositoryInventory, RepositoryTestSuite
 from .worklink.backends.registry import WorklinkConfig
@@ -580,7 +581,7 @@ class RepoProjectTests:
                 checkout_arguments.update(
                     excluded_prefixes=(b".factory",),
                     source_git_runner=retained_factory_subprocess_runner,
-                    clone_runner=retained_factory_subprocess_runner,
+                    bundle_provider=retained_factory_snapshot_bundle,
                 )
             checkout = self._checkout_factory(root, **checkout_arguments)
         except SnapshotCredentialsRefused as exc:
