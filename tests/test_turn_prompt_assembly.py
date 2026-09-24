@@ -2021,7 +2021,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
         ("producer", "mimir/access_control.py", "_acp_failed_tool_error_result", "SourceLabel"): 1,
         ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 5,
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 6,
         ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,
@@ -2042,6 +2042,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
         # Native forge reads publish exact-PR/head author-attested provenance.
         ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
+        # Retained remediation results preserve their exact factory authority.
+        ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
         ("recent_loader", "mimir/agent.py", "Agent._select_recent_activity", "self._buffer.assemble_recent_activity_candidates"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "_restore_event", "_event_from_stash"): 1,
         ("recovery_call", "mimir/poller_recovery.py", "stash_enqueued_event", "_event_to_stash"): 1,
@@ -2054,7 +2056,10 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
         ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
     })
-    assert observed == expected
+    assert observed == expected, (
+        f"unexpected channel-bearing sources: {observed - expected}; "
+        f"missing inventory entries: {expected - observed}"
+    )
 
 
 @pytest.mark.asyncio

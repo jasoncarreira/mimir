@@ -47,6 +47,7 @@ from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
 from .identities import AccessMetadata
 from .models import (
     NormalizedPullRequestSnapshot,
+    RetainedFactoryScope,
     RepoPRAction,
     RepoPRScopeProvenance,
     SourceKind,
@@ -1199,6 +1200,9 @@ _REPO_TOOL_ACTIONS: dict[str, str] = {
     "repo_revert_abort": RepoPRAction.WRITE.value,
     "repo_push": RepoPRAction.PUSH.value,
 }
+_RETAINED_REPO_TOOLS = frozenset({
+    "repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit",
+})
 _TYPED_REPO_PR_TOOL_ACTIONS = {**_FORGE_TOOL_ACTIONS, **_REPO_TOOL_ACTIONS}
 _GITHUB_REPO_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _GITHUB_SHA_PATTERN = re.compile(r"[0-9a-fA-F]{40}")
@@ -6734,9 +6738,13 @@ class SinkGate:
 
         if sink_category is SinkCategory.FORGE:
             forge_scope_mismatch: dict[str, Any] = {}
-            mismatch = _forge_repository_scope_mismatch(
-                ifc_labels, repo_pr_action_scope,
-                audit_fields=forge_scope_mismatch,
+            mismatch = (
+                None
+                if isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                else _forge_repository_scope_mismatch(
+                    ifc_labels, repo_pr_action_scope,
+                    audit_fields=forge_scope_mismatch,
+                )
             )
             if mismatch is not None:
                 source_repo, source_pr, mismatch_component = mismatch
@@ -6986,8 +6994,20 @@ class SinkGate:
             and isinstance(sources, tuple)
             and bool(sources)
             and all(
-                source.domain == "repository"
-                and source.domain_qualifier is None
+                (
+                    source.domain == "repository"
+                    and source.domain_qualifier is None
+                )
+                or (
+                    isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                    and source.domain == "worklink_retained_repository"
+                    and source.resource_id == (
+                        f"{repo_pr_action_scope.repository}"
+                        f"#issue/{repo_pr_action_scope.issue_id}"
+                        f"@retained/{repo_pr_action_scope.scope_id}"
+                    )
+                    and source.integrity == "trusted"
+                )
                 or (
                     (
                         (tool_name != "pr_submit_review" and repo_pr_action_scope is not None)
@@ -7002,10 +7022,13 @@ class SinkGate:
                 )
                 for source in sources
             )
-            and _forge_repository_scope_mismatch(
-                ifc_labels,
-                repo_pr_action_scope,
-            ) is None
+            and (
+                isinstance(repo_pr_action_scope, RetainedFactoryScope)
+                or _forge_repository_scope_mismatch(
+                    ifc_labels,
+                    repo_pr_action_scope,
+                ) is None
+            )
         ):
             # Repository command output may flow only back to the immutable
             # PR/head scope from which it was produced. An interactive forge turn
@@ -8380,6 +8403,33 @@ def authorize_repo_pr_tool(
     """Make the sole policy decision for one typed PR/repository action."""
     if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS:
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
+    if isinstance(scope, RetainedFactoryScope):
+        in_scope = (
+            tool_name in _RETAINED_REPO_TOOLS
+            and isinstance(service_principal, ServicePrincipal)
+            and service_principal.canonical == "poller:worklink-ready-queue"
+            and service_principal.trigger == "poller"
+            and service_principal.authority_profile == "github"
+            and service_can_invoke_operation(service_principal, tool_name)
+        )
+        return ToolAuthorization(
+            tool_name=tool_name,
+            decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=in_scope or not enforce,
+            reason=None if in_scope else "retained_factory_scope_denied",
+            service_principal=service_principal,
+            required_tier=AccessTier.USER,
+            enforcement_enabled=enforce,
+            is_shadow_decision=not enforce and not in_scope,
+            would_block=not in_scope,
+            refusal_detail=(
+                None if in_scope
+                else "retained factory scope does not grant this repository operation"
+            ),
+            flow_direction=flow_direction,
+            repo_pr_action_scope=scope,
+            result_integrity="trusted" if in_scope else "untrusted",
+        )
     report_required_actions = required_actions is not None
     if required_actions is None:
         required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
@@ -8862,21 +8912,34 @@ class ToolRegistry:
                 repo_pr_action_scope = issue_target
             elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 tool_arguments = arguments or {}
-                discovered = getattr(
-                    auth_context, "server_discovered_pr_states", None,
-                )
-                state = (
-                    discovered.resolve_for_tool(
-                        tool_name,
-                        tool_arguments.get("repository"),
-                        tool_arguments.get("pull_request"),
+                retained_scope = getattr(auth_context, "retained_factory_scope", None)
+                retained_matches = (
+                    isinstance(retained_scope, RetainedFactoryScope)
+                    and _is_worklink_retained_checkout_service(
+                        preliminary_service, auth_context=auth_context,
                     )
-                    if discovered is not None
-                    and isinstance(tool_arguments.get("repository"), str)
-                    and isinstance(tool_arguments.get("pull_request"), int)
-                    else None
+                    and tool_arguments.get("repository") == retained_scope.repository
+                    and tool_arguments.get("pull_request") == retained_scope.issue_id
                 )
-                if state is None:
+                if retained_matches:
+                    repo_pr_action_scope = retained_scope
+                    state = None
+                else:
+                    discovered = getattr(
+                        auth_context, "server_discovered_pr_states", None,
+                    )
+                    state = (
+                        discovered.resolve_for_tool(
+                            tool_name,
+                            tool_arguments.get("repository"),
+                            tool_arguments.get("pull_request"),
+                        )
+                        if discovered is not None
+                        and isinstance(tool_arguments.get("repository"), str)
+                        and isinstance(tool_arguments.get("pull_request"), int)
+                        else None
+                    )
+                if state is None and not retained_matches:
                     registry = getattr(auth_context, "repo_pr_scope_registry", None)
                     state = (
                         registry.resolve(
@@ -8886,12 +8949,13 @@ class ToolRegistry:
                         if registry is not None and hasattr(registry, "resolve")
                         else None
                     )
-                repo_pr_action_scope = (
-                    state.action_scope if state is not None else None
-                )
-                if heartbeat_git_authority_enabled(preliminary_service) or heartbeat_git_authority_enabled(
+                if not retained_matches:
+                    repo_pr_action_scope = (
+                        state.action_scope if state is not None else None
+                    )
+                if not retained_matches and (heartbeat_git_authority_enabled(preliminary_service) or heartbeat_git_authority_enabled(
                     getattr(auth_context, "service_authority", None),
-                ):
+                )):
                     from .tools.forge import resolve_review_state_for_context
 
                     try:
@@ -9938,6 +10002,35 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    retained_scope = getattr(auth_context, "retained_factory_scope", None)
+    if (
+        tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+        and retained_scope is not None
+        and args.get("repository") == retained_scope.repository
+        and args.get("pull_request") == retained_scope.issue_id
+    ):
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        source = SourceLabel(
+            principal=principal,
+            domain="worklink_retained_repository",
+            resource_id=(
+                f"{retained_scope.repository}#issue/{retained_scope.issue_id}"
+                f"@retained/{retained_scope.scope_id}"
+            ),
+            bridge_instance="worklink",
+            sensitivity="internal",
+            authorized_principals=(
+                frozenset({principal}) if principal else frozenset()
+            ),
+            source_kind="protected_tool",
+            integrity="trusted",
+            integrity_effect="active_ingest",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     if tool_name in _REPOSITORY_RESULT_TOOLS:
         scope = authorization.repo_pr_action_scope
         if scope is None:

@@ -5,10 +5,16 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain.tools import ToolRuntime
+from langchain_core.messages import ToolMessage
+from langgraph.prebuilt import ToolNode
+from langgraph.runtime import Runtime
 
 from mimir import access_control as ac
 from mimir._context import reset_current_turn, set_current_turn
@@ -252,6 +258,183 @@ async def test_real_worklink_failure_turn_reads_retained_checkout_with_ifc_ancho
         assert external_sink.reason == "ifc_label_blocked:shell_process"
     finally:
         reset_current_turn(token)
+
+
+async def _invoke_retained_tool(
+    name, tool, arguments, auth, runtime, registry, gate, node,
+) -> ToolMessage:
+    from mimir.tools import repo as repo_module
+
+    decision = registry.authorize_tool(
+        name, auth, enforce=True, arguments=arguments,
+        ifc_labels=auth.ifc_state.current(auth.ifc_labels),
+    )
+    assert decision.allowed, (
+        name, decision.reason, decision.refusal_detail, decision.resolved_sink_target,
+        type(decision.repo_pr_action_scope).__name__,
+        tuple(
+            (source.domain, source.resource_id, source.domain_qualifier)
+            for source in auth.ifc_state.current(auth.ifc_labels).sources
+        ),
+    )
+    request = ToolCallRequest(
+        tool_call={"name": name, "args": arguments, "id": name, "type": "tool_call"},
+        tool=tool, state={}, runtime=Runtime(context=auth),
+    )
+
+    async def handler(call: ToolCallRequest) -> ToolMessage:
+        injected = node._inject_tool_args(call.tool_call, runtime)
+        assert injected["args"]["runtime"] is runtime
+        parsed = tool._parse_input(injected["args"], name)
+        assert parsed["runtime"] is runtime
+        assert parsed["runtime"].context.retained_factory_scope is auth.retained_factory_scope
+        assert repo_module._retained_scope(
+            parsed["runtime"], arguments["repository"], arguments["pull_request"],
+        ) is auth.retained_factory_scope
+        result = (
+            await tool.ainvoke(injected["args"])
+            if tool.coroutine is not None
+            else tool.invoke(injected["args"])
+        )
+        return ToolMessage(content=json.dumps(result), tool_call_id=name, name=name)
+
+    try:
+        result = await gate.awrap_tool_call(request, handler)
+    except Exception as exc:
+        pytest.fail(
+            f"{name}: {type(exc).__name__}: {str(exc)[:500]}", pytrace=False,
+        )
+    assert isinstance(result, ToolMessage)
+    assert result.status != "error", (name, result.content)
+    return result
+
+
+@pytest.mark.asyncio
+async def test_real_worklink_failure_turn_executes_exact_retained_repo_tool_flow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    __tracebackhide__ = True
+    from mimir.project_tests import ProjectTestResult
+    from mimir.tools import repo as repo_module
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.worklink import dispatch_failures as failures, worker_client
+    from mimir.worklink.compute import LaunchHandle
+    from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+
+    home = tmp_path / "home"
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
+    init_logger(home / "logs" / "events.jsonl", session_id="retained-tool-turn")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    retained = tmp_path / "worklink"
+    sandbox = retained / "mimir" / "1806-1" / "checkout" / ".factory-sandboxes" / "chainlink-1806"
+    sandbox.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(sandbox), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(sandbox), "checkout", "-q", "-b", "feature/chainlink-1806"], check=True)
+    subprocess.run(["git", "-C", str(sandbox), "config", "user.name", "untrusted"], check=True)
+    subprocess.run(["git", "-C", str(sandbox), "config", "user.email", "untrusted@example.invalid"], check=True)
+    (sandbox / ".gitignore").write_text(".factory/\n", encoding="utf-8")
+    (sandbox / "fix.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(sandbox), "add", ".gitignore", "fix.txt"], check=True)
+    subprocess.run(["git", "-C", str(sandbox), "commit", "-q", "-m", "seed"], check=True)
+    (sandbox / "fix.txt").write_text("after\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "1")
+    monkeypatch.setattr(worker_client, "WORKLINK_CHECKOUT_ROOT", retained)
+    monkeypatch.setattr(
+        "mimir.worklink.retained_scope._factory_session_lock_is_fresh", lambda _record: False,
+    )
+
+    skills = Path(__file__).parents[1] / "mimir" / "optional-skills"
+    ready = next(
+        config for config in discover_pollers(skills, state_root=state_root)
+        if config.name == "worklink-ready-queue"
+    )
+    failures.record_failure(
+        failures.dispatch_failure_state_dir(home), issue_id=1806, attempt=1,
+        exit_status=1, error="retained checkout requires remediation",
+        log_path="run.log", run_id="chainlink-1806", work_path=str(sandbox),
+    )
+    save_factory_record(home, FactoryRunRecord(
+        run_id="chainlink-1806", issue_id=1806, attempt=1,
+        repository="owner/mimir", base_ref="main", branch="feature/chainlink-1806",
+        launcher="/opt/factory.js", sandbox=str(sandbox), session="session-1",
+        handle=LaunchHandle("local_subprocess", "99999999", 1), status=None,
+        observed_at=None, controller_phase="failed",
+    ))
+    enqueued = _CapturingEnqueue()
+    emitted = await run_poller(
+        replace(ready, command=f"{sys.executable} scripts/poller.py"),
+        enqueue=enqueued, home=home,
+    )
+    assert emitted == 1
+    [event] = enqueued.events
+    labels = _initialize_ifc_labels(event)
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    turn = TurnContext(
+        turn_id="real-worklink-tool-remediation", session_id=event.channel_id,
+        trigger=event.trigger, channel_id=event.channel_id, started_at=0.0,
+        auth_context=auth, ifc_labels=labels,
+    )
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="retained-tool", store=None,
+    )
+    owner_calls: list[tuple[str, ...]] = []
+
+    def owner_control(checkout, argv, *, env, timeout, output_limit):
+        assert checkout == sandbox
+        owner_calls.append(tuple(argv))
+        return subprocess.run(argv, env=env, capture_output=True, check=False)
+
+    monkeypatch.setattr(worker_client, "run_factory_control", owner_control)
+
+    async def passing_test(self, selectors, *, suite):
+        return ProjectTestResult(True, "tests_passed", 0)
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", passing_test)
+    tools = {
+        tool.name: tool for tool in repo_module.REPO_TOOLS
+        if tool.name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
+    }
+    arguments = {
+        "repo_status": {"repository": "owner/mimir", "pull_request": 1806},
+        "repo_diff": {"repository": "owner/mimir", "pull_request": 1806},
+        "repo_test": {"repository": "owner/mimir", "pull_request": 1806},
+        "repo_stage": {"repository": "owner/mimir", "pull_request": 1806, "paths": ("fix.txt",)},
+        "repo_commit": {
+            "repository": "owner/mimir", "pull_request": 1806,
+            "paths": ("fix.txt",), "message": "retained fix",
+        },
+    }
+    registry = ac.ToolRegistry()
+    gate = BudgetGateMiddleware()
+    node = ToolNode(list(tools.values()))
+
+    token = set_current_turn(turn)
+    try:
+        for name in ("repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"):
+            await _invoke_retained_tool(
+                name, tools[name], arguments[name], auth, runtime, registry, gate, node,
+            )
+        for excluded in ("repo_checkout", "repo_fetch", "repo_push", "repo_merge"):
+            assert not registry.authorize_tool(
+                excluded, auth, enforce=True,
+                arguments={"repository": "owner/mimir", "pull_request": 1806},
+                ifc_labels=auth.ifc_state.current(auth.ifc_labels),
+            ).allowed
+    finally:
+        reset_current_turn(token)
+
+    assert subprocess.run(
+        ["git", "-C", str(sandbox), "show", "-s", "--format=%s"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip() == "retained fix"
+    assert owner_calls
 
 
 def test_retained_read_root_and_anchor_do_not_require_an_edit_scope(retained_reader) -> None:

@@ -11,7 +11,12 @@ import subprocess
 from typing import Callable, Iterable
 
 from ._rmtree import rmtree_missing_ok
-from .contained_snapshot import SnapshotResult, create_git_snapshot, preflight_git_snapshot
+from .contained_snapshot import (
+    SnapshotGitRunner,
+    SnapshotResult,
+    create_git_snapshot,
+    preflight_git_snapshot,
+)
 from .worklink.checkout import (
     CheckoutAuthorization,
     _mint_checkout_authorization,
@@ -112,6 +117,9 @@ def _issue_checkout(
     open_checkout: Callable[[Path], int],
     known_sensitive: Iterable[bytes],
     scan_tracked_credentials: bool = True,
+    excluded_prefixes: Iterable[bytes] = (),
+    source_git_runner: SnapshotGitRunner | None = None,
+    clone_runner: SnapshotGitRunner | None = None,
     prepare: Callable[[Path], str | None] | None = None,
 ) -> tuple[SnapshotResult, CheckoutAuthorization, str | None]:
     boundary, destination = _prepare_boundary(root, scope, f"{issue_id}-{attempt}")
@@ -122,6 +130,9 @@ def _issue_checkout(
             destination,
             known_sensitive=known_sensitive,
             scan_tracked_credentials=scan_tracked_credentials,
+            excluded_prefixes=excluded_prefixes,
+            source_git_runner=source_git_runner,
+            clone_runner=clone_runner,
         )
         prepared = prepare(destination) if prepare is not None else None
         relative = destination.relative_to(root)
@@ -149,6 +160,9 @@ def create_repo_test_checkout(
     scope_id: str,
     pr_number: int,
     known_sensitive: Iterable[bytes] = (),
+    excluded_prefixes: Iterable[bytes] = (),
+    source_git_runner: SnapshotGitRunner | None = None,
+    clone_runner: SnapshotGitRunner | None = None,
 ) -> ContainedCheckout:
     if type(pr_number) is not int or pr_number < 1:
         raise ValueError("pull request number must be positive")
@@ -158,6 +172,8 @@ def create_repo_test_checkout(
         source_path,
         known_sensitive=sensitive,
         scan_tracked_credentials=False,
+        excluded_prefixes=excluded_prefixes,
+        git_runner=source_git_runner,
     )
     attempt = _positive_random()
     snapshot, authorization, _base_tree = _issue_checkout(
@@ -169,6 +185,9 @@ def create_repo_test_checkout(
         open_checkout=_open_repo_test_checkout,
         known_sensitive=sensitive,
         scan_tracked_credentials=False,
+        excluded_prefixes=excluded_prefixes,
+        source_git_runner=source_git_runner,
+        clone_runner=clone_runner,
     )
     return ContainedCheckout(snapshot.destination, authorization, snapshot)
 

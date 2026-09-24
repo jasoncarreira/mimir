@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import asdict
+import os
+from pathlib import Path
 from typing import Any, Literal
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 
-from ..models import AuthContext, RepoReviewState
+from ..models import AuthContext, RepoReviewState, RetainedFactoryScope, SourceLabel
 from ..pr_checkout_lease import acquire_pr_checkout_lease, cleanup_pr_checkout_lease
 from ..project_tests import ProjectTestRefusal, RepoProjectTests
 from ..repo_tools import (
@@ -30,6 +32,7 @@ from ..repo_tools import (
     GitUnmerged,
     RepoGitTools,
     _redact_git_output,
+    retained_factory_git_runner,
 )
 from .refusals import ToolPolicyRefusal
 
@@ -77,6 +80,67 @@ def _state(
         raise _tool_refusal(message, exc) from exc
 
 
+def _retained_scope(
+    runtime: ToolRuntime[AuthContext] | None,
+    repository: str,
+    issue: int,
+) -> RetainedFactoryScope | None:
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    scope = getattr(context, "retained_factory_scope", None)
+    if not isinstance(scope, RetainedFactoryScope):
+        return None
+    if scope.repository != repository or scope.issue_id != issue:
+        return None
+    return scope
+
+
+def _publish_retained_result(
+    runtime: ToolRuntime[AuthContext] | None, scope: RetainedFactoryScope,
+) -> None:
+    from ..access_control import publish_protected_result
+
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    principal = getattr(context, "canonical_principal", None)
+    if getattr(context, "is_service", False) and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal,
+        domain="repository",
+        resource_id=(
+            f"{scope.repository}#issue/{scope.issue_id}"
+            f"@retained/{scope.scope_id}"
+        ),
+        bridge_instance="worklink",
+        sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool",
+        integrity="trusted",
+        integrity_effect="active_ingest",
+    ),))
+
+
+def _retained_result(
+    runtime: ToolRuntime[AuthContext] | None,
+    scope: RetainedFactoryScope,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    _publish_retained_result(runtime, scope)
+    result["provenance"] = {
+        "kind": "retained_factory_scope",
+        "scope_id": scope.scope_id,
+        "repository": scope.repository,
+        "issue_id": scope.issue_id,
+        "run_id": scope.run_id,
+    }
+    return result
+
+
+def _retained_refusal(operation: str) -> ToolPolicyRefusal:
+    return ToolPolicyRefusal(
+        f"repository operation rejected: retained factory scope does not grant {operation}"
+    )
+
+
 def _enforcement_enabled(
     runtime: ToolRuntime[AuthContext] | None,
     *,
@@ -117,6 +181,26 @@ def _execute(
 ) -> dict[str, Any]:
     git_tools: RepoGitTools | None = None
     try:
+        retained = _retained_scope(runtime, repository, pull_request)
+        if retained is not None:
+            if not isinstance(operation, (GitStatus, GitDiff, GitStage, GitCommit)):
+                raise _retained_refusal(type(operation).__name__)
+            home_value = os.environ.get("MIMIR_HOME", "").strip()
+            if not home_value:
+                raise ToolPolicyRefusal("repository operation rejected: MIMIR_HOME is unavailable")
+            from ..worklink.retained_scope import retained_factory_effect_lease
+
+            with retained_factory_effect_lease(Path(home_value), retained) as lease:
+                if lease.scope is None:
+                    raise ToolPolicyRefusal(
+                        f"repository operation rejected: {lease.refusal_reason}"
+                    )
+                git_tools = RepoGitTools(
+                    retained_scope=retained, runner=retained_factory_git_runner,
+                )
+                return _retained_result(
+                    runtime, retained, asdict(git_tools.execute(operation)),
+                )
         state = _state(runtime, repository, pull_request)
         git_tools = RepoGitTools(
             state,
@@ -164,6 +248,8 @@ def repo_checkout(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
+    if _retained_scope(runtime, repository, pull_request) is not None:
+        raise _retained_refusal("repo_checkout")
     from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
@@ -211,6 +297,8 @@ def repo_cleanup(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
     """Revoke and remove this turn's exact active checkout lease."""
+    if _retained_scope(runtime, repository, pull_request) is not None:
+        raise _retained_refusal("repo_cleanup")
     state = _state(runtime, repository, pull_request)
     lease = state.checkout_lease
     if lease is None:
@@ -239,7 +327,11 @@ def repo_status(
     include_untracked: bool = True,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read porcelain status from the active bound checkout."""
+    """Read porcelain status from the active bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitStatus(include_untracked))
 
 
@@ -251,10 +343,34 @@ async def repo_test(
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
     suite: str | None = None,
 ) -> dict[str, Any]:
-    """Run configured tests in a contained PR snapshot. Pass suite='frontend'
-    for Vitest, or omit suite to infer it from selectors (no selectors: default).
+    """Run configured tests in a contained repository snapshot.
+
+    Pass suite='frontend' for Vitest, or omit suite to infer it from selectors
+    (no selectors: default). On a retained Worklink remediation turn,
+    ``repository`` is the retained run's repository and ``pull_request`` is the
+    incident's Chainlink issue id.
     """
     try:
+        retained = _retained_scope(runtime, repository, pull_request)
+        if retained is not None:
+            home_value = os.environ.get("MIMIR_HOME", "").strip()
+            if not home_value:
+                raise ToolPolicyRefusal("project test rejected: MIMIR_HOME is unavailable")
+            from ..worklink.retained_scope import retained_factory_effect_lease
+
+            with retained_factory_effect_lease(Path(home_value), retained) as lease:
+                if lease.scope is None:
+                    raise ToolPolicyRefusal(f"project test rejected: {lease.refusal_reason}")
+                result = asdict(
+                    await RepoProjectTests(retained_scope=retained).execute(
+                        selectors, suite=suite,
+                    )
+                )
+                result = _retained_result(runtime, retained, result)
+                result["remediation_guidance"] = _remediation_test_guidance(
+                    result["code"], scoped=bool(selectors),
+                )
+                return result
         result = asdict(
             await RepoProjectTests(_state(runtime, repository, pull_request)).execute(selectors, suite=suite)
         )
@@ -318,7 +434,12 @@ def repo_diff(
     paths: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Read a bounded working, staged, or base diff from the bound checkout."""
+    """Read a bounded working, staged, or base diff from the bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id;
+    retained scopes do not support ``mode='base'``.
+    """
     return _execute(runtime, repository, pull_request, GitDiff(mode, paths))
 
 
@@ -338,7 +459,11 @@ def repo_stage(
     paths: tuple[str, ...],
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Stage only explicit repository-relative paths in the bound checkout."""
+    """Stage only explicit repository-relative paths in the bound checkout.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitStage(paths))
 
 
@@ -350,7 +475,11 @@ def repo_commit(
     message: str,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Stage explicit paths and commit them with server-owned Git identity."""
+    """Stage explicit paths and commit them with server-owned Git identity.
+
+    On a retained Worklink remediation turn, ``repository`` is the retained
+    run's repository and ``pull_request`` is the incident's Chainlink issue id.
+    """
     return _execute(runtime, repository, pull_request, GitCommit(paths, message))
 
 
