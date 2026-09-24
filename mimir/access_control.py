@@ -9583,15 +9583,57 @@ def _attested_pr_checkout_lease(
         return _lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
         )
-    current_head = getattr(review_state, "git_expected_head", None)
-    if not current_head:
+    recorded_head = getattr(review_state, "git_expected_head", None)
+    if not recorded_head:
+        return False
+    observed_state = _observed_checkout_state(path)
+    if observed_state is None:
+        return False
+    observed_branch, observed_head = observed_state
+    if observed_branch != expected_branch or observed_head != recorded_head.lower():
+        # The checkout can be mutated by processes outside the typed repository
+        # tools. Never reuse a verdict unless the real branch and HEAD still
+        # match the server's recorded state.
         return False
     return review_state.author_attestation_verdict(
-        current_head,
+        observed_head,
         lambda: _lease_head_is_author_attested(
-            path, expected_branch, expected_head, current_head,
+            path, expected_branch, expected_head, observed_head,
+            observed_state=observed_state,
         ),
     )
+
+
+def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
+    """Read the checkout's actual branch and HEAD with one hardened Git command."""
+    from .repo_tools import hardened_git_command
+
+    try:
+        result = hardened_git_command(
+            path,
+            ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    fields = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("# branch."):
+            key, separator, value = line[2:].partition(" ")
+            if separator:
+                fields[key] = value
+    branch = fields.get("branch.head")
+    head = fields.get("branch.oid", "").lower()
+    if (
+        not branch
+        or branch == "(detached)"
+        or len(head) != 40
+        or any(character not in "0123456789abcdef" for character in head)
+    ):
+        return None
+    return branch, head
 
 
 def _lease_head_is_author_attested(
@@ -9599,6 +9641,8 @@ def _lease_head_is_author_attested(
     expected_branch: str,
     expected_head: str,
     current_head: str,
+    *,
+    observed_state: tuple[str, str] | None = None,
 ) -> bool:
     """Verify HEAD is the attested commit plus only server-identity commits."""
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
@@ -9608,11 +9652,8 @@ def _lease_head_is_author_attested(
         return hardened_git_command(path, arguments, timeout=5)
 
     try:
-        branch = run("symbolic-ref", "--quiet", "--short", "HEAD")
-        if branch.returncode != 0 or branch.stdout.strip() != expected_branch:
-            return False
-        head = run("rev-parse", "--verify", "HEAD^{commit}")
-        if head.returncode != 0 or head.stdout.strip().lower() != current_head.lower():
+        actual_state = observed_state or _observed_checkout_state(path)
+        if actual_state != (expected_branch, current_head.lower()):
             return False
         if current_head.lower() == expected_head:
             return True

@@ -216,7 +216,7 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
 def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    auth, scope, lease, target, server_identity = _real_attested_lease(tmp_path)
     state = auth.repo_review_state
     assert state is not None
     calls = []
@@ -233,9 +233,43 @@ def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
     assert len(calls) == 1
 
-    state.record_git_head(scope.scope_id, "c" * 40)
+    target.write_text("server remediation\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path),
+        "-c", f"user.name={server_identity[0]}",
+        "-c", f"user.email={server_identity[1]}",
+        "commit", "-qm", "server remediation",
+    ], check=True)
+    server_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    state.record_git_head(scope.scope_id, server_head)
+
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
     assert len(calls) == 2
+
+
+def test_attested_lease_cached_verdict_rejects_unrecorded_foreign_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", _self_login,
+    )
+    auth, scope, lease, target, _identity = _real_attested_lease(tmp_path)
+
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+    target.write_text("foreign commit\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path),
+        "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
+        "commit", "-qm", "foreign commit",
+    ], check=True)
+
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
 
 
 def test_attested_lease_head_rejects_foreign_ref(
