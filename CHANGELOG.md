@@ -6,6 +6,66 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-09-24
+
+Five hundred and seventeen commits since 0.8.8. Three threads run through them:
+the ACP server and Hands, which let an editor drive the agent with client-side
+execution; a worklink controller/executor split, which runs builds and
+remediation as a separate uid behind an owner-controlled boundary; and
+authorization provenance, which now attests collaborator content instead of
+tainting it wholesale.
+
+**Operator action is required.** A version bump alone satisfies none of these:
+
+- **The canonical image now requires provenance build arguments.**
+  `MIMIR_GIT_REF`, `MIMIR_CONTROLLER_COMMIT` and `MIMIR_EXECUTOR_COMMIT` must be
+  set, and the two commits must be equal full SHAs. An argument-less build fails
+  in its first stage. The worklink executor compares its image commit to the
+  controller source, so a forgotten pin bump fails loudly instead of shipping a
+  stale root executor.
+- **feature-factory moves from 0.8.x to 0.10.4**, and the pin lives in an image
+  layer. Rebuild the image; a pull and a restart are not enough. Exact-match
+  admission refuses a mismatched install.
+- **Skills changed**, including the optional `chainlink-orchestrator`,
+  `github-poller`, `github-ci-watch` and `gmail-poller`, and the bundled
+  `pollers`. A restart refreshes bundled skills and safely auto-updates installed
+  optional skills. Read the startup skill digest. Run
+  `mimir skills update <name>` only when it reports a partial update or remaining
+  drift, and inspect its diff before adding `--apply`.
+- **The console entry point is now `mimir.entrypoint:main`**, and
+  `mimir-agent` is installed alongside `mimir`. Reinstall any wrapper script
+  that imported `mimir.cli:main` directly.
+
+### Highlights
+
+- **ACP:** mimir serves the Agent Client Protocol (`agent-client-protocol`
+  0.12.0) for editors such as Zed. Hands are proxy-hosted with per-call client
+  authorization, session grants and a persistent Python REPL. Execution is
+  confined by macOS Seatbelt. A Linux AppArmor backend ships parser-checked in
+  CI, but its real-hardware enforcement is still unverified. Where no backend is
+  available, Hands runs unconfined only after the operator explicitly accepts
+  that risk. Confined Hands output no longer taints the turn.
+- **Worklink remediation:** the worklink controller and executor are split,
+  with builds and factory runs executing as the agent uid. Retained checkouts
+  sit behind an owner-controlled boundary. A retained remediation is proven end
+  to end, and an unparseable factory record no longer aborts the reattach sweep.
+- **Authorization:** `repo_*` results over an attested PR checkout lease now
+  inherit the PR author's attestation, cached per observed checkout HEAD. A
+  trusted collaborator's comment on mimir's own open PR grants remediation
+  scope rather than review-only. Together these cleared about 400 of the
+  would-block decisions that shadow enforcement recorded against collaborator
+  work.
+- **Git health:** a stale `.git/index.lock` escalates on its first blocked
+  commit with an operator recovery step, and repeated `git_commit_failed` now
+  escalates too. Mimir never deletes the lock itself.
+- **Tests:** a per-test `pytest-timeout` bound of 300 seconds fails a stalled
+  test by node id instead of hanging the session, and the suite runs under
+  `pytest-xdist`.
+
+`MIMIR_ACCESS_CONTROL_ENFORCED` remains unset.
+
+The per-change entries follow.
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.4. This is a
   pin-only update and changes no contract consumed by mimir.
 
