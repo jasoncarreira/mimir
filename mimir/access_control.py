@@ -9571,46 +9571,50 @@ def _attested_pr_checkout_lease(
     if not expected_head or not expected_branch or path is None:
         return False
 
-    return _lease_head_is_author_attested(path, expected_branch, expected_head)
+    registry = getattr(auth_context, "repo_pr_scope_registry", None)
+    review_state = (
+        registry.resolve_checkout_path(path)
+        if registry is not None
+        else getattr(auth_context, "repo_review_state", None)
+    )
+    if review_state is None or getattr(review_state, "checkout_lease", None) is not lease:
+        # Synthetic callers without the runtime's RepoReviewState do not get the
+        # cache, but still fail closed against the immutable attested head.
+        return _lease_head_is_author_attested(
+            path, expected_branch, expected_head, expected_head,
+        )
+    current_head = getattr(review_state, "git_expected_head", None)
+    if not current_head:
+        return False
+    return review_state.author_attestation_verdict(
+        current_head,
+        lambda: _lease_head_is_author_attested(
+            path, expected_branch, expected_head, current_head,
+        ),
+    )
 
 
 def _lease_head_is_author_attested(
     path: Path,
     expected_branch: str,
     expected_head: str,
+    current_head: str,
 ) -> bool:
     """Verify HEAD is the attested commit plus only server-identity commits."""
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    from .repo_tools import hardened_git_command
 
-    command = (
-        "/usr/bin/git", "-C", str(path), "--no-replace-objects",
-        "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
-    )
-    environment = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": "/nonexistent",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_NO_REPLACE_OBJECTS": "1",
-        "GIT_TERMINAL_PROMPT": "0",
-        "LC_ALL": "C",
-    }
-
-    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            (*command, *arguments), capture_output=True, text=True,
-            check=False, timeout=5, env=environment,
-        )
+    def run(*arguments: str):
+        return hardened_git_command(path, arguments, timeout=5)
 
     try:
         branch = run("symbolic-ref", "--quiet", "--short", "HEAD")
-        head = run("rev-parse", "--verify", "HEAD^{commit}")
         if branch.returncode != 0 or branch.stdout.strip() != expected_branch:
             return False
-        if head.returncode != 0:
+        head = run("rev-parse", "--verify", "HEAD^{commit}")
+        if head.returncode != 0 or head.stdout.strip().lower() != current_head.lower():
             return False
-        current_head = head.stdout.strip().lower()
-        if current_head == expected_head:
+        if current_head.lower() == expected_head:
             return True
         ancestry = run("merge-base", "--is-ancestor", expected_head, current_head)
         if ancestry.returncode != 0:

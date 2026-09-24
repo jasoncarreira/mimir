@@ -38,7 +38,7 @@ def _self_login(monkeypatch: pytest.MonkeyPatch):
     # metadata. Dedicated tests below exercise the real checkout-head predicate.
     monkeypatch.setattr(
         access_control_module, "_lease_head_is_author_attested",
-        lambda path, branch, head: True,
+        lambda *args, **kwargs: True,
     )
     yield real_head_check
 
@@ -164,6 +164,9 @@ def _real_attested_lease(tmp_path: Path):
         is_active=True,
     )
     auth = _auth(scope=scope)
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    object.__setattr__(auth, "repo_review_state", state)
     return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
 
 
@@ -186,6 +189,13 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
         "-c", f"user.email={server_identity[1]}",
         "commit", "-qm", "server remediation",
     ], check=True)
+    server_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    state = auth.repo_review_state
+    assert state is not None
+    state.record_git_head(scope.scope_id, server_head)
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
 
     target.write_text("foreign commit\n", encoding="utf-8")
@@ -195,7 +205,37 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
         "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
         "commit", "-qm", "foreign commit",
     ], check=True)
+    foreign_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    state.record_git_head(scope.scope_id, foreign_head)
     assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
+def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    state = auth.repo_review_state
+    assert state is not None
+    calls = []
+
+    def verify(*args, **kwargs):
+        calls.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", verify,
+    )
+
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert len(calls) == 1
+
+    state.record_git_head(scope.scope_id, "c" * 40)
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert len(calls) == 2
 
 
 def test_attested_lease_head_rejects_foreign_ref(
