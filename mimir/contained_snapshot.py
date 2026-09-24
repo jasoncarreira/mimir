@@ -111,8 +111,6 @@ _SOURCE_GIT_CONFIG = (
     "-c", "core.fsmonitor=",
     "-c", "core.hooksPath=/dev/null",
     "-c", "diff.external=",
-    "-c", "filter.evil.clean=cat",
-    "-c", "filter.evil.smudge=cat",
 )
 
 
@@ -592,7 +590,6 @@ def create_git_snapshot(
         excluded_prefixes=excluded,
         git_runner=source_git_runner,
     )
-    inventory_paths = tuple(entry.relative_path for entry in entries)
     try:
         clone_argv = (
             b"git", *(os.fsencode(value) for value in _SOURCE_GIT_CONFIG),
@@ -638,7 +635,7 @@ def create_git_snapshot(
         )
         if (
             _head_revision(source_bytes, git_runner=source_git_runner) != revision
-            or tuple(entry.relative_path for entry in verified_entries) != inventory_paths
+            or verified_entries != entries
         ):
             raise SnapshotSourceChanged("Snapshot source changed")
     except ContainedSnapshotError:

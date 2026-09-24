@@ -2021,7 +2021,7 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("feedback_stream", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent", "admit"): 2,
         ("producer", "mimir/access_control.py", "_acp_failed_tool_error_result", "SourceLabel"): 1,
         ("producer", "mimir/access_control.py", "_incomplete_protected_result", "SourceLabel"): 1,
-        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 5,
+        ("producer", "mimir/access_control.py", "classify_protected_result", "SourceLabel"): 6,
         ("producer", "mimir/access_control.py", "protected_result_source", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_commitments_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_self_state_block", "_prompt_source_labels"): 1,
@@ -2056,7 +2056,10 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("sink_predicate", "mimir/feedback/__init__.py", "FeedbackLog._select_prompt_recent.admit", "_source_is_triggering_channel_compatible"): 1,
         ("use_loader", "mimir/agent.py", "Agent._build_turn_prompt", "use"): 8,
     })
-    assert observed == expected
+    assert observed == expected, (
+        f"unexpected channel-bearing sources: {observed - expected}; "
+        f"missing inventory entries: {expected - observed}"
+    )
 
 
 @pytest.mark.asyncio
