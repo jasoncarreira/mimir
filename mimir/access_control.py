@@ -9543,6 +9543,94 @@ _UNTRUSTED_REFERENCE_SUBTREES = frozenset({("state", "pollers")})
 _PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 
 
+def _attested_pr_checkout_lease(
+    auth_context: "AuthContext | None",
+    scope: Any,
+    lease: Any,
+) -> bool:
+    """Return whether the lease still contains only author-attested content."""
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    author_trust = getattr(ifc_state, "pr_checkout_author_trust", {})
+    scope_id = getattr(scope, "scope_id", None)
+    if (
+        lease is None
+        or author_trust.get(scope_id) is not True
+        or scope_id != getattr(lease, "scope_id", None)
+        or getattr(scope, "canonical_repo", "").lower()
+        != getattr(lease, "canonical_repo", "").lower()
+        or getattr(scope, "pr_number", None) != getattr(lease, "pr_number", None)
+        or getattr(scope, "observed_head_sha", "").lower()
+        != getattr(lease, "head_sha", "").lower()
+        or not getattr(lease, "is_active", False)
+    ):
+        return False
+
+    expected_head = getattr(scope, "observed_head_sha", "").lower()
+    expected_branch = getattr(scope, "head_ref", None)
+    path = getattr(lease, "path", None)
+    if not expected_head or not expected_branch or path is None:
+        return False
+
+    return _lease_head_is_author_attested(path, expected_branch, expected_head)
+
+
+def _lease_head_is_author_attested(
+    path: Path,
+    expected_branch: str,
+    expected_head: str,
+) -> bool:
+    """Verify HEAD is the attested commit plus only server-identity commits."""
+    from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    command = (
+        "/usr/bin/git", "-C", str(path), "--no-replace-objects",
+        "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+    )
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/nonexistent",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LC_ALL": "C",
+    }
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            (*command, *arguments), capture_output=True, text=True,
+            check=False, timeout=5, env=environment,
+        )
+
+    try:
+        branch = run("symbolic-ref", "--quiet", "--short", "HEAD")
+        head = run("rev-parse", "--verify", "HEAD^{commit}")
+        if branch.returncode != 0 or branch.stdout.strip() != expected_branch:
+            return False
+        if head.returncode != 0:
+            return False
+        current_head = head.stdout.strip().lower()
+        if current_head == expected_head:
+            return True
+        ancestry = run("merge-base", "--is-ancestor", expected_head, current_head)
+        if ancestry.returncode != 0:
+            return False
+        commits = run(
+            "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce",
+            f"{expected_head}..{current_head}", "--",
+        )
+        if commits.returncode != 0:
+            return False
+        fields = [field for field in commits.stdout.split("\x00") if field]
+        expected_identity = [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL] * 2
+        return bool(fields) and len(fields) % 4 == 0 and all(
+            fields[index:index + 4] == expected_identity
+            for index in range(0, len(fields), 4)
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 @dataclass(frozen=True)
 class ProtectedResultProvenance:
     """Non-model-visible provenance for the exact resources a native read returned."""
@@ -9659,18 +9747,7 @@ def protected_result_source(
                 scope = getattr(review_state, "action_scope", None)
         # Acquired from head-bound native PR metadata and the same turn-local
         # author verdict cache as forge reads. No network lookup on file reads.
-        ifc_state = getattr(auth_context, "ifc_state", None)
-        author_trust = getattr(ifc_state, "pr_checkout_author_trust", {})
-        trusted_lease = (
-            lease is not None
-            and author_trust.get(getattr(scope, "scope_id", None)) is True
-            and getattr(scope, "scope_id", None) == lease.scope_id
-            and getattr(scope, "canonical_repo", "").lower()
-            == lease.canonical_repo.lower()
-            and getattr(scope, "pr_number", None) == lease.pr_number
-            and getattr(scope, "observed_head_sha", "").lower()
-            == lease.head_sha.lower()
-        )
+        trusted_lease = _attested_pr_checkout_lease(auth_context, scope, lease)
         retained_checkout = False
         service = get_trusted_service_from_auth_context(auth_context)
         if _is_worklink_retained_checkout_service(

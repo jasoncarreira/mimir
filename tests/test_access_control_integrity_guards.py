@@ -141,8 +141,14 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
     target.write_text("external")
     monkeypatch.setenv("MIMIR_HOME", str(home))
     monkeypatch.setenv("MIMIR_SOURCE_REPO", str(home))
-    lease = SimpleNamespace(scope_id="scope", canonical_repo="owner/repo", pr_number=7, head_sha="abc")
-    scope = SimpleNamespace(scope_id="scope", canonical_repo="owner/repo", pr_number=7, observed_head_sha="abc")
+    lease = SimpleNamespace(
+        scope_id="scope", canonical_repo="owner/repo", pr_number=7,
+        head_sha="abc", path=home, is_active=True,
+    )
+    scope = SimpleNamespace(
+        scope_id="scope", canonical_repo="owner/repo", pr_number=7,
+        observed_head_sha="abc", head_ref="fix",
+    )
     if mismatch in {"scope_id", "canonical_repo", "pr_number", "observed_head_sha"}:
         setattr(scope, mismatch, "different")
     auth = SimpleNamespace(
@@ -150,6 +156,7 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
         ifc_state=SimpleNamespace(pr_checkout_author_trust={scope.scope_id: mismatch != "verdict"}),
     )
     monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: None if mismatch == "no_lease" else lease)
+    monkeypatch.setattr(ac, "_lease_head_is_author_attested", lambda *args: True)
     decisions = []
     classify = ac._filesystem_read_trust_anchor
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from mimir import access_control as access_control_module
 from mimir.access_control import (
     OperationDecision,
     SinkGate,
@@ -29,8 +31,16 @@ from mimir.pr_checkout_lease import active_pr_checkout_lease_for_path
 
 
 @pytest.fixture(autouse=True)
-def _self_login(monkeypatch: pytest.MonkeyPatch) -> None:
+def _self_login(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir-bot")
+    real_head_check = access_control_module._lease_head_is_author_attested
+    # Most tests in this module exercise scope/lease binding with synthetic Git
+    # metadata. Dedicated tests below exercise the real checkout-head predicate.
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested",
+        lambda path, branch, head: True,
+    )
+    yield real_head_check
 
 
 def _recorded_lease(
@@ -125,6 +135,171 @@ def _auth(
         ifc_labels=current,
         ifc_state=state,
         repo_pr_action_scope=scope,
+    )
+
+
+def _real_attested_lease(tmp_path: Path):
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        ["git", "init", "-q", "-b", "worklink/7", str(checkout)], check=True,
+    )
+    target = checkout / "work.py"
+    target.write_text("attested\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(checkout), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(checkout),
+        "-c", "user.name=collaborator", "-c", "user.email=collaborator@example.test",
+        "commit", "-qm", "attested head",
+    ], check=True)
+    head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    scope = _scope(observed_head_sha=head, author="collaborator")
+    lease = SimpleNamespace(
+        path=checkout, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
+        pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
+        is_active=True,
+    )
+    auth = _auth(scope=scope)
+    return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
+
+
+def test_attested_lease_head_accepts_only_server_identity_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    real_head_check = _self_login
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", real_head_check,
+    )
+    auth, scope, lease, target, server_identity = _real_attested_lease(tmp_path)
+
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+    target.write_text("server remediation\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path),
+        "-c", f"user.name={server_identity[0]}",
+        "-c", f"user.email={server_identity[1]}",
+        "commit", "-qm", "server remediation",
+    ], check=True)
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+    target.write_text("foreign commit\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+    subprocess.run([
+        "git", "-C", str(lease.path),
+        "-c", "user.name=foreign", "-c", "user.email=foreign@example.test",
+        "commit", "-qm", "foreign commit",
+    ], check=True)
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
+def test_attested_lease_head_rejects_foreign_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", _self_login,
+    )
+    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(lease.path), "checkout", "-q", "-b", "foreign"], check=True,
+    )
+
+    assert not access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+
+
+@pytest.mark.parametrize("tool_name", ["repo_status", "repo_diff", "repo_test"])
+def test_repo_result_inherits_matching_attested_lease(
+    tool_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    from mimir.tools.repo import _publish_attested_lease_result
+
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", _self_login,
+    )
+    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    token = begin_protected_result_capture()
+    try:
+        _publish_attested_lease_result(SimpleNamespace(context=auth), state)
+    finally:
+        provenance = end_protected_result_capture(token)
+
+    labels = classify_protected_result(
+        tool_name, {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(
+            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True, repo_pr_action_scope=scope,
+        ),
+        result="repository output", provenance=provenance,
+    )
+
+    assert labels is not None
+    source, = labels.sources
+    assert (source.integrity, source.integrity_effect) == ("trusted", "active_ingest")
+    auth.ifc_state.merge(labels)
+    assert not auth.ifc_state.has_untrusted_active_ingest()
+
+
+def test_repo_result_without_author_verdict_stays_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login,
+) -> None:
+    from mimir.tools.repo import _publish_attested_lease_result
+
+    monkeypatch.setattr(
+        access_control_module, "_lease_head_is_author_attested", _self_login,
+    )
+    auth, scope, lease, _target, _identity = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    token = begin_protected_result_capture()
+    try:
+        _publish_attested_lease_result(SimpleNamespace(context=auth), state)
+    finally:
+        provenance = end_protected_result_capture(token)
+
+    assert provenance is None
+    labels = classify_protected_result(
+        "repo_status", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(
+            tool_name="repo_status", decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True, repo_pr_action_scope=scope,
+        ),
+        result="repository output", provenance=provenance,
+    )
+    assert labels is not None
+    source, = labels.sources
+    assert source.integrity == "untrusted"
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("tool_name", ["pr_job_log", "pr_comment"])
+def test_non_author_content_repository_results_remain_untrusted(
+    tool_name: str,
+) -> None:
+    auth = _auth()
+    scope = auth.repo_pr_action_scope
+    assert scope is not None
+    labels = classify_protected_result(
+        tool_name, {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(
+            tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+            allowed=True, repo_pr_action_scope=scope,
+        ),
+        result="external output",
+    )
+
+    assert labels is not None
+    source, = labels.sources
+    assert (source.integrity, source.integrity_effect) == (
+        "untrusted", "active_ingest",
     )
 
 

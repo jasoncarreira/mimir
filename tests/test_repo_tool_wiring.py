@@ -197,6 +197,69 @@ def test_repo_cleanup_refuses_without_active_lease() -> None:
         )
 
 
+@pytest.mark.parametrize("tool_name", ["repo_status", "repo_diff"])
+def test_repository_read_wrappers_publish_lease_attestation(
+    tool_name: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.repo_tools import GitOperationResult
+    from mimir.tools import repo as repo_module
+
+    scope = _scope(RepoPRAction.INSPECT)
+    context = _auth(scope)
+    state = context.repo_pr_scope_registry.resolve("owner/repo", 7)
+    assert state is not None
+    published = []
+
+    class FakeGitTools:
+        execution_started = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def execute(self, operation):
+            return GitOperationResult(True, "ok", stdout="result")
+
+    monkeypatch.setattr(repo_module, "RepoGitTools", FakeGitTools)
+    monkeypatch.setattr(
+        repo_module, "_publish_attested_lease_result",
+        lambda runtime, published_state: published.append(published_state),
+    )
+    runtime = SimpleNamespace(context=context)
+
+    getattr(repo_module, tool_name).func("owner/repo", 7, runtime=runtime)
+
+    assert published == [state]
+
+
+@pytest.mark.asyncio
+async def test_repo_test_wrapper_publishes_lease_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.project_tests import ProjectTestResult
+    from mimir.tools import repo as repo_module
+
+    scope = _scope(RepoPRAction.INSPECT)
+    context = _auth(scope)
+    state = context.repo_pr_scope_registry.resolve("owner/repo", 7)
+    assert state is not None
+    published = []
+
+    async def execute(self, selectors, *, suite):
+        return ProjectTestResult(True, "tests_passed", 0)
+
+    monkeypatch.setattr(repo_module.RepoProjectTests, "execute", execute)
+    monkeypatch.setattr(
+        repo_module, "_publish_attested_lease_result",
+        lambda runtime, published_state: published.append(published_state),
+    )
+
+    await repo_module.repo_test.coroutine(
+        "owner/repo", 7, runtime=SimpleNamespace(context=context),
+    )
+
+    assert published == [state]
+
+
 def test_checkout_proof_is_isolated_to_named_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
