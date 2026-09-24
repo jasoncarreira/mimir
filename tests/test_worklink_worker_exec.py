@@ -6,6 +6,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import pwd
 import shutil
 from types import SimpleNamespace
 import signal

@@ -59,7 +59,7 @@ class _ScriptedModel(GenericFakeChatModel):
 
 def _git(path: Path, *arguments: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(path), *arguments],
+        ["git", "-c", f"safe.directory={path}", "-C", str(path), *arguments],
         check=True,
         capture_output=True,
         text=True,

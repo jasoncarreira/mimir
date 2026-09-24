@@ -2972,6 +2972,12 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
             async def unsafe_runner(argv, directory, worker_env, projections, **_kwargs):
                 execution_env = dict(worker_env)
                 execution_env["HOME"] = str(controller_home)
+                unsafe_cache = controller_home / ".cache" / "uv"
+                unsafe_cache.mkdir(parents=True, exist_ok=True)
+                (unsafe_cache / "cached-wheel").write_text(
+                    "pre-populated", encoding="utf-8"
+                )
+                execution_env["UV_CACHE_DIR"] = str(unsafe_cache)
                 completed = await asyncio.to_thread(
                     subprocess.run,
                     argv,
@@ -2980,8 +2986,12 @@ def test_project_test_real_executor_preserves_active_lease_for_later_commit(
                     capture_output=True,
                     check=False,
                 )
+                snapshot_evidence = directory.path / "snapshot-executed.json"
+                assert snapshot_evidence.exists(), completed.stderr.decode(
+                    errors="replace"
+                )
                 unsafe_observation.update(json.loads(
-                    (directory.path / "snapshot-executed.json").read_text(encoding="utf-8")
+                    snapshot_evidence.read_text(encoding="utf-8")
                 ))
                 return CollectedExecutionResult(
                     completed.returncode,
