@@ -14,6 +14,7 @@ import re
 import shutil
 import stat as stat_module
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -333,6 +334,26 @@ def _parse_folders(raw: str) -> dict[str, str]:
             )
         return dict(DEFAULT_FOLDERS)
     return folders
+
+
+def configured_writable_dirs(
+    folders: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Return configured folder names whose mode is ``rw``.
+
+    Without an explicit parsed mapping, this reads only ``MIMIR_FOLDERS``. It
+    deliberately does not load the home dotenv or build ``Config`` because the
+    result is used in write authorization. Invalid values retain
+    ``_parse_folders``' fail-safe behavior and fall back to ``DEFAULT_FOLDERS``;
+    unrelated configuration failures, such as repository git probes, cannot
+    affect this decision.
+    """
+    effective = (
+        _parse_folders(os.environ.get("MIMIR_FOLDERS", ""))
+        if folders is None
+        else folders
+    )
+    return [name for name, mode in effective.items() if mode == "rw"]
 
 
 # Absolute roots OUTSIDE the home that the file tools may read/edit, declared by
@@ -1452,7 +1473,7 @@ class Config:
         ``WriteGuardBackend`` so deepagents' Write/Edit/upload tools
         block paths outside these roots. Order preserves dict order
         (insertion order from ``_parse_folders``)."""
-        return [name for name, mode in self.folders.items() if mode == "rw"]
+        return configured_writable_dirs(self.folders)
 
     @property
     def all_dirs(self) -> list[str]:

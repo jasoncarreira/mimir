@@ -5240,6 +5240,69 @@ def test_skill_write_boundary_has_no_opinion_on_non_skill_target(
     ) is None
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected_names"),
+    [
+        (None, ("state", "memory", "conversation_history", "attachments", "scratch", "skills")),
+        ("", ("state", "memory", "conversation_history", "attachments", "scratch", "skills")),
+        ("alpha:rw,beta:ro,gamma:rw", ("alpha", "gamma")),
+        ("alpha:ro,beta:ro", ()),
+        (".:rw,..:rw", ("state", "memory", "conversation_history", "attachments", "scratch", "skills")),
+    ],
+)
+def test_agent_writable_roots_match_folder_configuration(
+    raw: str | None,
+    expected_names: tuple[str, ...],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+    if raw is None:
+        monkeypatch.delenv("MIMIR_FOLDERS", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FOLDERS", raw)
+
+    home = home.resolve()
+    home_derived_roots = tuple(
+        root
+        for root in access_control.agent_writable_roots(home)
+        if root.is_relative_to(home)
+    )
+
+    assert home_derived_roots == tuple(
+        (home / name).resolve() for name in expected_names
+    )
+
+
+def test_write_authorization_does_not_build_config_or_spawn_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import config
+
+    home = tmp_path / "home"
+    target = home / "skills" / "example" / "SKILL.md"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_FILE_TOOL_ROOTS", raising=False)
+
+    def unexpected_call(*args: object, **kwargs: object) -> None:
+        pytest.fail(f"write authorization performed unexpected setup: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(config, "_configure_declared_repositories", unexpected_call)
+    monkeypatch.setattr(subprocess, "run", unexpected_call)
+
+    decision = ToolRegistry().authorize_tool(
+        "write_file",
+        _trusted_operator_write_auth(admin=True),
+        enforce=True,
+        target_channel=str(target),
+    )
+
+    assert decision.allowed is True
+
+
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
 def test_admin_operator_turn_may_write_skill_scripts(
     tool_name: str,
