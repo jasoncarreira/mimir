@@ -258,6 +258,7 @@ def test_review_needed_event_carries_submission_rule_and_marker(monkeypatch):
     marker = ev.get("expected_tool_call")
     assert isinstance(marker, dict)
     assert marker["signal_on_missing"] == "poller_review_missed_submission"
+    assert "pr_submit_review" in marker["tool_names"]
     assert "pull_request_review_write" in marker["tool_names"]
     # chainlink #308: the marker is now PR-specific so the framework can
     # attribute WHICH review wasn't submitted (a duplicate review of one PR

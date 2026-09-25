@@ -645,6 +645,7 @@ once the corresponding skill is installed.
 | `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
 | `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. |
+| `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
 
 ## Bridges (credentials)
 

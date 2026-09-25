@@ -24,6 +24,7 @@ import re
 import shutil
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -6630,12 +6631,146 @@ print('{"poller": "x", "prompt": "ok"}')
     ]
     combined_stderr = "|".join(stderr_payloads)
     # The pass_env token reached the subprocess (TOKEN_PRESENT=True), but
-    # diagnostics redact exact values for all pass_env keys before events.jsonl.
+    # diagnostics redact secrets, while the documented non-secret identity is
+    # preserved for server-side consumers.
     assert "TOKEN_PRESENT=True" in combined_stderr
     assert "ghp_test_pass_env_value" not in combined_stderr
-    assert "mimir-bot" not in combined_stderr
+    assert "LOGIN=mimir-bot" in combined_stderr
     assert "TOKEN=[REDACTED]" in combined_stderr
-    assert "LOGIN=[REDACTED]" in combined_stderr
+
+
+def test_discover_pollers_rejects_credential_shaped_redaction_exemption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The closed exemption set must fail startup if a secret-looking key enters it."""
+    from mimir import pollers
+
+    monkeypatch.setattr(
+        pollers,
+        "_NON_SECRET_FORWARDED_ENV_KEYS",
+        pollers._NON_SECRET_FORWARDED_ENV_KEYS | {"ACCIDENTAL_TOKEN"},
+    )
+
+    with pytest.raises(RuntimeError, match="ACCIDENTAL_TOKEN"):
+        discover_pollers(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_github_emit_preserves_identity_scope_and_redacts_forwarded_secrets(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise github-poller's emitter through run_poller and authorization."""
+    from mimir.access_control import _repo_review_state_from_event
+    from mimir.agent import _gh_review_submitted_for_marker
+
+    login = "mimir-bot"
+    token = "github-token-that-must-stay-secret"
+    manifest_secret = "manifest-secret-that-must-stay-hidden"
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", login)
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setenv("GITHUB_REPOS", "o/r")
+    agent_home = home / "agent-home"
+    agent_home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(agent_home))
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo_root), "remote", "add", "origin", "git@github.com:o/r.git"],
+        check=True,
+    )
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{repo_root}:rw")
+
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    shutil.copy2(
+        Path(__file__).parents[1]
+        / "mimir/optional-skills/github-poller/scripts/poller.py",
+        skill_dir / "github_poller.py",
+    )
+    _install_script(skill_dir, "emit_events.py", """
+import os
+import github_poller
+
+common = {
+    "repo": "o/r",
+    "author": os.environ["MIMIR_GITHUB_SELF_LOGIN"],
+    "head_repo": "o/r",
+    "head_remote": "origin",
+    "head_ref": "worklink/42",
+    "head_sha": "a" * 40,
+    "base_ref": "main",
+    "base_sha": "b" * 40,
+    "forwarded": {
+        "token": os.environ["GITHUB_TOKEN"],
+        "manifest": os.environ["FOO_SECRET_VALUE"],
+    },
+}
+github_poller._emit(
+    f"review token={os.environ['GITHUB_TOKEN']} manifest={os.environ['FOO_SECRET_VALUE']}",
+    event_type="pr_review", state="CHANGES_REQUESTED", number=42, **common,
+)
+github_poller._emit(
+    f"opened token={os.environ['GITHUB_TOKEN']} manifest={os.environ['FOO_SECRET_VALUE']}",
+    event_type="pr_opened", number=43,
+    **{**common, "head_ref": "worklink/43", "head_sha": "c" * 40},
+)
+""")
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_commit", "repo_push"),
+        creation_path="test",
+    )
+    cfg = PollerConfig(
+        name="github-activity", command=f"{sys.executable} emit_events.py",
+        cron="* * * * *", batch_size=2,
+        env={"FOO_SECRET_VALUE": manifest_secret}, skill_dir=skill_dir,
+        pass_env=(
+            "GITHUB_TOKEN", "GITHUB_REPOS", "MIMIR_GITHUB_SELF_LOGIN",
+            "MIMIR_SOURCE_DIR",
+        ),
+        authority=authority,
+    )
+    monkeypatch.setenv("MIMIR_SOURCE_DIR", str(Path(__file__).parents[1]))
+    captured: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent, **_kwargs: object) -> bool:
+        captured.append(event)
+        return True
+
+    emitted = await run_poller(cfg, enqueue=enqueue, home=agent_home)
+    assert emitted == 1, _read_events(home)
+    [event] = captured
+    first, second = event.extra["items"]
+    marker = second["expected_tool_call"]
+    assert first["author"] == login
+    assert marker["reviewer"] == login
+    serialized = json.dumps({"prompt": event.content, "extra": event.extra})
+    assert token not in serialized
+    assert manifest_secret not in serialized
+    assert serialized.count("[REDACTED]") >= 4
+
+    registry = _repo_review_state_from_event(
+        event, SimpleNamespace(authority_profile="github"),
+    )
+    assert registry is not None, event.extra
+    remediation = next(
+        scope for scope in registry.action_scopes if scope.pr_number == 42
+    )
+    assert RepoPRAction.COMMIT.value in remediation.allowed_operations
+    assert RepoPRAction.PUSH.value in remediation.allowed_operations
+
+    class ReviewsResponse:
+        returncode = 0
+        stdout = json.dumps([{
+            "user": {"login": login},
+            "state": "CHANGES_REQUESTED",
+            "commit_id": "c" * 40,
+        }])
+
+    monkeypatch.setattr("mimir.agent.subprocess.run", lambda *args, **kwargs: ReviewsResponse())
+    assert _gh_review_submitted_for_marker(marker) is True
 
 
 @pytest.mark.asyncio
