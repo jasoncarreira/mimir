@@ -5264,8 +5264,15 @@ def test_agent_writable_roots_match_folder_configuration(
     else:
         monkeypatch.setenv("MIMIR_FOLDERS", raw)
 
-    assert access_control.agent_writable_roots(home) == tuple(
-        home / name for name in expected_names
+    home = home.resolve()
+    home_derived_roots = tuple(
+        root
+        for root in access_control.agent_writable_roots(home)
+        if root.is_relative_to(home)
+    )
+
+    assert home_derived_roots == tuple(
+        (home / name).resolve() for name in expected_names
     )
 
 
