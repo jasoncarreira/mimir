@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -1211,6 +1212,46 @@ async def test_run_turn_writes_record_with_extracted_events(
     # The TurnLogger appended one record
     turns = (tmp_path / "home" / "logs" / "turns.jsonl").read_text().splitlines()
     assert len(turns) == 1
+
+
+async def test_user_turn_saga_query_overlaps_prompt_loaders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saga_entered = threading.Event()
+    loader_entered = asyncio.Event()
+
+    class _OverlappingSaga(_FakeSaga):
+        async def query(self, *args, **kwargs):
+            saga_entered.set()
+            await loader_entered.wait()
+            return await super().query(*args, **kwargs)
+
+    fake_agent = _FakeAgent(response_messages=[AIMessage(content="done")])
+    agent = _build_agent(
+        tmp_path,
+        fake_agent=fake_agent,
+        fake_saga=_OverlappingSaga(query_hits=[{
+            "atom_id": "a" * 16, "content": "overlap memory", "stream": "semantic",
+        }]),
+    )
+    loop = asyncio.get_running_loop()
+
+    def feedback_loader(*_args):
+        assert saga_entered.wait(1), "prompt loader started before SAGA query"
+        loop.call_soon_threadsafe(loader_entered.set)
+        return None
+
+    agent._config.feedback_limit_per_polarity = 1
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", feedback_loader)
+
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-overlap", content="remember this",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    await asyncio.wait_for(agent.run_turn(event), timeout=2)
+
+    prompt = fake_agent.invocations[0]["state"]["messages"][0].content
+    assert prompt.index("## Possibly relevant memories") < prompt.index("## Today's date")
 
 
 @pytest.mark.parametrize(

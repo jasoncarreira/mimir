@@ -1702,7 +1702,9 @@ class Agent:
         # the graph (prompt-cache prefix stays warm), while core-memory /
         # index / operator-config changes take effect on the next turn
         # without a process restart (chainlink #369).
-        system_prompt = self._current_system_prompt(emit_health_events=False)
+        system_prompt = await asyncio.to_thread(
+            self._current_system_prompt, emit_health_events=False,
+        )
         skill_sources = self._current_skill_sources()
         skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
         coding_enabled = self._config.coding_enabled
@@ -1730,7 +1732,9 @@ class Agent:
             # Re-render under the lock: a contending turn may have just
             # rebuilt the graph for the same prompt while we waited, or
             # the prompt may have changed again on disk.
-            system_prompt = self._current_system_prompt(emit_health_events=False)
+            system_prompt = await asyncio.to_thread(
+                self._current_system_prompt, emit_health_events=False,
+            )
             skill_sources = self._current_skill_sources()
             skill_catalog_fingerprint = await self._skill_catalog_fingerprint(skill_sources)
             coding_enabled = self._config.coding_enabled
@@ -1750,7 +1754,9 @@ class Agent:
             # health events for the final rendered prompt only on this
             # path, not on every unchanged-turn comparison.
             if os.environ.get("MIMIR_SYSTEM_PROMPT_OVERRIDE") is None:
-                system_prompt = self._current_system_prompt(emit_health_events=True)
+                system_prompt = await asyncio.to_thread(
+                    self._current_system_prompt, emit_health_events=True,
+                )
                 if (
                     self._agent is not None
                     and system_prompt == self._cached_system_prompt
@@ -2837,53 +2843,57 @@ class Agent:
         memory_block: str | None = None
         memory_labels = InformationFlowLabels()
         saga_atom_ids: list[str] = []
+        saga_query_task: asyncio.Task[
+            tuple[str | None, InformationFlowLabels]
+        ] | None = None
         if self._saga is not None and event.trigger not in NON_USER_QUERY_TRIGGERS:
-            try:
-                # Pass the channel's recent transcript so SagaStore's
-                # contextual rewrite (gated by saga.toml's
-                # [retrieval].enable_contextual_rewrite — default True
-                # for prod homes) can resolve referential queries
-                # ("yes, look for that") into self-contained retrieval
-                # anchors before embedding/FTS. ``None`` channel
-                # (system / poller triggers without a channel) skips
-                # the rewrite naturally — context will be empty.
-                rewrite_context = _rewrite_context_from_buffer(
-                    self._buffer, event.channel_id,
-                ) if event.channel_id else None
-                payload = await self._saga.query(
-                    event.content,
-                    top_k=12,
-                    session_id=saga_session_id,
-                    min_confidence_tier=(
-                        self._config.saga_pre_message_min_tier.strip() or None
-                    ),
-                    context=rewrite_context,
-                    auth_context=initial_auth_context,
-                )
-                raw_block = _format_saga_payload(payload)
-                memory_labels = _auto_recall_source_labels(
-                    initial_auth_context, payload,
-                )
-                if raw_block and raw_block != "(no atoms)":
-                    memory_block = raw_block
-                ids = _atom_ids_from_response(payload)
-                triple_ids = _source_atom_ids_from_triples(payload)
-                seen: set[str] = set()
-                # Atom ids returned as atoms are already known-real. Triple
-                # source ids are heuristic payload references and must resolve
-                # before they can become turn citations.
-                for aid in ids:
-                    if aid not in seen:
-                        seen.add(aid)
-                        saga_atom_ids.append(aid)
-                for aid in await _resolve_heuristic_atom_ids(
-                    self._saga, triple_ids, auth_context=initial_auth_context,
-                ):
-                    if aid not in seen:
-                        seen.add(aid)
-                        saga_atom_ids.append(aid)
-            except Exception as exc:
-                log.warning("pre-message saga.query failed: %s", exc)
+            async def query_saga() -> tuple[str | None, InformationFlowLabels]:
+                labels = InformationFlowLabels()
+                block: str | None = None
+                try:
+                    # Pass the channel's recent transcript so SagaStore's
+                    # contextual rewrite can resolve referential queries into
+                    # self-contained retrieval anchors before embedding/FTS.
+                    rewrite_context = _rewrite_context_from_buffer(
+                        self._buffer, event.channel_id,
+                    ) if event.channel_id else None
+                    payload = await self._saga.query(
+                        event.content,
+                        top_k=12,
+                        session_id=saga_session_id,
+                        min_confidence_tier=(
+                            self._config.saga_pre_message_min_tier.strip() or None
+                        ),
+                        context=rewrite_context,
+                        auth_context=initial_auth_context,
+                    )
+                    raw_block = _format_saga_payload(payload)
+                    labels = _auto_recall_source_labels(
+                        initial_auth_context, payload,
+                    )
+                    if raw_block and raw_block != "(no atoms)":
+                        block = raw_block
+                    ids = _atom_ids_from_response(payload)
+                    triple_ids = _source_atom_ids_from_triples(payload)
+                    seen: set[str] = set()
+                    # Atom ids returned as atoms are already known-real. Triple
+                    # source ids are heuristic payload references and must resolve
+                    # before they can become turn citations.
+                    for aid in ids:
+                        if aid not in seen:
+                            seen.add(aid)
+                            saga_atom_ids.append(aid)
+                    for aid in await _resolve_heuristic_atom_ids(
+                        self._saga, triple_ids, auth_context=initial_auth_context,
+                    ):
+                        if aid not in seen:
+                            seen.add(aid)
+                            saga_atom_ids.append(aid)
+                except Exception as exc:
+                    log.warning("pre-message saga.query failed: %s", exc)
+                return block, labels
+
+            saga_query_task = asyncio.create_task(query_saga())
 
         # Per-turn prompt assembly — Recent activity, Recent feedback,
         # Session summaries, Resource usage, Upcoming, Upcoming
@@ -2894,6 +2904,7 @@ class Agent:
             saga_block=memory_block,
             initial_auth_context=initial_auth_context,
             saga_labels=memory_labels,
+            saga_query_task=saga_query_task,
         )
 
         # Protected loaders merge their authoritative provenance into the turn
@@ -4506,6 +4517,9 @@ class Agent:
         saga_block: str | None,
         initial_auth_context: AuthContext | None = None,
         saga_labels: InformationFlowLabels | None = None,
+        saga_query_task: asyncio.Task[
+            tuple[str | None, InformationFlowLabels]
+        ] | None = None,
     ) -> tuple[str, list]:
         """Assemble the per-turn user-side prompt + the recent-message
         list. Synthesis turns get a dedicated synthesis prompt; everything
@@ -4582,46 +4596,87 @@ class Agent:
                 ),
             ) if channel_memory_content and channel_memory_owner else None
         )
-        feedback_block = use(
-            await asyncio.to_thread(self._feedback.recent_prompt_block, auth_context)
-            if self._config.feedback_limit_per_polarity > 0
-            else None
-        )
         # Open change-proposal nudge (chainlink #337/#339/#344), rendered next
         # to the feedback signals so the agent finishes/abandons an in-flight
         # proposal. Sync git call off the loop; a prompt section must never
         # break the turn, hence the broad guard.
-        try:
-            from .proposals import render_open_proposals_block
-            proposal_content = (
-                await asyncio.to_thread(render_open_proposals_block, self._config.home)
-                if _is_prompt_operator(auth_context)
-                else None
-            )
-            core_proposals_block = use(
-                PromptBlock(
+        async def load_open_proposals() -> PromptBlock | None:
+            try:
+                from .proposals import render_open_proposals_block
+                proposal_content = (
+                    await asyncio.to_thread(
+                        render_open_proposals_block, self._config.home,
+                    )
+                    if _is_prompt_operator(auth_context)
+                    else None
+                )
+                return PromptBlock(
                     proposal_content,
                     _prompt_source_labels(
                         auth_context, domain="proposals", resource="global:proposals",
                         principal="service:mimir", self_authored=True,
                     ),
                 ) if proposal_content else None
-            )
-        except Exception:  # noqa: BLE001 — prompt assembly must not fail a turn
-            core_proposals_block = None
-        session_summaries_block = use(
-            await self._assemble_session_summaries(
+            except Exception:  # noqa: BLE001 — prompt assembly must not fail a turn
+                return None
+
+        from .commitments.store import run_store_io
+        from .skill_resolver import find_skill_for_channel
+        from .skill_defs import home_builtin_skills_dir, home_skills_dir
+
+        skills_dirs = (
+            home_skills_dir(self._config.home),
+            home_builtin_skills_dir(self._config.home),
+        )
+        event_loop = asyncio.get_running_loop()
+        (
+            feedback_source,
+            core_proposals_source,
+            session_summaries_source,
+            usage_result,
+            commitments_source,
+            self_state_source,
+            auto_skill_block,
+            saga_result,
+        ) = await asyncio.gather(
+            asyncio.to_thread(self._feedback.recent_prompt_block, auth_context)
+            if self._config.feedback_limit_per_polarity > 0
+            else asyncio.sleep(0, result=None),
+            load_open_proposals(),
+            self._assemble_session_summaries(
                 channel_id=(
                     None
                     if event.channel_id == _REFLECTION_CHANNEL_ID
                     else event.channel_id
                 ),
                 auth_context=auth_context,
-            )
+            ),
+            asyncio.to_thread(self._assemble_usage_block, auth_context),
+            run_store_io(
+                self._assemble_commitments_block,
+                channel_id=event.channel_id,
+                auth_context=auth_context,
+            ),
+            asyncio.to_thread(
+                self._assemble_self_state_block,
+                auth_context,
+                event_loop=event_loop,
+            ),
+            asyncio.to_thread(
+                find_skill_for_channel,
+                event.channel_id,
+                skills_dirs,
+            ),
+            saga_query_task
+            if saga_query_task is not None
+            else asyncio.sleep(0, result=(saga_block, saga_labels)),
         )
-        usage_source, deferred_usage_events = await asyncio.to_thread(
-            self._assemble_usage_block, auth_context,
-        )
+
+        # Completion order must not affect prompt or provenance order.
+        feedback_block = use(feedback_source)
+        core_proposals_block = use(core_proposals_source)
+        session_summaries_block = use(session_summaries_source)
+        usage_source, deferred_usage_events = usage_result
         usage_block = use(usage_source)
         # Flush deferred events on the running loop.
         from .ntfy import fire_cost_runaway_alarm_if_warranted
@@ -4634,21 +4689,9 @@ class Agent:
                 fire_cost_runaway_alarm_if_warranted(event_kind, event_kwargs)
             )
         upcoming_block = use(self._assemble_upcoming_block(auth_context))
-        from .commitments.store import run_store_io
-
-        commitments_block = use(await run_store_io(
-            self._assemble_commitments_block,
-            channel_id=event.channel_id,
-            auth_context=auth_context,
-        ))
-        # Thread the running loop into the worker thread so the arbiter's
-        # lazy-expiry quota_recovered emit can bridge back via
-        # run_coroutine_threadsafe instead of being dropped (#489).
-        self_state_block = use(await asyncio.to_thread(
-            self._assemble_self_state_block,
-            auth_context,
-            event_loop=asyncio.get_running_loop(),
-        ))
+        commitments_block = use(commitments_source)
+        self_state_block = use(self_state_source)
+        saga_block, saga_labels = saga_result
         # Auto-surface the relevant SKILL.md when this turn is on a
         # ``poller:<name>`` channel — the agent gets the skill's
         # content inline without needing a ``find-skills`` lookup.
@@ -4657,8 +4700,6 @@ class Agent:
         # because it never loaded the matching skill (muninn-mimir
         # 2026-05-23: a Bluesky reply landed in Discord). Non-poller
         # turns return None and the prompt is unaffected.
-        from .skill_resolver import find_skill_for_channel
-        from .skill_defs import home_builtin_skills_dir, home_skills_dir
         # Disk I/O (walk skills dirs + read pollers.json + SKILL.md)
         # wrapped in to_thread to match the existing pattern in this
         # function — every other file-touching call here uses
@@ -4666,15 +4707,6 @@ class Agent:
         # Cost is sub-ms at current skill counts (<20 bundled + a few
         # operator-installed) but keeps the event loop honest if skill
         # counts grow or a SKILL.md gets large.
-        skills_dirs = (
-            home_skills_dir(self._config.home),
-            home_builtin_skills_dir(self._config.home),
-        )
-        auto_skill_block = await asyncio.to_thread(
-            find_skill_for_channel,
-            event.channel_id,
-            skills_dirs,
-        )
         # chainlink #783: slash-command chat skills resolve only through the
         # injected registry + the server-owned serialized invocation stored in
         # ``event.extra``. Presence of the extra key replaces any poller auto-
