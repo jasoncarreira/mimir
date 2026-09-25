@@ -829,6 +829,27 @@ def test_fetch_url_rejects_public_redirect_not_on_exact_url_allowlist(
         web_tools_mod.end_authorized_fetch(token)
 
 
+def test_fetch_url_allows_public_redirect_on_exact_url_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    monkeypatch.setattr(
+        web_tools_mod.HTTPRedirectHandler,
+        "redirect_request",
+        lambda _self, _req, _fp, _code, _msg, _headers, newurl: newurl,
+    )
+    handler = web_tools_mod._SSRFCheckingRedirectHandler()
+    destination = "https://arxiv.org/pdf/2609.30227"
+    token = web_tools_mod.begin_authorized_fetch(frozenset({destination}))
+    try:
+        assert handler.redirect_request(
+            web_tools_mod.Request("https://arxiv.org/abs/2609.30227"),
+            None, 302, "Found", {}, destination,
+        ) == destination
+    finally:
+        web_tools_mod.end_authorized_fetch(token)
+
+
 @pytest.mark.asyncio
 async def test_fetch_url_max_bytes_exceeded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

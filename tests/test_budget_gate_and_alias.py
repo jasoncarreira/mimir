@@ -68,6 +68,7 @@ from mimir.tools.budget_gate import (
     _OperatorShellPreparation,
     _check_and_increment_or_deny,
     _emit_tool_call_sync,
+    _merge_result_labels_from_result,
     _prepare_operator_shell_execution,
     _result_labels_for_call,
 )
@@ -7030,6 +7031,31 @@ def test_admin_sensitive_tool_matches_mcp_name_variants():
     assert _is_admin_sensitive_tool("mcp_mimir_glob")
     assert _is_admin_sensitive_tool("mcp_mimir_grep")
     assert _is_admin_sensitive_tool("mcp_mimir_file_search")
+
+
+def test_result_urls_are_recorded_from_returned_text_not_arguments() -> None:
+    ctx = _make_ctx()
+    auth = ctx.auth_context
+    argument_url = "https://attacker.example/from-arguments"
+    result_url = "https://arxiv.org/abs/2609.30227"
+    request = _make_request(
+        "web_search", "result-url", auth, {"query": argument_url},
+    )
+    result = ToolMessage(content=f"paper {result_url}", tool_call_id="result-url")
+    labels = _result_labels_for_call(
+        "web_search",
+        request,
+        auth,
+        ToolAuthorization(
+            tool_name="web_search", decision=OperationDecision.OPEN, allowed=True,
+        ),
+        result=result,
+    )
+
+    _merge_result_labels_from_result(auth, labels, result)
+
+    assert auth.ingested_url_state.urls() == frozenset({result_url})
+    assert argument_url not in auth.ingested_url_state.urls()
 
 
 @pytest.mark.asyncio

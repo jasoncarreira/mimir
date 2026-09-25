@@ -369,6 +369,17 @@ final boundary and obey the configured enforcement mode. SAGA
 ownership does not currently generate field-level IFC labels; after authorized
 recall, injected prompt context receives the conservative turn-level taint.
 
+On a tainted turn, `fetch_url` may also pass the taint gate for an exact HTTPS
+URL copied from untrusted active-ingest text in that same turn. The server
+extracts and normalizes those URLs from classified tool results and untrusted
+poller payloads, keeps at most 1000 in non-persisted turn state, and records an
+admission as `taint_gate_exempt:verbatim_ingest_url`. This is not destination
+authority: the URL must still match the service's `approved_urls` policy or
+another existing fetch adapter, and every redirect hop must independently be an
+exact approved or approved-and-ingested URL. Trusted prompt or memory content,
+`http://` URLs, userinfo, explicit ports, and model-supplied tool arguments do
+not populate the set. A new turn starts with an empty set.
+
 ### Ingest acknowledgement
 
 `clear_ingest_taint` is a model tool for an authenticated, non-service admin on

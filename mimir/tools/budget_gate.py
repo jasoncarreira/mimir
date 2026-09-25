@@ -74,8 +74,10 @@ from ..access_control import (
     configured_project_test_cwd,
     get_tool_registry,
     get_trusted_service_from_auth_context,
+    ingested_fetch_urls,
     normalize_sink_destination,
     parse_service_shell_argv_with_diagnostics,
+    record_ingested_urls,
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
@@ -617,6 +619,10 @@ def _authorized_fetch_urls_for_tool(
 ) -> frozenset[str] | None:
     if tool_name == "fetch_url":
         approved = set(approved_fetch_urls(auth_context))
+        approved.update(
+            url for url in ingested_fetch_urls(auth_context)
+            if fetch_url_is_approved(url, auth_context)
+        )
         if target is not None and fetch_url_is_approved(target, auth_context):
             normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
             if normalized is not None:
@@ -1741,6 +1747,20 @@ def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
         return None
 
 
+def _result_text(result: Any) -> str | None:
+    if isinstance(result, ToolMessage):
+        content = result.content
+        return content if isinstance(content, str) else json.dumps(content, ensure_ascii=True)
+    if isinstance(result, Command):
+        update = getattr(result, "update", None)
+        messages = update.get("messages", ()) if isinstance(update, dict) else ()
+        parts = [text for message in messages if (text := _result_text(message))]
+        return "\n".join(parts) if parts else None
+    if isinstance(result, ToolException):
+        return str(result)
+    return None
+
+
 def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     """Monotonically taint the exact turn and rebind harness egress."""
     if auth_context is None or added is None:
@@ -1759,6 +1779,15 @@ def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     emitter = getattr(active_ctx, "turn_event_emitter", None)
     if emitter is not None:
         emitter.bind_information_flow(merged, active_ctx.auth_context)
+
+
+def _merge_result_labels_from_result(
+    auth_context: AuthContext | None, added: Any, result: Any,
+) -> None:
+    """Record returned text, then pass through the established label merge seam."""
+    if auth_context is not None and added is not None:
+        record_ingested_urls(auth_context, _result_text(result), added)
+    _merge_result_labels(auth_context, added)
 
 
 def _result_labels_for_call(
@@ -3292,7 +3321,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels(auth_context, result_labels)
+                _merge_result_labels_from_result(auth_context, result_labels, exc)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3360,7 +3389,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels(auth_context, result_labels)
+        _merge_result_labels_from_result(auth_context, result_labels, result)
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,
@@ -3827,7 +3856,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels(auth_context, result_labels)
+                _merge_result_labels_from_result(auth_context, result_labels, exc)
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3895,7 +3924,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels(auth_context, result_labels)
+        _merge_result_labels_from_result(auth_context, result_labels, result)
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,

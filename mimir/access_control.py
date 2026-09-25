@@ -5376,6 +5376,63 @@ def approved_fetch_urls(auth_context: Any) -> frozenset[str]:
     return frozenset(approved)
 
 
+_INGESTED_HTTPS_URL = re.compile(r"https://[^\s<]+")
+_INGESTED_URL_TRAILING_PUNCTUATION = ".,;:)]}>\"'`"
+
+
+def record_ingested_urls(auth_context: Any, text: Any, labels: Any) -> None:
+    """Record normalized HTTPS URLs from one untrusted active-ingest result."""
+    from .models import InformationFlowLabels, IngestedURLState
+
+    if (
+        not isinstance(text, str)
+        or not isinstance(labels, InformationFlowLabels)
+        or not labels.has_untrusted_active_ingest
+    ):
+        return
+    state = getattr(auth_context, "ingested_url_state", None)
+    if not isinstance(state, IngestedURLState):
+        return
+    for match in _INGESTED_HTTPS_URL.finditer(text):
+        candidate = match.group(0).rstrip(_INGESTED_URL_TRAILING_PUNCTUATION)
+        try:
+            parsed = urlsplit(candidate)
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+        ):
+            continue
+        without_fragment = urlunsplit((
+            parsed.scheme, parsed.netloc, parsed.path, parsed.query, "",
+        ))
+        normalized = normalize_sink_destination(SinkCategory.NETWORK, without_fragment)
+        if normalized is not None:
+            state.add(normalized)
+
+
+def ingested_fetch_urls(auth_context: Any) -> frozenset[str]:
+    """Return the exact turn-local untrusted-ingest URLs, if available."""
+    state = getattr(auth_context, "ingested_url_state", None)
+    urls = getattr(state, "urls", None)
+    return urls() if callable(urls) else frozenset()
+
+
+def _target_is_verbatim_ingest_url(target: str | None, auth_context: Any) -> bool:
+    if target is None:
+        return False
+    normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
+    if normalized is None:
+        return False
+    state = getattr(auth_context, "ingested_url_state", None)
+    contains = getattr(state, "contains", None)
+    return bool(callable(contains) and contains(normalized))
+
+
 def _target_matches_configured_github_repo_fetch(target: str) -> bool:
     """Exempt only bounded poller evidence endpoints from the taint gate."""
     if not _target_within_configured_github_repo(target):
@@ -5623,6 +5680,7 @@ def _egress_target_requires_taint_gate(
     if (
         normalized in approved_fetch_urls(auth_context)
         or _target_matches_configured_github_repo_fetch(target)
+        or _target_is_verbatim_ingest_url(target, auth_context)
     ):
         return False
     service = get_trusted_service_from_auth_context(auth_context)
@@ -6384,6 +6442,10 @@ class SinkGate:
         egress_target_requires_taint_gate = _egress_target_requires_taint_gate(
             tool_name, target, auth_context,
         )
+        verbatim_ingest_taint_exempt = (
+            tool_name == "fetch_url"
+            and _target_is_verbatim_ingest_url(target, auth_context)
+        )
         if (
             is_application_egress
             and egress_target_requires_taint_gate
@@ -6879,7 +6941,11 @@ class SinkGate:
             tool_name=tool_name,
             decision=OperationDecision.OPEN,
             allowed=True,
-            reason="ifc_allowed",
+            reason=(
+                "taint_gate_exempt:verbatim_ingest_url"
+                if has_untrusted_active_ingest and verbatim_ingest_taint_exempt
+                else "ifc_allowed"
+            ),
             service_principal=service,
             enforcement_enabled=enforce,
             resolved_sink_target=resolved_target,
