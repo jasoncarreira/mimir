@@ -3439,7 +3439,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 result = handler(call.execution_request)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
-            assert refusal is not None
+            if refusal is None:
+                raise RuntimeError(
+                    "ToolException did not produce a refusal result"
+                ) from exc
             return refusal
         except Exception as exc:
             _finish_tool_exception(call, capture, exc)
@@ -3487,7 +3490,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 result = await handler(call.execution_request)
         except ToolException as exc:
             refusal = _finish_tool_exception(call, capture, exc)
-            assert refusal is not None
+            if refusal is None:
+                raise RuntimeError(
+                    "ToolException did not produce a refusal result"
+                ) from exc
             return refusal
         except Exception as exc:
             _finish_tool_exception(call, capture, exc)

@@ -2120,17 +2120,24 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
     monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://allowed.example/*")
     events: list[tuple[str, dict[str, Any]]] = []
     claims: list[str] = []
+    released_claims: list[str] = []
     validation_calls = 0
     original_validate = budget_gate._validated_arguments
 
     class Claim:
         duplicate = False
 
+        def __init__(self, key: str) -> None:
+            self.key = key
+            self.released = False
+
         def release(self) -> None:
-            pass
+            if not self.released:
+                released_claims.append(self.key)
+                self.released = True
 
     def submission(request: ToolCallRequest) -> ReviewSubmission | None:
-        if request.tool_call["id"] != "review":
+        if request.tool_call["id"] not in {"review", "review_permission_denied"}:
             return None
         return ReviewSubmission(
             executable="gh", repo="owner/repo", number=17,
@@ -2138,8 +2145,9 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
         )
 
     def claim(review: ReviewSubmission) -> Claim:
-        claims.append(f"{review.repo}#{review.number}")
-        return Claim()
+        key = f"{review.repo}#{review.number}"
+        claims.append(key)
+        return Claim(key)
 
     def validate(request: ToolCallRequest) -> dict[str, Any] | None:
         nonlocal validation_calls
@@ -2157,6 +2165,24 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
     monkeypatch.setattr(
         "mimir.tools.github_review_guard.claim_review_submission", claim,
     )
+    monkeypatch.setattr(
+        budget_gate,
+        "_request_permission_sync",
+        lambda request, *_args: (
+            "operator denied parity permission"
+            if request.tool_call["id"] == "review_permission_denied"
+            else None
+        ),
+    )
+
+    async def request_permission_async(request: ToolCallRequest, *_args: Any) -> str | None:
+        if request.tool_call["id"] == "review_permission_denied":
+            return "operator denied parity permission"
+        return None
+
+    monkeypatch.setattr(
+        budget_gate, "_request_permission_async", request_permission_async,
+    )
 
     scenarios = (
         ("allow", "write_todos", {}, "success"),
@@ -2172,6 +2198,7 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
             "fetch",
         ),
         ("review", "write_todos", {}, "success"),
+        ("review_permission_denied", "write_todos", {}, "success"),
     )
 
     async def run_path(
@@ -2184,9 +2211,13 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
         turn = _ifc_turn(auth)
         events.clear()
         claims.clear()
+        released_claims.clear()
         validation_calls = 0
+        handler_calls = 0
 
         def execute(request: ToolCallRequest) -> ToolMessage:
+            nonlocal handler_calls
+            handler_calls += 1
             if scenario_name == "allow":
                 publish_protected_result((protected_result_source(
                     auth,
@@ -2237,6 +2268,8 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
             "turn_labels": turn.ifc_labels,
             "ingested_urls": auth.ingested_url_state.urls(),
             "claims": tuple(claims),
+            "released_claims": tuple(released_claims),
+            "handler_calls": handler_calls,
             "validation_calls": validation_calls,
         }
 
@@ -2253,6 +2286,19 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
             assert "https://allowed.example/verbatim-only" in sync_snapshot["ingested_urls"]
         elif scenario[0] == "review":
             assert sync_snapshot["claims"] == ("owner/repo#17",)
+        elif scenario[0] == "review_permission_denied":
+            assert sync_snapshot["handler_calls"] == 0
+            assert sync_snapshot["result"]["status"] == "error"
+            assert "operator denied parity permission" in str(
+                sync_snapshot["result"]["content"]
+            )
+            assert sync_snapshot["released_claims"] == ("owner/repo#17",)
+            denied_events = [
+                fields for kind, fields in sync_snapshot["events"]
+                if kind == "tool_call" and fields.get("denied") is True
+            ]
+            assert len(denied_events) == 1
+            assert denied_events[0]["error"] == "operator denied parity permission"
 
 
 def test_sync_protected_read_allows_compatible_harness_egress():
