@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -80,6 +81,27 @@ async def test_build_agent_reuses_graph_when_prompt_unchanged(
     assert capture.graphs == [first]
     assert len(capture.prompts) == 1
     assert "INITIAL CORE BODY" in capture.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_build_agent_renders_system_prompt_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path, monkeypatch)
+    _stub_deepagent_build(monkeypatch)
+    loop_thread = threading.get_ident()
+    render_threads: list[int] = []
+
+    def render(*, emit_health_events: bool = False) -> str:
+        render_threads.append(threading.get_ident())
+        return f"prompt:{emit_health_events}"
+
+    monkeypatch.setattr(agent, "_current_system_prompt", render)
+
+    await agent._build_agent_if_needed()
+
+    assert render_threads
+    assert all(thread_id != loop_thread for thread_id in render_threads)
 
 
 @pytest.mark.asyncio

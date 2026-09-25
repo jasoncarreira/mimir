@@ -58,6 +58,7 @@ from mimir.models import (
     TurnContext,
 )
 from mimir.saga.client import SagaStore
+from mimir.prompts import build_turn_prompt
 from mimir.turn_logger import TurnLogger
 
 
@@ -119,6 +120,160 @@ def _block(content: str) -> PromptBlock:
             source_kind="protected_prompt",
         )),
     )
+
+
+def _domain_block(content: str, domain: str) -> PromptBlock:
+    return PromptBlock(
+        content,
+        InformationFlowLabels().with_source(SourceLabel(
+            principal="operator",
+            domain=domain,
+            resource_id=f"test:{domain}",
+            bridge_instance="test",
+            sensitivity="private",
+            authorized_principals=frozenset({"operator"}),
+            source_kind="protected_prompt",
+        )),
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-order", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    auth = ctx.auth_context
+    blocks = {
+        name: _domain_block(name.upper(), name)
+        for name in (
+            "feedback", "proposals", "sessions", "usage", "upcoming",
+            "commitments", "self_state",
+        )
+    }
+
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: "CHANNEL")
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: blocks["feedback"])
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", lambda *_args: "PROPOSALS")
+    monkeypatch.setattr(
+        agent, "_assemble_session_summaries",
+        lambda **_kwargs: asyncio.sleep(0, result=blocks["sessions"]),
+    )
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *_args: (blocks["usage"], []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *_args: blocks["upcoming"])
+    monkeypatch.setattr(agent, "_assemble_commitments_block", lambda **_kwargs: blocks["commitments"])
+    monkeypatch.setattr(agent, "_assemble_self_state_block", lambda *_args, **_kwargs: blocks["self_state"])
+    monkeypatch.setattr(
+        "mimir.skill_resolver.find_skill_for_channel",
+        lambda *_args: ("ordered-skill", "SKILL"),
+    )
+
+    prompt, recent = await agent._build_turn_prompt(
+        ctx, event, saga_block="SAGA", initial_auth_context=auth,
+    )
+    expected = build_turn_prompt(
+        event,
+        recent_messages=[],
+        saga_block="SAGA",
+        recent_message_chars=agent._config.recent_message_chars,
+        resolver=agent._buffer.resolver,
+        feedback_block="FEEDBACK",
+        core_proposals_block="PROPOSALS",
+        session_summaries_block="SESSIONS",
+        usage_block="USAGE",
+        upcoming_block="UPCOMING",
+        commitments_block="COMMITMENTS",
+        self_state_block="SELF_STATE",
+        auto_skill_block=("ordered-skill", "SKILL"),
+        saga_session_id=ctx.saga_session_id,
+        channel_memory_block="CHANNEL",
+        turn_scratch_path=str(tmp_path / "scratch" / "turns" / ctx.turn_id),
+    )
+
+    assert prompt == expected
+    assert recent == []
+    assert [source.domain for source in ctx.ifc_labels.sources] == [
+        "channel", "channel_memory", "feedback", "proposals", "sessions",
+        "usage", "upcoming", "commitments", "self_state", "saga", "skills",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-overlap", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    delay = 0.1
+
+    def slow_sync(*_args, **_kwargs):
+        time.sleep(delay)
+        return None
+
+    async def slow_async(**_kwargs):
+        await asyncio.sleep(delay)
+        return None
+
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", slow_sync)
+    monkeypatch.setattr("mimir.proposals.render_open_proposals_block", slow_sync)
+    monkeypatch.setattr(agent, "_assemble_session_summaries", slow_async)
+    monkeypatch.setattr(agent, "_assemble_usage_block", lambda *_args: (slow_sync(), []))
+    monkeypatch.setattr(agent, "_assemble_upcoming_block", lambda *_args: None)
+    monkeypatch.setattr(agent, "_assemble_commitments_block", slow_sync)
+    monkeypatch.setattr(agent, "_assemble_self_state_block", slow_sync)
+    monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", slow_sync)
+
+    started = time.monotonic()
+    await agent._build_turn_prompt(ctx, event, saga_block=None)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < delay * 3, f"independent loaders took {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_parallel_loaders_keep_existing_exception_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _make_agent(tmp_path)
+    agent._config.feedback_limit_per_polarity = 1
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-errors", content="hello",
+        author="operator", source="web",
+        extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
+    )
+    ctx = _make_ctx(event)
+    ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
+
+    def fail(message: str):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: fail("feedback"))
+    with pytest.raises(RuntimeError, match="feedback"):
+        await agent._build_turn_prompt(ctx, event, saga_block=None)
+
+    monkeypatch.setattr(agent._feedback, "recent_prompt_block", lambda *_args: None)
+    monkeypatch.setattr(
+        "mimir.proposals.render_open_proposals_block",
+        lambda *_args: fail("proposal"),
+    )
+    prompt, _ = await agent._build_turn_prompt(ctx, event, saga_block=None)
+    assert "## Open change proposals" not in prompt
 
 
 def _session_labels(channel_id: str) -> InformationFlowLabels:
@@ -2014,7 +2169,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("direct_block", "mimir/agent.py", "Agent._assemble_session_summaries", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_upcoming_block", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._assemble_usage_block", "PromptBlock"): 1,
-        ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 5,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt", "PromptBlock"): 4,
+            ("direct_block", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "PromptBlock"): 1,
         ("direct_block", "mimir/agent.py", "Agent._select_recent_activity", "PromptBlock"): 1,
         ("direct_block", "mimir/feedback/__init__.py", "FeedbackLog.recent_prompt_block", "PromptBlock"): 1,
         ("feedback_loader", "mimir/agent.py", "Agent._build_turn_prompt", "self._feedback.recent_prompt_block"): 1,
@@ -2028,7 +2184,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/agent.py", "Agent._assemble_session_summaries", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_upcoming_block", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._assemble_usage_block", "_prompt_source_labels"): 1,
-        ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 6,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt", "_prompt_source_labels"): 5,
+            ("producer", "mimir/agent.py", "Agent._build_turn_prompt.load_open_proposals", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "Agent._select_recent_activity", "_prompt_source_labels"): 1,
         ("producer", "mimir/agent.py", "_auto_recall_source_labels", "SourceLabel"): 1,
         ("producer", "mimir/agent.py", "_initialize_ifc_labels", "SourceLabel"): 1,
