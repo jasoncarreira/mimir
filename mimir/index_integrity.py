@@ -239,7 +239,12 @@ def _check_fts5_row_count_match(
 
 
 def _check_embedding_dim_uniform(
-    db_path: Path, db_name: str, table: str, column: str,
+    db_path: Path,
+    db_name: str,
+    table: str,
+    column: str,
+    *,
+    live_atoms_only: bool = False,
 ) -> IntegrityCheck:
     """All vectors in ``<table>.<column>`` should have the same byte
     length. A mix means the embedder model was changed without a
@@ -251,10 +256,27 @@ def _check_embedding_dim_uniform(
     except sqlite3.Error as exc:
         return IntegrityCheck(check_name, db_name, False, f"can't open db: {exc}")
     try:
-        rows = conn.execute(
-            f"SELECT length({column}) AS n, count(*) AS c FROM {table} "
-            f"WHERE {column} IS NOT NULL GROUP BY n ORDER BY c DESC LIMIT 5"
-        ).fetchall()
+        if live_atoms_only:
+            rows = conn.execute(
+                f"SELECT length(e.{column}) AS n, count(*) AS c FROM {table} e "
+                "JOIN atoms a ON a.id = e.atom_id "
+                f"WHERE a.tombstoned = 0 AND e.{column} IS NOT NULL "
+                "GROUP BY n ORDER BY c DESC LIMIT 5"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT length({column}) AS n, count(*) AS c FROM {table} "
+                f"WHERE {column} IS NOT NULL GROUP BY n ORDER BY c DESC LIMIT 5"
+            ).fetchall()
+        tombstoned_mismatches = 0
+        if live_atoms_only and len(rows) == 1:
+            tombstoned_mismatches = conn.execute(
+                f"SELECT count(*) FROM {table} e "
+                "JOIN atoms a ON a.id = e.atom_id "
+                f"WHERE a.tombstoned != 0 AND e.{column} IS NOT NULL "
+                f"AND length(e.{column}) != ?",
+                (rows[0][0],),
+            ).fetchone()[0]
     except sqlite3.Error as exc:
         conn.close()
         return IntegrityCheck(check_name, db_name, False, f"dim query failed: {exc}")
@@ -264,16 +286,29 @@ def _check_embedding_dim_uniform(
         except sqlite3.Error:
             pass
     if not rows:
+        if live_atoms_only:
+            return IntegrityCheck(
+                check_name, db_name, True, "no live embeddings (empty live index)",
+            )
         return IntegrityCheck(
             check_name, db_name, True, "no embeddings (empty index)",
         )
     if len(rows) == 1:
         n_bytes, n_rows = rows[0]
+        if live_atoms_only:
+            detail = f"{n_rows} live embeddings, uniform {n_bytes} bytes"
+            if tombstoned_mismatches:
+                detail += (
+                    f"; {tombstoned_mismatches} tombstoned rows carry other dims"
+                )
+            return IntegrityCheck(check_name, db_name, True, detail)
         return IntegrityCheck(
             check_name, db_name, True,
             f"{n_rows} embeddings, uniform {n_bytes} bytes",
         )
     distribution = ", ".join(f"{n_bytes}B×{n_rows}" for n_bytes, n_rows in rows)
+    if live_atoms_only:
+        distribution += " among live embeddings"
     return IntegrityCheck(
         check_name, db_name, False,
         f"mixed dims (model swap?): {distribution}",
@@ -318,7 +353,9 @@ def check_saga(home: Path) -> list[IntegrityCheck]:
         _check_foreign_keys(db_path, "saga"),
         _check_fts5_integrity(db_path, "saga", "atoms_fts"),
         _check_fts5_row_count_match(db_path, "saga", "atoms", "atoms_fts"),
-        _check_embedding_dim_uniform(db_path, "saga", "embeddings", "vec"),
+        _check_embedding_dim_uniform(
+            db_path, "saga", "embeddings", "vec", live_atoms_only=True,
+        ),
         _check_embedding_dim_uniform(db_path, "saga", "sessions", "embedding"),
     ]
 

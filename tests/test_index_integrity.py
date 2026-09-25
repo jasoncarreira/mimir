@@ -256,23 +256,15 @@ def test_mixed_embedding_dims_detected(tmp_path: Path):
     assert "4096" in dims.detail  # 1024 * 4
 
 
-@pytest.mark.parametrize(
-    ("table", "column"),
-    [("embeddings", "vec"), ("sessions", "embedding")],
-)
-def test_saga_mixed_embedding_dims_detected(
-    tmp_path: Path, table: str, column: str
-) -> None:
+def test_saga_session_mixed_embedding_dims_detected(tmp_path: Path) -> None:
     db_path = _init_saga(tmp_path)
     conn = sqlite3.connect(str(db_path))
     conn.execute(
-        f"INSERT INTO {table} ({'atom_id' if table == 'embeddings' else 'id'}, {column}) "
-        "VALUES ('one', ?)",
+        "INSERT INTO sessions (id, embedding) VALUES ('one', ?)",
         (b"\0" * 16,),
     )
     conn.execute(
-        f"INSERT INTO {table} ({'atom_id' if table == 'embeddings' else 'id'}, {column}) "
-        "VALUES ('two', ?)",
+        "INSERT INTO sessions (id, embedding) VALUES ('two', ?)",
         (b"\0" * 32,),
     )
     conn.commit()
@@ -280,10 +272,86 @@ def test_saga_mixed_embedding_dims_detected(
 
     dims = next(
         check for check in check_saga(tmp_path)
-        if check.name == f"embedding_dim_uniform_{table}"
+        if check.name == "embedding_dim_uniform_sessions"
     )
     assert not dims.ok
     assert "mixed dims" in dims.detail
+
+
+def test_saga_tombstoned_embedding_mismatches_are_reported_but_pass(
+    tmp_path: Path,
+) -> None:
+    db_path = _init_saga(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE atoms SET tombstoned = 1 WHERE id = 'a2'")
+    conn.execute(
+        "INSERT INTO atoms (id, content, content_hash, stream, memory_type, "
+        "arousal, valence, encoding_confidence, source_type, tombstoned, "
+        "created_at) VALUES ('a3', 'third atom', 'h3', 's', 'raw', 0.0, "
+        "0.0, 1.0, 'x', 1, '2026-05-23')",
+    )
+    conn.executemany(
+        "INSERT INTO embeddings (atom_id, vec) VALUES (?, ?)",
+        [
+            ("a1", b"\0" * 4096),
+            ("a2", b"\0" * 1536),
+            ("a3", b"\0" * 6144),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    dims = next(
+        check for check in check_saga(tmp_path)
+        if check.name == "embedding_dim_uniform_embeddings"
+    )
+    assert dims.ok
+    assert dims.detail == (
+        "1 live embeddings, uniform 4096 bytes; "
+        "2 tombstoned rows carry other dims"
+    )
+
+
+def test_saga_mixed_live_embedding_dims_fail(tmp_path: Path) -> None:
+    db_path = _init_saga(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        "INSERT INTO embeddings (atom_id, vec) VALUES (?, ?)",
+        [("a1", b"\0" * 1536), ("a2", b"\0" * 4096)],
+    )
+    conn.commit()
+    conn.close()
+
+    dims = next(
+        check for check in check_saga(tmp_path)
+        if check.name == "embedding_dim_uniform_embeddings"
+    )
+    assert not dims.ok
+    assert "mixed dims" in dims.detail
+    assert "1536B×1" in dims.detail
+    assert "4096B×1" in dims.detail
+    assert "live embeddings" in dims.detail
+
+
+def test_saga_only_tombstoned_embeddings_pass_as_empty_live_index(
+    tmp_path: Path,
+) -> None:
+    db_path = _init_saga(tmp_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("UPDATE atoms SET tombstoned = 1")
+    conn.executemany(
+        "INSERT INTO embeddings (atom_id, vec) VALUES (?, ?)",
+        [("a1", b"\0" * 1536), ("a2", b"\0" * 6144)],
+    )
+    conn.commit()
+    conn.close()
+
+    dims = next(
+        check for check in check_saga(tmp_path)
+        if check.name == "embedding_dim_uniform_embeddings"
+    )
+    assert dims.ok
+    assert dims.detail == "no live embeddings (empty live index)"
 
 
 def test_empty_index_doesnt_trip_dim_check(tmp_path: Path):
