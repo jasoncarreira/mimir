@@ -49,6 +49,92 @@ class FailingResolver:
         raise RuntimeError("lookup unavailable")
 
 
+def test_inventory_reports_drift_without_mutating_or_smoking(fresh_poller):
+    pin = fresh_poller.ToolPin(
+        "codex",
+        "coding-cli",
+        "0.139.0",
+        "codex --version",
+        source="npm",
+        package="@openai/codex",
+    )
+    resolver = FakeNpmResolver("0.140.0", fresh_poller)
+
+    inventory = fresh_poller.inventory_tool_pins([pin], {"npm": resolver})
+
+    assert resolver.calls == [pin]
+    assert inventory.diagnostics == ()
+    assert inventory.drift == (
+        fresh_poller.ToolPinDrift(
+            pin=pin,
+            current="0.140.0",
+            changelog="fake changelog",
+            risk="fake risk",
+        ),
+    )
+    assert inventory.drift[0].dedupe_key == "worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0"
+
+
+def test_inventory_skips_matching_manual_unknown_and_failed_resolvers(fresh_poller):
+    matching = fresh_poller.ToolPin("mermaid", "renderer", "11.16.0", "mmdc --version", source="npm")
+    manual = fresh_poller.ToolPin("bespoke", "coding-cli", "local", "bespoke --version", source="manual")
+    unknown = fresh_poller.ToolPin("other", "coding-cli", "1.0.0", "other --version", source="github")
+    failing = fresh_poller.ToolPin("chainlink", "issue-cli", "1.6.0", "chainlink --version", source="cargo")
+
+    inventory = fresh_poller.inventory_tool_pins(
+        [matching, manual, unknown, failing],
+        {"npm": FakeNpmResolver("11.16.0", fresh_poller), "cargo": FailingResolver()},
+    )
+
+    assert inventory.drift == ()
+    assert [(diag.name, diag.reason) for diag in inventory.diagnostics] == [
+        ("bespoke", "manual pin has no upstream resolver"),
+        ("other", "no resolver for source/category: github"),
+        ("chainlink", "resolver failed: lookup unavailable"),
+    ]
+
+
+def test_rendered_bump_issue_is_worklink_ready(fresh_poller):
+    drift = fresh_poller.ToolPinDrift(
+        pin=fresh_poller.ToolPin(
+            "codex",
+            "coding-cli",
+            "0.139.0",
+            "codex --version && uv run pytest -q tests/test_worklink_backends.py",
+            source="npm",
+            package="@openai/codex",
+        ),
+        current="0.140.0",
+        changelog="- release notes here",
+        risk="low risk",
+    )
+
+    assert fresh_poller.render_bump_issue_title(drift) == "Bump Worklink codex pin to 0.140.0"
+    body = fresh_poller.render_bump_issue_body(drift)
+
+    assert "Dedupe-Key: worklink-tool-pin:coding-cli:codex:0.139.0->0.140.0" in body
+    assert "- release notes here" in body
+    assert "low risk" in body
+    assert "Acceptance criteria:" in body
+    assert "Review criteria:" in body
+    assert "Worklink notes:" in body
+    assert "- Suggested test command: codex --version && uv run pytest -q tests/test_worklink_backends.py" in body
+
+
+def test_poller_home_requires_mimir_home(fresh_poller, monkeypatch, tmp_path, capsys):
+    assert not hasattr(fresh_poller, "DEFAULT_HOME")
+
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    assert fresh_poller._home() is None
+    assert fresh_poller.main() == 0
+    emitted = _events(capsys)[0]
+    assert emitted["signal"] == "worklink_tool_pins_misconfigured"
+    assert emitted["reason"] == "MIMIR_HOME unset"
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert fresh_poller._home() == tmp_path
+
+
 def test_missing_config_exits_zero_silently(fresh_poller, capsys):
     assert fresh_poller.main() == 0
     assert _events(capsys) == []
@@ -314,6 +400,25 @@ def test_valid_number_is_reused_when_id_field_is_malformed(
     assert len(calls) == 1
     event = _events(capsys)[0]
     assert event["issue_id"] == 902
+
+
+def test_create_failure_raises(fresh_poller):
+    calls: list[list[str]] = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if args[:3] == ["chainlink", "issue", "search"]:
+            return subprocess.CompletedProcess(args, 0, "[]", "")
+        return subprocess.CompletedProcess(args, 1, "", "boom")
+
+    drift = fresh_poller.ToolPinDrift(
+        pin=fresh_poller.ToolPin("codex", "coding-cli", "0.139.0", "codex --version", source="npm"),
+        current="0.140.0",
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        fresh_poller.ChainlinkBumpFiler(runner=runner).file(drift)
+    assert len(calls) == 2
 
 
 def test_lookup_failure_is_diagnostic_not_emit_or_nonzero(fresh_poller, monkeypatch, capsys):
