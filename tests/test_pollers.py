@@ -38,6 +38,7 @@ import yaml
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
+from mimir.poller_hooks import POLLER_HOOK_PROFILES, PollerHooks
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
     POLLER_CIRCUIT_BREAKER_THRESHOLD,
@@ -219,6 +220,45 @@ def test_discover_parses_valid_pollers_json(tmp_path: Path):
     assert p.trust_source == "external"
     assert p.skill_dir == skill_dir
     assert p.channel_id() == "poller:github-activity"
+
+
+@pytest.mark.parametrize(
+    ("skill", "name", "profile"),
+    [
+        ("github-poller", "renamed-github-poller", "github"),
+        ("chainlink-orchestrator", "renamed-worklink-poller", "worklink"),
+    ],
+)
+def test_declared_hooks_are_selected_independently_of_poller_name(
+    tmp_path: Path, skill: str, name: str, profile: str,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / skill, [{
+        "name": name,
+        "command": "true",
+        "cron": "* * * * *",
+        "hooks": profile,
+    }])
+
+    [poller] = discover_pollers(skills)
+
+    assert poller.name == name
+    assert poller.hooks is POLLER_HOOK_PROFILES[profile].hooks
+
+
+def test_hook_profile_requires_its_shipped_skill(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "impostor", [{
+        "name": "not-reserved",
+        "command": "true",
+        "cron": "* * * * *",
+        "hooks": "worklink",
+    }])
+
+    assert discover_pollers(skills) == []
+    assert "may only be declared by the 'chainlink-orchestrator' skill" in caplog.text
 
 
 def test_discover_treats_null_string_fields_as_missing(tmp_path: Path):
@@ -3426,6 +3466,7 @@ async def test_run_github_poller_logs_stale_recovery_drop(
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
+        hooks=POLLER_HOOK_PROFILES["github"].hooks,
     )
     source_id = "poller:github-activity:stale"
     prior = AgentEvent(
@@ -3490,6 +3531,7 @@ print(json.dumps({
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
+        hooks=POLLER_HOOK_PROFILES["github"].hooks,
     )
     prior = AgentEvent(
         trigger="poller",
@@ -4645,11 +4687,22 @@ print(json.dumps({"poller": "x", "prompt": "repair", "delivery_key": "ci:key"}))
 
 
 @pytest.fixture
-def worklink_receipts(home: Path):
+def worklink_receipts(home: Path, monkeypatch: pytest.MonkeyPatch):
     from mimir.worklink import dispatch_failures as failures
 
+    shipped = (
+        Path(__file__).parents[1]
+        / "mimir/optional-skills/chainlink-orchestrator/pollers.json"
+    )
+    skill_dir = home / "skills" / "chainlink-orchestrator"
+    skill_dir.mkdir(parents=True)
+    shutil.copyfile(shipped, skill_dir / "pollers.json")
+    monkeypatch.setenv("WORKLINK_REPO", str(home))
+    [cfg] = discover_pollers(
+        home / "skills", state_root=home / "state" / "pollers",
+    )
+    cfg = replace(cfg, command="true", skill_dir=home)
     state = failures.dispatch_failure_state_dir(home)
-    cfg = PollerConfig("worklink-ready-queue", "true", "* * * * *", {}, home, state)
 
     def record(issue=42, error="failed"):
         entry = failures.record_failure(
@@ -4675,15 +4728,57 @@ async def test_worklink_receipt_pruning_requires_clean_exit(home: Path, worklink
     assert receipt.exists() is bool(exit_code)
 
 
-@pytest.mark.parametrize("name", ["github-activity", "other"])
-def test_receipt_pruning_is_worklink_only(home: Path, worklink_receipts, name):
+def test_receipt_pruning_hook_survives_poller_rename(home: Path, worklink_receipts):
     failures, state, cfg, record = worklink_receipts
     entry, _, receipt = record()
     failures.mark_failure_notified(state, 42, entry["signature"], entry["occurrence_id"])
-    _prune_delivery_receipts(replace(cfg, name=name), home)
-    assert receipt.exists()
-    _prune_delivery_receipts(cfg, home)
+    _prune_delivery_receipts(replace(cfg, name="renamed-ready-queue"), home)
     assert not receipt.exists()
+
+
+def test_third_poller_receipt_liveness_hook_prunes_stale_receipts(tmp_path: Path):
+    persist_dir = tmp_path / "state" / "pollers" / "third"
+    stale = persist_dir / ".delivery-receipts" / hashlib.sha256(b"stale").hexdigest()
+    live = persist_dir / ".delivery-receipts" / hashlib.sha256(b"live").hexdigest()
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    live.touch()
+
+    def receipt_liveness(persist, home, prune_stale):
+        assert persist == persist_dir
+        assert home == tmp_path
+        prune_stale({live.name})
+
+    cfg = PollerConfig(
+        "third", "true", "* * * * *", {}, tmp_path,
+        persist_dir=persist_dir,
+        hooks=PollerHooks(receipt_liveness=receipt_liveness),
+    )
+
+    _prune_delivery_receipts(cfg, tmp_path)
+
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_invalid_receipt_liveness_result_fails_closed(tmp_path: Path):
+    persist_dir = tmp_path / "state"
+    receipt = persist_dir / ".delivery-receipts" / hashlib.sha256(b"stale").hexdigest()
+    receipt.parent.mkdir(parents=True)
+    receipt.touch()
+
+    def receipt_liveness(_persist, _home, prune_stale):
+        prune_stale({"not-a-receipt-digest"})
+
+    cfg = PollerConfig(
+        "third", "true", "* * * * *", {}, tmp_path,
+        persist_dir=persist_dir,
+        hooks=PollerHooks(receipt_liveness=receipt_liveness),
+    )
+
+    _prune_delivery_receipts(cfg, tmp_path)
+
+    assert receipt.exists()
 
 
 @pytest.mark.asyncio
