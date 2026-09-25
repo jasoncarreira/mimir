@@ -921,6 +921,40 @@ class EgressSessionState:
 
 
 @dataclass
+class IngestedURLState:
+    """Turn-local exact URLs observed in untrusted active ingest."""
+
+    MAX_URLS: int = field(default=1000, init=False, repr=False)
+    _urls: set[str] = field(default_factory=set, repr=False, compare=False)
+    _cap_logged: bool = field(default=False, repr=False, compare=False)
+    _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def add(self, url: str) -> None:
+        cap_reached = False
+        with self._lock:
+            if url in self._urls:
+                return
+            if len(self._urls) >= self.MAX_URLS:
+                if not self._cap_logged:
+                    self._cap_logged = True
+                    cap_reached = True
+            else:
+                self._urls.add(url)
+        if cap_reached:
+            from .event_logger import log_event_sync
+
+            log_event_sync("ingested_url_cap_reached", cap=self.MAX_URLS)
+
+    def contains(self, url: str) -> bool:
+        with self._lock:
+            return url in self._urls
+
+    def urls(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._urls)
+
+
+@dataclass
 class AgentEvent:
     """Inbound event from a bridge, scheduler tick, or HTTP injection.
 
@@ -1554,6 +1588,9 @@ class AuthContext(_AuthContextAuthoritySlot):
     # making identity, roles, or any authority field mutable.
     ifc_state: InformationFlowState = field(
         default_factory=InformationFlowState, repr=False, compare=False,
+    )
+    ingested_url_state: IngestedURLState = field(
+        default_factory=IngestedURLState, repr=False, compare=False,
     )
     egress_state: EgressSessionState = field(
         default_factory=EgressSessionState, repr=False, compare=False,

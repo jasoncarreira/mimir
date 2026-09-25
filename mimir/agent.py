@@ -86,6 +86,7 @@ from .models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    IngestedURLState,
     Integrity,
     IntegrityEffect,
     PromptBlock,
@@ -101,6 +102,7 @@ from .access_control import (
     create_auth_context,
     get_event_service_principal,
     get_trusted_service_from_auth_context,
+    record_ingested_urls,
 )
 from .prompts import ENFORCEMENT_GUIDANCE, build_system_prompt, build_turn_prompt
 from . import prompt_sources
@@ -567,7 +569,9 @@ def _create_turn_auth_context(
             enforcement_enabled=enforce,
             ifc_labels=ifc_labels,
             ifc_state=InformationFlowState(labels=ifc_labels),
+            ingested_url_state=IngestedURLState(),
         )
+    _seed_trigger_ingested_urls(event, ifc_labels, context)
     if server_discovered_pr_scope_store is None:
         return context
     registry = context.repo_pr_scope_registry
@@ -581,6 +585,27 @@ def _create_turn_auth_context(
         context,
         server_discovered_pr_scope_store=server_discovered_pr_scope_store,
     )
+
+
+def _seed_trigger_ingested_urls(
+    event: AgentEvent, labels: InformationFlowLabels, auth_context: AuthContext,
+) -> None:
+    """Seed URLs from trigger text only when that text is untrusted active ingest."""
+    inherited_sources = (
+        event.ifc_labels.sources
+        if isinstance(event.ifc_labels, InformationFlowLabels)
+        else ()
+    )
+    trigger_labels = InformationFlowLabels(sources=tuple(
+        source for source in labels.sources if source not in inherited_sources
+    ))
+    if (
+        event.trigger == "poller"
+        and isinstance(event.ifc_labels, InformationFlowLabels)
+        and event.ifc_labels.has_untrusted_active_ingest
+    ):
+        trigger_labels = event.ifc_labels
+    record_ingested_urls(auth_context, event.content, trigger_labels)
 
 
 def _is_private_attachment(filename: str) -> bool:
@@ -1908,6 +1933,7 @@ class Agent:
                 bound_auth_context,
                 ifc_labels=initial_ifc_labels,
                 ifc_state=InformationFlowState(labels=initial_ifc_labels),
+                ingested_url_state=IngestedURLState(),
                 saga_session_id=saga_session_id,
             )
         else:
@@ -1921,6 +1947,8 @@ class Agent:
                 cross_platform_pull=self._config.cross_platform_pull,
                 server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
             )
+        if explicit_session_binding:
+            _seed_trigger_ingested_urls(event, initial_ifc_labels, initial_auth_context)
         emitter = TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,

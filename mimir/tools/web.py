@@ -32,7 +32,7 @@ import socket
 from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import (
@@ -65,6 +65,9 @@ _home: Path | None = None
 _authorized_fetch_urls: ContextVar[frozenset[str] | None] = ContextVar(
     "mimir_authorized_fetch_urls", default=None,
 )
+_fetched_body_recorder: ContextVar[Callable[[str], None] | None] = ContextVar(
+    "mimir_fetched_body_recorder", default=None,
+)
 
 
 def set_home(home: Path | None) -> None:
@@ -80,6 +83,21 @@ def begin_authorized_fetch(urls: frozenset[str]) -> Token:
 
 def end_authorized_fetch(token: Token) -> None:
     _authorized_fetch_urls.reset(token)
+
+
+def begin_fetched_body_recording(recorder: Callable[[str], None] | None) -> Token:
+    """Bind the server-owned callback for one authorized fetch_url execution."""
+    return _fetched_body_recorder.set(recorder)
+
+
+def end_fetched_body_recording(token: Token) -> None:
+    _fetched_body_recorder.reset(token)
+
+
+def _record_fetched_body(body: bytes) -> None:
+    recorder = _fetched_body_recorder.get()
+    if recorder is not None:
+        recorder(body.decode("utf-8", errors="replace"))
 
 
 def _fetch_cache_dir() -> Path:
@@ -705,6 +723,15 @@ async def fetch_url(
         body_path.unlink(missing_ok=True)
         return "fetch_url failed: could not write downloaded content."
 
+    try:
+        downloaded_body = body_path.read_bytes()
+    except OSError:
+        body_path.unlink(missing_ok=True)
+        return "fetch_url failed: could not read downloaded content."
+    if hashlib.sha256(downloaded_body).hexdigest() != fetched["sha256"]:
+        body_path.unlink(missing_ok=True)
+        return "fetch_url failed: downloaded content changed before verification."
+
     if _home is None:
         return "fetch_url failed: home dir not configured."
 
@@ -730,6 +757,7 @@ async def fetch_url(
         json.dumps(meta_payload, ensure_ascii=True, sort_keys=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _record_fetched_body(downloaded_body)
     return yaml.safe_dump(meta_payload, sort_keys=False)
 
 

@@ -32,6 +32,7 @@ from mimir.access_control import (
     ToolRegistry,
     approve_live_declassification,
     audit_declassification,
+    build_trigger_service_principal,
     create_auth_context,
     fetch_url_is_approved,
     get_service_principal,
@@ -42,6 +43,7 @@ from mimir.access_control import (
     OperationDecision,
     ProtectedResultProvenance,
     protected_result_source,
+    record_ingested_urls,
     saga_mutation_taint_refusal,
 )
 from mimir.agent import (
@@ -53,6 +55,7 @@ from mimir.agent import (
     _prompt_source_labels,
     _propagate_ifc_labels,
     _recent_message_is_self_authored,
+    _seed_trigger_ingested_urls,
 )
 from mimir.history import Message, MessageBuffer
 from mimir.identities import IdentityResolver
@@ -66,6 +69,7 @@ from mimir.models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    IngestedURLState,
     Integrity,
     IntegrityEffect,
     RepoPRActionScope,
@@ -2571,6 +2575,166 @@ def _trigger_service_context(
         integrity_effect=integrity_effect,
     ))
     return auth, labels
+
+
+def _research_fetch_context() -> tuple[AuthContext, InformationFlowLabels]:
+    service = build_trigger_service_principal(
+        canonical="poller:research-test",
+        trigger="poller",
+        profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("fetch_url",),
+        approved_urls=("https://arxiv.org/",),
+        creation_path="test",
+    )
+    return _trigger_service_context(service, integrity="untrusted")
+
+
+def test_tainted_fetch_admits_only_exact_verbatim_ingest_url() -> None:
+    auth, labels = _research_fetch_context()
+    target = "https://arxiv.org/abs/2609.30227"
+    record_ingested_urls(auth, f"Paper: {target}", labels)
+
+    admitted = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+    assert (admitted.allowed, admitted.reason) == (
+        True, "taint_gate_exempt:verbatim_ingest_url",
+    )
+
+    for near_miss in (
+        "https://arxiv.org/abs/2609.30228",
+        f"{target}?x=1",
+        f"{target}/extra",
+    ):
+        refused = SinkGate.check_sink_flow(
+            "fetch_url", near_miss, labels, auth, enforce=True,
+        )
+        assert (refused.allowed, refused.reason) == (
+            False, "ifc_label_blocked:network",
+        )
+
+
+def test_verbatim_ingest_url_does_not_bypass_destination_approval() -> None:
+    auth, labels = _research_fetch_context()
+    target = "https://papers.example/private"
+    record_ingested_urls(auth, target, labels)
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert (decision.allowed, decision.reason) == (
+        False, "egress_destination_not_approved",
+    )
+
+
+def test_trusted_result_url_does_not_gain_taint_exemption() -> None:
+    auth, labels = _research_fetch_context()
+    target = "https://arxiv.org/abs/2609.30227"
+    trusted = InformationFlowLabels().with_source(replace(
+        labels.sources[0], integrity=Integrity.TRUSTED,
+    ))
+    record_ingested_urls(auth, target, trusted)
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+
+    assert (decision.allowed, decision.reason) == (
+        False, "ifc_label_blocked:network",
+    )
+
+
+def test_untrusted_poller_trigger_seeds_urls_and_new_turn_is_empty() -> None:
+    auth, labels = _research_fetch_context()
+    target = "https://arxiv.org/abs/2609.30227"
+    event = AgentEvent(
+        trigger="poller", channel_id=auth.channel_id, content=f"Read {target}",
+        ifc_labels=labels,
+    )
+    _seed_trigger_ingested_urls(event, labels, auth)
+
+    admitted = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+    assert admitted.reason == "taint_gate_exempt:verbatim_ingest_url"
+    assert auth.egress_state.approved_urls() == frozenset()
+
+    next_auth = replace(auth, ingested_url_state=IngestedURLState())
+    next_labels = labels
+    assert next_auth.egress_state is auth.egress_state
+    refused = SinkGate.check_sink_flow(
+        "fetch_url", target, next_labels, next_auth, enforce=True,
+    )
+    assert (refused.allowed, refused.reason) == (
+        False, "ifc_label_blocked:network",
+    )
+
+
+def test_untainted_scoped_fetch_behavior_is_unchanged() -> None:
+    auth, _tainted = _research_fetch_context()
+    _unused_auth, clean = _trigger_service_context(
+        auth.service_authority, integrity="trusted",
+    )
+    target = "https://arxiv.org/abs/model-selected"
+
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, clean, replace(auth, ifc_labels=clean), enforce=True,
+    )
+
+    assert (decision.allowed, decision.reason) == (True, "ifc_allowed")
+
+
+def test_ingested_url_extraction_normalizes_and_rejects_unsafe_shapes() -> None:
+    auth, labels = _research_fetch_context()
+    record_ingested_urls(
+        auth,
+        " ".join((
+            "https://arxiv.org/abs/1#section).",
+            "`https://arxiv.org/pdf/2.pdf`",
+            "http://arxiv.org/abs/3",
+            "https://user@arxiv.org/abs/4",
+            "https://arxiv.org:443/abs/5",
+        )),
+        labels,
+    )
+
+    assert auth.ingested_url_state.urls() == frozenset({
+        "https://arxiv.org/abs/1",
+        "https://arxiv.org/pdf/2.pdf",
+    })
+
+
+def test_ingested_url_cap_records_one_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    auth, labels = _research_fetch_context()
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda event_type, **payload: events.append((event_type, payload)),
+    )
+    text = " ".join(
+        f"https://arxiv.org/abs/{index}" for index in range(1002)
+    )
+
+    record_ingested_urls(auth, text, labels)
+
+    assert len(auth.ingested_url_state.urls()) == 1000
+    assert events == [("ingested_url_cap_reached", {"cap": 1000})]
+
+
+def test_fetch_redirect_pin_includes_only_approved_ingested_urls() -> None:
+    from mimir.tools.budget_gate import _authorized_fetch_urls_for_tool
+
+    auth, labels = _research_fetch_context()
+    admitted = "https://arxiv.org/abs/2609.30227"
+    unapproved = "https://papers.example/private"
+    record_ingested_urls(auth, f"{admitted} {unapproved}", labels)
+
+    pinned = _authorized_fetch_urls_for_tool("fetch_url", auth, admitted)
+
+    assert admitted in pinned
+    assert unapproved not in pinned
 
 
 @pytest.mark.parametrize(

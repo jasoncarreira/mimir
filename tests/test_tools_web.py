@@ -239,6 +239,80 @@ async def test_fetch_url_writes_body_and_meta(
 
 
 @pytest.mark.asyncio
+async def test_fetch_url_records_downloaded_body_before_cache_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://arxiv.org/abs/2609.30227"
+    body = f"paper {target}".encode()
+    recorded: list[str] = []
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(body))
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        await _drive_fetch_url(tmp_path, body)
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert recorded == [body.decode()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_changed_download_is_rejected_without_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    downloaded = b"remote body"
+    swapped = b"https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+
+    def swap_after_download(**kwargs: Any) -> dict[str, Any]:
+        target_path = kwargs["target_path"]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(swapped)
+        return {
+            "status": 200,
+            "content_type": "text/plain",
+            "bytes": len(downloaded),
+            "sha256": hashlib.sha256(downloaded).hexdigest(),
+        }
+
+    monkeypatch.setattr(web_tools_mod, "_download_url_bytes", swap_after_download)
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    recorded: list[str] = []
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        web_tools_mod.set_home(tmp_path)
+        (tmp_path / "attachments").mkdir(exist_ok=True)
+        result = await web_tools_mod.fetch_url.ainvoke({
+            "url": "https://example.com/foo.html",
+        })
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert result == "fetch_url failed: downloaded content changed before verification."
+    assert recorded == []
+    assert not list((tmp_path / "attachments" / "fetch-cache").glob("*"))
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_cache_hit_does_not_record_model_writable_cache_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = b"remote body"
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(original))
+    fresh = await _drive_fetch_url(tmp_path, original)
+    body_path = tmp_path / fresh["file_path"].lstrip("/")
+    body_path.write_text("https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123")
+
+    recorded: list[str] = []
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        cached = await _drive_fetch_url(tmp_path, b"unused")
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert cached["cached"] is True
+    assert recorded == []
+
+
+@pytest.mark.asyncio
 async def test_fetch_url_extracts_pdf_without_changing_cached_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -825,6 +899,27 @@ def test_fetch_url_rejects_public_redirect_not_on_exact_url_allowlist(
                 web_tools_mod.Request("https://example.com/start"), None, 302, "Found", {},
                 "https://example.com/other",
             )
+    finally:
+        web_tools_mod.end_authorized_fetch(token)
+
+
+def test_fetch_url_allows_public_redirect_on_exact_url_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    monkeypatch.setattr(
+        web_tools_mod.HTTPRedirectHandler,
+        "redirect_request",
+        lambda _self, _req, _fp, _code, _msg, _headers, newurl: newurl,
+    )
+    handler = web_tools_mod._SSRFCheckingRedirectHandler()
+    destination = "https://arxiv.org/pdf/2609.30227"
+    token = web_tools_mod.begin_authorized_fetch(frozenset({destination}))
+    try:
+        assert handler.redirect_request(
+            web_tools_mod.Request("https://arxiv.org/abs/2609.30227"),
+            None, 302, "Found", {}, destination,
+        ) == destination
     finally:
         web_tools_mod.end_authorized_fetch(token)
 

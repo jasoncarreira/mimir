@@ -54,6 +54,7 @@ from langchain.agents.middleware import AgentMiddleware, ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
 from langgraph.types import Command
+import yaml
 
 from ..models import AuthContext
 from ..redaction import redact_text
@@ -74,8 +75,10 @@ from ..access_control import (
     configured_project_test_cwd,
     get_tool_registry,
     get_trusted_service_from_auth_context,
+    ingested_fetch_urls,
     normalize_sink_destination,
     parse_service_shell_argv_with_diagnostics,
+    record_external_ingested_urls,
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
@@ -617,6 +620,10 @@ def _authorized_fetch_urls_for_tool(
 ) -> frozenset[str] | None:
     if tool_name == "fetch_url":
         approved = set(approved_fetch_urls(auth_context))
+        approved.update(
+            url for url in ingested_fetch_urls(auth_context)
+            if fetch_url_is_approved(url, auth_context)
+        )
         if target is not None and fetch_url_is_approved(target, auth_context):
             normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
             if normalized is not None:
@@ -1741,6 +1748,81 @@ def _current_ifc_labels(auth_context: AuthContext | None) -> Any:
         return None
 
 
+def _result_text(result: Any) -> str | None:
+    if isinstance(result, ToolMessage):
+        content = result.content
+        return content if isinstance(content, str) else json.dumps(content, ensure_ascii=True)
+    if isinstance(result, Command):
+        update = getattr(result, "update", None)
+        messages = update.get("messages", ()) if isinstance(update, dict) else ()
+        parts = [text for message in messages if (text := _result_text(message))]
+        return "\n".join(parts) if parts else None
+    return None
+
+
+_EXTERNAL_ORIGIN_URL_RESULT_TOOLS = frozenset({
+    "pr_job_log",
+    "pr_metadata",
+    "pr_files",
+    "pr_diff",
+    "pr_checks",
+    "pr_reviews",
+    "pr_comments",
+    "pr_review_requests",
+})
+
+
+def _web_search_external_result_text(result: Any) -> str | None:
+    """Return only remote Tavily result fields, never model-authored echoes."""
+    text = _result_text(result)
+    if text is None:
+        return None
+    try:
+        payload = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        return None
+    parts: list[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        for key in ("url", "snippet"):
+            value = item.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts) if parts else None
+
+
+def _external_result_text(
+    tool_name: str, labels: Any, result: Any, *, failed: bool,
+) -> str | None:
+    """Extract only server-attested external-origin result content."""
+    if failed or not getattr(labels, "has_untrusted_active_ingest", False):
+        return None
+    if tool_name == "web_search":
+        return _web_search_external_result_text(result)
+    if tool_name in _EXTERNAL_ORIGIN_URL_RESULT_TOOLS:
+        return _result_text(result)
+    return None
+
+
+def _fetched_body_url_recorder(
+    auth_context: AuthContext | None,
+) -> Callable[[str], None] | None:
+    """Bind successful fresh fetch bytes to this exact turn's URL state."""
+    if auth_context is None:
+        return None
+
+    def record(text: str) -> None:
+        record_external_ingested_urls(auth_context, text)
+
+    return record
+
+
 def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     """Monotonically taint the exact turn and rebind harness egress."""
     if auth_context is None or added is None:
@@ -1759,6 +1841,22 @@ def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     emitter = getattr(active_ctx, "turn_event_emitter", None)
     if emitter is not None:
         emitter.bind_information_flow(merged, active_ctx.auth_context)
+
+
+def _merge_result_labels_from_result(
+    auth_context: AuthContext | None,
+    added: Any,
+    result: Any,
+    *,
+    tool_name: str,
+    failed: bool,
+) -> None:
+    """Record URLs only from server-attested external result sources, then merge."""
+    if auth_context is not None and added is not None:
+        text = _external_result_text(tool_name, added, result, failed=failed)
+        if text is not None:
+            record_external_ingested_urls(auth_context, text)
+    _merge_result_labels(auth_context, added)
 
 
 def _result_labels_for_call(
@@ -3175,6 +3273,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         read_refusal_token = None
         policy_refusal = None
         fetch_token = None
+        fetched_body_recorder_token = None
         try:
             mutation_refusal = _operator_shell_chainlink_mutation_refusal(
                 request, operator_shell_preparation, auth_context,
@@ -3231,6 +3330,12 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_authorized_fetch
 
                 fetch_token = begin_authorized_fetch(authorized_fetch_urls)
+            if tool_name == "fetch_url":
+                from .web import begin_fetched_body_recording
+
+                fetched_body_recorder_token = begin_fetched_body_recording(
+                    _fetched_body_url_recorder(auth_context),
+                )
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
@@ -3292,7 +3397,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels(auth_context, result_labels)
+                _merge_result_labels_from_result(
+                    auth_context, result_labels, exc,
+                    tool_name=tool_name, failed=True,
+                )
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3341,6 +3449,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
+            if fetched_body_recorder_token is not None:
+                from .web import end_fetched_body_recording
+
+                end_fetched_body_recording(fetched_body_recorder_token)
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
             if read_refusal_token is not None:
@@ -3360,7 +3472,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels(auth_context, result_labels)
+        _merge_result_labels_from_result(
+            auth_context, result_labels, result,
+            tool_name=tool_name, failed=is_error,
+        )
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,
@@ -3708,6 +3823,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         read_refusal_token = None
         policy_refusal = None
         fetch_token = None
+        fetched_body_recorder_token = None
         try:
             mutation_refusal = _operator_shell_chainlink_mutation_refusal(
                 request, operator_shell_preparation, auth_context,
@@ -3766,6 +3882,12 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_authorized_fetch
 
                 fetch_token = begin_authorized_fetch(authorized_fetch_urls)
+            if tool_name == "fetch_url":
+                from .web import begin_fetched_body_recording
+
+                fetched_body_recorder_token = begin_fetched_body_recording(
+                    _fetched_body_url_recorder(auth_context),
+                )
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
             else:
@@ -3827,7 +3949,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels(auth_context, result_labels)
+                _merge_result_labels_from_result(
+                    auth_context, result_labels, exc,
+                    tool_name=tool_name, failed=True,
+                )
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3876,6 +4001,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import end_authorized_fetch
 
                 end_authorized_fetch(fetch_token)
+            if fetched_body_recorder_token is not None:
+                from .web import end_fetched_body_recording
+
+                end_fetched_body_recording(fetched_body_recorder_token)
             if capture_token is not None:
                 provenance = end_protected_result_capture(capture_token)
             if read_refusal_token is not None:
@@ -3895,7 +4024,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels(auth_context, result_labels)
+        _merge_result_labels_from_result(
+            auth_context, result_labels, result,
+            tool_name=tool_name, failed=is_error,
+        )
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,
