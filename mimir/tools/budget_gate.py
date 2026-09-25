@@ -1814,7 +1814,7 @@ def _merge_result_labels_from_result(
 
 def _result_labels_for_call(
     tool_name: str,
-    request: ToolCallRequest,
+    arguments: dict[str, Any],
     auth_context: AuthContext | None,
     authorization: ToolAuthorization,
     *,
@@ -1824,10 +1824,9 @@ def _result_labels_for_call(
     failed: bool = False,
 ) -> Any:
     if not failed and tool_name == "repo_checkout" and auth_context is not None:
-        args = _validated_arguments(request) or {}
         original_scope = authorization.repo_pr_action_scope
-        repository = args.get("repository")
-        pull_request = args.get("pull_request")
+        repository = arguments.get("repository")
+        pull_request = arguments.get("pull_request")
         discovered = auth_context.server_discovered_pr_states.resolve(
             repository, pull_request,
         ) if isinstance(repository, str) and isinstance(pull_request, int) else None
@@ -1850,7 +1849,7 @@ def _result_labels_for_call(
             )
     return classify_protected_result(
         tool_name,
-        _validated_arguments(request),
+        arguments,
         auth_context,
         authorization,
         result=result,
@@ -2852,25 +2851,547 @@ async def _request_permission_async(
     return _permission_failure_message(tool_name, "was withdrawn while waiting for the operator")
 
 
-class BudgetGateMiddleware(AgentMiddleware):
-    """Intercept model and tool calls at their exact LangGraph boundaries.
+@dataclass(frozen=True)
+class _ToolCallReview:
+    request: ToolCallRequest
+    tool_name: str
+    auth_context: AuthContext | None
+    arguments: dict[str, Any] | None
 
-    Ordinary, built-in, and LangGraph-wrapped MCP tools authorize from
-    ``ToolCallRequest.runtime.context``. Claude SDK tools have no exact carrier
-    in the current hook API and therefore fail closed under enforcement.
-    """
+
+@dataclass(frozen=True)
+class _PreparedToolCall:
+    request: ToolCallRequest
+    execution_request: ToolCallRequest
+    tool_name: str
+    auth_context: AuthContext | None
+    arguments: dict[str, Any]
+    authorization: Any
+    operator_shell_preparation: _OperatorShellPreparation | None
+    operator_shell_audit: dict[str, Any] | None
+    host_execution: ClientAuthorizedHostExecution | None
+    started: float
+
+
+@dataclass
+class _ToolExecutionCapture:
+    review_claim: Any = None
+    direct_argv_token: Any = None
+    capture_token: Any = None
+    provenance: Any = None
+    read_refusal_token: Any = None
+    policy_refusal: ToolPolicyRefusal | None = None
+    fetch_token: Any = None
+    fetched_body_recorder_token: Any = None
+
+
+def _prepare_tool_call_review(
+    request: ToolCallRequest,
+) -> _ToolCallReview | ToolMessage:
+    tool_name = _tool_name_from_request(request)
+    send_message_refusal = _acp_send_message_refusal(request, tool_name)
+    if send_message_refusal is not None:
+        return send_message_refusal
+    if _hands_has_caller_reserved_arguments(request, tool_name):
+        return _malformed_arguments_refusal(request, tool_name)
+    auth_context = _auth_context_from_request(request)
+    request = _strip_server_only_shell_args(request)
+    repeated_refusal = _operator_shell_recorded_refusal(request)
+    if repeated_refusal is not None:
+        return repeated_refusal
+    request = _request_with_resolved_service_write_path(
+        request, tool_name, auth_context,
+    )
+    request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
+    arguments = _validated_arguments(request)
+    raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
+    if arguments is None and (
+        not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
+    ):
+        return _malformed_arguments_refusal(request, tool_name)
+    return _ToolCallReview(request, tool_name, auth_context, arguments)
+
+
+def _tool_call_refusal(
+    call: _ToolCallReview,
+    refusal: str,
+    *,
+    arguments: dict[str, Any] | None,
+    operator_shell_audit: dict[str, Any] | None = None,
+    record_outcome: bool = False,
+) -> ToolMessage:
+    if record_outcome:
+        _record_tool_outcome(call.tool_name, refused_reason=refusal)
+    _emit_tool_call_sync(
+        call.tool_name, ok=False, error=refusal, denied=True,
+        arguments=arguments, operator_shell_audit=operator_shell_audit,
+    )
+    return ToolMessage(
+        content=refusal, tool_call_id=_tool_call_id(call.request),
+        name=call.tool_name, status="error",
+    )
+
+
+def _prepare_tool_call_execution(
+    call: _ToolCallReview,
+    review_denial: str | None,
+) -> _PreparedToolCall | ToolMessage | Command:
+    request = call.request
+    tool_name = call.tool_name
+    auth_context = call.auth_context
+    arguments = call.arguments
+    if review_denial is not None:
+        return _tool_call_refusal(
+            call, review_denial, arguments=arguments, record_outcome=True,
+        )
+    if arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+        return _tool_call_refusal(
+            call, _argument_validation_refusal(request), arguments=None,
+            record_outcome=True,
+        )
+    target_channels = _extract_sink_targets(request, auth_context)
+    hands_candidate = _admitted_admin_hands_candidate(
+        request, tool_name, auth_context, arguments,
+    )
+    if tool_name in {"hands_edit", "hands_shell", "hands_python"} and not hands_candidate:
+        return _tool_call_refusal(
+            call,
+            f"{tool_name} requires an admitted admin ACP Hands principal",
+            arguments=arguments,
+        )
+    ifc_labels = _current_ifc_labels(auth_context)
+    operator_shell_preparation = _prepare_operator_shell_execution(
+        request, tool_name, auth_context, ifc_labels,
+    )
+    operator_shell_audit = _operator_shell_audit_summary(operator_shell_preparation)
+
+    authorization = None
+    admin_denial = None
+    for target_channel in (() if hands_candidate else target_channels):
+        target_authorization, admin_denial = _authorize_tool_call(
+            tool_name,
+            auth_context,
+            target_channel,
+            ifc_labels,
+            getattr(request, "tool", None),
+            arguments,
+            operator_shell_binding=(
+                operator_shell_preparation.binding
+                if operator_shell_preparation is not None
+                else None
+            ),
+            operator_shell_refusal=(
+                operator_shell_preparation.refusal
+                if operator_shell_preparation is not None
+                else None
+            ),
+            operator_shell_request_identity=(
+                request if operator_shell_preparation is not None else None
+            ),
+            operator_shell_audit=operator_shell_audit,
+            tool_call_id=(
+                _tool_call_id(request)
+                if operator_shell_preparation is not None
+                else None
+            ),
+        )
+        if authorization is None:
+            authorization = target_authorization
+        if admin_denial is not None:
+            break
+    hard_refusal = _operator_shell_hard_refusal(
+        request, operator_shell_preparation, auth_context,
+    )
+    if hard_refusal is not None:
+        return hard_refusal
+    mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+        request, operator_shell_preparation, auth_context,
+    )
+    if mutation_refusal is not None:
+        return mutation_refusal
+    if admin_denial is not None:
+        if (
+            operator_shell_preparation is not None
+            and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+            and authorization.reason == "ifc_label_blocked:shell_process"
+        ):
+            admin_denial = _operator_shell_live_taint_refusal(auth_context)
+            _operator_shell_recorded_refusal(
+                request, record=True, audit=operator_shell_audit, refusal=admin_denial,
+            )
+        return _tool_call_refusal(
+            call, admin_denial, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+    if arguments is None:
+        return _tool_call_refusal(
+            call, _argument_validation_refusal(request), arguments=None,
+            operator_shell_audit=operator_shell_audit, record_outcome=True,
+        )
+    if tool_name in {"approve_declassification", "clear_ingest_taint"}:
+        denial = _check_and_increment_or_deny(tool_name)
+        if denial is not None:
+            return _tool_call_refusal(call, denial, arguments=arguments)
+        if tool_name == "clear_ingest_taint":
+            return _execute_clear_ingest_taint_action(request, auth_context)
+        return _execute_declassification_action(request, auth_context, arguments)
+
+    # This is an accident deterrent, not a security boundary; see #259.
+    prohibition = _check_prohibited(tool_name, request)
+    if prohibition is not None:
+        _emit_event_sync(
+            "prohibited_action_blocked",
+            tool=tool_name,
+            reason=(
+                "prohibited_action"
+                if operator_shell_audit is not None
+                else prohibition[:200]
+            ),
+            **(operator_shell_audit or {}),
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="prohibited_action_guard",
+            reason="prohibited_action",
+            target=(
+                None
+                if operator_shell_audit is not None
+                else _extract_sink_target(request, auth_context)
+            ),
+            auth_context=auth_context,
+            event_fields=(
+                dict(operator_shell_audit)
+                if operator_shell_audit is not None
+                else None
+            ),
+        )
+        return _tool_call_refusal(
+            call, prohibition, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+
+    host_execution = None
+    if hands_candidate:
+        host_execution = issue_client_authorized_host_execution(
+            request_identity=request,
+            auth_context_identity=auth_context,
+            wrapper_name=tool_name,
+            tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
+        )
+        for target_channel in target_channels:
+            target_authorization, admin_denial = _authorize_tool_call(
+                tool_name,
+                auth_context,
+                target_channel,
+                ifc_labels,
+                getattr(request, "tool", None),
+                arguments,
+                client_authorized_host_execution=host_execution,
+                request_identity=request,
+            )
+            if authorization is None:
+                authorization = target_authorization
+            if admin_denial is not None:
+                break
+        if admin_denial is not None:
+            return _tool_call_refusal(call, admin_denial, arguments=arguments)
+
+    denial = _check_and_increment_or_deny(
+        tool_name,
+        target=_extract_sink_target(request, auth_context),
+        auth_context=auth_context,
+        operator_shell_audit=operator_shell_audit,
+    )
+    if denial is not None:
+        return _tool_call_refusal(
+            call, denial, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+
+    # Delegation inherits the monotonic IFC carrier only after all gates admit it.
+    active_ctx = _get_current_turn_context()
+    if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+        from ..agent import _propagate_ifc_labels
+
+        propagated = _propagate_ifc_labels(
+            active_ctx.ifc_labels,
+            getattr(auth_context, "channel_id", None),
+            auth_context,
+            derived_by=tool_name,
+        )
+        _merge_result_labels(auth_context, propagated)
+    started = time.monotonic()
+    execution_request = (
+        _request_for_authorized_execution(
+            request,
+            tool_name,
+            auth_context,
+            operator_shell_preparation=operator_shell_preparation,
+        )
+        if operator_shell_preparation is not None
+        else _request_for_authorized_execution(request, tool_name, auth_context)
+    )
+    service_shell_refusal = _service_shell_refusal(execution_request)
+    if service_shell_refusal is not None:
+        if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
+            service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
+            _operator_shell_recorded_refusal(
+                request, record=True, audit=operator_shell_audit,
+                refusal=service_shell_refusal,
+            )
+        _record_tool_outcome(
+            tool_name,
+            refused_reason=service_shell_refusal,
+            **(
+                {"operator_shell_audit": operator_shell_audit}
+                if operator_shell_audit is not None
+                else {}
+            ),
+        )
+        return _tool_call_refusal(
+            call, service_shell_refusal, arguments=arguments,
+            operator_shell_audit=operator_shell_audit,
+        )
+    return _PreparedToolCall(
+        request=request,
+        execution_request=execution_request,
+        tool_name=tool_name,
+        auth_context=auth_context,
+        arguments=arguments,
+        authorization=authorization,
+        operator_shell_preparation=operator_shell_preparation,
+        operator_shell_audit=operator_shell_audit,
+        host_execution=host_execution,
+        started=started,
+    )
+
+
+def _review_submission_for_call(call: _PreparedToolCall) -> Any:
+    from .github_review_guard import review_submission_from_request
+
+    return review_submission_from_request(call.execution_request)
+
+
+def _begin_tool_execution(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+) -> ToolMessage | None:
+    mutation_refusal = _operator_shell_chainlink_mutation_refusal(
+        call.request, call.operator_shell_preparation, call.auth_context,
+    )
+    if mutation_refusal is not None:
+        return mutation_refusal
+    direct_argv = call.execution_request.tool_call.get("args", {}).get(
+        "mimir_direct_argv"
+    )
+    operator_direct_argv = (
+        list(call.operator_shell_preparation.binding.argv)
+        if call.operator_shell_preparation is not None
+        and call.operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
+        and call.operator_shell_preparation.binding is not None
+        else None
+    )
+    if operator_direct_argv is not None:
+        from ._shell_env import bind_direct_exec_argv
+
+        capture.direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
+    elif call.tool_name in {"shell_exec", "bash_async"} and isinstance(direct_argv, list):
+        from ._shell_env import bind_direct_exec_argv
+
+        service = get_trusted_service_from_auth_context(call.auth_context)
+        capture.direct_argv_token = bind_direct_exec_argv(
+            direct_argv,
+            command=call.request.tool_call["args"].get("command", ""),
+            declared=getattr(service, "declared_shell_commands", ()) or (),
+        )
+    from ..access_control import begin_protected_result_capture
+
+    capture.capture_token = begin_protected_result_capture()
+    from ..read_policy import begin_read_policy_refusal_capture
+
+    capture.read_refusal_token = begin_read_policy_refusal_capture()
+    authorized_fetch_urls = _authorized_fetch_urls_for_tool(
+        call.tool_name,
+        call.auth_context,
+        _extract_sink_target(call.request, call.auth_context),
+    )
+    if authorized_fetch_urls is not None:
+        from .web import begin_authorized_fetch
+
+        capture.fetch_token = begin_authorized_fetch(authorized_fetch_urls)
+    if call.tool_name == "fetch_url":
+        from .web import begin_fetched_body_recording
+
+        capture.fetched_body_recorder_token = begin_fetched_body_recording(
+            _fetched_body_url_recorder(call.auth_context),
+        )
+    if capture.review_claim is not None and capture.review_claim.duplicate:
+        return _duplicate_review_result(call.request, capture.review_claim)
+    return None
+
+
+def _permission_refusal(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    refusal: str | None,
+) -> ToolMessage | None:
+    if refusal is None:
+        return None
+    if capture.review_claim is not None:
+        capture.review_claim.release()
+    _emit_tool_call_sync(
+        call.tool_name, ok=False, error=refusal, denied=True,
+        arguments=call.arguments,
+    )
+    return ToolMessage(
+        content=refusal, tool_call_id=_tool_call_id(call.request),
+        name=call.tool_name, status="error",
+    )
+
+
+def _soft_live_execution_refusal(call: _PreparedToolCall) -> ToolMessage | None:
+    return _operator_shell_soft_live_refusal(
+        call.request,
+        call.operator_shell_preparation,
+        call.auth_context,
+        started=call.started,
+    )
+
+
+def _finish_result_captures(
+    capture: _ToolExecutionCapture,
+    *,
+    keep_policy_refusal: bool,
+) -> None:
+    if capture.capture_token is not None:
+        from ..access_control import end_protected_result_capture
+
+        capture.provenance = end_protected_result_capture(capture.capture_token)
+        capture.capture_token = None
+    if capture.read_refusal_token is not None:
+        from ..read_policy import end_read_policy_refusal_capture
+
+        refusal = end_read_policy_refusal_capture(capture.read_refusal_token)
+        if keep_policy_refusal:
+            capture.policy_refusal = refusal
+        capture.read_refusal_token = None
+
+
+def _end_tool_execution(capture: _ToolExecutionCapture) -> None:
+    if capture.review_claim is not None:
+        capture.review_claim.release()
+    if capture.direct_argv_token is not None:
+        from ._shell_env import reset_direct_exec_argv
+
+        reset_direct_exec_argv(capture.direct_argv_token)
+    if capture.fetch_token is not None:
+        from .web import end_authorized_fetch
+
+        end_authorized_fetch(capture.fetch_token)
+    if capture.fetched_body_recorder_token is not None:
+        from .web import end_fetched_body_recording
+
+        end_fetched_body_recording(capture.fetched_body_recorder_token)
+    _finish_result_captures(capture, keep_policy_refusal=True)
+
+
+def _finish_tool_exception(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    exc: Exception,
+) -> ToolMessage | None:
+    is_tool_refusal = isinstance(exc, ToolException)
+    _finish_result_captures(capture, keep_policy_refusal=is_tool_refusal)
+    if isinstance(exc, ToolPolicyRefusal):
+        _record_tool_outcome(
+            call.tool_name,
+            refused_reason=str(exc),
+            **(
+                {"operator_shell_audit": call.operator_shell_audit}
+                if call.operator_shell_audit is not None
+                else {}
+            ),
+        )
+        _merge_result_labels(call.auth_context, None)
+    elif is_tool_refusal:
+        result_labels = _result_labels_for_call(
+            call.tool_name,
+            call.arguments,
+            call.auth_context,
+            call.authorization,
+            result=exc,
+            provenance=capture.provenance,
+            failed=True,
+        )
+        _merge_result_labels_from_result(
+            call.auth_context, result_labels, exc,
+            tool_name=call.tool_name, failed=True,
+        )
+    else:
+        result_labels = _result_labels_for_call(
+            call.tool_name,
+            call.arguments,
+            call.auth_context,
+            call.authorization,
+            provenance=capture.provenance,
+            failed=True,
+        )
+        _merge_result_labels(call.auth_context, result_labels)
+    emit_kwargs: dict[str, Any] = {
+        "ok": False,
+        "duration_ms": (time.monotonic() - call.started) * 1000.0,
+        "error": str(exc),
+        "arguments": call.arguments,
+        "operator_shell_audit": call.operator_shell_audit,
+    }
+    if is_tool_refusal:
+        emit_kwargs["denied"] = True
+    _emit_tool_call_sync(call.tool_name, **emit_kwargs)
+    if is_tool_refusal:
+        return _tool_refusal_message(call.request, call.tool_name, exc)
+    return None
+
+
+def _finish_tool_result(
+    call: _PreparedToolCall,
+    capture: _ToolExecutionCapture,
+    result: ToolMessage | Command,
+) -> ToolMessage | Command:
+    is_error = _result_is_error(call.tool_name, result)
+    if not is_error:
+        _record_tool_outcome(call.tool_name)
+    result_labels = _result_labels_for_call(
+        call.tool_name,
+        call.arguments,
+        call.auth_context,
+        call.authorization,
+        result=result,
+        provenance=capture.provenance,
+        policy_refusal=capture.policy_refusal,
+        failed=is_error,
+    )
+    _merge_result_labels_from_result(
+        call.auth_context, result_labels, result,
+        tool_name=call.tool_name, failed=is_error,
+    )
+    _emit_tool_call_sync(
+        call.tool_name,
+        ok=not is_error,
+        duration_ms=(time.monotonic() - call.started) * 1000.0,
+        error=_result_error_text(result) if is_error else None,
+        arguments=call.arguments,
+        operator_shell_audit=call.operator_shell_audit,
+    )
+    return result
+
+
+class BudgetGateMiddleware(AgentMiddleware):
+    """Intercept model and tool calls at their exact LangGraph boundaries."""
 
     def __init__(self) -> None:
-        # Compatibility mode remains permissive, but every non-open decision is
-        # emitted so operators can inspect what enforcement would have done.
         get_tool_registry().enable_shadow_logging()
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
-        """Publish the final model-bound tool surface, then invoke the model.
-
-        Authorization decisions do not consult this observational inventory, so
-        replacing the snapshot cannot widen or narrow the current call's access.
-        """
         request = _request_for_acp_model(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return handler(request)
@@ -2880,7 +3401,6 @@ class BudgetGateMiddleware(AgentMiddleware):
         request: Any,
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
-        """Async counterpart to :meth:`wrap_model_call`."""
         request = _request_for_acp_model(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
@@ -2890,1099 +3410,88 @@ class BudgetGateMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], ToolMessage | Command],
     ) -> ToolMessage | Command:
-        tool_name = _tool_name_from_request(request)
-        send_message_refusal = _acp_send_message_refusal(request, tool_name)
-        if send_message_refusal is not None:
-            return send_message_refusal
-        if _hands_has_caller_reserved_arguments(request, tool_name):
-            return _malformed_arguments_refusal(request, tool_name)
-        auth_context = _auth_context_from_request(request)
-        request = _strip_server_only_shell_args(request)
-        repeated_refusal = _operator_shell_recorded_refusal(request)
-        if repeated_refusal is not None:
-            return repeated_refusal
-        request = _request_with_resolved_service_write_path(
-            request, tool_name, auth_context,
-        )
-        request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
-        validated_arguments = _validated_arguments(request)
-        raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
-        if validated_arguments is None and (
-            not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
-        ):
-            return _malformed_arguments_refusal(request, tool_name)
+        review = _prepare_tool_call_review(request)
+        if isinstance(review, ToolMessage):
+            return review
         review_denial = _resolve_standing_review(
-            tool_name, auth_context, validated_arguments,
+            review.tool_name, review.auth_context, review.arguments,
         )
-        if review_denial is not None:
-            _record_tool_outcome(tool_name, refused_reason=review_denial)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=review_denial, denied=True,
-                arguments=validated_arguments,
-            )
-            return ToolMessage(
-                content=review_denial, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
-            refusal = _argument_validation_refusal(request)
-            _record_tool_outcome(tool_name, refused_reason=refusal)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=refusal, denied=True, arguments=None,
-            )
-            return ToolMessage(
-                content=refusal, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        target_channels = _extract_sink_targets(request, auth_context)
-        hands_candidate = _admitted_admin_hands_candidate(
-            request, tool_name, auth_context, validated_arguments,
-        )
-        if (
-            tool_name in {"hands_edit", "hands_shell", "hands_python"}
-            and not hands_candidate
-        ):
-            denial = f"{tool_name} requires an admitted admin ACP Hands principal"
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=denial, denied=True,
-                arguments=validated_arguments,
-            )
-            return ToolMessage(
-                content=denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        ifc_labels = _current_ifc_labels(auth_context)
-        operator_shell_preparation = _prepare_operator_shell_execution(
-            request, tool_name, auth_context, ifc_labels,
-        )
-        operator_shell_audit = _operator_shell_audit_summary(
-            operator_shell_preparation,
-        )
-
-        authorization = None
-        admin_denial = None
-        for target_channel in (() if hands_candidate else target_channels):
-            target_authorization, admin_denial = _authorize_tool_call(
-                tool_name,
-                auth_context,
-                target_channel,
-                ifc_labels,
-                getattr(request, "tool", None),
-                validated_arguments,
-                operator_shell_binding=(
-                    operator_shell_preparation.binding
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-                operator_shell_refusal=(
-                    operator_shell_preparation.refusal
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-                operator_shell_request_identity=(
-                    request if operator_shell_preparation is not None else None
-                ),
-                operator_shell_audit=operator_shell_audit,
-                tool_call_id=(
-                    _tool_call_id(request)
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-            )
-            if authorization is None:
-                # The first target is the operation target; later targets are
-                # additional writable destinations that must also be admitted.
-                authorization = target_authorization
-            if admin_denial is not None:
-                break
-        hard_refusal = _operator_shell_hard_refusal(
-            request, operator_shell_preparation, auth_context,
-        )
-        if hard_refusal is not None:
-            return hard_refusal
-        mutation_refusal = _operator_shell_chainlink_mutation_refusal(
-            request, operator_shell_preparation, auth_context,
-        )
-        if mutation_refusal is not None:
-            return mutation_refusal
-        if admin_denial is not None:
-            if (
-                operator_shell_preparation is not None
-                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
-                and authorization.reason == "ifc_label_blocked:shell_process"
-            ):
-                admin_denial = _operator_shell_live_taint_refusal(auth_context)
-                _operator_shell_recorded_refusal(
-                    request, record=True, audit=operator_shell_audit, refusal=admin_denial,
-                )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=admin_denial, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=admin_denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        if validated_arguments is None:
-            refusal = _argument_validation_refusal(request)
-            _record_tool_outcome(tool_name, refused_reason=refusal)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=refusal, denied=True, arguments=None,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=refusal, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        if tool_name in {"approve_declassification", "clear_ingest_taint"}:
-            denial = _check_and_increment_or_deny(tool_name)
-            if denial is not None:
-                _emit_tool_call_sync(
-                    tool_name, ok=False, error=denial, denied=True,
-                    arguments=validated_arguments,
-                )
-                return ToolMessage(
-                    content=denial,
-                    tool_call_id=_tool_call_id(request),
-                    name=tool_name,
-                    status="error",
-                )
-            if tool_name == "clear_ingest_taint":
-                return _execute_clear_ingest_taint_action(request, auth_context)
-            return _execute_declassification_action(
-                request, auth_context, validated_arguments,
-            )
-        # Destructive-action guardrail (chainlink #259): an accident
-        # deterrent against force-push-to-main/master, NOT a security
-        # boundary — the regex screens the command arg and is bypassable
-        # (vars, $()); see prohibited_action_guard.py. Catches the honest
-        # mistake, doesn't claim to stop a determined caller.
-        prohibition = _check_prohibited(tool_name, request)
-        if prohibition is not None:
-            _emit_event_sync(
-                "prohibited_action_blocked",
-                tool=tool_name,
-                reason=(
-                    "prohibited_action"
-                    if operator_shell_audit is not None
-                    else prohibition[:200]
-                ),
-                **(operator_shell_audit or {}),
-            )
-            _emit_hard_boundary_denied(
-                tool=tool_name,
-                boundary="prohibited_action_guard",
-                reason="prohibited_action",
-                target=(
-                    None
-                    if operator_shell_audit is not None
-                    else _extract_sink_target(request, auth_context)
-                ),
-                auth_context=auth_context,
-                event_fields=(
-                    dict(operator_shell_audit)
-                    if operator_shell_audit is not None
-                    else None
-                ),
-            )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=prohibition, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=prohibition,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-
-        host_execution = None
-        if hands_candidate:
-            host_execution = issue_client_authorized_host_execution(
-                request_identity=request,
-                auth_context_identity=auth_context,
-                wrapper_name=tool_name,
-                tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
-            )
-            for target_channel in target_channels:
-                target_authorization, admin_denial = _authorize_tool_call(
-                    tool_name,
-                    auth_context,
-                    target_channel,
-                    ifc_labels,
-                    getattr(request, "tool", None),
-                    validated_arguments,
-                    client_authorized_host_execution=host_execution,
-                    request_identity=request,
-                )
-                if authorization is None:
-                    authorization = target_authorization
-                if admin_denial is not None:
-                    break
-            if admin_denial is not None:
-                _emit_tool_call_sync(
-                    tool_name, ok=False, error=admin_denial, denied=True,
-                    arguments=validated_arguments,
-                )
-                return ToolMessage(
-                    content=admin_denial,
-                    tool_call_id=_tool_call_id(request),
-                    name=tool_name,
-                    status="error",
-                )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
-        denial = _check_and_increment_or_deny(
-            tool_name,
-            target=_extract_sink_target(request, auth_context),
-            auth_context=auth_context,
-            operator_shell_audit=operator_shell_audit,
-        )
-        if denial is not None:
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=denial, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-
-        # Delegation inherits the current turn's monotonic IFC carrier only
-        # after every pre-execution gate admits the call.
-        active_ctx = _get_current_turn_context()
-        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
-            from ..agent import _propagate_ifc_labels
-
-            propagated = _propagate_ifc_labels(
-                active_ctx.ifc_labels,
-                getattr(auth_context, "channel_id", None),
-                auth_context,
-                derived_by=tool_name,
-            )
-            _merge_result_labels(auth_context, propagated)
-        started = time.monotonic()
-        execution_request = (
-            _request_for_authorized_execution(
-                request,
-                tool_name,
-                auth_context,
-                operator_shell_preparation=operator_shell_preparation,
-            )
-            if operator_shell_preparation is not None
-            else _request_for_authorized_execution(request, tool_name, auth_context)
-        )
-        # A profile refusal is served as the tool result. Nothing is executed,
-        # so the caller reads why instead of an unexplained exit 1.
-        service_shell_refusal = _service_shell_refusal(execution_request)
-        if service_shell_refusal is not None:
-            if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
-                service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
-                _operator_shell_recorded_refusal(
-                    request, record=True, audit=operator_shell_audit,
-                    refusal=service_shell_refusal,
-                )
-            _record_tool_outcome(
-                tool_name,
-                refused_reason=service_shell_refusal,
-                **(
-                    {"operator_shell_audit": operator_shell_audit}
-                    if operator_shell_audit is not None
-                    else {}
-                ),
-            )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=service_shell_refusal, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=service_shell_refusal,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
-        direct_argv_token = None
-        review_claim = None
-        capture_token = None
-        provenance = None
-        read_refusal_token = None
-        policy_refusal = None
-        fetch_token = None
-        fetched_body_recorder_token = None
+        call = _prepare_tool_call_execution(review, review_denial)
+        if not isinstance(call, _PreparedToolCall):
+            return call
+        capture = _ToolExecutionCapture()
         try:
-            mutation_refusal = _operator_shell_chainlink_mutation_refusal(
-                request, operator_shell_preparation, auth_context,
-            )
-            if mutation_refusal is not None:
-                return mutation_refusal
-            from .github_review_guard import (
-                claim_review_submission,
-                review_submission_from_request,
-            )
+            review_spec = _review_submission_for_call(call)
+            if review_spec is not None:
+                from .github_review_guard import claim_review_submission
 
-            review_spec = review_submission_from_request(execution_request)
-            review_claim = (
-                claim_review_submission(review_spec)
-                if review_spec is not None
-                else None
-            )
-            operator_direct_argv = (
-                list(operator_shell_preparation.binding.argv)
-                if operator_shell_preparation is not None
-                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
-                and operator_shell_preparation.binding is not None
-                else None
-            )
-            if operator_direct_argv is not None:
-                from ._shell_env import bind_direct_exec_argv
-
-                direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
-            elif (
-                tool_name in {"shell_exec", "bash_async"}
-                and isinstance(direct_argv, list)
-            ):
-                from ._shell_env import bind_direct_exec_argv
-
-                service = get_trusted_service_from_auth_context(auth_context)
-                direct_argv_token = bind_direct_exec_argv(
-                    direct_argv,
-                    command=request.tool_call["args"].get("command", ""),
-                    declared=getattr(service, "declared_shell_commands", ()) or (),
-                )
-            from ..access_control import (
-                begin_protected_result_capture,
-                end_protected_result_capture,
-            )
-
-            capture_token = begin_protected_result_capture()
-            from ..read_policy import begin_read_policy_refusal_capture
-
-            read_refusal_token = begin_read_policy_refusal_capture()
-            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-                tool_name, auth_context, _extract_sink_target(request, auth_context),
-            )
-            if authorized_fetch_urls is not None:
-                from .web import begin_authorized_fetch
-
-                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-            if tool_name == "fetch_url":
-                from .web import begin_fetched_body_recording
-
-                fetched_body_recorder_token = begin_fetched_body_recording(
-                    _fetched_body_url_recorder(auth_context),
-                )
-            if review_claim is not None and review_claim.duplicate:
-                result = _duplicate_review_result(request, review_claim)
-            else:
+                capture.review_claim = claim_review_submission(review_spec)
+            result = _begin_tool_execution(call, capture)
+            if result is None:
                 permission_denial = _request_permission_sync(
-                    request, tool_name, authorization, validated_arguments,
-                    host_execution,
+                    call.request, call.tool_name, call.authorization,
+                    call.arguments, call.host_execution,
                 )
-                if permission_denial is not None:
-                    if review_claim is not None:
-                        review_claim.release()
-                    _emit_tool_call_sync(
-                        tool_name, ok=False, error=permission_denial, denied=True,
-                        arguments=validated_arguments,
-                    )
-                    return ToolMessage(
-                        content=permission_denial,
-                        tool_call_id=_tool_call_id(request),
-                        name=tool_name,
-                        status="error",
-                    )
-                soft_live_refusal = _operator_shell_soft_live_refusal(
-                    request,
-                    operator_shell_preparation,
-                    auth_context,
-                    started=started,
-                )
-                if soft_live_refusal is not None:
-                    return soft_live_refusal
-                result = handler(execution_request)
+                result = _permission_refusal(call, capture, permission_denial)
+            if result is None:
+                result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = handler(call.execution_request)
         except ToolException as exc:
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-                capture_token = None
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-                read_refusal_token = None
-            if isinstance(exc, ToolPolicyRefusal):
-                _record_tool_outcome(
-                    tool_name,
-                    refused_reason=str(exc),
-                    **(
-                        {"operator_shell_audit": operator_shell_audit}
-                        if operator_shell_audit is not None
-                        else {}
-                    ),
-                )
-                # A server-authored refusal adds no result provenance, but it
-                # still traverses the common label-accounting boundary.
-                _merge_result_labels(auth_context, None)
-            else:
-                result_labels = _result_labels_for_call(
-                    tool_name,
-                    request,
-                    auth_context,
-                    authorization,
-                    result=exc,
-                    provenance=provenance,
-                    failed=True,
-                )
-                _merge_result_labels_from_result(
-                    auth_context, result_labels, exc,
-                    tool_name=tool_name, failed=True,
-                )
-            _emit_tool_call_sync(
-                tool_name,
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                error=str(exc),
-                denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return _tool_refusal_message(request, tool_name, exc)
+            refusal = _finish_tool_exception(call, capture, exc)
+            assert refusal is not None
+            return refusal
         except Exception as exc:
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-                capture_token = None
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                end_read_policy_refusal_capture(read_refusal_token)
-                read_refusal_token = None
-            result_labels = _result_labels_for_call(
-                tool_name,
-                request,
-                auth_context,
-                authorization,
-                provenance=provenance,
-                failed=True,
-            )
-            _merge_result_labels(auth_context, result_labels)
-            _emit_tool_call_sync(
-                tool_name,
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                error=str(exc),
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
+            _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            if review_claim is not None:
-                review_claim.release()
-            if direct_argv_token is not None:
-                from ._shell_env import reset_direct_exec_argv
-
-                reset_direct_exec_argv(direct_argv_token)
-            if fetch_token is not None:
-                from .web import end_authorized_fetch
-
-                end_authorized_fetch(fetch_token)
-            if fetched_body_recorder_token is not None:
-                from .web import end_fetched_body_recording
-
-                end_fetched_body_recording(fetched_body_recorder_token)
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-        is_error = _result_is_error(tool_name, result)
-        if not is_error:
-            _record_tool_outcome(tool_name)
-        result_labels = _result_labels_for_call(
-            tool_name,
-            request,
-            auth_context,
-            authorization,
-            result=result,
-            provenance=provenance,
-            policy_refusal=policy_refusal,
-            failed=is_error,
-        )
-        _merge_result_labels_from_result(
-            auth_context, result_labels, result,
-            tool_name=tool_name, failed=is_error,
-        )
-        duration_ms = (time.monotonic() - started) * 1000.0
-        _emit_tool_call_sync(
-            tool_name,
-            ok=not is_error,
-            duration_ms=duration_ms,
-            error=_result_error_text(result) if is_error else None,
-            arguments=validated_arguments,
-            operator_shell_audit=operator_shell_audit,
-        )
-        return result
+            _end_tool_execution(capture)
+        return _finish_tool_result(call, capture, result)
 
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Awaitable[ToolMessage | Command]],
     ) -> ToolMessage | Command:
-        tool_name = _tool_name_from_request(request)
-        send_message_refusal = _acp_send_message_refusal(request, tool_name)
-        if send_message_refusal is not None:
-            return send_message_refusal
-        if _hands_has_caller_reserved_arguments(request, tool_name):
-            return _malformed_arguments_refusal(request, tool_name)
-        auth_context = _auth_context_from_request(request)
-        request = _strip_server_only_shell_args(request)
-        repeated_refusal = _operator_shell_recorded_refusal(request)
-        if repeated_refusal is not None:
-            return repeated_refusal
-        request = _request_with_resolved_service_write_path(
-            request, tool_name, auth_context,
-        )
-        request = _request_with_resolved_spawn_paths(request, tool_name, auth_context)
-        validated_arguments = _validated_arguments(request)
-        raw_arguments = (getattr(request, "tool_call", None) or {}).get("args", {})
-        if validated_arguments is None and (
-            not isinstance(raw_arguments, dict) or tool_name.startswith("hands_")
-        ):
-            return _malformed_arguments_refusal(request, tool_name)
+        review = _prepare_tool_call_review(request)
+        if isinstance(review, ToolMessage):
+            return review
         review_denial = await asyncio.to_thread(
-            _resolve_standing_review, tool_name, auth_context, validated_arguments,
+            _resolve_standing_review,
+            review.tool_name,
+            review.auth_context,
+            review.arguments,
         )
-        if review_denial is not None:
-            _record_tool_outcome(tool_name, refused_reason=review_denial)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=review_denial, denied=True,
-                arguments=validated_arguments,
-            )
-            return ToolMessage(
-                content=review_denial, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        if validated_arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
-            refusal = _argument_validation_refusal(request)
-            _record_tool_outcome(tool_name, refused_reason=refusal)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=refusal, denied=True, arguments=None,
-            )
-            return ToolMessage(
-                content=refusal, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        target_channels = _extract_sink_targets(request, auth_context)
-        hands_candidate = _admitted_admin_hands_candidate(
-            request, tool_name, auth_context, validated_arguments,
-        )
-        if (
-            tool_name in {"hands_edit", "hands_shell", "hands_python"}
-            and not hands_candidate
-        ):
-            denial = f"{tool_name} requires an admitted admin ACP Hands principal"
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=denial, denied=True,
-                arguments=validated_arguments,
-            )
-            return ToolMessage(
-                content=denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        ifc_labels = _current_ifc_labels(auth_context)
-        operator_shell_preparation = _prepare_operator_shell_execution(
-            request, tool_name, auth_context, ifc_labels,
-        )
-        operator_shell_audit = _operator_shell_audit_summary(
-            operator_shell_preparation,
-        )
-
-        authorization = None
-        admin_denial = None
-        for target_channel in (() if hands_candidate else target_channels):
-            target_authorization, admin_denial = _authorize_tool_call(
-                tool_name,
-                auth_context,
-                target_channel,
-                ifc_labels,
-                getattr(request, "tool", None),
-                validated_arguments,
-                operator_shell_binding=(
-                    operator_shell_preparation.binding
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-                operator_shell_refusal=(
-                    operator_shell_preparation.refusal
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-                operator_shell_request_identity=(
-                    request if operator_shell_preparation is not None else None
-                ),
-                operator_shell_audit=operator_shell_audit,
-                tool_call_id=(
-                    _tool_call_id(request)
-                    if operator_shell_preparation is not None
-                    else None
-                ),
-            )
-            if authorization is None:
-                # The first target is the operation target; later targets are
-                # additional writable destinations that must also be admitted.
-                authorization = target_authorization
-            if admin_denial is not None:
-                break
-        hard_refusal = _operator_shell_hard_refusal(
-            request, operator_shell_preparation, auth_context,
-        )
-        if hard_refusal is not None:
-            return hard_refusal
-        mutation_refusal = _operator_shell_chainlink_mutation_refusal(
-            request, operator_shell_preparation, auth_context,
-        )
-        if mutation_refusal is not None:
-            return mutation_refusal
-        if admin_denial is not None:
-            if (
-                operator_shell_preparation is not None
-                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
-                and authorization.reason == "ifc_label_blocked:shell_process"
-            ):
-                admin_denial = _operator_shell_live_taint_refusal(auth_context)
-                _operator_shell_recorded_refusal(
-                    request, record=True, audit=operator_shell_audit, refusal=admin_denial,
-                )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=admin_denial, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=admin_denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        if validated_arguments is None:
-            refusal = _argument_validation_refusal(request)
-            _record_tool_outcome(tool_name, refused_reason=refusal)
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=refusal, denied=True, arguments=None,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=refusal, tool_call_id=_tool_call_id(request),
-                name=tool_name, status="error",
-            )
-        if tool_name in {"approve_declassification", "clear_ingest_taint"}:
-            denial = _check_and_increment_or_deny(tool_name)
-            if denial is not None:
-                _emit_tool_call_sync(
-                    tool_name, ok=False, error=denial, denied=True,
-                    arguments=validated_arguments,
-                )
-                return ToolMessage(
-                    content=denial,
-                    tool_call_id=_tool_call_id(request),
-                    name=tool_name,
-                    status="error",
-                )
-            if tool_name == "clear_ingest_taint":
-                return _execute_clear_ingest_taint_action(request, auth_context)
-            return _execute_declassification_action(
-                request, auth_context, validated_arguments,
-            )
-        # Destructive-action guardrail (chainlink #259): an accident
-        # deterrent against force-push-to-main/master, NOT a security
-        # boundary — the regex screens the command arg and is bypassable
-        # (vars, $()); see prohibited_action_guard.py. Catches the honest
-        # mistake, doesn't claim to stop a determined caller.
-        prohibition = _check_prohibited(tool_name, request)
-        if prohibition is not None:
-            _emit_event_sync(
-                "prohibited_action_blocked",
-                tool=tool_name,
-                reason=(
-                    "prohibited_action"
-                    if operator_shell_audit is not None
-                    else prohibition[:200]
-                ),
-                **(operator_shell_audit or {}),
-            )
-            _emit_hard_boundary_denied(
-                tool=tool_name,
-                boundary="prohibited_action_guard",
-                reason="prohibited_action",
-                target=(
-                    None
-                    if operator_shell_audit is not None
-                    else _extract_sink_target(request, auth_context)
-                ),
-                auth_context=auth_context,
-                event_fields=(
-                    dict(operator_shell_audit)
-                    if operator_shell_audit is not None
-                    else None
-                ),
-            )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=prohibition, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=prohibition,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-
-        host_execution = None
-        if hands_candidate:
-            host_execution = issue_client_authorized_host_execution(
-                request_identity=request,
-                auth_context_identity=auth_context,
-                wrapper_name=tool_name,
-                tainted=_live_untrusted_active_ingest(auth_context, ifc_labels) is True,
-            )
-            for target_channel in target_channels:
-                target_authorization, admin_denial = _authorize_tool_call(
-                    tool_name,
-                    auth_context,
-                    target_channel,
-                    ifc_labels,
-                    getattr(request, "tool", None),
-                    validated_arguments,
-                    client_authorized_host_execution=host_execution,
-                    request_identity=request,
-                )
-                if authorization is None:
-                    authorization = target_authorization
-                if admin_denial is not None:
-                    break
-            if admin_denial is not None:
-                _emit_tool_call_sync(
-                    tool_name, ok=False, error=admin_denial, denied=True,
-                    arguments=validated_arguments,
-                )
-                return ToolMessage(
-                    content=admin_denial,
-                    tool_call_id=_tool_call_id(request),
-                    name=tool_name,
-                    status="error",
-                )
-        result_labels = _result_labels_for_call(
-            tool_name, request, auth_context, authorization,
-        )
-
-        denial = _check_and_increment_or_deny(
-            tool_name,
-            target=_extract_sink_target(request, auth_context),
-            auth_context=auth_context,
-            operator_shell_audit=operator_shell_audit,
-        )
-        if denial is not None:
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=denial, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=denial,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-
-        # Delegation inherits the current turn's monotonic IFC carrier only
-        # after every pre-execution gate admits the call.
-        active_ctx = _get_current_turn_context()
-        if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
-            from ..agent import _propagate_ifc_labels
-
-            propagated = _propagate_ifc_labels(
-                active_ctx.ifc_labels,
-                getattr(auth_context, "channel_id", None),
-                auth_context,
-                derived_by=tool_name,
-            )
-            _merge_result_labels(auth_context, propagated)
-        started = time.monotonic()
-        execution_request = (
-            _request_for_authorized_execution(
-                request,
-                tool_name,
-                auth_context,
-                operator_shell_preparation=operator_shell_preparation,
-            )
-            if operator_shell_preparation is not None
-            else _request_for_authorized_execution(request, tool_name, auth_context)
-        )
-        # A profile refusal is served as the tool result. Nothing is executed,
-        # so the caller reads why instead of an unexplained exit 1.
-        service_shell_refusal = _service_shell_refusal(execution_request)
-        if service_shell_refusal is not None:
-            if service_shell_refusal == _OPERATOR_SHELL_LIVE_TAINT_REFUSAL:
-                service_shell_refusal = _operator_shell_live_taint_refusal(auth_context)
-                _operator_shell_recorded_refusal(
-                    request, record=True, audit=operator_shell_audit,
-                    refusal=service_shell_refusal,
-                )
-            _record_tool_outcome(
-                tool_name,
-                refused_reason=service_shell_refusal,
-                **(
-                    {"operator_shell_audit": operator_shell_audit}
-                    if operator_shell_audit is not None
-                    else {}
-                ),
-            )
-            _emit_tool_call_sync(
-                tool_name, ok=False, error=service_shell_refusal, denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return ToolMessage(
-                content=service_shell_refusal,
-                tool_call_id=_tool_call_id(request),
-                name=tool_name,
-                status="error",
-            )
-        direct_argv = execution_request.tool_call.get("args", {}).get("mimir_direct_argv")
-        direct_argv_token = None
-        review_claim = None
-        capture_token = None
-        provenance = None
-        read_refusal_token = None
-        policy_refusal = None
-        fetch_token = None
-        fetched_body_recorder_token = None
+        call = _prepare_tool_call_execution(review, review_denial)
+        if not isinstance(call, _PreparedToolCall):
+            return call
+        capture = _ToolExecutionCapture()
         try:
-            mutation_refusal = _operator_shell_chainlink_mutation_refusal(
-                request, operator_shell_preparation, auth_context,
-            )
-            if mutation_refusal is not None:
-                return mutation_refusal
-            from .github_review_guard import (
-                claim_review_submission,
-                review_submission_from_request,
-            )
+            review_spec = _review_submission_for_call(call)
+            if review_spec is not None:
+                from .github_review_guard import claim_review_submission
 
-            review_spec = review_submission_from_request(execution_request)
-            review_claim = (
-                await _claim_review_submission_async(
+                capture.review_claim = await _claim_review_submission_async(
                     lambda: claim_review_submission(review_spec)
                 )
-                if review_spec is not None
-                else None
-            )
-            operator_direct_argv = (
-                list(operator_shell_preparation.binding.argv)
-                if operator_shell_preparation is not None
-                and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.BOUND
-                and operator_shell_preparation.binding is not None
-                else None
-            )
-            if operator_direct_argv is not None:
-                from ._shell_env import bind_direct_exec_argv
-
-                direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
-            elif (
-                tool_name in {"shell_exec", "bash_async"}
-                and isinstance(direct_argv, list)
-            ):
-                from ._shell_env import bind_direct_exec_argv
-
-                service = get_trusted_service_from_auth_context(auth_context)
-                direct_argv_token = bind_direct_exec_argv(
-                    direct_argv,
-                    command=request.tool_call["args"].get("command", ""),
-                    declared=getattr(service, "declared_shell_commands", ()) or (),
-                )
-            from ..access_control import (
-                begin_protected_result_capture,
-                end_protected_result_capture,
-            )
-
-            capture_token = begin_protected_result_capture()
-            from ..read_policy import begin_read_policy_refusal_capture
-
-            read_refusal_token = begin_read_policy_refusal_capture()
-            authorized_fetch_urls = _authorized_fetch_urls_for_tool(
-                tool_name, auth_context, _extract_sink_target(request, auth_context),
-            )
-            if authorized_fetch_urls is not None:
-                from .web import begin_authorized_fetch
-
-                fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-            if tool_name == "fetch_url":
-                from .web import begin_fetched_body_recording
-
-                fetched_body_recorder_token = begin_fetched_body_recording(
-                    _fetched_body_url_recorder(auth_context),
-                )
-            if review_claim is not None and review_claim.duplicate:
-                result = _duplicate_review_result(request, review_claim)
-            else:
+            result = _begin_tool_execution(call, capture)
+            if result is None:
                 permission_denial = await _request_permission_async(
-                    request, tool_name, authorization, validated_arguments,
-                    host_execution,
+                    call.request, call.tool_name, call.authorization,
+                    call.arguments, call.host_execution,
                 )
-                if permission_denial is not None:
-                    if review_claim is not None:
-                        review_claim.release()
-                    _emit_tool_call_sync(
-                        tool_name, ok=False, error=permission_denial, denied=True,
-                        arguments=validated_arguments,
-                    )
-                    return ToolMessage(
-                        content=permission_denial,
-                        tool_call_id=_tool_call_id(request),
-                        name=tool_name,
-                        status="error",
-                    )
-                soft_live_refusal = _operator_shell_soft_live_refusal(
-                    request,
-                    operator_shell_preparation,
-                    auth_context,
-                    started=started,
-                )
-                if soft_live_refusal is not None:
-                    return soft_live_refusal
-                result = await handler(execution_request)
+                result = _permission_refusal(call, capture, permission_denial)
+            if result is None:
+                result = _soft_live_execution_refusal(call)
+            if result is None:
+                result = await handler(call.execution_request)
         except ToolException as exc:
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-                capture_token = None
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-                read_refusal_token = None
-            if isinstance(exc, ToolPolicyRefusal):
-                _record_tool_outcome(
-                    tool_name,
-                    refused_reason=str(exc),
-                    **(
-                        {"operator_shell_audit": operator_shell_audit}
-                        if operator_shell_audit is not None
-                        else {}
-                    ),
-                )
-                # A server-authored refusal adds no result provenance, but it
-                # still traverses the common label-accounting boundary.
-                _merge_result_labels(auth_context, None)
-            else:
-                result_labels = _result_labels_for_call(
-                    tool_name,
-                    request,
-                    auth_context,
-                    authorization,
-                    result=exc,
-                    provenance=provenance,
-                    failed=True,
-                )
-                _merge_result_labels_from_result(
-                    auth_context, result_labels, exc,
-                    tool_name=tool_name, failed=True,
-                )
-            _emit_tool_call_sync(
-                tool_name,
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                error=str(exc),
-                denied=True,
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
-            return _tool_refusal_message(request, tool_name, exc)
+            refusal = _finish_tool_exception(call, capture, exc)
+            assert refusal is not None
+            return refusal
         except Exception as exc:
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-                capture_token = None
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                end_read_policy_refusal_capture(read_refusal_token)
-                read_refusal_token = None
-            result_labels = _result_labels_for_call(
-                tool_name,
-                request,
-                auth_context,
-                authorization,
-                provenance=provenance,
-                failed=True,
-            )
-            _merge_result_labels(auth_context, result_labels)
-            _emit_tool_call_sync(
-                tool_name,
-                ok=False,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                error=str(exc),
-                arguments=validated_arguments,
-                operator_shell_audit=operator_shell_audit,
-            )
+            _finish_tool_exception(call, capture, exc)
             raise
         finally:
-            if review_claim is not None:
-                review_claim.release()
-            if direct_argv_token is not None:
-                from ._shell_env import reset_direct_exec_argv
-
-                reset_direct_exec_argv(direct_argv_token)
-            if fetch_token is not None:
-                from .web import end_authorized_fetch
-
-                end_authorized_fetch(fetch_token)
-            if fetched_body_recorder_token is not None:
-                from .web import end_fetched_body_recording
-
-                end_fetched_body_recording(fetched_body_recorder_token)
-            if capture_token is not None:
-                provenance = end_protected_result_capture(capture_token)
-            if read_refusal_token is not None:
-                from ..read_policy import end_read_policy_refusal_capture
-
-                policy_refusal = end_read_policy_refusal_capture(read_refusal_token)
-        is_error = _result_is_error(tool_name, result)
-        if not is_error:
-            _record_tool_outcome(tool_name)
-        result_labels = _result_labels_for_call(
-            tool_name,
-            request,
-            auth_context,
-            authorization,
-            result=result,
-            provenance=provenance,
-            policy_refusal=policy_refusal,
-            failed=is_error,
-        )
-        _merge_result_labels_from_result(
-            auth_context, result_labels, result,
-            tool_name=tool_name, failed=is_error,
-        )
-        duration_ms = (time.monotonic() - started) * 1000.0
-        _emit_tool_call_sync(
-            tool_name,
-            ok=not is_error,
-            duration_ms=duration_ms,
-            error=_result_error_text(result) if is_error else None,
-            arguments=validated_arguments,
-            operator_shell_audit=operator_shell_audit,
-        )
-        return result
+            _end_tool_execution(capture)
+        return _finish_tool_result(call, capture, result)

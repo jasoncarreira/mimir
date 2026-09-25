@@ -994,10 +994,7 @@ def test_repository_result_uses_revalidated_post_execution_scope(
 
     labels = _result_labels_for_call(
         "repo_checkout",
-        _make_request(
-            "repo_checkout", "checkout", auth,
-            {"repository": "owner/repo", "pull_request": 17},
-        ),
+        {"repository": "owner/repo", "pull_request": 17},
         auth,
         authorization,
         result=ToolMessage(content="checked out", tool_call_id="checkout"),
@@ -2105,6 +2102,157 @@ def test_middleware_sync_wrap_passes_through_under_budget():
     assert out.content == "ok"
     assert len(handler_calls) == 1
     assert ctx.tool_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sync_and_async_tool_gate_paths_remain_in_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import protected_result_source, publish_protected_result
+    from mimir.tools import budget_gate
+    from mimir.tools.github_review_guard import ReviewSubmission
+    from mimir.tools.web import _record_fetched_body
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://allowed.example/*")
+    events: list[tuple[str, dict[str, Any]]] = []
+    claims: list[str] = []
+    validation_calls = 0
+    original_validate = budget_gate._validated_arguments
+
+    class Claim:
+        duplicate = False
+
+        def release(self) -> None:
+            pass
+
+    def submission(request: ToolCallRequest) -> ReviewSubmission | None:
+        if request.tool_call["id"] != "review":
+            return None
+        return ReviewSubmission(
+            executable="gh", repo="owner/repo", number=17,
+            state="APPROVED", cwd=None,
+        )
+
+    def claim(review: ReviewSubmission) -> Claim:
+        claims.append(f"{review.repo}#{review.number}")
+        return Claim()
+
+    def validate(request: ToolCallRequest) -> dict[str, Any] | None:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(request)
+
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda kind, **fields: events.append((kind, fields)),
+    )
+    monkeypatch.setattr(budget_gate, "_validated_arguments", validate)
+    monkeypatch.setattr(
+        "mimir.tools.github_review_guard.review_submission_from_request", submission,
+    )
+    monkeypatch.setattr(
+        "mimir.tools.github_review_guard.claim_review_submission", claim,
+    )
+
+    scenarios = (
+        ("allow", "write_todos", {}, "success"),
+        (
+            "denied_write", "write_file",
+            {"file_path": str(home / "memory" / "blocked.md"), "content": "x"},
+            "success",
+        ),
+        ("tool_error", "write_todos", {}, "tool_error"),
+        ("handler_exception", "write_todos", {}, "exception"),
+        (
+            "fetch", "fetch_url", {"url": "https://allowed.example/start"},
+            "fetch",
+        ),
+        ("review", "write_todos", {}, "success"),
+    )
+
+    async def run_path(
+        path: str,
+        scenario: tuple[str, str, dict[str, Any], str],
+    ) -> dict[str, Any]:
+        nonlocal validation_calls
+        scenario_name, tool_name, arguments, outcome = scenario
+        auth = _ifc_auth() if scenario_name == "denied_write" else _untainted_ifc_auth()
+        turn = _ifc_turn(auth)
+        events.clear()
+        claims.clear()
+        validation_calls = 0
+
+        def execute(request: ToolCallRequest) -> ToolMessage:
+            if scenario_name == "allow":
+                publish_protected_result((protected_result_source(
+                    auth,
+                    principal="producer:parity",
+                    domain="filesystem",
+                    resource_id="parity.txt",
+                    bridge_instance="parity",
+                ),))
+            if outcome == "exception":
+                raise RuntimeError("parity handler failure")
+            if outcome == "fetch":
+                _record_fetched_body(
+                    b"body links https://allowed.example/verbatim-only"
+                )
+            return ToolMessage(
+                content="tool failed" if outcome == "tool_error" else "ok",
+                tool_call_id=request.tool_call["id"],
+                status="error" if outcome == "tool_error" else "success",
+            )
+
+        async def async_execute(request: ToolCallRequest) -> ToolMessage:
+            return execute(request)
+
+        request = _make_request(tool_name, scenario_name, auth, arguments)
+        token = set_current_turn(turn)
+        try:
+            try:
+                if path == "sync":
+                    result: Any = BudgetGateMiddleware().wrap_tool_call(request, execute)
+                else:
+                    result = await BudgetGateMiddleware().awrap_tool_call(
+                        request, async_execute,
+                    )
+                result_snapshot: Any = result.model_dump(mode="json")
+            except RuntimeError as exc:
+                result_snapshot = (type(exc).__name__, str(exc))
+        finally:
+            reset_current_turn(token)
+
+        event_snapshot = [
+            (kind, {key: value for key, value in fields.items() if key != "duration_ms"})
+            for kind, fields in events
+        ]
+        return {
+            "result": result_snapshot,
+            "events": event_snapshot,
+            "labels": auth.ifc_state.current(auth.ifc_labels),
+            "turn_labels": turn.ifc_labels,
+            "ingested_urls": auth.ingested_url_state.urls(),
+            "claims": tuple(claims),
+            "validation_calls": validation_calls,
+        }
+
+    for scenario in scenarios:
+        sync_snapshot = await run_path("sync", scenario)
+        async_snapshot = await run_path("async", scenario)
+        assert async_snapshot == sync_snapshot, scenario[0]
+        assert sync_snapshot["validation_calls"] == 1
+
+        if scenario[0] == "denied_write":
+            assert sync_snapshot["result"]["status"] == "error"
+            assert "ifc_label_blocked:file" in str(sync_snapshot["result"]["content"])
+        elif scenario[0] == "fetch":
+            assert "https://allowed.example/verbatim-only" in sync_snapshot["ingested_urls"]
+        elif scenario[0] == "review":
+            assert sync_snapshot["claims"] == ("owner/repo#17",)
 
 
 def test_sync_protected_read_allows_compatible_harness_egress():
@@ -7075,7 +7223,7 @@ def test_web_search_records_result_entries_but_not_echoed_query(
     )
     labels = _result_labels_for_call(
         "web_search",
-        request,
+        request.tool_call["args"],
         auth,
         ToolAuthorization(
             tool_name="web_search", decision=OperationDecision.OPEN, allowed=True,

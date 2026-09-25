@@ -748,7 +748,9 @@ def test_multi_target_result_labels_use_operative_authorization(
     )
 
     assert result.status == "success"
-    assert consumed == [cwd_authorization, cwd_authorization]
+    # Result classification consumes the first target's authorization once,
+    # after execution; the former pre-execution classification was dead.
+    assert consumed == [cwd_authorization]
 
 
 def test_wrap_tool_call_duplicate_release_remains_idempotent(
