@@ -32,6 +32,7 @@ from textwrap import dedent
 from typing import Any
 
 import pytest
+import yaml
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import ToolException
@@ -7049,15 +7050,29 @@ def _active_ingest_result_labels(
     ))
 
 
-def test_result_urls_are_recorded_from_returned_text_not_arguments() -> None:
+def test_web_search_records_result_entries_but_not_echoed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     ctx = _make_ctx()
     auth = ctx.auth_context
-    argument_url = "https://attacker.example/from-arguments"
+    argument_url = "https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
     result_url = "https://arxiv.org/abs/2609.30227"
+    snippet_url = "https://arxiv.org/abs/2609.30228"
     request = _make_request(
         "web_search", "result-url", auth, {"query": argument_url},
     )
-    result = ToolMessage(content=f"paper {result_url}", tool_call_id="result-url")
+    result = ToolMessage(
+        content=yaml.safe_dump({
+            "query": argument_url,
+            "results": [{
+                "title": "paper",
+                "url": result_url,
+                "snippet": f"related: {snippet_url}",
+            }],
+        }),
+        tool_call_id="result-url",
+    )
     labels = _result_labels_for_call(
         "web_search",
         request,
@@ -7072,8 +7087,14 @@ def test_result_urls_are_recorded_from_returned_text_not_arguments() -> None:
         auth, labels, result, tool_name="web_search", failed=False,
     )
 
-    assert auth.ingested_url_state.urls() == frozenset({result_url})
+    assert auth.ingested_url_state.urls() == frozenset({result_url, snippet_url})
     assert argument_url not in auth.ingested_url_state.urls()
+    refused = SinkGate.check_sink_flow(
+        "fetch_url", argument_url, labels, auth, enforce=True,
+    )
+    assert (refused.allowed, refused.reason) == (
+        False, "ifc_label_blocked:network",
+    )
 
 
 @pytest.mark.parametrize("tool_name", ["read_file", "shell_exec", "hands_python"])
@@ -7129,29 +7150,33 @@ def test_external_result_error_text_does_not_contribute_verbatim_url(
     assert auth.ingested_url_state.urls() == frozenset()
 
 
-def test_fetch_cache_body_read_contributes_external_url(
+def test_model_written_fetch_cache_read_does_not_contribute_verbatim_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
-    body = home / "attachments" / "fetch-cache" / "paper.txt"
+    body = home / "attachments" / "fetch-cache" / "planted.txt"
     body.parent.mkdir(parents=True)
-    body.write_text("external", encoding="utf-8")
+    target = "https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+    body.write_text(f"paper {target}\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://arxiv.org/*")
     auth = _make_ctx().auth_context
-    target = "https://arxiv.org/abs/2609.30227"
     result = ToolMessage(content=f"paper {target}", tool_call_id="cache-read")
-
-    _merge_result_labels_from_result(
-        auth,
-        _active_ingest_result_labels(
-            domain="filesystem", resource_id=str(body.resolve()),
-        ),
-        result,
-        tool_name="read_file",
-        failed=False,
+    labels = _active_ingest_result_labels(
+        domain="filesystem", resource_id=str(body.resolve()),
     )
 
-    assert auth.ingested_url_state.urls() == frozenset({target})
+    _merge_result_labels_from_result(
+        auth, labels, result, tool_name="read_file", failed=False,
+    )
+
+    assert auth.ingested_url_state.urls() == frozenset()
+    refused = SinkGate.check_sink_flow(
+        "fetch_url", target, labels, auth, enforce=True,
+    )
+    assert (refused.allowed, refused.reason) == (
+        False, "ifc_label_blocked:network",
+    )
 
 
 @pytest.mark.asyncio

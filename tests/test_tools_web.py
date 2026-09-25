@@ -239,6 +239,44 @@ async def test_fetch_url_writes_body_and_meta(
 
 
 @pytest.mark.asyncio
+async def test_fetch_url_records_downloaded_body_before_cache_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = "https://arxiv.org/abs/2609.30227"
+    body = f"paper {target}".encode()
+    recorded: list[str] = []
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(body))
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        await _drive_fetch_url(tmp_path, body)
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert recorded == [body.decode()]
+
+
+@pytest.mark.asyncio
+async def test_fetch_url_cache_hit_does_not_record_model_writable_cache_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = b"remote body"
+    _patch_safe_open(monkeypatch, lambda: _FakeResponse(original))
+    fresh = await _drive_fetch_url(tmp_path, original)
+    body_path = tmp_path / fresh["file_path"].lstrip("/")
+    body_path.write_text("https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123")
+
+    recorded: list[str] = []
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        cached = await _drive_fetch_url(tmp_path, b"unused")
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert cached["cached"] is True
+    assert recorded == []
+
+
+@pytest.mark.asyncio
 async def test_fetch_url_extracts_pdf_without_changing_cached_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
