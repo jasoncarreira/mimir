@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import re
+
+from .redaction import SECRET_NAME_MARKERS as SECRET_MARKERS
+from .redaction import redact_url_userinfo as _redact_url_userinfo
 from typing import Any
 
 from .access_control import create_local_operator_auth_context
@@ -26,29 +29,12 @@ POLLER_REGISTRATION_ERROR_TYPES = frozenset({
     "poller_reload_invalid_cron",
 })
 
-SECRET_MARKERS = (
-    "KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "CREDENTIAL",
-    "AUTH",
-)
 
-_URL_USERINFO_RE = re.compile(
-    r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
-    re.IGNORECASE,
-)
 
 
 def _is_secret_name(name: str) -> bool:
     upper = name.upper()
     return any(marker in upper for marker in SECRET_MARKERS)
-
-
-def _redact_url_userinfo(value: str) -> str:
-    return _URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", value)
 
 
 def _redact_config_value(value: Any, *, key: str | None = None) -> Any:

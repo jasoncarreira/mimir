@@ -559,3 +559,25 @@ def redact_payload(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return redact_text(str(value))
+
+
+# Env/config key substrings that mark a value as secret in operator dashboards.
+SECRET_NAME_MARKERS = (
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+)
+
+URL_USERINFO_RE = re.compile(
+    r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
+    re.IGNORECASE,
+)
+
+
+def redact_url_userinfo(value: str) -> str:
+    """Mask credentials embedded in URL userinfo components."""
+    return URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", value)

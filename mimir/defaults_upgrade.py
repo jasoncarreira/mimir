@@ -22,6 +22,7 @@ from pathlib import Path
 from packaging.version import InvalidVersion, Version
 
 from . import __version__
+from .env import env_bool
 from .git_bootstrap import _redact, _run
 from .memory_templates import bundled_defaults as bundled_core_defaults
 from .models import AgentEvent
@@ -30,6 +31,8 @@ from .prompt_templates import (
     bundled_upgrade_prompts,
 )
 from .proposals import (
+    _git,
+    _has_origin_remote,
     OpenResult,
     ProposalResult,
     UPGRADE_PROPOSAL_LANE,
@@ -92,14 +95,6 @@ class VendorSyncResult:
     error: str | None = None
 
 
-def _git(args: list[str], cwd: Path):
-    return _run(["git", *args], cwd=cwd, capture=True)
-
-
-def _has_origin_remote(home: Path) -> bool:
-    res = _git(["remote", "get-url", "origin"], cwd=home)
-    return res.returncode == 0 and bool((res.stdout or "").strip())
-
 
 def _branch_ref(repo: Path, branch: str) -> str | None:
     res = _git(["rev-parse", "--verify", branch], cwd=repo)
@@ -146,18 +141,6 @@ def read_last_synced_version(home: Path) -> str | None:
     unset). Callers capture this *before* ``check_and_open_defaults_upgrade``
     advances it, to know the version being upgraded *from*."""
     return _read_last_synced_version(home)
-
-
-def _env_bool_value(raw: str | None, *, default: bool = False) -> bool:
-    if raw is None or raw == "":
-        return default
-    norm = raw.strip().lower()
-    if norm in {"1", "true", "yes", "on", "y"}:
-        return True
-    if norm in {"0", "false", "no", "off", "n"}:
-        return False
-    log.warning("%s=%r is not a recognised boolean; using default %r", AUTO_SUBMIT_CLEAN_ENV, raw, default)
-    return default
 
 
 def _read_prompt_template(home: Path, name: str) -> str:
@@ -650,7 +633,7 @@ def check_and_open_defaults_upgrade(
 
     if auto_submit_clean is None:
         import os
-        auto_submit_clean = _env_bool_value(os.environ.get(AUTO_SUBMIT_CLEAN_ENV), default=False)
+        auto_submit_clean = env_bool(AUTO_SUBMIT_CLEAN_ENV, False, logger=log)
     sched_note = (
         f" New default scheduled tick(s) added to scheduler.yaml: {', '.join(sched_added)}."
         if sched_added

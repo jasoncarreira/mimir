@@ -1527,9 +1527,13 @@ def _parse_poller_authority(
         raise ValueError("file capabilities require at least one scoped root")
 
     home_root = state_root.parent.parent if state_root is not None else None
+    raw_shell_commands = raw.get("shell_commands")
     declared_shell_commands = parse_declared_shell_commands(
-        raw.get("shell_commands"),
-        writable_roots=agent_writable_roots(home_root),
+        raw_shell_commands,
+        # The roots only matter to declared commands; skip the lookup otherwise.
+        writable_roots=(
+            agent_writable_roots(home_root) if raw_shell_commands is not None else ()
+        ),
     )
     if declared_shell_commands and "shell_exec" not in capabilities:
         raise ValueError(
@@ -2670,7 +2674,11 @@ async def run_poller(
     # additional keys use manifest ``env``, manifest ``pass_env``, or the
     # global ``MIMIR_POLLER_ENV_ALLOWLIST``. Keep this path in sync with
     # ``_poller_env_available_at_discovery``.
-    env = {k: v for k, v in os.environ.items() if _allowed_poller_env_key(k)}
+    allowed_env = _BUILTIN_POLLER_ENV_ALLOWLIST | _extra_poller_env_allowlist()
+    env = {
+        k: v for k, v in os.environ.items()
+        if _allowed_poller_env_key(k, allowed=allowed_env)
+    }
     explicit_env_redact_keys: set[str] = set()
     # Per-poller pass_env (chainlink #82 sub #83/#85): explicit
     # whitelist of env keys that bypass the deny-suffix/deny-prefix
@@ -3250,6 +3258,9 @@ async def run_poller(
     # Phase 3: assemble + dispatch each batch as one AgentEvent.
     event_count = 0
     rejected_count = 0
+    # One immutable principal serves every batch of this fire.
+    authority = poller.resolved_authority()
+    service_principal = f"service:{authority.canonical}"
     for batch_idx, batch in enumerate(batches):
         content = _render_batch(poller.name, batch, batch_idx, len(batches))
         # Apply the prompt cap once more on the assembled batch — even
@@ -3282,8 +3293,6 @@ async def run_poller(
         if poller.deliver:  # chainlink #508 — raw value; resolved at turn time
             extra["deliver"] = poller.deliver
         channel_id = poller.channel_id()
-        authority = poller.resolved_authority()
-        service_principal = f"service:{authority.canonical}"
         item_labels = InformationFlowLabels()
         for item in batch:
             item_extras = item["extras"]

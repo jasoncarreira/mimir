@@ -90,6 +90,7 @@ from .renderers import (  # noqa: F401
     _render_turn_error,
 )
 from .cross_turn import _detect_cross_turn_send_loops  # noqa: F401
+from ..session_boundary_log import _short_ts
 from .resolved import (  # noqa: F401
     _load_resolved_incidents,
     _parse_resolved_ts,
@@ -1060,12 +1061,6 @@ def _format_lines(signals: list[FeedbackSignal], *, window_hours: int = 24) -> l
         out.append(f"- {ts} — {sig.content}{count_suffix}{ch}")
     return out
 
-
-def _short_ts(ts: str) -> str:
-    # Tolerate non-ISO inputs; just truncate to 16 chars so we get
-    # "YYYY-MM-DD HH:MM" out of "YYYY-MM-DDTHH:MM:SS+00:00".
-    cleaned = ts.replace("T", " ")
-    return cleaned[:16] if len(cleaned) >= 16 else cleaned
 
 
 # Backwards-compatible alias for the streaming tail reader. Older code

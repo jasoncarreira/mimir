@@ -431,13 +431,12 @@ def _download_url_bytes(
         advertised_len = response.headers.get("Content-Length")
         if advertised_len is not None:
             try:
-                if int(advertised_len) > max_bytes:
-                    raise ValueError("download exceeded max_bytes")
-            except (TypeError, ValueError) as exc:
-                # Re-raise our own ValueError; ignore unparseable
-                # Content-Length headers and fall back to streaming check.
-                if isinstance(exc, ValueError) and "max_bytes" in str(exc):
-                    raise
+                advertised = int(advertised_len)
+            except (TypeError, ValueError):
+                # Unparseable Content-Length: fall back to the streaming check.
+                advertised = None
+            if advertised is not None and advertised > max_bytes:
+                raise ValueError("download exceeded max_bytes")
         total_bytes = 0
         hasher = hashlib.sha256()
         with target_path.open("wb") as f:

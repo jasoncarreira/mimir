@@ -49,6 +49,7 @@ from .compute import (
 from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
 from .autonomy import chainlink_bin
 from .evidence import (
+    _paths_from_status,
     EvidenceValidation,
     TestResult,
     WorklinkEvidence,
@@ -1549,29 +1550,35 @@ class WorklinkRunner:
         # compute substrate. Its capabilities declare shared_filesystem=True, so
         # the controller runs the diff/test re-derivation itself (no remote-fetch
         # gate, no folded trusted-test job).
-        validation = await observe_evidence(
-            issue=issue.issue_id,
-            attempt=attempt,
-            backend=selected_name,
-            branch=lease.branch,
-            checkout=lease.path,
-            started_at=started,
-            base_ref=lease.local_base or lease.base_ref,
-            backend_status=raw.backend_status,
-            test_command=test_cmd,
-            transcript=str(raw.transcript_path) if raw.transcript_path else None,
-            gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
-            blocked_reason=raw.blocked_reason,
-            model=invocation_model,
-            failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
-            executor_tests=executor_tests,
-            skip_test_reason="executor exited nonzero before the test gate" if executor_failed else None,
-            runner=runner,
-            safe_git=publication,
-            work_spec=spec,
-            compute=compute,
-            on_gate_launch=persist_gate_handle,
-        )
+        async def _observe() -> EvidenceValidation:
+            # The post-commit re-observation must use exactly the same inputs.
+            return await observe_evidence(
+                issue=issue.issue_id,
+                attempt=attempt,
+                backend=selected_name,
+                branch=lease.branch,
+                checkout=lease.path,
+                started_at=started,
+                base_ref=lease.local_base or lease.base_ref,
+                backend_status=raw.backend_status,
+                test_command=test_cmd,
+                transcript=str(raw.transcript_path) if raw.transcript_path else None,
+                gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
+                blocked_reason=raw.blocked_reason,
+                model=invocation_model,
+                failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
+                executor_tests=executor_tests,
+                skip_test_reason=(
+                    "executor exited nonzero before the test gate" if executor_failed else None
+                ),
+                runner=runner,
+                safe_git=publication,
+                work_spec=spec,
+                compute=compute,
+                on_gate_launch=persist_gate_handle,
+            )
+
+        validation = await _observe()
         validation = _with_outside_checkout_detection(
             validation,
             issue=issue.issue_id,
@@ -1598,31 +1605,7 @@ class WorklinkRunner:
                 )
             else:
                 first_tests = validation.evidence.tests
-                validation = await observe_evidence(
-                    issue=issue.issue_id,
-                    attempt=attempt,
-                    backend=selected_name,
-                    branch=lease.branch,
-                    checkout=lease.path,
-                    started_at=started,
-                    base_ref=lease.local_base or lease.base_ref,
-                    backend_status=raw.backend_status,
-                    test_command=test_cmd,
-                    transcript=str(raw.transcript_path) if raw.transcript_path else None,
-                    gate_rerun_max_failures=config.defaults.gate_rerun_max_failures,
-                    blocked_reason=raw.blocked_reason,
-                    model=invocation_model,
-                    failure_reason=raw.error if (executor_failed or backend_reported_failure) else None,
-                    executor_tests=executor_tests,
-                    skip_test_reason=(
-                        "executor exited nonzero before the test gate" if executor_failed else None
-                    ),
-                    runner=runner,
-                    safe_git=publication,
-                    work_spec=spec,
-                    compute=compute,
-                    on_gate_launch=persist_gate_handle,
-                )
+                validation = await _observe()
                 if first_tests is not None and first_tests.flaky_tests:
                     tests = validation.evidence.tests
                     if tests is not None:
@@ -5322,19 +5305,6 @@ def _paths_escape_checkout(paths: Sequence[str], *, root: Path, checkout: Path) 
             continue
         escaped.append(path)
     return escaped
-
-
-def _paths_from_status(output: str) -> list[str]:
-    paths: list[str] = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        path = line[3:] if len(line) > 3 else ""
-        if " -> " in path:
-            path = path.rsplit(" -> ", 1)[1]
-        if path:
-            paths.append(path.strip())
-    return paths
 
 
 def _ensure_clean_checkout(

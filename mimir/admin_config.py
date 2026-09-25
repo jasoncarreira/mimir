@@ -11,19 +11,12 @@ from typing import Any
 
 from .config import Config
 from .providers import provider_for_quota
+from .redaction import SECRET_NAME_MARKERS as SECRET_MARKERS
 from .redaction import redact_text
+from .redaction import redact_url_userinfo as _redact_url_userinfo
 from .scheduler import load_jobs
 
 
-SECRET_MARKERS = (
-    "KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PASSWD",
-    "CREDENTIAL",
-    "AUTH",
-)
 
 _ENV_REFERENCE_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
@@ -118,10 +111,6 @@ RAW_CONFIG_URL_REDACTED_FIELDS = frozenset({
 })
 
 
-_URL_USERINFO_RE = re.compile(
-    r"(?P<prefix>\b[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+)@",
-    re.IGNORECASE,
-)
 
 ENV_CATEGORIES: dict[str, tuple[str, ...]] = {
     "core": (
@@ -241,12 +230,6 @@ def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)
-
-
-def _redact_url_userinfo(value: str) -> str:
-    """Mask credentials embedded in URL userinfo components."""
-
-    return _URL_USERINFO_RE.sub(r"\g<prefix>[REDACTED]@", value)
 
 
 def _redact_config_value(value: Any, *, key: str | None = None) -> Any:
