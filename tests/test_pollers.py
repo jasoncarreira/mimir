@@ -246,6 +246,30 @@ def test_declared_hooks_are_selected_independently_of_poller_name(
     assert poller.hooks is POLLER_HOOK_PROFILES[profile].hooks
 
 
+def test_reserved_poller_without_hooks_is_registered_and_surfaced(
+    home: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    skills = home / "skills"
+    _write_pollers_json(skills / "github-poller", [{
+        "name": "github-activity",
+        "command": "true",
+        "cron": "* * * * *",
+    }])
+
+    with caplog.at_level("WARNING", logger="mimir.pollers"):
+        [poller] = discover_pollers(skills)
+
+    assert poller.name == "github-activity"
+    assert poller.hooks is None
+    assert "poller_hooks_undeclared" in caplog.text
+    assert "expected_profile='github'" in caplog.text
+    events = _read_events(home)
+    event = next(item for item in events if item["type"] == "poller_hooks_undeclared")
+    assert event["poller"] == "github-activity"
+    assert event["expected_profile"] == "github"
+    assert event["path"] == str(skills / "github-poller" / "pollers.json")
+
+
 def test_hook_profile_requires_its_shipped_skill(
     tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:

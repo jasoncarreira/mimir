@@ -98,12 +98,20 @@ POLLER_HOOK_PROFILES = {
 }
 
 
+def reserved_hook_profile_for_name(name: str) -> str | None:
+    """Return the hook profile expected by a reserved poller name."""
+    for profile_name, profile in POLLER_HOOK_PROFILES.items():
+        if profile.reserved_name == name:
+            return profile_name
+    return None
+
+
 def reserved_skill_for_name(name: str) -> str | None:
     """Return the only skill allowed to claim a reserved poller name."""
-    for profile in POLLER_HOOK_PROFILES.values():
-        if profile.reserved_name == name:
-            return profile.skill
-    return None
+    profile_name = reserved_hook_profile_for_name(name)
+    if profile_name is None:
+        return None
+    return POLLER_HOOK_PROFILES[profile_name].skill
 
 
 def resolve_poller_hooks(raw: object, manifest_path: Path) -> PollerHooks | None:

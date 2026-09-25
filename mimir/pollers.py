@@ -115,6 +115,7 @@ from . import poller_recovery
 from .poller_hooks import (
     PollerHooks,
     github_recovery_relevance_check as _github_recovery_relevance_check,
+    reserved_hook_profile_for_name,
     reserved_skill_for_name,
     resolve_poller_hooks,
     worklink_recovery_relevance_check as _worklink_recovery_relevance_check,
@@ -1816,8 +1817,9 @@ def discover_pollers(
                 if invalid_entries is not None:
                     invalid_entries.append((pollers_file, name, str(exc)))
                 continue
+            hooks_raw = entry.get("hooks")
             try:
-                hooks = resolve_poller_hooks(entry.get("hooks"), pollers_file)
+                hooks = resolve_poller_hooks(hooks_raw, pollers_file)
             except ValueError as exc:
                 log.warning(
                     "poller_hooks_rejected: %s name=%r — %s; poller not registered",
@@ -1826,6 +1828,22 @@ def discover_pollers(
                 if invalid_entries is not None:
                     invalid_entries.append((pollers_file, name, str(exc)))
                 continue
+            expected_hooks = reserved_hook_profile_for_name(name)
+            if expected_hooks is not None and hooks_raw is None:
+                log.warning(
+                    "poller_hooks_undeclared: %s name=%r expected_profile=%r — "
+                    "poller registered without reserved recovery hooks",
+                    pollers_file, name, expected_hooks,
+                )
+                try:
+                    log_event_sync(
+                        "poller_hooks_undeclared",
+                        path=str(pollers_file),
+                        poller=name,
+                        expected_profile=expected_hooks,
+                    )
+                except Exception:  # telemetry must not interrupt discovery
+                    pass
             misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
             if misplaced_authority:
                 log.warning(
