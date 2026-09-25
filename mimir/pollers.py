@@ -457,6 +457,42 @@ _PROCESS_CONTROL_ENV_DENY = frozenset({
 })
 _POLLER_INJECTED_ENV_KEYS = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
 
+_NON_SECRET_FORWARDED_ENV_KEYS = frozenset({
+    "MIMIR_GITHUB_SELF_LOGIN",
+    "MIMIR_HOME",
+    "MIMIR_SOURCE_DIR",
+    "GITHUB_REPOS",
+    "MIMIR_GITHUB_REPOS",
+    "MIMIR_CODING_ENABLED",
+    "MIMIR_GITHUB_PRELOAD_REVIEW_SKILL",
+    "MIMIR_GITHUB_REVIEW_SKILL_PATH",
+})
+"""Forwarded configuration values that poller payload redaction must preserve.
+
+The GitHub login is identity used by authorization and review reconciliation;
+the two home/source values are filesystem locations; the repository values are
+public repository selectors; and the remaining values are feature flags or a
+review-skill path. None is a credential. This is deliberately closed: every
+other value forwarded through ``pass_env`` or manifest ``env`` remains redacted.
+"""
+
+
+def _validate_non_secret_forwarded_env_keys() -> None:
+    """Fail startup if the payload-redaction exemption becomes credential-like."""
+    invalid = {
+        key for key in _NON_SECRET_FORWARDED_ENV_KEYS
+        if key in _PROCESS_CONTROL_ENV_DENY
+        or any(key.endswith(suffix) for suffix in _DENY_ENV_SUFFIXES)
+    }
+    if invalid:
+        raise RuntimeError(
+            "poller non-secret redaction exemptions match environment deny patterns: "
+            + ", ".join(sorted(invalid))
+        )
+
+
+_validate_non_secret_forwarded_env_keys()
+
 # Runner-process lifetime, including manifest reloads; retain names, never values.
 _poller_named_secrets_seen: set[tuple[str, str]] = set()
 
@@ -1875,6 +1911,7 @@ def discover_pollers(
     as ``(source_path, poller_name, reason)`` tuples. The scheduler emits them
     after discovery returns, keeping this parser safe in synchronous contexts.
     """
+    _validate_non_secret_forwarded_env_keys()
     pollers: list[PollerConfig] = []
     if not skills_dir.exists():
         return pollers
@@ -2727,6 +2764,7 @@ async def run_poller(
                 poller=poller.name,
                 key=key,
             )
+    explicit_env_redact_keys.difference_update(_NON_SECRET_FORWARDED_ENV_KEYS)
     env["STATE_DIR"] = str(persist_dir)
     env["POLLER_NAME"] = poller.name
     # Let a poller bound its own work against the cap it will actually be killed

@@ -4699,6 +4699,45 @@ async def test_run_turn_emits_missed_submission_for_unsubmitted_poller_review(
     assert missed[0]["submitted"] == 0
 
 
+async def test_run_turn_typed_pr_review_submission_emits_no_missed_signal(
+    tmp_path: Path,
+) -> None:
+    fake_agent = _FakeAgent(response_messages=[
+        AIMessage(content="", tool_calls=[{
+            "id": "review-1",
+            "name": "pr_submit_review",
+            "args": {"repository": "o/r", "pull_request": 522, "event": "APPROVE"},
+        }]),
+        AIMessage(content="Review submitted"),
+    ])
+    agent = _build_agent(
+        tmp_path, fake_agent=fake_agent, fake_saga=None,
+        session_manager=_FakeSessionManager(),
+    )
+    marker = {
+        "tool_names": ["pr_submit_review"],
+        "bash_substrings": ["gh pr review "],
+        "signal_on_missing": "poller_review_missed_submission",
+    }
+    event = AgentEvent(
+        trigger="poller", channel_id="poller:github-activity",
+        content="Review PR #522", source_id="typed-review",
+        extra={"poller_name": "github-activity", "items": [{
+            "event_type": "pr_opened", "repo": "o/r", "number": 522,
+            "expected_tool_call": marker,
+        }]},
+    )
+
+    await agent.run_turn(event)
+
+    events_log = tmp_path / "home" / "logs" / "events.jsonl"
+    events = [json.loads(line) for line in events_log.read_text().splitlines()]
+    assert [
+        item for item in events
+        if item.get("type") == "poller_review_missed_submission"
+    ] == []
+
+
 async def test_run_turn_failed_event_includes_traceback_for_model_loop_errors(
     tmp_path: Path,
 ):

@@ -823,6 +823,8 @@ _REVIEW_SUBMISSION_RULE = (
 #: PR #234 / #235 nit about coupling.
 _REVIEW_EXPECTED_TOOL_CALL: dict = {
     "tool_names": [
+        # Mimir's typed forge tool.
+        "pr_submit_review",
         # MCP path (GitHub MCP server)
         "pull_request_review_write",
         "submit_pending_pull_request_review",
@@ -997,8 +999,9 @@ def _emit(prompt: str, **extras: object) -> None:
         # submitted, so a duplicate review of one PR can't mask an
         # unreviewed sibling in the same batch. ``ref`` is surfaced in the
         # signal. Falls back to the generic marker when the number is
-        # unavailable. (The MCP ``tool_names`` path isn't PR-attributable —
-        # it matches by name — but mimir-carreira reviews via ``gh``.)
+        # unavailable. The typed/MCP ``tool_names`` path isn't
+        # PR-attributable because it matches by name; per-PR attribution still
+        # comes from the marker's repo, number, and head fields.
         marker = dict(_REVIEW_EXPECTED_TOOL_CALL)
         number = extras.get("number")
         url = extras.get("url")
