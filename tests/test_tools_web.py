@@ -256,6 +256,42 @@ async def test_fetch_url_records_downloaded_body_before_cache_read(
 
 
 @pytest.mark.asyncio
+async def test_fetch_url_changed_download_is_rejected_without_recording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    downloaded = b"remote body"
+    swapped = b"https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+
+    def swap_after_download(**kwargs: Any) -> dict[str, Any]:
+        target_path = kwargs["target_path"]
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_bytes(swapped)
+        return {
+            "status": 200,
+            "content_type": "text/plain",
+            "bytes": len(downloaded),
+            "sha256": hashlib.sha256(downloaded).hexdigest(),
+        }
+
+    monkeypatch.setattr(web_tools_mod, "_download_url_bytes", swap_after_download)
+    monkeypatch.setattr(web_tools_mod, "_validate_fetch_url", lambda _url: None)
+    recorded: list[str] = []
+    token = web_tools_mod.begin_fetched_body_recording(recorded.append)
+    try:
+        web_tools_mod.set_home(tmp_path)
+        (tmp_path / "attachments").mkdir(exist_ok=True)
+        result = await web_tools_mod.fetch_url.ainvoke({
+            "url": "https://example.com/foo.html",
+        })
+    finally:
+        web_tools_mod.end_fetched_body_recording(token)
+
+    assert result == "fetch_url failed: downloaded content changed before verification."
+    assert recorded == []
+    assert not list((tmp_path / "attachments" / "fetch-cache").glob("*"))
+
+
+@pytest.mark.asyncio
 async def test_fetch_url_cache_hit_does_not_record_model_writable_cache_body(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

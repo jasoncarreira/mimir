@@ -5380,15 +5380,11 @@ _INGESTED_HTTPS_URL = re.compile(r"https://[^\s<]+")
 _INGESTED_URL_TRAILING_PUNCTUATION = ".,;:)]}>\"'`"
 
 
-def record_ingested_urls(auth_context: Any, text: Any, labels: Any) -> None:
-    """Record normalized HTTPS URLs from one untrusted active-ingest result."""
-    from .models import InformationFlowLabels, IngestedURLState
+def record_external_ingested_urls(auth_context: Any, text: Any) -> None:
+    """Record URLs from content already vetted as external-origin ingest."""
+    from .models import IngestedURLState
 
-    if (
-        not isinstance(text, str)
-        or not isinstance(labels, InformationFlowLabels)
-        or not labels.has_untrusted_active_ingest
-    ):
+    if not isinstance(text, str):
         return
     state = getattr(auth_context, "ingested_url_state", None)
     if not isinstance(state, IngestedURLState):
@@ -5413,6 +5409,18 @@ def record_ingested_urls(auth_context: Any, text: Any, labels: Any) -> None:
         normalized = normalize_sink_destination(SinkCategory.NETWORK, without_fragment)
         if normalized is not None:
             state.add(normalized)
+
+
+def record_ingested_urls(auth_context: Any, text: Any, labels: Any) -> None:
+    """Record URLs when IFC labels attest untrusted active ingest."""
+    from .models import InformationFlowLabels
+
+    if (
+        not isinstance(labels, InformationFlowLabels)
+        or not labels.has_untrusted_active_ingest
+    ):
+        return
+    record_external_ingested_urls(auth_context, text)
 
 
 def ingested_fetch_urls(auth_context: Any) -> frozenset[str]:

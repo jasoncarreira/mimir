@@ -56,7 +56,7 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 import yaml
 
-from ..models import AuthContext, InformationFlowLabels, SourceLabel
+from ..models import AuthContext
 from ..redaction import redact_text
 from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
@@ -78,7 +78,7 @@ from ..access_control import (
     ingested_fetch_urls,
     normalize_sink_destination,
     parse_service_shell_argv_with_diagnostics,
-    record_ingested_urls,
+    record_external_ingested_urls,
     resolve_repository_review_state,
     ServicePrincipal,
     ServiceShellBindingRule,
@@ -1811,25 +1811,14 @@ def _external_result_text(
 
 
 def _fetched_body_url_recorder(
-    auth_context: AuthContext | None, target: str | None,
+    auth_context: AuthContext | None,
 ) -> Callable[[str], None] | None:
     """Bind successful fresh fetch bytes to this exact turn's URL state."""
     if auth_context is None:
         return None
-    labels = InformationFlowLabels().with_source(SourceLabel(
-        principal=None,
-        domain="network",
-        resource_id=target or "fetch_url",
-        bridge_instance="fetch_url",
-        sensitivity="internal",
-        authorized_principals=frozenset(),
-        source_kind="protected_tool",
-        integrity="untrusted",
-        integrity_effect="active_ingest",
-    ))
 
     def record(text: str) -> None:
-        record_ingested_urls(auth_context, text, labels)
+        record_external_ingested_urls(auth_context, text)
 
     return record
 
@@ -1866,7 +1855,7 @@ def _merge_result_labels_from_result(
     if auth_context is not None and added is not None:
         text = _external_result_text(tool_name, added, result, failed=failed)
         if text is not None:
-            record_ingested_urls(auth_context, text, added)
+            record_external_ingested_urls(auth_context, text)
     _merge_result_labels(auth_context, added)
 
 
@@ -3345,9 +3334,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_fetched_body_recording
 
                 fetched_body_recorder_token = begin_fetched_body_recording(
-                    _fetched_body_url_recorder(
-                        auth_context, _extract_sink_target(request, auth_context),
-                    ),
+                    _fetched_body_url_recorder(auth_context),
                 )
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
@@ -3899,9 +3886,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                 from .web import begin_fetched_body_recording
 
                 fetched_body_recorder_token = begin_fetched_body_recording(
-                    _fetched_body_url_recorder(
-                        auth_context, _extract_sink_target(request, auth_context),
-                    ),
+                    _fetched_body_url_recorder(auth_context),
                 )
             if review_claim is not None and review_claim.duplicate:
                 result = _duplicate_review_result(request, review_claim)
