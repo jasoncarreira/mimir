@@ -11,6 +11,12 @@ All notable changes will land here. Format loosely follows
   identical tree reuses its green verify. Epic runs therefore take longer per
   slice. A source deployment must rebuild its image to install the new package
   and adapter pins.
+- Poller recovery and delivery-receipt behavior is now selected by each skill's
+  declared `hooks` profile instead of generic-runner name checks. Installed
+  `github-poller` and `chainlink-orchestrator` manifests must pick up their new
+  `hooks` fields through the normal startup auto-update or `mimir skills update`
+  for that behavior to remain active; startup logs and emits
+  `poller_hooks_undeclared` when an older reserved manifest is still installed.
 
 ## [0.9.1] — 2026-09-24
 

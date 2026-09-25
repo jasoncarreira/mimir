@@ -84,7 +84,6 @@ import logging
 import os
 import re
 import signal
-import stat
 import time
 import urllib.error
 import urllib.parse
@@ -92,7 +91,6 @@ import urllib.request
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from .background_io import run_in_pool
-from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -114,6 +112,14 @@ from .event_logger import log_event, log_event_sync, get_events_path, get_logger
 from .models import AgentEvent, InformationFlowLabels, SourceLabel
 from .redaction import redact_text
 from . import poller_recovery
+from .poller_hooks import (
+    PollerHooks,
+    github_recovery_relevance_check as _github_recovery_relevance_check,
+    reserved_hook_profile_for_name,
+    reserved_skill_for_name,
+    resolve_poller_hooks,
+    worklink_recovery_relevance_check as _worklink_recovery_relevance_check,
+)
 from .poller_budget import (
     PollerBudgetConfig,
     parse_poller_budget_config,
@@ -214,163 +220,49 @@ _GITHUB_PR_EVENT_TYPES = frozenset(
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 
 
-def _prune_worklink_delivery_receipts(persist_dir: Path, home: Path) -> None:
-    """Sweep occurrence receipts only after the failure ledger supersedes them.
-
-    Failure UUIDs are never reused; current unacknowledged occurrences, pending
-    factory transitions and all extant continuation sidecars remain protected,
-    without an age limit.
-    """
-    from .worklink.dispatch_failures import (
-        STATE_FILE,
-        _validate_merge_reconciliations,
-        dispatch_failure_state_dir,
-    )
-
+def _prune_delivery_receipts(poller: PollerConfig, home: Path | None = None) -> None:
+    """Run a poller's declared receipt-liveness sweep, if any."""
+    hook = poller.hooks.receipt_liveness if poller.hooks is not None else None
+    if hook is None:
+        return
     try:
-        if persist_dir.resolve() != dispatch_failure_state_dir(home).resolve():
-            return
-        with ExitStack() as stack:
-            # Anchor both cursor trees to the authoritative home. Refuse
-            # symlinked state ancestry rather than infer it from physical '..'.
-            home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-            stack.callback(os.close, home_fd)
-            parent_fd = home_fd
-            for component in ("state", "pollers", "worklink-ready-queue"):
-                root_fd = os.open(
-                    component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=parent_fd,
-                )
-                stack.callback(os.close, root_fd)
-                if component == "state":
-                    state_root_fd = root_fd
-                parent_fd = root_fd
+        persist_fd = os.open(
+            poller.resolved_persist_dir(),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
             receipts_fd = os.open(
-                _DELIVERY_RECEIPTS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=root_fd,
+                _DELIVERY_RECEIPTS_DIR,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=persist_fd,
             )
-            stack.callback(os.close, receipts_fd)
-            # Never sweep a receipt created after this snapshot. In particular,
-            # a concurrent sidecar producer must not lose a fresh acknowledgement.
+        finally:
+            os.close(persist_fd)
+        try:
             with os.scandir(receipts_fd) as entries:
                 candidates = {
                     entry.name for entry in entries
                     if re.fullmatch(r"[0-9a-f]{64}", entry.name)
                     and entry.is_file(follow_symlinks=False)
                 }
-            lock_fd = os.open(
-                f"{STATE_FILE}.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
-                0o600, dir_fd=root_fd,
-            )
-            stack.callback(os.close, lock_fd)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            state_fd = os.open(
-                STATE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd,
-            )
-            with os.fdopen(state_fd, encoding="utf-8") as handle:
-                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                    return
-                state = json.load(handle)
-                if (not isinstance(state, dict) or state.get("version") != 1
-                        or not isinstance(state.get("issues"), dict)):
-                    return
-                live = set()
-                for entry in state["issues"].values():
-                    if not isinstance(entry, dict):
-                        return
-                    issue = entry.get("issue_id")
-                    signature = entry.get("signature")
-                    notified = entry.get("notified_signatures")
-                    occurrence = entry.get("occurrence_id")
-                    if (type(issue) is not int or not isinstance(signature, str)
-                            or not signature or type(entry.get("active")) is not bool
-                            or not isinstance(notified, list)
-                            or not all(isinstance(value, str) for value in notified)
-                            or not (occurrence is None or isinstance(occurrence, str))):
-                        return
-                    if entry["active"] and signature not in notified:
-                        key = f"worklink-run-failure:{issue}:{signature}:{occurrence}"
-                        live.add(hashlib.sha256(key.encode()).hexdigest())
-                transitions = state.get("factory_transitions", {})
-                if not isinstance(transitions, dict):
-                    return
-                for key, entry in transitions.items():
-                    if not isinstance(entry, dict):
-                        return
-                    kind = entry.get("kind")
-                    issue = entry.get("issue_id")
-                    run = entry.get("run_id")
-                    attempt = entry.get("attempt")
-                    if (kind not in ("factory_start", "factory_success")
-                            or type(issue) is not int
-                            or not isinstance(run, str) or not run
-                            or type(attempt) is not int
-                            or type(entry.get("notified")) is not bool
-                            or not (entry.get("pr_url") is None or isinstance(entry["pr_url"], str))
-                            or key != f"worklink-{kind}:{issue}:{run}:{attempt}"
-                            or entry.get("delivery_key") != key):
-                        return
-                    if not entry["notified"]:
-                        live.add(hashlib.sha256(key.encode()).hexdigest())
-                reconciliations = _validate_merge_reconciliations(
-                    state.get("merge_reconciliations")
-                )
-                for key, entry in reconciliations["notices"].items():
-                    if not entry["notified"]:
-                        live.add(hashlib.sha256(key.encode()).hexdigest())
-                # The existing writer's directory fsync is best-effort. Require
-                # it here before allowing receipt deletion to become durable.
-                os.fsync(handle.fileno())
-            os.fsync(root_fd)
-            try:
-                worklink_fd = os.open(
-                    "worklink", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=state_root_fd,
-                )
-                stack.callback(os.close, worklink_fd)
-                continuation_fd = os.open(
-                    "continuations", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=worklink_fd,
-                )
-            except FileNotFoundError:
-                continuation_fd = None
-            if continuation_fd is not None:
-                stack.callback(os.close, continuation_fd)
-                with os.scandir(continuation_fd) as entries:
-                    for entry in entries:
-                        if not entry.name.endswith(".json"):
-                            continue
-                        fd = os.open(
-                            entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                            dir_fd=continuation_fd,
-                        )
-                        with os.fdopen(fd, encoding="utf-8") as handle:
-                            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                                return
-                            sidecar = json.load(handle)
-                        if (not isinstance(sidecar, dict)
-                                or sidecar.get("kind") != "worklink_tool_budget_continuation"):
-                            return
-                        key = sidecar.get("idempotency_key") or Path(entry.name).stem
-                        if not isinstance(key, str):
-                            return
-                        live.add(hashlib.sha256(f"worklink-continuation:{key}".encode()).hexdigest())
-            for name in candidates - live:
-                os.unlink(name, dir_fd=receipts_fd)
-            os.fsync(receipts_fd)
+
+            def prune_stale(live: object) -> None:
+                if not isinstance(live, (set, frozenset)) or not all(
+                    isinstance(name, str) and re.fullmatch(r"[0-9a-f]{64}", name)
+                    for name in live
+                ):
+                    raise ValueError("receipt liveness hook returned invalid digests")
+                for name in candidates - set(live):
+                    os.unlink(name, dir_fd=receipts_fd)
+                os.fsync(receipts_fd)
+
+            hook(poller.resolved_persist_dir(), home, prune_stale)
+        finally:
+            os.close(receipts_fd)
     except FileNotFoundError:
         pass
     except (OSError, ValueError, RuntimeError) as exc:
-        log.warning("Worklink receipt pruning skipped or incomplete: %s", exc)
-
-
-def _prune_delivery_receipts(poller: PollerConfig, home: Path | None = None) -> None:
-    """Only Worklink's occurrence/continuation contract supports this sweep."""
-    if poller.name == "worklink-ready-queue" and home is not None:
-        _prune_worklink_delivery_receipts(poller.resolved_persist_dir(), home)
+        log.warning("Poller %r receipt pruning skipped or incomplete: %s", poller.name, exc)
 
 
 def _write_delivery_receipt(persist_dir: Path, delivery_key: object) -> None:
@@ -922,135 +814,6 @@ def _github_framework_trigger_is_trusted(
     )
 
 
-def _github_recovery_relevance_check(
-    token: str,
-) -> poller_recovery.RelevanceFn:
-    """Build a per-poll-cycle, per-PR-cached actionability predicate.
-
-    A mixed batch is stale only when every item is an authoritatively closed PR.
-    Non-PR items and API uncertainty keep the batch actionable (fail open).
-    """
-    cache: dict[tuple[str, int], bool | None] = {}
-
-    async def check(event: AgentEvent) -> bool | None:
-        items = event.extra.get("items") if isinstance(event.extra, dict) else None
-        if not isinstance(items, list) or not items:
-            return None
-        saw_pr = False
-        saw_unknown = False
-        for item in items:
-            if not isinstance(item, dict):
-                saw_unknown = True
-                continue
-            event_type = item.get("event_type")
-            url = item.get("url")
-            is_pr = (
-                item.get("subject_type") == "pull_request"
-                or event_type in _GITHUB_PR_EVENT_TYPES
-                or (
-                    event_type == "issue_comment"
-                    and isinstance(url, str)
-                    and "/pull/" in urllib.parse.urlsplit(url).path
-                )
-            )
-            if not is_pr:
-                saw_unknown = True
-                continue
-            repo = item.get("repo")
-            number = item.get("number")
-            if isinstance(number, str) and number.isdigit():
-                number = int(number)
-            parts = repo.split("/") if isinstance(repo, str) else []
-            if (
-                len(parts) != 2
-                or not all(parts)
-                or not isinstance(number, int)
-                or isinstance(number, bool)
-                or number < 1
-            ):
-                saw_unknown = True
-                continue
-            saw_pr = True
-            key = (repo, number)
-            if key not in cache:
-                escaped_repo = "/".join(
-                    urllib.parse.quote(value, safe="") for value in parts
-                )
-                attestation = await run_in_pool(
-                    _ATTESTATION_POOL,
-                    _github_api_attestation,
-                    f"repos/{escaped_repo}/pulls/{number}",
-                    token,
-                )
-                if (
-                    attestation is None
-                    or attestation[0] != 200
-                    or not isinstance(attestation[1], dict)
-                    or attestation[1].get("state") not in {"open", "closed"}
-                ):
-                    cache[key] = None
-                else:
-                    cache[key] = attestation[1]["state"] == "open"
-            verdict = cache[key]
-            if verdict is True:
-                return True
-            if verdict is None:
-                saw_unknown = True
-        if saw_unknown or not saw_pr:
-            return None
-        return False
-
-    return check
-
-
-def _worklink_recovery_relevance_check(
-    persist_dir: Path,
-) -> poller_recovery.RelevanceFn:
-    """Validate the single incident identity immediately before execution."""
-    from .worklink.dispatch_failures import STATE_FILE
-
-    def current(event: AgentEvent) -> bool | None:
-        items = event.extra.get("items") if isinstance(event.extra, dict) else None
-        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
-            return None
-        item = items[0]
-        issue_id = item.get("issue_id")
-        signature = item.get("error_signature")
-        occurrence = item.get("failure_occurrence_id")
-        if (
-            not isinstance(issue_id, int)
-            or isinstance(issue_id, bool)
-            or not isinstance(signature, str)
-            or not signature
-            or not isinstance(occurrence, str)
-            or not occurrence
-        ):
-            return None
-        try:
-            payload = json.loads((persist_dir / STATE_FILE).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return False
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(payload, dict) or not isinstance(payload.get("issues"), dict):
-            return None
-        entry = payload["issues"].get(str(issue_id))
-        if entry is None:
-            return False
-        if not isinstance(entry, dict) or not isinstance(entry.get("active"), bool):
-            return None
-        return bool(
-            entry["active"]
-            and entry.get("signature") == signature
-            and entry.get("occurrence_id") == occurrence
-        )
-
-    async def check(event: AgentEvent) -> bool | None:
-        return await asyncio.to_thread(current, event)
-
-    return check
-
-
 # Pollers manifest schema version history:
 #
 #   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
@@ -1263,6 +1026,9 @@ class PollerConfig:
     #: Immutable, per-instance authority resolved from this manifest. ``None``
     #: means an explicit empty grant, never the former shared poller principal.
     authority: ServicePrincipal | None = None
+    #: Optional recovery and receipt-liveness behavior selected by the
+    #: operator-reviewed manifest, independent of the poller's runtime name.
+    hooks: PollerHooks | None = None
 
     def channel_id(self) -> str:
         """Synthetic channel for emitted events. Mirrors the
@@ -1369,11 +1135,7 @@ def _resolve_direct_child(candidate: Path, base: Path, *, label: str) -> Path:
 
 def _validate_poller_identity(name: str, manifest_path: Path) -> None:
     """Bind names with special server-side authority to their shipped skill identity."""
-    reserved_skills = {
-        "github-activity": "github-poller",
-        "worklink-ready-queue": "chainlink-orchestrator",
-    }
-    required_skill = reserved_skills.get(name)
+    required_skill = reserved_skill_for_name(name)
     if required_skill is not None and manifest_path.parent.name != required_skill:
         raise ValueError(
             f"reserved poller name {name!r} may only be declared by "
@@ -2055,6 +1817,33 @@ def discover_pollers(
                 if invalid_entries is not None:
                     invalid_entries.append((pollers_file, name, str(exc)))
                 continue
+            hooks_raw = entry.get("hooks")
+            try:
+                hooks = resolve_poller_hooks(hooks_raw, pollers_file)
+            except ValueError as exc:
+                log.warning(
+                    "poller_hooks_rejected: %s name=%r — %s; poller not registered",
+                    pollers_file, name, exc,
+                )
+                if invalid_entries is not None:
+                    invalid_entries.append((pollers_file, name, str(exc)))
+                continue
+            expected_hooks = reserved_hook_profile_for_name(name)
+            if expected_hooks is not None and hooks_raw is None:
+                log.warning(
+                    "poller_hooks_undeclared: %s name=%r expected_profile=%r — "
+                    "poller registered without reserved recovery hooks",
+                    pollers_file, name, expected_hooks,
+                )
+                try:
+                    log_event_sync(
+                        "poller_hooks_undeclared",
+                        path=str(pollers_file),
+                        poller=name,
+                        expected_profile=expected_hooks,
+                    )
+                except Exception:  # telemetry must not interrupt discovery
+                    pass
             misplaced_authority = (set(entry) & POLLER_AUTHORITY_FIELDS) - {"authority"}
             if misplaced_authority:
                 log.warning(
@@ -2360,6 +2149,7 @@ def discover_pollers(
                     deliver=deliver,
                     budget=budget,
                     authority=authority,
+                    hooks=hooks,
                 ),
             )
 
@@ -2561,13 +2351,9 @@ async def run_poller(
 
     persist_dir = poller.resolved_persist_dir()
     relevance_check = (
-        _github_recovery_relevance_check(
-            poller.env.get("GITHUB_TOKEN", "")
-            or os.environ.get("GITHUB_TOKEN", "")
-        )
-        if poller.name == "github-activity"
-        else _worklink_recovery_relevance_check(persist_dir)
-        if poller.name == "worklink-ready-queue"
+        poller.hooks.recovery_relevance(poller)
+        if poller.hooks is not None
+        and poller.hooks.recovery_relevance is not None
         else None
     )
 
