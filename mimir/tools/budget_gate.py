@@ -1756,9 +1756,58 @@ def _result_text(result: Any) -> str | None:
         messages = update.get("messages", ()) if isinstance(update, dict) else ()
         parts = [text for message in messages if (text := _result_text(message))]
         return "\n".join(parts) if parts else None
-    if isinstance(result, ToolException):
-        return str(result)
     return None
+
+
+_EXTERNAL_ORIGIN_URL_RESULT_TOOLS = frozenset({
+    "web_search",
+    "pr_job_log",
+    "pr_metadata",
+    "pr_files",
+    "pr_diff",
+    "pr_checks",
+    "pr_reviews",
+    "pr_comments",
+    "pr_review_requests",
+})
+_FETCH_CACHE_READ_TOOLS = frozenset({"Read", "read_file", "aread"})
+
+
+def _result_is_external_url_source(
+    tool_name: str, labels: Any, *, failed: bool,
+) -> bool:
+    """Identify server-attested external-origin result bodies.
+
+    Labels establish that bytes are untrusted active ingest; the tool and exact
+    result source establish that they came from outside the agent's writable
+    roots. Text content itself never decides eligibility.
+    """
+    if failed or not getattr(labels, "has_untrusted_active_ingest", False):
+        return False
+    if tool_name in _EXTERNAL_ORIGIN_URL_RESULT_TOOLS:
+        return True
+    if tool_name not in _FETCH_CACHE_READ_TOOLS:
+        return False
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return False
+    try:
+        cache_root = (Path(home_value).resolve(strict=True) / "attachments" / "fetch-cache")
+    except (OSError, RuntimeError):
+        return False
+    sources = tuple(getattr(labels, "sources", ()) or ())
+    if not sources:
+        return False
+    try:
+        return all(
+            getattr(source, "domain", None) == "filesystem"
+            and Path(getattr(source, "resource_id", "")).resolve(strict=True).is_relative_to(
+                cache_root.resolve(strict=True)
+            )
+            for source in sources
+        )
+    except (OSError, RuntimeError, TypeError):
+        return False
 
 
 def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
@@ -1782,10 +1831,19 @@ def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
 
 
 def _merge_result_labels_from_result(
-    auth_context: AuthContext | None, added: Any, result: Any,
+    auth_context: AuthContext | None,
+    added: Any,
+    result: Any,
+    *,
+    tool_name: str,
+    failed: bool,
 ) -> None:
-    """Record returned text, then pass through the established label merge seam."""
-    if auth_context is not None and added is not None:
+    """Record URLs only from server-attested external result sources, then merge."""
+    if (
+        auth_context is not None
+        and added is not None
+        and _result_is_external_url_source(tool_name, added, failed=failed)
+    ):
         record_ingested_urls(auth_context, _result_text(result), added)
     _merge_result_labels(auth_context, added)
 
@@ -3321,7 +3379,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels_from_result(auth_context, result_labels, exc)
+                _merge_result_labels_from_result(
+                    auth_context, result_labels, exc,
+                    tool_name=tool_name, failed=True,
+                )
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3389,7 +3450,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels_from_result(auth_context, result_labels, result)
+        _merge_result_labels_from_result(
+            auth_context, result_labels, result,
+            tool_name=tool_name, failed=is_error,
+        )
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,
@@ -3856,7 +3920,10 @@ class BudgetGateMiddleware(AgentMiddleware):
                     provenance=provenance,
                     failed=True,
                 )
-                _merge_result_labels_from_result(auth_context, result_labels, exc)
+                _merge_result_labels_from_result(
+                    auth_context, result_labels, exc,
+                    tool_name=tool_name, failed=True,
+                )
             _emit_tool_call_sync(
                 tool_name,
                 ok=False,
@@ -3924,7 +3991,10 @@ class BudgetGateMiddleware(AgentMiddleware):
             policy_refusal=policy_refusal,
             failed=is_error,
         )
-        _merge_result_labels_from_result(auth_context, result_labels, result)
+        _merge_result_labels_from_result(
+            auth_context, result_labels, result,
+            tool_name=tool_name, failed=is_error,
+        )
         duration_ms = (time.monotonic() - started) * 1000.0
         _emit_tool_call_sync(
             tool_name,

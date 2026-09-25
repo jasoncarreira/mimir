@@ -7033,6 +7033,22 @@ def test_admin_sensitive_tool_matches_mcp_name_variants():
     assert _is_admin_sensitive_tool("mcp_mimir_file_search")
 
 
+def _active_ingest_result_labels(
+    *, domain: str = "unknown", resource_id: str = "external",
+) -> InformationFlowLabels:
+    return InformationFlowLabels().with_source(SourceLabel(
+        principal=None,
+        domain=domain,
+        resource_id=resource_id,
+        bridge_instance="test",
+        sensitivity="internal",
+        authorized_principals=frozenset(),
+        source_kind="protected_tool",
+        integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+
+
 def test_result_urls_are_recorded_from_returned_text_not_arguments() -> None:
     ctx = _make_ctx()
     auth = ctx.auth_context
@@ -7052,10 +7068,90 @@ def test_result_urls_are_recorded_from_returned_text_not_arguments() -> None:
         result=result,
     )
 
-    _merge_result_labels_from_result(auth, labels, result)
+    _merge_result_labels_from_result(
+        auth, labels, result, tool_name="web_search", failed=False,
+    )
 
     assert auth.ingested_url_state.urls() == frozenset({result_url})
     assert argument_url not in auth.ingested_url_state.urls()
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "shell_exec", "hands_python"])
+def test_model_echo_result_does_not_contribute_verbatim_url(
+    tool_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _make_ctx().auth_context
+    composed = "https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+    result = ToolMessage(content=f"see {composed}", tool_call_id="echo")
+    labels = _active_ingest_result_labels()
+    if tool_name == "read_file":
+        home = tmp_path / "home"
+        writable = home / "state" / "notes.md"
+        writable.parent.mkdir(parents=True)
+        writable.write_text(f"see {composed}\n", encoding="utf-8")
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        labels = _active_ingest_result_labels(
+            domain="filesystem", resource_id=str(writable.resolve()),
+        )
+
+    _merge_result_labels_from_result(
+        auth,
+        labels,
+        result,
+        tool_name=tool_name,
+        failed=False,
+    )
+
+    assert auth.ingested_url_state.urls() == frozenset()
+
+
+@pytest.mark.parametrize("tool_name", ["web_search", "pr_comments"])
+def test_external_result_error_text_does_not_contribute_verbatim_url(
+    tool_name: str,
+) -> None:
+    auth = _make_ctx().auth_context
+    composed = "https://arxiv.org/abs/SECRET-FROM-MEMORY-abc123"
+    result = ToolMessage(
+        content=f"tool failed while processing {composed}",
+        tool_call_id="error-echo",
+        status="error",
+    )
+
+    labels = _active_ingest_result_labels()
+    _merge_result_labels_from_result(
+        auth,
+        labels,
+        result,
+        tool_name=tool_name,
+        failed=True,
+    )
+
+    assert auth.ingested_url_state.urls() == frozenset()
+
+
+def test_fetch_cache_body_read_contributes_external_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    body = home / "attachments" / "fetch-cache" / "paper.txt"
+    body.parent.mkdir(parents=True)
+    body.write_text("external", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _make_ctx().auth_context
+    target = "https://arxiv.org/abs/2609.30227"
+    result = ToolMessage(content=f"paper {target}", tool_call_id="cache-read")
+
+    _merge_result_labels_from_result(
+        auth,
+        _active_ingest_result_labels(
+            domain="filesystem", resource_id=str(body.resolve()),
+        ),
+        result,
+        tool_name="read_file",
+        failed=False,
+    )
+
+    assert auth.ingested_url_state.urls() == frozenset({target})
 
 
 @pytest.mark.asyncio
