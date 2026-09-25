@@ -2,11 +2,11 @@
 
 The web UI has one browser bootstrap path:
 
-- `GET /api/web/bootstrap` returns public, secret-free JSON describing whether `MIMIR_API_KEY` is required, the bind posture, and the stream auth shape.
+- `GET /api/v1/web/bootstrap` returns public, secret-free JSON describing whether `MIMIR_API_KEY` is required, the bind posture, and the stream auth shape.
 - `GET /app/auth.js` is the shared browser helper for legacy static pages during migration. It stores a user-entered key under `mimir.api_key` in browser localStorage and sends it as `X-API-Key`.
-- React uses one `AuthProvider` backed by `/api/web/bootstrap` and the same localStorage key.
+- React uses one `AuthProvider` backed by `/api/v1/web/bootstrap` and the same localStorage key.
 
-Both `/api/web/bootstrap` and the dynamic React app shell are served with `Cache-Control: no-store`. The bootstrap payload never includes `MIMIR_API_KEY`.
+Both `/api/v1/web/bootstrap` and the dynamic React app shell are served with `Cache-Control: no-store`. The bootstrap payload never includes `MIMIR_API_KEY`.
 
 ## Server Auth Policy
 

@@ -2351,7 +2351,7 @@ class TestAuthExemptSet:
 
     def test_browser_auth_bootstrap_is_exempt(self) -> None:
         assert ("GET", "/app/auth.js") in _AUTH_EXEMPT
-        assert ("GET", "/api/web/bootstrap") in _AUTH_EXEMPT
+        assert ("GET", "/api/web/bootstrap") not in _AUTH_EXEMPT
         assert ("GET", "/api/v1/web/bootstrap") in _AUTH_EXEMPT
 
     def test_skill_auto_update_event_reports_failures_without_drift(self) -> None:
@@ -2784,7 +2784,6 @@ def _auth_app(expected_key: str, *, web_host: str | None = None) -> web.Applicat
     app.router.add_get("/ops", _ok_handler)
     app.router.add_get("/saga", _ok_handler)
     app.router.add_get("/state", _ok_handler)
-    app.router.add_get("/api/web/bootstrap", _ok_handler)
     app.router.add_get("/api/v1/web/bootstrap", _ok_handler)
     return app
 

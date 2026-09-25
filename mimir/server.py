@@ -567,7 +567,7 @@ def _safe_str_eq(a: str, b: str) -> bool:
 # they carry no operator data or secrets, and browser code sends the key
 # in ``X-API-Key`` for protected JSON/stream routes. The data behind these
 # surfaces is auth-required — /turns and /ops serve only static-shaped HTML;
-# their data comes from /api/turns, /api/events, /api/ops which DO require auth.
+# their data comes from /api/turns and /api/ops, which DO require auth.
 #
 # Method-keyed (PR #104 review fix): if a future ``POST /turns`` is
 # ever added (e.g. for a server-side form), it inherits NO exemption.
@@ -580,7 +580,6 @@ _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/health"),
     ("GET", "/app"),
     ("GET", "/app/auth.js"),
-    ("GET", "/api/web/bootstrap"),
     ("GET", "/api/v1/web/bootstrap"),
     ("GET", "/turns"),
     ("GET", "/ops"),
@@ -716,7 +715,7 @@ def _make_auth_middleware(expected_key: str, web_host: str | None = None):
     Why middleware (vs per-handler checks):
 
     - The original code only gated ``POST /event``. Every other route —
-      ``/api/turns``, ``/api/events``, ``/api/ops``, ``/chat`` — was
+      ``/api/turns``, ``/api/v1/events``, ``/api/ops``, ``/chat`` — was
       open. Centralizing the gate here means new routes inherit
       protection by default; opting OUT requires adding the path to
       the exempt set, which is operator-visible.

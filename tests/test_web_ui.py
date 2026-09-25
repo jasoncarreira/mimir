@@ -1629,6 +1629,17 @@ async def test_api_turns_handles_missing_file(app):
 
 
 @pytest.mark.asyncio
+async def test_removed_unversioned_routes_return_404(app):
+    a, _, _ = app
+    async with TestClient(TestServer(a)) as client:
+        bootstrap = await client.get("/api/web/bootstrap")
+        events = await client.get("/api/events")
+
+    assert bootstrap.status == 404
+    assert events.status == 404
+
+
+@pytest.mark.asyncio
 async def test_log_read_failure_is_degraded_and_emits_once_per_path(
     app,
     monkeypatch: pytest.MonkeyPatch,
@@ -1652,8 +1663,7 @@ async def test_log_read_failure_is_degraded_and_emits_once_per_path(
     async with TestClient(TestServer(a)) as client:
         legacy_turns = await client.get("/api/turns?limit=2")
         repeated_turns = await client.get("/api/v1/turns?limit=2")
-        legacy_events = await client.get("/api/events")
-        repeated_events = await client.get("/api/v1/events")
+        events = await client.get("/api/v1/events")
         live_events = await client.get("/api/v1/live-events?once=1")
 
         assert await legacy_turns.json() == {"turns": [], "degraded": True}
@@ -1661,8 +1671,7 @@ async def test_log_read_failure_is_degraded_and_emits_once_per_path(
             "turns": [],
             "degraded": True,
         }
-        assert await legacy_events.json() == {"events": [], "degraded": True}
-        assert (await repeated_events.json())["data"] == {
+        assert (await events.json())["data"] == {
             "events": [],
             "degraded": True,
         }
@@ -1696,20 +1705,20 @@ async def test_empty_logs_are_healthy_empty_without_event(
 
     async with TestClient(TestServer(a)) as client:
         turns = await client.get("/api/turns?limit=2")
-        events = await client.get("/api/events")
+        events = await client.get("/api/v1/events")
         live_events = await client.get("/api/v1/live-events?once=1")
 
         assert turns.status == 200
         assert await turns.json() == {"turns": []}
         assert events.status == 200
-        assert await events.json() == {"events": []}
+        assert (await events.json())["data"] == {"events": []}
         assert "degraded" not in await live_events.text()
 
     assert emitted == []
 
 
 @pytest.mark.asyncio
-async def test_api_events_filters_by_type_and_limit(app):
+async def test_api_v1_events_filters_by_type_and_limit(app):
     a, _, events_log = app
     rows = [
         {"timestamp": "2026-01-01T00:00:00Z", "type": "turn_started"},
@@ -1720,35 +1729,34 @@ async def test_api_events_filters_by_type_and_limit(app):
     events_log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/events?type=tool_call")
-        body = await resp.json()
+        resp = await client.get("/api/v1/events?type=tool_call")
+        body = (await resp.json())["data"]
         assert all(e["type"] == "tool_call" for e in body["events"])
         assert len(body["events"]) == 2
 
         # Multiple types via repeated query param.
-        resp = await client.get("/api/events?type=turn_started&type=turn_finished")
-        body = await resp.json()
+        resp = await client.get("/api/v1/events?type=turn_started&type=turn_finished")
+        body = (await resp.json())["data"]
         assert {e["type"] for e in body["events"]} == {"turn_started", "turn_finished"}
 
         # Comma-joined form should work too.
-        resp = await client.get("/api/events?type=turn_started,turn_finished")
-        body = await resp.json()
+        resp = await client.get("/api/v1/events?type=turn_started,turn_finished")
+        body = (await resp.json())["data"]
         assert {e["type"] for e in body["events"]} == {"turn_started", "turn_finished"}
 
         # Limit returns the tail.
-        resp = await client.get("/api/events?limit=2")
-        body = await resp.json()
+        resp = await client.get("/api/v1/events?limit=2")
+        body = (await resp.json())["data"]
         assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
 
         # since= drops anything before the timestamp.
-        resp = await client.get("/api/events?since=2026-01-01T00:00:02Z")
-        body = await resp.json()
+        resp = await client.get("/api/v1/events?since=2026-01-01T00:00:02Z")
+        body = (await resp.json())["data"]
         assert [e["type"] for e in body["events"]] == ["tool_call", "turn_finished"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["/api/events?limit=2", "/api/v1/events?limit=2"])
-async def test_api_events_reads_jsonl_off_event_loop(monkeypatch, app, path):
+async def test_api_v1_events_reads_jsonl_off_event_loop(monkeypatch, app):
     """Dashboard polling must not tail/parse JSONL logs on the aiohttp loop."""
     a, _, events_log = app
     rows = [
@@ -1767,10 +1775,10 @@ async def test_api_events_reads_jsonl_off_event_loop(monkeypatch, app, path):
     monkeypatch.setattr(web_ui, "_read_jsonl", recording_read_jsonl)
 
     async with TestClient(TestServer(a)) as client:
-        resp = await client.get(path)
+        resp = await client.get("/api/v1/events?limit=2")
         body = await resp.json()
 
-    events = body.get("events") or body["data"]["events"]
+    events = body["data"]["events"]
     assert resp.status == 200
     assert [e["timestamp"] for e in events] == [
         "2026-01-01T00:00:02Z",
@@ -2562,34 +2570,7 @@ async def test_react_app_dist_can_use_live_deployment_build(
 
 
 @pytest.mark.asyncio
-async def test_web_bootstrap_is_no_store_and_secret_free(tmp_path: Path):
-    class _Config:
-        web_host = "0.0.0.0"
-
-    a = web.Application()
-    a["api_key"] = "super-secret"
-    a["config"] = _Config()
-    web_ui.register_routes(
-        a,
-        turns_log=tmp_path / "t.jsonl",
-        events_log=tmp_path / "e.jsonl",
-        react_app_dist=tmp_path / "missing-dist",
-    )
-
-    async with TestClient(TestServer(a)) as client:
-        resp = await client.get("/api/web/bootstrap")
-        body_text = await resp.text()
-        body = json.loads(body_text)
-
-    assert resp.status == 200
-    assert resp.headers["Cache-Control"].startswith("no-store")
-    assert "super-secret" not in body_text
-    assert set(body) == {"version", "auth"}
-    assert body["auth"] == {"required": True}
-
-
-@pytest.mark.asyncio
-async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
+async def test_api_v1_web_bootstrap_reports_resolved_empty_host_as_loopback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -2609,11 +2590,11 @@ async def test_web_bootstrap_reports_resolved_empty_host_as_loopback(
 
     async with TestClient(TestServer(a)) as client:
         resp = await client.get(
-            "/api/web/bootstrap", headers={"X-API-Key": "super-secret"},
+            "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
         )
         body = await resp.json()
 
-    assert body["server"] == {
+    assert body["data"]["server"] == {
         "web_host": "127.0.0.1",
         "public_bind": False,
         "unauthenticated_allowed": False,
@@ -3309,7 +3290,7 @@ async def test_api_v1_wiki_filesystem_reads_are_off_thread(
 
 
 @pytest.mark.asyncio
-async def test_both_web_bootstraps_limit_unauthenticated_operator_data(
+async def test_api_v1_web_bootstrap_limits_unauthenticated_operator_data(
     tmp_path: Path,
 ):
     from mimir.server import _make_auth_middleware
@@ -3336,23 +3317,15 @@ async def test_both_web_bootstraps_limit_unauthenticated_operator_data(
     )
 
     async with TestClient(TestServer(a)) as client:
-        public_v0 = await (await client.get("/api/web/bootstrap")).json()
         public_v1 = await (await client.get("/api/v1/web/bootstrap")).json()
-        full_v0 = await (await client.get(
-            "/api/web/bootstrap", headers={"X-API-Key": "super-secret"},
-        )).json()
         full_v1 = await (await client.get(
             "/api/v1/web/bootstrap", headers={"X-API-Key": "super-secret"},
         )).json()
 
-    assert set(public_v0) == {"version", "auth"}
-    assert public_v0["auth"] == {"required": True}
     validate_api_envelope(public_v1, expect_ok=True)
     assert set(public_v1["data"]) == {"version", "auth"}
     assert public_v1["data"]["auth"] == {"required": True}
-    assert "Private Agent Name" not in json.dumps(public_v0)
     assert "Private Agent Name" not in json.dumps(public_v1)
-    assert full_v0["server"]["public_bind"] is True
     assert full_v1["data"]["ui"]["agent_name"] == "Private Agent Name"
     assert full_v1["data"]["model"] == "private-model"
 
