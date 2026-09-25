@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.8. Repository
+  `verify` now runs on each slice, bootstrap runs before every verify, and an
+  identical tree reuses its green verify. Epic runs therefore take longer per
+  slice. A source deployment must rebuild its image to install the new package
+  and adapter pins.
+
 ## [0.9.1] — 2026-09-24
 
 Fixes the upgrade from 0.8.x. On 0.9.0, a SAGA store written by 0.8.x refused
