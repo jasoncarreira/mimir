@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mimir.config import DEFAULT_FOLDERS, _parse_folders
+from mimir.config import DEFAULT_FOLDERS, _parse_folders, configured_writable_dirs
 
 
 class TestParseFolders:
@@ -76,6 +76,29 @@ class TestParseFolders:
     def test_skips_empty_names(self) -> None:
         out = _parse_folders(":rw,state:rw,/:ro")
         assert out == {"state": "rw"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ["state", "memory", "conversation_history", "attachments", "scratch", "skills"]),
+        ("", ["state", "memory", "conversation_history", "attachments", "scratch", "skills"]),
+        ("alpha:rw,beta:ro,gamma:rw", ["alpha", "gamma"]),
+        ("alpha:ro,beta:ro", []),
+        (".:rw,..:rw", ["state", "memory", "conversation_history", "attachments", "scratch", "skills"]),
+    ],
+)
+def test_configured_writable_dirs_from_env(
+    raw: str | None,
+    expected: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if raw is None:
+        monkeypatch.delenv("MIMIR_FOLDERS", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_FOLDERS", raw)
+
+    assert configured_writable_dirs() == expected
 
 
 def test_writable_dirs_preserves_insertion_order(monkeypatch: pytest.MonkeyPatch) -> None:

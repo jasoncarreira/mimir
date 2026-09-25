@@ -2059,22 +2059,17 @@ def _declaration_error(
 def agent_writable_roots(home: Path | str | None = None) -> tuple[Path, ...]:
     """Directories the agent can write through its file tools.
 
-    Read from ``Config.folders`` so this tracks the real write guard rather than
-    a second copy of the list. Path-specific restrictions inside those roots are
-    applied by ``_agent_writable_root_for_path``.
+    Derived from the same ``MIMIR_FOLDERS`` policy as ``Config.writable_dirs``
+    without constructing a full ``Config``. Path-specific restrictions inside
+    those roots are applied by ``_agent_writable_root_for_path``.
     """
     root = Path(home or os.environ.get("MIMIR_HOME", "")).expanduser()
     if not str(root) or str(root) == ".":
         return ()
     root = root.resolve()
-    try:
-        from .config import Config
+    from .config import configured_writable_dirs
 
-        names = Config.from_env().writable_dirs
-    except Exception:  # noqa: BLE001 - fall back to the shipped default
-        from .config import DEFAULT_FOLDERS
-
-        names = [name for name, mode in DEFAULT_FOLDERS.items() if mode == "rw"]
+    names = configured_writable_dirs()
     roots: list[Path] = []
     for name in names:
         candidate = (root / name)
