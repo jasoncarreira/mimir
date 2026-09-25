@@ -7483,18 +7483,6 @@ def approve_live_declassification(
     return (True, "approved") if approved else (False, "approval_failed")
 
 
-def audit_declassification(
-    labels: Any,
-    declassification_reason: str,
-    auth_context: Any,
-    *,
-    destination: str,
-    policy_version: str = IFC_POLICY_VERSION,
-) -> Any:
-    """Deprecated no-op; only the live middleware action can authorize egress."""
-    return labels
-
-
 class ChannelResourceAdapter:
     """Resource-scoped adapter for channel messaging tools (chainlink #866).
 

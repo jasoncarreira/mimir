@@ -347,8 +347,11 @@ Labels are initialized before the first model call from inbound/folded messages,
 history, attachments, continuations, and preloaded server context. Automatic
 memory, session, skill, file, and other prompt injection is conservatively
 tainted `private`. Labels propagate into delegated/forked work, continuations,
-and resumed turns. Summarizing or transforming content cannot remove them;
-`audit_declassification()` is the only removal path and requires an admin.
+and resumed turns. Summarizing or transforming content cannot remove them.
+The only way to let labelled data reach an otherwise blocked sink is the
+audited, admin-approved `approve_declassification` flow. It grants one use of a
+specific sink category and destination on the live turn; it does not strip the
+source or sensitivity labels.
 
 `SinkCategory` and `_SINK_CATEGORY_MAP` classify channel egress, MCP, HTTP,
 network, shell, spawn, notification, and file destinations. `SinkGate.check_sink_flow()`:
