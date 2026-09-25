@@ -349,9 +349,11 @@ memory, session, skill, file, and other prompt injection is conservatively
 tainted `private`. Labels propagate into delegated/forked work, continuations,
 and resumed turns. Summarizing or transforming content cannot remove them.
 The only way to let labelled data reach an otherwise blocked sink is the
-audited, admin-approved `approve_declassification` flow. It grants one use of a
-specific sink category and destination on the live turn; it does not strip the
-source or sensitivity labels.
+audited, admin-approved `approve_declassification` flow. The declassification
+capability grants one use of a specific sink category and destination on the
+live turn; it does not strip the source or sensitivity labels. For a network
+sink, the approved destination additionally persists as an exact approved URL
+for the rest of the server-owned session.
 
 `SinkCategory` and `_SINK_CATEGORY_MAP` classify channel egress, MCP, HTTP,
 network, shell, spawn, notification, and file destinations. `SinkGate.check_sink_flow()`:
