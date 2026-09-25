@@ -78,6 +78,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+# One PyPI distribution name for both the daily check and update-on-start.
+from .version_check import _pypi_package_name
+
 log = logging.getLogger(__name__)
 
 # Flag-file path under the agent home. ``.mimir/`` is the same
@@ -613,12 +616,6 @@ def _read_flag(path: Path) -> PendingUpdate:
     )
 
 
-def _pypi_package_name() -> str:
-    """Defaults to ``"mimir-agent"``; ``MIMIR_PYPI_PACKAGE_NAME`` env
-    overrides for forks / pre-release channels. Same env var the
-    daily version-check uses, so an operator who sets it once gets
-    consistent behavior across both surfaces."""
-    return os.environ.get("MIMIR_PYPI_PACKAGE_NAME", "mimir-agent").strip() or "mimir-agent"
 
 
 def _install_spec(pkg: str, parsed: PendingUpdate) -> str:

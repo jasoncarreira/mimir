@@ -56,6 +56,7 @@ from langchain_core.tools import ToolException
 from langgraph.types import Command
 import yaml
 
+from ..env import env_bool
 from ..models import AuthContext
 from ..redaction import redact_text
 from .refusals import ToolPolicyRefusal
@@ -205,35 +206,6 @@ def _resolve_standing_review(
 # is exempt for the same operator-facing-acknowledgement reason.
 _BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
 
-_ADMIN_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "add_schedule",
-        "set_schedule_priority",
-        "remove_schedule",
-        "reload_pollers",
-        "open_proposal",
-        "submit_proposal",
-        "abandon_proposal",
-        "request_mimir_update",
-        "worklink_run",
-        "worklink_resume",
-        "shell_exec",
-        "bash_async",
-        "saga_forget",
-        # Deepagents built-in write tools mutate tracked state / repo files.
-        # Under access-control enforcement they have comparable blast radius
-        # to reload_pollers and proposal tools, so gate them explicitly rather
-        # than leaving file writes as a prompt-policy-only boundary.
-        "write_file",
-        "edit_file",
-    }
-)
-
-# PRODUCTION-DEAD (chainlink #895): This frozenset is never consulted in
-# the production code path. The authoritative admin-tool set lives in
-# access_control.py OperationCatalog._ADMIN_REQUIRED_OPERATIONS. Retained
-# for backwards compatibility with any external callers that might reference it.
-
 def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
     """Return the exact graph invocation's valid server-created auth carrier.
 
@@ -247,25 +219,6 @@ def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
     context = getattr(runtime, "context", None) if runtime is not None else None
     return context if isinstance(context, AuthContext) else None
 
-
-_ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "Bash",
-        "bash",
-        "bash_exec",
-        "execute",
-        "aexecute",
-        "shell",
-        "Write",
-        "Edit",
-    }
-)
-
-# PRODUCTION-DEAD (chainlink #895): This frozenset diverges from
-# access_control.py OperationCatalog._ADMIN_BUILTIN_TOOL_NAMES (which includes
-# "Read", "Glob", "Grep", "download_files") and is never consulted in the
-# production code path. The authoritative set is in access_control.py.
-# Retained for test compatibility but marked as deprecated.
 
 _HTTP_EVENT_ADMIN_DENIAL_REASON = "http_event_author_untrusted"
 
@@ -1970,12 +1923,7 @@ def _admin_denial_message(
 
 
 def _env_access_control_enforced() -> bool:
-    raw = os.environ.get("MIMIR_ACCESS_CONTROL_ENFORCED")
-    return bool(
-        raw is not None
-        and raw != ""
-        and raw.strip().lower() in {"1", "true", "yes", "on", "y"}
-    )
+    return env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False)
 
 
 def _turn_has_http_event_ingress(ctx: Any) -> bool:

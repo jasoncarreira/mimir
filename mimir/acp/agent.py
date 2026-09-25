@@ -36,6 +36,7 @@ from mimir.tools.client_provider import (
 )
 
 from .bridge import ACPBridge
+from .hands_contract import _thaw
 from .journal import JournalCache, JournalLease
 from .sdk import (
     AUTH_METHOD_ID,
@@ -1525,14 +1526,6 @@ def _strict_arguments(value: Mapping[str, Any]) -> dict[str, Any]:
     from .updates import _strict_json
     result = _strict_json(value)
     return result if isinstance(result, dict) else {}
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw(item) for item in value]
-    return value
 
 
 def _bounded_audit_text(value: Any) -> str | None:

@@ -21,7 +21,11 @@ from .models import (
     RepoPRActionScope,
     RepoReviewState,
 )
-from .worklink.checkout import _assert_self_contained_checkout, _clone_attempt_checkout
+from .worklink.checkout import (
+    _assert_self_contained_checkout,
+    _clone_attempt_checkout,
+    _default_runner,
+)
 
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
@@ -94,8 +98,6 @@ def _report_lease_acquired(
         pass
 
 
-def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
 @dataclass(frozen=True)

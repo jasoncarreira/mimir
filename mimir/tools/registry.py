@@ -53,6 +53,7 @@ from ..bridges._directives import (
     resolve_react_target,
 )
 from ..billing import PRIORITY_LEVELS
+from ..env import env_int_floor1 as _env_int_floor1
 from ..poller_budget import aggregate_poller_turn_usage
 from ..pollers import (
     PollerOverridesValidationError,
@@ -2081,48 +2082,7 @@ _SPAWN_DEPTH_ENV = "MIMIR_SPAWN_DEPTH"
 # from an allowlist: infrastructure vars the CLI needs to find binaries,
 # config, and a home, plus only the provider credentials that specific
 # CLI uses. New secrets added to the parent env are excluded by default.
-_CHILD_ENV_INFRA = (
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM",
-    "TMPDIR", "TMP", "TEMP", "TZ", "PWD", "NODE_EXTRA_CA_CERTS",
-    "SSL_CERT_FILE", "SSL_CERT_DIR",
-)
 # Prefixes for benign locale/desktop vars passed through wholesale.
-_CHILD_ENV_INFRA_PREFIXES = ("LC_", "XDG_")
-
-
-def _minimal_child_env(*, depth: int, cred_prefixes: tuple[str, ...]) -> dict[str, str]:
-    """Build a spawned-CLI env from an allowlist (#494): infra vars +
-    ``cred_prefixes``-matching credentials + ``MIMIR_SPAWN_DEPTH``.
-
-    Everything else in the parent ``os.environ`` (unrelated secrets) is
-    dropped. ``cred_prefixes`` is the set of provider-credential prefixes
-    the target CLI legitimately needs (e.g. ``("OPENAI_", "CODEX_")``
-    for codex)."""
-    env: dict[str, str] = {}
-    for key in _CHILD_ENV_INFRA:
-        val = os.environ.get(key)
-        if val is not None:
-            env[key] = val
-    for key, val in os.environ.items():
-        if key.startswith(_CHILD_ENV_INFRA_PREFIXES) or key.startswith(cred_prefixes):
-            env[key] = val
-    env[_SPAWN_DEPTH_ENV] = str(depth)
-    return env
-
-
-def _env_int_floor1(name: str, default: int) -> int:
-    """Read an int env var, defaulting if missing/invalid. Floors at 1
-    so an operator who sets ``=0`` doesn't accidentally disable all
-    spawns (the depth cap is the right tool for "no spawns")."""
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return default
-
-
 @dataclass
 class _SpawnGuard:
     """Process-wide state for spawn caps. Lazy-initialized on first
@@ -2234,37 +2194,6 @@ async def _spawn_release_rate_slot(guard: _SpawnGuard, token: float | None) -> N
             # The token may already have aged out during an unusually long
             # wait; either way, there is no live reservation to release.
             pass
-
-
-def _run_spawn_subprocess(
-    argv: list[str],
-    cwd: str | None,
-    timeout_s: int,
-    env: dict[str, str] | None = None,
-) -> tuple[int, str, str]:
-    """Sync subprocess.run wrapper — called from a thread via to_thread.
-
-    Keeping the blocking I/O in a helper that's invoked through
-    ``asyncio.to_thread`` keeps coding-tool spawns from freezing the
-    dispatcher's event loop for the duration of the subprocess (up to
-    ``timeout_s=1800`` by default). Returns (returncode, stdout, stderr)
-    or raises subprocess.TimeoutExpired / FileNotFoundError unchanged.
-
-    ``env`` (if set) replaces the inherited environment. The spawn
-    path always sets it so ``MIMIR_SPAWN_DEPTH`` is incremented for
-    the child, enforcing the recursion cap defense-in-depth.
-    """
-    proc = subprocess.run(  # noqa: S603 — argv is constructed, not shell
-        argv,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        env=env,
-        # Headless spawn: never inherit the parent's stdin.
-        stdin=subprocess.DEVNULL,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
 
 
 def _confined_artifact_base(artifact_root: str, home: str | Path) -> Path:

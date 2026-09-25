@@ -1493,25 +1493,9 @@ def create_server_discovered_review_scope(
     review_state: object = None,
 ) -> Any:
     """Issue standing review or fresh-remediation authority from a live PR."""
-    if (
-        not isinstance(pull_request, NormalizedPullRequestSnapshot)
-        or pull_request.state != "open"
-    ):
-        return None
-    return _repo_pr_scope(
-        provenance=RepoPRScopeProvenance.SERVER_DISCOVERED,
-        repo=repo,
-        principal=pull_request.author,
-        event_type="pr_review",
-        review_state=review_state,
-        number=pull_request.number,
-        head_repo=pull_request.head_repo,
-        head_remote=pull_request.head_remote,
-        head_ref=pull_request.head_ref,
-        head_sha=pull_request.head_sha,
-        base_ref=pull_request.base_ref,
-        base_sha=pull_request.base_sha,
-    )
+    return resolve_server_discovered_review_scope(
+        repo, pull_request, review_state=review_state,
+    ).scope
 
 
 def resolve_server_discovered_review_scope(
@@ -1617,16 +1601,6 @@ def _static_service_write_roots() -> list[Path]:
         *((artifact_root,) if artifact_root is not None else ()),
         Path("/tmp").resolve(),
     ]))
-
-
-def _target_within_configured_roots(target: str, _destination: str) -> bool:
-    from ._paths import PathOutsideHomeError, resolve_within_roots
-
-    try:
-        resolve_within_roots(_configured_file_roots(), target)
-    except (OSError, PathOutsideHomeError):
-        return False
-    return True
 
 
 def _target_within_configured_write_roots(target: str, _destination: str) -> bool:
@@ -3799,7 +3773,6 @@ def _operator_shell_binding_matches(
     return resolved is not None and str(resolved) == binding.resolved_cwd
 
 
-_OPERATOR_CWD_REFUSAL = "operator shell cwd confinement failed"
 _OPERATOR_READ_REFUSAL = "operator shell reader confinement failed"
 _OPERATOR_READER_EXCLUDED_REFUSAL = "operator shell reader is not eligible for binding"
 _OPERATOR_GIT_REFUSAL = "operator shell Git hardening failed"
@@ -8032,18 +8005,6 @@ class OperationCatalog:
 
         return OperationDecision.UNKNOWN
 
-    def get_scopes(
-        self,
-        tool_name: str,
-    ) -> list[ResourceScope] | None:
-        """Get resource scopes for a RESOURCE_SCOPED operation."""
-        return self._resource_scoped_operations.get(tool_name)
-
-    def is_known(self, tool_name: str) -> bool:
-        """Check if a tool is known (has a non-UNKNOWN decision)."""
-        return self.get_decision(tool_name) != OperationDecision.UNKNOWN
-
-
 _global_operation_catalog = OperationCatalog()
 
 _global_operation_catalog.register_adapter_hook(
@@ -10049,16 +10010,6 @@ def _configured_pr_checkout_lease_root() -> Path | None:
     return resolved if resolved.is_dir() else None
 
 
-def _resolved_path_contains(root: object, resource: Path) -> bool:
-    if not isinstance(root, (str, Path)):
-        return False
-    try:
-        resource.relative_to(Path(root).resolve(strict=True))
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return True
-
-
 def publish_framework_files(
     home: Path,
     files: Mapping[Path, bytes],
@@ -10707,11 +10658,6 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
         ),
     )
 }
-
-
-def register_service_principal(service: ServicePrincipal) -> None:
-    """Register a trusted autonomous service principal."""
-    _TRUSTED_SERVICE_PRINCIPALS[service.trigger] = service
 
 
 _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
@@ -11384,11 +11330,6 @@ def get_provenance_from_auth_context(
         "event_ingress": getattr(auth_context, "event_ingress", None),
         "is_service": service is not None,
     }
-
-
-def _find_service_principal_for_trigger(trigger: str) -> ServicePrincipal | None:
-    """Find a service principal that matches the given trigger."""
-    return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
 
 
 @dataclass(frozen=True)

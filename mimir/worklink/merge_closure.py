@@ -19,6 +19,7 @@ import yaml
 from ..redaction import redact_text
 from ..repository_config import RepositoryConfig, RepositoryInventory
 from .backends import WorklinkConfig
+from .checkout import _default_runner
 from .dispatch_failures import (
     active_failure_identities,
     current_failure_identity,
@@ -794,8 +795,6 @@ def _process_intent(
     return None
 
 
-def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
 def reconcile_merged_leaves(

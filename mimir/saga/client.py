@@ -1275,32 +1275,6 @@ class SagaStore:
                     seen.add(atom_id)
         return atom_ids
 
-    async def _session_boundary_atom_pathway(
-        self,
-        query: str,
-        *,
-        limit: int = 3,
-        alpha: float = 0.7,
-        atoms_per_session: int = 30,
-    ) -> list[str]:
-        def _do():
-            conn, should_close = self._operation_conn()
-            try:
-                return self._session_boundary_atom_pathway_with_conn(
-                    conn,
-                    query,
-                    limit=limit,
-                    alpha=alpha,
-                    atoms_per_session=atoms_per_session,
-                )
-            finally:
-                if should_close:
-                    conn.close()
-
-        if self._db_path is None:
-            return await self._db_locked(_do)
-        return await self._run_worker(_do)
-
     async def get_atoms(
         self, ids: list[str], auth_context: Any = None
     ) -> dict[str, Any]:

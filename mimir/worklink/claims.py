@@ -20,6 +20,8 @@ import subprocess
 import time
 from typing import Any, Callable, Iterable, Sequence
 
+from .checkout import _default_runner
+
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
 
@@ -99,8 +101,6 @@ def scope_active_worklink_lock_ids(
     return scoped
 
 
-def _default_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
 def _is_git_contention(result: subprocess.CompletedProcess[str]) -> bool:

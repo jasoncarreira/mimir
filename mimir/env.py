@@ -29,3 +29,14 @@ def env_bool(name: str, default: bool, *, logger: logging.Logger | None = None) 
             default,
         )
     return default
+
+
+def env_int_floor1(name: str, default: int) -> int:
+    """Read an int env var, defaulting when missing or invalid, floored at 1."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default

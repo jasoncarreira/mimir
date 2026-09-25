@@ -24,14 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import random
+import math
 import time
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from typing import Any
 
-from mimir._llm_retry import _is_retryable_error
+from mimir._llm_retry import (
+    _calculate_delay,
+    _is_retryable_error,
+    _resolve_env_float,
+    _resolve_env_int,
+)
 
 log = logging.getLogger(__name__)
 
@@ -43,41 +47,6 @@ _CODEX_STREAM_CHUNK_FAST_PATH: ContextVar[bool] = ContextVar(
 )
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BASE_DELAY_SECONDS = 0.5
-
-
-def _retry_attempts() -> int:
-    raw = os.environ.get("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS", "").strip()
-    if not raw:
-        return _DEFAULT_MAX_ATTEMPTS
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        log.warning(
-            "invalid MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS=%r; using %s",
-            raw, _DEFAULT_MAX_ATTEMPTS,
-        )
-        return _DEFAULT_MAX_ATTEMPTS
-
-
-def _retry_base_delay() -> float:
-    raw = os.environ.get("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY", "").strip()
-    if not raw:
-        return _DEFAULT_BASE_DELAY_SECONDS
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        log.warning(
-            "invalid MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY=%r; using %.2f",
-            raw, _DEFAULT_BASE_DELAY_SECONDS,
-        )
-        return _DEFAULT_BASE_DELAY_SECONDS
-
-
-def _calculate_delay(attempt: int, base_delay: float) -> float:
-    """Calculate exponential backoff delay with jitter."""
-    delay = base_delay * (2 ** (attempt - 1))
-    jitter = random.uniform(0, 0.5 * delay)
-    return delay + jitter
 
 
 def install_codex_plus_transient_retry_patch(ChatCodexPlus: type[Any] | None = None) -> None:
@@ -146,8 +115,10 @@ def _patch_astream(ChatCodexPlus: type[Any]) -> None:
         return
 
     async def _patched_astream(self: Any, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        attempts = _retry_attempts()
-        base_delay = _retry_base_delay()
+        attempts = _resolve_env_int("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS", _DEFAULT_MAX_ATTEMPTS)
+        base_delay = _resolve_env_float(
+            "MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY", _DEFAULT_BASE_DELAY_SECONDS,
+        )
         for attempt in range(1, attempts + 1):
             yielded = False
             stream = original(self, *args, **kwargs)
@@ -169,7 +140,7 @@ def _patch_astream(ChatCodexPlus: type[Any]) -> None:
                 is_retryable, reason = _is_retryable_error(exc, provider="codex_plus")
                 if not is_retryable:
                     raise
-                delay = _calculate_delay(attempt, base_delay)
+                delay = _calculate_delay(attempt, base_delay, math.inf)
                 log.warning(
                     "ChatCodexPlus._astream transient %s (reason=%s) before first chunk; "
                     "retrying attempt %s/%s after %.2fs: %s",
@@ -191,8 +162,10 @@ def _patch_generate(ChatCodexPlus: type[Any]) -> None:
         return
 
     def _patched_generate(self: Any, *args: Any, **kwargs: Any) -> Any:
-        attempts = _retry_attempts()
-        base_delay = _retry_base_delay()
+        attempts = _resolve_env_int("MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS", _DEFAULT_MAX_ATTEMPTS)
+        base_delay = _resolve_env_float(
+            "MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY", _DEFAULT_BASE_DELAY_SECONDS,
+        )
         for attempt in range(1, attempts + 1):
             try:
                 return original(self, *args, **kwargs)
@@ -202,7 +175,7 @@ def _patch_generate(ChatCodexPlus: type[Any]) -> None:
                 is_retryable, reason = _is_retryable_error(exc, provider="codex_plus")
                 if not is_retryable:
                     raise
-                delay = _calculate_delay(attempt, base_delay)
+                delay = _calculate_delay(attempt, base_delay, math.inf)
                 log.warning(
                     "ChatCodexPlus._generate transient %s (reason=%s); retrying attempt "
                     "%s/%s after %.2fs: %s",

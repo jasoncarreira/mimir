@@ -49,6 +49,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .billing import normalize_priority
+from .env import env_int_floor1
 from .background_io import run_in_pool
 from .background_tasks import cancel_background_tasks, spawn_background
 from .access_control import (
@@ -912,15 +913,6 @@ class Scheduler:
         # ``add_poller_jobs`` runs (most installs no-op cleanly).
         self._pollers_dir: Path | None = None
         self._pollers: dict[str, PollerConfig] = {}
-        # Snapshot of the most-recent reload's invalid-manifest events
-        # (chainlink #84, PR #141 review). Cleared and re-populated on
-        # each ``add_poller_jobs`` / ``reload_pollers`` call. Read by the
-        # ``mcp__mimir__reload_pollers`` MCP tool to surface a warning
-        # in the operator-visible reply (events.jsonl already carries
-        # the full payload — this just lets the MCP layer flag
-        # "1 manifest failed to parse — see events.jsonl" inline). An
-        # empty list means "last reload had no parse failures."
-        self._last_invalid_manifest_events: list[dict[str, Any]] = []
         # Global concurrency cap on poller subprocess fan-out.
         # ``MIMIR_MAX_CONCURRENT_POLLERS`` (default 8) bounds how many
         # ``run_poller`` invocations can be in-flight at once. Without a
@@ -931,11 +923,7 @@ class Scheduler:
         # doesn't apply here because pollers run BEFORE events get
         # enqueued. Default 8 is generous for typical 5-10 skill
         # deployments while throttling buggy fork-bomb skills.
-        try:
-            cap = int(os.environ.get("MIMIR_MAX_CONCURRENT_POLLERS", "8"))
-        except ValueError:
-            cap = 8
-        cap = max(1, cap)  # 0 / negative → 1 (degenerate single-fire)
+        cap = env_int_floor1("MIMIR_MAX_CONCURRENT_POLLERS", 8)  # 0 / negative → 1
         self._poller_semaphore = asyncio.Semaphore(cap)
         self._poller_concurrency_cap = cap
         # Direct completion triggers share the timed path and serialize with it
@@ -1077,10 +1065,12 @@ class Scheduler:
                 load_jobs, self._yaml_path,
             )
         else:
+            home = self._home
+            # Resolve writable roots in the worker too; it reads config and repos.
             yaml_jobs, rejections = await asyncio.to_thread(
-                load_jobs,
-                self._yaml_path,
-                writable_roots=agent_writable_roots(self._home),
+                lambda: load_jobs(
+                    self._yaml_path, writable_roots=agent_writable_roots(home),
+                ),
             )
         return self._apply_reload(yaml_jobs, rejections)
 
@@ -1852,13 +1842,6 @@ class Scheduler:
         installed, invalid_events, invalid_entry_events, invalid_cron_events = (
             self._reinstall_pollers()
         )
-        # Snapshot for the MCP reply (PR #141 review item #1+2).
-        # ``installed`` returned here is the count of pollers
-        # freshly registered in Phase 3 — at bootstrap time there
-        # are no preserved entries, so this equals the live total.
-        # ``reload_pollers`` (below) overrides with the live total
-        # to handle the preserved case correctly.
-        self._last_invalid_manifest_events = list(invalid_events)
         self._dispatch_reload_events(
             "poller_reload_invalid_manifest", invalid_events,
         )
@@ -1897,7 +1880,6 @@ class Scheduler:
         poller (i.e. operator intentionally removed it).
         """
         if self._pollers_dir is None:
-            self._last_invalid_manifest_events = []
             return {"registered": 0, "replaced": 0, "removed": 0, "total": 0}
         async with self._mutate_lock:
             (
@@ -1919,12 +1901,6 @@ class Scheduler:
             # under the mutate lock so concurrent reloads can't
             # observe a torn snapshot.
             live_total = len(self._pollers)
-        # PR #141 review item #1: snapshot for the MCP reply so the
-        # operator-visible response can flag "X manifest(s) failed to
-        # parse — see events.jsonl" inline. Set before emitting the
-        # algedonic events to keep the snapshot consistent with what
-        # the MCP layer reads.
-        self._last_invalid_manifest_events = list(invalid_events)
         # Emit invalid-manifest algedonic events from the awaited
         # caller (we have a running loop here, unlike inside the
         # ``to_thread`` worker). Outside the mutate lock — the events
@@ -2364,12 +2340,6 @@ class Scheduler:
                     }, turn_headroom
         return None, turn_headroom
 
-    def _poller_budget_exceeded(
-        self, poller: PollerConfig, *, now: datetime | None = None,
-    ) -> dict[str, Any] | None:
-        """Return the persisted-usage suppression payload for ``poller``."""
-        return self._poller_budget_status(poller, now=now)[0]
-
     async def _fire_poller(
         self,
         *,
@@ -2738,20 +2708,6 @@ class Scheduler:
             }
             for p in sorted(self._pollers.values(), key=lambda p: p.name)
         ]
-
-    def last_invalid_manifest_events(self) -> list[dict[str, Any]]:
-        """Snapshot of the most-recent reload's invalid-manifest event
-        payloads (chainlink #84, PR #141 review item #1). Returns a
-        copy so callers can't mutate scheduler state. Read by the
-        ``mcp__mimir__reload_pollers`` MCP tool to flag parse
-        failures in the operator-visible reply.
-
-        Each payload has the same shape as the
-        ``poller_reload_invalid_manifest`` event in events.jsonl:
-        ``{"manifest_path": str, "error": str,
-        "preserved_pollers": list[str]}``. Empty list when the last
-        reload had no parse failures."""
-        return list(self._last_invalid_manifest_events)
 
     # ---- SAGA consolidation cron -------------------------------------
 
