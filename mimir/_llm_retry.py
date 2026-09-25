@@ -85,9 +85,12 @@ def _is_retryable_error(exc: BaseException, provider: str | None = None) -> tupl
 
     Returns (is_retryable, reason) tuple.
     """
-    kind = classify_provider_error(exc, provider)
-    retryable = kind in {ProviderErrorKind.RATE_LIMIT, ProviderErrorKind.TRANSIENT}
-    return retryable, f"provider_error_{kind.value}:{type(exc).__name__}"
+    classification = classify_provider_error(exc, provider)
+    retryable = classification.kind in {
+        ProviderErrorKind.RATE_LIMIT,
+        ProviderErrorKind.TRANSIENT,
+    }
+    return retryable, f"provider_error_{classification.kind.value}:{type(exc).__name__}"
 
 
 def _calculate_delay(attempt: int, base_delay: float, max_delay: float) -> float:

@@ -39,6 +39,14 @@ class RateLimitError(Exception):
     pass
 
 
+class AnthropicError(Exception):
+    pass
+
+
+class CodexResponseError(Exception):
+    pass
+
+
 def _response_error(status: int, message: str) -> Exception:
     exc = Exception(message)
     exc.response = SimpleNamespace(status_code=status)  # type: ignore[attr-defined]
@@ -57,6 +65,211 @@ _NONEMPTY_STRUCTURED_OUTPUT = StructuredOutputValidationError(
 )
 
 
+def _legacy_status(exc: BaseException) -> int | None:
+    raw = getattr(exc, "status_code", None)
+    if raw is None:
+        raw = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _legacy_retry(exc: BaseException, provider: str | None) -> bool:
+    """Frozen boolean behavior of main before the shared classifier."""
+    name = type(exc).__name__
+    lowered_name = name.lower()
+    message = str(exc).lower()
+    status = _legacy_status(exc)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+
+    if name in {"AuthenticationError", "AuthorizationError", "PermissionError"}:
+        return False
+    if "unauthorized" in message or "forbidden" in message:
+        return False
+    if name in {"BadRequestError", "BadRequest"} or "bad request" in message:
+        return False
+    if any(
+        phrase in message
+        for phrase in (
+            "context length",
+            "max tokens",
+            "too long",
+            "maximum context",
+            "content policy",
+            "content policy violation",
+            "safety policy",
+            "prohibited",
+        )
+    ):
+        return False
+
+    if name in {
+        "ReadError",
+        "ConnectError",
+        "RemoteProtocolError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "Timeout",
+        "ConnectionError",
+    } or any(
+        phrase in message
+        for phrase in (
+            "connection reset",
+            "connection refused",
+            "connection timeout",
+            "read timeout",
+            "timed out",
+            "temporary failure",
+            "name or service not known",
+        )
+    ):
+        return True
+
+    if provider == "anthropic" or "anthropic" in lowered_name:
+        if name in {"RateLimitError", "OverloadedError"}:
+            return True
+        if "overloaded" in message or "service unavailable" in message:
+            return True
+    if provider == "openai_compat" or "openai" in lowered_name:
+        if name == "RateLimitError" or "service unavailable" in message:
+            return True
+    if provider == "codex_plus" or "codex" in lowered_name:
+        if name == "CodexResponseError" or "codexresponseerror" in message:
+            if any(
+                phrase in message
+                for phrase in (
+                    "you can retry",
+                    "rate limit",
+                    "too many requests",
+                    "overloaded",
+                    "temporarily unavailable",
+                )
+            ):
+                return True
+
+    return any(
+        phrase in message
+        for phrase in (
+            "rate limit",
+            "too many requests",
+            "5xx",
+            "internal server error",
+            "server error",
+        )
+    )
+
+
+def _legacy_pause(exc: BaseException) -> bool:
+    """Frozen boolean behavior of main before the shared classifier."""
+    if "RateLimit" in type(exc).__name__:
+        return True
+    if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+        return True
+    message = str(exc).lower()
+    return (
+        "429" in message
+        or "rate limit" in message
+        or "rate_limit" in message
+        or (
+            "quota" in message
+            and any(phrase in message for phrase in ("exhaust", "exceed", "limit"))
+        )
+    )
+
+
+def _synthetic_error(class_name: str, message: str, status: int | None, shape: str) -> BaseException:
+    exc = type(class_name, (Exception,), {})(message)
+    if status is not None:
+        if shape == "attribute":
+            exc.status_code = status  # type: ignore[attr-defined]
+        else:
+            exc.response = SimpleNamespace(status_code=status)  # type: ignore[attr-defined]
+    return exc
+
+
+def test_shared_classifier_preserves_legacy_decisions_over_cross_product() -> None:
+    """Differential guard: behavior may move only through reviewed allow-lists."""
+    class_names = (
+        "Exception",
+        "AnthropicError",
+        "OpenAIError",
+        "CodexResponseError",
+        "RateLimitError",
+        "OverloadedError",
+        "AuthenticationError",
+        "BadRequestError",
+        "ConnectionError",
+    )
+    messages = (
+        "plain failure",
+        "overloaded",
+        "service unavailable",
+        "you can retry your request",
+        "rate limit exceeded",
+        "too many requests",
+        "HTTP 429",
+        "quota exceeded",
+        "bad request: rate limit",
+        "unauthorized",
+        "context length exceeded",
+        "content policy violation",
+        "connection reset",
+        "internal server error",
+    )
+    statuses = (None, 400, 403, 429, 500, 503)
+    providers = (None, "anthropic", "openai_compat", "codex_plus")
+
+    for class_name in class_names:
+        for message in messages:
+            for status in statuses:
+                for shape in ("attribute", "response"):
+                    for provider in providers:
+                        exc = _synthetic_error(class_name, message, status, shape)
+                        old_retry = _legacy_retry(exc, provider)
+                        new_retry = _is_retryable_error(exc, provider)[0]
+                        old_pause = _legacy_pause(exc)
+                        new_pause = is_quota_exhaustion(exc)
+
+                        # Deliberate retry gain: provider-independent recognition
+                        # of RateLimit-named exceptions without structured status.
+                        retry_gain_allowed = (
+                            not old_retry
+                            and new_retry
+                            and status is None
+                            and "RateLimit" in class_name
+                        )
+                        assert new_retry == old_retry or retry_gain_allowed, (
+                            class_name,
+                            message,
+                            status,
+                            shape,
+                            provider,
+                            old_retry,
+                            new_retry,
+                        )
+
+                        # Deliberate pause gain: a top-level 429 is now recognized
+                        # in addition to the legacy response.status_code shape.
+                        pause_gain_allowed = (
+                            not old_pause
+                            and new_pause
+                            and status == 429
+                            and shape == "attribute"
+                        )
+                        assert new_pause == old_pause or pause_gain_allowed, (
+                            class_name,
+                            message,
+                            status,
+                            shape,
+                            provider,
+                            old_pause,
+                            new_pause,
+                        )
+
+
 @pytest.mark.parametrize(
     ("exc", "provider", "kind", "retry", "pause"),
     [
@@ -73,7 +286,9 @@ _NONEMPTY_STRUCTURED_OUTPUT = StructuredOutputValidationError(
         (_HTTPError(500, "internal server error"), None, ProviderErrorKind.TRANSIENT, True, False),
         (_HTTPError(400, "bad request: invalid schema"), None, ProviderErrorKind.CLIENT, False, False),
         (_HTTPError(400, "prompt is too long"), None, ProviderErrorKind.CLIENT, False, False),
-        (_HTTPError(400, "rate limit exceeded"), None, ProviderErrorKind.CLIENT, False, False),
+        # Retry still fails fast on a 400, but quota pause preserves main's
+        # message-sensitive brake instead of trusting the wrapper status alone.
+        (_HTTPError(400, "rate limit exceeded"), None, ProviderErrorKind.CLIENT, False, True),
         (_HTTPError(401), None, ProviderErrorKind.CLIENT, False, False),
         (_HTTPError(403), None, ProviderErrorKind.CLIENT, False, False),
         (Exception("context length exceeded"), None, ProviderErrorKind.CLIENT, False, False),
@@ -133,7 +348,7 @@ def test_provider_error_decision_table(
     retry: bool,
     pause: bool,
 ) -> None:
-    assert classify_provider_error(exc, provider) is kind
+    assert classify_provider_error(exc, provider).kind is kind
     assert _is_retryable_error(exc, provider)[0] is retry
     assert is_quota_exhaustion(exc) is pause
     assert not (kind is ProviderErrorKind.TRANSIENT and retry and pause)

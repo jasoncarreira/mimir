@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from ._atomic import atomic_write_json
-from ._provider_errors import ProviderErrorKind, classify_provider_error
+from ._provider_errors import classify_provider_error
 
 log = logging.getLogger(__name__)
 
@@ -691,5 +691,4 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
 
 def is_quota_exhaustion(exc: BaseException) -> bool:
     """Return whether an upstream refusal should activate quota pause."""
-    kind = classify_provider_error(exc)
-    return kind in {ProviderErrorKind.RATE_LIMIT, ProviderErrorKind.QUOTA}
+    return classify_provider_error(exc).quota_exhausted

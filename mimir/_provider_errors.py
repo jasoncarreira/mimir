@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+
+@dataclass(frozen=True)
+class ProviderErrorClassification:
+    """Typed policy inputs derived from one pass over a provider error.
+
+    ``kind`` drives immediate retry behavior. ``quota_exhausted`` is an
+    independent, deliberately more sensitive brake: a client-status wrapper can
+    still carry a trustworthy rate-limit message and should activate pause
+    without making that same request retryable.
+    """
+
+    kind: "ProviderErrorKind"
+    quota_exhausted: bool
 
 
 class ProviderErrorKind(Enum):
@@ -158,62 +173,105 @@ def _is_empty_structured_output_validation_error(exc: BaseException) -> bool:
     return _message_content_is_blank(ai_message)
 
 
-def _effective_provider(provider: str | None, class_name: str) -> str | None:
-    if provider is not None:
-        return provider
+def _effective_providers(provider: str | None, class_name: str) -> frozenset[str]:
+    """Return every provider indicated explicitly or by the exception class."""
+    providers = {provider} if provider is not None else set()
     lowered = class_name.lower()
     if "anthropic" in lowered:
-        return "anthropic"
+        providers.add("anthropic")
     if "openai" in lowered:
-        return "openai_compat"
+        providers.add("openai_compat")
     if "codex" in lowered:
-        return "codex_plus"
-    return None
+        providers.add("codex_plus")
+    return frozenset(providers)
+
+
+def _message_signals_quota(message: str) -> bool:
+    return (
+        "429" in message
+        or "rate limit" in message
+        or "rate_limit" in message
+        or (
+            "quota" in message
+            and any(phrase in message for phrase in ("exhaust", "exceed", "limit"))
+        )
+    )
+
+
+def _message_signals_client(message: str) -> bool:
+    client_phrases = _PHRASE_TABLE[0][1]
+    return any(phrase in message for phrase in client_phrases)
 
 
 def classify_provider_error(
     exc: BaseException,
     provider: str | None = None,
-) -> ProviderErrorKind:
-    """Classify an LLM provider error from structured evidence before text."""
+) -> ProviderErrorClassification:
+    """Classify retry policy and quota-pause policy from one evidence pass."""
+    class_name = exc.__class__.__name__
+    message = str(exc).lower()
     status = _http_status_code(exc)
+    response_status = getattr(getattr(exc, "response", None), "status_code", None)
+    quota_exhausted = (
+        "RateLimit" in class_name
+        or status == 429
+        # Preserve the legacy pause path even when a wrapper also exposes a
+        # different top-level status code.
+        or response_status == 429
+        or _message_signals_quota(message)
+    )
+
     if status is not None:
         if status == 429:
-            return ProviderErrorKind.RATE_LIMIT
-        if 500 <= status < 600:
-            return ProviderErrorKind.TRANSIENT
-        if 400 <= status < 500:
-            return ProviderErrorKind.CLIENT
-        return ProviderErrorKind.UNKNOWN
+            kind = ProviderErrorKind.RATE_LIMIT
+        elif 500 <= status < 600:
+            kind = ProviderErrorKind.TRANSIENT
+        elif 400 <= status < 500:
+            kind = ProviderErrorKind.CLIENT
+        else:
+            kind = ProviderErrorKind.UNKNOWN
+        return ProviderErrorClassification(kind, quota_exhausted)
 
-    class_name = exc.__class__.__name__
-    effective_provider = _effective_provider(provider, class_name)
+    effective_providers = _effective_providers(provider, class_name)
 
     if _is_empty_structured_output_validation_error(exc):
-        return ProviderErrorKind.TRANSIENT
-    if "RateLimit" in class_name:
-        return ProviderErrorKind.RATE_LIMIT
-    if class_name == "OverloadedError":
-        return ProviderErrorKind.TRANSIENT
-    if class_name in _CLIENT_EXCEPTION_NAMES:
-        return ProviderErrorKind.CLIENT
-    if class_name in _TRANSIENT_EXCEPTION_NAMES:
-        return ProviderErrorKind.TRANSIENT
-
-    message = str(exc).lower()
-    for kind, phrases, providers, required_phrases in _PHRASE_TABLE:
-        if providers is not None and effective_provider not in providers:
-            continue
-        if providers == frozenset({"codex_plus"}):
-            if class_name != "CodexResponseError" and "codexresponseerror" not in message:
+        kind = ProviderErrorKind.TRANSIENT
+    elif "RateLimit" in class_name:
+        kind = ProviderErrorKind.RATE_LIMIT
+    elif class_name in _CLIENT_EXCEPTION_NAMES:
+        kind = ProviderErrorKind.CLIENT
+    elif class_name in _TRANSIENT_EXCEPTION_NAMES:
+        kind = (
+            ProviderErrorKind.CLIENT
+            if _message_signals_client(message)
+            else ProviderErrorKind.TRANSIENT
+        )
+    else:
+        kind = ProviderErrorKind.UNKNOWN
+        for candidate, phrases, providers, required_phrases in _PHRASE_TABLE:
+            if providers is not None and effective_providers.isdisjoint(providers):
                 continue
-        if required_phrases is not None and not any(
-            phrase in message for phrase in required_phrases
+            if providers == frozenset({"codex_plus"}):
+                if class_name != "CodexResponseError" and "codexresponseerror" not in message:
+                    continue
+            if required_phrases is not None and not any(
+                phrase in message for phrase in required_phrases
+            ):
+                continue
+            if any(phrase in message for phrase in phrases):
+                kind = candidate
+                break
+        if (
+            kind is not ProviderErrorKind.CLIENT
+            and class_name == "OverloadedError"
+            and "anthropic" in effective_providers
         ):
-            continue
-        if any(phrase in message for phrase in phrases):
-            return kind
-    return ProviderErrorKind.UNKNOWN
+            kind = ProviderErrorKind.TRANSIENT
+    return ProviderErrorClassification(kind, quota_exhausted)
 
 
-__all__ = ["ProviderErrorKind", "classify_provider_error"]
+__all__ = [
+    "ProviderErrorClassification",
+    "ProviderErrorKind",
+    "classify_provider_error",
+]
