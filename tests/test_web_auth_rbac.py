@@ -382,20 +382,16 @@ async def test_bootstrap_reports_gate_active_with_webkeys_and_no_master(tmp_path
     # The bug mimir caught: no MIMIR_API_KEY but per-user keys exist → the
     # middleware gates, so bootstrap must tell the browser auth is required.
     async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=True))) as c:
-        for path in ("/api/web/bootstrap", "/api/v1/web/bootstrap"):
-            body = await (await c.get(path)).json()
-            data = body.get("data", body)  # v1 is enveloped, legacy is flat
-            assert set(data) == {"version", "auth"}, path
-            assert data["auth"] == {"required": True}, path
+        body = await (await c.get("/api/v1/web/bootstrap")).json()
+        assert set(body["data"]) == {"version", "auth"}
+        assert body["data"]["auth"] == {"required": True}
 
 
 async def test_bootstrap_dev_mode_reports_no_auth(tmp_path: Path) -> None:
     async with TestClient(TestServer(_bootstrap_app(tmp_path, "", with_user=False))) as c:
-        for path in ("/api/web/bootstrap", "/api/v1/web/bootstrap"):
-            body = await (await c.get(path)).json()
-            data = body.get("data", body)
-            assert data["auth"]["required"] is False, path
-            assert data["server"]["unauthenticated_allowed"] is True, path
+        body = await (await c.get("/api/v1/web/bootstrap")).json()
+        assert body["data"]["auth"]["required"] is False
+        assert body["data"]["server"]["unauthenticated_allowed"] is True
 
 
 # ── web-chat trusted attribution ────────────────────────────────────────
@@ -574,12 +570,6 @@ async def test_user_events_endpoints_filter_to_own_channel(tmp_path: Path) -> No
     ])
 
     async with TestClient(TestServer(app)) as c:
-        legacy = await c.get("/api/events", headers={"X-API-Key": alice_key})
-        assert [e["timestamp"] for e in (await legacy.json())["events"]] == [
-            "2026-06-21T01:00:00Z",
-            "2026-06-21T01:00:02Z",
-        ]
-
         v1 = await c.get("/api/v1/events", headers={"X-API-Key": alice_key})
         assert [e["timestamp"] for e in (await v1.json())["data"]["events"]] == [
             "2026-06-21T01:00:00Z",

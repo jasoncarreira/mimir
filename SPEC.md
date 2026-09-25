@@ -1231,7 +1231,7 @@ Implemented in `mimir/web_ui.py`, mounted on the same aiohttp app that serves th
 
 - `GET /turns` — returns the static `turn_viewer.html` body. Cached in memory at startup.
 - `GET /api/turns` — reads `<home>/logs/turns.jsonl` line-by-line and returns `{"turns": [...]}`. The page polls this every 5s for live updates.
-- `GET /api/events?since=<ts>&type=<kind>` — same idea for events.jsonl, paged. Used by an "Events" tab in the viewer.
+- `GET /api/v1/events?since=<ts>&type=<kind>` — same idea for events.jsonl, paged.
 
 ### 11.2 Page structure
 
@@ -1525,7 +1525,7 @@ Slack and Discord bridge config is live (both implemented). Bluesky is handled b
 
 ### Phase 6.5 — turn viewer (1 day)
 - Port `turn_viewer.html` from open-strix (single-file vanilla-JS page).
-- `mimir/web_ui.py` aiohttp routes: `GET /turns`, `GET /api/turns`, `GET /api/events`.
+- `mimir/web_ui.py` aiohttp routes: `GET /turns`, `GET /api/turns`, `GET /api/v1/events`.
 - Wire viewer port into the container + benchmark adapter.
 - Add an Events tab driven by events.jsonl (type-filter pills, time scrub).
 

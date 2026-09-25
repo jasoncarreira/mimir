@@ -5,9 +5,6 @@ hosts the WebUI bridge's ``/chat``. Routes:
 
   GET /turns            — legacy single-file vanilla-JS turn viewer (HTML)
   GET /api/turns        — turns.jsonl as JSON (optional ``?after=<turn_id>``)
-  GET /api/events       — events.jsonl as JSON (optional ``?since=<ts>``,
-                          ``?type=<kind>``, ``?limit=<n>``); type may be
-                          repeated to combine filters
   GET /api/v1/live-events — fetch-authenticated SSE stream for React live
                           dashboards with cursor backfill/dedup semantics
   GET /ops              — legacy live ops dashboard (HTML, Chart.js)
@@ -24,8 +21,7 @@ hosts the WebUI bridge's ``/chat``. Routes:
                           view=channels returns channel dir names
   GET /app              — built React app shell (default frontend)
 
-The HTML page polls ``/api/turns`` every 5s for live updates. ``/api/events``
-is exposed for the (deferred) Events tab + ad-hoc scripting. ``/ops``
+The HTML page polls ``/api/turns`` every 5s for live updates. ``/ops``
 recomputes from events.jsonl on every request — no caching.
 ``/saga`` reads the saga SQLite DB on each request — no caching.
 ``/memory`` reads ``<home>/memory/`` and ``<home>/state/`` on each request — no caching.
@@ -1215,20 +1211,6 @@ def register_routes(
             read_status,
         )
 
-    async def events_data(request: web.Request) -> web.Response:
-        since, type_filter, limit, channel = _parse_events_query(request)
-        out, _meta, read_status = await asyncio.to_thread(
-            _events_window,
-            since=since,
-            type_filter=type_filter,
-            limit=limit,
-            channel=channel,
-        )
-        payload: dict[str, Any] = {"events": out}
-        if await _report_state_read(events_log, read_status):
-            payload["degraded"] = True
-        return web.json_response(payload)
-
     async def events_data_v1(request: web.Request) -> web.Response:
         since, type_filter, limit, channel = _parse_events_query(request)
         events, meta, read_status = await asyncio.to_thread(
@@ -1470,41 +1452,6 @@ def register_routes(
         return web.Response(
             text=_load_web_auth_js(),
             content_type="application/javascript",
-            headers=_no_store_headers(),
-        )
-
-    async def web_bootstrap(request: web.Request) -> web.Response:
-        api_key = str(request.app.get("api_key") or "")
-        gate = web_gate_active(api_key, request.app.get("identity_resolver"))
-        public_payload = {"version": __version__, "auth": {"required": gate}}
-        if gate and not (
-            request.get("auth_is_master")
-            or request.get("auth_identity") is not None
-        ):
-            return web.json_response(public_payload, headers=_no_store_headers())
-        config = request.app.get("config")
-        web_host = str(getattr(config, "web_host", "") or "")
-        public_bind = web_host not in ("", "127.0.0.1", "::1", "localhost")
-        return web.json_response(
-            {
-                "version": __version__,
-                "auth": {
-                    "required": gate,
-                    "scheme": "x-api-key",
-                    "storage": "browser-localStorage",
-                },
-                "server": {
-                    "web_host": web_host,
-                    "public_bind": public_bind,
-                    "unauthenticated_allowed": not gate,
-                },
-                "stream_auth": {
-                    "shape": "fetch-event-stream",
-                    "header": "X-API-Key",
-                    "native_eventsource_supported_when_auth_required": False,
-                },
-                "dashboard_extensions": _dashboard_extensions.navigation_payload(),
-            },
             headers=_no_store_headers(),
         )
 
@@ -2371,8 +2318,6 @@ def register_routes(
         app.router.add_get("/api/v1/turns", turns_data_v1)
     if ("GET", "/api/v1/sessions") not in existing:
         app.router.add_get("/api/v1/sessions", sessions_data_v1)
-    if ("GET", "/api/events") not in existing:
-        app.router.add_get("/api/events", events_data)
     if ("GET", "/api/v1/events") not in existing:
         app.router.add_get("/api/v1/events", events_data_v1)
     if ("GET", "/api/v1/live-events") not in existing:
@@ -2383,8 +2328,6 @@ def register_routes(
         app.router.add_get("/app", react_app)
     if ("GET", "/app/auth.js") not in existing:
         app.router.add_get("/app/auth.js", web_auth_js)
-    if ("GET", "/api/web/bootstrap") not in existing:
-        app.router.add_get("/api/web/bootstrap", web_bootstrap)
     if ("GET", "/api/v1/web/bootstrap") not in existing:
         app.router.add_get("/api/v1/web/bootstrap", web_bootstrap_v1)
     if ("GET", "/api/v1/whoami") not in existing:
