@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from ._atomic import atomic_write_json
+from ._provider_errors import ProviderErrorKind, classify_provider_error
 
 log = logging.getLogger(__name__)
 
@@ -689,33 +690,6 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
 
 
 def is_quota_exhaustion(exc: BaseException) -> bool:
-    """Heuristic: does this exception represent an upstream quota /
-    rate-limit refusal (vs. a transient network blip or a logic bug)?
-
-    Checks, in order:
-    1. anthropic.RateLimitError (string-match the class name so we
-       don't have to import the SDK eagerly).
-    2. httpx-shaped exception with ``response.status_code == 429``.
-    3. The exception class name contains ``RateLimit``.
-    4. The message contains ``"429"`` or ``"rate limit"`` / ``"quota"``
-       (case-insensitive) — covers ChatClaudeCode subprocess errors
-       and generic provider-specific wrappers.
-    """
-    cls_name = type(exc).__name__
-    # ``"RateLimit" in cls_name`` subsumes the exact-match check
-    # (the exact name IS a substring of itself) — single check
-    # catches ``RateLimitError`` and any ``*RateLimit*`` variant
-    # provider SDKs introduce.
-    if "RateLimit" in cls_name:
-        return True
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status == 429:
-        return True
-    msg = str(exc).lower()
-    if "429" in msg:
-        return True
-    if "rate limit" in msg or "rate_limit" in msg:
-        return True
-    if "quota" in msg and ("exhaust" in msg or "exceed" in msg or "limit" in msg):
-        return True
-    return False
+    """Return whether an upstream refusal should activate quota pause."""
+    kind = classify_provider_error(exc)
+    return kind in {ProviderErrorKind.RATE_LIMIT, ProviderErrorKind.QUOTA}
