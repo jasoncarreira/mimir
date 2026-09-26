@@ -219,14 +219,16 @@ trigger/canonical/ingress checks described above.
 | `synthesis` | `session`, `saga`, `filesystem`, `turn_history` | `session_boundary`, `saga`, `filesystem` |
 | `system` | `defaults`, `proposal`, `filesystem`, `schedule_metadata` | `operator_alert`, `filesystem`, `shell_process`, `proposal`, `scheduler`, `message` |
 
-`_OPERATION_READABLE_DOMAIN` and `_OPERATION_SINK_DESTINATION` map operations
-to additional constraints. `service_can_invoke_operation()` requires the exact
-capability and every mapped domain and sink. This function is authoritative for
-service execution of admin-gated operations and for the trusted-service
-exception to `UNKNOWN`. `can_write_saga()` separately requires a canonical SAGA
-mutation and then either an admin or the same exact service capability check;
-SAGA handlers call it again, so bypassing general middleware does not bypass
-memory-integrity authorization.
+`_OPERATION_READABLE_DOMAIN` maps operations to protected read domains.
+`TOOL_DESCRIPTORS` in `mimir/tool_descriptors.py` carries each operation's sink
+destination alongside its other authorization and information-flow facts.
+`service_can_invoke_operation()` requires the exact capability and every mapped
+domain and sink. This function is authoritative for service execution of
+admin-gated operations and for the trusted-service exception to `UNKNOWN`.
+`can_write_saga()` separately requires a canonical SAGA mutation and then either
+an admin or the same exact service capability check; SAGA handlers call it
+again, so bypassing general middleware does not bypass memory-integrity
+authorization.
 
 ### Enable-time completeness gate
 
@@ -350,8 +352,15 @@ tainted `private`. Labels propagate into delegated/forked work, continuations,
 and resumed turns. Summarizing or transforming content cannot remove them;
 `audit_declassification()` is the only removal path and requires an admin.
 
-`SinkCategory` and `_SINK_CATEGORY_MAP` classify channel egress, MCP, HTTP,
-network, shell, spawn, notification, and file destinations. `SinkGate.check_sink_flow()`:
+`TOOL_DESCRIPTORS` in `mimir/tool_descriptors.py` is the per-tool source of
+truth for authorization and information-flow metadata. Each immutable
+`ToolDescriptor` can carry the sink category, sink target extractor, sink
+destination, fetch-authorization kind, result origin, git-operation-result flag,
+IFC-delegation flag, and budget-exemption flag. Its `SinkCategory` values
+classify channel egress, MCP, HTTP, network, shell, spawn, notification, and
+file destinations. A descriptor with a sink category must declare a target
+extractor; use `None` only to opt out explicitly. `validate_tool_descriptors()`
+enforces that invariant at module import. `SinkGate.check_sink_flow()`:
 
 - fails closed on a missing label carrier, unknown category, unknown label, or
   missing destination when enforcement is active;
@@ -906,12 +915,18 @@ profile refused it and no declaration applied.
    operation accepts a protected selector or mutation, put an exact-carrier and
    ownership predicate in the handler/storage path and test it independently.
    Never use `OPEN` for an operation whose safety depends only on model guidance.
-4. If it reads a protected domain or writes an active destination for services,
-   add the operation to `_OPERATION_READABLE_DOMAIN` and/or
-   `_OPERATION_SINK_DESTINATION`.
-5. If it is an egress path, add an exact/prefix `SinkCategory` mapping and pass
-   the concrete destination to `SinkGate`. Harness-owned egress must check at
-   its final send/edit boundary, not only model middleware.
+4. If it reads a protected domain, add the operation to
+   `_OPERATION_READABLE_DOMAIN`. Add or update its `ToolDescriptor` in
+   `mimir/tool_descriptors.py` for per-tool authorization and information-flow
+   facts: sink category, target extractor, sink destination,
+   fetch-authorization kind, result origin, git-operation-result flag,
+   IFC-delegation flag, and budget-exemption flag. A sink category requires a
+   declared target extractor; use `None` only as an explicit opt-out.
+   `validate_tool_descriptors()` enforces this at import.
+5. If it is an egress path, declare the exact `SinkCategory`, concrete target
+   extractor, and sink destination in `TOOL_DESCRIPTORS`, then pass the
+   extracted destination to `SinkGate`. Harness-owned egress must check at its
+   final send/edit boundary, not only model middleware.
 6. Add catalog tests for the exact name and aliases, enforcement-on deny/allow,
    enforcement-off shadow behavior, missing `AuthContext`, generic HTTP ingress,
    and any resource arguments. Assemble the relevant final model tool surface in
