@@ -26,7 +26,8 @@ for ARG in "$@"; do
   fi
   case "$SUBCOMMAND:$ARG" in
     count:--platform|count:--action|count:--since|dispatch:--platform) EXPECT_VALUE="$ARG" ;;
-    count:--json|dispatch:--dry-run) ;;
+    count:--json) ;;
+    dispatch:*) echo "run-social-cli.sh: unsupported dispatch argument: $ARG" >&2; exit 2 ;;
     *:-*) echo "run-social-cli.sh: unsupported option: $ARG" >&2; exit 2 ;;
   esac
 done

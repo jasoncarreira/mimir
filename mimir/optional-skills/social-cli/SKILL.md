@@ -37,10 +37,16 @@ the platforms credentials are configured for.
   `send_message` (different surface — see the "`send_message` goes to chat
   channels, NOT to Bluesky / X" section).
 - Registered outbox files are privacy-scanned when written and again immediately
-  before a declared service-turn dispatch. Credentials are always refused;
-  configured private terms follow `MIMIR_OUTBOUND_PRIVACY_ENFORCE`
-  shadow/enforcement policy. Direct operator-turn shell dispatch remains outside
-  this service-command guard and is operator-authorized posting.
+  before a declared service-turn dispatch. Service dispatch accepts only canonical
+  `dispatch` / `dispatch --platform <p>` argv, requires an explicit confined
+  `stateDir`, rejects `SOCIAL_CLI_STATE_DIR` / `AGENT_ID` steering, and scans every
+  YAML file under the poller and state directories within fixed limits. Credentials
+  are always refused; configured private terms follow
+  `MIMIR_OUTBOUND_PRIVACY_ENFORCE` shadow/enforcement policy. Direct operator-turn
+  shell dispatch remains outside this service-command guard and is operator-authorized
+  posting. The user-level `~/.config/social-cli/config.yaml` fallback is read-only to
+  the model under service roots; when selected it must still name the confined state
+  directory explicitly.
 - Dispatch validates per-action and continues on per-action failure;
   per-action outcomes land in `dispatch_result.yaml` for review.
 - After successful `dispatch`, the inbox is pruned to pending work only —

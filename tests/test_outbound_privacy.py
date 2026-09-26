@@ -52,14 +52,22 @@ def _request(tool: str, arguments: dict[str, Any], auth: AuthContext) -> ToolCal
     )
 
 
-def _social_service_auth(tmp_path: Path) -> tuple[AuthContext, Path]:
+def _social_service_auth(
+    tmp_path: Path, *, pass_env: tuple[str, ...] = (),
+) -> tuple[AuthContext, Path]:
     script = tmp_path / "run-social-cli.sh"
     script.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "config.yaml").write_text(
+        f"state:\n  stateDir: {state_dir}\n", encoding="utf-8",
+    )
     declaration = DeclaredShellCommand(
         executable="bash",
         path=Path("/usr/bin/bash"),
         script=script.resolve(),
         options=("--platform", "--dry-run", "--since"),
+        pass_env=pass_env,
     )
     base_service = get_service_principal("scheduled_tick")
     assert base_service is not None
@@ -457,7 +465,7 @@ def test_declared_social_dispatch_scans_seeded_outbox_before_execution(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     text = TOKEN if credential else "a clean post"
     outbox.write_text(
         f"dispatch:\n  - post:\n      platform: bsky\n      text: {text}\n",
@@ -498,7 +506,7 @@ def test_bare_social_dispatch_scans_discovered_and_shared_outboxes(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     outbox = tmp_path / "state/pollers/social-cli-notifications" / outbox_name
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     outbox.write_text(
         f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
     )
@@ -523,7 +531,7 @@ def test_bare_social_dispatch_dry_run_is_also_scanned(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     outbox.write_text(
         f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
     )
@@ -535,7 +543,7 @@ def test_bare_social_dispatch_dry_run_is_also_scanned(
     )
 
     assert refusal is not None
-    assert "credential detector" in refusal
+    assert "arguments are not canonical" in refusal
     assert TOKEN not in refusal
 
 
@@ -550,7 +558,7 @@ def test_outbox_symlink_to_non_outbox_is_scanned_on_write_and_dispatch(
     target.write_text(
         f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
     )
-    state_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     outbox = state_dir / "outbox-bsky.yaml"
     outbox.symlink_to(target)
 
@@ -583,7 +591,7 @@ def test_non_outbox_symlink_to_outbox_is_scanned_on_write(
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     outbox = tmp_path / "state/pollers/social-cli-feed/outbox-bsky.yaml"
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     outbox.write_text("safe", encoding="utf-8")
     alias = tmp_path / "state/notes/draft.yaml"
     alias.parent.mkdir(parents=True)
@@ -607,7 +615,7 @@ def test_social_dispatch_detection_does_not_search_command_substrings(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     outbox.write_text(
         f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
     )
@@ -651,7 +659,7 @@ def test_tagged_social_outbox_is_scanned_as_raw_text(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
-    outbox.parent.mkdir(parents=True)
+    outbox.parent.mkdir(parents=True, exist_ok=True)
     outbox.write_text(
         "dispatch:\n  - !custom {post: {text: " + TOKEN + "}}\n", encoding="utf-8",
     )
@@ -698,9 +706,9 @@ def test_social_dispatch_refuses_redirected_state_dir(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     state_dir = tmp_path / "state/pollers/social-cli-notifications"
-    state_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "config.yaml").write_text(
-        "state:\n  stateDir: sub\n", encoding="utf-8",
+        "state:\n  stateDir: ../outside\n", encoding="utf-8",
     )
 
     refusal = _outbound_privacy_refusal(
@@ -713,15 +721,41 @@ def test_social_dispatch_refuses_redirected_state_dir(
     assert "stateDir escapes" in refusal
 
 
+def test_social_dispatch_allows_confined_state_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    nested = state_dir / "sub"
+    nested.mkdir()
+    (state_dir / "config.yaml").write_text(
+        "state:\n  stateDir: sub\n", encoding="utf-8",
+    )
+    (nested / "outbox-bsky.yaml").write_text(
+        f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
+    )
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+
+
 def test_social_dispatch_scans_shared_outbox_with_isolation_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     state_dir = tmp_path / "state/pollers/social-cli-notifications"
-    state_dir.mkdir(parents=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "config.yaml").write_text(
-        "state:\n  platformIsolation: false\n", encoding="utf-8",
+        f"state:\n  stateDir: {state_dir}\n  platformIsolation: false\n",
+        encoding="utf-8",
     )
     (state_dir / "outbox.yaml").write_text(
         f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
@@ -750,7 +784,7 @@ def test_social_dispatch_refuses_unparseable_config(
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     config = tmp_path / "state/pollers/social-cli-notifications/config.yaml"
-    config.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("state: [unterminated", encoding="utf-8")
 
     refusal = _outbound_privacy_refusal(
@@ -761,6 +795,142 @@ def test_social_dispatch_refuses_unparseable_config(
 
     assert refusal is not None
     assert "unreadable or unparseable" in refusal
+
+
+@pytest.mark.parametrize("positional", ["evil.yaml", "../evil.yaml"])
+def test_social_dispatch_refuses_positional_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, positional: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch {positional}"},
+        auth,
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+@pytest.mark.parametrize("name", ["SOCIAL_CLI_STATE_DIR", "AGENT_ID"])
+def test_social_dispatch_refuses_environment_state_steering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv(name, "redirected")
+    auth, script = _social_service_auth(tmp_path, pass_env=(name,))
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "environment steering" in refusal
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_outbox_config"
+
+
+@pytest.mark.parametrize("config", [None, "state: {platformIsolation: true}\n"])
+def test_social_dispatch_requires_explicit_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str | None,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    config_path = tmp_path / "state/pollers/social-cli-notifications/config.yaml"
+    if config is None:
+        config_path.unlink()
+    else:
+        config_path.write_text(config, encoding="utf-8")
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "requires an explicit stateDir" in refusal
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_outbox_config"
+
+
+def test_social_dispatch_refuses_unreadable_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    unreadable = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
+    unreadable.mkdir()
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
+    assert "could not be read" in str(result.content)
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+def test_social_config_write_uses_spec_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "write_file",
+        {
+            "file_path": "state/pollers/social-cli-feed/config.yaml",
+            "content": "state: {}\n",
+        },
+        _auth(),
+    )
+
+    assert refusal is not None
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_outbox_config"
+
+
+@pytest.mark.parametrize("tool_name", ["Write", "Edit", "MultiEdit"])
+def test_claude_code_native_social_config_writes_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool_name: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    tool_input: dict[str, Any] = {
+        "file_path": "state/pollers/social-cli-feed/config.yaml",
+    }
+    if tool_name == "Write":
+        tool_input["content"] = "state: {}\n"
+    elif tool_name == "Edit":
+        tool_input.update(old_string="safe", new_string="state: {}\n")
+    else:
+        tool_input["edits"] = [{"old_string": "safe", "new_string": "state: {}\n"}]
+
+    result = _claude_code_pre_tool_enforcement(
+        tool_name, tool_input, "toolu_social_config", auth_context=_auth(),
+    )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "controls which outbox is dispatched" in output["permissionDecisionReason"]
 
 
 def test_declared_external_shell_payload_is_scanned(
