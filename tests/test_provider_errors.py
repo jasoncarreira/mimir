@@ -53,6 +53,17 @@ def _response_error(status: int, message: str) -> Exception:
     return exc
 
 
+def _top_level_and_response_error(
+    status: int,
+    response_status: int,
+    message: str,
+) -> Exception:
+    exc = Exception(message)
+    exc.status_code = status  # type: ignore[attr-defined]
+    exc.response = SimpleNamespace(status_code=response_status)  # type: ignore[attr-defined]
+    return exc
+
+
 _EMPTY_STRUCTURED_OUTPUT = StructuredOutputValidationError(
     "CriticFindings",
     ValueError("Native structured output expected valid JSON for CriticFindings"),
@@ -268,6 +279,17 @@ def test_shared_classifier_preserves_legacy_decisions_over_cross_product() -> No
                             old_pause,
                             new_pause,
                         )
+
+
+def test_nested_429_preserves_pause_when_top_level_status_differs() -> None:
+    """A wrapper status must not hide the nested legacy quota signal."""
+    exc = _top_level_and_response_error(500, 429, "not obvious from message")
+
+    classification = classify_provider_error(exc)
+
+    assert classification.kind is ProviderErrorKind.TRANSIENT
+    assert classification.quota_exhausted is True
+    assert is_quota_exhaustion(exc) is True
 
 
 @pytest.mark.parametrize(
