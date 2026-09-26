@@ -279,9 +279,16 @@ def _claude_code_pre_tool_enforcement(
         _record_claude_code_tool_result_denial(tool_name, tool_use_id, admin_denial)
         return _claude_code_permission_denial(admin_denial)
 
-    privacy_refusal = _outbound_privacy_refusal(
-        tool_name, tool_input, auth_context,
-    )
+    try:
+        privacy_refusal = _outbound_privacy_refusal(
+            tool_name, tool_input, auth_context,
+        )
+    except Exception:
+        log.exception("Claude Code outbound privacy check failed closed for %s", tool_name)
+        privacy_refusal = (
+            "Outbound privacy refused this tool call because the local content "
+            "check failed. Retry only after the scanner is healthy."
+        )
     if privacy_refusal is not None:
         _emit_tool_call_sync(tool_name, ok=False, error=privacy_refusal, denied=True)
         _record_claude_code_tool_result_denial(

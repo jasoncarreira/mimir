@@ -18,6 +18,8 @@ from mimir.access_control import (
 from mimir.models import AuthContext, InformationFlowLabels
 from mimir.outbound_privacy import scan_outbound
 from mimir.read_policy import is_protected_read_path
+from mimir.tool_descriptors import get_tool_descriptor
+from mimir.tools import budget_gate
 from mimir.tools.budget_gate import BudgetGateMiddleware, _outbound_privacy_refusal
 
 
@@ -223,13 +225,26 @@ def test_declared_external_shell_payload_is_scanned(
     assert TOKEN not in json.dumps(events)
 
 
-def test_claude_code_pre_tool_path_refuses_credential(
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        ("WebFetch", {"url": f"https://example.test/?key={TOKEN}"}),
+        ("WebSearch", {"query": f"find {TOKEN}"}),
+        (
+            "mcp__langchain-tools__fetch_url",
+            {"url": f"https://example.test/?key={TOKEN}"},
+        ),
+    ],
+)
+def test_claude_code_real_network_tool_names_refuse_credentials(
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    tool_input: dict[str, str],
 ) -> None:
     events = _capture_events(monkeypatch)
     result = _claude_code_pre_tool_enforcement(
-        "fetch_url",
-        {"url": f"https://example.test/?key={TOKEN}"},
+        tool_name,
+        tool_input,
         "toolu_privacy",
         auth_context=_auth(),
     )
@@ -239,6 +254,89 @@ def test_claude_code_pre_tool_path_refuses_credential(
     assert "credential detector" in output["permissionDecisionReason"]
     assert TOKEN not in json.dumps(result)
     assert TOKEN not in json.dumps(events)
+
+
+def test_claude_code_bridged_local_write_is_not_treated_as_external_mcp() -> None:
+    result = _claude_code_pre_tool_enforcement(
+        "mcp__langchain-tools__write_file",
+        {"file_path": "/tmp/local.txt", "content": TOKEN},
+        "toolu_local_write",
+        auth_context=_auth(),
+    )
+
+    assert result == {}
+
+
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+def test_middleware_privacy_errors_prevent_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_component: str,
+) -> None:
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise RuntimeError("extractor failed")
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+    else:
+        monkeypatch.setattr(
+            "mimir.outbound_privacy.scan_outbound",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scanner failed")),
+        )
+
+    executed: list[bool] = []
+    with pytest.raises(RuntimeError, match=f"{failing_component} failed"):
+        _run_sync(
+            "fetch_url",
+            {"url": "https://example.test/"},
+            _auth(),
+            executed,
+        )
+    assert executed == []
+
+
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+def test_claude_code_privacy_errors_return_value_free_denial(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_component: str,
+) -> None:
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise RuntimeError("extractor failed")
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+    else:
+        monkeypatch.setattr(
+            "mimir.outbound_privacy.scan_outbound",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scanner failed")),
+        )
+
+    result = _claude_code_pre_tool_enforcement(
+        "WebFetch",
+        {"url": f"https://example.test/?value={TOKEN}"},
+        f"toolu_{failing_component}_error",
+        auth_context=_auth(),
+    )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "local content check failed" in output["permissionDecisionReason"]
+    assert TOKEN not in output["permissionDecisionReason"]
 
 
 def test_private_terms_file_is_a_protected_read(

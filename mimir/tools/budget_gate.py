@@ -508,6 +508,20 @@ def _declared_shell_payloads(
     return ()
 
 
+_CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
+_CLAUDE_CODE_NATIVE_PRIVACY_TOOLS = {
+    "WebFetch": "fetch_url",
+    "WebSearch": "web_search",
+}
+
+
+def _outbound_privacy_tool_name(tool_name: str) -> tuple[str, bool]:
+    """Return the descriptor name and whether this is a bridged Mimir tool."""
+    if tool_name.startswith(_CLAUDE_CODE_MIMIR_TOOL_PREFIX):
+        return tool_name.removeprefix(_CLAUDE_CODE_MIMIR_TOOL_PREFIX), True
+    return _CLAUDE_CODE_NATIVE_PRIVACY_TOOLS.get(tool_name, tool_name), False
+
+
 def _outbound_privacy_refusal(
     tool_name: str,
     arguments: Mapping[str, Any],
@@ -516,16 +530,17 @@ def _outbound_privacy_refusal(
     sink_category: SinkCategory | None = None,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
-    descriptor = get_tool_descriptor(tool_name)
+    descriptor_name, bridged_mimir_tool = _outbound_privacy_tool_name(tool_name)
+    descriptor = get_tool_descriptor(descriptor_name)
     extractor = descriptor.sink_payload_extractor if descriptor is not None else None
     texts: tuple[str, ...] = ()
     if callable(extractor):
-        texts = extractor(tool_name, arguments, auth_context)
-    elif tool_name.startswith("mcp_"):
+        texts = extractor(descriptor_name, arguments, auth_context)
+    elif not bridged_mimir_tool and tool_name.startswith("mcp_"):
         from ..tool_descriptors import _string_leaf_payload
 
         texts = _string_leaf_payload(tool_name, arguments, auth_context)
-    texts = (*texts, *_declared_shell_payloads(tool_name, arguments, auth_context))
+    texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
     if not texts:
         return None
 
