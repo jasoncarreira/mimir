@@ -508,6 +508,129 @@ def _declared_shell_payloads(
     return ()
 
 
+_OUTBOX_DISPATCH_SCRIPTS = {
+    "run-social-cli.sh": "state/pollers/{poller}/outbox-{platform}.yaml",
+}
+
+
+def _outbox_write_payloads(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if tool_name not in {"write_file", "edit_file"}:
+        return ()
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return ()
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return ()
+    from ..outbound_privacy import is_outbox_path
+
+    if not is_outbox_path(target):
+        return ()
+    field = "content" if tool_name == "write_file" else "new_string"
+    value = arguments.get(field)
+    return (value,) if isinstance(value, str) else ()
+
+
+def _string_leaves(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Mapping):
+        return tuple(
+            text for child in value.values() for text in _string_leaves(child)
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(text for child in value for text in _string_leaves(child))
+    return ()
+
+
+def _declared_dispatch_outboxes(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[tuple[str, Path], ...]:
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return ()
+    service = get_trusted_service_from_auth_context(auth_context)
+    declared = getattr(service, "declared_shell_commands", ()) if service is not None else ()
+    command = arguments.get("command")
+    if not declared or not isinstance(command, str):
+        return ()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return ()
+
+    from ..access_control import _declared_command_execution_argv
+    from ..outbound_privacy import is_outbox_path
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return ()
+    for declaration in declared:
+        script = declaration.script
+        pattern = _OUTBOX_DISPATCH_SCRIPTS.get(script.name if script is not None else "")
+        if pattern is None or _declared_command_execution_argv(argv, (declaration,)) is None:
+            continue
+        if len(argv) < 6 or argv[3] != "dispatch":
+            continue
+        poller = argv[2]
+        if re.fullmatch(r"social-cli-[A-Za-z0-9_-]+", poller) is None:
+            continue
+        platforms: list[str] = []
+        index = 4
+        valid = True
+        while index < len(argv):
+            argument = argv[index]
+            if argument == "--dry-run":
+                index += 1
+                continue
+            if argument == "--platform" and index + 1 < len(argv):
+                platform = argv[index + 1]
+                index += 2
+            elif argument.startswith("--platform="):
+                platform = argument.removeprefix("--platform=")
+                index += 1
+            else:
+                valid = False
+                break
+            if re.fullmatch(r"[A-Za-z0-9_-]+", platform) is None:
+                valid = False
+                break
+            platforms.append(platform)
+        if not valid or not platforms:
+            continue
+        outboxes = []
+        for platform in dict.fromkeys(platforms):
+            path = Path(home_value) / pattern.format(poller=poller, platform=platform)
+            if is_outbox_path(path):
+                outboxes.append((platform, path.resolve(strict=False)))
+        return tuple(outboxes)
+    return ()
+
+
+def _dispatch_outbox_payloads(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    texts: list[str] = []
+    platforms: list[str] = []
+    for platform, path in _declared_dispatch_outboxes(
+        tool_name, arguments, auth_context,
+    ):
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, RuntimeError, yaml.YAMLError):
+            continue
+        if not isinstance(document, Mapping) or not isinstance(document.get("dispatch"), list):
+            continue
+        texts.extend(_string_leaves(document["dispatch"]))
+        platforms.append(platform)
+    return tuple(texts), tuple(platforms)
+
+
 _CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
 _CLAUDE_CODE_NATIVE_PRIVACY_TOOLS = {
     "WebFetch": "fetch_url",
@@ -541,11 +664,20 @@ def _outbound_privacy_refusal(
 
         texts = _string_leaf_payload(descriptor_name, arguments, auth_context)
     texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
+    outbox_write_texts = _outbox_write_payloads(descriptor_name, arguments)
+    dispatch_texts, dispatch_platforms = _dispatch_outbox_payloads(
+        descriptor_name, arguments, auth_context,
+    )
+    texts = (*texts, *outbox_write_texts, *dispatch_texts)
     if not texts:
         return None
 
-    category = sink_category or (
-        descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+    category = (
+        SinkCategory.NETWORK
+        if outbox_write_texts or dispatch_texts
+        else sink_category or (
+            descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+        )
     )
     from ..outbound_privacy import scan_outbound
 
@@ -586,8 +718,13 @@ def _outbound_privacy_refusal(
         auth_context=auth_context,
         event_fields={"sink_category": category.value, "findings": metadata},
     )
+    dispatch_target = (
+        f" social-cli dispatch for platform {', '.join(dispatch_platforms)}"
+        if dispatch_platforms
+        else f" `{tool_name}`"
+    )
     return (
-        f"Outbound privacy refused `{tool_name}` because the {detector} detector "
+        f"Outbound privacy refused{dispatch_target} because the {detector} detector "
         "matched outbound content. Remove the sensitive value and retry."
     )
 

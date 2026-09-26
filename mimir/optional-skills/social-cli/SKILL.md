@@ -36,6 +36,9 @@ the platforms credentials are configured for.
   through `<state_dir>/outbox-<platform>.yaml` + `social-cli dispatch`, **NOT** via
   `send_message` (different surface — see the "`send_message` goes to chat
   channels, NOT to Bluesky / X" section).
+- Registered outbox files are privacy-scanned when written and again immediately
+  before a declared dispatch. Credentials are always refused; configured private
+  terms follow `MIMIR_OUTBOUND_PRIVACY_ENFORCE` shadow/enforcement policy.
 - Dispatch validates per-action and continues on per-action failure;
   per-action outcomes land in `dispatch_result.yaml` for review.
 - After successful `dispatch`, the inbox is pruned to pending work only —

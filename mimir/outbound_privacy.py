@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import re
@@ -25,12 +26,40 @@ class OutboundFinding:
 
 OutboundScan = list[OutboundFinding]
 
+OUTBOX_PATTERNS = ("state/pollers/social-cli-*/outbox-*.yaml",)
+
 _PRIVATE_TERMS_FILE = "private-terms.txt"
 _HASH_PREFIX_LENGTH = 12
 _cache_lock = threading.Lock()
 _cached_path: Path | None = None
 _cached_signature: tuple[int, int] | None = None
 _cached_terms: tuple[str, ...] = ()
+
+
+def is_outbox_path(path: Path | str) -> bool:
+    """Return whether a resolved path matches a registered home-relative glob."""
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return False
+    try:
+        home = Path(home_value).expanduser().resolve(strict=False)
+        relative = Path(path).expanduser().resolve(strict=False).relative_to(home)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    relative_parts = relative.as_posix().split("/")
+    for pattern in OUTBOX_PATTERNS:
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute() or ".." in pattern_path.parts:
+            continue
+        pattern_parts = pattern_path.as_posix().split("/")
+        if len(relative_parts) != len(pattern_parts):
+            continue
+        if all(
+            fnmatch.fnmatchcase(part, pattern_part)
+            for part, pattern_part in zip(relative_parts, pattern_parts)
+        ):
+            return True
+    return False
 
 
 def _fingerprint(value: str) -> str:
