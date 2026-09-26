@@ -199,10 +199,28 @@ def _cross_channel_message_payload(
     text = arguments.get("text")
     if not isinstance(text, str):
         return ()
+    from .access_control import normalize_sink_destination
+
     trigger_channel = getattr(auth_context, "channel_id", None)
     explicit_channel = arguments.get("channel_id")
     target_channel = explicit_channel or trigger_channel
-    return () if target_channel == trigger_channel else (text,)
+    normalized_target = normalize_sink_destination(
+        SinkCategory.SAME_CHANNEL, target_channel,
+    )
+    normalized_trigger = normalize_sink_destination(
+        SinkCategory.SAME_CHANNEL, trigger_channel,
+    )
+    configured_alert = os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", "").strip()
+    normalized_alert = (
+        normalize_sink_destination(SinkCategory.SAME_CHANNEL, configured_alert)
+        if configured_alert else None
+    )
+    return (
+        ()
+        if normalized_target is not None
+        and normalized_target in {normalized_trigger, normalized_alert}
+        else (text,)
+    )
 
 
 def _web_search_target(
@@ -306,25 +324,25 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
     "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message", sink_payload_extractor=None),
     "pr_checks": _D(result_origin=_E | _R),
-    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "pr_comments": _D(result_origin=_E | _R),
     "pr_diff": _D(result_origin=_E | _R),
-    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "pr_files": _D(result_origin=_E | _R),
-    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "pr_job_log": _D(result_origin=_E | _R),
     "pr_metadata": _D(result_origin=_E | _R),
     "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "pr_review_requests": _D(result_origin=_E | _R),
     "pr_reviews": _D(result_origin=_E | _R),
-    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "react": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True),
     "rebuild_index": _D(SinkCategory.FILE, _index_target, "filesystem", result_origin=_N),
     "reload_pollers": _D(SinkCategory.SCHEDULER, _fixed_target("scheduler:pollers"), "scheduler", result_origin=_N),
     "remove_schedule": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
     "repo_checkout": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
-    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=_argument_payload("message")),
     "repo_diff": _D(result_origin=_R, git_operation_result=True),
     "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),

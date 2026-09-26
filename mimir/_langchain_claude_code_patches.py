@@ -289,8 +289,21 @@ def _claude_code_pre_tool_enforcement(
             include_jev=include_jev,
             jev_candidates=jev_candidates,
         )
-    except Exception:
-        log.exception("Claude Code outbound privacy check failed closed for %s", tool_name)
+    except Exception as exc:
+        exception_type = type(exc).__name__
+        log.error(
+            "Claude Code outbound privacy internal error for %s: %s",
+            tool_name,
+            exception_type,
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_privacy_internal_error",
+            target=None,
+            auth_context=auth_context,
+            event_fields={"exception_type": exception_type},
+        )
         privacy_refusal = (
             "Outbound privacy refused this tool call because the local content "
             "check failed. Retry only after the scanner is healthy."
@@ -393,6 +406,7 @@ async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> d
 
     from .outbound_privacy import jev_detector_enabled
     from .tools.budget_gate import (
+        _emit_hard_boundary_denied,
         _emit_outbound_jev_events,
         _outbound_privacy_refusal,
         _scan_outbound_jev,
@@ -417,8 +431,21 @@ async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> d
             if findings
             else None
         )
-    except Exception:
-        log.exception("Claude Code outbound privacy check failed closed for %s", tool_name)
+    except Exception as exc:
+        exception_type = type(exc).__name__
+        log.error(
+            "Claude Code outbound privacy internal error for %s: %s",
+            tool_name,
+            exception_type,
+        )
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_privacy_internal_error",
+            target=None,
+            auth_context=auth_context,
+            event_fields={"exception_type": exception_type},
+        )
         privacy_refusal = (
             "Outbound privacy refused this tool call because the local content "
             "check failed. Retry only after the scanner is healthy."

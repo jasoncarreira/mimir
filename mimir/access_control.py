@@ -4933,7 +4933,8 @@ def resolve_trigger_service_write_target(
 
 _TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
     ".env", ".git", ".mimir", ".venv", "config", "credentials",
-    "identities", "private-terms.txt", "prompts", "secret", "secrets",
+    "identities", ".outbound-privacy-key", "private-terms.txt", "prompts",
+    "secret", "secrets",
 })
 
 
