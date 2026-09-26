@@ -107,8 +107,10 @@ def _run(
     capsys: pytest.CaptureFixture,
     *,
     message: dict | None = None,
+    messages: list[dict] | None = None,
 ) -> tuple[list[dict], str]:
-    monkeypatch.setattr(poller, "_gog_search", lambda *_args: [message or _message()])
+    search_results = messages if messages is not None else [message or _message()]
+    monkeypatch.setattr(poller, "_gog_search", lambda *_args: search_results)
     assert poller.main() == 0
     captured = capsys.readouterr()
     events = [json.loads(line) for line in captured.out.splitlines() if line]
@@ -332,32 +334,45 @@ def test_transport_and_body_errors_fail_open_once(
 
 
 @pytest.mark.parametrize("failure_site", ["urlopen", "read"])
-def test_incomplete_read_fails_open_and_advances_cursor(
+def test_incomplete_read_fails_open_without_losing_later_messages(
     fresh_poller, tmp_path, monkeypatch, capsys, failure_site,
 ):
     _configure(tmp_path, triage=_triage_config())
     monkeypatch.setenv("JEV_KEY", "test-key")
+    calls = 0
 
-    if failure_site == "urlopen":
-        def fail(*_args, **_kwargs):
-            raise http.client.IncompleteRead(b"partial")
-
-        monkeypatch.setattr(fresh_poller.request, "urlopen", fail)
-    else:
-        class IncompleteResponse(_FakeResponse):
-            def read(self) -> bytes:
+    def fake_urlopen(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure_site == "urlopen":
                 raise http.client.IncompleteRead(b"partial")
 
-        monkeypatch.setattr(
-            fresh_poller.request,
-            "urlopen",
-            lambda *_args, **_kwargs: IncompleteResponse(b"unused"),
-        )
+            class IncompleteResponse(_FakeResponse):
+                def read(self) -> bytes:
+                    raise http.client.IncompleteRead(b"partial")
 
-    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+            return IncompleteResponse(b"unused")
+        return _FakeResponse(_response(0.91))
 
-    assert len(events) == 1 and "triage" not in events[0]
-    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    events, stderr = _run(
+        fresh_poller,
+        monkeypatch,
+        capsys,
+        messages=[
+            _message(),
+            _message(id="m2", threadId="thread-2", subject="Security alert"),
+        ],
+    )
+
+    assert [event["message_id"] for event in events] == ["m1", "m2"]
+    assert "triage" not in events[0]
+    assert events[1]["triage"] == {
+        "model": "jev-1.13.0",
+        "answers": {"notify": {"type": "noul", "noul": 0.91}},
+    }
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1", "m2"]
     assert stderr.count("triage failed") == 1
     assert "emitting untriaged" in stderr
     assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
