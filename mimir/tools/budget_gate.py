@@ -57,6 +57,7 @@ from langgraph.types import Command
 import yaml
 
 from ..env import env_bool
+from ..event_logger import emit_event_background as _emit_event_sync
 from ..models import AuthContext
 from ..redaction import redact_text
 from ..tool_descriptors import (
@@ -234,30 +235,6 @@ def _resolve_budget_state(ctx: Any | None = None) -> tuple[Any, int] | None:
     if budget <= 0:
         return None
     return ctx, int(budget)
-
-
-# Strong references to fire-and-forget background tasks (chainlink #118).
-# Module-level set holds tasks spawned by _emit_event_sync until completion.
-# The done-callback discards each entry so the set stays bounded to in-flight
-# tasks only.  See cpython docs "Coroutines and Tasks / Important" callout.
-_background_tasks: set["asyncio.Task[Any]"] = set()
-
-
-def _emit_event_sync(kind: str, **kwargs: Any) -> None:
-    """Fire-and-forget log_event from inside the middleware sync path.
-
-    The middleware's ``wrap_tool_call`` is sync; ``log_event`` is async.
-    We schedule it on the running loop when available, drop otherwise
-    (the denial text on the returned ToolMessage is still load-bearing).
-    """
-    try:
-        from ..event_logger import safe_log_event
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(safe_log_event(kind, **kwargs))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except RuntimeError:
-        log.debug("budget event %s dropped: no running loop", kind)
 
 
 def _emit_hard_boundary_denied(

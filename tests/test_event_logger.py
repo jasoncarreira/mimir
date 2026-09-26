@@ -15,6 +15,7 @@ import pytest
 from mimir.event_logger import (
     FEEDBACK_EVENT_VERSION,
     EventLogger,
+    emit_event_background,
     init_logger,
     safe_log_event,
 )
@@ -361,6 +362,72 @@ async def test_safe_log_event_swallows_errors_when_logger_not_initialized():
         await safe_log_event("orphan_event", x=1)
     finally:
         _el._logger = original  # restore so other tests aren't affected
+
+
+@pytest.mark.asyncio
+async def test_emit_event_background_retains_task_until_completion(monkeypatch):
+    import mimir.event_logger as event_logger
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    spawned_task = None
+
+    async def blocking_safe_log_event(kind: str, **kwargs) -> None:
+        nonlocal spawned_task
+        spawned_task = asyncio.current_task()
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(event_logger, "safe_log_event", blocking_safe_log_event)
+    emit_event_background("tool_call_budget_denied", tool="bash", count=5)
+    await started.wait()
+
+    assert spawned_task in event_logger._background_event_tasks
+
+    release.set()
+    await spawned_task
+    await asyncio.sleep(0)
+    assert spawned_task not in event_logger._background_event_tasks
+
+
+def test_emit_event_background_drops_without_running_loop(monkeypatch, caplog):
+    import mimir.event_logger as event_logger
+
+    calls = []
+
+    async def capture_safe_log_event(kind: str, **kwargs) -> None:
+        calls.append((kind, kwargs))
+
+    monkeypatch.setattr(event_logger, "safe_log_event", capture_safe_log_event)
+    monkeypatch.setattr(
+        event_logger, "log_event_sync",
+        lambda *args, **kwargs: pytest.fail("event must not be queued"),
+    )
+    caplog.set_level("DEBUG", logger="mimir.event_logger")
+
+    emit_event_background("iteration_budget_reached", count=20, budget=20)
+
+    assert calls == []
+    assert "event iteration_budget_reached dropped: no running loop" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_emit_event_background_swallows_and_logs_logger_failure(
+    monkeypatch, caplog,
+):
+    import mimir.event_logger as event_logger
+
+    async def fail_log_event(kind: str, **kwargs) -> None:
+        raise RuntimeError("logger failed")
+
+    monkeypatch.setattr(event_logger, "log_event", fail_log_event)
+    caplog.set_level("DEBUG", logger="mimir.event_logger")
+
+    emit_event_background("iteration_budget_warning", count=18, budget=20)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert "log_event 'iteration_budget_warning' failed: logger failed" in caplog.text
 
 
 @pytest.mark.asyncio

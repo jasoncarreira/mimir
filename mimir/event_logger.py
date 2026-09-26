@@ -25,6 +25,7 @@ from .background_io import run_in_pool
 log = logging.getLogger(__name__)
 
 _EVENT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="event-log")
+_background_event_tasks: set[asyncio.Task[Any]] = set()
 
 FEEDBACK_EVENT_VERSION: Final[str] = "v1"
 PROCESS_LOCK_TIMEOUT_SECONDS = 1.0
@@ -431,3 +432,15 @@ async def safe_log_event(event_type: str, **payload: Any) -> None:
         await log_event(event_type, **payload)
     except Exception as exc:  # noqa: BLE001
         log.debug("log_event %r failed: %s", event_type, exc)
+
+
+def emit_event_background(kind: str, **kwargs: Any) -> None:
+    """Schedule best-effort event logging, dropping when no loop is running."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        log.debug("event %s dropped: no running loop", kind)
+        return
+    task = loop.create_task(safe_log_event(kind, **kwargs))
+    _background_event_tasks.add(task)
+    task.add_done_callback(_background_event_tasks.discard)
