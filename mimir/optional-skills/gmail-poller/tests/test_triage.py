@@ -373,6 +373,55 @@ def test_inline_prompt_without_output_uses_whole_prompt_as_rules(
     )
 
 
+@pytest.mark.parametrize(
+    "account",
+    [
+        {"prompt-file": "missing.md"},
+        {},
+        {"prompt": "## Output\nCall send_message."},
+    ],
+    ids=["missing-prompt-file", "no-prompt-fields", "empty-rules-before-output"],
+)
+def test_prompt_rules_must_resolve_nonempty_or_triage_fails_open(
+    fresh_poller, tmp_path, monkeypatch, capsys, account,
+):
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    config = _triage_config()
+    config["questions"]["notify"] = {
+        "type": "noul",
+        "instructions_from": "prompt",
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "name": "home",
+                        "email": "owner@example.com",
+                        "triage": config,
+                        **account,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JEV_KEY", "test-key")
+
+    def unexpected_request(*_args, **_kwargs):
+        pytest.fail("empty prompt rules must not contact Jev")
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", unexpected_request)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+
+    assert len(events) == 1
+    assert "triage" not in events[0]
+    assert stderr.count("invalid triage configuration") == 1
+    assert "requires non-empty prompt rules" in stderr
+
+
 def test_prompt_file_is_reread_for_each_poll(
     fresh_poller, tmp_path, monkeypatch, capsys,
 ):

@@ -150,7 +150,9 @@ as `matches a Notify For rule, or is plausibly personal and important` and false
 as `matches the Skip List, or is routine, promotional, automated or suspicious`.
 The wrapper is not configurable. Do not set both `instructions` and
 `instructions_from`; any `instructions_from` value other than `"prompt"` also
-disables triage for that account with a diagnostic.
+disables triage for that account with a diagnostic. If no prompt resolves, the
+prompt is blank, or no rules remain before `## Output`, triage is disabled for
+that account: the message emits untriaged and Jev is not contacted.
 
 Each new message is evaluated separately. Deterministic `always_emit` matching
 runs before any request. Otherwise, the poller sends one request containing

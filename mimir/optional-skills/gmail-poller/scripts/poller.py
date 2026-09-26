@@ -273,12 +273,19 @@ def _load_triage(
                 problem = "questions.notify must be a noul question"
 
             if problem is None and notify.get("instructions_from") == "prompt":
-                questions = dict(questions)
-                questions["notify"] = {
-                    "type": "noul",
-                    "instructions": PROMPT_NOTIFY_PREAMBLE + _prompt_rules(prompt_body),
-                    "criteria": dict(PROMPT_NOTIFY_CRITERIA),
-                }
+                prompt_rules = _prompt_rules(prompt_body)
+                if not prompt_rules.strip():
+                    problem = (
+                        "questions.notify instructions_from prompt requires "
+                        "non-empty prompt rules"
+                    )
+                else:
+                    questions = dict(questions)
+                    questions["notify"] = {
+                        "type": "noul",
+                        "instructions": PROMPT_NOTIFY_PREAMBLE + prompt_rules,
+                        "criteria": dict(PROMPT_NOTIFY_CRITERIA),
+                    }
 
     if problem is not None:
         _eprint(
