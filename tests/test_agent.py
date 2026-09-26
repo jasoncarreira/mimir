@@ -50,6 +50,7 @@ from mimir.feedback import FeedbackLog
 from mimir.history import MessageBuffer
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.index import IndexGenerator
+from mimir._langchain_codex_plus_patches import codex_plus_stream_buffering_enabled
 from mimir.models import (
     AgentEvent,
     AuthContext,
@@ -2822,6 +2823,59 @@ async def test_run_turn_records_error_when_ainvoke_raises(tmp_path: Path):
     assert record.events == []
     # feedback skipped on error
     assert fake_saga.feedback_calls == []
+
+
+@pytest.mark.parametrize(
+    ("trigger", "override", "expected"),
+    [
+        ("poller", None, True),
+        ("scheduled_tick", None, True),
+        ("saga_session_end", None, True),
+        ("upgrade", None, True),
+        ("shell_job_complete", None, True),
+        ("user_message", None, False),
+        ("poller", "0", False),
+    ],
+)
+async def test_run_turn_sets_codex_plus_buffering_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trigger: str,
+    override: str | None,
+    expected: bool,
+) -> None:
+    if override is not None:
+        monkeypatch.setenv("MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE", override)
+
+    class BufferModeAgent(_FakeAgent):
+        modes: list[bool] = []
+
+        async def astream(self, *args, **kwargs):
+            self.modes.append(codex_plus_stream_buffering_enabled())
+            async for chunk in super().astream(*args, **kwargs):
+                yield chunk
+
+    fake = BufferModeAgent([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=fake)
+
+    await agent.run_turn(AgentEvent(trigger=trigger, channel_id="ch-1", content="work"))
+
+    assert fake.modes == [expected]
+    assert codex_plus_stream_buffering_enabled() is False
+
+
+async def test_run_turn_resets_codex_plus_buffering_after_exception(tmp_path: Path) -> None:
+    class BrokenAgent(_FakeAgent):
+        async def astream(self, *args, **kwargs):
+            assert codex_plus_stream_buffering_enabled() is True
+            raise RuntimeError("model failed")
+            yield  # pragma: no cover - makes this an async generator
+
+    agent = _build_agent(tmp_path, fake_agent=BrokenAgent([]))
+
+    await agent.run_turn(AgentEvent(trigger="poller", channel_id="ch-1", content="work"))
+
+    assert codex_plus_stream_buffering_enabled() is False
 
 
 @pytest.mark.parametrize("failure", ["exception", "timeout"])

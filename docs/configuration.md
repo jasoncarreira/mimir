@@ -71,6 +71,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_USE_RESPONSES_API` | bool (tri-state) | auto | Force OpenAI Responses API on/off. Unset → derived from `OPENAI_BASE_URL`. |
 | `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_ATTEMPTS` | int | `3` | Max attempts for Codex-Plus transient connection-error retries (floor 1). |
 | `MIMIR_CODEX_PLUS_TRANSIENT_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for Codex-Plus transient retries (floor 0.0). |
+| `MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE` | bool | `true` | Buffer Codex-Plus model steps for non-interactive turns so mid-response transient drops can be retried safely. Set to `0` or `false` to disable. |
 | `MIMIR_LLM_RETRY_MAX_ATTEMPTS` | int | `3` | Max attempts in the shared provider-agnostic LLM retry layer (backoff + jitter on transient errors). |
 | `MIMIR_LLM_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for the shared LLM retry layer. |
 | `MIMIR_LLM_RETRY_MAX_DELAY` | float | `30.0` | Max backoff (s) cap for the shared LLM retry layer. |
