@@ -102,6 +102,17 @@ TRIAGE_DROPPED_FILE = STATE_DIR / "triage-dropped.jsonl"
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_JEV_MODEL = "jev-1.13.0"
 JEV_TIMEOUT_SECONDS = 5.0
+PROMPT_NOTIFY_PREAMBLE = (
+    "Should the account owner be notified about this email, according to these "
+    "rules? Apply the Skip List first; a sender or type listed there is a 'no' "
+    "even if it looks important.\n\n"
+)
+PROMPT_NOTIFY_CRITERIA = {
+    "true": "matches a Notify For rule, or is plausibly personal and important",
+    "false": (
+        "matches the Skip List, or is routine, promotional, automated or suspicious"
+    ),
+}
 
 # Default search: last 24h in inbox. Caller can narrow via
 # MIMIR_GMAIL_QUERY (e.g. ``"in:inbox is:unread newer_than:6h
@@ -138,6 +149,7 @@ class TriageConfig:
     questions: dict
     drop_below: float
     always_emit: tuple[str, ...]
+    shadow: bool
 
 
 @dataclass(frozen=True)
@@ -154,7 +166,19 @@ class Account:
     triage: TriageConfig | None = None
 
 
-def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
+def _prompt_rules(prompt_body: str) -> str:
+    """Return operator rules before the agent-delivery section, if present."""
+    lines = prompt_body.splitlines()
+    try:
+        output_index = lines.index("## Output")
+    except ValueError:
+        return prompt_body
+    return "\n".join(lines[:output_index]).rstrip()
+
+
+def _load_triage(
+    entry: dict, *, account_label: str, prompt_body: str
+) -> TriageConfig | None:
     """Validate an account's optional triage block, disabling it on error."""
     if "triage" not in entry:
         return None
@@ -168,6 +192,7 @@ def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
         questions = raw.get("questions")
         drop_below = raw.get("drop_below", 0.10)
         always_emit = raw.get("always_emit", [])
+        shadow = raw.get("shadow", False)
 
         if not isinstance(model, str) or not model.strip():
             problem = "model must be a non-empty string"
@@ -181,6 +206,8 @@ def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
             isinstance(item, str) and item.strip() for item in always_emit
         ):
             problem = "always_emit must be a list of sender addresses or domains"
+        elif not isinstance(shadow, bool):
+            problem = "shadow must be a boolean"
         else:
             for name, question in questions.items():
                 if not isinstance(name, str) or not name or not isinstance(question, dict):
@@ -188,15 +215,32 @@ def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
                     break
                 qtype = question.get("type")
                 instructions = question.get("instructions")
+                instructions_from = question.get("instructions_from")
                 criteria = question.get("criteria")
                 if qtype not in {"noul", "choice", "score"}:
                     problem = f"question {name!r} has unknown type"
-                elif not isinstance(instructions, str) or not instructions.strip():
+                elif instructions_from is not None and (
+                    name != "notify" or instructions_from != "prompt"
+                ):
+                    problem = f"question {name!r} has invalid instructions_from"
+                elif instructions is not None and instructions_from is not None:
+                    problem = (
+                        f"question {name!r} cannot use both instructions "
+                        "and instructions_from"
+                    )
+                elif instructions_from is None and (
+                    not isinstance(instructions, str) or not instructions.strip()
+                ):
                     problem = f"question {name!r} needs non-empty instructions"
-                elif qtype == "noul" and criteria is not None and not (
-                    isinstance(criteria, dict)
-                    and set(criteria) == {"true", "false"}
-                    and all(isinstance(value, str) for value in criteria.values())
+                elif (
+                    qtype == "noul"
+                    and instructions_from is None
+                    and criteria is not None
+                    and not (
+                        isinstance(criteria, dict)
+                        and set(criteria) == {"true", "false"}
+                        and all(isinstance(value, str) for value in criteria.values())
+                    )
                 ):
                     problem = (
                         f"noul question {name!r} criteria must contain "
@@ -228,6 +272,21 @@ def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
             ):
                 problem = "questions.notify must be a noul question"
 
+            if problem is None and notify.get("instructions_from") == "prompt":
+                prompt_rules = _prompt_rules(prompt_body)
+                if not prompt_rules.strip():
+                    problem = (
+                        "questions.notify instructions_from prompt requires "
+                        "non-empty prompt rules"
+                    )
+                else:
+                    questions = dict(questions)
+                    questions["notify"] = {
+                        "type": "noul",
+                        "instructions": PROMPT_NOTIFY_PREAMBLE + prompt_rules,
+                        "criteria": dict(PROMPT_NOTIFY_CRITERIA),
+                    }
+
     if problem is not None:
         _eprint(
             f"gmail-poller: account {account_label!r} has invalid triage "
@@ -240,6 +299,7 @@ def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
         questions=questions,
         drop_below=float(drop_below),
         always_emit=tuple(item.strip().lower().lstrip("@") for item in always_emit),
+        shadow=shadow,
     )
 
 
@@ -371,7 +431,9 @@ def _load_accounts() -> list[Account] | None:
                 name=name,
                 email=email,
                 prompt_body=prompt_body or "",
-                triage=_load_triage(entry, account_label=name),
+                triage=_load_triage(
+                    entry, account_label=name, prompt_body=prompt_body or ""
+                ),
             )
         )
     return accounts
@@ -634,7 +696,7 @@ def _triage_message(event: dict, account: Account) -> dict | None:
         return None
 
 
-def _audit_drop(event: dict, triage_result: dict) -> bool:
+def _audit_drop(event: dict, triage_result: dict, *, shadow: bool = False) -> bool:
     """Persist a drop record; return False so audit failures fail open."""
     record = {
         "message_id": event["message_id"],
@@ -644,6 +706,8 @@ def _audit_drop(event: dict, triage_result: dict) -> bool:
         "answers": triage_result["answers"],
         "model": triage_result["model"],
     }
+    if shadow:
+        record["shadow"] = True
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with TRIAGE_DROPPED_FILE.open("a", encoding="utf-8") as audit:
@@ -766,9 +830,12 @@ def main() -> int:
                 triage_result = _triage_message(event, account)
             if triage_result is not None:
                 notify = triage_result["answers"]["notify"]["noul"]
-                if notify <= account.triage.drop_below and _audit_drop(
-                    event, triage_result
-                ):
+                would_drop = notify <= account.triage.drop_below
+                if account.triage.shadow:
+                    triage_result["would_drop"] = would_drop
+                    if would_drop:
+                        _audit_drop(event, triage_result, shadow=True)
+                elif would_drop and _audit_drop(event, triage_result):
                     new_ids.append(mid)
                     seen.add(mid)
                     dropped += 1
