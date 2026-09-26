@@ -626,18 +626,11 @@ def test_social_dispatch_detection_does_not_search_command_substrings(
     assert refusal is None
 
 
-@pytest.mark.parametrize("contents", [None, "dispatch: [unterminated"])
-def test_missing_or_unparseable_social_outbox_has_no_findings(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    contents: str | None,
+def test_missing_social_outbox_has_no_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
-    if contents is not None:
-        outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
-        outbox.parent.mkdir(parents=True)
-        outbox.write_text(contents, encoding="utf-8")
 
     refusal = _outbound_privacy_refusal(
         "shell_exec",
@@ -650,6 +643,124 @@ def test_missing_or_unparseable_social_outbox_has_no_findings(
     )
 
     assert refusal is None
+
+
+def test_tagged_social_outbox_is_scanned_as_raw_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
+    outbox.parent.mkdir(parents=True)
+    outbox.write_text(
+        "dispatch:\n  - !custom {post: {text: " + TOKEN + "}}\n", encoding="utf-8",
+    )
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {
+            "command": (
+                f"bash {script} social-cli-notifications dispatch --platform bsky"
+            ),
+        },
+        auth,
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+    assert TOKEN not in refusal
+
+
+def test_social_config_write_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "write_file",
+        {
+            "file_path": "state/pollers/social-cli-feed/config.yaml",
+            "content": "state:\n  platformIsolation: false\n",
+        },
+        _auth(),
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
+    assert "controls which outbox is dispatched" in str(result.content)
+
+
+def test_social_dispatch_refuses_redirected_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    state_dir.mkdir(parents=True)
+    (state_dir / "config.yaml").write_text(
+        "state:\n  stateDir: sub\n", encoding="utf-8",
+    )
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "stateDir escapes" in refusal
+
+
+def test_social_dispatch_scans_shared_outbox_with_isolation_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    state_dir.mkdir(parents=True)
+    (state_dir / "config.yaml").write_text(
+        "state:\n  platformIsolation: false\n", encoding="utf-8",
+    )
+    (state_dir / "outbox.yaml").write_text(
+        f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
+    )
+    (state_dir / "outbox-bsky.yaml").write_text(
+        "dispatch:\n  - post:\n      text: clean\n", encoding="utf-8",
+    )
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {
+            "command": (
+                f"bash {script} social-cli-notifications dispatch --platform bsky"
+            ),
+        },
+        auth,
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+
+
+def test_social_dispatch_refuses_unparseable_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    config = tmp_path / "state/pollers/social-cli-notifications/config.yaml"
+    config.parent.mkdir(parents=True)
+    config.write_text("state: [unterminated", encoding="utf-8")
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "unreadable or unparseable" in refusal
 
 
 def test_declared_external_shell_payload_is_scanned(

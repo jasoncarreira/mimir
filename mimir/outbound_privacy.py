@@ -30,6 +30,9 @@ OUTBOX_PATTERNS = (
     "state/pollers/social-cli-*/outbox-*.yaml",
     "state/pollers/social-cli-*/outbox.yaml",
 )
+OUTBOX_CONTROL_PATTERNS = (
+    "state/pollers/social-cli-*/config.yaml",
+)
 
 _PRIVATE_TERMS_FILE = "private-terms.txt"
 _HASH_PREFIX_LENGTH = 12
@@ -39,12 +42,14 @@ _cached_signature: tuple[int, int] | None = None
 _cached_terms: tuple[str, ...] = ()
 
 
-def _matches_outbox_pattern(path: Path, home: Path) -> bool:
+def _matches_outbox_pattern(
+    path: Path, home: Path, patterns: tuple[str, ...] | None = None,
+) -> bool:
     try:
         relative_parts = path.relative_to(home).as_posix().split("/")
     except ValueError:
         return False
-    for pattern in OUTBOX_PATTERNS:
+    for pattern in OUTBOX_PATTERNS if patterns is None else patterns:
         pattern_path = Path(pattern)
         if pattern_path.is_absolute() or ".." in pattern_path.parts:
             continue
@@ -59,8 +64,9 @@ def _matches_outbox_pattern(path: Path, home: Path) -> bool:
     return False
 
 
-def is_outbox_path(path: Path | str) -> bool:
-    """Return whether either the lexical or resolved path is a registered outbox."""
+def _matches_registered_path(
+    path: Path | str, patterns: tuple[str, ...],
+) -> bool:
     home_value = os.environ.get("MIMIR_HOME", "").strip()
     if not home_value:
         return False
@@ -72,9 +78,19 @@ def is_outbox_path(path: Path | str) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     return any(
-        _matches_outbox_pattern(candidate, home)
+        _matches_outbox_pattern(candidate, home, patterns)
         for candidate in dict.fromkeys((lexical, resolved))
     )
+
+
+def is_outbox_path(path: Path | str) -> bool:
+    """Return whether either the lexical or resolved path is a registered outbox."""
+    return _matches_registered_path(path, OUTBOX_PATTERNS)
+
+
+def is_outbox_control_path(path: Path | str) -> bool:
+    """Return whether a path controls which social-cli outbox is dispatched."""
+    return _matches_registered_path(path, OUTBOX_CONTROL_PATTERNS)
 
 
 def _fingerprint(value: str) -> str:

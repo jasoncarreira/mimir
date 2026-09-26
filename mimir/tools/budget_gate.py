@@ -508,9 +508,7 @@ def _declared_shell_payloads(
     return ()
 
 
-_OUTBOX_DISPATCH_SCRIPTS = {
-    "run-social-cli.sh": "state/pollers/{poller}/outbox-{platform}.yaml",
-}
+_OUTBOX_DISPATCH_SCRIPTS = frozenset({"run-social-cli.sh"})
 
 
 def _outbox_write_payloads(
@@ -545,16 +543,75 @@ def _outbox_write_payloads(
     )
 
 
+def _outbox_control_write(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> bool:
+    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
+        return False
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return False
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return False
+    from ..outbound_privacy import is_outbox_control_path
+
+    return is_outbox_control_path(target)
+
+
 def _literal_outbox_path(path: Path) -> Path:
     """Return an absolute lexical path without following an outbox symlink."""
     return Path(os.path.abspath(path.expanduser()))
 
 
-def _bare_dispatch_outboxes(home: Path, poller: str) -> tuple[tuple[str, Path], ...]:
-    """Mirror social-cli's bare-dispatch discovery and shared-file fallback."""
-    state_dir = home / "state" / "pollers" / poller
+def _social_dispatch_state_dir(home: Path, poller: str) -> tuple[Path | None, str | None]:
+    """Resolve social-cli stateDir while confining dispatch to its poller directory."""
+    poller_dir = _literal_outbox_path(home / "state" / "pollers" / poller)
+    user_home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    config_paths = (poller_dir / "config.yaml", user_home / ".config/social-cli/config.yaml")
+    config: Mapping[str, Any] = {}
+    for config_path in config_paths:
+        try:
+            if not config_path.exists():
+                continue
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, RuntimeError, yaml.YAMLError):
+            return None, "social-cli dispatch configuration is unreadable or unparseable"
+        if loaded is None:
+            config = {}
+        elif isinstance(loaded, Mapping):
+            config = loaded
+        else:
+            return None, "social-cli dispatch configuration is not a mapping"
+        break
+
+    state = config.get("state", {})
+    if state is None:
+        state = {}
+    if not isinstance(state, Mapping):
+        return None, "social-cli dispatch state configuration is not a mapping"
+    configured = state.get("stateDir")
+    if configured is None:
+        return poller_dir, None
+    if not isinstance(configured, str) or not configured.strip():
+        return None, "social-cli dispatch stateDir is invalid"
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = poller_dir / candidate
+    try:
+        effective = candidate.resolve(strict=False)
+        expected = poller_dir.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, "social-cli dispatch stateDir could not be resolved"
+    if effective != expected:
+        return None, "social-cli dispatch stateDir escapes its poller state directory"
+    return poller_dir, None
+
+
+def _all_dispatch_outboxes(state_dir: Path) -> tuple[tuple[str, Path], ...]:
+    """Return every outbox social-cli could dispatch, independent of isolation mode."""
     suffixed = sorted(state_dir.glob("outbox-*.yaml"))
-    candidates = suffixed or [state_dir / "outbox.yaml"]
+    candidates = [*suffixed, state_dir / "outbox.yaml"]
     return tuple(
         (
             path.name.removeprefix("outbox-").removesuffix(".yaml")
@@ -562,27 +619,15 @@ def _bare_dispatch_outboxes(home: Path, poller: str) -> tuple[tuple[str, Path], 
             else "shared",
             _literal_outbox_path(path),
         )
-        for path in candidates
+        for path in dict.fromkeys(candidates)
     )
-
-
-def _string_leaves(value: Any) -> tuple[str, ...]:
-    if isinstance(value, str):
-        return (value,)
-    if isinstance(value, Mapping):
-        return tuple(
-            text for child in value.values() for text in _string_leaves(child)
-        )
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return tuple(text for child in value for text in _string_leaves(child))
-    return ()
 
 
 def _declared_dispatch_outboxes(
     tool_name: str,
     arguments: Mapping[str, Any],
     auth_context: AuthContext | None,
-) -> tuple[tuple[str, Path], ...]:
+) -> tuple[tuple[str, Path], ...] | str:
     if tool_name not in {"shell_exec", "bash_async"}:
         return ()
     service = get_trusted_service_from_auth_context(auth_context)
@@ -596,15 +641,17 @@ def _declared_dispatch_outboxes(
         return ()
 
     from ..access_control import _declared_command_execution_argv
-    from ..outbound_privacy import is_outbox_path
 
     home_value = os.environ.get("MIMIR_HOME", "").strip()
     if not home_value:
         return ()
     for declaration in declared:
         script = declaration.script
-        pattern = _OUTBOX_DISPATCH_SCRIPTS.get(script.name if script is not None else "")
-        if pattern is None or _declared_command_execution_argv(argv, (declaration,)) is None:
+        script_name = script.name if script is not None else ""
+        if (
+            script_name not in _OUTBOX_DISPATCH_SCRIPTS
+            or _declared_command_execution_argv(argv, (declaration,)) is None
+        ):
             continue
         if len(argv) < 4 or argv[3] != "dispatch":
             continue
@@ -635,14 +682,10 @@ def _declared_dispatch_outboxes(
         if not valid:
             continue
         home = Path(home_value)
-        if not platforms:
-            return _bare_dispatch_outboxes(home, poller)
-        outboxes = []
-        for platform in dict.fromkeys(platforms):
-            path = home / pattern.format(poller=poller, platform=platform)
-            if is_outbox_path(path):
-                outboxes.append((platform, _literal_outbox_path(path)))
-        return tuple(outboxes)
+        state_dir, config_error = _social_dispatch_state_dir(home, poller)
+        if config_error is not None or state_dir is None:
+            return config_error or "social-cli dispatch configuration could not be resolved"
+        return _all_dispatch_outboxes(state_dir)
     return ()
 
 
@@ -650,21 +693,22 @@ def _dispatch_outbox_payloads(
     tool_name: str,
     arguments: Mapping[str, Any],
     auth_context: AuthContext | None,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
     texts: list[str] = []
     platforms: list[str] = []
-    for platform, path in _declared_dispatch_outboxes(
-        tool_name, arguments, auth_context,
-    ):
+    outboxes = _declared_dispatch_outboxes(tool_name, arguments, auth_context)
+    if isinstance(outboxes, str):
+        return (), (), outboxes
+    for platform, path in outboxes:
         try:
-            document = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
-        except (OSError, RuntimeError, yaml.YAMLError):
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
             continue
-        if not isinstance(document, Mapping) or not isinstance(document.get("dispatch"), list):
-            continue
-        texts.extend(_string_leaves(document["dispatch"]))
+        except (OSError, RuntimeError):
+            return (), (), "a social-cli outbox could not be read"
+        texts.append(raw)
         platforms.append(platform)
-    return tuple(texts), tuple(platforms)
+    return tuple(texts), tuple(platforms), None
 
 
 _CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
@@ -703,10 +747,33 @@ def _outbound_privacy_refusal(
 
         texts = _string_leaf_payload(descriptor_name, arguments, auth_context)
     texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
+    if _outbox_control_write(descriptor_name, arguments):
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_config_control",
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return (
+            "Outbound privacy refused a model write to social-cli `config.yaml` "
+            "because it controls which outbox is dispatched."
+        )
     outbox_write_texts = _outbox_write_payloads(descriptor_name, arguments)
-    dispatch_texts, dispatch_platforms = _dispatch_outbox_payloads(
+    dispatch_texts, dispatch_platforms, dispatch_error = _dispatch_outbox_payloads(
         descriptor_name, arguments, auth_context,
     )
+    if dispatch_error is not None:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_dispatch_unscannable",
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return f"Outbound privacy refused social-cli dispatch: {dispatch_error}."
     texts = (*texts, *outbox_write_texts, *dispatch_texts)
     if not texts:
         return None
