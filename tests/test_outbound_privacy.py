@@ -168,12 +168,20 @@ def test_send_message_scans_only_cross_channel(
     assert PRIVATE_TERM.casefold() not in cross.casefold()
 
 
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "mcp_remote_publish",
+        "mcp__langchain-tools__mcp_github_create_issue",
+    ],
+)
 def test_nested_external_mcp_credential_is_refused(
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
     events = _capture_events(monkeypatch)
     refusal = _outbound_privacy_refusal(
-        "mcp_remote_publish",
+        tool_name,
         {"outer": {"items": ["safe", {"body": TOKEN}]}},
         _auth(),
     )
@@ -181,6 +189,39 @@ def test_nested_external_mcp_credential_is_refused(
     assert refusal is not None
     assert "credential detector" in refusal
     assert TOKEN not in refusal
+    assert TOKEN not in json.dumps(events)
+
+
+def test_credential_wins_when_private_term_also_matches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", raising=False)
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    outbound = f"{PRIVATE_TERM}: {TOKEN}"
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    middleware_result = _run_sync(
+        "web_search", {"query": outbound}, _auth(), executed,
+    )
+    claude_result = _claude_code_pre_tool_enforcement(
+        "WebSearch", {"query": outbound}, "toolu_mixed_privacy", auth_context=_auth(),
+    )
+
+    assert middleware_result.status == "error"
+    assert executed == []
+    assert claude_result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    hard_denials = [
+        fields for event, fields in events
+        if event == "hard_boundary_denied"
+    ]
+    assert len(hard_denials) == 2
+    assert all(fields["reason"] == "outbound_credential" for fields in hard_denials)
+    assert not any(event == "shadow_tool_decision" for event, _fields in events)
+    assert TOKEN not in str(middleware_result.content)
+    assert TOKEN not in json.dumps(claude_result)
     assert TOKEN not in json.dumps(events)
 
 
@@ -268,10 +309,11 @@ def test_claude_code_bridged_local_write_is_not_treated_as_external_mcp() -> Non
 
 
 @pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
-def test_middleware_privacy_errors_prevent_execution(
+def test_middleware_privacy_errors_return_value_free_refusal(
     monkeypatch: pytest.MonkeyPatch,
     failing_component: str,
 ) -> None:
+    events = _capture_events(monkeypatch)
     if failing_component == "extractor":
         descriptor = get_tool_descriptor("fetch_url")
         assert descriptor is not None
@@ -292,14 +334,21 @@ def test_middleware_privacy_errors_prevent_execution(
         )
 
     executed: list[bool] = []
-    with pytest.raises(RuntimeError, match=f"{failing_component} failed"):
-        _run_sync(
-            "fetch_url",
-            {"url": "https://example.test/"},
-            _auth(),
-            executed,
-        )
+    result = _run_sync(
+        "fetch_url",
+        {"url": f"https://example.test/?value={TOKEN}"},
+        _auth(),
+        executed,
+    )
+
+    assert result.status == "error"
+    assert "local content check failed" in str(result.content)
     assert executed == []
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["boundary"] == "outbound_privacy"
+    assert hard["reason"] == "outbound_privacy_check_failed"
+    assert TOKEN not in str(result.content)
+    assert TOKEN not in json.dumps(events)
 
 
 @pytest.mark.parametrize("failing_component", ["extractor", "scanner"])

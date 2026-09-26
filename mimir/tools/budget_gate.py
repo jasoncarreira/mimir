@@ -530,16 +530,16 @@ def _outbound_privacy_refusal(
     sink_category: SinkCategory | None = None,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
-    descriptor_name, bridged_mimir_tool = _outbound_privacy_tool_name(tool_name)
+    descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
     descriptor = get_tool_descriptor(descriptor_name)
     extractor = descriptor.sink_payload_extractor if descriptor is not None else None
     texts: tuple[str, ...] = ()
     if callable(extractor):
         texts = extractor(descriptor_name, arguments, auth_context)
-    elif not bridged_mimir_tool and tool_name.startswith("mcp_"):
+    elif descriptor_name.startswith("mcp_"):
         from ..tool_descriptors import _string_leaf_payload
 
-        texts = _string_leaf_payload(tool_name, arguments, auth_context)
+        texts = _string_leaf_payload(descriptor_name, arguments, auth_context)
     texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
     if not texts:
         return None
@@ -3015,9 +3015,23 @@ def _prepare_tool_call_execution(
             return _execute_clear_ingest_taint_action(request, auth_context)
         return _execute_declassification_action(request, auth_context, arguments)
 
-    privacy_refusal = _outbound_privacy_refusal(
-        tool_name, arguments, auth_context,
-    )
+    try:
+        privacy_refusal = _outbound_privacy_refusal(
+            tool_name, arguments, auth_context,
+        )
+    except Exception:
+        log.exception("Outbound privacy check failed closed for %s", tool_name)
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason="outbound_privacy_check_failed",
+            target=None,
+            auth_context=auth_context,
+        )
+        privacy_refusal = (
+            "Outbound privacy refused this tool call because the local content "
+            "check failed. Retry only after the scanner is healthy."
+        )
     if privacy_refusal is not None:
         return _tool_call_refusal(call, privacy_refusal, arguments=None)
 
