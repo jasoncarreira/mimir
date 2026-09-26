@@ -662,7 +662,10 @@ def test_job_log_provenance_inventories_remain_repository_sources():
     assert access_control._TOOL_FLOW_MAP["pr_job_log"] == access_control.ToolFlowDirection.SOURCE
     assert access_control._PROTECTED_RESULT_DOMAINS["pr_job_log"] == "repository"
     assert "pr_job_log" in access_control._READ_BACKEND_RESULT_TOOLS
-    assert "pr_job_log" in access_control._REPOSITORY_RESULT_TOOLS
+    assert (
+        access_control.TOOL_DESCRIPTORS["pr_job_log"].result_origin
+        & access_control.ResultOriginKind.REPOSITORY
+    )
     assert "pr_job_log" not in access_control.TRIGGER_AUTHORITY_PROFILES["heartbeat"]
     access_control.assert_capability_matrix_complete()
     scope = _scope(RepoPRAction.INSPECT)
@@ -3201,14 +3204,13 @@ def test_issue_comment_refuses_invalid_issue_numbers_before_adapter_call(
 
 def test_issue_comment_registration_and_capability_preflights() -> None:
     assert "issue_comment" in {forge_tool.name for forge_tool in FORGE_TOOLS}
-    assert access_control._SINK_CATEGORY_MAP["issue_comment"] is access_control.SinkCategory.FORGE
+    descriptor = access_control.TOOL_DESCRIPTORS["issue_comment"]
+    assert descriptor.sink_category is access_control.SinkCategory.FORGE
     assert access_control._TOOL_FLOW_MAP["issue_comment"] is access_control.ToolFlowDirection.SINK
     assert access_control.TRIGGER_CAPABILITY_TIERS["issue_comment"] is (
         access_control.CapabilityTier.SCOPED_WITH_PROVENANCE
     )
-    assert access_control._OPERATION_SINK_DESTINATION["issue_comment"] == (
-        "configured_repository_issue"
-    )
+    assert descriptor.sink_destination == "configured_repository_issue"
     assert "issue_comment" in access_control.TRIGGER_AUTHORITY_PROFILES["github"]
     assert all(
         "issue_comment" not in capabilities
