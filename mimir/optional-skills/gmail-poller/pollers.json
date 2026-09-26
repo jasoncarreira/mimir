@@ -26,7 +26,8 @@
         "GOG_ACCOUNT",
         "MIMIR_GMAIL_QUERY",
         "MIMIR_GMAIL_MAX_FETCH",
-        "MIMIR_HOME"
+        "MIMIR_HOME",
+        "JEV_KEY"
       ]
     }
   ]

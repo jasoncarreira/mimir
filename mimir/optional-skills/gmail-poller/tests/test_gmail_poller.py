@@ -616,6 +616,7 @@ def test_seeds_state_gitignore(fresh_poller, tmp_path):
         if ln.strip() and not ln.strip().startswith("#")
     ]
     assert "cursor.json" in active
+    assert "triage-dropped.jsonl" in active
     # operator config (config.json) must NOT be an active ignore rule
     assert not any(ln.startswith("config") for ln in active)
     gi.write_text("operator-custom\n")
