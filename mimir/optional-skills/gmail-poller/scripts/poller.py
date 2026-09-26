@@ -68,6 +68,8 @@ Environment:
                              Applies to every configured account.
     MIMIR_GMAIL_MAX_FETCH  - Optional. Per-account fetch cap.
                              Default: 50.
+    JEV_KEY                - Required only for accounts that opt in to
+                             TypeSafe Jev pre-turn triage.
 
 Requires `gog` binary (https://gogcli.sh) installed and authed for
 every account listed in config.json. See SKILL.md install section.
@@ -87,12 +89,19 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from email.utils import parseaddr
 from pathlib import Path
+from urllib import request
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
 CONFIG_FILE = STATE_DIR / "config.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "gmail-inbox")
+TRIAGE_DROPPED_FILE = STATE_DIR / "triage-dropped.jsonl"
+
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+DEFAULT_JEV_MODEL = "jev-1.13.0"
+JEV_TIMEOUT_SECONDS = 5.0
 
 # Default search: last 24h in inbox. Caller can narrow via
 # MIMIR_GMAIL_QUERY (e.g. ``"in:inbox is:unread newer_than:6h
@@ -123,6 +132,15 @@ def _eprint(*args, **kwargs) -> None:
 
 
 @dataclass(frozen=True)
+class TriageConfig:
+    """Validated, operator-controlled Jev settings for one account."""
+    model: str
+    questions: dict
+    drop_below: float
+    always_emit: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Account:
     """One Gmail account configured for this poller.
 
@@ -133,6 +151,96 @@ class Account:
     name: str
     email: str
     prompt_body: str
+    triage: TriageConfig | None = None
+
+
+def _load_triage(entry: dict, *, account_label: str) -> TriageConfig | None:
+    """Validate an account's optional triage block, disabling it on error."""
+    if "triage" not in entry:
+        return None
+    raw = entry["triage"]
+
+    problem = None
+    if not isinstance(raw, dict):
+        problem = "triage must be an object"
+    else:
+        model = raw.get("model", DEFAULT_JEV_MODEL)
+        questions = raw.get("questions")
+        drop_below = raw.get("drop_below", 0.10)
+        always_emit = raw.get("always_emit", [])
+
+        if not isinstance(model, str) or not model.strip():
+            problem = "model must be a non-empty string"
+        elif not isinstance(questions, dict) or not questions:
+            problem = "questions must be a non-empty object"
+        elif isinstance(drop_below, bool) or not isinstance(drop_below, (int, float)):
+            problem = "drop_below must be a number from 0 to 1"
+        elif not 0 <= drop_below <= 1:
+            problem = "drop_below must be a number from 0 to 1"
+        elif not isinstance(always_emit, list) or not all(
+            isinstance(item, str) and item.strip() for item in always_emit
+        ):
+            problem = "always_emit must be a list of sender addresses or domains"
+        else:
+            for name, question in questions.items():
+                if not isinstance(name, str) or not name or not isinstance(question, dict):
+                    problem = "each question must be a named object"
+                    break
+                qtype = question.get("type")
+                instructions = question.get("instructions")
+                criteria = question.get("criteria")
+                if qtype not in {"noul", "choice", "score"}:
+                    problem = f"question {name!r} has unknown type"
+                elif not isinstance(instructions, str) or not instructions.strip():
+                    problem = f"question {name!r} needs non-empty instructions"
+                elif qtype == "noul" and criteria is not None and not (
+                    isinstance(criteria, dict)
+                    and set(criteria) == {"true", "false"}
+                    and all(isinstance(value, str) for value in criteria.values())
+                ):
+                    problem = (
+                        f"noul question {name!r} criteria must contain "
+                        "true and false descriptions"
+                    )
+                elif qtype == "choice" and not (
+                    isinstance(criteria, dict)
+                    and bool(criteria)
+                    and all(
+                        isinstance(option, str)
+                        and option
+                        and isinstance(description, str)
+                        for option, description in criteria.items()
+                    )
+                ):
+                    problem = f"choice question {name!r} criteria must be an object"
+                elif qtype == "score" and not (
+                    isinstance(criteria, list)
+                    and 2 <= len(criteria) <= 10
+                    and all(isinstance(level, str) and level for level in criteria)
+                ):
+                    problem = f"score question {name!r} criteria must be a list of 2-10 strings"
+                if problem:
+                    break
+
+            notify = questions.get("notify")
+            if problem is None and (
+                not isinstance(notify, dict) or notify.get("type") != "noul"
+            ):
+                problem = "questions.notify must be a noul question"
+
+    if problem is not None:
+        _eprint(
+            f"gmail-poller: account {account_label!r} has invalid triage "
+            f"configuration ({problem}); triage disabled."
+        )
+        return None
+
+    return TriageConfig(
+        model=model.strip(),
+        questions=questions,
+        drop_below=float(drop_below),
+        always_emit=tuple(item.strip().lower().lstrip("@") for item in always_emit),
+    )
 
 
 def _resolve_prompt(
@@ -215,7 +323,8 @@ def _load_accounts() -> list[Account] | None:
 
     Schema:
         {"accounts": [{"name": str, "email": str,
-                        "prompt-file"?: str, "prompt"?: str}, ...]}
+                        "prompt-file"?: str, "prompt"?: str,
+                        "triage"?: object}, ...]}
     """
     if not CONFIG_FILE.is_file():
         return None
@@ -258,7 +367,12 @@ def _load_accounts() -> list[Account] | None:
         seen_emails.add(email)
         prompt_body = _resolve_prompt(entry, mimir_home=mimir_home, account_label=name)
         accounts.append(
-            Account(name=name, email=email, prompt_body=prompt_body or "")
+            Account(
+                name=name,
+                email=email,
+                prompt_body=prompt_body or "",
+                triage=_load_triage(entry, account_label=name),
+            )
         )
     return accounts
 
@@ -422,6 +536,127 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     }
 
 
+def _always_emit(sender: str, configured: tuple[str, ...]) -> bool:
+    """Match a parsed sender against exact addresses or exact domains."""
+    address = parseaddr(sender)[1].strip().lower()
+    if not address or "@" not in address:
+        return False
+    domain = address.rsplit("@", 1)[1]
+    return address in configured or domain in configured
+
+
+def _valid_probability(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and 0 <= value <= 1
+    )
+
+
+def _validate_answers(answers: object, questions: dict) -> bool:
+    """Require the documented answer shape for every configured question."""
+    if not isinstance(answers, dict) or set(answers) != set(questions):
+        return False
+    for name, question in questions.items():
+        answer = answers.get(name)
+        qtype = question["type"]
+        if not isinstance(answer, dict) or answer.get("type") != qtype:
+            return False
+        if qtype == "noul":
+            if set(answer) != {"type", "noul"} or not _valid_probability(answer.get("noul")):
+                return False
+        elif qtype == "choice":
+            if not (
+                isinstance(answer.get("choice"), str)
+                and _valid_probability(answer.get("confidence"))
+                and isinstance(answer.get("probabilities"), dict)
+            ):
+                return False
+        elif qtype == "score" and not (
+            not isinstance(answer.get("score"), bool)
+            and isinstance(answer.get("score"), (int, float))
+            and isinstance(answer.get("legend"), (str, list, dict))
+            and isinstance(answer.get("probabilities"), (list, dict))
+            and _valid_probability(answer.get("confidence"))
+        ):
+            return False
+    return True
+
+
+def _triage_message(event: dict, account: Account) -> dict | None:
+    """Return validated Jev output, or None after one fail-open diagnostic."""
+    triage = account.triage
+    if triage is None:
+        return None
+    key = os.environ.get("JEV_KEY", "").strip()
+    if not key:
+        _eprint(
+            f"gmail-poller: triage failed for account {account.name!r}, "
+            f"message {event['message_id']!r} (JEV_KEY is missing); emitting untriaged."
+        )
+        return None
+
+    payload = {
+        "model": triage.model,
+        "state": (
+            f"From: {event['from']}\n"
+            f"Subject: {event['subject']}\n"
+            f"Snippet: {event['snippet']}"
+        ),
+        "questions": triage.questions,
+    }
+    req = request.Request(
+        JEV_ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=JEV_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not isinstance(result, dict):
+            raise ValueError("response is not an object")
+        model = result.get("model")
+        answers = result.get("answers")
+        if not isinstance(model, str) or not model or not _validate_answers(
+            answers, triage.questions
+        ):
+            raise ValueError("response has an unknown answer shape")
+        return {"model": model, "answers": answers}
+    except Exception as exc:
+        _eprint(
+            f"gmail-poller: triage failed for account {account.name!r}, "
+            f"message {event['message_id']!r} ({exc}); emitting untriaged."
+        )
+        return None
+
+
+def _audit_drop(event: dict, triage_result: dict) -> bool:
+    """Persist a drop record; return False so audit failures fail open."""
+    record = {
+        "message_id": event["message_id"],
+        "url": event["url"],
+        "from": event["from"],
+        "subject": event["subject"],
+        "answers": triage_result["answers"],
+        "model": triage_result["model"],
+    }
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with TRIAGE_DROPPED_FILE.open("a", encoding="utf-8") as audit:
+            audit.write(json.dumps(record) + "\n")
+        return True
+    except OSError as exc:
+        _eprint(
+            f"gmail-poller: triage audit failed for message "
+            f"{event['message_id']!r} ({exc}); emitting untriaged."
+        )
+        return False
+
+
 def _resolve_accounts_or_exit() -> list[Account] | None:
     """Pick the source of accounts: structured ``config.json`` if
     present, else legacy single-account ``GOG_ACCOUNT`` env.
@@ -459,6 +694,7 @@ _STATE_GITIGNORE = """\
 # config.json (operator account config) is intentionally NOT ignored so it
 # stays tracked via the home allowlist.
 cursor.json
+triage-dropped.jsonl
 *.tmp
 """
 
@@ -499,6 +735,7 @@ def main() -> int:
     # all-empty-inbox-but-one-account-failed run doesn't get
     # mis-classified as a catastrophic failure (Mimir's PR #234 nit).
     new_ids: list[str] = []
+    dropped = 0
     successful_accounts = 0
     failed_accounts = 0
     for account in accounts:
@@ -521,6 +758,26 @@ def main() -> int:
             mid = event["message_id"]
             if mid in seen:
                 continue
+
+            triage_result = None
+            if account.triage is not None and not _always_emit(
+                event["from"], account.triage.always_emit
+            ):
+                triage_result = _triage_message(event, account)
+            if triage_result is not None:
+                notify = triage_result["answers"]["notify"]["noul"]
+                if notify <= account.triage.drop_below and _audit_drop(
+                    event, triage_result
+                ):
+                    new_ids.append(mid)
+                    seen.add(mid)
+                    dropped += 1
+                    continue
+                event["triage"] = triage_result
+                event["prompt"] += (
+                    "\nJev triage answers: "
+                    + json.dumps(triage_result, separators=(",", ":"))
+                )
             print(json.dumps(event), flush=True)
             new_ids.append(mid)
             seen.add(mid)
@@ -531,6 +788,9 @@ def main() -> int:
         if len(cursor) > CURSOR_MAX_IDS:
             cursor = cursor[-CURSOR_MAX_IDS:]
         _save_cursor(cursor)
+
+    if any(account.triage is not None for account in accounts):
+        _eprint(f"gmail-poller: dropped={dropped}")
 
     # Exit code: 0 when at least one account's search succeeded — empty
     # inbox is a normal silence-as-filter result, not a failure, and a

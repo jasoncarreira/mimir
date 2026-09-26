@@ -50,11 +50,26 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    ```json
    {
      "accounts": [
-       {
-         "name":        "home",
-         "email":       "you@gmail.com",
-         "prompt-file": "email-home.md"
-       },
+        {
+          "name":        "home",
+          "email":       "you@gmail.com",
+          "prompt-file": "email-home.md",
+          "triage": {
+            "model": "jev-1.13.0",
+            "drop_below": 0.10,
+            "always_emit": ["family@example.com", "trusted.example"],
+            "questions": {
+              "notify": {
+                "type": "noul",
+                "instructions": "Should the account owner be notified? Apply the account's Notify-For and Skip-List rules.",
+                "criteria": {
+                  "true": "needs the owner's attention",
+                  "false": "safe to skip silently"
+                }
+              }
+            }
+          }
+        },
        {
          "name":   "work",
          "email":  "you@employer.com",
@@ -75,8 +90,9 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    |---|---|---|
    | `name` | yes | Friendly label — surfaces in the emitted event as `account_name` for downstream routing. |
    | `email` | yes | Gmail address `gog` should query (`gog --account <email>`). Must already be authed via `gog auth add`. |
-   | `prompt-file` | no | Filename under `<home>/prompts/` to load as the per-message prompt. Path traversal (`..`, absolute paths) is rejected. |
-   | `prompt` | no | Inline prompt body. Used when `prompt-file` is absent or its target is missing. |
+    | `prompt-file` | no | Filename under `<home>/prompts/` to load as the per-message prompt. Path traversal (`..`, absolute paths) is rejected. |
+    | `prompt` | no | Inline prompt body. Used when `prompt-file` is absent or its target is missing. |
+    | `triage` | no | Opt in to TypeSafe Jev pre-turn triage for this account. See "Optional Jev triage" below. |
 
    **Prompt resolution per account:** `prompt-file` > inline `prompt` >
    built-in default template (the original `[gmail] new message from …`
@@ -94,13 +110,54 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    |---|---|---|
    | `MIMIR_GMAIL_QUERY` | no | Gmail search override. Default: `in:inbox newer_than:1d`. Use Gmail's search language: `is:unread`, `from:`, `to:`, `subject:`, `label:`, `-from:` (exclude), `category:primary`, etc. Applies to every account. |
    | `MIMIR_GMAIL_MAX_FETCH` | no | Per-account fetch cap. Default 50, clamp 1–200. |
-   | `MIMIR_HOME` | no (yes if any `prompt-file` is set) | Agent home root. Used to resolve `prompt-file` entries against `<MIMIR_HOME>/prompts/`. |
-   | `GOG_ACCOUNT` | only in Mode B | Gmail address for single-account legacy mode. Ignored when `config.json` is present. |
+    | `MIMIR_HOME` | no (yes if any `prompt-file` is set) | Agent home root. Used to resolve `prompt-file` entries against `<MIMIR_HOME>/prompts/`. |
+    | `GOG_ACCOUNT` | only in Mode B | Gmail address for single-account legacy mode. Ignored when `config.json` is present. |
+    | `JEV_KEY` | only when `triage` is enabled | TypeSafe API key used by the optional Jev pre-turn triage. |
 
-   All env vars listed above (including `MIMIR_HOME`) are declared in
+   All env vars listed above (including `MIMIR_HOME` and `JEV_KEY`) are declared in
    `pollers.json` `pass_env`. `MIMIR_*`-prefixed keys would otherwise
    be stripped by the env filter — explicit `pass_env` bypasses both
    gates.
+
+### Optional Jev triage
+
+An account opts in by adding a `triage` object. Accounts without one retain the
+original behavior and make no TypeSafe requests. Enabling it is an explicit
+operator decision to send that account's sender, subject, and Gmail snippet to
+TypeSafe's Jev System One API. The message body is never fetched or sent, and
+no other message fields are included. TypeSafe is a third-party service; its
+documentation makes no pricing, data-retention, SLA, self-hosting, or
+adversarial-robustness guarantees.
+
+The fields are:
+
+| Field | Required | Description |
+|---|---|---|
+| `model` | no | Versioned Jev model name. Defaults to the pinned `jev-1.13.0`, not a `-latest` alias. |
+| `questions` | yes | Operator-written Jev question map. It must include `notify` as a `noul` question. Questions use `instructions`; `choice.criteria` is an object and `score.criteria` is a list of 2-10 strings. Email content and model output cannot alter this map. |
+| `drop_below` | no | Inclusive `notify.noul` drop threshold from 0 to 1. Defaults to `0.10`; therefore `0.10` drops and `0.11` emits. |
+| `always_emit` | no | Sender addresses or exact domains that bypass Jev and always emit. Matching is case-insensitive. A leading `@` on domains is optional. Domain matches are exact: list subdomains separately when needed. |
+
+Each new message is evaluated separately. Deterministic `always_emit` matching
+runs before any request. Otherwise, the poller sends one request containing
+only `model`, the fixed `questions`, and a `state` made from sender, subject,
+and snippet. A message is dropped only when the documented noul answer is valid
+and `answers.notify.noul <= drop_below`. A noul answer has no `confidence`
+field. Emitted, successfully triaged events include a `triage` extra with the
+resolved model and returned answers, plus a `Jev triage answers:` line in the
+prompt. These values remain untrusted email-ingest context and do not change
+the event's trust tier.
+
+Every dropped message is still added to the cursor and appended to
+`<persist>/triage-dropped.jsonl` with its message ID, thread URL, sender,
+subject, answers, and resolved model. That audit file is gitignored. Runs with
+at least one valid triage configuration log `dropped=N` on stderr; deployments
+without triage retain the original empty-stderr behavior. If `JEV_KEY` is
+missing, configuration is invalid, the request times out after five seconds,
+TypeSafe returns an HTTP error, the response is malformed, or the audit record
+cannot be written, the poller fails open: it emits the message as before and
+logs one diagnostic instead of
+dropping mail.
 
 5. **Bring it live:** arrange an operator-managed reload or restart.
 
@@ -210,10 +267,9 @@ unfamiliar senders' requests.
   own fire interval — read the effective value from the injected
   `POLLER_TIMEOUT_SECONDS`). Overrunning discards every event the run
   had already emitted, so it loses the whole poll, not just the tail.
-- **Don't put credentials in `pass_env`**. gog reads its own creds
-  from `~/.config/gogcli/`. The poller subprocess doesn't need an
-  API key — `pass_env` carries only configuration (account name,
-  query override).
+- **Don't put gog credentials in `pass_env`**. gog reads its own creds
+  from `~/.config/gogcli/`. `JEV_KEY` is the sole API credential passed
+  explicitly, and is used only for accounts that opt in to triage.
 - **Don't delete the cursor on every container rebuild**. Cursor
   lives at `<home>/state/pollers/gmail-inbox/` (persistent volume),
   separate from the skill dir — same rationale as github-poller.
