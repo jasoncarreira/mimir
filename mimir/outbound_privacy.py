@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import os
 import re
@@ -25,12 +26,71 @@ class OutboundFinding:
 
 OutboundScan = list[OutboundFinding]
 
+OUTBOX_PATTERNS = (
+    "state/pollers/social-cli-*/outbox-*.yaml",
+    "state/pollers/social-cli-*/outbox.yaml",
+)
+OUTBOX_CONTROL_PATTERNS = (
+    "state/pollers/social-cli-*/config.yaml",
+)
+
 _PRIVATE_TERMS_FILE = "private-terms.txt"
 _HASH_PREFIX_LENGTH = 12
 _cache_lock = threading.Lock()
 _cached_path: Path | None = None
 _cached_signature: tuple[int, int] | None = None
 _cached_terms: tuple[str, ...] = ()
+
+
+def _matches_outbox_pattern(
+    path: Path, home: Path, patterns: tuple[str, ...] | None = None,
+) -> bool:
+    try:
+        relative_parts = path.relative_to(home).as_posix().split("/")
+    except ValueError:
+        return False
+    for pattern in OUTBOX_PATTERNS if patterns is None else patterns:
+        pattern_path = Path(pattern)
+        if pattern_path.is_absolute() or ".." in pattern_path.parts:
+            continue
+        pattern_parts = pattern_path.as_posix().split("/")
+        if len(relative_parts) != len(pattern_parts):
+            continue
+        if all(
+            fnmatch.fnmatchcase(part, pattern_part)
+            for part, pattern_part in zip(relative_parts, pattern_parts)
+        ):
+            return True
+    return False
+
+
+def _matches_registered_path(
+    path: Path | str, patterns: tuple[str, ...],
+) -> bool:
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return False
+    try:
+        home = Path(home_value).expanduser().resolve(strict=False)
+        requested = Path(path).expanduser()
+        lexical = Path(os.path.abspath(requested))
+        resolved = requested.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(
+        _matches_outbox_pattern(candidate, home, patterns)
+        for candidate in dict.fromkeys((lexical, resolved))
+    )
+
+
+def is_outbox_path(path: Path | str) -> bool:
+    """Return whether either the lexical or resolved path is a registered outbox."""
+    return _matches_registered_path(path, OUTBOX_PATTERNS)
+
+
+def is_outbox_control_path(path: Path | str) -> bool:
+    """Return whether a path controls which social-cli outbox is dispatched."""
+    return _matches_registered_path(path, OUTBOX_CONTROL_PATTERNS)
 
 
 def _fingerprint(value: str) -> str:

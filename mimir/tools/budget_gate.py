@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -508,10 +509,321 @@ def _declared_shell_payloads(
     return ()
 
 
+_OUTBOX_DISPATCH_SCRIPTS = frozenset({"run-social-cli.sh"})
+_OUTBOX_SCAN_MAX_FILES = 200
+_OUTBOX_SCAN_MAX_BYTES = 8 * 1024 * 1024
+_OUTBOX_ARCHIVE_DIR = "outbox_archive"
+_OUTBOX_CONFIG_REASON = "outbound_outbox_config"
+_OUTBOX_UNSCANNABLE_REASON = "outbound_dispatch_unscannable"
+
+
+@dataclass(frozen=True)
+class _DispatchScanError:
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class _DispatchScanPlan:
+    paths: tuple[Path, ...]
+    platforms: tuple[str, ...]
+
+
+def _outbox_write_payloads(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> tuple[str, ...]:
+    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
+        return ()
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return ()
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return ()
+    from ..outbound_privacy import is_outbox_path
+
+    if not is_outbox_path(target):
+        return ()
+    if tool_name == "write_file":
+        value = arguments.get("content")
+        return (value,) if isinstance(value, str) else ()
+    if tool_name == "edit_file":
+        value = arguments.get("new_string")
+        return (value,) if isinstance(value, str) else ()
+    edits = arguments.get("edits")
+    if not isinstance(edits, Sequence) or isinstance(edits, (str, bytes, bytearray)):
+        return ()
+    return tuple(
+        value
+        for edit in edits
+        if isinstance(edit, Mapping)
+        if isinstance((value := edit.get("new_string")), str)
+    )
+
+
+def _outbox_control_write(
+    tool_name: str, arguments: Mapping[str, Any],
+) -> bool:
+    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
+        return False
+    raw_path = arguments.get("file_path") or arguments.get("path")
+    if not isinstance(raw_path, str):
+        return False
+    target = _resolve_file_tool_target(raw_path)
+    if target is None:
+        return False
+    from ..outbound_privacy import is_outbox_control_path
+
+    return is_outbox_control_path(target)
+
+
+def _literal_outbox_path(path: Path) -> Path:
+    """Return an absolute lexical path without following an outbox symlink."""
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _social_dispatch_state_dir(
+    home: Path,
+    poller: str,
+    pass_env: tuple[str, ...],
+) -> tuple[tuple[Path, Path] | None, _DispatchScanError | None]:
+    """Resolve an explicit, confined social-cli stateDir or fail closed."""
+    poller_dir = _literal_outbox_path(home / "state" / "pollers" / poller)
+    inherited_steering = [
+        name for name in ("SOCIAL_CLI_STATE_DIR", "AGENT_ID")
+        if name in pass_env and name in os.environ
+    ]
+    if inherited_steering:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch state is ambiguous because environment steering is set",
+        )
+
+    user_home = Path(os.environ.get("HOME", str(Path.home()))).expanduser()
+    config_paths = (poller_dir / "config.yaml", user_home / ".config/social-cli/config.yaml")
+    config: Mapping[str, Any] | None = None
+    for config_path in config_paths:
+        try:
+            if not config_path.exists():
+                continue
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, RuntimeError, yaml.YAMLError):
+            return None, _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration is unreadable or unparseable",
+            )
+        if not isinstance(loaded, Mapping):
+            return None, _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration is not a mapping",
+            )
+        config = loaded
+        break
+    if config is None:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch requires an explicit stateDir",
+        )
+
+    state = config.get("state", {})
+    if not isinstance(state, Mapping):
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch state configuration is not a mapping",
+        )
+    configured = state.get("stateDir")
+    if not isinstance(configured, str) or not configured.strip():
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch requires an explicit stateDir",
+        )
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        candidate = poller_dir / candidate
+    try:
+        effective = candidate.resolve(strict=False)
+        expected = poller_dir.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch stateDir could not be resolved",
+        )
+    try:
+        effective.relative_to(expected)
+    except ValueError:
+        return None, _DispatchScanError(
+            _OUTBOX_CONFIG_REASON,
+            "social-cli dispatch stateDir escapes its poller state directory",
+        )
+    return (poller_dir, effective), None
+
+
+def _dispatch_yaml_paths(
+    roots: tuple[Path, ...],
+) -> tuple[tuple[Path, ...] | None, _DispatchScanError | None]:
+    """Enumerate bounded YAML inputs without following directory symlinks."""
+    paths: dict[str, Path] = {}
+    walk_errors: list[OSError] = []
+
+    def remember_walk_error(error: OSError) -> None:
+        walk_errors.append(error)
+
+    for root in dict.fromkeys(roots):
+        try:
+            if not root.is_dir():
+                return None, _DispatchScanError(
+                    _OUTBOX_UNSCANNABLE_REASON,
+                    "a social-cli dispatch scan root is unreadable",
+                )
+            for directory, dirnames, filenames in os.walk(
+                root, topdown=True, onerror=remember_walk_error, followlinks=False,
+            ):
+                # social-cli only moves sent outboxes into outbox_archive/; dispatch
+                # never reads that write-only history back, so it is not outbound input.
+                dirnames[:] = [
+                    name for name in dirnames if name != _OUTBOX_ARCHIVE_DIR
+                ]
+                names = [
+                    name for name in (*dirnames, *filenames)
+                    if name.casefold().endswith((".yaml", ".yml"))
+                ]
+                for name in names:
+                    path = _literal_outbox_path(Path(directory) / name)
+                    paths.setdefault(str(path), path)
+                    if len(paths) > _OUTBOX_SCAN_MAX_FILES:
+                        return None, _DispatchScanError(
+                            _OUTBOX_UNSCANNABLE_REASON,
+                            "social-cli dispatch exceeds the YAML file scan limit",
+                        )
+        except (OSError, RuntimeError):
+            return None, _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch scan root is unreadable",
+            )
+    if walk_errors:
+        return None, _DispatchScanError(
+            _OUTBOX_UNSCANNABLE_REASON,
+            "a social-cli dispatch scan root is unreadable",
+        )
+    return tuple(paths.values()), None
+
+
+def _declared_dispatch_scan_plan(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> _DispatchScanPlan | _DispatchScanError | None:
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return None
+    service = get_trusted_service_from_auth_context(auth_context)
+    declared = getattr(service, "declared_shell_commands", ()) if service is not None else ()
+    command = arguments.get("command")
+    if not declared or not isinstance(command, str):
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return None
+    for declaration in declared:
+        script = declaration.script
+        if (
+            script is None
+            or script.name not in _OUTBOX_DISPATCH_SCRIPTS
+            or len(argv) < 4
+            or argv[0] != declaration.executable
+        ):
+            continue
+        try:
+            script_matches = Path(argv[1]).resolve() == script
+        except (OSError, RuntimeError, ValueError):
+            script_matches = False
+        if not script_matches or argv[3] != "dispatch":
+            continue
+        poller = argv[2]
+        if re.fullmatch(r"social-cli-[A-Za-z0-9_-]+", poller) is None:
+            return _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch poller name is invalid",
+            )
+        suffix = argv[4:]
+        if not suffix:
+            platforms = ("all",)
+        elif (
+            len(suffix) == 2
+            and suffix[0] == "--platform"
+            and re.fullmatch(r"[A-Za-z0-9_-]+", suffix[1]) is not None
+        ):
+            platforms = (suffix[1],)
+        else:
+            return _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch arguments are not canonical",
+            )
+
+        roots, config_error = _social_dispatch_state_dir(
+            Path(home_value), poller, declaration.pass_env,
+        )
+        if config_error is not None or roots is None:
+            return config_error or _DispatchScanError(
+                _OUTBOX_CONFIG_REASON,
+                "social-cli dispatch configuration could not be resolved",
+            )
+        paths, scan_error = _dispatch_yaml_paths(roots)
+        if scan_error is not None or paths is None:
+            return scan_error or _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "social-cli dispatch files could not be enumerated",
+            )
+        return _DispatchScanPlan(paths=paths, platforms=platforms)
+    return None
+
+
+def _dispatch_outbox_payloads(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[tuple[str, ...], tuple[str, ...], _DispatchScanError | None]:
+    plan = _declared_dispatch_scan_plan(tool_name, arguments, auth_context)
+    if isinstance(plan, _DispatchScanError):
+        return (), (), plan
+    if plan is None:
+        return (), (), None
+    texts: list[str] = []
+    for path in plan.paths:
+        try:
+            mode = path.stat().st_mode
+            if not stat.S_ISREG(mode):
+                return (), (), _DispatchScanError(
+                    _OUTBOX_UNSCANNABLE_REASON,
+                    "a social-cli dispatch YAML path is not a regular file",
+                )
+            with path.open("rb") as handle:
+                raw = handle.read(_OUTBOX_SCAN_MAX_BYTES + 1)
+        except (OSError, RuntimeError):
+            return (), (), _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch YAML file could not be read",
+            )
+        if len(raw) > _OUTBOX_SCAN_MAX_BYTES:
+            return (), (), _DispatchScanError(
+                _OUTBOX_UNSCANNABLE_REASON,
+                "a social-cli dispatch YAML file exceeds the scan size limit",
+            )
+        texts.append(raw.decode("utf-8", errors="replace"))
+    return tuple(texts), plan.platforms, None
+
+
 _CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
 _CLAUDE_CODE_NATIVE_PRIVACY_TOOLS = {
     "WebFetch": "fetch_url",
     "WebSearch": "web_search",
+    "Write": "write_file",
+    "Edit": "edit_file",
+    "MultiEdit": "multi_edit",
 }
 
 
@@ -541,11 +853,43 @@ def _outbound_privacy_refusal(
 
         texts = _string_leaf_payload(descriptor_name, arguments, auth_context)
     texts = (*texts, *_declared_shell_payloads(descriptor_name, arguments, auth_context))
+    if _outbox_control_write(descriptor_name, arguments):
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason=_OUTBOX_CONFIG_REASON,
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return (
+            "Outbound privacy refused a model write to social-cli `config.yaml` "
+            "because it controls which outbox is dispatched."
+        )
+    outbox_write_texts = _outbox_write_payloads(descriptor_name, arguments)
+    dispatch_texts, dispatch_platforms, dispatch_error = _dispatch_outbox_payloads(
+        descriptor_name, arguments, auth_context,
+    )
+    if dispatch_error is not None:
+        _emit_hard_boundary_denied(
+            tool=tool_name,
+            boundary="outbound_privacy",
+            reason=dispatch_error.reason,
+            target=None,
+            auth_context=auth_context,
+            event_fields={"sink_category": SinkCategory.NETWORK.value},
+        )
+        return f"Outbound privacy refused social-cli dispatch: {dispatch_error.detail}."
+    texts = (*texts, *outbox_write_texts, *dispatch_texts)
     if not texts:
         return None
 
-    category = sink_category or (
-        descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+    category = (
+        SinkCategory.NETWORK
+        if outbox_write_texts or dispatch_texts
+        else sink_category or (
+            descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+        )
     )
     from ..outbound_privacy import scan_outbound
 
@@ -586,8 +930,13 @@ def _outbound_privacy_refusal(
         auth_context=auth_context,
         event_fields={"sink_category": category.value, "findings": metadata},
     )
+    dispatch_target = (
+        f" social-cli dispatch for platform {', '.join(dispatch_platforms)}"
+        if dispatch_platforms
+        else f" `{tool_name}`"
+    )
     return (
-        f"Outbound privacy refused `{tool_name}` because the {detector} detector "
+        f"Outbound privacy refused{dispatch_target} because the {detector} detector "
         "matched outbound content. Remove the sensitive value and retry."
     )
 
