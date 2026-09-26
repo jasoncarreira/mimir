@@ -424,7 +424,7 @@ async def test_egress_still_requires_declassification(live_turn, tool, target, t
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
     owned_tasks = set()
-    monkeypatch.setattr("mimir.tools.budget_gate._background_tasks", owned_tasks)
+    monkeypatch.setattr("mimir.event_logger._background_event_tasks", owned_tasks)
 
     auth = live_turn.auth_context
     before = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)

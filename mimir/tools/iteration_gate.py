@@ -21,30 +21,11 @@ The 75% tier deliberately emits no event (only 90% and 100% do). Off when
 
 from __future__ import annotations
 
-import asyncio
-import logging
-from typing import Any
-
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import AIMessage, HumanMessage
 
-log = logging.getLogger(__name__)
-
-# Strong refs to fire-and-forget log_event tasks (mirrors budget_gate.py).
-_background_tasks: set["asyncio.Task[Any]"] = set()
-
-
-def _emit_event_sync(kind: str, **kwargs: Any) -> None:
-    """Fire-and-forget ``log_event`` from the sync ``before_model`` path."""
-    try:
-        from ..event_logger import log_event  # lazy: monkeypatchable in tests
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(log_event(kind, **kwargs))
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
-    except RuntimeError:
-        log.debug("iteration event %s dropped: no running loop", kind)
+from ..event_logger import emit_event_background as _emit_event_sync
 
 
 def _nudge_75(count: int, budget: int) -> str:

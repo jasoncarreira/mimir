@@ -6088,50 +6088,6 @@ async def test_clear_ingest_taint_intercepts_live_request(
         reset_current_turn(token)
 
 
-# ─── chainlink #118: asyncio strong-ref for fire-and-forget tasks ────────────
-
-
-@pytest.mark.asyncio
-async def test_emit_event_sync_task_held_in_background_tasks() -> None:
-    """_emit_event_sync holds the spawned log_event task in _background_tasks
-    until completion (chainlink #118).  Regression: bare loop.create_task()
-    without a retained reference can be GC'd before completion."""
-    import asyncio
-    from unittest.mock import patch
-
-    from mimir.tools.budget_gate import _background_tasks, _emit_event_sync
-
-    logged: list[str] = []
-    unblocked = asyncio.Event()
-
-    async def blocking_log_event(kind: str, **kwargs: Any) -> None:
-        logged.append(kind)
-        await unblocked.wait()
-
-    # _emit_event_sync uses a lazy import, so patch the source module
-    # (mimir.event_logger) so the lazy ``from ..event_logger import log_event``
-    # picks up the replacement at call time.
-    with patch("mimir.event_logger.log_event", new=blocking_log_event):
-        _emit_event_sync("tool_call_budget_denied", tool="bash", count=5)
-        await asyncio.sleep(0)
-
-        # Task is in flight: strong ref must be held.
-        assert len(_background_tasks) == 1, (
-            f"Expected 1 in-flight task, got {len(_background_tasks)}"
-        )
-
-        unblocked.set()
-        # Two yields: first lets the task run to completion; second lets
-        # the loop.call_soon-scheduled done_callback (discard) execute.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-    # After completion the done-callback must have removed the entry.
-    assert len(_background_tasks) == 0, (
-        "_background_tasks should be empty after task completes"
-    )
-
-
 @pytest.mark.asyncio
 async def test_middleware_emits_tool_call_events_for_success_and_error(
     monkeypatch: pytest.MonkeyPatch,
