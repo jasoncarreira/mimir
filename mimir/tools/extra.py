@@ -321,8 +321,9 @@ def get_turn(turn_id: str) -> str:
     return _read_turn_record(turn_id)
 
 
-mimir_get_turn.handle_tool_error = True
-get_turn.handle_tool_error = True
+# Do not set ``handle_tool_error`` on these aliases.  Synthesis-read policy
+# refusals are ``ToolPolicyRefusal`` instances, and BudgetGateMiddleware must
+# observe those exceptions to record a refusal without tainting the turn.
 
 
 # ────────────────────────────────────────────────────────────────────

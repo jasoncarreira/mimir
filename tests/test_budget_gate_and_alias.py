@@ -6313,7 +6313,6 @@ async def test_middleware_records_raised_returned_and_typed_failures(
         ),
         ("bash_job_output", {"job_id": ""}, "bash_job_output failed: no shell-job registry configured"),
         ("shell_exec", {"command": "exit 7"}, "exit=7"),
-        ("mimir_get_turn", {"turn_id": ""}, "get_turn failed: turn_id is required"),
     ],
 )
 async def test_converted_tool_failure_is_accounted_from_typed_status(
