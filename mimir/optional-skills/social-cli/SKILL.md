@@ -40,7 +40,8 @@ the platforms credentials are configured for.
   before a declared service-turn dispatch. Service dispatch accepts only canonical
   `dispatch` / `dispatch --platform <p>` argv, requires an explicit confined
   `stateDir`, rejects `SOCIAL_CLI_STATE_DIR` / `AGENT_ID` steering, and scans every
-  YAML file under the poller and state directories within fixed limits. Credentials
+  regular YAML file under the poller and state directories within fixed limits,
+  excluding the write-only `outbox_archive/` history. Credentials
   are always refused; configured private terms follow
   `MIMIR_OUTBOUND_PRIVACY_ENFORCE` shadow/enforcement policy. Direct operator-turn
   shell dispatch remains outside this service-command guard and is operator-authorized

@@ -884,7 +884,126 @@ def test_social_dispatch_refuses_unreadable_yaml(
 
     assert result.status == "error"
     assert executed == []
-    assert "could not be read" in str(result.content)
+    assert "not a regular file" in str(result.content)
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+def test_social_dispatch_scans_non_outbox_nested_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    nested = tmp_path / "state/pollers/social-cli-notifications/sub/deep/x.yaml"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(f"notes: {TOKEN}\n", encoding="utf-8")
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+    assert TOKEN not in refusal
+
+
+def test_social_dispatch_refuses_yaml_file_count_over_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    for index in range(budget_gate._OUTBOX_SCAN_MAX_FILES):
+        (state_dir / f"extra-{index}.yaml").write_text("clean: true\n", encoding="utf-8")
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "file scan limit" in refusal
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+def test_social_dispatch_refuses_yaml_over_size_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(budget_gate, "_OUTBOX_SCAN_MAX_BYTES", 32)
+    auth, script = _social_service_auth(tmp_path)
+    oversized = tmp_path / "state/pollers/social-cli-notifications/large.yaml"
+    oversized.write_text("x" * 33, encoding="utf-8")
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "size limit" in refusal
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+def test_social_dispatch_admits_production_shaped_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    archive = state_dir / "outbox_archive"
+    archive.mkdir()
+    for index in range(1300):
+        (archive / f"outbox-bsky-{index}.yaml").write_text(
+            f"archived: {TOKEN}\n", encoding="utf-8",
+        )
+    (state_dir / "sent_ledger-bsky.yaml").write_text(
+        "x" * (300 * 1024), encoding="utf-8",
+    )
+    (state_dir / "outbox-bsky.yaml").write_text(
+        "dispatch:\n  - post:\n      text: clean\n", encoding="utf-8",
+    )
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch --platform bsky"},
+        auth,
+        executed,
+    )
+
+    assert result.status == "success"
+    assert executed == [True]
+
+
+def test_social_dispatch_refuses_fifo_without_opening_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    fifo = tmp_path / "state/pollers/social-cli-notifications/blocked.yaml"
+    try:
+        fifo.mkfifo()
+    except (AttributeError, NotImplementedError, OSError):
+        pytest.skip("FIFOs are unavailable on this platform")
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "not a regular file" in refusal
     denial = next(fields for event, fields in events if event == "hard_boundary_denied")
     assert denial["reason"] == "outbound_dispatch_unscannable"
 

@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -510,7 +511,8 @@ def _declared_shell_payloads(
 
 _OUTBOX_DISPATCH_SCRIPTS = frozenset({"run-social-cli.sh"})
 _OUTBOX_SCAN_MAX_FILES = 200
-_OUTBOX_SCAN_MAX_BYTES = 1024 * 1024
+_OUTBOX_SCAN_MAX_BYTES = 8 * 1024 * 1024
+_OUTBOX_ARCHIVE_DIR = "outbox_archive"
 _OUTBOX_CONFIG_REASON = "outbound_outbox_config"
 _OUTBOX_UNSCANNABLE_REASON = "outbound_dispatch_unscannable"
 
@@ -676,6 +678,11 @@ def _dispatch_yaml_paths(
             for directory, dirnames, filenames in os.walk(
                 root, topdown=True, onerror=remember_walk_error, followlinks=False,
             ):
+                # social-cli only moves sent outboxes into outbox_archive/; dispatch
+                # never reads that write-only history back, so it is not outbound input.
+                dirnames[:] = [
+                    name for name in dirnames if name != _OUTBOX_ARCHIVE_DIR
+                ]
                 names = [
                     name for name in (*dirnames, *filenames)
                     if name.casefold().endswith((".yaml", ".yml"))
@@ -788,6 +795,12 @@ def _dispatch_outbox_payloads(
     texts: list[str] = []
     for path in plan.paths:
         try:
+            mode = path.stat().st_mode
+            if not stat.S_ISREG(mode):
+                return (), (), _DispatchScanError(
+                    _OUTBOX_UNSCANNABLE_REASON,
+                    "a social-cli dispatch YAML path is not a regular file",
+                )
             with path.open("rb") as handle:
                 raw = handle.read(_OUTBOX_SCAN_MAX_BYTES + 1)
         except (OSError, RuntimeError):
