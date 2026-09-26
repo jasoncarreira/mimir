@@ -2214,7 +2214,13 @@ def test_maximal_model_tool_inventory_has_total_protected_result_partition(
         *access_control._deepagents_builtin_tool_names(),
     }
     mapped = names & access_control._PROTECTED_RESULT_DOMAINS.keys()
-    exempted = names & access_control._NON_INGESTING_RESULT_TOOLS
+    from mimir.tool_descriptors import ResultOriginKind, TOOL_DESCRIPTORS
+
+    exempted = {
+        name for name in names
+        if name in TOOL_DESCRIPTORS
+        and TOOL_DESCRIPTORS[name].result_origin & ResultOriginKind.NON_INGESTING
+    }
 
     assert mapped.isdisjoint(exempted)
     assert mapped | exempted == names
@@ -16488,14 +16494,18 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     }
     actual = {
         category: {
-            name for name, observed in access_control._SINK_CATEGORY_MAP.items()
-            if observed is category and not name.startswith("hands_")
+            name for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
+            if descriptor.sink_category is category and not name.startswith("hands_")
         }
         for category in expected
     }
 
     assert actual == expected
-    assert set(access_control._SINK_CATEGORY_MAP) - {"hands_edit", "hands_shell", "hands_python"} == set().union(*expected.values())
+    categorized = {
+        name for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
+        if descriptor.sink_category is not None
+    }
+    assert categorized - {"hands_edit", "hands_shell", "hands_python"} == set().union(*expected.values())
     assert not any("*" in name for names in actual.values() for name in names)
     capability_eligible = {
         SinkCategory.SAME_CHANNEL,
@@ -16555,7 +16565,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
     }
     observed_verdicts = {}
     for name in sorted(expected_verdicts):
-        category = access_control._SINK_CATEGORY_MAP[name]
+        category = access_control.TOOL_DESCRIPTORS[name].sink_category
         decision = SinkGate.check_sink_flow(
             name,
             "native-target",
@@ -16583,9 +16593,12 @@ def test_pr_edit_body_catalog_mirrors_comment() -> None:
         assert access_control.TRIGGER_CAPABILITY_TIERS[operation] is CapabilityTier.SCOPED_WITH_PROVENANCE
         assert access_control._TYPED_REPO_PR_TOOL_ACTIONS[operation] == action.value
         assert access_control._PROTECTED_RESULT_DOMAINS[operation] == "repository"
-        assert operation in access_control._REPOSITORY_RESULT_TOOLS
+        assert (
+            access_control.TOOL_DESCRIPTORS[operation].result_origin
+            & access_control.ResultOriginKind.REPOSITORY
+        )
         assert operation not in access_control._OPERATION_READABLE_DOMAIN
-        assert access_control._OPERATION_SINK_DESTINATION[operation] == "bound_pull_request"
+        assert access_control.TOOL_DESCRIPTORS[operation].sink_destination == "bound_pull_request"
 
 
 def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -16678,7 +16691,11 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         if catalog.get_decision(name, _write_auth(admin=True)) is OperationDecision.UNKNOWN
     } == decisions[OperationDecision.UNKNOWN]
     assert {name: value for name, value in access_control._OPERATION_READABLE_DOMAIN.items() if name not in hands} == readable
-    assert {name: value for name, value in access_control._OPERATION_SINK_DESTINATION.items() if name not in hands} == destinations
+    assert {
+        name: descriptor.sink_destination
+        for name, descriptor in access_control.TOOL_DESCRIPTORS.items()
+        if name not in hands and descriptor.sink_destination is not None
+    } == destinations
     assert {name: value for name, value in access_control._PROTECTED_RESULT_DOMAINS.items() if name not in hands} == protected
     assert catalog.get_decision("hands_read") is OperationDecision.RESOURCE_SCOPED
     assert catalog.get_decision("hands_edit") is OperationDecision.ADMIN_REQUIRED
@@ -16770,7 +16787,7 @@ async def test_shell_exec_policy_and_execution_are_unchanged(
     assert {name: access_control._TOOL_FLOW_MAP[name] for name in shell_names} == {
         name: access_control.ToolFlowDirection.BOTH for name in shell_names
     }
-    assert {name: access_control._OPERATION_SINK_DESTINATION[name] for name in shell_names} == {
+    assert {name: access_control.TOOL_DESCRIPTORS[name].sink_destination for name in shell_names} == {
         name: "shell_process" for name in shell_names
     }
     assert access_control.OperationCatalog().get_decision("shell_exec") is OperationDecision.ADMIN_REQUIRED

@@ -101,7 +101,10 @@ def test_retained_file_effects_are_in_all_central_policy_inventories() -> None:
         assert ac.get_tool_flow_direction(tool) is ac.ToolFlowDirection.SINK
         assert ac.TRIGGER_CAPABILITY_TIERS[tool] is ac.CapabilityTier.SCOPE_CONTAINED
         assert tool in budget_gate._REMEDIATION_EFFECT_TOOLS
-        assert tool in ac._NON_INGESTING_RESULT_TOOLS
+        assert (
+            ac.TOOL_DESCRIPTORS[tool].result_origin
+            & ac.ResultOriginKind.NON_INGESTING
+        )
 
 
 def test_worklink_resume_is_exact_spawn_capability() -> None:

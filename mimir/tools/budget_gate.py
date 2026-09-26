@@ -59,6 +59,11 @@ import yaml
 from ..env import env_bool
 from ..models import AuthContext
 from ..redaction import redact_text
+from ..tool_descriptors import (
+    FetchAuthorizationKind,
+    ResultOriginKind,
+    get_tool_descriptor,
+)
 from .refusals import ToolPolicyRefusal
 from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
@@ -108,7 +113,6 @@ from .client_provider import (
     validate_hands_wrapper_arguments,
 )
 from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
-from .web_search_destination import web_search_url
 
 log = logging.getLogger(__name__)
 
@@ -134,11 +138,6 @@ _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
 _TOOL_EVENT_ARGUMENT_VALUE_LIMIT = 200
 _TOOL_EVENT_ERROR_LIMIT = 500
 _TOOL_EVENT_ELISION = "...[truncated]..."
-_GIT_OPERATION_RESULT_TOOLS = frozenset({
-    "repo_fetch", "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
-    "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
-    "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
-})
 _GIT_OPERATION_RESULT_FIELDS = frozenset({"ok", "code", "stdout", "stderr"})
 _PROJECT_TEST_RESULT_FIELDS = frozenset({"ok", "code"})
 _SPAWN_OPEN_CODE_RESULT_FIELDS = frozenset({
@@ -196,16 +195,14 @@ def _resolve_standing_review(
     return None
 
 
-# Tools exempt from the per-turn cap. They neither consume a slot nor
-# get refused after the cap is hit. The driving case is ``send_message``:
+# Exempt tools neither consume a slot nor get refused after the cap is hit.
+# The driving case is ``send_message``:
 # when the budget is exhausted the denial path tells the model to
 # "finish the turn", but the final assistant text does NOT auto-deliver
 # to channels (an explicit send_message call is the only delivery path
 # — see SPEC §7.1). Without exempting it, the agent would hit the cap,
 # get told to stop, but have no way to actually tell the operator. ``react``
 # is exempt for the same operator-facing-acknowledgement reason.
-_BUDGET_EXEMPT_TOOLS = frozenset({"send_message", "react"})
-
 def _auth_context_from_request(request: ToolCallRequest) -> AuthContext | None:
     """Return the exact graph invocation's valid server-created auth carrier.
 
@@ -391,9 +388,9 @@ def _check_and_increment_or_deny(
     or ``None`` if the call should proceed. Shared between the sync
     and async middleware paths so the bookkeeping stays identical."""
     # Exempt tools (send_message, react) bypass both the count
-    # increment AND the cap check — see ``_BUDGET_EXEMPT_TOOLS``
-    # docstring for why. Free passage, no bookkeeping.
-    if tool_name in _BUDGET_EXEMPT_TOOLS:
+    # increment AND the cap check. Free passage, no bookkeeping.
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor is not None and descriptor.budget_exempt:
         return None
     state = _resolve_budget_state(ctx)
     if state is None:
@@ -470,85 +467,13 @@ def _extract_sink_target(
     tc = getattr(request, "tool_call", None) or {}
     args = tc.get("args") or {}
     tool_name = _tool_name_from_request(request)
-    if tool_name in {
-        "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body",
-        "pr_rerequest_review", "unsupported_operation", "repo_checkout",
-        "repo_cleanup", "repo_fetch", "repo_test", "repo_stage", "repo_commit", "repo_merge",
-        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
-        "repo_revert_abort", "repo_push",
-    }:
-        discovered = getattr(auth_context, "server_discovered_pr_states", None)
-        state = (
-            discovered.resolve_for_tool(tool_name, args.get("repository"), args.get("pull_request"))
-            if discovered is not None
-            and isinstance(args.get("repository"), str)
-            and isinstance(args.get("pull_request"), int)
-            else None
-        )
-        if state is None:
-            registry = getattr(auth_context, "repo_pr_scope_registry", None)
-            state = (
-                registry.resolve(args.get("repository"), args.get("pull_request"))
-                if registry is not None and hasattr(registry, "resolve")
-                else None
-            )
-        if state is None:
-            return None
-        scope = state.action_scope
-        return (
-            f"{scope.canonical_repo}#pull/{scope.pr_number}"
-            f"@{scope.observed_head_sha}:{scope.scope_id}"
-        )
-    if tool_name == "operator_alert":
-        from ..channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
-
-        return resolve_deliver_channel(
-            OPERATOR_CHANNEL_SENTINEL,
-            os.environ.get("MIMIR_OPERATOR_ALERT_CHANNEL", ""),
-        )
-    if tool_name in {"send_message", "react", "fetch_channel_history"}:
-        explicit_channel = args.get("channel_id")
-        if explicit_channel:
-            return str(explicit_channel)
-        return auth_context.channel_id if auth_context is not None else None
-    if tool_name in {"write_file", "edit_file"}:
-        target = args.get("file_path") or args.get("path")
-    elif tool_name in {"shell_exec", "bash_async"}:
-        target = args.get("command")
-    elif tool_name == "spawn_open_code":
-        target = args.get("cwd") or os.environ.get("MIMIR_HOME")
-    elif tool_name in {"worklink_run", "worklink_resume"}:
-        target = os.environ.get("WORKLINK_REPO") or os.environ.get("MIMIR_WORKLINK_REPO")
-    elif tool_name in {"fetch_url", "http_request", "webhook"}:
-        target = args.get("url")
-    elif tool_name == "web_search":
-        target = web_search_url()
-    elif tool_name in {"add_schedule", "set_schedule_priority", "remove_schedule"}:
-        name = str(args.get("name") or "").strip()
-        target = f"scheduler:job:{name}" if name else "scheduler:jobs"
-    elif tool_name == "set_poller_overrides":
-        home = os.environ.get("MIMIR_HOME", "").strip()
-        target = str(Path(home) / "pollers-overrides.yaml") if home else "scheduler:poller-overrides"
-    elif tool_name == "reload_pollers":
-        target = "scheduler:pollers"
-    elif tool_name in {
-        "commitment_complete", "commitment_snooze", "commitment_dismiss",
-    }:
-        commitment_id = str(args.get("commitment_id") or "").strip()
-        target = f"commitment:{commitment_id}" if commitment_id else "commitments"
-    elif tool_name == "defer_injected_message":
-        message_id = str(args.get("message_id") or "").strip()
-        target = f"injected-message:{message_id}" if message_id else "injected_messages"
-    elif tool_name == "request_mimir_update":
-        home = os.environ.get("MIMIR_HOME", "").strip()
-        target = str(Path(home) / ".mimir" / "pending-update.flag") if home else "pending-update.flag"
-    elif tool_name == "rebuild_index":
-        scope = str(args.get("scope") or "all").strip().lower()
-        target = f"index:{scope}"
-    elif tool_name.startswith("mcp_"):
-        target = tool_name
-    else:
-        target = args.get("target") or args.get("destination")
+    descriptor = get_tool_descriptor(tool_name)
+    extractor = descriptor.sink_target_extractor if descriptor is not None else None
+    if callable(extractor):
+        return extractor(tool_name, args, auth_context)[0]
+    if tool_name.startswith("mcp_"):
+        return tool_name
+    target = args.get("target") or args.get("destination")
     return str(target) if target else None
 
 
@@ -557,13 +482,13 @@ def _extract_sink_targets(
     auth_context: AuthContext | None = None,
 ) -> list[str | None]:
     """Return every independently writable destination in a tool call."""
-    target = _extract_sink_target(request, auth_context)
-    if _tool_name_from_request(request) != "spawn_open_code":
-        return [target]
-
+    tool_name = _tool_name_from_request(request)
     args = (getattr(request, "tool_call", None) or {}).get("args") or {}
-    artifact_root = args.get("artifact_root")
-    return [target, str(artifact_root)] if artifact_root else [target]
+    descriptor = get_tool_descriptor(tool_name)
+    extractor = descriptor.sink_target_extractor if descriptor is not None else None
+    if callable(extractor):
+        return list(extractor(tool_name, args, auth_context))
+    return [_extract_sink_target(request, auth_context)]
 
 
 def _authorized_fetch_urls_for_tool(
@@ -571,7 +496,9 @@ def _authorized_fetch_urls_for_tool(
     auth_context: AuthContext | None,
     target: str | None = None,
 ) -> frozenset[str] | None:
-    if tool_name == "fetch_url":
+    descriptor = get_tool_descriptor(tool_name)
+    kind = descriptor.fetch_authorization if descriptor else FetchAuthorizationKind.NONE
+    if kind is FetchAuthorizationKind.FETCH_URL:
         approved = set(approved_fetch_urls(auth_context))
         approved.update(
             url for url in ingested_fetch_urls(auth_context)
@@ -582,7 +509,7 @@ def _authorized_fetch_urls_for_tool(
             if normalized is not None:
                 approved.add(normalized)
         return frozenset(approved)
-    if tool_name == "web_search":
+    if kind is FetchAuthorizationKind.WEB_SEARCH:
         from ..access_control import _fixed_web_search_url
 
         fixed_url = _fixed_web_search_url()
@@ -1660,13 +1587,6 @@ def _argument_validation_refusal(request: ToolCallRequest) -> str:
     return "Tool argument validation failed. Fix the error and try again."
 
 
-_IFC_DELEGATION_TOOLS = frozenset({
-    "task",
-    "spawn_open_code",
-    "bash_async",
-})
-
-
 def _get_current_turn_context() -> Any:
     from .._context import get_current_turn
 
@@ -1713,18 +1633,6 @@ def _result_text(result: Any) -> str | None:
     return None
 
 
-_EXTERNAL_ORIGIN_URL_RESULT_TOOLS = frozenset({
-    "pr_job_log",
-    "pr_metadata",
-    "pr_files",
-    "pr_diff",
-    "pr_checks",
-    "pr_reviews",
-    "pr_comments",
-    "pr_review_requests",
-})
-
-
 def _web_search_external_result_text(result: Any) -> str | None:
     """Return only remote Tavily result fields, never model-authored echoes."""
     text = _result_text(result)
@@ -1756,11 +1664,12 @@ def _external_result_text(
     """Extract only server-attested external-origin result content."""
     if failed or not getattr(labels, "has_untrusted_active_ingest", False):
         return None
-    if tool_name == "web_search":
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor is None or not descriptor.result_origin & ResultOriginKind.EXTERNAL:
+        return None
+    if descriptor.result_origin & ResultOriginKind.WEB_SEARCH_FORMAT:
         return _web_search_external_result_text(result)
-    if tool_name in _EXTERNAL_ORIGIN_URL_RESULT_TOOLS:
-        return _result_text(result)
-    return None
+    return _result_text(result)
 
 
 def _fetched_body_url_recorder(
@@ -2297,7 +2206,8 @@ def _returned_value_is_error(tool_name: str, content: Any) -> bool:
         )
 
     expected_fields: frozenset[str] | None = None
-    if tool_name in _GIT_OPERATION_RESULT_TOOLS:
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor is not None and descriptor.git_operation_result:
         expected_fields = _GIT_OPERATION_RESULT_FIELDS
     elif tool_name == "repo_test":
         expected_fields = _PROJECT_TEST_RESULT_FIELDS
@@ -3110,7 +3020,8 @@ def _prepare_tool_call_execution(
 
     # Delegation inherits the monotonic IFC carrier only after all gates admit it.
     active_ctx = _get_current_turn_context()
-    if active_ctx is not None and tool_name in _IFC_DELEGATION_TOOLS:
+    descriptor = get_tool_descriptor(tool_name)
+    if active_ctx is not None and descriptor is not None and descriptor.ifc_delegation:
         from ..agent import _propagate_ifc_labels
 
         propagated = _propagate_ifc_labels(
@@ -3219,7 +3130,11 @@ def _begin_tool_execution(
         from .web import begin_authorized_fetch
 
         capture.fetch_token = begin_authorized_fetch(authorized_fetch_urls)
-    if call.tool_name == "fetch_url":
+    descriptor = get_tool_descriptor(call.tool_name)
+    if (
+        descriptor is not None
+        and descriptor.fetch_authorization is FetchAuthorizationKind.FETCH_URL
+    ):
         from .web import begin_fetched_body_recording
 
         capture.fetched_body_recorder_token = begin_fetched_body_recording(

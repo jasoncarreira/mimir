@@ -60,6 +60,12 @@ from .read_policy import (
     resolved_read_target_from_arguments,
     resolve_large_tool_results_target,
 )
+from .tool_descriptors import (
+    ResultOriginKind,
+    SinkCategory,
+    TOOL_DESCRIPTORS,
+    get_tool_descriptor,
+)
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
@@ -107,31 +113,6 @@ class OperationDecision(StrEnum):
     UNKNOWN = "unknown"
 
 
-class SinkCategory(StrEnum):
-    """Sink categories for information flow control (chainlink #871).
-
-    Used to determine which sinks are compatible with which IFC labels.
-    """
-
-    SAME_CHANNEL = "same_channel"
-    CROSS_CHANNEL = "cross_channel"
-    PUBLIC = "public"
-    EXTERNAL_MCP = "external_mcp"
-    HTTP_WEBHOOK = "http_webhook"
-    SHELL_PROCESS = "shell_process"
-    NETWORK = "network"
-    SPAWN = "spawn"
-    NOTIFICATION = "notification"
-    FILE = "file"
-    DIRECT_MESSAGE = "direct_message"
-    SAGA = "saga"
-    SCHEDULER = "scheduler"
-    PROPOSAL = "proposal"
-    FORGE = "forge"
-    HARNESS_DISPLAY = "harness_display"
-    UNKNOWN = "unknown"
-
-
 _SINK_CATEGORY_CAPABILITY_ELIGIBLE = frozenset({
     SinkCategory.SAME_CHANNEL,
     SinkCategory.CROSS_CHANNEL,
@@ -175,91 +156,10 @@ class ToolFlowDirection(StrEnum):
     UNKNOWN = "unknown"
 
 
-_SINK_CATEGORY_MAP: dict[str, SinkCategory] = {
-    "send_message": SinkCategory.SAME_CHANNEL,
-    "operator_alert": SinkCategory.NOTIFICATION,
-    "react": SinkCategory.SAME_CHANNEL,
-    # Harness-owned egress paths bypass model tool middleware, so they are
-    # named explicitly and checked at their final send/edit boundary.
-    "harness_auto_deliver": SinkCategory.SAME_CHANNEL,
-    "harness_resend_nudge": SinkCategory.SAME_CHANNEL,
-    "web_turn_events": SinkCategory.SAME_CHANNEL,
-    # These harness-only sinks accept metadata-only payloads. They are not
-    # model-selected messages and intentionally do not share SAME_CHANNEL.
-    "activity_panel_post": SinkCategory.HARNESS_DISPLAY,
-    "activity_panel_edit": SinkCategory.HARNESS_DISPLAY,
-    "post_message": SinkCategory.CROSS_CHANNEL,
-    "webhook": SinkCategory.HTTP_WEBHOOK,
-    "http_request": SinkCategory.HTTP_WEBHOOK,
-    "fetch_url": SinkCategory.NETWORK,
-    "web_search": SinkCategory.NETWORK,
-    "shell_exec": SinkCategory.SHELL_PROCESS,
-    "bash_async": SinkCategory.SHELL_PROCESS,
-    "Bash": SinkCategory.SHELL_PROCESS,
-    "bash": SinkCategory.SHELL_PROCESS,
-    "bash_exec": SinkCategory.SHELL_PROCESS,
-    "execute": SinkCategory.SHELL_PROCESS,
-    "aexecute": SinkCategory.SHELL_PROCESS,
-    "shell": SinkCategory.SHELL_PROCESS,
-    "hands_edit": SinkCategory.EXTERNAL_MCP,
-    "hands_shell": SinkCategory.SHELL_PROCESS,
-    "hands_python": SinkCategory.SHELL_PROCESS,
-    "spawn_open_code": SinkCategory.SPAWN,
-    "worklink_run": SinkCategory.SPAWN,
-    "worklink_resume": SinkCategory.SPAWN,
-    "ntfy_send": SinkCategory.NOTIFICATION,
-    "write_file": SinkCategory.FILE,
-    "edit_file": SinkCategory.FILE,
-    "Write": SinkCategory.FILE,
-    "Edit": SinkCategory.FILE,
-    "download_files": SinkCategory.FILE,
-    "adownload_files": SinkCategory.FILE,
-    "rebuild_index": SinkCategory.FILE,
-    "request_mimir_update": SinkCategory.FILE,
-    "memory_store": SinkCategory.SAGA,
-    "saga_record_skill_learning": SinkCategory.SAGA,
-    "saga_feedback": SinkCategory.SAGA,
-    "saga_mark_contributions": SinkCategory.SAGA,
-    "saga_forget": SinkCategory.SAGA,
-    "saga_end_session": SinkCategory.SAGA,
-    "add_schedule": SinkCategory.SCHEDULER,
-    "set_schedule_priority": SinkCategory.SCHEDULER,
-    "remove_schedule": SinkCategory.SCHEDULER,
-    "set_poller_overrides": SinkCategory.SCHEDULER,
-    "reload_pollers": SinkCategory.SCHEDULER,
-    "commitment_complete": SinkCategory.SAGA,
-    "commitment_snooze": SinkCategory.SAGA,
-    "commitment_dismiss": SinkCategory.SAGA,
-    "defer_injected_message": SinkCategory.SAGA,
-    "open_proposal": SinkCategory.PROPOSAL,
-    "submit_proposal": SinkCategory.PROPOSAL,
-    "abandon_proposal": SinkCategory.PROPOSAL,
-    "pr_submit_review": SinkCategory.FORGE,
-    "pr_inline_review_comment": SinkCategory.FORGE,
-    "pr_comment": SinkCategory.FORGE,
-    "pr_edit_body": SinkCategory.FORGE,
-    "issue_comment": SinkCategory.FORGE,
-    "pr_rerequest_review": SinkCategory.FORGE,
-    "unsupported_operation": SinkCategory.FORGE,
-    "repo_checkout": SinkCategory.FORGE,
-    "repo_cleanup": SinkCategory.FORGE,
-    "repo_fetch": SinkCategory.FORGE,
-    "repo_test": SinkCategory.FORGE,
-    "repo_stage": SinkCategory.FORGE,
-    "repo_commit": SinkCategory.FORGE,
-    "repo_merge": SinkCategory.FORGE,
-    "repo_merge_abort": SinkCategory.FORGE,
-    "repo_rebase": SinkCategory.FORGE,
-    "repo_rebase_abort": SinkCategory.FORGE,
-    "repo_revert": SinkCategory.FORGE,
-    "repo_revert_abort": SinkCategory.FORGE,
-    "repo_push": SinkCategory.FORGE,
-}
-
 SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
     name
-    for name, category in _SINK_CATEGORY_MAP.items()
-    if category is SinkCategory.SHELL_PROCESS
+    for name, descriptor in TOOL_DESCRIPTORS.items()
+    if descriptor.sink_category is SinkCategory.SHELL_PROCESS
 )
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
@@ -397,7 +297,8 @@ def get_sink_category(tool_name: str) -> SinkCategory:
     Unknown operations are not presumed public: doing so would make a newly
     added harness send an implicit IFC bypass until the map was updated.
     """
-    return _SINK_CATEGORY_MAP.get(tool_name, SinkCategory.UNKNOWN)
+    descriptor = get_tool_descriptor(tool_name)
+    return descriptor.sink_category if descriptor and descriptor.sink_category else SinkCategory.UNKNOWN
 
 
 def get_tool_flow_direction(tool_name: str) -> ToolFlowDirection:
@@ -761,7 +662,8 @@ def build_trigger_service_principal(
         domain = _OPERATION_READABLE_DOMAIN.get(operation)
         if domain:
             readable_domains.add(domain)
-        destination = _OPERATION_SINK_DESTINATION.get(operation)
+        descriptor = get_tool_descriptor(operation)
+        destination = descriptor.sink_destination if descriptor else None
         if destination:
             sink_destinations.add(destination)
         if operation in {"write_file", "edit_file"}:
@@ -9100,7 +9002,8 @@ class ToolRegistry:
         ):
             sink_target = getattr(auth_context, "channel_id", None)
         if not sink_target:
-            sink_target = _OPERATION_SINK_DESTINATION.get(tool_name)
+            descriptor = get_tool_descriptor(tool_name)
+            sink_target = descriptor.sink_destination if descriptor else None
         is_ifc_sink = flow_direction in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         } or (
@@ -9484,68 +9387,6 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
 _ACP_HANDS_RESULT_TOOLS = frozenset({
     "hands_read", "hands_edit", "hands_shell", "hands_python"
-})
-
-# Every model-bound tool that does not ingest model-visible content is listed
-# explicitly. This makes exemption a reviewed semantic claim rather than an
-# inference from flow direction.
-_NON_INGESTING_RESULT_TOOLS = frozenset({
-    # Authorization/workflow actions return only server-created status.
-    "hands_request_scope",
-    "approve_declassification",
-    "clear_ingest_taint",
-    "request_operator_approval",
-    # These writes return identifiers, counts, or fixed status, not stored data.
-    "memory_store",
-    "open_proposal",
-    "submit_proposal",
-    "abandon_proposal",
-    "saga_feedback",
-    "saga_mark_contributions",
-    "saga_end_session",
-    "saga_record_skill_learning",
-    "rebuild_index",
-    # Async shell and fetch return metadata; content is read through a mapped tool.
-    "bash_async",
-    "fetch_url",
-    # Delivery and queue mutations return acknowledgements only.
-    "operator_alert",
-    "send_message",
-    "react",
-    "defer_injected_message",
-    # Scheduler and commitment mutations return normalized status only.
-    "add_schedule",
-    "set_schedule_priority",
-    "remove_schedule",
-    "set_poller_overrides",
-    "reload_pollers",
-    "commitment_complete",
-    "commitment_snooze",
-    "commitment_dismiss",
-    # Self-update returns the server-created pending-update status.
-    "request_mimir_update",
-    # These repository actions construct local acknowledgements without readback.
-    "pr_rerequest_review",
-    "unsupported_operation",
-    "repo_cleanup",
-    "repo_stage",
-    # DeepAgents state/write tools return acknowledgements or remain in-carrier.
-    "write_todos",
-    "write_file",
-    "edit_file",
-    "task",
-})
-
-_REPOSITORY_RESULT_TOOLS = frozenset({
-    "pr_job_log",
-    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
-    "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
-    "repo_status", "repo_test", "repo_diff", "repo_unmerged",
-    "pr_submit_review", "pr_inline_review_comment", "pr_comment",
-    "pr_edit_body",
-    "repo_commit", "repo_merge", "repo_merge_abort",
-    "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort",
-    "repo_push",
 })
 
 # Independent semantic inventory for tools whose results come from a read
@@ -10198,7 +10039,8 @@ def classify_protected_result(
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
-    if tool_name in _REPOSITORY_RESULT_TOOLS:
+    descriptor = get_tool_descriptor(tool_name)
+    if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
         scope = authorization.repo_pr_action_scope
         if scope is None:
             return _incomplete_protected_result(
@@ -10453,7 +10295,8 @@ def classify_protected_result(
                 labels = labels.with_source(source)
             return labels
 
-        if tool_name in _NON_INGESTING_RESULT_TOOLS:
+        descriptor = get_tool_descriptor(tool_name)
+        if descriptor and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
             return None
         # An ingesting native tool without a confidentiality domain still
         # introduces model-visible content. Unknown provenance must taint the
@@ -10691,82 +10534,6 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     },
 }
 
-_OPERATION_SINK_DESTINATION: dict[str, str] = {
-    "write_file": "filesystem",
-    "edit_file": "filesystem",
-    "shell_exec": "shell_process",
-    "bash_async": "shell_process",
-    "spawn_open_code": "spawn_process",
-    "open_proposal": "proposal",
-    "submit_proposal": "proposal",
-    "abandon_proposal": "proposal",
-    "add_schedule": "scheduler",
-    "set_schedule_priority": "scheduler",
-    "remove_schedule": "scheduler",
-    "set_poller_overrides": "scheduler",
-    "reload_pollers": "scheduler",
-    "commitment_complete": "commitments",
-    "commitment_snooze": "commitments",
-    "commitment_dismiss": "commitments",
-    "defer_injected_message": "injected_messages",
-    "rebuild_index": "filesystem",
-    "request_mimir_update": "filesystem",
-    "saga_feedback": "saga",
-    "saga_mark_contributions": "saga",
-    "saga_record_skill_learning": "saga",
-    "saga_forget": "saga",
-    "memory_store": "saga",
-    "send_message": "message",
-    "operator_alert": "notification",
-    "saga_end_session": "session_boundary",
-    "worklink_run": "worklink",
-    "worklink_resume": "worklink",
-    "react": "message",
-    "web_search": "network",
-    "fetch_url": "network",
-    "post_message": "message",
-    "webhook": "network",
-    "http_request": "network",
-    "ntfy_send": "notification",
-    "download_files": "filesystem",
-    "adownload_files": "filesystem",
-    "Bash": "shell_process",
-    "bash": "shell_process",
-    "bash_exec": "shell_process",
-    "execute": "shell_process",
-    "aexecute": "shell_process",
-    "shell": "shell_process",
-    "hands_edit": "client_provider",
-    "hands_shell": "shell_process",
-    "hands_python": "shell_process",
-    "Write": "filesystem",
-    "Edit": "filesystem",
-    "harness_auto_deliver": "message",
-    "harness_resend_nudge": "message",
-    "activity_panel_post": "message",
-    "activity_panel_edit": "message",
-    "pr_submit_review": "bound_pull_request",
-    "pr_inline_review_comment": "bound_pull_request",
-    "pr_comment": "bound_pull_request",
-    "pr_edit_body": "bound_pull_request",
-    "issue_comment": "configured_repository_issue",
-    "pr_rerequest_review": "bound_pull_request",
-    "unsupported_operation": "bound_pull_request",
-    "repo_checkout": "bound_pull_request",
-    "repo_cleanup": "bound_pull_request",
-    "repo_fetch": "bound_pull_request",
-    "repo_test": "bound_pull_request",
-    "repo_stage": "bound_pull_request",
-    "repo_commit": "bound_pull_request",
-    "repo_merge": "bound_pull_request",
-    "repo_merge_abort": "bound_pull_request",
-    "repo_rebase": "bound_pull_request",
-    "repo_rebase_abort": "bound_pull_request",
-    "repo_revert": "bound_pull_request",
-    "repo_revert_abort": "bound_pull_request",
-    "repo_push": "bound_pull_request",
-}
-
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
     "memory_store",
     "saga_feedback",
@@ -10790,17 +10557,21 @@ def _capability_matrix_errors() -> list[str]:
             errors.append(
                 f"IFC {direction.value} operation '{operation}' has no sink category"
             )
-        if operation not in _OPERATION_SINK_DESTINATION:
+        descriptor = get_tool_descriptor(operation)
+        if descriptor is None or descriptor.sink_destination is None:
             errors.append(
                 f"IFC {direction.value} operation '{operation}' has no destination extraction"
             )
-    for operation in sorted(_OPERATION_SINK_DESTINATION):
+    for operation, descriptor in sorted(TOOL_DESCRIPTORS.items()):
+        if descriptor.sink_destination is None:
+            continue
         if get_sink_category(operation) is SinkCategory.UNKNOWN:
             errors.append(
                 f"Sink operation '{operation}' has no IFC sink category mapping"
             )
     for operation in sorted(_SAGA_MUTATION_OPERATIONS):
-        if operation not in _OPERATION_SINK_DESTINATION:
+        descriptor = get_tool_descriptor(operation)
+        if descriptor is None or descriptor.sink_destination is None:
             errors.append(
                 f"SAGA mutation '{operation}' has no sink destination mapping"
             )
@@ -10903,7 +10674,8 @@ def _capability_matrix_errors() -> list[str]:
                     f"Service principal '{principal.canonical}' capability "
                     f"'{operation}' requires readable domain '{required_domain}'"
                 )
-            required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+            descriptor = get_tool_descriptor(operation)
+            required_sink = descriptor.sink_destination if descriptor else None
             if required_sink and required_sink not in sink_destinations:
                 errors.append(
                     f"Service principal '{principal.canonical}' capability "
@@ -11030,7 +10802,8 @@ def assert_model_tool_inventory_cataloged(
         }
         and (
             get_sink_category(tool_name) == SinkCategory.UNKNOWN
-            or tool_name not in _OPERATION_SINK_DESTINATION
+            or (descriptor := get_tool_descriptor(tool_name)) is None
+            or descriptor.sink_destination is None
         )
     })
     misclassified_read_backends = sorted({
@@ -11046,10 +10819,16 @@ def assert_model_tool_inventory_cataloged(
         # flow direction never exempts its remote response from provenance.
         if not tool_name.startswith(MCPResourceAdapter._MCP_TOOL_PREFIX)
         and tool_name not in _PROTECTED_RESULT_DOMAINS
-        and tool_name not in _NON_INGESTING_RESULT_TOOLS
+        and not (
+            (descriptor := get_tool_descriptor(tool_name))
+            and descriptor.result_origin & ResultOriginKind.NON_INGESTING
+        )
     })
     overlapping_result_policies = sorted(
-        _PROTECTED_RESULT_DOMAINS.keys() & _NON_INGESTING_RESULT_TOOLS
+        tool_name
+        for tool_name in _PROTECTED_RESULT_DOMAINS
+        if (descriptor := get_tool_descriptor(tool_name))
+        and descriptor.result_origin & ResultOriginKind.NON_INGESTING
     )
     errors: list[str] = []
     if unknown_tools:
@@ -11281,7 +11060,8 @@ def service_can_invoke_operation(
     required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
     if required_domain and not service.can_read_domain(required_domain):
         return False
-    required_sink = _OPERATION_SINK_DESTINATION.get(operation)
+    descriptor = get_tool_descriptor(operation)
+    required_sink = descriptor.sink_destination if descriptor else None
     if required_sink and not service.can_write_sink(required_sink):
         return False
     return True

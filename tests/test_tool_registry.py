@@ -313,10 +313,10 @@ def test_typed_repo_pr_surface_is_default_off_and_complete_when_enabled() -> Non
 def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
     from mimir.access_control import (
         ToolFlowDirection,
-        _OPERATION_SINK_DESTINATION,
         _TYPED_REPO_PR_TOOL_ACTIONS,
         get_tool_flow_direction,
     )
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
     sinks = {
         name for name in _TYPED_REPO_PR_TOOL_ACTIONS
@@ -324,7 +324,7 @@ def test_typed_repo_pr_sinks_all_have_destination_extraction() -> None:
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         }
     }
-    assert sinks <= set(_OPERATION_SINK_DESTINATION)
+    assert all(TOOL_DESCRIPTORS[name].sink_destination is not None for name in sinks)
 
 
 def test_typed_repo_pr_schemas_only_name_exact_registry_selectors() -> None:
@@ -476,9 +476,9 @@ def test_factory_operations_are_cataloged_as_admin_required(operation: str) -> N
 
 
 def test_spawn_open_code_declares_spawn_sink_destination() -> None:
-    from mimir.access_control import _OPERATION_SINK_DESTINATION
+    from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
-    assert _OPERATION_SINK_DESTINATION["spawn_open_code"] == "spawn_process"
+    assert TOOL_DESCRIPTORS["spawn_open_code"].sink_destination == "spawn_process"
 
 
 @pytest.mark.parametrize(
@@ -1001,9 +1001,14 @@ def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
 ) -> None:
     import mimir.access_control as access_control
 
-    sinks = access_control._OPERATION_SINK_DESTINATION.copy()
-    sinks.pop("memory_store")
-    monkeypatch.setattr(access_control, "_OPERATION_SINK_DESTINATION", sinks)
+    original = access_control.get_tool_descriptor
+    monkeypatch.setattr(
+        access_control,
+        "get_tool_descriptor",
+        lambda name: replace(original(name), sink_destination=None)
+        if name == "memory_store"
+        else original(name),
+    )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
 
@@ -1016,9 +1021,14 @@ def test_capability_matrix_rejects_declared_sink_without_ifc_category(
 ) -> None:
     import mimir.access_control as access_control
 
-    categories = access_control._SINK_CATEGORY_MAP.copy()
-    categories.pop("memory_store")
-    monkeypatch.setattr(access_control, "_SINK_CATEGORY_MAP", categories)
+    original = access_control.get_tool_descriptor
+    monkeypatch.setattr(
+        access_control,
+        "get_tool_descriptor",
+        lambda name: replace(original(name), sink_category=None)
+        if name == "memory_store"
+        else original(name),
+    )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
 
@@ -1760,7 +1770,11 @@ def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
             access_control.get_tool_flow_direction(name),
             access_control.get_operation_catalog().get_decision(name),
             access_control._OPERATION_READABLE_DOMAIN.get(name),
-            access_control._OPERATION_SINK_DESTINATION.get(name),
+            (
+                access_control.TOOL_DESCRIPTORS[name].sink_destination
+                if name in access_control.TOOL_DESCRIPTORS
+                else None
+            ),
             access_control._PROTECTED_RESULT_DOMAINS.get(name),
         )
         for name in ("hands_read", "hands_edit", "hands_shell", "hands_python")
