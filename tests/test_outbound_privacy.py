@@ -1800,6 +1800,122 @@ def test_claude_code_privacy_errors_return_value_free_denial(
     assert distinctive not in json.dumps(result)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+async def test_async_middleware_privacy_errors_return_value_free_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failing_component: str,
+) -> None:
+    distinctive = "distinctive-async-middleware-token"
+    events = _capture_events(monkeypatch)
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise ValueError(distinctive)
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+        tool_name = "fetch_url"
+        arguments = {"url": f"https://example.test/?value={TOKEN}"}
+        sensitive_value = TOKEN
+    else:
+        _enable_jev(monkeypatch)
+        monkeypatch.setattr(
+            budget_gate,
+            "_scan_outbound_jev",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
+        )
+        tool_name = "web_search"
+        arguments = {"query": PII_TEXT}
+        sensitive_value = PII_TEXT
+
+    executed: list[bool] = []
+    result = await _run_async(tool_name, arguments, _auth(), executed)
+
+    assert result.status == "error"
+    assert "local content check failed" in str(result.content)
+    assert executed == []
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["boundary"] == "outbound_privacy"
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
+    assert sensitive_value not in str(result.content)
+    assert sensitive_value not in json.dumps(events)
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in str(result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+async def test_async_claude_code_privacy_errors_return_value_free_denial(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failing_component: str,
+) -> None:
+    distinctive = "distinctive-async-claude-token"
+    events = _capture_events(monkeypatch)
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise ValueError(distinctive)
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+        tool_name = "WebFetch"
+        tool_input = {"url": f"https://example.test/?value={TOKEN}"}
+        sensitive_value = TOKEN
+    else:
+        _enable_jev(monkeypatch)
+        monkeypatch.setattr(
+            budget_gate,
+            "_scan_outbound_jev",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
+        )
+        tool_name = "WebSearch"
+        tool_input = {"query": PII_TEXT}
+        sensitive_value = PII_TEXT
+
+    carrier = _InvocationAuthCarrier()
+    binding = carrier.bind(_auth())
+    token = _auth_carrier_var.set(carrier)
+    try:
+        result = await _pre_tool_use_hook(
+            {"tool_name": tool_name, "tool_input": tool_input},
+            f"toolu_async_{failing_component}_error",
+            None,
+        )
+    finally:
+        carrier.clear(binding)
+        _auth_carrier_var.reset(token)
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "local content check failed" in output["permissionDecisionReason"]
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["boundary"] == "outbound_privacy"
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
+    assert sensitive_value not in json.dumps(result)
+    assert sensitive_value not in json.dumps(events)
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in json.dumps(result)
+
+
 @pytest.mark.parametrize("name", ["private-terms.txt", ".outbound-privacy-key"])
 def test_outbound_privacy_files_are_protected_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
