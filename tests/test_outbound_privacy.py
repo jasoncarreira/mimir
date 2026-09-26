@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -953,8 +955,9 @@ def test_social_dispatch_refuses_yaml_over_size_bound(
     assert denial["reason"] == "outbound_dispatch_unscannable"
 
 
+@pytest.mark.parametrize("dispatch_args", ["", " --platform bsky"])
 def test_social_dispatch_admits_production_shaped_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dispatch_args: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
@@ -975,7 +978,7 @@ def test_social_dispatch_admits_production_shaped_state(
 
     result = _run_sync(
         "shell_exec",
-        {"command": f"bash {script} social-cli-notifications dispatch --platform bsky"},
+        {"command": f"bash {script} social-cli-notifications dispatch{dispatch_args}"},
         auth,
         executed,
     )
@@ -987,23 +990,58 @@ def test_social_dispatch_admits_production_shaped_state(
 def test_social_dispatch_refuses_fifo_without_opening_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs are unavailable on this platform")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     auth, script = _social_service_auth(tmp_path)
     fifo = tmp_path / "state/pollers/social-cli-notifications/blocked.yaml"
-    try:
-        fifo.mkfifo()
-    except (AttributeError, NotImplementedError, OSError):
-        pytest.skip("FIFOs are unavailable on this platform")
+    os.mkfifo(fifo)
     events = _capture_events(monkeypatch)
+    result: list[str | None] = []
 
-    refusal = _outbound_privacy_refusal(
+    worker = threading.Thread(
+        target=lambda: result.append(_outbound_privacy_refusal(
+            "shell_exec",
+            {"command": f"bash {script} social-cli-notifications dispatch"},
+            auth,
+        )),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "dispatch scan blocked while inspecting a FIFO"
+    assert len(result) == 1
+    refusal = result[0]
+    assert refusal is not None
+    assert "not a regular file" in refusal
+    denial = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert denial["reason"] == "outbound_dispatch_unscannable"
+
+
+def test_social_dispatch_refuses_unreadable_regular_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root can read chmod-000 files")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    unreadable = tmp_path / "state/pollers/social-cli-notifications/blocked.yaml"
+    unreadable.write_text("clean: true\n", encoding="utf-8")
+    unreadable.chmod(0)
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync(
         "shell_exec",
         {"command": f"bash {script} social-cli-notifications dispatch"},
         auth,
+        executed,
     )
 
-    assert refusal is not None
-    assert "not a regular file" in refusal
+    assert result.status == "error"
+    assert executed == []
+    assert "could not be read" in str(result.content)
     denial = next(fields for event, fields in events if event == "hard_boundary_denied")
     assert denial["reason"] == "outbound_dispatch_unscannable"
 
