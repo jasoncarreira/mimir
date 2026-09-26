@@ -136,7 +136,7 @@ The fields are:
 | `model` | no | Versioned Jev model name. Defaults to the pinned `jev-1.13.0`, not a `-latest` alias. |
 | `questions` | yes | Operator-written Jev question map. It must include `notify` as a `noul` question. Questions use `instructions`; `choice.criteria` is an object and `score.criteria` is a list of 2-10 strings. Email content and model output cannot alter this map. |
 | `drop_below` | no | Inclusive `notify.noul` drop threshold from 0 to 1. Defaults to `0.10`; therefore `0.10` drops and `0.11` emits. |
-| `always_emit` | no | Sender addresses or exact domains that bypass Jev and always emit. Matching is case-insensitive. A leading `@` on domains is optional. |
+| `always_emit` | no | Sender addresses or exact domains that bypass Jev and always emit. Matching is case-insensitive. A leading `@` on domains is optional. Domain matches are exact: list subdomains separately when needed. |
 
 Each new message is evaluated separately. Deterministic `always_emit` matching
 runs before any request. Otherwise, the poller sends one request containing
@@ -150,11 +150,13 @@ the event's trust tier.
 
 Every dropped message is still added to the cursor and appended to
 `<persist>/triage-dropped.jsonl` with its message ID, thread URL, sender,
-subject, answers, and resolved model. That audit file is gitignored. Each run
-logs `dropped=N` on stderr. If `JEV_KEY` is missing, configuration is invalid,
-the request times out after five seconds, TypeSafe returns an HTTP error, the
-response is malformed, or the audit record cannot be written, the poller fails
-open: it emits the message as before and logs one diagnostic instead of
+subject, answers, and resolved model. That audit file is gitignored. Runs with
+at least one valid triage configuration log `dropped=N` on stderr; deployments
+without triage retain the original empty-stderr behavior. If `JEV_KEY` is
+missing, configuration is invalid, the request times out after five seconds,
+TypeSafe returns an HTTP error, the response is malformed, or the audit record
+cannot be written, the poller fails open: it emits the message as before and
+logs one diagnostic instead of
 dropping mail.
 
 5. **Bring it live:** arrange an operator-managed reload or restart.

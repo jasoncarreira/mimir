@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import http.client
 import io
 import json
 import socket
@@ -126,8 +127,9 @@ def test_no_triage_preserves_event_and_makes_no_request(
         pytest.fail("an account without triage must not contact Jev")
 
     monkeypatch.setattr(fresh_poller.request, "urlopen", unexpected_request)
-    events, _ = _run(fresh_poller, monkeypatch, capsys)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
 
+    assert stderr == ""
     assert events == [
         {
             "poller": "gmail-inbox",
@@ -326,6 +328,38 @@ def test_transport_and_body_errors_fail_open_once(
 
     assert len(events) == 1 and "triage" not in events[0]
     assert stderr.count("triage failed") == 1
+    assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
+
+
+@pytest.mark.parametrize("failure_site", ["urlopen", "read"])
+def test_incomplete_read_fails_open_and_advances_cursor(
+    fresh_poller, tmp_path, monkeypatch, capsys, failure_site,
+):
+    _configure(tmp_path, triage=_triage_config())
+    monkeypatch.setenv("JEV_KEY", "test-key")
+
+    if failure_site == "urlopen":
+        def fail(*_args, **_kwargs):
+            raise http.client.IncompleteRead(b"partial")
+
+        monkeypatch.setattr(fresh_poller.request, "urlopen", fail)
+    else:
+        class IncompleteResponse(_FakeResponse):
+            def read(self) -> bytes:
+                raise http.client.IncompleteRead(b"partial")
+
+        monkeypatch.setattr(
+            fresh_poller.request,
+            "urlopen",
+            lambda *_args, **_kwargs: IncompleteResponse(b"unused"),
+        )
+
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+
+    assert len(events) == 1 and "triage" not in events[0]
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+    assert stderr.count("triage failed") == 1
+    assert "emitting untriaged" in stderr
     assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
 
 

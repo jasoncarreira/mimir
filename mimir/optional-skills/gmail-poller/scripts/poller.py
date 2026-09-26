@@ -86,13 +86,12 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 from dataclasses import dataclass
 from email.utils import parseaddr
 from pathlib import Path
-from urllib import error, request
+from urllib import request
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -627,16 +626,7 @@ def _triage_message(event: dict, account: Account) -> dict | None:
         ):
             raise ValueError("response has an unknown answer shape")
         return {"model": model, "answers": answers}
-    except (
-        error.HTTPError,
-        error.URLError,
-        socket.timeout,
-        TimeoutError,
-        OSError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        ValueError,
-    ) as exc:
+    except Exception as exc:
         _eprint(
             f"gmail-poller: triage failed for account {account.name!r}, "
             f"message {event['message_id']!r} ({exc}); emitting untriaged."
@@ -799,7 +789,8 @@ def main() -> int:
             cursor = cursor[-CURSOR_MAX_IDS:]
         _save_cursor(cursor)
 
-    _eprint(f"gmail-poller: dropped={dropped}")
+    if any(account.triage is not None for account in accounts):
+        _eprint(f"gmail-poller: dropped={dropped}")
 
     # Exit code: 0 when at least one account's search succeeded — empty
     # inbox is a normal silence-as-filter result, not a failure, and a
