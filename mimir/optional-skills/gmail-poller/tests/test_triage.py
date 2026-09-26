@@ -291,6 +291,145 @@ def test_request_contains_only_triage_fields_and_message_preview(
     }
 
 
+def test_prompt_file_rules_build_notify_question_without_output_section(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "email-home.md").write_text(
+        "# Mail rules\n\n## Skip List\n- Newsletters\n\n"
+        "## Notify For\n- Personal mail\n\n## Output\nCall send_message.",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    config = _triage_config()
+    config["questions"]["notify"] = {
+        "type": "noul",
+        "instructions_from": "prompt",
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "name": "home",
+                        "email": "owner@example.com",
+                        "prompt-file": "email-home.md",
+                        "triage": config,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    captured = {}
+
+    def fake_urlopen(req, **_kwargs):
+        captured.update(json.loads(req.data))
+        return _FakeResponse(_response(0.91))
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    events, _ = _run(fresh_poller, monkeypatch, capsys)
+
+    assert len(events) == 1
+    notify = captured["questions"]["notify"]
+    assert notify == {
+        "type": "noul",
+        "instructions": (
+            fresh_poller.PROMPT_NOTIFY_PREAMBLE
+            + "# Mail rules\n\n## Skip List\n- Newsletters\n\n"
+            "## Notify For\n- Personal mail"
+        ),
+        "criteria": fresh_poller.PROMPT_NOTIFY_CRITERIA,
+    }
+    assert "## Output" not in notify["instructions"]
+    assert "send_message" not in notify["instructions"]
+
+
+def test_inline_prompt_without_output_uses_whole_prompt_as_rules(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    prompt = "## Skip List\n- Promotions\n\n## Notify For\n- Direct requests"
+    config = _triage_config()
+    config["questions"]["notify"] = {
+        "type": "noul",
+        "instructions_from": "prompt",
+    }
+    _configure(tmp_path, triage=config, prompt=prompt)
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    captured = {}
+
+    def fake_urlopen(req, **_kwargs):
+        captured.update(json.loads(req.data))
+        return _FakeResponse(_response(0.91))
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    _run(fresh_poller, monkeypatch, capsys)
+
+    assert captured["questions"]["notify"]["instructions"] == (
+        fresh_poller.PROMPT_NOTIFY_PREAMBLE + prompt
+    )
+
+
+def test_prompt_file_is_reread_for_each_poll(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    home = tmp_path / "home"
+    prompts = home / "prompts"
+    prompts.mkdir(parents=True)
+    prompt_file = prompts / "email-home.md"
+    prompt_file.write_text("FIRST RULE", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    config = _triage_config()
+    config["questions"]["notify"] = {
+        "type": "noul",
+        "instructions_from": "prompt",
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "accounts": [
+                    {
+                        "name": "home",
+                        "email": "owner@example.com",
+                        "prompt-file": "email-home.md",
+                        "triage": config,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    requests = []
+    searches = 0
+
+    def fake_search(*_args):
+        nonlocal searches
+        searches += 1
+        return [_message(id=f"m{searches}")]
+
+    def fake_urlopen(req, **_kwargs):
+        requests.append(json.loads(req.data))
+        return _FakeResponse(_response(0.91))
+
+    monkeypatch.setattr(fresh_poller, "_gog_search", fake_search)
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    assert fresh_poller.main() == 0
+    capsys.readouterr()
+    prompt_file.write_text("SECOND RULE", encoding="utf-8")
+    assert fresh_poller.main() == 0
+    capsys.readouterr()
+
+    instructions = [body["questions"]["notify"]["instructions"] for body in requests]
+    assert instructions == [
+        fresh_poller.PROMPT_NOTIFY_PREAMBLE + "FIRST RULE",
+        fresh_poller.PROMPT_NOTIFY_PREAMBLE + "SECOND RULE",
+    ]
+
+
 @pytest.mark.parametrize("status", [500, 422, 429])
 def test_http_errors_fail_open_once(
     fresh_poller, tmp_path, monkeypatch, capsys, status,
@@ -457,6 +596,23 @@ def test_unknown_notify_shape_fails_open(
                 }
             }
         ),
+        _triage_config(
+            questions={
+                "notify": {
+                    "type": "noul",
+                    "instructions": "literal",
+                    "instructions_from": "prompt",
+                }
+            }
+        ),
+        _triage_config(
+            questions={
+                "notify": {
+                    "type": "noul",
+                    "instructions_from": "message",
+                }
+            }
+        ),
     ],
     ids=[
         "not-an-object",
@@ -467,6 +623,8 @@ def test_unknown_notify_shape_fails_open(
         "threshold-out-of-range",
         "missing-notify",
         "notify-not-noul",
+        "instructions-and-instructions-from",
+        "unknown-instructions-from",
     ],
 )
 def test_invalid_config_disables_triage_once(
@@ -519,6 +677,48 @@ def test_audit_write_error_fails_open(
     assert len(events) == 1
     assert "triage audit failed" in stderr
     assert "dropped=0" in stderr
+
+
+def test_shadow_would_drop_is_emitted_audited_and_cursored(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(shadow=True))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    monkeypatch.setattr(
+        fresh_poller.request, "urlopen", lambda *_a, **_k: _FakeResponse(_response())
+    )
+
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+
+    assert len(events) == 1
+    assert events[0]["triage"]["would_drop"] is True
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+    records = [
+        json.loads(line)
+        for line in fresh_poller.TRIAGE_DROPPED_FILE.read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["shadow"] is True
+    assert records[0]["answers"]["notify"]["noul"] == 0.06
+    assert "dropped=0" in stderr
+
+
+def test_shadow_notify_is_emitted_without_audit(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(shadow=True))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    monkeypatch.setattr(
+        fresh_poller.request,
+        "urlopen",
+        lambda *_a, **_k: _FakeResponse(_response(0.91)),
+    )
+
+    events, _ = _run(fresh_poller, monkeypatch, capsys)
+
+    assert len(events) == 1
+    assert events[0]["triage"]["would_drop"] is False
+    assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
 
 
 def test_manifest_passes_jev_key():

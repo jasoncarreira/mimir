@@ -57,15 +57,12 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
           "triage": {
             "model": "jev-1.13.0",
             "drop_below": 0.10,
+            "shadow": true,
             "always_emit": ["family@example.com", "trusted.example"],
             "questions": {
               "notify": {
                 "type": "noul",
-                "instructions": "Should the account owner be notified? Apply the account's Notify-For and Skip-List rules.",
-                "criteria": {
-                  "true": "needs the owner's attention",
-                  "false": "safe to skip silently"
-                }
+                "instructions_from": "prompt"
               }
             }
           }
@@ -134,9 +131,26 @@ The fields are:
 | Field | Required | Description |
 |---|---|---|
 | `model` | no | Versioned Jev model name. Defaults to the pinned `jev-1.13.0`, not a `-latest` alias. |
-| `questions` | yes | Operator-written Jev question map. It must include `notify` as a `noul` question. Questions use `instructions`; `choice.criteria` is an object and `score.criteria` is a list of 2-10 strings. Email content and model output cannot alter this map. |
+| `questions` | yes | Operator-written Jev question map. It must include `notify` as a `noul` question. Questions normally use literal `instructions`; `choice.criteria` is an object and `score.criteria` is a list of 2-10 strings. The `notify` question may use `instructions_from: "prompt"` instead, as described below. Email content and model output cannot alter this map. |
 | `drop_below` | no | Inclusive `notify.noul` drop threshold from 0 to 1. Defaults to `0.10`; therefore `0.10` drops and `0.11` emits. |
 | `always_emit` | no | Sender addresses or exact domains that bypass Jev and always emit. Matching is case-insensitive. A leading `@` on domains is optional. Domain matches are exact: list subdomains separately when needed. |
+| `shadow` | no | When `true`, run and record triage but emit every message. Defaults to `false`. Use this to calibrate `drop_below` before enabling drops. |
+
+For `notify`, `instructions_from: "prompt"` makes the account prompt the single
+source of truth for both Jev and the agent. The prompt file is read again on every
+poll. Rules end at the first line exactly equal to `## Output`; that heading and
+the delivery mechanics after it are not sent to Jev. Without that heading, the
+whole prompt is used. Inline `prompt` behaves the same as `prompt-file`.
+
+The poller wraps those rules in a fixed yes/no question. Its instructions begin
+`Should the account owner be notified about this email, according to these rules?
+Apply the Skip List first; a sender or type listed there is a 'no' even if it
+looks important.`, followed by the prompt rules. Its fixed criteria define true
+as `matches a Notify For rule, or is plausibly personal and important` and false
+as `matches the Skip List, or is routine, promotional, automated or suspicious`.
+The wrapper is not configurable. Do not set both `instructions` and
+`instructions_from`; any `instructions_from` value other than `"prompt"` also
+disables triage for that account with a diagnostic.
 
 Each new message is evaluated separately. Deterministic `always_emit` matching
 runs before any request. Otherwise, the poller sends one request containing
@@ -158,6 +172,13 @@ TypeSafe returns an HTTP error, the response is malformed, or the audit record
 cannot be written, the poller fails open: it emits the message as before and
 logs one diagnostic instead of
 dropping mail.
+
+For rollout, start with `shadow: true` and inspect emitted events plus
+`triage-dropped.jsonl` on real mail. Messages at or below the threshold remain
+emitted with `triage.would_drop: true` and receive an audit record containing
+`"shadow": true`; messages above it have `triage.would_drop: false` and no audit
+record. After choosing a safe `drop_below`, remove `shadow` (or set it to
+`false`) to enable dropping.
 
 5. **Bring it live:** arrange an operator-managed reload or restart.
 
