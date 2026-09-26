@@ -24,7 +24,7 @@ import threading
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import InjectedToolArg, ToolException, tool
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -235,14 +235,14 @@ def _read_turn_record(turn_id: str) -> str:
     if synthesis and (not turn_id or not turn_id.strip()):
         raise ToolPolicyRefusal("get_turn refused: turn_id is required")
     if not turn_id or not turn_id.strip():
-        return "get_turn failed: turn_id is required"
+        raise ToolException("get_turn failed: turn_id is required")
     path = _TURN_STATE["turns_log_path"]
     if synthesis and (path is None or not path.is_file()):
         raise ToolPolicyRefusal("get_turn refused: turns log unavailable")
     if path is None:
-        return "get_turn failed: turns log path not configured"
+        raise ToolException("get_turn failed: turns log path not configured")
     if not path.exists():
-        return f"get_turn failed: turns log not found at {path}"
+        raise ToolException(f"get_turn failed: turns log not found at {path}")
     target = turn_id.strip()
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -319,6 +319,10 @@ def get_turn(turn_id: str) -> str:
     ``mimir_get_turn`` going forward (it's namespaced to mimir).
     """
     return _read_turn_record(turn_id)
+
+
+mimir_get_turn.handle_tool_error = True
+get_turn.handle_tool_error = True
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -503,7 +507,7 @@ def shell_exec(
         Formatted block: stdout, stderr, exit code.
     """
     if not command or not command.strip():
-        return "shell_exec failed: command is required"
+        raise ToolException("shell_exec failed: command is required")
     from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
     direct_argv = bound_direct_exec_argv()
     if direct_argv is None:
@@ -544,11 +548,11 @@ def shell_exec(
             )
     except subprocess.TimeoutExpired:
         if is_project_test:
-            return (
+            raise ToolException(
                 "shell_exec refused: project_test_timeout after "
                 f"{_SHELL_STATE['timeout_s']}s"
             )
-        return f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s"
+        raise ToolException(f"shell_exec timed out after {_SHELL_STATE['timeout_s']}s")
     except (FileNotFoundError, NotADirectoryError) as exc:
         # Use launch-time evidence, not a racy filesystem probe. Do not expose
         # paths or raw exception text, or guess when both targets match.
@@ -557,12 +561,16 @@ def shell_exec(
         failed_executable = bool(argv) and filename == argv[0]
         if failed_cwd and not failed_executable:
             reason = "not found" if isinstance(exc, FileNotFoundError) else "not a directory"
-            return f"shell_exec failed: working directory {reason}"
+            raise ToolException(f"shell_exec failed: working directory {reason}") from exc
         if failed_executable and not failed_cwd:
             # ENOENT can also mean a missing script interpreter or loader.
             reason = "file not found" if isinstance(exc, FileNotFoundError) else "not a directory"
-            return f"shell_exec failed: executable could not be started ({reason})"
-        return "shell_exec failed: process could not be started (check working directory and executable)"
+            raise ToolException(
+                f"shell_exec failed: executable could not be started ({reason})"
+            ) from exc
+        raise ToolException(
+            "shell_exec failed: process could not be started (check working directory and executable)"
+        ) from exc
 
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
@@ -587,4 +595,10 @@ def shell_exec(
                     + output[-limit // 2:]
                 )
             parts.append(f"{name}:\n{output}")
-    return "\n\n".join(parts)
+    result = "\n\n".join(parts)
+    if proc.returncode != 0:
+        raise ToolException(result)
+    return result
+
+
+shell_exec.handle_tool_error = True

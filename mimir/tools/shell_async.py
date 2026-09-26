@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Annotated, Any, Callable, Optional
 
 from langchain.tools import ToolRuntime
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import InjectedToolArg, ToolException, tool
 
 from ..models import AuthContext
 from ..shell_jobs import (
@@ -495,14 +495,14 @@ async def bash_job_output(
         stream: ``stdout`` / ``stderr`` / ``both`` (default ``both``).
     """
     if _REGISTRY is None:
-        return "bash_job_output failed: no shell-job registry configured"
+        raise ToolException("bash_job_output failed: no shell-job registry configured")
     if not job_id:
-        return "bash_job_output failed: job_id is required"
+        raise ToolException("bash_job_output failed: job_id is required")
     try:
         resolved_tail = parse_shell_job_tail_lines(tail_lines)
         resolved_stream = normalize_shell_job_stream(stream)
     except ValueError as exc:
-        return f"bash_job_output failed: {exc}"
+        raise ToolException(f"bash_job_output failed: {exc}") from exc
 
     # ``read_output`` does sync file IO (seek-from-end tail). Wrap in
     # ``asyncio.to_thread`` so a multi-MB read doesn't freeze the
@@ -514,7 +514,7 @@ async def bash_job_output(
         tail_lines=resolved_tail, stream=resolved_stream,
     )
     if "error" in result:
-        return result["error"]
+        raise ToolException(result["error"])
     _publish_shell_job_provenance([job_id], auth_context)
     lines = [
         f"Job {result['job_id']} [{result['status']}] "
@@ -533,6 +533,9 @@ async def bash_job_output(
         lines.append("--- stderr tail ---")
         lines.append(stderr)
     return "\n".join(lines)
+
+
+bash_job_output.handle_tool_error = True
 
 
 def _reading_auth_context(runtime: ToolRuntime[AuthContext] | None) -> AuthContext | None:

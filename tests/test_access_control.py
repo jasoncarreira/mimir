@@ -16722,6 +16722,7 @@ async def test_consecutive_shell_exec_after_nonzero_exit(
         result = ToolMessage(
             content=f"exit={exit_code}\nidentical output",
             tool_call_id=request.tool_call["id"],
+            status="error" if exit_code != 0 else "success",
         )
         calls.append(result)
         return result

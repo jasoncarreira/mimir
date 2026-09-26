@@ -42,7 +42,7 @@ from urllib.request import (
 )
 
 import yaml
-from langchain_core.tools import tool
+from langchain_core.tools import ToolException, tool
 from pypdf import PdfReader
 
 from .web_search_destination import web_search_url
@@ -516,25 +516,25 @@ async def web_search(
     """
     normalized_query = query.strip()
     if not normalized_query:
-        return "query is required."
+        raise ToolException("query is required.")
     if limit <= 0:
-        return "limit must be > 0."
+        raise ToolException("limit must be > 0.")
     if limit > 10:
         limit = 10
 
     normalized_topic = topic.strip().lower()
     if normalized_topic not in {"general", "news", "finance"}:
-        return "topic must be one of: general, news, finance."
+        raise ToolException("topic must be one of: general, news, finance.")
 
     normalized_time_range = time_range.strip().lower() if time_range else None
     if normalized_time_range and normalized_time_range not in {"day", "week", "month", "year"}:
-        return "time_range must be one of: day, week, month, year."
+        raise ToolException("time_range must be one of: day, week, month, year.")
     if timeout_seconds <= 0:
-        return "timeout_seconds must be > 0."
+        raise ToolException("timeout_seconds must be > 0.")
 
     api_key = os.environ.get("TAVILY_API_KEY", "").strip()
     if not api_key:
-        return "web_search is disabled (TAVILY_API_KEY not set)."
+        raise ToolException("web_search is disabled (TAVILY_API_KEY not set).")
 
     search_url = web_search_url()
 
@@ -559,11 +559,11 @@ async def web_search(
             timeout_seconds=timeout_seconds,
         )
     except HTTPError as exc:
-        return f"web_search failed: HTTP {exc.code} ({exc.reason})"
+        raise ToolException(f"web_search failed: HTTP {exc.code} ({exc.reason})") from exc
     except URLError as exc:
-        return f"web_search failed: {getattr(exc, 'reason', exc)}"
+        raise ToolException(f"web_search failed: {getattr(exc, 'reason', exc)}") from exc
     except (ValueError, json.JSONDecodeError) as exc:
-        return f"web_search failed: {exc}"
+        raise ToolException(f"web_search failed: {exc}") from exc
 
     raw = response["json"]
     rows = raw.get("results")
@@ -629,21 +629,20 @@ async def fetch_url(
     """
     normalized_url = url.strip()
     if not normalized_url:
-        return "url is required."
+        raise ToolException("url is required.")
     if timeout_seconds <= 0:
-        return "timeout_seconds must be > 0."
+        raise ToolException("timeout_seconds must be > 0.")
     if max_bytes <= 0:
-        return "max_bytes must be > 0."
+        raise ToolException("max_bytes must be > 0.")
     if max_age_seconds < 0:
-        return "max_age_seconds must be >= 0."
+        raise ToolException("max_age_seconds must be >= 0.")
 
-    # SSRF + scheme validation. Returns a friendly error string instead
-    # of letting the SSRFBlocked exception bubble out as a generic
-    # "ValueError: …" — the agent reads this back as a tool result.
+    # SSRF + scheme validation. Surface a bounded tool error instead of letting
+    # SSRFBlocked escape as a generic "ValueError: ..." result.
     try:
         _validate_fetch_url(normalized_url)
     except SSRFBlocked as exc:
-        return f"fetch_url failed: {exc}"
+        raise ToolException(f"fetch_url failed: {exc}") from exc
 
     cache_dir = _fetch_cache_dir()
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -712,27 +711,27 @@ async def fetch_url(
             max_bytes=max_bytes,
         )
     except HTTPError:
-        return "fetch_url failed: HTTP request failed."
+        raise ToolException("fetch_url failed: HTTP request failed.") from None
     except URLError:
-        return "fetch_url failed: URL request failed."
+        raise ToolException("fetch_url failed: URL request failed.") from None
     except ValueError as exc:
         body_path.unlink(missing_ok=True)
-        return f"fetch_url failed: {exc}"
+        raise ToolException(f"fetch_url failed: {exc}") from exc
     except OSError:
         body_path.unlink(missing_ok=True)
-        return "fetch_url failed: could not write downloaded content."
+        raise ToolException("fetch_url failed: could not write downloaded content.") from None
 
     try:
         downloaded_body = body_path.read_bytes()
     except OSError:
         body_path.unlink(missing_ok=True)
-        return "fetch_url failed: could not read downloaded content."
+        raise ToolException("fetch_url failed: could not read downloaded content.") from None
     if hashlib.sha256(downloaded_body).hexdigest() != fetched["sha256"]:
         body_path.unlink(missing_ok=True)
-        return "fetch_url failed: downloaded content changed before verification."
+        raise ToolException("fetch_url failed: downloaded content changed before verification.")
 
     if _home is None:
-        return "fetch_url failed: home dir not configured."
+        raise ToolException("fetch_url failed: home dir not configured.")
 
     body_virtual_path = _virtual_path(body_path, root=_home)
     meta_virtual_path = _virtual_path(meta_path, root=_home)
@@ -758,6 +757,10 @@ async def fetch_url(
     )
     _record_fetched_body(downloaded_body)
     return yaml.safe_dump(meta_payload, sort_keys=False)
+
+
+web_search.handle_tool_error = True
+fetch_url.handle_tool_error = True
 
 
 # ─── Provider gating ───────────────────────────────────────────────
