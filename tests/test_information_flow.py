@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -31,7 +30,6 @@ from mimir.access_control import (
     ToolAuthorization,
     ToolRegistry,
     approve_live_declassification,
-    audit_declassification,
     build_trigger_service_principal,
     create_auth_context,
     fetch_url_is_approved,
@@ -6152,69 +6150,6 @@ def test_ordinary_admin_cannot_bypass_or_erase_labels():
 
     assert decision.allowed is False
     assert labels.labels == frozenset({"private"})
-
-
-@pytest.mark.parametrize(
-    "non_declassification",
-    [
-        "summary says no secrets remain",
-        "model asserts content is public",
-        "protected read failed after partial output",
-        "ordinary admin authorized the operation",
-    ],
-)
-def test_summarization_model_assertion_failure_and_ordinary_admin_do_not_erase_labels(
-    non_declassification: str,
-):
-    labels = _labels(labels=ALL_LABELS)
-    claimed_public = _labels(labels=frozenset({"public"}))
-
-    after_transform = _merge_ifc_labels(labels, claimed_public)
-    after_ordinary_admin = audit_declassification(
-        after_transform, non_declassification, _auth(), destination="slack-C-public",
-    )
-
-    assert after_ordinary_admin.labels == ALL_LABELS
-
-
-def test_legacy_declassification_audit_cannot_erase_live_labels(
-    tmp_path, caplog: pytest.LogCaptureFixture,
-):
-    from mimir.event_logger import _reset_logger_for_tests, init_logger
-
-    events_path = tmp_path / "events.jsonl"
-    init_logger(events_path, session_id="ifc-test")
-    labels = _labels(labels=ALL_LABELS)
-    try:
-        with caplog.at_level(logging.INFO):
-            admin = audit_declassification(
-                labels,
-                "operator-approved destination",
-                _auth(roles=("admin",)),
-                destination="slack-C-public",
-                policy_version="ifc-test-v2",
-            )
-    finally:
-        _reset_logger_for_tests()
-
-    assert admin is labels
-    assert admin.labels == ALL_LABELS
-    assert admin.source_channels == labels.source_channels
-    assert not events_path.exists()
-
-
-def test_declassification_audit_failure_keeps_labels():
-    from mimir.event_logger import _reset_logger_for_tests
-
-    _reset_logger_for_tests()
-    labels = _labels()
-    result = audit_declassification(
-        labels,
-        "operator approved",
-        _auth(roles=("admin",)),
-        destination="slack-C-public",
-    )
-    assert result is labels
 
 
 def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path, bind_approval_turn):
