@@ -27,6 +27,9 @@ from mimir._langchain_claude_code_patches import (
 from mimir.models import AuthContext, InformationFlowLabels
 
 
+_OUTBOUND_CREDENTIAL = "sk-" + "Z" * 24
+
+
 def _auth_context(
     *,
     principal: str = "admin",
@@ -170,6 +173,31 @@ async def test_pre_tool_hook_missing_carrier_fails_closed(monkeypatch):
     output = result["hookSpecificOutput"]
     assert output["permissionDecision"] == "deny"
     assert "missing_auth_context" in output["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pre_tool_hook_refuses_outbound_credential(monkeypatch):
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    url = f"https://example.test/?key={_OUTBOUND_CREDENTIAL}"
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", url)
+    with _authorized_hook_context():
+        result = await _pre_tool_use_hook(
+            {
+                "tool_name": "fetch_url",
+                "tool_input": {"url": url},
+            },
+            "toolu_outbound_credential",
+            None,
+        )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "credential detector" in output["permissionDecisionReason"]
+    assert _OUTBOUND_CREDENTIAL not in repr(events)
 
 
 @pytest.mark.asyncio

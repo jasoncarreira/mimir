@@ -582,6 +582,42 @@ def test_service_read_roots_do_not_consume_protected_names(
         ) is True
 
 
+def test_private_terms_are_protected_from_service_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = home / "private-terms.txt"
+    home.mkdir()
+    target.write_text("operator-only\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    service = get_service_principal("scheduled_tick")
+    assert service is not None
+
+    assert access_control._is_trigger_service_protected_read_path(target) is True
+    assert access_control._trigger_service_read_target_is_allowed(
+        service, "read_file", {"file_path": str(target)},
+    ) is False
+
+
+def test_external_shell_command_requires_payload_args() -> None:
+    declaration = {
+        "exec": "gog",
+        "path": "/bin/echo",
+        "subcommands": [["gmail", "send"]],
+        "options": ["--body"],
+        "external_send": True,
+    }
+    with pytest.raises(ValueError, match="must declare payload_args"):
+        access_control.parse_declared_shell_commands([declaration])
+
+    parsed = access_control.parse_declared_shell_commands([{
+        **declaration,
+        "payload_args": ["--body"],
+    }])
+    assert parsed[0].external_send is True
+    assert parsed[0].payload_args == ("--body",)
+
+
 def test_service_protected_predicates_agree_when_matched_root_is_protected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
