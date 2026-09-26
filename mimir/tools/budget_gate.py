@@ -841,6 +841,8 @@ def _outbound_privacy_refusal(
     *,
     sink_category: SinkCategory | None = None,
     include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
+    findings_override: Sequence[Any] | None = None,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
     descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
@@ -894,12 +896,17 @@ def _outbound_privacy_refusal(
     )
     from ..outbound_privacy import scan_outbound
 
-    findings = scan_outbound(
-        texts,
-        tool=tool_name,
-        sink_category=category.value,
-        emit_event=_emit_event_sync,
-        include_jev=include_jev,
+    findings = (
+        list(findings_override)
+        if findings_override is not None
+        else scan_outbound(
+            texts,
+            tool=tool_name,
+            sink_category=category.value,
+            emit_event=_emit_event_sync,
+            include_jev=include_jev,
+            jev_candidates=jev_candidates,
+        )
     )
     if not findings:
         return None
@@ -955,6 +962,21 @@ def _outbound_privacy_refusal(
         f"Outbound privacy refused{dispatch_target} because the {detector} detector "
         "matched outbound content. Remove the sensitive value and retry."
     )
+
+
+def _scan_outbound_jev(
+    texts: Sequence[str],
+) -> tuple[list[Any], tuple[str, ...]]:
+    """Run only the blocking Jev HTTP classification in a worker thread."""
+    from ..outbound_privacy import scan_jev_outbound
+
+    key = os.environ.get("JEV_KEY", "").strip()
+    return scan_jev_outbound(texts, key=key)
+
+
+def _emit_outbound_jev_events(failure_reasons: Sequence[str]) -> None:
+    for failure_reason in failure_reasons:
+        _emit_event_sync("outbound_pii_check_failed", reason=failure_reason)
 
 
 def _authorized_fetch_urls_for_tool(
@@ -3281,6 +3303,7 @@ def _prepare_tool_call_execution(
     review_denial: str | None,
     *,
     include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
 ) -> _PreparedToolCall | ToolMessage | Command:
     request = call.request
     tool_name = call.tool_name
@@ -3384,7 +3407,11 @@ def _prepare_tool_call_execution(
 
     try:
         privacy_refusal = _outbound_privacy_refusal(
-            tool_name, arguments, auth_context, include_jev=include_jev,
+            tool_name,
+            arguments,
+            auth_context,
+            include_jev=include_jev,
+            jev_candidates=jev_candidates,
         )
     except Exception:
         log.exception("Outbound privacy check failed closed for %s", tool_name)
@@ -3836,20 +3863,34 @@ class BudgetGateMiddleware(AgentMiddleware):
             review.auth_context,
             review.arguments,
         )
+        jev_candidates: list[str] = []
         call = _prepare_tool_call_execution(
-            review, review_denial, include_jev=False,
+            review,
+            review_denial,
+            include_jev=False,
+            jev_candidates=jev_candidates,
         )
         if not isinstance(call, _PreparedToolCall):
             return call
         from ..outbound_privacy import jev_detector_enabled
 
-        if jev_detector_enabled():
+        if jev_candidates and jev_detector_enabled():
             try:
-                privacy_refusal = await asyncio.to_thread(
-                    _outbound_privacy_refusal,
-                    call.tool_name,
-                    call.arguments,
-                    call.auth_context,
+                findings, failure_reasons = await asyncio.to_thread(
+                    _scan_outbound_jev,
+                    jev_candidates,
+                )
+                _emit_outbound_jev_events(failure_reasons)
+                privacy_refusal = (
+                    _outbound_privacy_refusal(
+                        call.tool_name,
+                        call.arguments,
+                        call.auth_context,
+                        include_jev=False,
+                        findings_override=findings,
+                    )
+                    if findings
+                    else None
                 )
             except Exception:
                 log.exception(

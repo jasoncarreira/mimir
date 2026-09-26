@@ -180,7 +180,9 @@ def _jev_pii_score(text: str, key: str) -> tuple[float | None, str | None]:
     payload = {
         "model": JEV_MODEL,
         "state": text[:_JEV_MAX_TEXT_LENGTH],
-        "question": JEV_PII_QUESTION,
+        "questions": {
+            "pii": {"type": "noul", **JEV_PII_QUESTION},
+        },
     }
     request = urllib.request.Request(
         JEV_ENDPOINT,
@@ -203,9 +205,13 @@ def _jev_pii_score(text: str, key: str) -> tuple[float | None, str | None]:
     except Exception:
         return None, "request_failed"
 
-    if not isinstance(answer, dict) or set(answer) != {"type", "noul"}:
+    if not isinstance(answer, dict):
         return None, "malformed_response"
-    score = answer.get("noul")
+    answers = answer.get("answers")
+    pii = answers.get("pii") if isinstance(answers, dict) else None
+    if not isinstance(pii, dict) or set(pii) != {"type", "noul"}:
+        return None, "malformed_response"
+    score = pii.get("noul")
     if (
         isinstance(score, bool)
         or not isinstance(score, (int, float))
@@ -213,9 +219,34 @@ def _jev_pii_score(text: str, key: str) -> tuple[float | None, str | None]:
         or not 0 <= score <= 1
     ):
         return None, "malformed_response"
-    if answer.get("type") != "noul":
+    if pii.get("type") != "noul":
         return None, "malformed_response"
     return float(score), None
+
+
+def scan_jev_outbound(
+    texts: Iterable[str], *, key: str,
+) -> tuple[OutboundScan, tuple[str, ...]]:
+    """Run only Jev network classification and return value-free outcomes."""
+    findings: OutboundScan = []
+    failures: list[str] = []
+    for text in texts:
+        if not isinstance(text, str) or len(text) < _JEV_MIN_TEXT_LENGTH:
+            continue
+        score, failure_reason = _jev_pii_score(text, key)
+        if failure_reason is not None:
+            failures.append(failure_reason)
+            continue
+        if score is not None and score >= JEV_PII_THRESHOLD:
+            state = text[:_JEV_MAX_TEXT_LENGTH]
+            findings.append(OutboundFinding(
+                detector="pii",
+                kind="pii",
+                match_length=len(state),
+                match_sha256=_fingerprint(state),
+                score=score,
+            ))
+    return findings, tuple(failures)
 
 
 def jev_detector_enabled() -> bool:
@@ -232,6 +263,7 @@ def scan_outbound(
     sink_category: str,
     emit_event: Callable[..., Any] | None = None,
     include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
 ) -> OutboundScan:
     """Return privacy findings without retaining or returning matched values."""
     del tool, sink_category  # Reserved for detector-specific policy and diagnostics.
@@ -271,20 +303,15 @@ def scan_outbound(
                     match_length=metadata[0],
                     match_sha256=metadata[1],
                 ))
-        if local_finding or not jev_enabled or len(text) < _JEV_MIN_TEXT_LENGTH:
+        if local_finding:
             continue
-        score, failure_reason = _jev_pii_score(text, jev_key)
-        if failure_reason is not None:
-            if emit_event is not None:
+        if jev_candidates is not None and len(text) >= _JEV_MIN_TEXT_LENGTH:
+            jev_candidates.append(text)
+        if not jev_enabled:
+            continue
+        jev_findings, failure_reasons = scan_jev_outbound((text,), key=jev_key)
+        findings.extend(jev_findings)
+        if emit_event is not None:
+            for failure_reason in failure_reasons:
                 emit_event("outbound_pii_check_failed", reason=failure_reason)
-            continue
-        if score is not None and score >= JEV_PII_THRESHOLD:
-            state = text[:_JEV_MAX_TEXT_LENGTH]
-            findings.append(OutboundFinding(
-                detector="pii",
-                kind="pii",
-                match_length=len(state),
-                match_sha256=_fingerprint(state),
-                score=score,
-            ))
     return findings
