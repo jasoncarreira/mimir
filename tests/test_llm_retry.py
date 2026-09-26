@@ -49,40 +49,40 @@ class TestIsRetryableError:
     @pytest.mark.parametrize(
         ("exc", "expected"),
         [
-            (_HTTPError(429, "Rate limited. Please retry."), (True, "http_status_retryable:_HTTPError")),
+            (_HTTPError(429, "Rate limited. Please retry."), (True, "provider_error_rate_limit:_HTTPError")),
             (
                 _HTTPError(
                     429,
                     "This request would exceed your organization's rate limit of 80000 "
                     "max tokens per minute. Please try again later.",
                 ),
-                (True, "http_status_retryable:_HTTPError"),
+                (True, "provider_error_rate_limit:_HTTPError"),
             ),
             (
                 _HTTPError(429, "rate_limit_error: request queue too long, retry shortly"),
-                (True, "http_status_retryable:_HTTPError"),
+                (True, "provider_error_rate_limit:_HTTPError"),
             ),
-            (_HTTPError(529, "Overloaded"), (True, "http_status_retryable:_HTTPError")),
-            (_HTTPError(500, "internal server error"), (True, "http_status_retryable:_HTTPError")),
+            (_HTTPError(529, "Overloaded"), (True, "provider_error_transient:_HTTPError")),
+            (_HTTPError(500, "internal server error"), (True, "provider_error_transient:_HTTPError")),
             (
                 _HTTPError(400, "bad request: invalid schema"),
-                (False, "non_retryable_client_error:_HTTPError"),
+                (False, "provider_error_client:_HTTPError"),
             ),
             (
                 _HTTPError(400, "prompt is too long: 250000 tokens > 200000 maximum context"),
-                (False, "non_retryable_client_error:_HTTPError"),
+                (False, "provider_error_client:_HTTPError"),
             ),
             (
                 _HTTPError(400, "rate limit exceeded"),
-                (False, "non_retryable_client_error:_HTTPError"),
+                (False, "provider_error_client:_HTTPError"),
             ),
-            (_HTTPError(401), (False, "non_retryable_client_error:_HTTPError")),
-            (_HTTPError(403), (False, "non_retryable_client_error:_HTTPError")),
-            (Exception("context length exceeded"), (False, "non_retryable_client_error:Exception")),
-            (Exception("content policy violation"), (False, "non_retryable_client_error:Exception")),
-            (Exception("rate limit exceeded"), (True, "generic_retryable:Exception")),
-            (Exception("internal server error"), (True, "generic_retryable:Exception")),
-            (Exception("provider rejected the request"), (False, "unknown_non_retryable:Exception")),
+            (_HTTPError(401), (False, "provider_error_client:_HTTPError")),
+            (_HTTPError(403), (False, "provider_error_client:_HTTPError")),
+            (Exception("context length exceeded"), (False, "provider_error_client:Exception")),
+            (Exception("content policy violation"), (False, "provider_error_client:Exception")),
+            (Exception("rate limit exceeded"), (True, "provider_error_rate_limit:Exception")),
+            (Exception("internal server error"), (True, "provider_error_transient:Exception")),
+            (Exception("provider rejected the request"), (False, "provider_error_unknown:Exception")),
         ],
         ids=[
             "429-rate-limit",
@@ -173,7 +173,7 @@ class TestIsRetryableError:
         exc = _NonRetryableError("provider rejected the request")
         is_retryable, reason = _is_retryable_error(exc)
         assert not is_retryable
-        assert reason == "unknown_non_retryable:_NonRetryableError"
+        assert reason == "provider_error_unknown:_NonRetryableError"
 
     def test_numeric_substrings_do_not_imply_status_codes(self) -> None:
         retryable, _ = _is_retryable_error(Exception("prompt has 14000 tokens"))
@@ -192,7 +192,7 @@ class TestIsRetryableError:
         assert _is_empty_structured_output_validation_error(exc)
         is_retryable, reason = _is_retryable_error(exc)
         assert is_retryable
-        assert reason == "empty_structured_output:StructuredOutputValidationError"
+        assert reason == "provider_error_transient:StructuredOutputValidationError"
 
     def test_non_empty_structured_output_validation_error_is_not_retryable(self) -> None:
         exc = StructuredOutputValidationError(
@@ -204,7 +204,7 @@ class TestIsRetryableError:
         assert not _is_empty_structured_output_validation_error(exc)
         is_retryable, reason = _is_retryable_error(exc)
         assert not is_retryable
-        assert reason == "unknown_non_retryable:StructuredOutputValidationError"
+        assert reason == "provider_error_unknown:StructuredOutputValidationError"
 
 
 @pytest.mark.asyncio
