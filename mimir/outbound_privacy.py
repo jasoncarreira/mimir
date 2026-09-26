@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
+import math
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Callable, Iterable
 
+from .env import env_bool
 from .read_policy import text_contains_secret
 
 
@@ -22,6 +27,7 @@ class OutboundFinding:
     kind: str
     match_length: int
     match_sha256: str
+    score: float | None = None
 
 
 OutboundScan = list[OutboundFinding]
@@ -36,6 +42,28 @@ OUTBOX_CONTROL_PATTERNS = (
 
 _PRIVATE_TERMS_FILE = "private-terms.txt"
 _HASH_PREFIX_LENGTH = 12
+JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-1.13.0"
+JEV_TIMEOUT_SECONDS = 3.0
+JEV_PII_THRESHOLD = 0.5
+JEV_PII_QUESTION = {
+    "instructions": (
+        "Does this outbound text reveal personal or private information about a "
+        "specific real person that should not be published or sent to a third party? "
+        "Count: home or mailing addresses, personal phone numbers, personal email "
+        "addresses, government ID numbers, financial account or card numbers, medical "
+        "or health details, private family matters, precise location or travel plans of "
+        "a private individual, or contents of private messages. Do not count: public "
+        "figures' public roles, business contact details published for that purpose, "
+        "generic technical content, or information about no identifiable person."
+    ),
+    "criteria": {
+        "true": "reveals private or personal information about an identifiable person",
+        "false": "contains no private personal information",
+    },
+}
+_JEV_MAX_TEXT_LENGTH = 4000
+_JEV_MIN_TEXT_LENGTH = 20
 _cache_lock = threading.Lock()
 _cached_path: Path | None = None
 _cached_signature: tuple[int, int] | None = None
@@ -148,20 +176,110 @@ def _private_term_matches(text: str, term: str) -> Iterable[str]:
         yield match.group(0)
 
 
+def _jev_pii_score(text: str, key: str) -> tuple[float | None, str | None]:
+    payload = {
+        "model": JEV_MODEL,
+        "state": text[:_JEV_MAX_TEXT_LENGTH],
+        "questions": {
+            "pii": {"type": "noul", **JEV_PII_QUESTION},
+        },
+    }
+    request = urllib.request.Request(
+        JEV_ENDPOINT,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=JEV_TIMEOUT_SECONDS) as response:  # noqa: S310
+            answer = json.loads(response.read().decode("utf-8"))
+    except TimeoutError:
+        return None, "timeout"
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None, "http_error"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "malformed_response"
+    except Exception:
+        return None, "request_failed"
+
+    if not isinstance(answer, dict):
+        return None, "malformed_response"
+    answers = answer.get("answers")
+    pii = answers.get("pii") if isinstance(answers, dict) else None
+    if not isinstance(pii, dict) or set(pii) != {"type", "noul"}:
+        return None, "malformed_response"
+    score = pii.get("noul")
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or not math.isfinite(score)
+        or not 0 <= score <= 1
+    ):
+        return None, "malformed_response"
+    if pii.get("type") != "noul":
+        return None, "malformed_response"
+    return float(score), None
+
+
+def scan_jev_outbound(
+    texts: Iterable[str], *, key: str,
+) -> tuple[OutboundScan, tuple[str, ...]]:
+    """Run only Jev network classification and return value-free outcomes."""
+    findings: OutboundScan = []
+    failures: list[str] = []
+    for text in texts:
+        if not isinstance(text, str) or len(text) < _JEV_MIN_TEXT_LENGTH:
+            continue
+        score, failure_reason = _jev_pii_score(text, key)
+        if failure_reason is not None:
+            failures.append(failure_reason)
+            continue
+        if score is not None and score >= JEV_PII_THRESHOLD:
+            state = text[:_JEV_MAX_TEXT_LENGTH]
+            findings.append(OutboundFinding(
+                detector="pii",
+                kind="pii",
+                match_length=len(state),
+                match_sha256=_fingerprint(state),
+                score=score,
+            ))
+    return findings, tuple(failures)
+
+
+def jev_detector_enabled() -> bool:
+    """Return whether the operator supplied both Jev opt-in settings."""
+    return env_bool("MIMIR_OUTBOUND_PII_JEV", False) and bool(
+        os.environ.get("JEV_KEY", "").strip()
+    )
+
+
 def scan_outbound(
-    texts: Iterable[str], *, tool: str, sink_category: str,
+    texts: Iterable[str],
+    *,
+    tool: str,
+    sink_category: str,
+    emit_event: Callable[..., Any] | None = None,
+    include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
 ) -> OutboundScan:
     """Return privacy findings without retaining or returning matched values."""
     del tool, sink_category  # Reserved for detector-specific policy and diagnostics.
     findings: OutboundScan = []
     terms = _load_private_terms()
+    jev_key = os.environ.get("JEV_KEY", "").strip()
+    jev_enabled = include_jev and jev_detector_enabled()
     for text in texts:
         if not isinstance(text, str) or not text:
             continue
+        local_finding = False
         if text_contains_secret(text):
             from .secret_scan import secret_matches
 
             matches = secret_matches(text) or {text}
+            local_finding = True
             findings.extend(
                 OutboundFinding(
                     detector="credential",
@@ -178,10 +296,22 @@ def scan_outbound(
                 if metadata in seen_private:
                     continue
                 seen_private.add(metadata)
+                local_finding = True
                 findings.append(OutboundFinding(
                     detector="private_term",
                     kind="private_term",
                     match_length=metadata[0],
                     match_sha256=metadata[1],
                 ))
+        if local_finding:
+            continue
+        if jev_candidates is not None and len(text) >= _JEV_MIN_TEXT_LENGTH:
+            jev_candidates.append(text)
+        if not jev_enabled:
+            continue
+        jev_findings, failure_reasons = scan_jev_outbound((text,), key=jev_key)
+        findings.extend(jev_findings)
+        if emit_event is not None:
+            for failure_reason in failure_reasons:
+                emit_event("outbound_pii_check_failed", reason=failure_reason)
     return findings

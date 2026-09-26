@@ -243,6 +243,8 @@ def _claude_code_pre_tool_enforcement(
     *,
     session_id: str | None = None,
     auth_context: Any | None = None,
+    include_jev: bool = True,
+    jev_candidates: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run mimir's pre-execution gates for Claude Code SDK tools.
 
@@ -281,7 +283,11 @@ def _claude_code_pre_tool_enforcement(
 
     try:
         privacy_refusal = _outbound_privacy_refusal(
-            tool_name, tool_input, auth_context,
+            tool_name,
+            tool_input,
+            auth_context,
+            include_jev=include_jev,
+            jev_candidates=jev_candidates,
         )
     except Exception:
         log.exception("Claude Code outbound privacy check failed closed for %s", tool_name)
@@ -367,17 +373,64 @@ async def _pre_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> d
             "name": tool_name,
             "input": tool_input,
         })
-    return _claude_code_pre_tool_enforcement(
+    auth_context = (
+        carrier.resolve()
+        if (carrier := _auth_carrier_var.get()) is not None
+        else None
+    )
+    jev_candidates: list[str] = []
+    result = _claude_code_pre_tool_enforcement(
         tool_name,
         tool_input,
         tool_use_id,
         session_id=session_id,
-        auth_context=(
-            carrier.resolve()
-            if (carrier := _auth_carrier_var.get()) is not None
-            else None
-        ),
+        auth_context=auth_context,
+        include_jev=False,
+        jev_candidates=jev_candidates,
     )
+    if result or not jev_candidates:
+        return result
+
+    from .outbound_privacy import jev_detector_enabled
+    from .tools.budget_gate import (
+        _emit_outbound_jev_events,
+        _outbound_privacy_refusal,
+        _scan_outbound_jev,
+    )
+
+    if not jev_detector_enabled():
+        return result
+    try:
+        findings, failure_reasons = await asyncio.to_thread(
+            _scan_outbound_jev,
+            jev_candidates,
+        )
+        _emit_outbound_jev_events(failure_reasons)
+        privacy_refusal = (
+            _outbound_privacy_refusal(
+                tool_name,
+                tool_input,
+                auth_context,
+                include_jev=False,
+                findings_override=findings,
+            )
+            if findings
+            else None
+        )
+    except Exception:
+        log.exception("Claude Code outbound privacy check failed closed for %s", tool_name)
+        privacy_refusal = (
+            "Outbound privacy refused this tool call because the local content "
+            "check failed. Retry only after the scanner is healthy."
+        )
+    if privacy_refusal is None:
+        return result
+
+    from .tools.budget_gate import _emit_tool_call_sync
+
+    _emit_tool_call_sync(tool_name, ok=False, error=privacy_refusal, denied=True)
+    _record_claude_code_tool_result_denial(tool_name, tool_use_id, privacy_refusal)
+    return _claude_code_permission_denial(privacy_refusal)
 
 
 async def _post_tool_use_hook(input_data: dict, tool_use_id: str, _ctx: Any) -> dict:

@@ -386,8 +386,8 @@ recall, injected prompt context receives the conservative turn-level taint.
 ### Outbound content privacy
 
 Before an authorized external-sink write executes, Mimir also scans the outbound
-content selected by the tool's `sink_payload_extractor`. This synchronous local
-check is independent of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
+content selected by the tool's `sink_payload_extractor`. This check is independent
+of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
 
 - Credential-shaped content uses `read_policy.text_contains_secret`, including
   PEM private keys, and is always refused.
@@ -395,9 +395,18 @@ check is independent of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
   case-insensitively with normalized whitespace. Terms containing at least seven
   digits also match separator-free forms. They emit `shadow_tool_decision` by
   default and are refused when `MIMIR_OUTBOUND_PRIVACY_ENFORCE` is true.
+- When `MIMIR_OUTBOUND_PII_JEV` is true and `JEV_KEY` is set, locally clean text
+  of at least 20 characters is sent to `https://api.typesafe.ai/v1/systemone`
+  for PII classification. Mimir sends only the first 4000 characters and the
+  fixed classification question; TypeSafe therefore sees that outbound text as
+  part of the operator's explicit opt-in. The model is pinned to `jev-1.13.0`,
+  the request has a three-second timeout, and every request or response failure
+  fails open with value-free telemetry. Scores at least 0.5 shadow by default
+  and are refused under `MIMIR_OUTBOUND_PRIVACY_ENFORCE`.
 
-Refusals and events identify only the detector and include match length plus a
-short SHA-256 prefix; they never include the matched value. Context metadata is
+Refusals and events identify only the detector. Local findings include match
+length and a short SHA-256 prefix; Jev findings include the score and SHA-256
+prefix. They never include the matched value. Context metadata is
 passed through `redaction.redact_payload`. The private-term file is protected
 from agent and trusted-service read tools, is re-read when its mtime changes, and
 is optional.
