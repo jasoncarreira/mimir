@@ -5499,7 +5499,7 @@ def retained_read_context(tmp_path, monkeypatch, bind_approval_turn):
         turn = bind_approval_turn(auth)
         calls = []
 
-        def read(tool_name, arguments):
+        def read(tool_name, arguments, *, invoke_tool=False):
             request = ToolCallRequest(
                 tool_call={"name": tool_name, "args": arguments,
                            "id": "retained-read", "type": "tool_call"},
@@ -5515,6 +5515,8 @@ def retained_read_context(tmp_path, monkeypatch, bind_approval_turn):
                     content = asyncio.run(memory.memory_get.coroutine(
                         args.get("atom_ids"), runtime=SimpleNamespace(context=auth),
                     ))
+                elif invoke_tool:
+                    return getattr(extra, tool_name).invoke(request.tool_call)
                 else:
                     content = getattr(extra, tool_name).func(args.get("turn_id"))
                 return ToolMessage(content=content, tool_call_id="retained-read")
@@ -5645,6 +5647,53 @@ def test_synthesis_turn_read_unavailable_refuses_without_taint(
     assert result.status == "error"
     assert f"get_turn refused: {message}" in result.content
     assert "record-body" not in result.content
+    assert context.captures == [None]
+    assert context.auth.ifc_state.current(context.labels) == context.labels
+    context.assert_clean_sinks()
+
+
+@pytest.mark.parametrize(
+    ("arguments", "failure", "message"),
+    [
+        ({"turn_id": ""}, None, "turn_id is required"),
+        ({"turn_id": "prior"}, "unconfigured", "turns log unavailable"),
+    ],
+)
+def test_synthesis_turn_tool_invoke_refusal_is_recorded_without_taint(
+    tmp_path, monkeypatch, retained_read_context, arguments, failure, message,
+):
+    from mimir.tools import budget_gate, extra
+
+    context = retained_read_context()
+    path = tmp_path / "turns.jsonl"
+    path.write_text(
+        json.dumps({
+            "turn_id": "prior", "integrity": "trusted", "output": "record-body",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(
+        extra._TURN_STATE,
+        "turns_log_path",
+        None if failure == "unconfigured" else path,
+    )
+    outcomes = []
+    original_record_outcome = budget_gate._record_tool_outcome
+
+    def record_outcome(tool_name, *, refused_reason="", **kwargs):
+        outcomes.append((tool_name, refused_reason))
+        return original_record_outcome(
+            tool_name, refused_reason=refused_reason, **kwargs,
+        )
+
+    monkeypatch.setattr(budget_gate, "_record_tool_outcome", record_outcome)
+
+    result = context.read("mimir_get_turn", arguments, invoke_tool=True)
+
+    assert len(context.calls) == 1
+    assert result.status == "error"
+    assert f"get_turn refused: {message}" in result.content
+    assert outcomes == [("mimir_get_turn", f"get_turn refused: {message}")]
     assert context.captures == [None]
     assert context.auth.ifc_state.current(context.labels) == context.labels
     context.assert_clean_sinks()

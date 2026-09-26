@@ -2824,7 +2824,7 @@ async def worklink_run(
     """
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
-        return "worklink_run failed: MIMIR_HOME not set"
+        raise ToolException("worklink_run failed: MIMIR_HOME not set")
     home = Path(home_env)
 
     from ..worklink.autonomy import check_concurrency, worklink_priority, worklink_repo
@@ -2834,7 +2834,7 @@ async def worklink_run(
     try:
         repo = Path(worklink_repo())
     except Exception as exc:
-        return f"worklink_run failed: {exc}"
+        raise ToolException(f"worklink_run failed: {exc}") from exc
 
     # 1) Arbiter gate: shed autonomous dispatch under pressure. ``should_fire``
     #    may scan turns.jsonl, so keep it off the event loop. The CLI path never
@@ -2856,7 +2856,7 @@ async def worklink_run(
             log.warning("worklink_run arbiter check failed: %s", exc)
             decision = None
         if decision is not None and not decision.fire:
-            return (
+            raise ToolException(
                 f"worklink_run shed: resource pressure {decision.severity.name} "
                 f"(priority={decision.priority}) — {decision.reason}. "
                 "Try again later, or run `mimir worklink run` to force."
@@ -2866,9 +2866,9 @@ async def worklink_run(
     try:
         cc = check_concurrency(home)
     except Exception as exc:
-        return f"worklink_run failed: concurrency check error: {exc}"
+        raise ToolException(f"worklink_run failed: concurrency check error: {exc}") from exc
     if not cc.allowed:
-        return f"worklink_run skipped: {cc.reason} — try again when a slot frees."
+        raise ToolException(f"worklink_run skipped: {cc.reason} — try again when a slot frees.")
 
     # 3) Dispatch via the deterministic core executor. ``run_worklink`` is
     #    synchronous (and opens its own event loop), so run it off the agent's
@@ -2885,7 +2885,7 @@ async def worklink_run(
             autonomous=True,  # in-turn dispatch is autonomous → policy-gated (#460)
         )
     except Exception as exc:
-        return f"worklink_run failed: {exc}"
+        raise ToolException(f"worklink_run failed: {exc}") from exc
 
     parts = [f"worklink_run #{result.issue_id}: {result.status}"]
     if result.attempt is not None:
@@ -2898,7 +2898,13 @@ async def worklink_run(
         parts.append(f"evidence={result.evidence_path}")
     if result.reason:
         parts.append(f"reason={result.reason}")
-    return " ".join(parts)
+    content = " ".join(parts)
+    if result.status in {"blocked", "failed"}:
+        raise ToolException(content)
+    return content
+
+
+worklink_run.handle_tool_error = True
 
 
 @tool

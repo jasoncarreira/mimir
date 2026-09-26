@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from langchain_core.tools import ToolException
 
 from mimir.shell_jobs import ShellJob, ShellJobRegistry
 from mimir.tools import shell_async
@@ -606,16 +607,17 @@ async def test_shell_job_reads_are_scoped_to_reading_turn_owner(
     own_output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
         job_id="job-private", runtime=runtime,
     )
-    foreign_output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
-        job_id="job-heartbeat", runtime=runtime,
-    )
+    with pytest.raises(ToolException) as exc_info:
+        await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
+            job_id="job-heartbeat", runtime=runtime,
+        )
 
     assert "job-private" in listed
     assert "private-command" in listed
     assert "job-heartbeat" not in listed
     assert "heartbeat-command" not in listed
     assert "private-secret" in own_output
-    assert foreign_output == "unknown job_id: job-heartbeat"
+    assert str(exc_info.value) == "unknown job_id: job-heartbeat"
 
 
 @pytest.mark.asyncio
@@ -642,12 +644,13 @@ async def test_shell_job_reads_without_auth_carrier_serve_nothing(
     listed = await shell_async.bash_jobs_list.coroutine(  # type: ignore[misc]
         scope="all",
     )
-    output = await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
-        job_id="job-private",
-    )
+    with pytest.raises(ToolException) as exc_info:
+        await shell_async.bash_job_output.coroutine(  # type: ignore[misc]
+            job_id="job-private",
+        )
 
     assert listed == "No jobs in scope=all."
-    assert output == "unknown job_id: job-private"
+    assert str(exc_info.value) == "unknown job_id: job-private"
 
 
 # ─── bash_job_output ──────────────────────────────────────────────

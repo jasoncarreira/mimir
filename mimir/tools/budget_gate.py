@@ -150,6 +150,10 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
     "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
     "authentication_required", "failed", "proposal_unavailable",
 })
+_TYPED_ERROR_SIGNAL_TOOLS = frozenset({
+    "bash_job_output", "fetch_url", "get_turn", "mimir_get_turn",
+    "shell_exec", "web_search", "worklink_run",
+})
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
     "pr_rerequest_review", "write_file", "edit_file", "worklink_resume",
@@ -2128,48 +2132,16 @@ def _execute_declassification_action(
 
 
 def _returned_value_is_error(tool_name: str, content: Any) -> bool:
-    """Recognize first-party prose and required typed-result fields, allowing additions."""
+    """Recognize required typed-result fields for tools not yet returning typed errors."""
     text = content if isinstance(content, str) else str(content)
-    result_prefixes = {tool_name}
-    if tool_name == "mimir_get_turn":
-        result_prefixes.add("get_turn")
-    if any(
-        text.startswith(f"{prefix} {outcome}")
-        for prefix in result_prefixes
-        for outcome in ("failed", "refused", "timed out")
-    ):
-        return True
-    if tool_name == "worklink_run" and text.startswith(
-        ("worklink_run shed:", "worklink_run skipped:")
-    ):
-        return True
-    if tool_name == "worklink_run" and re.match(
-        r"worklink_run #\d+: (?:blocked|failed)(?:\s|$)", text,
+    if tool_name not in _TYPED_ERROR_SIGNAL_TOOLS and text.startswith(
+        (f"{tool_name} failed", f"{tool_name} refused", f"{tool_name} timed out")
     ):
         return True
     if tool_name == "worklink_resume" and text.startswith((
         "worklink_resume shed:", "worklink_resume refused:", "worklink_resume failed:",
     )):
         return True
-    if tool_name == "bash_job_output" and text.startswith("unknown job_id:"):
-        return True
-    if tool_name == "web_search" and text.startswith((
-        "query is required.", "limit must be > 0.", "topic must be one of:",
-        "time_range must be one of:", "timeout_seconds must be > 0.",
-        "web_search is disabled ",
-    )):
-        return True
-    if tool_name == "fetch_url" and text.startswith((
-        "url is required.", "timeout_seconds must be > 0.",
-        "max_bytes must be > 0.", "max_age_seconds must be >= 0.",
-    )):
-        return True
-    if tool_name == "shell_exec" and text.startswith("exit="):
-        first_line = text.partition("\n")[0]
-        try:
-            return int(first_line.removeprefix("exit=")) != 0
-        except ValueError:
-            return False
 
     if tool_name == "spawn_open_code":
         try:

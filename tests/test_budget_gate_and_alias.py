@@ -26,7 +26,7 @@ import contextvars
 import json
 import subprocess
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -6256,6 +6256,127 @@ async def test_middleware_records_raised_returned_and_typed_failures(
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_text"),
+    [
+        ("worklink_run", {"issue_id": 1827}, "worklink_run failed: MIMIR_HOME not set"),
+        ("web_search", {"query": ""}, "query is required."),
+        (
+            "fetch_url",
+            {"url": "https://example.invalid", "max_age_seconds": -1},
+            "max_age_seconds must be >= 0.",
+        ),
+        ("bash_job_output", {"job_id": ""}, "bash_job_output failed: no shell-job registry configured"),
+        ("shell_exec", {"command": "exit 7"}, "exit=7"),
+    ],
+)
+async def test_converted_tool_failure_is_accounted_from_typed_status(
+    tool_name: str,
+    arguments: dict[str, Any],
+    expected_text: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.tools import extra, registry, shell_async, web
+
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    monkeypatch.setattr(shell_async, "_REGISTRY", None)
+    monkeypatch.setitem(extra._TURN_STATE, "turns_log_path", None)
+    tools = {
+        "worklink_run": registry.worklink_run,
+        "web_search": web.web_search,
+        "fetch_url": web.fetch_url,
+        "bash_job_output": shell_async.bash_job_output,
+        "shell_exec": extra.shell_exec,
+        "mimir_get_turn": extra.mimir_get_turn,
+    }
+    request = _make_request(tool_name, f"typed-{tool_name}", args=arguments)
+    produced = await tools[tool_name].ainvoke(request.tool_call)
+    assert isinstance(produced, ToolMessage)
+    assert produced.status == "error"
+    assert produced.content == expected_text
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        captured.append((kind, fields))
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        return produced
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    ctx = _make_ctx(budget=5)
+    if tool_name == "fetch_url":
+        from mimir.models import EgressSessionState
+
+        egress_state = EgressSessionState()
+        egress_state.approve_url(arguments["url"])
+        ctx.auth_context = replace(ctx.auth_context, egress_state=egress_state)
+        monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", json.dumps([arguments["url"]]))
+    token = set_current_turn(ctx)
+    try:
+        result = await BudgetGateMiddleware().awrap_tool_call(
+            _make_request(tool_name, f"typed-{tool_name}", args=arguments), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    assert result is produced
+    assert [fields["ok"] for kind, fields in captured if kind == "tool_call"] == [False]
+    assert [fields["tool"] for kind, fields in captured if kind == "tool_error"] == [tool_name]
+
+
+@pytest.mark.asyncio
+async def test_converted_tool_error_accounting_does_not_depend_on_message_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture(kind: str, **fields: Any) -> None:
+        captured.append((kind, fields))
+
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(
+            content="Search input omitted; provide some terms.",
+            tool_call_id=request.tool_call["id"],
+            name="web_search",
+            status="error",
+        )
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    token = set_current_turn(_make_ctx(budget=5))
+    try:
+        await BudgetGateMiddleware().awrap_tool_call(
+            _make_request("web_search", "reworded-error", args={"query": ""}), handler,
+        )
+    finally:
+        reset_current_turn(token)
+
+    await asyncio.sleep(0)
+    tool_call = next(fields for kind, fields in captured if kind == "tool_call")
+    assert tool_call["ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "legacy_text"),
+    [
+        ("worklink_run", "worklink_run shed: overloaded"),
+        ("web_search", "query is required."),
+        ("fetch_url", "url is required."),
+        ("bash_job_output", "unknown job_id: missing"),
+        ("shell_exec", "exit=1"),
+        ("mimir_get_turn", "get_turn failed: unavailable"),
+    ],
+)
+def test_converted_tool_prose_is_not_classified_as_error(
+    tool_name: str, legacy_text: str,
+) -> None:
+    from mimir.tools.budget_gate import _returned_value_is_error
+
+    assert not _returned_value_is_error(tool_name, legacy_text)
+
+
 @pytest.mark.parametrize("tool_name", ["repo_test", "repo_status", "spawn_open_code"])
 @pytest.mark.parametrize("added_fields", [False, True])
 def test_returned_typed_errors_allow_added_producer_fields(tool_name, added_fields):
@@ -6301,11 +6422,16 @@ async def test_fetch_url_max_age_validation_is_returned_error():
     from mimir.tools.budget_gate import _result_is_error
     from mimir.tools.web import fetch_url
 
-    content = await fetch_url.coroutine(url="https://example.invalid", max_age_seconds=-1)
-    assert content == "max_age_seconds must be >= 0."
-    message = ToolMessage(content=content, tool_call_id="invalid-max-age", status="success")
+    message = await fetch_url.ainvoke({
+        "name": "fetch_url",
+        "args": {"url": "https://example.invalid", "max_age_seconds": -1},
+        "id": "invalid-max-age",
+        "type": "tool_call",
+    })
+    assert isinstance(message, ToolMessage)
+    assert message.content == "max_age_seconds must be >= 0."
+    assert message.status == "error"
     assert _result_is_error("fetch_url", message)
-    assert not _result_is_error("memory_query", message)
 
 
 @pytest.mark.asyncio
@@ -6382,12 +6508,7 @@ async def test_shell_exec_timeout_event_contains_redacted_bounded_command(
     mw = BudgetGateMiddleware()
 
     async def handler(req: ToolCallRequest) -> ToolMessage:
-        content = shell_exec.invoke(req.tool_call["args"])
-        return ToolMessage(
-            content=content,
-            tool_call_id=req.tool_call["id"],
-            name=req.tool_call["name"],
-        )
+        return await shell_exec.ainvoke(req.tool_call)
 
     ctx = _make_ctx(budget=5)
     token = set_current_turn(ctx)

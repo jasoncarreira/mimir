@@ -1028,6 +1028,7 @@ def test_set_global_buffer_accepts_none_and_clears_state(tmp_path: Path):
 
 def test_turns_log_path_can_be_cleared(tmp_path: Path):
     from mimir.tools.extra import _TURN_STATE, _read_turn_record, set_turns_log_path
+    from langchain_core.tools import ToolException
 
     path = tmp_path / "turns.jsonl"
     set_turns_log_path(path)
@@ -1036,7 +1037,8 @@ def test_turns_log_path_can_be_cleared(tmp_path: Path):
     set_turns_log_path(None)
 
     assert _TURN_STATE["turns_log_path"] is None
-    assert _read_turn_record("turn-1") == "get_turn failed: turns log path not configured"
+    with pytest.raises(ToolException, match="get_turn failed: turns log path not configured"):
+        _read_turn_record("turn-1")
 
 
 def test_web_home_can_be_cleared(tmp_path: Path):
