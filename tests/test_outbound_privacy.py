@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langgraph.runtime import Runtime
+
+from mimir._langchain_claude_code_patches import _claude_code_pre_tool_enforcement
+from mimir.access_control import (
+    get_service_principal,
+    parse_declared_shell_commands,
+)
+from mimir.models import AuthContext, InformationFlowLabels
+from mimir.outbound_privacy import scan_outbound
+from mimir.read_policy import is_protected_read_path
+from mimir.tools.budget_gate import BudgetGateMiddleware, _outbound_privacy_refusal
+
+
+TOKEN = "sk-" + "A" * 24
+PRIVATE_TERM = "42 Maplewood Drive"
+
+
+def _auth(*, channel_id: str = "discord:channel:1") -> AuthContext:
+    return AuthContext(
+        principal="admin",
+        canonical_principal="admin",
+        roles=("user", "admin"),
+        event_ingress="discord",
+        trigger="user_message",
+        channel_id=channel_id,
+        interactivity=None,
+        enforcement_enabled=False,
+        ifc_labels=InformationFlowLabels(),
+    )
+
+
+def _request(tool: str, arguments: dict[str, Any], auth: AuthContext) -> ToolCallRequest:
+    return ToolCallRequest(
+        tool_call={"name": tool, "args": arguments, "id": "privacy-1", "type": "tool_call"},
+        tool=None,
+        state=None,
+        runtime=Runtime(context=auth),
+    )
+
+
+def _capture_events(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    return events
+
+
+def _run_sync(
+    tool: str,
+    arguments: dict[str, Any],
+    auth: AuthContext,
+    executed: list[bool],
+) -> ToolMessage:
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        executed.append(True)
+        return ToolMessage(
+            content="executed", tool_call_id=request.tool_call["id"], name=tool,
+        )
+
+    return BudgetGateMiddleware().wrap_tool_call(_request(tool, arguments, auth), handler)
+
+
+def test_scan_private_terms_normalizes_whitespace_digits_and_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert scan_outbound([PRIVATE_TERM], tool="web_search", sink_category="network") == []
+
+    terms = tmp_path / "private-terms.txt"
+    terms.write_text(
+        "# operator terms\n(585) 555-0142\n42 Maplewood Drive\n",
+        encoding="utf-8",
+    )
+    findings = scan_outbound(
+        ["Call 5855550142 or visit 42  maplewood   drive"],
+        tool="web_search",
+        sink_category="network",
+    )
+
+    assert [finding.detector for finding in findings] == ["private_term", "private_term"]
+    assert PRIVATE_TERM.casefold() not in repr(findings).casefold()
+
+
+def test_credential_finding_contains_only_match_metadata() -> None:
+    findings = scan_outbound(
+        [f"prefix {TOKEN} suffix"], tool="fetch_url", sink_category="network",
+    )
+    assert len(findings) == 1
+    assert findings[0].detector == "credential"
+    assert findings[0].match_length == len(TOKEN)
+    assert TOKEN not in repr(findings)
+
+
+def test_fetch_url_credential_is_always_refused_without_value_in_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+    url = f"https://example.test/path?credential={TOKEN}"
+
+    result = _run_sync("fetch_url", {"url": url}, _auth(), executed)
+
+    assert result.status == "error"
+    assert "credential detector" in str(result.content)
+    assert TOKEN not in str(result.content)
+    assert executed == []
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["reason"] == "outbound_credential"
+    assert TOKEN not in json.dumps(events)
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_web_search_private_term_shadows_then_enforces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enforced: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1" if enforced else "0")
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync("web_search", {"query": PRIVATE_TERM}, _auth(), executed)
+
+    assert executed == ([] if enforced else [True])
+    assert result.status == ("error" if enforced else "success")
+    expected_event = "hard_boundary_denied" if enforced else "shadow_tool_decision"
+    decision = next(fields for event, fields in events if event == expected_event)
+    assert decision["reason"] == "outbound_private_term"
+    assert PRIVATE_TERM.casefold() not in json.dumps(events).casefold()
+    assert PRIVATE_TERM.casefold() not in str(result.content).casefold()
+
+
+def test_send_message_scans_only_cross_channel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    auth = _auth()
+
+    same = _outbound_privacy_refusal(
+        "send_message", {"channel_id": auth.channel_id, "text": PRIVATE_TERM}, auth,
+    )
+    cross = _outbound_privacy_refusal(
+        "send_message", {"channel_id": "discord:channel:2", "text": PRIVATE_TERM}, auth,
+    )
+
+    assert same is None
+    assert cross is not None
+    assert "private_term detector" in cross
+    assert PRIVATE_TERM.casefold() not in cross.casefold()
+
+
+def test_nested_external_mcp_credential_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _capture_events(monkeypatch)
+    refusal = _outbound_privacy_refusal(
+        "mcp_remote_publish",
+        {"outer": {"items": ["safe", {"body": TOKEN}]}},
+        _auth(),
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+    assert TOKEN not in refusal
+    assert TOKEN not in json.dumps(events)
+
+
+def test_declared_external_shell_payload_is_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared = parse_declared_shell_commands([{
+        "exec": "gog",
+        "path": "/bin/echo",
+        "subcommands": [["gmail", "send"]],
+        "options": ["--body"],
+        "external_send": True,
+        "payload_args": ["--body"],
+    }])
+    base_service = get_service_principal("scheduled_tick")
+    assert base_service is not None
+    service = replace(
+        base_service,
+        declared_shell_commands=declared,
+    )
+    auth = AuthContext(
+        principal=f"service:{service.canonical}",
+        canonical_principal=service.canonical,
+        roles=("service",),
+        event_ingress=None,
+        trigger="scheduled_tick",
+        channel_id="scheduler:test",
+        interactivity=None,
+        is_service=True,
+        service_authority=service,
+        enforcement_enabled=False,
+        ifc_labels=InformationFlowLabels(),
+    )
+    events = _capture_events(monkeypatch)
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec", {"command": f"gog gmail send --body {TOKEN}"}, auth,
+    )
+
+    assert refusal is not None
+    assert TOKEN not in refusal
+    assert TOKEN not in json.dumps(events)
+
+
+def test_claude_code_pre_tool_path_refuses_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _capture_events(monkeypatch)
+    result = _claude_code_pre_tool_enforcement(
+        "fetch_url",
+        {"url": f"https://example.test/?key={TOKEN}"},
+        "toolu_privacy",
+        auth_context=_auth(),
+    )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "credential detector" in output["permissionDecisionReason"]
+    assert TOKEN not in json.dumps(result)
+    assert TOKEN not in json.dumps(events)
+
+
+def test_private_terms_file_is_a_protected_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    path = tmp_path / "private-terms.txt"
+    path.write_text(PRIVATE_TERM, encoding="utf-8")
+    assert is_protected_read_path(path) is True

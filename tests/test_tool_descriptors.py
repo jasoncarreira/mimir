@@ -240,6 +240,24 @@ def test_sink_category_requires_declared_target_extractor() -> None:
     })
 
 
+def test_external_sink_requires_declared_payload_extractor() -> None:
+    with pytest.raises(ValueError, match="payload extractors.*external"):
+        validate_tool_descriptors({
+            "external": ToolDescriptor(
+                sink_category=SinkCategory.NETWORK,
+                sink_target_extractor=None,
+            ),
+        })
+
+    validate_tool_descriptors({
+        "intentionally_payloadless": ToolDescriptor(
+            sink_category=SinkCategory.NETWORK,
+            sink_target_extractor=None,
+            sink_payload_extractor=None,
+        ),
+    })
+
+
 def test_tool_descriptors_are_immutable() -> None:
     with pytest.raises(FrozenInstanceError):
         TOOL_DESCRIPTORS["send_message"].budget_exempt = False

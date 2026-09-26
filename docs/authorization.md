@@ -383,6 +383,32 @@ final boundary and obey the configured enforcement mode. SAGA
 ownership does not currently generate field-level IFC labels; after authorized
 recall, injected prompt context receives the conservative turn-level taint.
 
+### Outbound content privacy
+
+Before an authorized external-sink write executes, Mimir also scans the outbound
+content selected by the tool's `sink_payload_extractor`. This synchronous local
+check is independent of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
+
+- Credential-shaped content uses `read_policy.text_contains_secret`, including
+  PEM private keys, and is always refused.
+- Exact operator terms from `<MIMIR_HOME>/private-terms.txt` are matched
+  case-insensitively with normalized whitespace. Terms containing at least seven
+  digits also match separator-free forms. They emit `shadow_tool_decision` by
+  default and are refused when `MIMIR_OUTBOUND_PRIVACY_ENFORCE` is true.
+
+Refusals and events identify only the detector and include match length plus a
+short SHA-256 prefix; they never include the matched value. Context metadata is
+passed through `redaction.redact_payload`. The private-term file is protected
+from agent and trusted-service read tools, is re-read when its mtime changes, and
+is optional.
+
+External categories (`NETWORK`, `HTTP_WEBHOOK`, `EXTERNAL_MCP`, `NOTIFICATION`,
+`CROSS_CHANNEL`, and `FORGE`) must explicitly declare a
+`sink_payload_extractor`; `None` is an intentional operator-owned or deferred
+opt-out. `send_message` extracts text only when its target differs from the
+triggering channel. External declared shell commands likewise require
+`payload_args`, naming the argv options whose values are scanned.
+
 On a tainted turn, `fetch_url` may also pass the taint gate for an exact HTTPS
 URL copied from external-origin untrusted active-ingest text in that same turn.
 The server extracts and normalizes those URLs only from successful
@@ -923,10 +949,11 @@ profile refused it and no declaration applied.
 4. If it reads a protected domain, add the operation to
    `_OPERATION_READABLE_DOMAIN`. Add or update its `ToolDescriptor` in
    `mimir/tool_descriptors.py` for per-tool authorization and information-flow
-   facts: sink category, target extractor, sink destination,
+   facts: sink category, target extractor, sink payload extractor, sink destination,
    fetch-authorization kind, result origin, git-operation-result flag,
    IFC-delegation flag, and budget-exemption flag. A sink category requires a
-   declared target extractor; use `None` only as an explicit opt-out.
+   declared target extractor. Every external sink also requires a declared
+   `sink_payload_extractor`; use `None` only as an explicit opt-out.
    `validate_tool_descriptors()` enforces this at import.
 5. If it is an egress path, declare the exact `SinkCategory`, concrete target
    extractor, and sink destination in `TOOL_DESCRIPTORS`, then pass the

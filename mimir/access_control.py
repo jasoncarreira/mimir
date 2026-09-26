@@ -1910,6 +1910,8 @@ class DeclaredShellCommand:
     options: tuple[str, ...] = ()
     script: Path | None = None
     pass_env: tuple[str, ...] = ()
+    external_send: bool = False
+    payload_args: tuple[str, ...] = ()
 
 
 class DeclaredShellCommandError(ValueError):
@@ -2035,9 +2037,25 @@ def parse_declared_shell_commands(
         name = entry.get("exec")
         if not isinstance(name, str) or not name or "/" in name or name != Path(name).name:
             raise ValueError(f"shell_commands exec must be a bare command name, got {name!r}")
-        unknown = set(entry) - {"exec", "path", "subcommands", "options", "script", "pass_env"}
+        unknown = set(entry) - {
+            "exec", "path", "subcommands", "options", "script", "pass_env",
+            "external_send", "payload_args",
+        }
         if unknown:
             raise _declaration_error(name, f"unknown keys {sorted(unknown)}")
+
+        external_send = entry.get("external_send", False)
+        payload_args = entry.get("payload_args", [])
+        if not isinstance(external_send, bool):
+            raise _declaration_error(name, "external_send must be a boolean")
+        if not isinstance(payload_args, list) or not all(
+            isinstance(option, str) and option.startswith("-") for option in payload_args
+        ):
+            raise _declaration_error(name, "payload_args must be a list of option names")
+        if external_send and not payload_args:
+            raise _declaration_error(
+                name, "external_send commands must declare payload_args",
+            )
 
         pass_env = entry.get("pass_env", [])
         if not isinstance(pass_env, list) or not all(
@@ -2158,6 +2176,8 @@ def parse_declared_shell_commands(
             options=tuple(options_raw),
             script=script,
             pass_env=tuple(dict.fromkeys(pass_env)),
+            external_send=external_send,
+            payload_args=tuple(dict.fromkeys(payload_args)),
         ))
     return tuple(out)
 
@@ -4913,7 +4933,7 @@ def resolve_trigger_service_write_target(
 
 _TRIGGER_SERVICE_PROTECTED_READ_NAMES = frozenset({
     ".env", ".git", ".mimir", ".venv", "config", "credentials",
-    "identities", "prompts", "secret", "secrets",
+    "identities", "private-terms.txt", "prompts", "secret", "secrets",
 })
 
 

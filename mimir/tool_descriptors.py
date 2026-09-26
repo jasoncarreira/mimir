@@ -50,7 +50,11 @@ class ResultOriginKind(IntFlag):
 SinkTargetExtractor = Callable[
     [str, Mapping[str, Any], Any | None], tuple[str | None, ...]
 ]
+SinkPayloadExtractor = Callable[
+    [str, Mapping[str, Any], Any | None], tuple[str, ...]
+]
 _TARGET_EXTRACTOR_UNDECLARED = object()
+_PAYLOAD_EXTRACTOR_UNDECLARED = object()
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,9 @@ class ToolDescriptor:
     git_operation_result: bool = False
     ifc_delegation: bool = False
     budget_exempt: bool = False
+    sink_payload_extractor: SinkPayloadExtractor | None | object = (
+        _PAYLOAD_EXTRACTOR_UNDECLARED
+    )
 
 
 def _value(value: Any) -> str | None:
@@ -158,6 +165,46 @@ def _url_target(
     return (_value(arguments.get("url")),)
 
 
+def _argument_payload(*names: str) -> SinkPayloadExtractor:
+    def extract(
+        _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+    ) -> tuple[str, ...]:
+        return tuple(value for name in names if isinstance((value := arguments.get(name)), str))
+
+    return extract
+
+
+def _string_leaf_payload(
+    _tool_name: str, arguments: Mapping[str, Any], _auth_context: Any | None,
+) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, Mapping):
+            for child in value.values():
+                collect(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    collect(arguments)
+    return tuple(values)
+
+
+def _cross_channel_message_payload(
+    _tool_name: str, arguments: Mapping[str, Any], auth_context: Any | None,
+) -> tuple[str, ...]:
+    text = arguments.get("text")
+    if not isinstance(text, str):
+        return ()
+    trigger_channel = getattr(auth_context, "channel_id", None)
+    explicit_channel = arguments.get("channel_id")
+    target_channel = explicit_channel or trigger_channel
+    return () if target_channel == trigger_channel else (text,)
+
+
 def _web_search_target(
     _tool_name: str, _arguments: Mapping[str, Any], _auth_context: Any | None,
 ) -> tuple[str | None, ...]:
@@ -244,52 +291,52 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "edit_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
     "execute": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "fetch_channel_history": _D(sink_target_extractor=_channel_target),
-    "fetch_url": _D(SinkCategory.NETWORK, _url_target, "network", FetchAuthorizationKind.FETCH_URL, _N),
-    "hands_edit": _D(SinkCategory.EXTERNAL_MCP, _generic_target, "client_provider"),
+    "fetch_url": _D(SinkCategory.NETWORK, _url_target, "network", FetchAuthorizationKind.FETCH_URL, _N, sink_payload_extractor=_argument_payload("url")),
+    "hands_edit": _D(SinkCategory.EXTERNAL_MCP, _generic_target, "client_provider", sink_payload_extractor=_string_leaf_payload),
     "hands_python": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "hands_request_scope": _D(result_origin=_N),
     "hands_shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "harness_auto_deliver": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
     "harness_resend_nudge": _D(SinkCategory.SAME_CHANNEL, _generic_target, "message"),
-    "http_request": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network"),
-    "issue_comment": _D(SinkCategory.FORGE, _generic_target, "configured_repository_issue"),
+    "http_request": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
+    "issue_comment": _D(SinkCategory.FORGE, _generic_target, "configured_repository_issue", sink_payload_extractor=_argument_payload("body")),
     "memory_store": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
-    "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification"),
+    "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification", sink_payload_extractor=None),
     "open_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
-    "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N),
-    "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message"),
+    "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
+    "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message", sink_payload_extractor=None),
     "pr_checks": _D(result_origin=_E | _R),
-    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
+    "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "pr_comments": _D(result_origin=_E | _R),
     "pr_diff": _D(result_origin=_E | _R),
-    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
+    "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "pr_files": _D(result_origin=_E | _R),
-    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
+    "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "pr_job_log": _D(result_origin=_E | _R),
     "pr_metadata": _D(result_origin=_E | _R),
-    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N),
+    "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "pr_review_requests": _D(result_origin=_E | _R),
     "pr_reviews": _D(result_origin=_E | _R),
-    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
+    "pr_submit_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "react": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True),
     "rebuild_index": _D(SinkCategory.FILE, _index_target, "filesystem", result_origin=_N),
     "reload_pollers": _D(SinkCategory.SCHEDULER, _fixed_target("scheduler:pollers"), "scheduler", result_origin=_N),
     "remove_schedule": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
-    "repo_checkout": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
-    "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N),
-    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
+    "repo_checkout": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
+    "repo_cleanup": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
+    "repo_commit": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
     "repo_diff": _D(result_origin=_R, git_operation_result=True),
-    "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_push": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_rebase": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_rebase_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_revert": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_revert_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True),
-    "repo_stage": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, git_operation_result=True),
+    "repo_fetch": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_merge": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_merge_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_push": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_rebase": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_rebase_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_revert": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_revert_abort": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, git_operation_result=True, sink_payload_extractor=None),
+    "repo_stage": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, git_operation_result=True, sink_payload_extractor=None),
     "repo_status": _D(result_origin=_R, git_operation_result=True),
-    "repo_test": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R),
+    "repo_test": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=None),
     "repo_unmerged": _D(result_origin=_R, git_operation_result=True),
     "request_mimir_update": _D(SinkCategory.FILE, _update_target, "filesystem", result_origin=_N),
     "request_operator_approval": _D(result_origin=_N),
@@ -298,7 +345,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "saga_forget": _D(SinkCategory.SAGA, _generic_target, "saga"),
     "saga_mark_contributions": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
     "saga_record_skill_learning": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
-    "send_message": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True),
+    "send_message": _D(SinkCategory.SAME_CHANNEL, _channel_target, "message", result_origin=_N, budget_exempt=True, sink_payload_extractor=_cross_channel_message_payload),
     "set_poller_overrides": _D(SinkCategory.SCHEDULER, _poller_overrides_target, "scheduler", result_origin=_N),
     "set_schedule_priority": _D(SinkCategory.SCHEDULER, _schedule_target, "scheduler", result_origin=_N),
     "shell": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
@@ -306,16 +353,17 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "spawn_open_code": _D(SinkCategory.SPAWN, _spawn_target, "spawn_process", ifc_delegation=True),
     "submit_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
     "task": _D(result_origin=_N, ifc_delegation=True),
-    "unsupported_operation": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N),
+    "unsupported_operation": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "web_search": _D(
         SinkCategory.NETWORK,
         _web_search_target,
         "network",
         FetchAuthorizationKind.WEB_SEARCH,
         _E | ResultOriginKind.WEB_SEARCH_FORMAT,
+        sink_payload_extractor=_argument_payload("query"),
     ),
     "web_turn_events": _D(SinkCategory.SAME_CHANNEL, _generic_target),
-    "webhook": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network"),
+    "webhook": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
     "worklink_resume": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
     "worklink_run": _D(SinkCategory.SPAWN, _worklink_target, "worklink"),
     "write_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
@@ -330,7 +378,7 @@ def get_tool_descriptor(tool_name: str) -> ToolDescriptor | None:
 def validate_tool_descriptors(
     descriptors: Mapping[str, ToolDescriptor] = TOOL_DESCRIPTORS,
 ) -> None:
-    """Reject categorized sinks whose target extraction was not considered."""
+    """Reject categorized sinks whose target or external payload was not considered."""
     missing = sorted(
         name
         for name, descriptor in descriptors.items()
@@ -340,6 +388,25 @@ def validate_tool_descriptors(
     if missing:
         raise ValueError(
             "sink categories without declared target extractors: " + ", ".join(missing)
+        )
+    external_categories = {
+        SinkCategory.NETWORK,
+        SinkCategory.HTTP_WEBHOOK,
+        SinkCategory.EXTERNAL_MCP,
+        SinkCategory.NOTIFICATION,
+        SinkCategory.CROSS_CHANNEL,
+        SinkCategory.FORGE,
+    }
+    missing_payloads = sorted(
+        name
+        for name, descriptor in descriptors.items()
+        if descriptor.sink_category in external_categories
+        and descriptor.sink_payload_extractor is _PAYLOAD_EXTRACTOR_UNDECLARED
+    )
+    if missing_payloads:
+        raise ValueError(
+            "external sink categories without declared payload extractors: "
+            + ", ".join(missing_payloads)
         )
 
 

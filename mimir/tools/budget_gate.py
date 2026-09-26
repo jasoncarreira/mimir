@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -470,6 +471,110 @@ def _extract_sink_targets(
     if callable(extractor):
         return list(extractor(tool_name, args, auth_context))
     return [_extract_sink_target(request, auth_context)]
+
+
+def _declared_shell_payloads(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+) -> tuple[str, ...]:
+    if tool_name not in {"shell_exec", "bash_async"}:
+        return ()
+    service = get_trusted_service_from_auth_context(auth_context)
+    declared = getattr(service, "declared_shell_commands", ()) if service is not None else ()
+    command = arguments.get("command")
+    if not declared or not isinstance(command, str):
+        return ()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return ()
+
+    from ..access_control import _declared_command_execution_argv
+
+    for declaration in declared:
+        if not declaration.external_send:
+            continue
+        if _declared_command_execution_argv(argv, (declaration,)) is None:
+            continue
+        values: list[str] = []
+        for index, argument in enumerate(argv):
+            for option in declaration.payload_args:
+                if argument == option and index + 1 < len(argv):
+                    values.append(argv[index + 1])
+                elif argument.startswith(option + "="):
+                    values.append(argument[len(option) + 1:])
+        return tuple(values)
+    return ()
+
+
+def _outbound_privacy_refusal(
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    auth_context: AuthContext | None,
+    *,
+    sink_category: SinkCategory | None = None,
+) -> str | None:
+    """Scan an external write and emit value-free shadow or denial evidence."""
+    descriptor = get_tool_descriptor(tool_name)
+    extractor = descriptor.sink_payload_extractor if descriptor is not None else None
+    texts: tuple[str, ...] = ()
+    if callable(extractor):
+        texts = extractor(tool_name, arguments, auth_context)
+    elif tool_name.startswith("mcp_"):
+        from ..tool_descriptors import _string_leaf_payload
+
+        texts = _string_leaf_payload(tool_name, arguments, auth_context)
+    texts = (*texts, *_declared_shell_payloads(tool_name, arguments, auth_context))
+    if not texts:
+        return None
+
+    category = sink_category or (
+        descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
+    )
+    from ..outbound_privacy import scan_outbound
+
+    findings = scan_outbound(texts, tool=tool_name, sink_category=category.value)
+    if not findings:
+        return None
+    metadata = [{
+        "detector": finding.detector,
+        "kind": finding.kind,
+        "match_length": finding.match_length,
+        "match_sha256": finding.match_sha256,
+    } for finding in findings]
+    credential_match = any(finding.detector == "credential" for finding in findings)
+    private_match = any(finding.detector == "private_term" for finding in findings)
+    private_enforced = env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False, logger=log)
+
+    if not credential_match and private_match and not private_enforced:
+        from ..redaction import redact_payload
+
+        _emit_event_sync("shadow_tool_decision", **redact_payload({
+            "operation": tool_name,
+            "tool": tool_name,
+            "reason": "outbound_private_term",
+            "sink_category": category.value,
+            "would_block": True,
+            "enforcement_enabled": False,
+            "findings": metadata,
+        }))
+        return None
+
+    detector = "credential" if credential_match else "private_term"
+    reason = f"outbound_{detector}"
+    _emit_hard_boundary_denied(
+        tool=tool_name,
+        boundary="outbound_privacy",
+        reason=reason,
+        target=None,
+        auth_context=auth_context,
+        event_fields={"sink_category": category.value, "findings": metadata},
+    )
+    return (
+        f"Outbound privacy refused `{tool_name}` because the {detector} detector "
+        "matched outbound content. Remove the sensitive value and retry."
+    )
 
 
 def _authorized_fetch_urls_for_tool(
@@ -2894,6 +2999,12 @@ def _prepare_tool_call_execution(
         if tool_name == "clear_ingest_taint":
             return _execute_clear_ingest_taint_action(request, auth_context)
         return _execute_declassification_action(request, auth_context, arguments)
+
+    privacy_refusal = _outbound_privacy_refusal(
+        tool_name, arguments, auth_context,
+    )
+    if privacy_refusal is not None:
+        return _tool_call_refusal(call, privacy_refusal, arguments=None)
 
     # This is an accident deterrent, not a security boundary; see #259.
     prohibition = _check_prohibited(tool_name, request)
