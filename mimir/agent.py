@@ -76,6 +76,10 @@ from .history import Message, MessageBuffer
 from .harness_egress import harness_sink_allowed
 from .index import IndexGenerator
 from . import _langchain_claude_code_patches as _lcc_patches
+from ._langchain_codex_plus_patches import (
+    reset_codex_plus_stream_buffering,
+    set_codex_plus_stream_buffering,
+)
 from ._deepagents_summarization import install_offload_traceback_logging_patch
 from ._jsonl_tail import tail_jsonl_records
 from ._reasoning_effort import EFFORT_LEVELS as _EFFORT_LEVELS
@@ -1995,7 +1999,9 @@ class Agent:
         ctx_token = None
         cid_token = None
         interactive_token = None
+        codex_stream_buffer_token = None
         try:
+            codex_stream_buffer_token = set_codex_plus_stream_buffering(event.trigger)
             # Capture the asyncio loop once so shell-job waiter threads
             # can schedule their completion handlers back onto it via
             # ``asyncio.run_coroutine_threadsafe``.
@@ -2322,6 +2328,8 @@ class Agent:
                 _reset_interactive(interactive_token)
             if cid_token is not None:
                 _reset_cid(cid_token)
+            if codex_stream_buffer_token is not None:
+                reset_codex_plus_stream_buffering(codex_stream_buffer_token)
 
     async def _post_deliver_failure(
         self, event: AgentEvent, error: str, ctx: Any = None,
