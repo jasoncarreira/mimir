@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,37 @@ from mimir.tools.budget_gate import BudgetGateMiddleware, _outbound_privacy_refu
 
 TOKEN = "sk-" + "A" * 24
 PRIVATE_TERM = "42 Maplewood Drive"
+PII_TEXT = "Please mail the package to Alex at 14 Cedar Lane, Rochester."
+
+
+class _JevResponse:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self) -> _JevResponse:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.body
+
+
+def _enable_jev(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_OUTBOUND_PII_JEV", "1")
+    monkeypatch.setenv("JEV_KEY", "test-jev-key")
+
+
+def _jev_answer(monkeypatch: pytest.MonkeyPatch, answer: Any) -> list[Any]:
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _JevResponse:
+        requests.append((request, timeout, threading.current_thread()))
+        return _JevResponse(json.dumps(answer).encode("utf-8"))
+
+    monkeypatch.setattr(outbound_privacy.urllib.request, "urlopen", urlopen)
+    return requests
 
 
 def _auth(*, channel_id: str = "discord:channel:1") -> AuthContext:
@@ -111,6 +144,194 @@ def _run_sync(
         )
 
     return BudgetGateMiddleware().wrap_tool_call(_request(tool, arguments, auth), handler)
+
+
+async def _run_async(
+    tool: str,
+    arguments: dict[str, Any],
+    auth: AuthContext,
+    executed: list[bool],
+) -> ToolMessage:
+    async def handler(request: ToolCallRequest) -> ToolMessage:
+        executed.append(True)
+        return ToolMessage(
+            content="executed", tool_call_id=request.tool_call["id"], name=tool,
+        )
+
+    return await BudgetGateMiddleware().awrap_tool_call(
+        _request(tool, arguments, auth), handler,
+    )
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_jev_pii_shadows_then_enforces(
+    monkeypatch: pytest.MonkeyPatch, enforced: bool,
+) -> None:
+    _enable_jev(monkeypatch)
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1" if enforced else "0")
+    requests = _jev_answer(monkeypatch, {"type": "noul", "noul": 0.96})
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync("web_search", {"query": PII_TEXT}, _auth(), executed)
+
+    assert len(requests) == 1
+    assert executed == ([] if enforced else [True])
+    assert result.status == ("error" if enforced else "success")
+    expected_event = "hard_boundary_denied" if enforced else "shadow_tool_decision"
+    decision = next(fields for event, fields in events if event == expected_event)
+    assert decision["reason"] == "outbound_pii"
+    assert decision["findings"] == [{
+        "detector": "pii",
+        "kind": "pii",
+        "match_sha256": outbound_privacy._fingerprint(PII_TEXT),
+        "score": 0.96,
+    }]
+    assert PII_TEXT not in json.dumps(events)
+
+
+@pytest.mark.parametrize(("score", "matched"), [(0.49, False), (0.50, True)])
+def test_jev_pii_threshold_is_inclusive(
+    monkeypatch: pytest.MonkeyPatch, score: float, matched: bool,
+) -> None:
+    _enable_jev(monkeypatch)
+    _jev_answer(monkeypatch, {"type": "noul", "noul": score})
+
+    findings = scan_outbound([PII_TEXT], tool="web_search", sink_category="network")
+
+    assert bool(findings) is matched
+
+
+def test_jev_request_contains_only_pinned_classification_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_jev(monkeypatch)
+    requests = _jev_answer(monkeypatch, {"type": "noul", "noul": 0.02})
+    text = "x" * 4100
+
+    scan_outbound([text], tool="secret_tool", sink_category="secret_channel")
+
+    request, timeout, _thread = requests[0]
+    body = json.loads(request.data)
+    assert body == {
+        "model": "jev-1.13.0",
+        "state": text[:4000],
+        "question": outbound_privacy.JEV_PII_QUESTION,
+    }
+    assert timeout <= 3
+    assert set(body) == {"model", "state", "question"}
+
+
+def test_local_findings_prevent_jev_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_jev(monkeypatch)
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+
+    def unexpected_request(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("Jev received text already matched by a local detector")
+
+    monkeypatch.setattr(outbound_privacy.urllib.request, "urlopen", unexpected_request)
+
+    credential_executed: list[bool] = []
+    credential = _run_sync(
+        "web_search", {"query": f"Credential: {TOKEN}"}, _auth(), credential_executed,
+    )
+    private_executed: list[bool] = []
+    private = _run_sync(
+        "web_search", {"query": f"Address: {PRIVATE_TERM}"}, _auth(), private_executed,
+    )
+
+    assert credential.status == "error"
+    assert private.status == "error"
+    assert credential_executed == []
+    assert private_executed == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "error", "reason"),
+    [
+        (None, TimeoutError(), "timeout"),
+        (None, urllib.error.HTTPError("https://test", 500, "", {}, None), "http_error"),
+        (None, urllib.error.HTTPError("https://test", 429, "", {}, None), "http_error"),
+        (b"not-json", None, "malformed_response"),
+        ({"type": "noul"}, None, "malformed_response"),
+    ],
+)
+def test_jev_failures_emit_once_and_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: Any,
+    error: Exception | None,
+    reason: str,
+) -> None:
+    _enable_jev(monkeypatch)
+    events = _capture_events(monkeypatch)
+    requests: list[Any] = []
+
+    def urlopen(request: Any, *, timeout: float) -> _JevResponse:
+        requests.append(request)
+        if error is not None:
+            raise error
+        body = answer if isinstance(answer, bytes) else json.dumps(answer).encode("utf-8")
+        return _JevResponse(body)
+
+    monkeypatch.setattr(outbound_privacy.urllib.request, "urlopen", urlopen)
+    executed: list[bool] = []
+
+    result = _run_sync("web_search", {"query": PII_TEXT}, _auth(), executed)
+
+    assert len(requests) == 1
+    assert result.status == "success"
+    assert executed == [True]
+    failures = [fields for event, fields in events if event == "outbound_pii_check_failed"]
+    assert failures == [{"reason": reason}]
+
+
+@pytest.mark.parametrize(
+    ("flag", "key", "text"),
+    [
+        (None, "test-key", PII_TEXT),
+        ("1", None, PII_TEXT),
+        ("1", "test-key", "under twenty chars"),
+    ],
+)
+def test_jev_is_inert_without_complete_opt_in_or_for_short_text(
+    monkeypatch: pytest.MonkeyPatch,
+    flag: str | None,
+    key: str | None,
+    text: str,
+) -> None:
+    if flag is not None:
+        monkeypatch.setenv("MIMIR_OUTBOUND_PII_JEV", flag)
+    if key is not None:
+        monkeypatch.setenv("JEV_KEY", key)
+
+    def unexpected_request(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("Jev was called without a complete applicable opt-in")
+
+    monkeypatch.setattr(outbound_privacy.urllib.request, "urlopen", unexpected_request)
+
+    assert scan_outbound([text], tool="web_search", sink_category="network") == []
+
+
+@pytest.mark.asyncio
+async def test_async_tool_call_runs_jev_off_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_jev(monkeypatch)
+    requests = _jev_answer(monkeypatch, {"type": "noul", "noul": 0.02})
+    event_loop_thread = threading.current_thread()
+    executed: list[bool] = []
+
+    result = await asyncio.wait_for(
+        _run_async("web_search", {"query": PII_TEXT}, _auth(), executed), timeout=2,
+    )
+
+    assert result.status == "success"
+    assert executed == [True]
+    assert requests[0][2] is not event_loop_thread
 
 
 def test_scan_private_terms_normalizes_whitespace_digits_and_mtime(

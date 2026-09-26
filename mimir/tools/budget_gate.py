@@ -840,6 +840,7 @@ def _outbound_privacy_refusal(
     auth_context: AuthContext | None,
     *,
     sink_category: SinkCategory | None = None,
+    include_jev: bool = True,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
     descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
@@ -893,26 +894,39 @@ def _outbound_privacy_refusal(
     )
     from ..outbound_privacy import scan_outbound
 
-    findings = scan_outbound(texts, tool=tool_name, sink_category=category.value)
+    findings = scan_outbound(
+        texts,
+        tool=tool_name,
+        sink_category=category.value,
+        emit_event=_emit_event_sync,
+        include_jev=include_jev,
+    )
     if not findings:
         return None
     metadata = [{
         "detector": finding.detector,
         "kind": finding.kind,
-        "match_length": finding.match_length,
         "match_sha256": finding.match_sha256,
+        **(
+            {"match_length": finding.match_length}
+            if finding.detector != "pii"
+            else {}
+        ),
+        **({"score": finding.score} if finding.score is not None else {}),
     } for finding in findings]
     credential_match = any(finding.detector == "credential" for finding in findings)
     private_match = any(finding.detector == "private_term" for finding in findings)
+    pii_match = any(finding.detector == "pii" for finding in findings)
     private_enforced = env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False, logger=log)
 
-    if not credential_match and private_match and not private_enforced:
+    if not credential_match and (private_match or pii_match) and not private_enforced:
         from ..redaction import redact_payload
 
+        detector = "private_term" if private_match else "pii"
         _emit_event_sync("shadow_tool_decision", **redact_payload({
             "operation": tool_name,
             "tool": tool_name,
-            "reason": "outbound_private_term",
+            "reason": f"outbound_{detector}",
             "sink_category": category.value,
             "would_block": True,
             "enforcement_enabled": False,
@@ -920,7 +934,9 @@ def _outbound_privacy_refusal(
         }))
         return None
 
-    detector = "credential" if credential_match else "private_term"
+    detector = (
+        "credential" if credential_match else "private_term" if private_match else "pii"
+    )
     reason = f"outbound_{detector}"
     _emit_hard_boundary_denied(
         tool=tool_name,
@@ -3263,6 +3279,8 @@ def _tool_call_refusal(
 def _prepare_tool_call_execution(
     call: _ToolCallReview,
     review_denial: str | None,
+    *,
+    include_jev: bool = True,
 ) -> _PreparedToolCall | ToolMessage | Command:
     request = call.request
     tool_name = call.tool_name
@@ -3366,7 +3384,7 @@ def _prepare_tool_call_execution(
 
     try:
         privacy_refusal = _outbound_privacy_refusal(
-            tool_name, arguments, auth_context,
+            tool_name, arguments, auth_context, include_jev=include_jev,
         )
     except Exception:
         log.exception("Outbound privacy check failed closed for %s", tool_name)
@@ -3818,9 +3836,38 @@ class BudgetGateMiddleware(AgentMiddleware):
             review.auth_context,
             review.arguments,
         )
-        call = _prepare_tool_call_execution(review, review_denial)
+        call = _prepare_tool_call_execution(
+            review, review_denial, include_jev=False,
+        )
         if not isinstance(call, _PreparedToolCall):
             return call
+        from ..outbound_privacy import jev_detector_enabled
+
+        if jev_detector_enabled():
+            try:
+                privacy_refusal = await asyncio.to_thread(
+                    _outbound_privacy_refusal,
+                    call.tool_name,
+                    call.arguments,
+                    call.auth_context,
+                )
+            except Exception:
+                log.exception(
+                    "Outbound privacy check failed closed for %s", call.tool_name,
+                )
+                _emit_hard_boundary_denied(
+                    tool=call.tool_name,
+                    boundary="outbound_privacy",
+                    reason="outbound_privacy_check_failed",
+                    target=None,
+                    auth_context=call.auth_context,
+                )
+                privacy_refusal = (
+                    "Outbound privacy refused this tool call because the local content "
+                    "check failed. Retry only after the scanner is healthy."
+                )
+            if privacy_refusal is not None:
+                return _tool_call_refusal(call, privacy_refusal, arguments=None)
         capture = _ToolExecutionCapture()
         try:
             review_spec = _review_submission_for_call(call)
