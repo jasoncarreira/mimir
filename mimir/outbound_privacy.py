@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
+import stat
 import threading
 import urllib.error
 import urllib.request
@@ -26,7 +29,7 @@ class OutboundFinding:
     detector: str
     kind: str
     match_length: int
-    match_sha256: str
+    match_sha256: str | None
     score: float | None = None
 
 
@@ -41,6 +44,8 @@ OUTBOX_CONTROL_PATTERNS = (
 )
 
 _PRIVATE_TERMS_FILE = "private-terms.txt"
+_FINGERPRINT_KEY_FILE = ".outbound-privacy-key"
+_FINGERPRINT_KEY_BYTES = 32
 _HASH_PREFIX_LENGTH = 12
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-1.13.0"
@@ -121,8 +126,54 @@ def is_outbox_control_path(path: Path | str) -> bool:
     return _matches_registered_path(path, OUTBOX_CONTROL_PATTERNS)
 
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:_HASH_PREFIX_LENGTH]
+def _load_fingerprint_key() -> bytes | None:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    path = Path(home).expanduser() / _FINGERPRINT_KEY_FILE
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
+                0o600,
+            )
+        except FileExistsError:
+            descriptor = None
+        if descriptor is not None:
+            try:
+                os.fchmod(descriptor, 0o600)
+                key = secrets.token_bytes(_FINGERPRINT_KEY_BYTES)
+                written = 0
+                while written < len(key):
+                    count = os.write(descriptor, key[written:])
+                    if count <= 0:
+                        raise OSError("fingerprint key write made no progress")
+                    written += count
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                return None
+            key = os.read(descriptor, _FINGERPRINT_KEY_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return key if len(key) == _FINGERPRINT_KEY_BYTES else None
+
+
+def _fingerprint(value: str) -> str | None:
+    key = _load_fingerprint_key()
+    if key is None:
+        return None
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()[
+        :_HASH_PREFIX_LENGTH
+    ]
 
 
 def _normalize_whitespace(value: str) -> str:
@@ -289,13 +340,13 @@ def scan_outbound(
                 )
                 for matched in matches
             )
-        seen_private: set[tuple[int, str]] = set()
+        seen_private: set[str] = set()
         for term in terms:
             for matched in _private_term_matches(text, term):
-                metadata = (len(matched), _fingerprint(matched))
-                if metadata in seen_private:
+                if matched in seen_private:
                     continue
-                seen_private.add(metadata)
+                seen_private.add(matched)
+                metadata = (len(matched), _fingerprint(matched))
                 local_finding = True
                 findings.append(OutboundFinding(
                     detector="private_term",

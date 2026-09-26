@@ -913,7 +913,10 @@ def _outbound_privacy_refusal(
     metadata = [{
         "detector": finding.detector,
         "kind": finding.kind,
-        "match_sha256": finding.match_sha256,
+        **(
+            {"match_sha256": finding.match_sha256}
+            if finding.match_sha256 is not None else {}
+        ),
         **(
             {"match_length": finding.match_length}
             if finding.detector != "pii"
@@ -3413,14 +3416,20 @@ def _prepare_tool_call_execution(
             include_jev=include_jev,
             jev_candidates=jev_candidates,
         )
-    except Exception:
-        log.exception("Outbound privacy check failed closed for %s", tool_name)
+    except Exception as exc:
+        exception_type = type(exc).__name__
+        log.error(
+            "Outbound privacy internal error for %s: %s",
+            tool_name,
+            exception_type,
+        )
         _emit_hard_boundary_denied(
             tool=tool_name,
             boundary="outbound_privacy",
-            reason="outbound_privacy_check_failed",
+            reason="outbound_privacy_internal_error",
             target=None,
             auth_context=auth_context,
+            event_fields={"exception_type": exception_type},
         )
         privacy_refusal = (
             "Outbound privacy refused this tool call because the local content "
@@ -3892,16 +3901,20 @@ class BudgetGateMiddleware(AgentMiddleware):
                     if findings
                     else None
                 )
-            except Exception:
-                log.exception(
-                    "Outbound privacy check failed closed for %s", call.tool_name,
+            except Exception as exc:
+                exception_type = type(exc).__name__
+                log.error(
+                    "Outbound privacy internal error for %s: %s",
+                    call.tool_name,
+                    exception_type,
                 )
                 _emit_hard_boundary_denied(
                     tool=call.tool_name,
                     boundary="outbound_privacy",
-                    reason="outbound_privacy_check_failed",
+                    reason="outbound_privacy_internal_error",
                     target=None,
                     auth_context=call.auth_context,
+                    event_fields={"exception_type": exception_type},
                 )
                 privacy_refusal = (
                     "Outbound privacy refused this tool call because the local content "

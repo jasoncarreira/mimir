@@ -405,18 +405,27 @@ of turn taint and `MIMIR_ACCESS_CONTROL_ENFORCED`:
   and are refused under `MIMIR_OUTBOUND_PRIVACY_ENFORCE`.
 
 Refusals and events identify only the detector. Local findings include match
-length and a short SHA-256 prefix; Jev findings include the score and SHA-256
-prefix. They never include the matched value. Context metadata is
-passed through `redaction.redact_payload`. The private-term file is protected
-from agent and trusted-service read tools, is re-read when its mtime changes, and
-is optional.
+length and a short HMAC-SHA-256 prefix; Jev findings include the score and the
+same keyed prefix. The per-install 32-byte key is created on first use at
+`<MIMIR_HOME>/.outbound-privacy-key` with mode 0600. If it cannot be created or
+read, findings omit the fingerprint rather than falling back to an unkeyed hash
+or failing the scan. Findings never include the matched value. Context metadata
+is passed through `redaction.redact_payload`. The key and private-term file are
+protected from agent and trusted-service read tools; the term file is re-read
+when its mtime changes and is optional.
 
 External categories (`NETWORK`, `HTTP_WEBHOOK`, `EXTERNAL_MCP`, `NOTIFICATION`,
 `CROSS_CHANNEL`, and `FORGE`) must explicitly declare a
 `sink_payload_extractor`; `None` is an intentional operator-owned or deferred
 opt-out. `send_message` extracts text only when its target differs from the
-triggering channel. External declared shell commands likewise require
-`payload_args`, naming the argv options whose values are scanned.
+triggering channel and from the exactly normalized configured operator alert
+channel. An unset alert channel grants no additional exemption. GitHub text is
+scanned for `issue_comment`, `pr_comment`, `pr_edit_body`,
+`pr_inline_review_comment`, and `pr_submit_review` bodies and `repo_commit`
+messages; operations without model-authored published text, such as `repo_push`
+and `pr_rerequest_review`, remain explicit opt-outs. External declared shell
+commands likewise require `payload_args`, naming the argv options whose values
+are scanned.
 
 On a tainted turn, `fetch_url` may also pass the taint gate for an exact HTTPS
 URL copied from external-origin untrusted active-ingest text in that same turn.

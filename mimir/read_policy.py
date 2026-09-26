@@ -207,6 +207,7 @@ _PROTECTED_BASENAMES = frozenset({
     ".netrc",
     ".pypirc",
     ".npmrc",
+    ".outbound-privacy-key",
     "private-terms.txt",
 })
 _PROTECTED_DIR_NAMES = frozenset({"credentials", "identities"})

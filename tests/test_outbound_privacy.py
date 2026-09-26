@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -23,13 +25,21 @@ from mimir._langchain_claude_code_patches import (
 )
 from mimir.access_control import (
     DeclaredShellCommand,
+    _is_trigger_service_protected_read_path,
     get_service_principal,
     parse_declared_shell_commands,
 )
-from mimir.models import AuthContext, InformationFlowLabels
+from mimir.models import (
+    AuthContext,
+    InformationFlowLabels,
+    RepoPRAction,
+    RepoPRActionScope,
+    RepoReviewState,
+    ServerDiscoveredPRStates,
+)
 from mimir import outbound_privacy
 from mimir.outbound_privacy import scan_outbound
-from mimir.read_policy import is_protected_read_path
+from mimir.read_policy import _has_protected_read_name, is_protected_read_path
 from mimir.tool_descriptors import get_tool_descriptor
 from mimir.tools import budget_gate
 from mimir.tools.budget_gate import BudgetGateMiddleware, _outbound_privacy_refusal
@@ -102,6 +112,28 @@ def _auth(*, channel_id: str = "discord:channel:1") -> AuthContext:
         enforcement_enabled=False,
         ifc_labels=InformationFlowLabels(),
     )
+
+
+def _repo_auth() -> AuthContext:
+    scope = RepoPRActionScope(
+        provenance="server_discovered",
+        canonical_repo="owner/repo",
+        canonical_root="/tmp/repo",
+        canonical_origin="https://github.com/owner/repo.git",
+        principal="mimir-bot",
+        event_type="pull_request",
+        allowed_operations=frozenset(action.value for action in RepoPRAction),
+        pr_number=17,
+        head_repo="owner/repo",
+        head_remote="origin",
+        destination_ref="refs/heads/fix",
+        observed_head_sha="a" * 40,
+        base_ref="main",
+        observed_base_sha="b" * 40,
+    )
+    discovered = ServerDiscoveredPRStates()
+    discovered.remember(RepoReviewState(scope))
+    return replace(_auth(), server_discovered_pr_states=discovered)
 
 
 def _request(tool: str, arguments: dict[str, Any], auth: AuthContext) -> ToolCallRequest:
@@ -210,7 +242,6 @@ def test_jev_pii_shadows_then_enforces(
     assert decision["findings"] == [{
         "detector": "pii",
         "kind": "pii",
-        "match_sha256": outbound_privacy._fingerprint(PII_TEXT),
         "score": 0.96,
     }]
     assert PII_TEXT not in json.dumps(events)
@@ -466,6 +497,63 @@ def test_credential_finding_contains_only_match_metadata() -> None:
     assert TOKEN not in repr(findings)
 
 
+def test_fingerprint_is_install_keyed_hmac_and_key_is_private(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fingerprints: list[str | None] = []
+    keys: list[bytes] = []
+    for name in ("one", "two"):
+        home = tmp_path / name
+        home.mkdir()
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        fingerprints.append(outbound_privacy._fingerprint(PRIVATE_TERM))
+        key_path = home / ".outbound-privacy-key"
+        keys.append(key_path.read_bytes())
+        assert key_path.stat().st_mode & 0o777 == 0o600
+        assert is_protected_read_path(key_path) is True
+        assert _is_trigger_service_protected_read_path(key_path) is True
+
+    assert all(len(key) == 32 for key in keys)
+    assert fingerprints == [
+        hmac.new(key, PRIVATE_TERM.encode(), hashlib.sha256).hexdigest()[:12]
+        for key in keys
+    ]
+    assert fingerprints[0] != fingerprints[1]
+    assert fingerprints[0] != hashlib.sha256(PRIVATE_TERM.encode()).hexdigest()[:12]
+
+
+def test_unreadable_fingerprint_key_omits_hash_without_failing_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    key_path = tmp_path / ".outbound-privacy-key"
+    key_path.write_bytes(b"k" * 32)
+    real_open = outbound_privacy.os.open
+
+    def guarded_open(path: Any, flags: int, mode: int = 0o777) -> int:
+        if Path(path) == key_path:
+            raise PermissionError("key unavailable")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(outbound_privacy.os, "open", guarded_open)
+    events = _capture_events(monkeypatch)
+
+    findings = scan_outbound(
+        [PRIVATE_TERM], tool="web_search", sink_category="network",
+    )
+    assert _outbound_privacy_refusal(
+        "web_search", {"query": PRIVATE_TERM}, _auth(),
+    ) is None
+
+    assert len(findings) == 1
+    assert findings[0].match_sha256 is None
+    plain = hashlib.sha256(PRIVATE_TERM.encode()).hexdigest()[:12]
+    assert plain not in repr(findings)
+    shadow = next(fields for event, fields in events if event == "shadow_tool_decision")
+    assert "match_sha256" not in json.dumps(shadow)
+
+
 def test_fetch_url_credential_is_always_refused_without_value_in_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -527,6 +615,128 @@ def test_send_message_scans_only_cross_channel(
     assert cross is not None
     assert "private_term detector" in cross
     assert PRIVATE_TERM.casefold() not in cross.casefold()
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_send_message_exempts_only_configured_operator_alert_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    if configured:
+        monkeypatch.setenv(
+            "MIMIR_OPERATOR_ALERT_CHANNEL", " discord:channel:operator ",
+        )
+    else:
+        monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    events = _capture_events(monkeypatch)
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "send_message",
+        {"channel_id": "discord:channel:operator", "text": PRIVATE_TERM},
+        _auth(channel_id="scheduler:poller"),
+        executed,
+    )
+
+    assert executed == ([True] if configured else [])
+    assert result.status == ("success" if configured else "error")
+    assert not any(event == "shadow_tool_decision" for event, _fields in events)
+
+
+def test_send_message_operator_alert_exemption_is_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "discord:channel:operator")
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+
+    refusal = _outbound_privacy_refusal(
+        "send_message",
+        {"channel_id": "discord:channel:operator-extra", "text": PRIVATE_TERM},
+        _auth(channel_id="scheduler:poller"),
+    )
+
+    assert refusal is not None
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "argument"),
+    [
+        ("pr_comment", "body"),
+        ("pr_edit_body", "body"),
+        ("pr_inline_review_comment", "body"),
+        ("pr_submit_review", "body"),
+        ("repo_commit", "message"),
+    ],
+)
+def test_github_text_credentials_are_refused_on_both_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    argument: str,
+) -> None:
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setattr(
+        "mimir.tools.forge.revalidate_review_head_for_context",
+        lambda *_args, **_kwargs: None,
+    )
+    events = _capture_events(monkeypatch)
+    arguments = {
+        argument: TOKEN,
+        "repository": "owner/repo",
+        "pull_request": 17,
+    }
+    executed: list[bool] = []
+
+    auth = _repo_auth()
+    middleware_result = _run_sync(tool_name, arguments, auth, executed)
+    claude_result = _claude_code_pre_tool_enforcement(
+        f"mcp__langchain-tools__{tool_name}",
+        arguments,
+        f"toolu_{tool_name}",
+        auth_context=auth,
+    )
+
+    assert middleware_result.status == "error"
+    assert "credential detector" in str(middleware_result.content)
+    assert executed == []
+    assert claude_result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "credential detector" in claude_result["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+    assert TOKEN not in str(middleware_result.content)
+    assert TOKEN not in json.dumps(claude_result)
+    assert TOKEN not in json.dumps(events)
+
+
+def test_non_text_github_tools_remain_unscanned() -> None:
+    for tool_name in ("repo_push", "pr_rerequest_review"):
+        descriptor = get_tool_descriptor(tool_name)
+        assert descriptor is not None
+        assert descriptor.sink_payload_extractor is None
+
+
+def test_github_private_term_shadows_then_enforces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(PRIVATE_TERM + "\n", encoding="utf-8")
+    events = _capture_events(monkeypatch)
+
+    assert _outbound_privacy_refusal(
+        "repo_commit", {"message": PRIVATE_TERM}, _auth(),
+    ) is None
+    assert any(event == "shadow_tool_decision" for event, _fields in events)
+
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    assert _outbound_privacy_refusal(
+        "mcp__langchain-tools__pr_comment", {"body": PRIVATE_TERM}, _auth(),
+    ) is not None
 
 
 @pytest.mark.parametrize(
@@ -1498,15 +1708,17 @@ def test_claude_code_bridged_local_write_is_not_treated_as_external_mcp() -> Non
 @pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
 def test_middleware_privacy_errors_return_value_free_refusal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     failing_component: str,
 ) -> None:
+    distinctive = "distinctive-fake-token"
     events = _capture_events(monkeypatch)
     if failing_component == "extractor":
         descriptor = get_tool_descriptor("fetch_url")
         assert descriptor is not None
 
         def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
-            raise RuntimeError("extractor failed")
+            raise ValueError(distinctive)
 
         failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
         monkeypatch.setattr(
@@ -1517,7 +1729,7 @@ def test_middleware_privacy_errors_return_value_free_refusal(
     else:
         monkeypatch.setattr(
             "mimir.outbound_privacy.scan_outbound",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scanner failed")),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
         )
 
     executed: list[bool] = []
@@ -1533,22 +1745,29 @@ def test_middleware_privacy_errors_return_value_free_refusal(
     assert executed == []
     hard = next(fields for event, fields in events if event == "hard_boundary_denied")
     assert hard["boundary"] == "outbound_privacy"
-    assert hard["reason"] == "outbound_privacy_check_failed"
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
     assert TOKEN not in str(result.content)
     assert TOKEN not in json.dumps(events)
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in str(result.content)
 
 
 @pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
 def test_claude_code_privacy_errors_return_value_free_denial(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     failing_component: str,
 ) -> None:
+    distinctive = "distinctive-fake-token"
+    events = _capture_events(monkeypatch)
     if failing_component == "extractor":
         descriptor = get_tool_descriptor("fetch_url")
         assert descriptor is not None
 
         def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
-            raise RuntimeError("extractor failed")
+            raise ValueError(distinctive)
 
         failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
         monkeypatch.setattr(
@@ -1559,7 +1778,7 @@ def test_claude_code_privacy_errors_return_value_free_denial(
     else:
         monkeypatch.setattr(
             "mimir.outbound_privacy.scan_outbound",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("scanner failed")),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
         )
 
     result = _claude_code_pre_tool_enforcement(
@@ -1573,12 +1792,138 @@ def test_claude_code_privacy_errors_return_value_free_denial(
     assert output["permissionDecision"] == "deny"
     assert "local content check failed" in output["permissionDecisionReason"]
     assert TOKEN not in output["permissionDecisionReason"]
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in json.dumps(result)
 
 
-def test_private_terms_file_is_a_protected_read(
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+async def test_async_middleware_privacy_errors_return_value_free_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failing_component: str,
+) -> None:
+    distinctive = "distinctive-async-middleware-token"
+    events = _capture_events(monkeypatch)
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise ValueError(distinctive)
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+        tool_name = "fetch_url"
+        arguments = {"url": f"https://example.test/?value={TOKEN}"}
+        sensitive_value = TOKEN
+    else:
+        _enable_jev(monkeypatch)
+        monkeypatch.setattr(
+            budget_gate,
+            "_scan_outbound_jev",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
+        )
+        tool_name = "web_search"
+        arguments = {"query": PII_TEXT}
+        sensitive_value = PII_TEXT
+
+    executed: list[bool] = []
+    result = await _run_async(tool_name, arguments, _auth(), executed)
+
+    assert result.status == "error"
+    assert "local content check failed" in str(result.content)
+    assert executed == []
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["boundary"] == "outbound_privacy"
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
+    assert sensitive_value not in str(result.content)
+    assert sensitive_value not in json.dumps(events)
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in str(result.content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_component", ["extractor", "scanner"])
+async def test_async_claude_code_privacy_errors_return_value_free_denial(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failing_component: str,
+) -> None:
+    distinctive = "distinctive-async-claude-token"
+    events = _capture_events(monkeypatch)
+    if failing_component == "extractor":
+        descriptor = get_tool_descriptor("fetch_url")
+        assert descriptor is not None
+
+        def fail_extractor(*_args: Any, **_kwargs: Any) -> tuple[str, ...]:
+            raise ValueError(distinctive)
+
+        failing_descriptor = replace(descriptor, sink_payload_extractor=fail_extractor)
+        monkeypatch.setattr(
+            budget_gate,
+            "get_tool_descriptor",
+            lambda name: failing_descriptor if name == "fetch_url" else get_tool_descriptor(name),
+        )
+        tool_name = "WebFetch"
+        tool_input = {"url": f"https://example.test/?value={TOKEN}"}
+        sensitive_value = TOKEN
+    else:
+        _enable_jev(monkeypatch)
+        monkeypatch.setattr(
+            budget_gate,
+            "_scan_outbound_jev",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError(distinctive)),
+        )
+        tool_name = "WebSearch"
+        tool_input = {"query": PII_TEXT}
+        sensitive_value = PII_TEXT
+
+    carrier = _InvocationAuthCarrier()
+    binding = carrier.bind(_auth())
+    token = _auth_carrier_var.set(carrier)
+    try:
+        result = await _pre_tool_use_hook(
+            {"tool_name": tool_name, "tool_input": tool_input},
+            f"toolu_async_{failing_component}_error",
+            None,
+        )
+    finally:
+        carrier.clear(binding)
+        _auth_carrier_var.reset(token)
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "local content check failed" in output["permissionDecisionReason"]
+    hard = next(fields for event, fields in events if event == "hard_boundary_denied")
+    assert hard["boundary"] == "outbound_privacy"
+    assert hard["reason"] == "outbound_privacy_internal_error"
+    assert hard["exception_type"] == "ValueError"
+    assert sensitive_value not in json.dumps(result)
+    assert sensitive_value not in json.dumps(events)
+    assert distinctive not in caplog.text
+    assert distinctive not in json.dumps(events)
+    assert distinctive not in json.dumps(result)
+
+
+@pytest.mark.parametrize("name", ["private-terms.txt", ".outbound-privacy-key"])
+def test_outbound_privacy_files_are_protected_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    path = tmp_path / "private-terms.txt"
+    path = tmp_path / name
     path.write_text(PRIVATE_TERM, encoding="utf-8")
     assert is_protected_read_path(path) is True
+    assert _has_protected_read_name(path) is True
+    assert _is_trigger_service_protected_read_path(path) is True
