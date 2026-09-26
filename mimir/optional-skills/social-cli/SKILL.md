@@ -37,8 +37,10 @@ the platforms credentials are configured for.
   `send_message` (different surface — see the "`send_message` goes to chat
   channels, NOT to Bluesky / X" section).
 - Registered outbox files are privacy-scanned when written and again immediately
-  before a declared dispatch. Credentials are always refused; configured private
-  terms follow `MIMIR_OUTBOUND_PRIVACY_ENFORCE` shadow/enforcement policy.
+  before a declared service-turn dispatch. Credentials are always refused;
+  configured private terms follow `MIMIR_OUTBOUND_PRIVACY_ENFORCE`
+  shadow/enforcement policy. Direct operator-turn shell dispatch remains outside
+  this service-command guard and is operator-authorized posting.
 - Dispatch validates per-action and continues on per-action failure;
   per-action outcomes land in `dispatch_result.yaml` for review.
 - After successful `dispatch`, the inbox is pruned to pending work only —

@@ -26,7 +26,10 @@ class OutboundFinding:
 
 OutboundScan = list[OutboundFinding]
 
-OUTBOX_PATTERNS = ("state/pollers/social-cli-*/outbox-*.yaml",)
+OUTBOX_PATTERNS = (
+    "state/pollers/social-cli-*/outbox-*.yaml",
+    "state/pollers/social-cli-*/outbox.yaml",
+)
 
 _PRIVATE_TERMS_FILE = "private-terms.txt"
 _HASH_PREFIX_LENGTH = 12
@@ -36,17 +39,11 @@ _cached_signature: tuple[int, int] | None = None
 _cached_terms: tuple[str, ...] = ()
 
 
-def is_outbox_path(path: Path | str) -> bool:
-    """Return whether a resolved path matches a registered home-relative glob."""
-    home_value = os.environ.get("MIMIR_HOME", "").strip()
-    if not home_value:
-        return False
+def _matches_outbox_pattern(path: Path, home: Path) -> bool:
     try:
-        home = Path(home_value).expanduser().resolve(strict=False)
-        relative = Path(path).expanduser().resolve(strict=False).relative_to(home)
-    except (OSError, RuntimeError, ValueError):
+        relative_parts = path.relative_to(home).as_posix().split("/")
+    except ValueError:
         return False
-    relative_parts = relative.as_posix().split("/")
     for pattern in OUTBOX_PATTERNS:
         pattern_path = Path(pattern)
         if pattern_path.is_absolute() or ".." in pattern_path.parts:
@@ -60,6 +57,24 @@ def is_outbox_path(path: Path | str) -> bool:
         ):
             return True
     return False
+
+
+def is_outbox_path(path: Path | str) -> bool:
+    """Return whether either the lexical or resolved path is a registered outbox."""
+    home_value = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_value:
+        return False
+    try:
+        home = Path(home_value).expanduser().resolve(strict=False)
+        requested = Path(path).expanduser()
+        lexical = Path(os.path.abspath(requested))
+        resolved = requested.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(
+        _matches_outbox_pattern(candidate, home)
+        for candidate in dict.fromkeys((lexical, resolved))
+    )
 
 
 def _fingerprint(value: str) -> str:

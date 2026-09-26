@@ -516,7 +516,7 @@ _OUTBOX_DISPATCH_SCRIPTS = {
 def _outbox_write_payloads(
     tool_name: str, arguments: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    if tool_name not in {"write_file", "edit_file"}:
+    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
         return ()
     raw_path = arguments.get("file_path") or arguments.get("path")
     if not isinstance(raw_path, str):
@@ -528,9 +528,42 @@ def _outbox_write_payloads(
 
     if not is_outbox_path(target):
         return ()
-    field = "content" if tool_name == "write_file" else "new_string"
-    value = arguments.get(field)
-    return (value,) if isinstance(value, str) else ()
+    if tool_name == "write_file":
+        value = arguments.get("content")
+        return (value,) if isinstance(value, str) else ()
+    if tool_name == "edit_file":
+        value = arguments.get("new_string")
+        return (value,) if isinstance(value, str) else ()
+    edits = arguments.get("edits")
+    if not isinstance(edits, Sequence) or isinstance(edits, (str, bytes, bytearray)):
+        return ()
+    return tuple(
+        value
+        for edit in edits
+        if isinstance(edit, Mapping)
+        if isinstance((value := edit.get("new_string")), str)
+    )
+
+
+def _literal_outbox_path(path: Path) -> Path:
+    """Return an absolute lexical path without following an outbox symlink."""
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def _bare_dispatch_outboxes(home: Path, poller: str) -> tuple[tuple[str, Path], ...]:
+    """Mirror social-cli's bare-dispatch discovery and shared-file fallback."""
+    state_dir = home / "state" / "pollers" / poller
+    suffixed = sorted(state_dir.glob("outbox-*.yaml"))
+    candidates = suffixed or [state_dir / "outbox.yaml"]
+    return tuple(
+        (
+            path.name.removeprefix("outbox-").removesuffix(".yaml")
+            if path.name.startswith("outbox-")
+            else "shared",
+            _literal_outbox_path(path),
+        )
+        for path in candidates
+    )
 
 
 def _string_leaves(value: Any) -> tuple[str, ...]:
@@ -573,7 +606,7 @@ def _declared_dispatch_outboxes(
         pattern = _OUTBOX_DISPATCH_SCRIPTS.get(script.name if script is not None else "")
         if pattern is None or _declared_command_execution_argv(argv, (declaration,)) is None:
             continue
-        if len(argv) < 6 or argv[3] != "dispatch":
+        if len(argv) < 4 or argv[3] != "dispatch":
             continue
         poller = argv[2]
         if re.fullmatch(r"social-cli-[A-Za-z0-9_-]+", poller) is None:
@@ -599,13 +632,16 @@ def _declared_dispatch_outboxes(
                 valid = False
                 break
             platforms.append(platform)
-        if not valid or not platforms:
+        if not valid:
             continue
+        home = Path(home_value)
+        if not platforms:
+            return _bare_dispatch_outboxes(home, poller)
         outboxes = []
         for platform in dict.fromkeys(platforms):
-            path = Path(home_value) / pattern.format(poller=poller, platform=platform)
+            path = home / pattern.format(poller=poller, platform=platform)
             if is_outbox_path(path):
-                outboxes.append((platform, path.resolve(strict=False)))
+                outboxes.append((platform, _literal_outbox_path(path)))
         return tuple(outboxes)
     return ()
 
@@ -635,6 +671,9 @@ _CLAUDE_CODE_MIMIR_TOOL_PREFIX = "mcp__langchain-tools__"
 _CLAUDE_CODE_NATIVE_PRIVACY_TOOLS = {
     "WebFetch": "fetch_url",
     "WebSearch": "web_search",
+    "Write": "write_file",
+    "Edit": "edit_file",
+    "MultiEdit": "multi_edit",
 }
 
 

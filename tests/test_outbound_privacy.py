@@ -380,6 +380,74 @@ def test_edit_file_new_string_is_scanned_for_outbox_credentials(
     assert executed == []
 
 
+def test_shared_outbox_write_is_scanned_for_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "write_file",
+        {
+            "file_path": "state/pollers/social-cli-feed/outbox.yaml",
+            "content": TOKEN,
+        },
+        _auth(),
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_input"),
+    [
+        (
+            "Write",
+            {
+                "file_path": "state/pollers/social-cli-feed/outbox-bsky.yaml",
+                "content": TOKEN,
+            },
+        ),
+        (
+            "Edit",
+            {
+                "file_path": "state/pollers/social-cli-feed/outbox-bsky.yaml",
+                "old_string": "safe",
+                "new_string": TOKEN,
+            },
+        ),
+        (
+            "MultiEdit",
+            {
+                "file_path": "state/pollers/social-cli-feed/outbox-bsky.yaml",
+                "edits": [{"old_string": "safe", "new_string": TOKEN}],
+            },
+        ),
+    ],
+)
+def test_claude_code_native_outbox_writes_are_scanned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    tool_input: dict[str, Any],
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+
+    result = _claude_code_pre_tool_enforcement(
+        tool_name,
+        tool_input,
+        "toolu_outbox_write",
+        auth_context=_auth(),
+    )
+
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "credential detector" in output["permissionDecisionReason"]
+    assert TOKEN not in json.dumps(result)
+
+
 @pytest.mark.parametrize("credential", [False, True])
 def test_declared_social_dispatch_scans_seeded_outbox_before_execution(
     tmp_path: Path,
@@ -416,6 +484,121 @@ def test_declared_social_dispatch_scans_seeded_outbox_before_execution(
         assert "credential detector" in str(result.content)
         assert TOKEN not in str(result.content)
         assert TOKEN not in json.dumps(events)
+
+
+@pytest.mark.parametrize(
+    "outbox_name",
+    ["outbox-bsky.yaml", "outbox.yaml"],
+)
+def test_bare_social_dispatch_scans_discovered_and_shared_outboxes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outbox_name: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    outbox = tmp_path / "state/pollers/social-cli-notifications" / outbox_name
+    outbox.parent.mkdir(parents=True)
+    outbox.write_text(
+        f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
+    )
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch"},
+        auth,
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
+    assert "credential detector" in str(result.content)
+    assert TOKEN not in str(result.content)
+
+
+def test_bare_social_dispatch_dry_run_is_also_scanned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    outbox = tmp_path / "state/pollers/social-cli-notifications/outbox-bsky.yaml"
+    outbox.parent.mkdir(parents=True)
+    outbox.write_text(
+        f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
+    )
+
+    refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {"command": f"bash {script} social-cli-notifications dispatch --dry-run"},
+        auth,
+    )
+
+    assert refusal is not None
+    assert "credential detector" in refusal
+    assert TOKEN not in refusal
+
+
+def test_outbox_symlink_to_non_outbox_is_scanned_on_write_and_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth, script = _social_service_auth(tmp_path)
+    state_dir = tmp_path / "state/pollers/social-cli-notifications"
+    target = tmp_path / "state/notes/draft.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        f"dispatch:\n  - post:\n      text: {TOKEN}\n", encoding="utf-8",
+    )
+    state_dir.mkdir(parents=True)
+    outbox = state_dir / "outbox-bsky.yaml"
+    outbox.symlink_to(target)
+
+    executed: list[bool] = []
+    write_result = _run_sync(
+        "write_file",
+        {"file_path": str(outbox), "content": TOKEN},
+        _auth(),
+        executed,
+    )
+    dispatch_refusal = _outbound_privacy_refusal(
+        "shell_exec",
+        {
+            "command": (
+                f"bash {script} social-cli-notifications dispatch --platform bsky"
+            ),
+        },
+        auth,
+    )
+
+    assert write_result.status == "error"
+    assert executed == []
+    assert dispatch_refusal is not None
+    assert "credential detector" in dispatch_refusal
+    assert TOKEN not in dispatch_refusal
+
+
+def test_non_outbox_symlink_to_outbox_is_scanned_on_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    outbox = tmp_path / "state/pollers/social-cli-feed/outbox-bsky.yaml"
+    outbox.parent.mkdir(parents=True)
+    outbox.write_text("safe", encoding="utf-8")
+    alias = tmp_path / "state/notes/draft.yaml"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(outbox)
+    executed: list[bool] = []
+
+    result = _run_sync(
+        "write_file",
+        {"file_path": str(alias), "content": TOKEN},
+        _auth(),
+        executed,
+    )
+
+    assert result.status == "error"
+    assert executed == []
 
 
 def test_social_dispatch_detection_does_not_search_command_substrings(
