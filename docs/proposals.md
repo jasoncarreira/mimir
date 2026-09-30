@@ -1,5 +1,7 @@
 # Proposal PRs
 
+For an end-to-end example, see [Writing a proposal poller (the arxiv pattern)](proposal-pollers.md).
+
 Proposals edit an isolated Git worktree of the home repository, secret-scan the
 changes, commit with credential-redacted metadata, push, and open one PR. **Merge
 is approval.** Nothing in the live wiki changes until the PR is merged and the
@@ -41,7 +43,7 @@ live `wiki:<slug>` roots. No new manifest key is required.
 
 ## Draft Then Propose
 
-1. Write draft notes under your own state directory.
+1. Write draft notes under `state/pollers/<name>/` (your `STATE_DIR`).
 2. Call `open_proposal(source="https://arxiv.org/abs/<paper-id>")`.
 3. Edit `state/wiki/` inside the returned worktree, never the live wiki.
 4. Call `submit_proposal(title, rationale)` to request review, or
@@ -71,7 +73,7 @@ The `arxiv-agent-memory` script, manifest, and SKILL belong to the mimirbot home
 repository, not this checkout. The operator must add the three capabilities there
 and change its prompt/SKILL to:
 
-> Write notes under your state dir, then open_proposal to publish wiki changes;
+> Interpolate `STATE_DIR` into the prompt, then open_proposal to publish wiki changes;
 > never write to state/wiki directly. Supply the paper ID or URL as source, edit
 > only state/wiki inside the returned worktree, and submit for operator review.
 

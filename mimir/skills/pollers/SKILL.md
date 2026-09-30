@@ -113,7 +113,8 @@ async work; guarantee a successful emit (poller bugs surface as `poller_stderr` 
 ### Research Notes and Wiki Proposals
 
 Poller turns are tainted from their trigger and cannot use durable-memory tools.
-Write notes under your own persist directory (`state/pollers/<name>/`), then
+Write drafts and notes under your own persist directory (`state/pollers/<name>/`)
+— the poller's `STATE_DIR` — then
 `open_proposal(source="<paper ID or URL>")` to publish wiki changes; never write
 to `state/wiki` directly. Edit only `state/wiki/` inside the returned worktree,
 then call `submit_proposal(title, rationale)`, or `abandon_proposal()` to discard
@@ -125,8 +126,9 @@ The operator must declare `open_proposal`, `submit_proposal`, and
 `scoped-with-provenance` or higher and `scoped_roots: ["state"]`. Keep the file
 read/write capabilities needed to draft and edit. Proposal-enabled research
 pollers cannot declare live `wiki:<slug>` roots or write to unrelated scratch
-directories. See [proposal operations](../../../docs/proposals.md) for the
-manifest example and operator rollout.
+directories. See [writing a proposal poller](../../../docs/proposal-pollers.md)
+for the arxiv pattern and [proposal operations](../../../docs/proposals.md)
+for lane details.
 
 ### 1. Write the poller script
 

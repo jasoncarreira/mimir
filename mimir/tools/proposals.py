@@ -175,8 +175,9 @@ async def open_proposal(
     can be open per lane (``abandon_proposal`` discards one). Supported lanes are
     ``agent`` (default) and ``upgrade`` (for version-triggered default syncs).
 
-    Research pollers first write drafts in their own state directory, then use
-    this tool for a wiki-only proposal. Never edit live state/wiki. Their lane
+    Research pollers first write drafts in ``state/pollers/<name>/`` (their
+    persist directory), then edit ``state/wiki/`` in the proposal worktree
+    returned by this tool. Never edit live state/wiki. Their lane
     is automatically poller, including when lane is omitted. Supply the paper
     ID or URL as source; it is untrusted attribution, not verified provenance.
 
@@ -199,9 +200,14 @@ async def open_proposal(
         result = await asyncio.to_thread(_run_poller, context, home, "open_proposal", source=source)
         if result.ok or result.reason == "exists":
             rel = result.worktree.relative_to(home.resolve())
+            from ..access_control import get_trusted_service_from_auth_context
+
+            service = get_trusted_service_from_auth_context(context)
+            draft_root = f"state/pollers/{service.canonical.removeprefix('poller:')}/"
             return (
                 f"{'Opened' if result.ok else 'Already open'} `poller` wiki proposal `{result.branch}`.\n"
-                f"Edit only `{rel}/state/wiki/`, never the live wiki. "
+                f"Keep drafts under `{draft_root}`. Edit only `{rel}/state/wiki/` "
+                "in this proposal worktree, never the live wiki. "
                 "Call submit_proposal(title, rationale) for operator review and merge."
             )
     else:

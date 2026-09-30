@@ -6345,6 +6345,39 @@ def test_research_proposal_exact_write_grants(
         reset_current_turn(token)
 
 
+def test_research_proposal_write_refusal_names_actual_roots(
+    research_proposal_auth, tmp_path: Path,
+) -> None:
+    auth, persist, worktree = research_proposal_auth
+    registry = ToolRegistry()
+    denied = registry.authorize_tool(
+        "write_file", auth, enforce=True,
+        target_channel=str(tmp_path / "state/research/x.md"),
+    )
+    assert not denied.allowed
+    assert denied.reason == "service_sink_destination_denied"
+    assert "state/pollers/research/" in denied.refusal_detail
+    assert f"{worktree.relative_to(tmp_path)}/" in denied.refusal_detail
+    assert "state/wiki/" in denied.refusal_detail
+    assert str(tmp_path) not in denied.refusal_detail
+
+    admitted = registry.authorize_tool(
+        "write_file", auth, enforce=True,
+        target_channel=str(persist / "drafts/x.md"),
+    )
+    assert admitted.allowed
+    assert admitted.refusal_detail is None
+
+    auth.poller_proposal_state.active = False
+    denied_without_proposal = registry.authorize_tool(
+        "write_file", auth, enforce=True,
+        target_channel=str(tmp_path / "state/research/x.md"),
+    )
+    assert not denied_without_proposal.allowed
+    assert "state/pollers/research/" in denied_without_proposal.refusal_detail
+    assert "scratch/proposals/" not in denied_without_proposal.refusal_detail
+
+
 @pytest.mark.parametrize("invalid", ["missing", "inactive", "owner", "path", "ingress", "context_only"])
 def test_research_proposal_requires_trusted_active_runtime_state(
     research_proposal_auth, invalid: str, tmp_path: Path,
