@@ -257,6 +257,20 @@ def test_poller_skill_tools_match_authority(
         )
 
 
+def test_poller_skill_examples_exclude_durable_memory_tools() -> None:
+    text = (SKILLS_ROOT / "pollers" / "SKILL.md").read_text(encoding="utf-8")
+    examples = [
+        json.loads(value)
+        for value in re.findall(r'"capabilities"\s*:\s*(\[[^\]]*\])', text)
+    ]
+    assert len(examples) == 2
+    for capabilities in examples:
+        assert not {"memory_store", "saga_feedback"} & set(capabilities)
+        assert {"write_file", "open_proposal", "submit_proposal", "abandon_proposal"} <= set(capabilities)
+    assert "Poller turns are tainted from their trigger and cannot use durable-memory tools" in text
+    assert "own persist directory (`state/pollers/<name>/`)" in text
+
+
 @pytest.mark.parametrize("text", [
     "Run reload_pollers now.",
     "Run `reload_pollers` now.",

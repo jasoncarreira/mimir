@@ -770,6 +770,188 @@ def test_shadow_notify_is_emitted_without_audit(
     assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
 
 
+NOTIFY_LINE = (
+    "Jev triage: NOTIFY — send the operator alert for this email; do not skip it."
+)
+
+
+@pytest.mark.parametrize(
+    "notify_at,noul,dropped",
+    [(0.5, 0.49, True), (0.5, 0.50, False),
+     (0.3, 0.29, True), (0.3, 0.30, False)],
+)
+def test_decide_threshold_and_audit(
+    fresh_poller, tmp_path, monkeypatch, capsys, notify_at, noul, dropped,
+):
+    _configure(
+        tmp_path,
+        triage=_triage_config(mode="decide", notify_at=notify_at, drop_below=0.0),
+    )
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    requests = []
+
+    def fake_urlopen(req, **_kwargs):
+        requests.append(json.loads(req.data))
+        return _FakeResponse(_response(noul))
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+
+    assert requests == [{
+        "model": "jev-1.13.0",
+        "state": (
+            "From: Deals <deals@shop-example.com>\n"
+            "Subject: 48-hour flash sale\nSnippet: Don't miss out."
+        ),
+        "questions": _questions(),
+    }]
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+    if dropped:
+        assert events == []
+        records = [json.loads(line) for line in fresh_poller.TRIAGE_DROPPED_FILE.read_text().splitlines()]
+        assert records == [{
+            "message_id": "m1",
+            "url": "https://mail.google.com/mail/u/0/#inbox/thread-1",
+            "from": "Deals <deals@shop-example.com>",
+            "subject": "48-hour flash sale",
+            "answers": {"notify": {"type": "noul", "noul": noul}},
+            "model": "jev-1.13.0",
+            "mode": "decide",
+        }]
+        assert "dropped=1" in stderr
+    else:
+        assert len(events) == 1
+        assert events[0]["triage"] == {
+            "model": "jev-1.13.0",
+            "answers": {"notify": {"type": "noul", "noul": noul}},
+        }
+        assert "Jev triage answers:" in events[0]["prompt"]
+        assert events[0]["prompt"].endswith("\n" + NOTIFY_LINE)
+        assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
+        assert "dropped=0" in stderr
+
+
+def test_decide_defaults_notify_at_and_ignores_drop_below(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(mode="decide", drop_below="ignored"))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    monkeypatch.setattr(
+        fresh_poller.request, "urlopen", lambda *_a, **_k: _FakeResponse(_response(0.49))
+    )
+    events, _ = _run(fresh_poller, monkeypatch, capsys)
+    assert events == []
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+
+
+def test_decide_always_emit_bypasses_jev_and_notify_line(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(mode="decide", always_emit=["example.com"]))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    requests = []
+
+    def fake_urlopen(*_args, **_kwargs):
+        requests.append(True)
+        return _FakeResponse(_response(0.9))
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fake_urlopen)
+    events, _ = _run(
+        fresh_poller, monkeypatch, capsys,
+        message=_message(**{"from": "Family <family@example.com>"}),
+    )
+    assert requests == []
+    assert len(events) == 1 and "triage" not in events[0]
+    assert NOTIFY_LINE not in events[0]["prompt"]
+
+
+@pytest.mark.parametrize("noul,would_drop", [(0.1, True), (0.5, False)])
+def test_decide_shadow_emits_without_notify_line(
+    fresh_poller, tmp_path, monkeypatch, capsys, noul, would_drop,
+):
+    _configure(tmp_path, triage=_triage_config(mode="decide", shadow=True))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    monkeypatch.setattr(
+        fresh_poller.request, "urlopen", lambda *_a, **_k: _FakeResponse(_response(noul))
+    )
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+    assert len(events) == 1
+    assert events[0]["triage"]["would_drop"] is would_drop
+    assert NOTIFY_LINE not in events[0]["prompt"]
+    assert json.loads(fresh_poller.CURSOR_FILE.read_text()) == ["m1"]
+    assert "dropped=0" in stderr
+    if would_drop:
+        records = [json.loads(line) for line in fresh_poller.TRIAGE_DROPPED_FILE.read_text().splitlines()]
+        assert len(records) == 1
+        assert records[0]["shadow"] is True
+        assert records[0]["mode"] == "decide"
+        assert records[0]["answers"]["notify"]["noul"] == noul
+    else:
+        assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
+
+
+def test_decide_http_error_fails_open_without_notify_line(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(mode="decide"))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+
+    def fail(req, **_kwargs):
+        raise HTTPError(req.full_url, 500, "failure", {}, io.BytesIO())
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", fail)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+    assert len(events) == 1 and "triage" not in events[0]
+    assert NOTIFY_LINE not in events[0]["prompt"]
+    assert stderr.count("triage failed") == 1
+    assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
+
+
+def test_decide_audit_error_emits_instead_of_dropping(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    _configure(tmp_path, triage=_triage_config(mode="decide"))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+    monkeypatch.setattr(
+        fresh_poller.request, "urlopen", lambda *_a, **_k: _FakeResponse(_response(0.1))
+    )
+    audit_directory = tmp_path / "cannot-append-as-jsonl"
+    audit_directory.mkdir()
+    monkeypatch.setattr(fresh_poller, "TRIAGE_DROPPED_FILE", audit_directory)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+    assert len(events) == 1
+    assert events[0]["triage"]["answers"]["notify"]["noul"] == 0.1
+    assert NOTIFY_LINE not in events[0]["prompt"]
+    assert stderr.count("triage audit failed") == 1
+    assert "dropped=0" in stderr
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"mode": "bogus"}, {"mode": 1}, {"mode": None},
+     {"mode": "decide", "notify_at": 1.5},
+     {"mode": "decide", "notify_at": "high"},
+     {"mode": "decide", "notify_at": True}],
+    ids=["unknown-mode", "numeric-mode", "null-mode", "high-threshold",
+         "string-threshold", "boolean-threshold"],
+)
+def test_invalid_decide_config_emits_untriaged_once(
+    fresh_poller, tmp_path, monkeypatch, capsys, override,
+):
+    _configure(tmp_path, triage=_triage_config(**override))
+    monkeypatch.setenv("JEV_KEY", "test-key")
+
+    def unexpected_request(*_args, **_kwargs):
+        pytest.fail("invalid decide configuration must not contact Jev")
+
+    monkeypatch.setattr(fresh_poller.request, "urlopen", unexpected_request)
+    events, stderr = _run(fresh_poller, monkeypatch, capsys)
+    assert len(events) == 1 and "triage" not in events[0]
+    assert NOTIFY_LINE not in events[0]["prompt"]
+    assert stderr.count("invalid triage configuration") == 1
+    assert not fresh_poller.TRIAGE_DROPPED_FILE.exists()
+
+
 def test_manifest_passes_jev_key():
     manifest_path = Path(__file__).resolve().parent.parent / "pollers.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

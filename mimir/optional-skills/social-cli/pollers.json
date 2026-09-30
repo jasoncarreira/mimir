@@ -9,14 +9,14 @@
         "profile": "research",
         "tier": "scoped-with-provenance",
         "saga_full_corpus_read": true,
-        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "capabilities": ["write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
         "scoped_roots": ["state"],
         "shell_commands": [
           {
             "exec": "bash",
             "path": "/usr/bin/bash",
             "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
-            "options": ["--platform", "--action", "--since", "--json", "--dry-run"]
+            "options": ["--platform", "--action", "--since", "--json"]
           },
           {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
           {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
@@ -40,14 +40,14 @@
         "profile": "research",
         "tier": "scoped-with-provenance",
         "saga_full_corpus_read": true,
-        "capabilities": ["memory_store", "saga_feedback", "saga_mark_contributions", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "capabilities": ["write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
         "scoped_roots": ["state"],
         "shell_commands": [
           {
             "exec": "bash",
             "path": "/usr/bin/bash",
             "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
-            "options": ["--platform", "--action", "--since", "--json", "--dry-run"]
+            "options": ["--platform", "--action", "--since", "--json"]
           },
           {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
           {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}

@@ -112,8 +112,9 @@ async work; guarantee a successful emit (poller bugs surface as `poller_stderr` 
 
 ### Research Notes and Wiki Proposals
 
-Pollers ingest untrusted content. Write drafts and state under
-`state/pollers/<name>/` (the poller's `STATE_DIR`), then
+Poller turns are tainted from their trigger and cannot use durable-memory tools.
+Write drafts and notes under your own persist directory, `state/pollers/<name>/`
+(the poller's `STATE_DIR`), then
 `open_proposal(source="<paper ID or URL>")` to publish wiki changes; never write
 to `state/wiki` directly. Edit only `state/wiki/` inside the returned worktree,
 then call `submit_proposal(title, rationale)`, or `abandon_proposal()` to discard
@@ -229,7 +230,7 @@ if __name__ == "__main__":
       "authority": {
         "profile": "research",
         "tier": "scoped-with-provenance",
-        "capabilities": ["memory_store", "saga_feedback", "write_file", "send_message"],
+        "capabilities": ["write_file", "send_message", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"]
       },
       "env": {
@@ -262,7 +263,7 @@ Research pollers may opt into `fetch_url` with an `authority.approved_urls` list
 {
   "profile": "research",
   "tier": "scoped-with-provenance",
-  "capabilities": ["memory_store", "write_file"],
+  "capabilities": ["write_file", "open_proposal", "submit_proposal", "abandon_proposal"],
   "scoped_roots": ["state"],
   "approved_urls": [
     "https://arxiv.org/",
