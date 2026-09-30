@@ -86,8 +86,8 @@ Before either track, gather inputs:
 - All core-memory blocks already rendered in the system prompt
 - `memory/learnings-inbox/*.md` — create-only candidate behaviors captured by
   `saga_session_end` synthesis turns since last reflection. Read these alongside
-  `memory/learnings-pending.md` (the legacy live buffer). Promote / drop / keep
-  per §B.4. Do not confuse the inbox with weekly archives.
+  `memory/learnings-pending.md` (the legacy live buffer).
+  Promote / drop / keep per §B.4. Do not confuse the inbox with weekly archives.
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
 - **Applied-proposals audit** — read the newest
