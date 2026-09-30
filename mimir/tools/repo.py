@@ -239,7 +239,19 @@ def _execute(
                 pull_request=pull_request,
             ),
         )
+        previous_head = state.action_scope.observed_head_sha
         result = asdict(git_tools.execute(operation))
+        if (
+            isinstance(operation, GitPush)
+            and result["ok"]
+            and state.action_scope.observed_head_sha != previous_head
+        ):
+            context = getattr(runtime, "context", None) if runtime is not None else None
+            if context is not None and context.ifc_state is not None:
+                context.ifc_state.record_own_push(
+                    state.action_scope.canonical_repo, state.action_scope.pr_number,
+                    previous_head,
+                )
         if isinstance(operation, (GitStatus, GitDiff, GitUnmerged)):
             _publish_attested_lease_result(runtime, state)
         return result

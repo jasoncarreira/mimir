@@ -854,6 +854,119 @@ def test_push_argv_has_only_bound_non_force_non_delete_branch_form(repo_tools) -
     )
 
 
+def test_wrapper_records_only_successful_verified_head_transition(repo_tools, monkeypatch) -> None:
+    from mimir.access_control import ToolRegistry
+    from mimir import repo_tools as git_module
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, RepoPRScopeRegistry, SourceLabel, TurnInteractivity,
+    )
+    from mimir.tools import repo as wrapper
+
+    origin, _source, scope, state, tools = repo_tools
+    initial = scope.observed_head_sha
+    ingress = SourceLabel(
+        principal="operator", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"operator"}), integrity="trusted",
+        integrity_effect="active_ingest",
+    )
+    result_source = SourceLabel(
+        principal="operator", domain="repository",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{initial}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(
+        labels=frozenset({"private"}), source_channels=frozenset({"slack-C1"}),
+        sources=(ingress, result_source),
+    )
+    def context_for_turn():
+        return AuthContext(
+            principal="service:poller", canonical_principal="poller",
+            roles=("service",), event_ingress=None, trigger="poller",
+            channel_id="poller:forge", interactivity=None,
+            repo_review_state=state, enforcement_enabled=True,
+        )
+
+    context = context_for_turn()
+    authorization_context = AuthContext(
+        principal="slack-U1", canonical_principal="operator", roles=("user", "admin"),
+        event_ingress=None, trigger="user_message", channel_id="slack-C1",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=True,
+        domain="channel", resource_id="slack-C1", bridge_instance="slack",
+        ifc_labels=labels, repo_review_state=state, repo_pr_action_scope=scope,
+        repo_pr_scope_registry=RepoPRScopeRegistry((state,)),
+        ifc_state=context.ifc_state,
+    )
+    registry = ToolRegistry()
+    arguments = {"repository": scope.canonical_repo, "pull_request": scope.pr_number}
+    runtime = SimpleNamespace(context=context)
+    monkeypatch.setattr(wrapper, "_state", lambda *args: state)
+    (state.checkout_lease.path / "fix.txt").write_text("fix\n", encoding="utf-8")
+    tools.execute(GitCommit(("fix.txt",), "fix"))
+    target = _git(state.checkout_lease.path, "rev-parse", "HEAD")
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    class FailedPush(git_module.RepoGitTools):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, runner=lambda argv, **kw: (
+                GitProcessResult(1, stderr="failed") if "push" in argv
+                else _bounded_subprocess_runner(argv, **kw)
+            ), **kwargs)
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", FailedPush)
+    with pytest.raises(ToolException):
+        wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())
+    assert context.ifc_state.own_push_lineage() == {}
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    class UnverifiedPush(git_module.RepoGitTools):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, runner=lambda argv, **kw: (
+                GitProcessResult(0, stdout="up to date") if "push" in argv
+                else _bounded_subprocess_runner(argv, **kw)
+            ), **kwargs)
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", UnverifiedPush)
+    with pytest.raises(ToolException):
+        wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())
+    assert context.ifc_state.own_push_lineage() == {}
+    assert not git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+
+    # A foreign/unverified head still refuses every later forge effect.
+    advanced = replace(scope, observed_head_sha=target)
+    for tool_name in ("pr_comment", "pr_rerequest_review", "repo_cleanup"):
+        from mimir.access_control import SinkGate, SinkCategory
+        denied = SinkGate.check_sink_flow(
+            tool_name, scope.canonical_repo, labels, authorization_context,
+            enforce=True, sink_category=SinkCategory.FORGE, repo_pr_action_scope=advanced,
+        )
+        assert not denied.allowed
+        assert denied.forge_scope_mismatch["component"] == "observed_head_sha"
+
+    monkeypatch.setattr(wrapper, "RepoGitTools", git_module.RepoGitTools)
+    assert wrapper._execute(runtime, scope.canonical_repo, scope.pr_number, GitPush())["ok"]
+    assert context.ifc_state.own_push_lineage() == {
+        (scope.canonical_repo, scope.pr_number): frozenset({initial}),
+    }
+    assert git_module.was_verified_push(scope.canonical_repo, scope.pr_number, initial, target)
+    assert _git(origin, "rev-parse", scope.destination_ref) == target
+    fresh_context = context_for_turn()
+    assert fresh_context.ifc_state.own_push_lineage() == {}
+    # A successful no-op push does not supersede a head in the new turn.
+    assert wrapper._execute(
+        SimpleNamespace(context=fresh_context), scope.canonical_repo, scope.pr_number,
+        GitPush(),
+    )["ok"]
+    assert fresh_context.ifc_state.own_push_lineage() == {}
+    for tool_name in ("pr_comment", "pr_rerequest_review", "repo_cleanup"):
+        decision = registry.authorize_tool(
+            tool_name, authorization_context, enforce=True, arguments=arguments,
+        )
+        assert decision.allowed, (tool_name, decision.reason, decision.refusal_detail)
+
+
 @pytest.mark.parametrize("recreate_tools", [False, True])
 def test_turn_pushes_twice_as_fast_forwards(repo_tools, recreate_tools) -> None:
     origin, _source, scope, state, tools = repo_tools

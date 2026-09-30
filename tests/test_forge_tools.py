@@ -222,6 +222,98 @@ def test_author_attestation_denial_without_ifc_state(monkeypatch):
     assert "attestation" not in refusal
 
 
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff])
+def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
+    import mimir.event_logger as events
+
+    scope = _scope(RepoPRAction.INSPECT, head_sha="b" * 40)
+    runtime = _runtime(scope)
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: pytest.fail(
+        "a mismatched head must not attest an author"
+    ), raising=False)
+    recorded = []
+    monkeypatch.setattr(events, "log_event_sync", lambda event, **fields: recorded.append((event, fields)))
+    set_forge_client(client)
+    token = access_control.begin_protected_result_capture()
+    try:
+        read_tool.func("owner/repo", 17, runtime=runtime)
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+    assert provenance.sources[0].integrity == "untrusted"
+    assert recorded[0][0] == "forge_author_attestation_downgraded"
+    assert recorded[0][1]["failed_authors"] == ["<head-mismatch>"]
+
+
+@pytest.mark.parametrize("own_push", [
+    False, True, "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr",
+])
+@pytest.mark.parametrize("event_type", ["pr_changes_requested_stale", "pr_ci_failure"])
+def test_remint_seeds_only_exact_verified_previous_head(monkeypatch, own_push, event_type):
+    import uuid
+
+    from mimir.access_control import SinkCategory, SinkGate
+    from mimir.repo_tools import _record_verified_push
+    from mimir.tools.forge import remediation_checkout_preflight
+
+    old = replace(_scope(*RepoPRAction), event_type=event_type,
+                  observed_head_sha=uuid.uuid4().hex + "0" * 8)
+    context = _runtime(old).context
+    context = replace(context, server_discovered_pr_states=ServerDiscoveredPRStates())
+    client = FakeForge()
+    client.reviews = (
+        ReviewProjection("2", "reviewer", "CHANGES_REQUESTED", "fix", "now", "c" * 40),
+    )
+    client.list_checks = lambda scope: (
+        CheckProjection("test", "completed", "failure", "now", "now"),
+    )
+    fresh = replace(old, provenance="server_discovered",
+                    observed_head_sha=uuid.uuid4().hex + "0" * 8)
+    client.snapshot_heads = [fresh.observed_head_sha]
+    monkeypatch.setattr(access_control, "create_server_discovered_heartbeat_scope",
+                        lambda *args, **kw: fresh)
+    if own_push:
+        recorded_scope = replace(
+            old,
+            canonical_repo="other/repo" if own_push == "wrong_repo" else old.canonical_repo,
+            pr_number=18 if own_push == "wrong_pr" else old.pr_number,
+        )
+        _record_verified_push(
+            recorded_scope,
+            "e" * 40 if own_push == "wrong_previous" else old.observed_head_sha,
+            "f" * 40 if own_push == "wrong_new" else fresh.observed_head_sha,
+        )
+    set_forge_client(client)
+    reminted, stopped = remediation_checkout_preflight(context, "owner/repo", 17)
+    assert stopped is None and reminted.action_scope is fresh
+    assert context.ifc_state.own_push_lineage() == (
+        {("owner/repo", 17): frozenset({old.observed_head_sha})} if own_push is True else {}
+    )
+    label = SourceLabel(
+        principal="poller", domain="repository",
+        resource_id=f"owner/repo#pull/17@{old.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({"poller"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels(sources=(label,))
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, context, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=reminted.action_scope,
+    )
+    assert decision.allowed is (own_push is True), decision.reason
+    if own_push is not True:
+        assert decision.forge_scope_mismatch["component"] == "observed_head_sha"
+    second_turn = _runtime(old).context
+    assert second_turn.ifc_state.own_push_lineage() == {}
+    second_decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, second_turn, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=reminted.action_scope,
+    )
+    assert not second_decision.allowed
+    assert second_decision.forge_scope_mismatch["component"] == "observed_head_sha"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("author, collaborator, expected, api_calls", [
     pytest.param("outsider", 404, "untrusted", 2, id="fork-outsider"),

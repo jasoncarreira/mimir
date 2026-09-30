@@ -54,6 +54,8 @@ _HISTORY_REWRITE_EVENT_TYPES = frozenset({
 _PROTECTED_BRANCH_REFS = frozenset({"refs/heads/main", "refs/heads/master"})
 _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
 _recent_agent_pushes_lock = threading.Lock()
+_verified_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
+_verified_pushes_lock = threading.Lock()
 
 
 def _history_rewrite_push_permitted(scope: RepoPRActionScope) -> bool:
@@ -84,6 +86,26 @@ def was_agent_push(
     key = (repository.lower(), pull_request, previous_head.lower(), current_head.lower())
     with _recent_agent_pushes_lock:
         return key in _recent_agent_pushes
+
+
+def _record_verified_push(scope: RepoPRActionScope, previous_head: str, pushed_head: str) -> None:
+    key = (scope.canonical_repo.casefold(), scope.pr_number,
+           previous_head.casefold(), pushed_head.casefold())
+    with _verified_pushes_lock:
+        _verified_pushes[key] = None
+        _verified_pushes.move_to_end(key)
+        while len(_verified_pushes) > _RECENT_AGENT_PUSH_LIMIT:
+            _verified_pushes.popitem(last=False)
+
+
+def was_verified_push(
+    repository: str, pull_request: int, previous_head: str, current_head: str,
+) -> bool:
+    """Recognize an exact verified publication, independently of review policy."""
+    key = (repository.casefold(), pull_request,
+           previous_head.casefold(), current_head.casefold())
+    with _verified_pushes_lock:
+        return key in _verified_pushes
 
 _BASE_CONFIG = (
     "-c", "core.fsmonitor=",
@@ -1191,6 +1213,7 @@ class RepoGitTools:
                         reachability.stderr.strip() or "push reachability verification failed",
                     )
                 self._command(("update-ref", PUBLISHED_HEAD_REF, observed))
+                previous_head = self._scope.observed_head_sha
                 _record_agent_push(self._scope, observed)
                 # Keep the turn identity fixed; only our own verified publication
                 # advances its observation, never a concurrent writer's commit.
@@ -1215,6 +1238,7 @@ class RepoGitTools:
                 # stay fixed; do not cache these objects as immutable head snapshots.
                 object.__setattr__(lease, "head_sha", self._expected_head)
                 object.__setattr__(self._scope, "observed_head_sha", self._expected_head)
+                _record_verified_push(self._scope, previous_head, self._expected_head)
             except GitRefusal as exc:
                 if exc.code == "git_failed":
                     raise GitRefusal(
