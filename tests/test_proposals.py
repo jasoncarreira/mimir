@@ -245,6 +245,48 @@ def test_social_private_term_follows_enforcement(home, rolling_forge, monkeypatc
     assert allowed.ok
 
 
+@pytest.mark.parametrize("existing_branch", [False, True])
+def test_social_open_unknown_forge_state_preserves_local_branch_and_worktrees(
+    home, monkeypatch, existing_branch,
+):
+    import mimir.proposals as proposals
+
+    scope = _social_scope("one")
+    branch = poller_branch_name(scope)
+    worktree = poller_worktree_path(home, scope)
+    if existing_branch:
+        # Keep a distinct local tip so resetting the branch to origin/main is
+        # observable, not just deleting and recreating the same branch name.
+        _git("commit", "--allow-empty", "-m", "local work to preserve", cwd=home)
+        _git("branch", branch, cwd=home)
+    ref = f"refs/heads/{branch}"
+    before_ref = _git("show-ref", "--verify", ref, cwd=home, check=False)
+    before_worktrees = _git("worktree", "list", "--porcelain", cwd=home).stdout
+    commands = []
+    original_git = proposals._git
+
+    def record_git(args, *, cwd):
+        commands.append(args)
+        return original_git(args, cwd=cwd)
+
+    monkeypatch.setattr(proposals, "_git", record_git)
+    monkeypatch.setattr(proposals, "_rolling_pr", lambda *a: (None, None))
+    result = open_proposal(home, lane="poller", poller=scope)
+
+    assert not result.ok and result.reason == "error"
+    assert "unavailable" in result.detail
+    assert result.branch == branch and result.worktree is None
+    assert not worktree.exists()
+    assert list_open_proposals(home, lane="poller", poller=scope) == []
+    after_ref = _git("show-ref", "--verify", ref, cwd=home, check=False)
+    assert (after_ref.returncode, after_ref.stdout) == (
+        before_ref.returncode, before_ref.stdout,
+    )
+    assert _git("worktree", "list", "--porcelain", cwd=home).stdout == before_worktrees
+    assert not any(args[:2] == ["branch", "-D"] for args in commands)
+    assert not any(args[:2] == ["worktree", "add"] for args in commands)
+
+
 def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling_forge, monkeypatch):
     import mimir.proposals as proposals
 

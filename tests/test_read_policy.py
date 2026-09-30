@@ -56,6 +56,32 @@ def test_protected_names_and_templates(stem, suffix, uppercase, tmp_path, monkey
     )
 
 
+@pytest.mark.parametrize("roles", [(), ("admin",)])
+def test_live_social_outbox_denial_reason_is_protected_name_match(
+    tmp_path, monkeypatch, roles,
+):
+    from types import SimpleNamespace
+
+    from mimir._context import reset_current_turn, set_current_turn
+
+    home = tmp_path / "home"
+    live = home / "state/social-outbox/feed/post.yaml"
+    live.parent.mkdir(parents=True)
+    live.write_text("dispatch: []\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = SimpleNamespace(roles=roles, is_service=False, service_authority=None)
+    token = set_current_turn(SimpleNamespace(
+        turn_id="social-outbox-denial-reason", auth_context=auth,
+    ))
+    try:
+        assert is_protected_read_path(live)
+        # A human turn has no service-protected-name fallback. The shared
+        # target guard must name the actual protection, not the home boundary.
+        assert protected_read_denial_reason(live) == "protected_name_match"
+    finally:
+        reset_current_turn(token)
+
+
 @pytest.mark.parametrize("name", [".env.example.local", ".env.sample.bak", ".env.examples"])
 def test_template_marker_must_be_final(name, tmp_path):
     assert is_protected_read_path(tmp_path / name)
