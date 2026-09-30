@@ -1108,7 +1108,9 @@ async def test_dispatcher_logs_undeliverable_approval_notice(
     assert calls == []
     assert mp in requests.pending("slack-C1")
     assert approval.pending_request("slack-C1") == request
-    assert len(mti._drain("slack-C1")) == (0 if reply == "named" else 1)
+    # Both named replies and ambiguous bare replies with mp pending are
+    # consumed by the server, even when notice delivery fails.
+    assert mti._drain("slack-C1") == []
 
 
 def test_model_queue_cannot_resolve_typed_registry_entry(tmp_path):

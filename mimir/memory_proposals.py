@@ -5,7 +5,9 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
+from contextlib import contextmanager
 import re
 import tempfile
 import time
@@ -63,7 +65,10 @@ def protected_model_targets(home: Path) -> tuple[tuple[Path, bool], ...]:
     """
     store = proposal_path(home)
     outbox = home / "state/social-outbox"
-    targets = [(store, False), (store.parent, False), (outbox, True)]
+    targets = [(store, False), (store.with_suffix(".lock"), False),
+               (store.parent, False), (outbox, True)]
+    if store.parent.exists():
+        targets.extend((path, False) for path in store.parent.glob(".memory-proposals-*"))
     if outbox.exists():
         targets.extend((path, False) for path in outbox.rglob("*") if path.is_file())
     return tuple(targets)
@@ -110,6 +115,65 @@ def is_protected_proposal_path(candidate: Path) -> bool:
     return is_protected_model_path(candidate)
 
 
+@contextmanager
+def _store_lock(home: Path, *, exclusive: bool):
+    """Lock a stable sidecar inode, including across atomic store replacement."""
+    path = proposal_path(home)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ProposalRefusal("proposal directory must not be a symlink")
+    lock_path = path.with_suffix(".lock")
+    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600), "r+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+
+
+def _load_records(home: Path) -> list[dict[str, Any]]:
+    """Read under the sidecar lock; refuse the whole store on corruption."""
+    path = proposal_path(home)
+    if not path.exists():
+        return []
+    records = []
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, 1):
+            try:
+                record = json.loads(line)
+                required = ("status", "content_sha256", "proposed_by", "id", "content",
+                            "stream", "turn_id", "expires_at")
+                if not isinstance(record, dict) or any(
+                    not isinstance(record.get(key), str) or not record[key].strip()
+                    for key in required
+                ):
+                    raise ValueError("invalid proposal fields")
+                deadline = datetime.fromisoformat(record["expires_at"])
+                if deadline.tzinfo is None:
+                    raise ValueError("expiry must have a timezone")
+            except (ValueError, TypeError):
+                raise ProposalRefusal(f"malformed proposal store record at line {line_number}") from None
+            records.append(record)
+    return records
+
+
+def _replace_records(home: Path, records: list[dict[str, Any]]) -> None:
+    """Publish complete, fsynced bytes while holding the sidecar lock."""
+    path = proposal_path(home)
+    fd, temporary = tempfile.mkstemp(prefix=".memory-proposals-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.writelines(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def queue_proposal(
     home: Path, *, content: str, stream: str, rationale: str,
     proposed_by: str, turn_id: str, origin_trigger: str, origin_ref: str | None,
@@ -129,35 +193,14 @@ def queue_proposal(
         raise ProposalRefusal("missing server-owned proposal provenance")
 
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    path = proposal_path(home)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.parent.is_symlink():
-        raise ProposalRefusal("proposal directory must not be a symlink")
-    with os.fdopen(
-        os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600),
-        "r+", encoding="utf-8",
-    ) as file:
-        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-        pending = []
-        for line_number, line in enumerate(file, 1):
-            try:
-                record = json.loads(line)
-            except ValueError:
-                raise ProposalRefusal(f"malformed proposal store record at line {line_number}") from None
-            required = ("status", "content_sha256", "proposed_by", "id")
-            if not isinstance(record, dict) or any(
-                not isinstance(record.get(key), str) or not record[key].strip()
-                for key in required
-            ):
-                raise ProposalRefusal(f"malformed proposal store record at line {line_number}")
-            if record["status"] == "pending":
-                pending.append(record)
+    with _store_lock(home, exclusive=True):
+        records = _load_records(home)
+        pending = [record for record in records if record["status"] == "pending"]
         if any(record["content_sha256"] == digest for record in pending):
             raise ProposalRefusal("duplicate pending proposal")
         if sum(record["proposed_by"] == proposed_by for record in pending) >= 20:
             raise ProposalRefusal("principal has 20 pending proposals (limit reached)")
-        file.seek(0)
-        existing_ids = {json.loads(line)["id"] for line in file}
+        existing_ids = {record["id"] for record in records}
         proposal_id = approval_requests.mint_id("mp", excluded=frozenset(existing_ids))
         now = datetime.now(timezone.utc)
         record = {
@@ -183,10 +226,8 @@ def queue_proposal(
             "expires_at": (now + timedelta(days=7)).isoformat(),
             "status": "pending",
         }
-        file.seek(0, os.SEEK_END)
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        file.flush()
-        os.fsync(file.fileno())
+        records.append(record)
+        _replace_records(home, records)
     sync_pending(home)
     return proposal_id
 
@@ -199,27 +240,17 @@ def configure_approvals(home: Path, channel_id: str, saga_store: Any) -> None:
 
 
 def _update(home: Path, proposal_id: str, status: str, **fields: Any) -> None:
-    path = proposal_path(home)
-    with path.open("r+", encoding="utf-8") as file:
-        fcntl.flock(file.fileno(), fcntl.LOCK_EX)
-        records = [json.loads(line) for line in file]
+    with _store_lock(home, exclusive=True):
+        records = _load_records(home)
         for record in records:
             if record["id"] == proposal_id:
                 record.update(status=status, **fields)
-        file.seek(0)
-        file.truncate()
-        file.writelines(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
-        file.flush()
-        os.fsync(file.fileno())
+        _replace_records(home, records)
 
 
 def _records(home: Path) -> list[dict[str, Any]]:
-    path = proposal_path(home)
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8") as file:
-        fcntl.flock(file.fileno(), fcntl.LOCK_SH)
-        return [json.loads(line) for line in file]
+    with _store_lock(home, exclusive=False):
+        return _load_records(home)
 
 
 def sync_pending(home: Path) -> None:
@@ -230,7 +261,12 @@ def sync_pending(home: Path) -> None:
     channel, _saga = backend
     now = datetime.now(timezone.utc)
     registered = {entry.approval_id for entry in approval_requests.pending(channel)}
-    for record in _records(home):
+    try:
+        records = _records(home)
+    except ProposalRefusal as exc:
+        logging.getLogger(__name__).warning("Memory proposal registration skipped: %s", exc)
+        return
+    for record in records:
         if record.get("status") != "pending":
             continue
         deadline = datetime.fromisoformat(record["expires_at"])
@@ -267,6 +303,23 @@ def is_mp_reply(event: Any) -> bool:
 
 
 async def complete_reply(home: Path, event: Any, resolution: Any, resolver: Any) -> str | None:
+    """Finish a reply, restoring retryability unless the durable decision completed."""
+    try:
+        return await _complete_reply(home, event, resolution, resolver)
+    except ProposalRefusal as exc:
+        return f"Could not complete memory proposal: {exc}"
+    finally:
+        entry = resolution.entry
+        if entry is not None and entry.kind == "mp":
+            try:
+                record = next((r for r in _records(home) if r["id"] == entry.approval_id), None)
+            except ProposalRefusal:
+                record = None
+            if record is None or record["status"] == "pending":
+                approval_requests.restore_uncompleted(entry)
+
+
+async def _complete_reply(home: Path, event: Any, resolution: Any, resolver: Any) -> str | None:
     """Finish a registry-selected reply and return a server-owned notice."""
     action = event.extra.pop("_memory_proposal_action", None)
     from .operator_approval import _is_authenticated_operator
@@ -274,7 +327,7 @@ async def complete_reply(home: Path, event: Any, resolution: Any, resolver: Any)
         return None
     if resolution.entry is None or resolution.entry.kind != "mp":
         if not is_mp_reply(event):
-            return None
+            return resolution.message
         match = _NAMED_MP.fullmatch((event.content or "").strip())
         proposal_id = match.group(1).lower()
         record = next((r for r in _records(home) if r.get("id") == proposal_id), None)

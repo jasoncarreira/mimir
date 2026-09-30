@@ -1938,7 +1938,7 @@ class Agent:
             else:
                 resolution = None
             if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
-                    or (resolution.entry is None and is_mp_reply(event))):
+                    or (resolution.entry is None and (is_mp_reply(event) or bare_reply))):
                 notice = await complete_reply(
                     self._config.home, event, resolution, self._identity_resolver,
                 )

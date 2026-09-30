@@ -119,6 +119,18 @@ def cancel(approval_id: str, *, expired: bool = False) -> None:
                 _EXPIRED.add(approval_id)
 
 
+def restore_uncompleted(entry: ApprovalEntry) -> None:
+    """Undo only this entry's transient resolution after durable completion failed."""
+    with _LOCK:
+        recent = _RECENT.get(entry.approval_id)
+        if (recent is not None and recent[1] == entry.channel_id
+                and entry.approval_id not in _PENDING
+                and entry.expires_at > time.monotonic()):
+            _RECENT.pop(entry.approval_id)
+            _EXPIRED.discard(entry.approval_id)
+            _PENDING[entry.approval_id] = entry
+
+
 def pending(channel_id: str, *, now: float | None = None) -> tuple[ApprovalEntry, ...]:
     now = time.monotonic() if now is None else now
     with _LOCK:
