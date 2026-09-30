@@ -643,6 +643,20 @@ async def test_on_message_enqueues_user_message(bridge_with_fake_client):
     # global_name and over str(author).
     assert e.author_display == "Alice in this server"
     assert e.extra["channel_conversation_type"] == "multi_user"
+    assert "reply_to_message_id" not in e.extra
+
+
+@pytest.mark.asyncio
+async def test_on_message_captures_discord_reply_reference(bridge_with_fake_client):
+    bridge, enqueued, _ = bridge_with_fake_client
+    channel = _fake_channel(id=1)
+    msg = SimpleNamespace(
+        id=555, author=SimpleNamespace(id=99, bot=False), channel=channel,
+        content="approve", mentions=[],
+        reference=SimpleNamespace(message_id=12345),
+    )
+    await bridge._on_message(msg)
+    assert enqueued[0].extra["reply_to_message_id"] == "12345"
 
 
 @pytest.mark.asyncio

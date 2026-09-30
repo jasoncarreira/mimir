@@ -805,10 +805,11 @@ async def request_operator_approval(
             f"Requested target (non-binding context only): {render(normalized_target)}\n"
         )
     alert = (
-        "Operator approval requested\n"
+        f"Operator approval requested ({request.request_id})\n"
         f"{request_details}"
         f"Reason: {render(normalized_reason or '(none provided)')}\n"
-        "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes."
+        f"Reply `approve {request.request_id}` or `decline {request.request_id}` "
+        "in this channel. The request expires in 5 minutes."
     )
     if category is not None:
         alert += f"\n{blocking_details}Source summary:\n{rendered_sources}"
@@ -820,6 +821,9 @@ async def request_operator_approval(
     if not getattr(result, "sent", True):
         cancel_request(request.request_id)
         return "request_operator_approval refused: operator is unreachable"
+    from ..approval_requests import set_prompt_message_id
+
+    set_prompt_message_id(request.request_id, getattr(result, "message_id", None))
     if category is not None:
         return "Operator approval is pending for the sink category."
     return "Operator approval is pending for the exact tool and target."

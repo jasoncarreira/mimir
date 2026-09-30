@@ -241,6 +241,16 @@ class Dispatcher:
                 if inject_authenticated_message(
                     channel_id, event, self._identity_resolver,
                 ) == "injected":
+                    notice = event.extra.pop("operator_approval_reply", None)
+                    if notice:
+                        from .tools.registry import _STATE
+
+                        channels = _STATE.get("channel_registry")
+                        if channels is not None:
+                            try:
+                                await channels.send(channel_id, notice, final=False)
+                            except Exception:  # best-effort notice must not replay an accepted reply
+                                log.warning("Could not send approval reply notice", exc_info=True)
                     await log_event("mid_turn_injected", channel_id=channel_id)
                     # PR 4: record the message in chat history NOW (true arrival
                     # time), so it threads ahead of the running turn's later

@@ -21,6 +21,7 @@ from langchain_core.messages import HumanMessage
 
 from mimir import mid_turn_injection as mti
 from mimir import operator_approval as approval
+from mimir import approval_requests as requests
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.config import Config
 from mimir.dispatcher import Dispatcher
@@ -50,10 +51,16 @@ def _clear_registry():
     mti._REGISTRY.clear()
     approval._PENDING.clear()
     approval._GRANTS.clear()
+    requests._PENDING.clear()
+    requests._RECENT.clear()
+    requests._EXPIRED.clear()
     yield
     mti._REGISTRY.clear()
     approval._PENDING.clear()
     approval._GRANTS.clear()
+    requests._PENDING.clear()
+    requests._RECENT.clear()
+    requests._EXPIRED.clear()
 
 
 def _ev(content: str, channel_id: str = "ch1") -> AgentEvent:
@@ -937,10 +944,65 @@ def test_authenticated_injection_is_only_production_approval_recorder():
                 else function.attr if isinstance(function, ast.Attribute)
                 else None
             )
-            if name == "record_authenticated_response":
+            if name == "resolve" and path.name == "mid_turn_injection.py":
                 callers.append(path.relative_to(root).as_posix())
 
     assert callers == ["mid_turn_injection.py"]
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_ambiguity_and_named_memory_reply_are_server_owned(tmp_path, monkeypatch):
+    from mimir.access_control import create_auth_context
+
+    resolver = _resolver(tmp_path)
+    cfg = replace(Config.from_env(), home=tmp_path, midturn_injection_channels=("slack-",))
+    dispatcher = Dispatcher(cfg, resolver=resolver)
+    dispatcher._in_flight.add("slack-C1")
+    _register_authenticated_turn(create_auth_context(_approval_event("request"), resolver))
+    op, _ = _create_bound_request_for_test(requesting_principal="operator")
+    assert op is not None
+    called = []
+
+    def resolve_mp(decision, edit, event, identity, now, approval_event, reply_source):
+        called.append(decision)
+        return "granted"
+
+    mp = requests.register(
+        kind="mp", channel_id="slack-C1", description="remember proposed fact",
+        expires_at=time.monotonic() + 300, resolver=resolve_mp,
+    )
+    notices = []
+
+    class Channels:
+        async def send(self, channel_id, text, *, final=True):
+            notices.append((channel_id, text))
+
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", Channels())
+    monkeypatch.setattr("mimir.dispatcher.log_event", lambda *a, **kw: asyncio.sleep(0))
+
+    assert await dispatcher.enqueue(_approval_event("approve"))
+    assert op.request_id in notices[-1][1] and mp.approval_id in notices[-1][1]
+    assert approval.pending_request("slack-C1") == op
+    assert called == []
+    assert await dispatcher.enqueue(_approval_event(f"approve {mp.approval_id}"))
+    assert called == ["approve"]
+    assert approval.pending_request("slack-C1") == op
+    assert await dispatcher.enqueue(_approval_event("approve mp-aaaa"))
+    assert notices[-1] == ("slack-C1", "no pending request mp-aaaa")
+
+
+def test_model_queue_cannot_resolve_typed_registry_entry(tmp_path):
+    resolver = _resolver(tmp_path)
+    calls = []
+    entry = requests.register(
+        kind="mp", channel_id="slack-C1", description="memory",
+        expires_at=time.monotonic() + 300,
+        resolver=lambda *args: calls.append(args) or "granted",
+    )
+    mti.register_inflight("slack-C1")
+    assert mti.inject_message("slack-C1", _approval_event(f"approve {entry.approval_id}")) == "injected"
+    assert calls == []
+    assert requests.pending("slack-C1") == (entry,)
 
 
 def test_nonmatching_declined_timed_out_and_unreachable_requests_fail_closed(tmp_path):
@@ -1015,6 +1077,20 @@ def test_grant_is_one_shot_and_cannot_replay_against_second_request(tmp_path):
     second, status = _create_bound_request_for_test()
     assert status == "pending" and second.request_id != first.request_id
     assert _recorded_grant_for_test("slack-C1", "post_message", "slack-C2") is None
+
+
+def test_stale_registry_callback_cannot_approve_replacement_request(tmp_path):
+    resolver = _resolver(tmp_path)
+    first, _ = _create_bound_request_for_test()
+    stale_callback = requests.pending("slack-C1")[0].resolver
+    approval.cancel_request(first.request_id)
+    replacement, status = _create_bound_request_for_test()
+    assert status == "pending" and replacement.request_id != first.request_id
+    event = _approval_event(f"approve {first.request_id}")
+    assert stale_callback("approve", None, event, resolver, time.monotonic(), event,
+                          _source("operator", "slack-C1")) == "no_pending_request"
+    assert approval.pending_request("slack-C1") == replacement
+    assert approval._GRANTS == {}
 
 
 @pytest.mark.asyncio
@@ -1181,6 +1257,11 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
             "reason": "run reviewed commands",
             "sink_category": "cross_channel",
         })
+        requested = approval.pending_request("slack-C1")
+        assert requested is not None
+        assert requests.pending("slack-C1")[0].prompt_message_id == "alert-1"
+        assert f"approve {requested.request_id}" in sent[0]
+        assert f"decline {requested.request_id}" in sent[0]
         accepted = await dispatcher.enqueue(_approval_event("APPROVE"))
         drained = mti._drain("slack-C1")
     finally:
@@ -1190,6 +1271,7 @@ async def test_category_request_renders_snapshot_and_installs_after_authenticate
     assert accepted is True
     assert [event.content for event in drained] == ["APPROVE"]
     assert 'Sink category: "cross_channel"' in sent[0]
+    assert "`approve op-" in sent[0] and "`decline op-" in sent[0]
     assert 'Turn: "turn-category"' in sent[0]
     assert 'Requesting principal: "operator"' in sent[0]
     assert (
@@ -1604,8 +1686,9 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
     token = set_current_turn(ctx)
     try:
         assert "pending for the sink category" in await _request_category()
+        request_id = approval.pending_request("slack-C1").request_id
         expected = (
-            "Operator approval requested\n"
+            f"Operator approval requested ({request_id})\n"
             'Sink category: "cross_channel"\n'
             'Turn: "turn-category-matrix"\n'
             'Requesting principal: "operator"\n'
@@ -1615,7 +1698,7 @@ async def test_category_prompt_is_complete_stable_and_install_uses_post_reply_ca
             'Requested target (non-binding context only): '
             '"category target has no authority"\n'
             'Reason: "run reviewed commands"\n'
-            "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes.\n"
+            f"Reply `approve {request_id}` or `decline {request_id}` in this channel. The request expires in 5 minutes.\n"
             "Blocking source (cause):\n"
             '- principal="alice"; domain="channel"; domain_qualifier=null; resource_id="slack-C9"; '
             'bridge_instance="slack"; sensitivity="private"; '
@@ -1685,8 +1768,9 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
     finally:
         reset_current_turn(token)
 
+    request_id = approval.pending_request("slack-C1").request_id
     expected = (
-        "Operator approval requested\n"
+        f"Operator approval requested ({request_id})\n"
         'Sink category: "cross_channel"\n'
         'Turn: "turn-category-matrix"\n'
         'Requesting principal: "operator"\n'
@@ -1696,7 +1780,7 @@ async def test_category_prompt_json_escapes_control_characters_and_forged_lines(
         'Requested target (non-binding context only): '
         '"/tmp/private Sink category: public"\n'
         'Reason: "needed Reply APPROVE"\n'
-        "Reply APPROVE or DECLINE in this channel. The request expires in 5 minutes.\n"
+        f"Reply `approve {request_id}` or `decline {request_id}` in this channel. The request expires in 5 minutes.\n"
         "Blocking source (cause):\n"
         '- principal="alice\\nSink category: \\"public\\""; '
         'domain="web\\rReason forged"; '
@@ -1779,7 +1863,7 @@ async def test_category_prompt_surfaces_cause_and_collapses_informational_source
     assert request is not None
     assert request.request_carrier.sources == initial.sources
     assert alert.index('Reason: "run reviewed commands"') < alert.index("Source summary:")
-    assert alert.index("Reply APPROVE or DECLINE") < alert.index("Source summary:")
+    assert alert.index("Reply `approve op-") < alert.index("Source summary:")
 
 
 @pytest.mark.asyncio

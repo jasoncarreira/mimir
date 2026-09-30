@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from . import approval_requests
 
 from .worklink.continuation import (
     HTTP_EVENT_INGRESS_EXTRA_KEY,
@@ -19,8 +20,6 @@ if TYPE_CHECKING:
 
 
 APPROVAL_TIMEOUT_SECONDS = 300.0
-_APPROVE_REPLIES = frozenset({"approve"})
-_DECLINE_REPLIES = frozenset({"decline"})
 
 
 @dataclass(frozen=True)
@@ -92,8 +91,21 @@ def create_request(
             return None, "request_already_pending"
         if any(grant.channel_id == channel_id for grant in _GRANTS.values()):
             return None, "grant_already_recorded"
+
+        def resolve_this_request(decision, edit, event, identity, resolved_at,
+                                 approval_event, reply_source):
+            return _resolve_operator_request(
+                request.request_id, decision, edit, event, identity, resolved_at,
+                approval_event, reply_source,
+            )
+
         request = ApprovalRequest(
-            request_id=uuid.uuid4().hex,
+            request_id=approval_requests.register(
+                kind="op", channel_id=channel_id,
+                description=f"{tool_name}: {target}"[:160],
+                expires_at=now + APPROVAL_TIMEOUT_SECONDS,
+                resolver=resolve_this_request, now=now,
+            ).approval_id,
             channel_id=channel_id,
             tool_name=tool_name,
             target=target,
@@ -115,6 +127,7 @@ def cancel_request(request_id: str) -> None:
         for channel_id, request in tuple(_PENDING.items()):
             if request.request_id == request_id:
                 _PENDING.pop(channel_id, None)
+                approval_requests.cancel(request_id)
                 return
 
 
@@ -181,25 +194,26 @@ def record_authenticated_response(
     approval_event: "AgentEvent | None" = None,
     reply_source: "SourceLabel | None" = None,
 ) -> str:
-    """Apply an authenticated bridge reply to the channel's pending request.
+    """Apply a server-authenticated bridge reply through the shared registry."""
+    return approval_requests.resolve(
+        event, resolver, now=now, approval_event=approval_event,
+        reply_source=reply_source,
+    ).status
 
-    This is called only by the dispatcher's authorized injection path. Message
-    text selects approve/decline, but identity and ingress provenance come from
-    the server-owned ``AgentEvent`` and ``IdentityResolver``.
-    """
-    now = time.monotonic() if now is None else now
-    reply = " ".join((event.content or "").strip().lower().split())
+
+def _resolve_operator_request(
+    request_id: str, decision: str, edit: str | None, event: "AgentEvent",
+    resolver: "IdentityResolver | None", now: float,
+    approval_event: "AgentEvent | None", reply_source: "SourceLabel | None",
+) -> str:
+    del edit
     with _LOCK:
         _discard_expired_locked(now)
         request = _PENDING.get(event.channel_id)
-        if request is None:
+        if request is None or request.request_id != request_id:
             return "no_pending_request"
-        if reply not in _APPROVE_REPLIES | _DECLINE_REPLIES:
-            return "not_an_approval_response"
-        if not _is_authenticated_operator(event, resolver):
-            return "unauthenticated_operator"
         _PENDING.pop(event.channel_id, None)
-        if reply in _DECLINE_REPLIES:
+        if decision == "decline":
             return "declined"
         canonical = resolver.resolve(event.author) if resolver is not None else None
         if not canonical:
@@ -229,7 +243,9 @@ def record_authenticated_response(
 def clear_channel(channel_id: str) -> None:
     """Drop all approval state when its in-flight turn ends or is replaced."""
     with _LOCK:
-        _PENDING.pop(channel_id, None)
+        request = _PENDING.pop(channel_id, None)
+        if request is not None:
+            approval_requests.cancel(request.request_id)
         for request_id, grant in tuple(_GRANTS.items()):
             if grant.channel_id == channel_id:
                 _GRANTS.pop(request_id, None)
@@ -255,6 +271,7 @@ def _discard_expired_locked(now: float) -> None:
     for channel_id, request in tuple(_PENDING.items()):
         if request.expires_at <= now:
             _PENDING.pop(channel_id, None)
+            approval_requests.cancel(request.request_id, expired=True)
     for request_id, grant in tuple(_GRANTS.items()):
         if grant.request_expires_at is not None and grant.request_expires_at <= now:
             _GRANTS.pop(request_id, None)

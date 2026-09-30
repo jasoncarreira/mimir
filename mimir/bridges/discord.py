@@ -973,6 +973,8 @@ class DiscordBridge(Bridge):
         # Platform-prefixed stable id is the matching key for cross-channel
         # / cross-platform pull (FUTURE_WORK §6.1).
         author_key = f"discord-{author_id}" if author_id else None
+        reference = getattr(message, "reference", None)
+        reply_id = getattr(reference, "message_id", None)
 
         event = AgentEvent(
             trigger="user_message",
@@ -991,6 +993,7 @@ class DiscordBridge(Bridge):
                 "channel_conversation_type": conv_type,
                 "channel_visibility": visibility,
                 "channel_name": channel_name,
+                **({"reply_to_message_id": str(reply_id)} if reply_id is not None else {}),
                 **(
                     {"inbound_attachment_urls": attachment_urls}
                     if attachment_urls else {}

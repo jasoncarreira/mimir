@@ -241,19 +241,26 @@ def inject_authenticated_message(
         if not can_inject_authenticated_message(channel_id, event, resolver):
             return "principal_mismatch"
         from .agent import _initialize_ifc_labels
-        from .operator_approval import pending_request, record_authenticated_response
+        from .approval_requests import resolve
 
-        request = pending_request(channel_id)
         event_labels = _initialize_ifc_labels(event, resolver=resolver)
         reply_source = event_labels.sources[-1] if event_labels.sources else None
-        status = record_authenticated_response(
+        resolution = resolve(
             event,
             resolver,
             approval_event=event,
             reply_source=reply_source,
         )
-        if status == "granted" and request is not None and request.sink_category is not None:
-            inflight.authenticated_grants[id(event)] = request
+        if resolution.message:
+            event.extra["operator_approval_reply"] = resolution.message
+        if resolution.status == "granted" and resolution.entry is not None and resolution.entry.kind == "op":
+            # The resolver has removed the pending request; use the grant's
+            # immutable binding rather than another channel's request.
+            from .operator_approval import _GRANTS
+
+            grant = _GRANTS.get(resolution.entry.approval_id)
+            if grant is not None and grant.sink_category is not None:
+                inflight.authenticated_grants[id(event)] = grant
         inflight.queue.append(event)
         return "injected"
 
