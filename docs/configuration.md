@@ -659,8 +659,9 @@ remaining fields are optional and default to unset.
 
 ## Optional-skill pollers (gmail / social / github)
 
-These are read by opt-in poller skills, not the core config. They only matter
-once the corresponding skill is installed.
+These settings apply to opt-in poller skills and only matter once the
+corresponding skill is installed. `MIMIR_SOCIAL_OUTBOX_APPROVERS` is also read
+by the core proposals helper that verifies social-outbox merge approval.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
@@ -670,6 +671,7 @@ once the corresponding skill is installed.
 | `MIMIR_SOCIAL_LIMIT` | int | `50` (clamp 1–200) | Per-sync item limit for the mentions poller. |
 | `MIMIR_SOCIAL_FEED_LIMIT` | int | `50` (clamp 1–200) | Per-sync item limit for the feed poller. |
 | `MIMIR_SOCIAL_USERS_DIR` | path | unset | Directory of tracked social users. |
+| `MIMIR_SOCIAL_OUTBOX_APPROVERS` | csv-list | unset (withhold all) | Comma-separated list of GitHub logins allowed to approve social-outbox dispatch by merging the rolling outbox PR; entries are trimmed and compared case-insensitively. Unset or empty (including whitespace/comma-only) withholds every dispatch with `no_approvers_configured`; any malformed login entry withholds with `invalid_approvers_configured`; a merger outside the list is withheld with `merger_not_approved`. Both social-cli pollers forward this setting via `pass_env`. Accepted risk: an agent holding an allowlisted operator's token could self-merge; the allowlist authorizes the forge actor, not an independent human. A separate agent GitHub identity is needed to close that risk. |
 | `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
 | `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. |
