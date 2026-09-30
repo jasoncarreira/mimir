@@ -496,7 +496,7 @@ def test_resolve_model_codex_plus_builds_chat_codex_plus():
     model = _resolve_model("codex-plus:gpt-5.4")
     assert isinstance(model, ChatCodexPlus)
     assert model.model == "gpt-5.4"
-    assert model.reasoning_effort == "none"
+    assert model.reasoning_effort is None
     # No callback was passed → field defaults to None.
     assert model.rate_limit_callback is None
 

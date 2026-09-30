@@ -335,8 +335,8 @@ async def _call_codex_plus_async(
 
     ``max_tokens``/``temperature`` are accepted but unused: the Codex
     responses API (as surfaced by ChatCodexPlus) doesn't expose them.
-    Reasoning effort defaults to ``"none"`` to keep inference cheap, and can
-    be overridden through saga's LLM configuration.
+    An unset reasoning effort uses the model default; explicit values can be
+    provided through saga's LLM configuration.
 
     A fresh ChatCodexPlus is built per call so its async HTTP client
     binds to the *calling* loop — saga runs on different loops across
@@ -369,9 +369,7 @@ async def _call_codex_plus_async(
     if system:
         messages.append(SystemMessage(content=system))
     messages.append(HumanMessage(content=prompt))
-    reasoning_effort = validate_effort(
-        "codex-plus", str(llm.get("reasoning_effort") or "none")
-    )
+    reasoning_effort = validate_effort("codex-plus", llm.get("reasoning_effort"))
     try:
         chat = ChatCodexPlus(
             model=llm.get("model") or "gpt-5.4",

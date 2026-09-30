@@ -909,13 +909,11 @@ def _resolve_model(
         )
         install_codex_plus_transient_retry_patch(ChatCodexPlus)
         model_name = spec.split(":", 1)[1]
-        # reasoning_effort defaults to "none" (mimir's cheap-inference
-        # baseline) but is settable across providers via
-        # MIMIR_MODEL_REASONING_EFFORT (config.model_reasoning_effort),
-        # threaded in here. An empty value keeps the "none" default.
+        # An unset effort lets the model apply its own default. Explicit
+        # values, including "none" for older models, pass through unchanged.
         return ChatCodexPlus(
             model=model_name,
-            reasoning_effort=_validate_effort("codex-plus", reasoning_effort or "none"),
+            reasoning_effort=_validate_effort("codex-plus", reasoning_effort),
             rate_limit_callback=rate_limit_callback,
         )
     # langchain ``init_chat_model`` resolves provider extras at call time
