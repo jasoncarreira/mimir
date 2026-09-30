@@ -314,6 +314,60 @@ def test_remint_seeds_only_exact_verified_previous_head(monkeypatch, own_push, e
     assert second_decision.forge_scope_mismatch["component"] == "observed_head_sha"
 
 
+@pytest.mark.parametrize("push_event_type", ["pr_review", "pr_mergeability_rebase"])
+def test_non_remediation_verified_push_still_rechecks_blocking_reviews(
+    monkeypatch, push_event_type,
+):
+    import uuid
+
+    from mimir.repo_tools import (
+        _record_agent_push, _record_verified_push, was_agent_push, was_verified_push,
+    )
+    from mimir.tools.forge import remediation_checkout_preflight
+
+    old = replace(
+        _scope(*RepoPRAction), event_type="pr_changes_requested_stale",
+        observed_head_sha=uuid.uuid4().hex + "0" * 8,
+    )
+    fresh = replace(
+        old, provenance="server_discovered",
+        observed_head_sha=uuid.uuid4().hex + "0" * 8,
+    )
+    push_scope = replace(old, event_type=push_event_type)
+    # The publication record is broader than the remediation-policy record.
+    # Use production recorders and a unique transition, not shared-cache resets.
+    _record_agent_push(push_scope, fresh.observed_head_sha)
+    _record_verified_push(push_scope, old.observed_head_sha, fresh.observed_head_sha)
+    transition = (
+        old.canonical_repo, old.pr_number, old.observed_head_sha, fresh.observed_head_sha,
+    )
+    assert was_verified_push(*transition)
+
+    context = replace(
+        _runtime(old).context, server_discovered_pr_states=ServerDiscoveredPRStates(),
+    )
+    client = FakeForge()
+    client.snapshot_heads = [fresh.observed_head_sha]
+    client.reviews = (
+        ReviewProjection("1", "reviewer", "APPROVED", "LGTM", "now", fresh.observed_head_sha),
+    )
+    monkeypatch.setattr(
+        access_control, "create_server_discovered_heartbeat_scope",
+        lambda *args, **kwargs: fresh,
+    )
+    set_forge_client(client)
+
+    reminted, stopped = remediation_checkout_preflight(context, old.canonical_repo, old.pr_number)
+
+    assert client.calls == [
+        ("snapshot", old.canonical_repo, old.pr_number), ("reviews", fresh),
+    ]
+    assert reminted is None
+    assert stopped == "pull request no longer has a blocking changes-requested review"
+    assert context.ifc_state.own_push_lineage() == {}
+    assert not was_agent_push(*transition)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("author, collaborator, expected, api_calls", [
     pytest.param("outsider", 404, "untrusted", 2, id="fork-outsider"),
