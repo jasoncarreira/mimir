@@ -233,6 +233,136 @@ class RateLimitStore:
             self._write_failed = False
             return True
 
+    def reconcile_codex_probe_sync(
+        self,
+        updates: dict[str, RateLimitSnapshot],
+        *,
+        owned_keys: Iterable[str],
+        observed_epoch: float,
+    ) -> tuple[bool, dict[str, tuple[float, float, bool]]]:
+        """Persist a Codex usage probe with a bounded rolling-max history.
+
+        The raw history is Codex-private store metadata. ``current()`` ignores
+        it, so other providers and the public snapshot shape are unchanged.
+        A generation-429 rejection remains authoritative until its reset or a
+        successful generation response overwrites it.
+        """
+        cutoff = observed_epoch - 15 * 60
+        owned = set(owned_keys)
+        stats: dict[str, tuple[float, float, bool]] = {}
+        with self._thread_lock:
+            data = self._load()
+            for key in owned:
+                if key not in updates:
+                    previous = data.get(key)
+                    if isinstance(previous, dict):
+                        reset = _as_timestamp(previous.get("resets_at"))
+                        if (
+                            previous.get("status") == "rejected"
+                            and previous.get("_codex_rejection_source") == "generation"
+                            and (reset is None or reset > observed_epoch)
+                        ):
+                            # Missing probe windows do not revoke a live 429.
+                            continue
+                    data.pop(key, None)
+            for key, snapshot in updates.items():
+                previous = data.get(key)
+                previous = previous if isinstance(previous, dict) else {}
+                history: list[dict[str, float]] = []
+                raw_history = previous.get("_codex_probe_readings", [])
+                if isinstance(raw_history, list):
+                    for item in raw_history:
+                        if not isinstance(item, dict):
+                            continue
+                        ts = _as_float(item.get("ts"))
+                        util = _as_float(item.get("utilization"))
+                        if ts is not None and util is not None and ts >= cutoff:
+                            history.append({"ts": ts, "utilization": util})
+                if snapshot.utilization is not None:
+                    history.append({
+                        "ts": observed_epoch,
+                        "utilization": snapshot.utilization,
+                    })
+                history = history[-5:]
+                values = [item["utilization"] for item in history]
+                if values:
+                    low, high = min(values), max(values)
+                    snapshot.utilization = high
+                    stats[key] = (low, high, high - low > 0.10)
+
+                # A usage endpoint saying "allowed" is not evidence that a
+                # generation 429 was transient. Only a successful generation
+                # callback may clear that enforced verdict before reset.
+                previous_reset = _as_timestamp(previous.get("resets_at"))
+                rejection_live = previous_reset is None or previous_reset >= int(observed_epoch)
+                if (
+                    previous.get("status") == "rejected"
+                    and previous.get("_codex_rejection_source") == "generation"
+                    and rejection_live
+                ):
+                    snapshot.status = "rejected"
+                    snapshot.resets_at = previous_reset
+
+                raw = asdict(snapshot)
+                raw["_codex_probe_readings"] = history
+                if snapshot.status == "rejected":
+                    raw["_codex_rejection_source"] = (
+                        previous.get("_codex_rejection_source") or "probe"
+                    )
+                data[key] = raw
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False, {}
+            self._write_failed = False
+            return True, stats
+
+    def record_codex_rejection_sync(
+        self,
+        rate_limit_type: str,
+        snapshot: RateLimitSnapshot,
+    ) -> bool:
+        """Record an enforced generation rejection without dropping siblings."""
+        with self._thread_lock:
+            data = self._load()
+            raw = asdict(snapshot)
+            raw["_codex_rejection_source"] = "generation"
+            data[rate_limit_type] = raw
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
+    def clear_codex_generation_rejections_sync(self) -> bool:
+        """Clear enforced Codex rejections after a successful canary."""
+        with self._thread_lock:
+            data = self._load()
+            changed = False
+            for key, raw in data.items():
+                if not key.startswith("openai_") or not isinstance(raw, dict):
+                    continue
+                if raw.get("_codex_rejection_source") != "generation":
+                    continue
+                raw["status"] = "allowed"
+                raw.pop("_codex_rejection_source", None)
+                changed = True
+            if not changed:
+                return True
+            try:
+                atomic_write_json(self.path, data)
+            except OSError as exc:
+                log.warning("rate_limits.json write failed: %s", exc)
+                self._report_write_failure(exc)
+                return False
+            self._write_failed = False
+            return True
+
     def _report_write_failure(self, exc: OSError) -> None:
         """Emit once when persistence enters a failed state."""
         if self._write_failed:

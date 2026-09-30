@@ -199,12 +199,35 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_LOOP_STALL_ALERT_SECONDS` | float | `300` | Daemon-thread threshold for a direct ntfy/webhook alert. `0` disables. |
 | `MIMIR_LOOP_STALL_SELF_TERMINATE` | bool | `false` | After alerting, signal PID 1 so the supervisor can restart the agent. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | cron | `""` (off) | Identities populator (scrapes Discord/Slack into `state/identities.yaml`). Recommended `0 6 * * *`. |
-| `MIMIR_QUOTA_RECHECK_SECONDS` | int | `180` (floor `30`) | Quota-pause recheck probe cadence. |
+| `MIMIR_QUOTA_RECHECK_SECONDS` | int | `180` (floor `30`) | Shared quota-pause recheck job cadence; Codex applies its own 15-minute throttle (see below). |
 | `MIMIR_QUOTA_5H_BACKDERIVE_FACTOR` | float | `10.0` | Back-derive factor for the 5h quota-dollar estimator. |
 | `MIMIR_QUOTA_7D_ANOMALY_CONFIRM_THRESHOLD` | int | `5` | Confirmations required before acting on a 7d quota anomaly. |
 | `MIMIR_WATCHDOG_WEBHOOK_URL` | str | unset | Out-of-band webhook the watchdog POSTs `{"text": ...}` to on liveness down/recovered. |
 | `NTFY_TOPIC` | str | unset | ntfy.sh topic for watchdog alerts (alternative sink). |
 | `MIMIR_POLLER_ENV_ALLOWLIST` | csv-list | `""` | Extra env-var names (beyond the builtin allowlist) forwarded into poller subprocess environments. |
+
+### Codex quota-pause recovery
+
+`MIMIR_QUOTA_RECHECK_SECONDS` remains the shared recheck-job interval (default
+180 seconds, floor 30); Anthropic and other providers keep their existing
+recovery behavior. The Codex path adds a separate 15-minute throttle and limits
+canaries to 4 per hour. It runs only while a Codex quota pause is active.
+
+Each Codex recheck refreshes `/wham/usage`. Only an explicit server verdict
+`allowed=true` with `limit_reached` not true permits a minimal `ping` generation
+canary; a usage read alone cannot clear the pause. When `MIMIR_MODEL_SPEC` is
+`codex-plus:<model>`, that configured model is used. Otherwise (for example, an
+Anthropic agent whose Saga or Worklinks use Codex), the first model in the live
+`/codex/models` listing is selected using the chat adapter's configured client
+version. The canary never hardcodes a model and omits reasoning effort.
+
+Canary success clears generation-sourced rejection snapshots and the matching
+pause. `quota_pause_recheck` records `success`, `still_limited`, or `error` for
+canary outcomes; error diagnostics contain only exception type/classification,
+not exception text. Usage-denied rechecks record `still_limited` with
+`stage=usage`. Clearing the pause emits `quota_pause_cleared` with
+`reason=recheck_succeeded` and schedules recovery through the normal arbiter.
+Failed canaries leave the pause intact; the recorded reset remains the fallback.
 
 ## Git, state, update & files
 

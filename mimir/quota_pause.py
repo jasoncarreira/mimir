@@ -629,6 +629,32 @@ def extract_reset_at(exc: BaseException) -> tuple[datetime | None, str | None]:
        is what the old ``now + _DEFAULT_PAUSE_HOURS`` default did.
     """
     now = datetime.now(tz=timezone.utc)
+    raw = getattr(exc, "raw", None)
+    error = raw.get("error", raw) if isinstance(raw, dict) else None
+    if (
+        getattr(exc, "status_code", None) == 429
+        and isinstance(error, dict)
+        and (getattr(exc, "type", None) or error.get("type")) == "usage_limit_reached"
+    ):
+        raw_reset = error.get("resets_at")
+        reset: datetime | None = None
+        if isinstance(raw_reset, str):
+            try:
+                reset = datetime.fromisoformat(raw_reset.replace("Z", "+00:00"))
+            except ValueError:
+                reset = None
+        elif isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
+            try:
+                reset = datetime.fromtimestamp(raw_reset, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                reset = None
+        reset_seconds = error.get("resets_in_seconds")
+        if reset is None and isinstance(reset_seconds, (int, float)) and not isinstance(reset_seconds, bool):
+            reset = now + timedelta(seconds=max(0, reset_seconds))
+        if reset is not None:
+            if reset.tzinfo is None:
+                reset = reset.replace(tzinfo=timezone.utc)
+            return _clamp_reset_at(reset, now), "codex-plus"
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None) if response is not None else None
 

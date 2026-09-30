@@ -20,6 +20,8 @@ from mimir.billing import (
     evaluate_quota_severity,
     parse_codex_usage_payload,
     poll_codex_usage_once,
+    record_codex_plus_rate_limits,
+    record_codex_plus_rejection,
     OpenAIQuotaProvider,
 )
 from mimir.budget import HomeostaticArbiter
@@ -1300,6 +1302,357 @@ def _codex_usage_payload(*, pro: bool = False, used: float = 12.0) -> dict:
             "reset_at": now + 6 * 86400,
         }
     return {"plan_type": "pro" if pro else "plus", "rate_limit": rate_limit}
+
+
+def test_codex_usage_verdict_rejects_limiting_window_and_saturates_gate(
+    tmp_path, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append({"type": kind, **fields}),
+    )
+    payload = _codex_usage_payload(pro=True, used=95)
+    payload["rate_limit"].update(allowed=False, limit_reached=True)
+    parsed = parse_codex_usage_payload(payload)
+    store = RateLimitStore(tmp_path / "rl.json")
+
+    assert record_codex_plus_rate_limits(store, parsed, source="probe")
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "rejected"
+    assert snap.utilization == pytest.approx(0.95)
+    assert events[-1]["recorded"]["seven_day"]["status"] == "rejected"
+    result = evaluate_quota_severity([OpenAIQuotaProvider(store)])
+    assert result.severity is Severity.TIGHT
+    assert result.reason == "quota_saturated:openai:seven_day@1.00"
+
+
+@pytest.mark.parametrize("verdict", [
+    {"allowed": True, "limit_reached": True},
+    {"allowed": False, "limit_reached": False},
+])
+def test_each_codex_rejection_verdict_is_independently_binding(tmp_path, verdict):
+    payload = _codex_usage_payload(pro=True, used=20)
+    payload["rate_limit"].update(verdict)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "rejected"
+    assert snap.utilization == pytest.approx(0.20)
+    assert evaluate_quota_severity(
+        [OpenAIQuotaProvider(store)]
+    ).severity is Severity.TIGHT
+
+
+@pytest.mark.parametrize("verdict", [
+    {"allowed": True, "limit_reached": False},
+    {},
+])
+def test_codex_usage_allowed_or_absent_verdict_stays_allowed(tmp_path, verdict):
+    payload = _codex_usage_payload(pro=True, used=25)
+    payload["rate_limit"].update(verdict)
+    parsed = parse_codex_usage_payload(payload)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rate_limits(store, parsed, source="probe")
+    assert store.current()["openai_seven_day"].status == "allowed"
+
+
+def test_codex_probe_uses_rolling_max_and_reports_inconsistency(
+    tmp_path, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append({"type": kind, **fields}),
+    )
+    store = RateLimitStore(tmp_path / "rl.json")
+    base = datetime.now(tz=timezone.utc)
+
+    def record(minutes: int, used: float) -> None:
+        parsed = parse_codex_usage_payload(_codex_usage_payload(pro=True, used=used))
+        assert record_codex_plus_rate_limits(
+            store, parsed, source="probe",
+            observed_at=(base + timedelta(minutes=minutes)).isoformat(),
+        )
+
+    record(0, 100)
+    record(1, 94)
+    record(2, 0)
+    assert [event["recorded"]["seven_day"]["utilization"] for event in events] == [
+        1.0, 1.0, 1.0,
+    ]
+    assert events[-1]["inconsistent"] is True
+    assert events[-1]["min_utilization"] == 0.0
+    assert events[-1]["max_utilization"] == 1.0
+
+    record(16, 94)
+    assert events[-1]["recorded"]["seven_day"]["utilization"] == pytest.approx(0.94)
+
+
+class _CodexUsageLimitError(RuntimeError):
+    def __init__(self, reset_at: int):
+        super().__init__("usage limit reached")
+        self.status_code = 429
+        self.type = "usage_limit_reached"
+        self.raw = {"error": {
+            "type": self.type, "resets_at": reset_at,
+            "limit_window_minutes": 10080,
+        }}
+        self.headers = {}
+
+
+def test_generation_rejection_beats_probe_until_successful_generation(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    reset_at = int(time.time()) + 3 * 86400
+    assert record_codex_plus_rejection(store, _CodexUsageLimitError(reset_at))
+    assert store.current()["openai_seven_day"].status == "rejected"
+
+    payload = _codex_usage_payload(pro=True, used=95)
+    payload["rate_limit"].update(allowed=True, limit_reached=False)
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    assert store.current()["openai_seven_day"].status == "rejected"
+
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="response",
+    )
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "allowed"
+    assert snap.utilization == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize("minutes,key", [
+    (300, "openai_five_hour"), (10080, "openai_seven_day"),
+])
+def test_codex_generation_rejection_uses_real_error_headers_not_reset_horizon(
+    tmp_path, monkeypatch, minutes, key,
+):
+    from langchain_codex_plus import CodexResponseError
+
+    # Use the real exception type and its public shape, without binding this
+    # regression to the adapter's exception-constructor signature.
+    exc = CodexResponseError.__new__(CodexResponseError)
+    Exception.__init__(exc, "usage limit reached")
+    exc.status_code = 429
+    exc.type = "usage_limit_reached"
+    exc.code = None
+    exc.raw = {"error": {
+        "type": exc.type, "resets_at": int(time.time()) + 60,
+    }}
+    exc.headers = {
+        "x-codex-primary-window-minutes": str(minutes),
+        "x-codex-primary-used-percent": "100",
+        "x-codex-secondary-window-minutes": "10080" if minutes == 300 else "300",
+        "x-codex-secondary-used-percent": "10",
+    }
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rejection(store, exc)
+    assert set(store.current()) == {key}
+    assert store.current()[key].status == "rejected"
+    assert events[-1][0] == "codex_plus_usage_ok"
+    assert events[-1][1]["recorded"][key.removeprefix("openai_")]["status"] == "rejected"
+
+    payload = _codex_usage_payload(pro=True, used=1)
+    payload["rate_limit"].update(allowed=True, limit_reached=False)
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    assert store.current()[key].status == "rejected"
+    assert evaluate_quota_severity([OpenAIQuotaProvider(store)]).severity is Severity.TIGHT
+
+
+@pytest.mark.parametrize("minutes,key", [
+    (300, "openai_five_hour"), (10080, "openai_seven_day"),
+])
+def test_codex_rejection_body_window_does_not_depend_on_reset_time(tmp_path, minutes, key):
+    exc = _CodexUsageLimitError(int(time.time()) + 60)
+    exc.raw["error"]["limit_window_minutes"] = minutes
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rejection(store, exc)
+    assert set(store.current()) == {key}
+
+
+def test_codex_probe_preserves_missing_generation_rejection_without_reset(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_five_hour", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=None,
+    ))
+    assert store.reconcile_codex_probe_sync(
+        {"openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.01)},
+        owned_keys=("openai_five_hour", "openai_seven_day"), observed_epoch=time.time(),
+    )[0]
+    assert store.current()["openai_five_hour"].status == "rejected"
+
+
+def test_codex_probe_removes_expired_missing_generation_rejection(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    now = time.time()
+    assert store.record_codex_rejection_sync("openai_five_hour", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(now) - 1,
+    ))
+    assert store.reconcile_codex_probe_sync(
+        {"openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.01)},
+        owned_keys=("openai_five_hour", "openai_seven_day"), observed_epoch=now,
+    )[0]
+    assert set(store.current()) == {"openai_seven_day"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["gpt-5.6-luna", "gpt-6.1-sol"])
+async def test_codex_canary_uses_configured_model_through_chat_adapter(
+    tmp_path, monkeypatch, model_name,
+):
+    from langchain_codex_plus import ChatCodexPlus
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:" + model_name)
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    seen = []
+
+    async def fake_generate(self, messages, **kwargs):
+        # Keep ChatCodexPlus construction and LangChain invocation real; replace
+        # only its generation/transport boundary (no OAuth or network in tests).
+        seen.append((self.model, messages, self.reasoning_effort))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", fake_generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    await run_codex_quota_canary(store, auth_path=tmp_path / "unused-auth.json")
+    assert len(seen) == 1
+    assert seen[0][0] == model_name
+    assert seen[0][1][0].content == "ping"
+    assert seen[0][2] is None
+    assert store.current()["openai_seven_day"].status == "allowed"
+
+
+@pytest.mark.asyncio
+async def test_codex_canary_non_codex_spec_uses_first_live_model(tmp_path, monkeypatch):
+    import aiohttp
+    from langchain_codex_plus import ChatCodexPlus
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-sonnet-4-6")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "test-token")
+    requests, generations, closes = [], [], []
+
+    def configured_adapter(**kwargs):
+        return ChatCodexPlus(client_version="0.159.1-test", **kwargs)
+
+    monkeypatch.setattr("langchain_codex_plus.ChatCodexPlus", configured_adapter)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            closes.append(True)
+
+        def get(self, endpoint, *, params, headers, timeout):
+            requests.append((endpoint, params, headers, timeout.total))
+            return _UsageResponse(200, {"models": [
+                {"slug": "first-live-model"}, {"slug": "second-live-model"},
+            ]})
+
+    async def generate(self, messages, **kwargs):
+        generations.append((self.model, self.client_version, self.reasoning_effort,
+                            self.auth_file_path, messages[0].content))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    await run_codex_quota_canary(store, auth_path=auth_path)
+    assert len(generations) == len(requests) == len(closes) == 1
+    model, version, effort, used_auth_path, prompt = generations[0]
+    assert (model, effort, used_auth_path, prompt) == (
+        "first-live-model", None, auth_path, "ping",
+    )
+    assert requests[0] == (
+        "https://chatgpt.com/backend-api/codex/models",
+        {"client_version": version},
+        {"Authorization": "Bearer test-token", "Accept": "application/json",
+         "User-Agent": "codex-cli (mimir quota recheck)",
+         "ChatGPT-Account-Id": "acct-secret"},
+        15.0,
+    )
+    assert version == "0.159.1-test"
+    assert store.current()["openai_seven_day"].status == "allowed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [
+    (503, {"error": "private-response-must-not-leak"}),
+    (200, "private-response-must-not-leak"),
+    (200, {"models": []}),
+    (200, {"models": [{"slug": ""}, {"slug": "later-model"}]}),
+    (200, {"models": [{"slug": 123}]}),
+])
+async def test_codex_canary_listing_failure_preserves_rejection(
+    tmp_path, monkeypatch, status, body,
+):
+    import aiohttp
+    from langchain_codex_plus import ChatCodexPlus
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-other")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "test-token")
+    closes = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            closes.append(True)
+
+        def get(self, *_args, **_kwargs):
+            return _UsageResponse(status, body)
+
+    async def generate(*_args, **_kwargs):
+        pytest.fail("listing failure must not attempt generation")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    before = (tmp_path / "rl.json").read_bytes()
+    with pytest.raises(ValueError, match="codex_canary_models_") as error:
+        await run_codex_quota_canary(store, auth_path=auth_path)
+    assert "private-response" not in str(error.value)
+    assert closes == [True]
+    assert (tmp_path / "rl.json").read_bytes() == before
+
+
+def test_codex_canary_documentation_preserves_shared_knob():
+    root = Path(__file__).resolve().parents[1]
+    for relative in ("SPEC.md", "docs/configuration.md"):
+        text = (root / relative).read_text()
+        for required in ("MIMIR_QUOTA_RECHECK_SECONDS", "180", "30",
+                         "15-minute", "4 per hour", "/codex/models",
+                         "quota_pause_recheck", "quota_pause_cleared"):
+            assert required in text, (relative, required)
 
 
 def test_parse_codex_usage_maps_plus_and_pro_by_declared_duration():

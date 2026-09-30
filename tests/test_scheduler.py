@@ -5842,6 +5842,21 @@ def _record_pause(home: Path, *, reason: str = "quota_exhausted",
     return tracker
 
 
+def _record_codex_pause(home: Path, *, hours_ahead: float = 48.0):
+    from datetime import datetime, timedelta, timezone
+    from mimir.quota_pause import QuotaPauseTracker
+
+    tracker = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
+    now = datetime.now(tz=timezone.utc)
+    tracker.pause_until(
+        now + timedelta(hours=hours_ahead),
+        reason="quota_exhausted",
+        provider="codex-plus",
+        now=now,
+    )
+    return tracker
+
+
 def _fresh_snap(store, key: str, util: float, *, minutes_ago: float = 1.0):
     from datetime import datetime, timedelta, timezone
     from mimir.rate_limits import RateLimitSnapshot
@@ -6167,6 +6182,222 @@ async def test_quota_recheck_early_clear_disarms_recovery_wake(tmp_path: Path):
     assert len(enqueued) == 1
     assert sched._scheduler.get_job(_QUOTA_RECOVERY_JOB_ID) is None
     assert sched._scheduler.get_job(_QUOTA_RECHECK_JOB_ID) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_requires_canary_and_clears_on_success(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued = []
+    sched, home, _store = _paused_scheduler(tmp_path, enqueued)
+    _record_codex_pause(home)
+    calls = []
+
+    async def allowed(*_args, **kwargs):
+        assert kwargs["require_allowed"] is True
+        return True
+
+    async def canary(*_args, **_kwargs):
+        calls.append("canary")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", canary)
+    await sched._recheck_quota_pause()
+
+    assert calls == ["canary"]
+    assert not QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json"
+    ).is_paused().paused
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [cleared] = [event for event in events if event["type"] == "quota_pause_cleared"]
+    assert cleared["reason"] == "recheck_succeeded"
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_denied_usage_skips_canary(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued = []
+    sched, home, _store = _paused_scheduler(tmp_path, enqueued)
+    _record_codex_pause(home)
+    calls = []
+
+    async def denied(*_args, **_kwargs):
+        return False
+
+    async def canary(*_args, **_kwargs):
+        calls.append("canary")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", denied)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", canary)
+    await sched._recheck_quota_pause()
+
+    assert calls == []
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json"
+    ).is_paused().paused
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [outcome] = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert outcome["outcome"] == "still_limited"
+    assert outcome["stage"] == "usage"
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_failed_canary_does_not_clear(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued = []
+    sched, home, _store = _paused_scheduler(tmp_path, enqueued)
+    _record_codex_pause(home)
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def failed(*_args, **_kwargs):
+        raise RuntimeError("canary failed")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", failed)
+    await sched._recheck_quota_pause()
+
+    assert QuotaPauseTracker(
+        home / ".mimir" / "quota_pause.json"
+    ).is_paused().paused
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_refreshes_usage_limit_pause(
+    tmp_path: Path, monkeypatch,
+):
+    from mimir.quota_pause import QuotaPauseTracker
+
+    enqueued = []
+    sched, home, _store = _paused_scheduler(tmp_path, enqueued)
+    original = _record_codex_pause(home)
+    refreshed_reset = int(original.reset_at.timestamp()) + 3600
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def rejected(*_args, **_kwargs):
+        exc = RuntimeError("usage limit reached")
+        exc.status_code = 429
+        exc.type = "usage_limit_reached"
+        exc.raw = {"error": {"type": exc.type, "resets_at": refreshed_reset}}
+        exc.rate_limits = None
+        raise exc
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", rejected)
+    await sched._recheck_quota_pause()
+
+    refreshed = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
+    assert refreshed.is_paused().paused
+    assert int(refreshed.reset_at.timestamp()) == refreshed_reset
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [outcome] = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert outcome["outcome"] == "still_limited"
+    assert outcome["stage"] == "canary"
+    assert outcome["exception_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_never_canaries_without_pause(
+    tmp_path: Path, monkeypatch,
+):
+    enqueued = []
+    sched, _home, _store = _paused_scheduler(tmp_path, enqueued)
+    calls = []
+
+    async def canary(*_args, **_kwargs):
+        calls.append("canary")
+
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", canary)
+    await sched._recheck_quota_pause()
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_codex_quota_recheck_caps_canaries_at_four_per_hour(
+    tmp_path: Path, monkeypatch,
+):
+    enqueued = []
+    sched, home, _store = _paused_scheduler(tmp_path, enqueued)
+    _record_codex_pause(home)
+    calls = []
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def failed(*_args, **_kwargs):
+        calls.append("canary")
+        raise RuntimeError("still unavailable")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", failed)
+    clock = [0.0]
+    monkeypatch.setattr("mimir.scheduler.time.monotonic", lambda: clock[0])
+    # Isolate the independent hourly cap from the 15-minute throttle.
+    monkeypatch.setattr("mimir.scheduler._CODEX_QUOTA_RECHECK_SECONDS", 1)
+    for _ in range(5):
+        await sched._recheck_quota_pause()
+        clock[0] += 1
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize("configured,expected", [
+    (None, 180), ("75", 75), ("1", 30), ("invalid", 180),
+])
+def test_shared_quota_recheck_cadence_preserves_env_knob(monkeypatch, configured, expected):
+    from mimir.scheduler import _quota_recheck_seconds
+
+    if configured is None:
+        monkeypatch.delenv("MIMIR_QUOTA_RECHECK_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_QUOTA_RECHECK_SECONDS", configured)
+    assert _quota_recheck_seconds() == expected
+
+
+@pytest.mark.asyncio
+async def test_codex_canary_cadence_is_fifteen_minutes_not_shared_interval(
+    tmp_path, monkeypatch,
+):
+    sched, home, _store = _paused_scheduler(tmp_path, [])
+    _record_codex_pause(home)
+    clock = [0.0]
+    monkeypatch.setattr("mimir.scheduler.time.monotonic", lambda: clock[0])
+    monkeypatch.setenv("MIMIR_QUOTA_RECHECK_SECONDS", "30")
+    calls = []
+    probes = []
+
+    async def allowed(*args, **kwargs):
+        probes.append(clock[0])
+        return True
+
+    async def failed(*args, **kwargs):
+        calls.append(clock[0])
+        raise RuntimeError("not a quota error; secret diagnostic text")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", failed)
+    for tick in (0, 30, 180, 899, 900):
+        clock[0] = tick
+        await sched._recheck_quota_pause()
+    assert calls == [0, 900]
+    assert probes == [0, 900]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    outcomes = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert len(outcomes) == 2
+    assert all(e["outcome"] == "error" for e in outcomes)
+    assert all(e["exception_type"] == "RuntimeError" for e in outcomes)
+    assert all(e["classification_kind"] == "unknown" for e in outcomes)
+    assert "secret diagnostic text" not in str(outcomes)
 
 
 # ─── chainlink #508: deliver: channel ────────────────────────────────

@@ -208,7 +208,10 @@ class HomeostaticArbiter:
                 visible.update(filter_to_active_provider(current, provider))
             current = visible
         for key, snap in current.items():
-            if snap.utilization is None:
+            effective_utilization = (
+                1.0 if snap.status == "rejected" else snap.utilization
+            )
+            if effective_utilization is None:
                 continue
             # Only finite, declared quota windows can be a hard plan wall.
             # Unknown payload keys have no refresh/expiry contract, while
@@ -229,8 +232,8 @@ class HomeostaticArbiter:
                 and _is_stale_observation(snap.observed_at, window_hours)
             ):
                 continue
-            if worst_util is None or snap.utilization > worst_util:
-                worst_util = snap.utilization
+            if worst_util is None or effective_utilization > worst_util:
+                worst_util = effective_utilization
                 worst_key = key
                 worst_resets_at = snap.resets_at
 

@@ -234,6 +234,10 @@ class UsagePoint:
     resets_at: int | None  # unix epoch seconds; None if absent
     projection: float | None = None  # projected end-of-window utilization
     pressure: str = "clear"
+    status: str = "allowed"
+    inconsistent: bool = False
+    min_utilization: float | None = None
+    max_utilization: float | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -242,6 +246,10 @@ class UsagePoint:
             "resets_at": self.resets_at,
             "projection": self.projection,
             "pressure": self.pressure,
+            "status": self.status,
+            "inconsistent": self.inconsistent,
+            "min_utilization": self.min_utilization,
+            "max_utilization": self.max_utilization,
         }
 
 
@@ -306,11 +314,25 @@ def normalize_subscription_events(
                     utilization=util,
                     resets_at=resets,
                     projection=projection,
-                    pressure=_pressure_label(util, projection),
+                    pressure=(
+                        "blocked" if snap.get("status") == "rejected"
+                        else _pressure_label(util, projection)
+                    ),
+                    status=str(snap.get("status") or "allowed"),
+                    inconsistent=snap.get("inconsistent") is True,
+                    min_utilization=_optional_float(snap.get("min_utilization")),
+                    max_utilization=_optional_float(snap.get("max_utilization")),
                 ),
             )
     # Convert nested defaultdicts to plain dicts for serialization.
     return {p: dict(w) for p, w in out.items()}
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _downsample_last_per_bucket(

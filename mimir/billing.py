@@ -165,6 +165,7 @@ class QuotaWindow:
     on_pace_utilization: Optional[float]
     resets_at: Optional[int]
     derived: bool = False
+    status: str = "allowed"
 
 
 class QuotaProvider(ABC):
@@ -296,6 +297,7 @@ class _StorageBackedQuotaProvider(QuotaProvider):
                     on_pace_utilization=on_pace,
                     resets_at=snap.resets_at,
                     derived=is_derived,
+                    status=snap.status,
                 )
             )
         return out
@@ -395,6 +397,7 @@ def record_codex_plus_rate_limits(
     rl: Any,
     *,
     observed_at: str | None = None,
+    source: str = "response",
 ) -> bool:
     """Validate, classify, and atomically persist one Codex quota reading."""
     import datetime as _dt
@@ -413,6 +416,28 @@ def record_codex_plus_rate_limits(
 
     recorded: dict[str, dict[str, Any]] = {}
     updates: dict[str, RateLimitSnapshot] = {}
+    rejected = (
+        getattr(rl, "limit_reached", None) is True
+        or getattr(rl, "allowed", None) is False
+    )
+    usable_windows = [
+        window for window in (
+            getattr(rl, "primary", None), getattr(rl, "secondary", None)
+        )
+        if window is not None and getattr(window, "used_percent", None) is not None
+    ]
+    def _used_for_order(window: Any) -> float:
+        try:
+            value = float(getattr(window, "used_percent", -1))
+        except (TypeError, ValueError):
+            return -1.0
+        return value if math.isfinite(value) else -1.0
+
+    limiting_window = max(
+        usable_windows,
+        key=_used_for_order,
+        default=None,
+    )
     for window in (getattr(rl, "primary", None), getattr(rl, "secondary", None)):
         if window is None or getattr(window, "used_percent", None) is None:
             continue
@@ -463,8 +488,9 @@ def record_codex_plus_rate_limits(
         else:
             effective_reset = None
 
+        status = "rejected" if rejected and window is limiting_window else "allowed"
         updates[store_key] = RateLimitSnapshot(
-            status="allowed",
+            status=status,
             utilization=util,
             resets_at=effective_reset,
             reset_after_seconds=reset_after,
@@ -473,15 +499,47 @@ def record_codex_plus_rate_limits(
         recorded[short] = {
             "utilization": util,
             "resets_at": effective_reset,
-            "status": "allowed",
+            "status": status,
         }
     if not updates:
         return False
-    store.reconcile_sync(
-        updates, owned_keys=provider_store_keys(CODEX_PLUS.provider)
-    )
+    inconsistency: dict[str, tuple[float, float, bool]] = {}
+    if source == "probe":
+        persisted, inconsistency = store.reconcile_codex_probe_sync(
+            updates,
+            owned_keys=provider_store_keys(CODEX_PLUS.provider),
+            observed_epoch=observed_epoch,
+        )
+    else:
+        persisted = store.reconcile_sync(
+            updates, owned_keys=provider_store_keys(CODEX_PLUS.provider)
+        )
+    if not persisted:
+        return False
+    inconsistent_lows: list[float] = []
+    inconsistent_highs: list[float] = []
+    for store_key, (low, high, inconsistent) in inconsistency.items():
+        short = store_key.removeprefix("openai_")
+        if short not in recorded:
+            continue
+        recorded[short]["utilization"] = updates[store_key].utilization
+        recorded[short]["status"] = updates[store_key].status
+        recorded[short]["resets_at"] = updates[store_key].resets_at
+        recorded[short]["inconsistent"] = inconsistent
+        recorded[short]["min_utilization"] = low
+        recorded[short]["max_utilization"] = high
+        if inconsistent:
+            inconsistent_lows.append(low)
+            inconsistent_highs.append(high)
     try:
-        log_event_sync("codex_plus_usage_ok", recorded=recorded)
+        fields: dict[str, Any] = {"recorded": recorded}
+        if inconsistent_lows:
+            fields.update(
+                inconsistent=True,
+                min_utilization=min(inconsistent_lows),
+                max_utilization=max(inconsistent_highs),
+            )
+        log_event_sync("codex_plus_usage_ok", **fields)
     except (RuntimeError, OSError):
         pass
     return True
@@ -602,11 +660,20 @@ def parse_codex_usage_payload(data: Any) -> Any:
             reset_after_seconds=raw.get("reset_after_seconds"),
         )
 
+    for verdict_name in ("allowed", "limit_reached"):
+        verdict = rate_limit.get(verdict_name)
+        if verdict is not None and not isinstance(verdict, bool):
+            raise CodexUsageSchemaError(f"invalid_{verdict_name}")
     primary = _window("primary_window")
     secondary = _window("secondary_window")
     if primary is None and secondary is None:
         raise CodexUsageSchemaError("no_quota_windows")
-    return SimpleNamespace(primary=primary, secondary=secondary)
+    return SimpleNamespace(
+        primary=primary,
+        secondary=secondary,
+        allowed=rate_limit.get("allowed"),
+        limit_reached=rate_limit.get("limit_reached"),
+    )
 
 
 async def poll_codex_usage_once(
@@ -616,6 +683,7 @@ async def poll_codex_usage_once(
     endpoint: str = CODEX_USAGE_ENDPOINT,
     timeout_seconds: float = CODEX_USAGE_TIMEOUT_SECONDS,
     session: Any = None,
+    require_allowed: bool = False,
 ) -> bool:
     """Refresh Codex quota without generation; preserve state on all failures."""
     import aiohttp
@@ -682,10 +750,179 @@ async def poll_codex_usage_once(
         store,
         rate_limits,
         observed_at=observed_at,
+        source="probe",
     )
     if not recorded:
         return await _failed("schema", error="no_usable_windows")
+    if require_allowed:
+        return rate_limits.allowed is True and rate_limits.limit_reached is not True
     return True
+
+
+def _codex_error_body(exc: BaseException) -> dict[str, Any] | None:
+    raw = getattr(exc, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    error = raw.get("error", raw)
+    return error if isinstance(error, dict) else None
+
+
+def record_codex_plus_rejection(
+    store: RateLimitStore,
+    exc: BaseException,
+    *,
+    observed_at: str | None = None,
+) -> bool:
+    """Persist an enforced ``usage_limit_reached`` generation verdict."""
+    body = _codex_error_body(exc)
+    try:
+        status_code = int(getattr(exc, "status_code", 0))
+    except (TypeError, ValueError):
+        return False
+    error_type = getattr(exc, "type", None)
+    if error_type is None and body is not None:
+        error_type = body.get("type")
+    if status_code != 429 or error_type != "usage_limit_reached":
+        return False
+
+    now = datetime.now(tz=timezone.utc)
+    observed = observed_at or now.isoformat()
+    reset_at: int | None = None
+    if body is not None:
+        raw_reset = body.get("resets_at")
+        if isinstance(raw_reset, str):
+            try:
+                reset_at = int(datetime.fromisoformat(
+                    raw_reset.replace("Z", "+00:00")
+                ).timestamp())
+            except ValueError:
+                reset_at = None
+        elif isinstance(raw_reset, (int, float)) and not isinstance(raw_reset, bool):
+            reset_at = int(raw_reset)
+        raw_seconds = body.get("resets_in_seconds")
+        if reset_at is None and isinstance(raw_seconds, (int, float)) and not isinstance(raw_seconds, bool):
+            reset_at = int(now.timestamp() + max(0, raw_seconds))
+
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    # Classify the window from CodexResponseError's headers/raw evidence.
+    # A nearly-expired seven-day window is still seven-day: never infer its
+    # identity from the remaining reset horizon.
+    headers = getattr(exc, "headers", None)
+    headers = (
+        {str(key).lower(): value for key, value in headers.items()}
+        if hasattr(headers, "items") else {}
+    )
+    candidates: list[tuple[float, str]] = []
+    for name in ("primary", "secondary"):
+        minutes = finite_number(headers.get(f"x-codex-{name}-window-minutes"))
+        used = finite_number(headers.get(f"x-codex-{name}-used-percent"))
+        key = {300: "openai_five_hour", 10080: "openai_seven_day"}.get(minutes)
+        if key is not None:
+            candidates.append((used if used is not None else -1.0, key))
+    store_key = max(candidates, key=lambda item: item[0])[1] if candidates else None
+    if store_key is None and body is not None:
+        minutes = finite_number(body.get("limit_window_minutes"))
+        store_key = {300: "openai_five_hour", 10080: "openai_seven_day"}.get(minutes)
+    if store_key is None:
+        # No window evidence: preserve an enforced verdict conservatively,
+        # without pretending the reset timestamp identifies the window.
+        store_key = "openai_five_hour"
+    persisted = store.record_codex_rejection_sync(
+        store_key,
+        RateLimitSnapshot(
+            status="rejected",
+            utilization=1.0,
+            resets_at=reset_at,
+            observed_at=observed,
+        ),
+    )
+    if persisted:
+        from .event_logger import log_event_sync
+
+        try:
+            log_event_sync("codex_plus_usage_ok", recorded={
+                store_key.removeprefix("openai_"): {
+                    "status": "rejected", "utilization": 1.0,
+                    "resets_at": reset_at,
+                },
+            })
+        except (RuntimeError, OSError):
+            pass
+    return persisted
+
+
+async def _first_codex_canary_model(
+    *, auth_path: Path | None, client_version: str,
+) -> str:
+    """Read the first live catalogue model without hardcoding a model/version."""
+    import aiohttp
+
+    from .codex_auth import CODEX_API_BASE, load_codex_auth
+
+    auth = await asyncio.to_thread(load_codex_auth, auth_path)
+    if auth is None:
+        raise ValueError("codex_canary_auth_missing")
+    headers = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli (mimir quota recheck)",
+    }
+    if auth.account_id:
+        headers["ChatGPT-Account-Id"] = auth.account_id
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{CODEX_API_BASE}/codex/models",
+            params={"client_version": client_version},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=CODEX_USAGE_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status != 200:
+                raise ValueError("codex_canary_models_http_error")
+            try:
+                data = json.loads(await response.text())
+            except (json.JSONDecodeError, UnicodeError):
+                raise ValueError("codex_canary_models_invalid_json") from None
+    models = data.get("models") if isinstance(data, dict) else None
+    first = models[0] if isinstance(models, list) and models else None
+    slug = first.get("slug") if isinstance(first, dict) else None
+    if not isinstance(slug, str) or not slug.strip():
+        raise ValueError("codex_canary_models_missing_first_slug")
+    return slug.strip()
+
+
+async def run_codex_quota_canary(
+    store: RateLimitStore,
+    *,
+    auth_path: Path | None = None,
+) -> None:
+    """Make one minimal generation call; raise unchanged on refusal."""
+    from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
+    from .config import model_spec_at_call_time
+
+    provider, separator, model_name = model_spec_at_call_time().partition(":")
+    configured_codex = provider == "codex-plus" and separator and model_name.strip()
+    model = ChatCodexPlus(
+        **({"model": model_name.strip()} if configured_codex else {}),
+        auth_file_path=auth_path,
+        rate_limit_callback=make_codex_plus_rate_limit_callback(store),
+    )
+    if not configured_codex:
+        # Other providers may drive the main agent while Saga/Worklink uses
+        # Codex. Match the adapter's configured protocol version, and replace
+        # its default model before any generation with the first live slug.
+        model.model = await _first_codex_canary_model(
+            auth_path=auth_path, client_version=model.client_version,
+        )
+    await model.ainvoke("ping")
+    await asyncio.to_thread(store.clear_codex_generation_rejections_sync)
 
 
 # ─── Auto-discovery: which QuotaProvider(s) to register at boot ───────
@@ -955,24 +1192,34 @@ def evaluate_quota_severity(
             continue
         for w in windows:
             pname = provider.provider_name
+            effective_utilization = (
+                1.0 if w.status == "rejected" else w.utilization
+            )
+            if w.status == "rejected":
+                candidates.append((
+                    Severity.TIGHT, 0, 1.0,
+                    f"quota_saturated:{pname}:{w.key}@1.00",
+                    pname, w.key, None, None,
+                ))
+                continue
             # Pace signal first — the raw wall consults it below.
             m: Optional[float] = None
             gamma: Optional[float] = None
             if (
                 w.on_pace_utilization is not None
-                and w.utilization is not None
+                and effective_utilization is not None
             ):
-                m = burst_multiple(w.utilization, w.on_pace_utilization)
+                m = burst_multiple(effective_utilization, w.on_pace_utilization)
                 if m is not None:
                     # elapsed_fraction = util / on_pace (P = u / ef).
                     # Both inputs are positive per burst_multiple's
                     # guards.
-                    elapsed_fraction = w.utilization / w.on_pace_utilization
+                    elapsed_fraction = effective_utilization / w.on_pace_utilization
                     gamma = min(1.0, elapsed_fraction / ramp_fraction)
 
-            if w.utilization is not None:
+            if effective_utilization is not None:
                 w_threshold = _raw_threshold_for(w, raw_threshold)
-                if w.utilization >= w_threshold:
+                if effective_utilization >= w_threshold:
                     # Coasting demotion: when this window's own pace
                     # shows the cap won't be hit (M clears the
                     # ELEVATED edge — e.g. 85% used, slow pace, reset
@@ -992,8 +1239,8 @@ def evaluate_quota_severity(
                     ):
                         wall_severity = Severity.ELEVATED
                     candidates.append((
-                        wall_severity, 0, w.utilization,
-                        f"quota_saturated:{pname}:{w.key}@{w.utilization:.2f}",
+                        wall_severity, 0, effective_utilization,
+                        f"quota_saturated:{pname}:{w.key}@{effective_utilization:.2f}",
                         pname, w.key, m, gamma,
                     ))
 
