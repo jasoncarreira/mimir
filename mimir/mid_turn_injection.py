@@ -251,6 +251,11 @@ def inject_authenticated_message(
             approval_event=event,
             reply_source=reply_source,
         )
+        from .memory_proposals import is_mp_reply
+        if (resolution.entry is not None and not resolution.entry.inject_into_turn
+                or resolution.entry is None and is_mp_reply(event)):
+            event.extra["_memory_proposal_resolution"] = resolution
+            return "consumed"
         if resolution.message:
             event.extra["operator_approval_reply"] = resolution.message
         if resolution.status == "granted" and resolution.entry is not None and resolution.entry.kind == "op":

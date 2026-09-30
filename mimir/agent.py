@@ -1458,6 +1458,9 @@ class Agent:
         # SagaStore handle so deepagents can call into recall.
         if saga_client is not None:
             self._try_inject_memory_client(saga_client)
+        if self._saga_store is not None:
+            from .memory_proposals import configure_approvals
+            configure_approvals(config.home, config.operator_alert_channel, self._saga_store)
 
     def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
         """If saga_client is a SagaStore (or wraps one at any depth),
@@ -1922,6 +1925,34 @@ class Agent:
         saga_session_id: str | None = None,
     ) -> TurnRecord:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
+        from .operator_approval import _is_authenticated_operator
+        from .memory_proposals import complete_reply, is_mp_reply, sync_pending
+        from .approval_requests import pending as pending_approvals, resolve as resolve_approval
+        bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
+        if _is_authenticated_operator(event, self._identity_resolver) and (is_mp_reply(event) or bare_reply):
+            sync_pending(self._config.home)
+            if is_mp_reply(event) or any(
+                entry.kind == "mp" for entry in pending_approvals(event.channel_id)
+            ):
+                resolution = resolve_approval(event, self._identity_resolver)
+            else:
+                resolution = None
+            if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
+                    or (resolution.entry is None and is_mp_reply(event))):
+                notice = await complete_reply(
+                    self._config.home, event, resolution, self._identity_resolver,
+                )
+                if notice and self._dispatcher is not None:
+                    await self._dispatcher._send_approval_notice(event.channel_id, notice)
+                elif notice and self._channels is not None:
+                    await self._channels.send(event.channel_id, notice, final=True)
+                return TurnRecord(
+                    ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
+                    session_id=session_id or event.channel_id or "default",
+                    saga_session_id=saga_session_id, trigger=event.trigger,
+                    channel_id=event.channel_id, input=event.content or "",
+                    output=notice or "", kind="memory_proposal_approval",
+                )
         turn_id = turn_id or make_turn_id()
         explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
