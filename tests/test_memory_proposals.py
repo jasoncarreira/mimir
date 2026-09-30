@@ -262,6 +262,105 @@ def test_store_identity_aliases_are_protected(proposal_turn, alias_kind):
     assert [match["path"] for match in backend.grep("A useful fact", "/").matches] == ["/public.jsonl"]
 
 
+@pytest.mark.parametrize("principal", ["poller", "human", "admin"])
+@pytest.mark.parametrize("alias_kind", ["ordinary", "hard_link", "directory_case", "filename_case"])
+def test_outbox_identity_and_backend_matrix(proposal_turn, principal, alias_kind):
+    from mimir.memory_proposals import is_protected_model_path
+    from mimir.readonly_backend import WriteGuardBackend
+    from mimir.read_policy import is_protected_read_path
+
+    env = proposal_turn
+    live = env.home / "state/social-outbox/feed/x.yaml"
+    live.parent.mkdir(parents=True)
+    live.write_text("dispatch: public-outbox-marker\n")
+    alias = live
+    if alias_kind == "hard_link":
+        alias = env.home / "outbox-alias.yaml"
+        alias.hardlink_to(live)
+    elif alias_kind != "ordinary":
+        probe = env.home / "case-probe"
+        probe.write_text("fixture")
+        if not (env.home / "CASE-PROBE").exists():
+            pytest.skip("fixture filesystem is case-sensitive")
+        alias = (env.home / "State/Social-Outbox/feed/x.yaml"
+                 if alias_kind == "directory_case" else live.with_name("X.YAML"))
+    assert alias.samefile(live)
+    assert is_protected_model_path(alias)
+    assert is_protected_read_path(alias)
+    auth = env.auth
+    if principal != "poller":
+        auth = create_auth_context(AgentEvent(
+            trigger="user_message", channel_id="web-operator", source="web",
+            source_id="message-1", author="viewer",
+        ), enforce=True, ifc_labels=env.labels)
+        if principal == "admin":
+            auth = replace(auth, roles=("admin",))
+    env.turn.auth_context = auth
+    backend = WriteGuardBackend(root_dir=env.home, writable_dirs=["."])
+    virtual = "/" + alias.relative_to(env.home).as_posix()
+    paths = (str(alias), virtual, virtual.lstrip("/"),
+             virtual.replace("/feed/", "/./feed/"), "/" + virtual)
+    for path in paths:
+        for tool in ("read_file", "aread", "ls", "als", "glob", "aglob",
+                     "grep", "agrep", "write_file", "edit_file"):
+            key = "file_path" if tool in {"read_file", "aread", "write_file", "edit_file"} else "path"
+            decision = get_tool_registry().authorize_tool(
+                tool, auth, enforce=False, target_channel=path, arguments={key: path},
+            )
+            assert not decision.allowed, (principal, tool, path)
+        assert backend.read(path).error
+        assert asyncio.run(backend.aread(path)).error
+        assert backend.ls(path).error
+        assert backend.write(path, "replacement").error
+        assert backend.edit(path, "public", "replacement").error
+    (env.home / "public.yaml").write_text("public-outbox-marker\n")
+    for result in (backend.glob("*.yaml", "/"), asyncio.run(backend.aglob("*.yaml", "/")),
+                   backend.grep("public-outbox-marker", "/"),
+                   asyncio.run(backend.agrep("public-outbox-marker", "/"))):
+        assert all(match["path"] == "/public.yaml" for match in result.matches)
+        if principal == "admin":
+            assert result.matches
+    assert not any("social-outbox" in entry["path"] for entry in backend.ls("/state").entries)
+
+
+def test_outbox_protection_before_creation_and_worktree_exclusion(proposal_turn):
+    from mimir.memory_proposals import is_protected_model_path
+
+    home = proposal_turn.home
+    assert is_protected_model_path(home / "state/social-outbox/feed/new.yaml")
+    assert not is_protected_model_path(home / "scratch/proposals/state/social-outbox/feed/new.yaml")
+
+
+@pytest.mark.parametrize("relative,protected", [
+    ("memory/channels/channel-b/loop/summary.md", False),
+    (".mimir/memory-proposals.jsonl", True),
+    ("state/social-outbox/feed/loop/post.yaml", True),
+])
+def test_unresolvable_paths_keep_protected_classification(
+    proposal_turn, monkeypatch, relative, protected,
+):
+    import errno
+    from mimir.memory_proposals import is_protected_model_path
+
+    candidate = proposal_turn.home / relative
+    original_resolve = Path.resolve
+
+    def python313_resolve(path, strict=False):
+        if path == candidate:
+            if strict:
+                raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+            # Python 3.13's non-strict resolution can retain a symlink loop.
+            return path
+        return original_resolve(path, strict=strict)
+
+    def failed_identity(*args):
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(Path, "resolve", python313_resolve)
+    monkeypatch.setattr("mimir.memory_proposals.same_model_target", failed_identity)
+    assert is_protected_model_path(candidate) is protected
+
+
 def test_protected_path_before_store_creation(proposal_turn):
     from mimir.memory_proposals import is_protected_proposal_path
 

@@ -35,6 +35,16 @@ class OutboundFinding:
 
 OutboundScan = list[OutboundFinding]
 
+
+def findings_require_refusal(findings: Iterable[OutboundFinding]) -> bool:
+    """Canonical rule: credentials always block; private terms/PII are opt-in."""
+    enforced = env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False)
+    return any(
+        finding.detector == "credential"
+        or (enforced and finding.detector in {"private_term", "pii"})
+        for finding in findings
+    )
+
 OUTBOX_PATTERNS = (
     "state/pollers/social-cli-*/outbox-*.yaml",
     "state/pollers/social-cli-*/outbox.yaml",

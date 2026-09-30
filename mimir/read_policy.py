@@ -284,6 +284,10 @@ def is_protected_read_path(path: Path) -> bool:
     except (OSError, RuntimeError):
         return True
 
+    from .memory_proposals import is_protected_model_path
+    if is_protected_model_path(path):
+        return True
+
     if _has_protected_read_name(resolved):
         return True
 
@@ -446,6 +450,9 @@ def protected_read_denial_reason(path: Path) -> str | None:
     from ._context import get_current_turn
 
     auth_context = getattr(get_current_turn(), "auth_context", None)
+    from .memory_proposals import is_protected_model_path
+    if is_protected_model_path(path):
+        return "protected_name_match"
     authority = getattr(auth_context, "service_authority", None)
     # The backend route spans the lease directory, not just this turn's lease.
     # Recheck the live grant so sibling or revoked checkouts cannot be read

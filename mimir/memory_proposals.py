@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import secrets
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -20,30 +21,85 @@ def proposal_path(home: Path) -> Path:
     return home / ".mimir" / "memory-proposals.jsonl"
 
 
-def is_protected_proposal_path(candidate: Path) -> bool:
-    """Unconditional model-file boundary, including resolved virtual aliases."""
+def same_model_target(target: Path, protected: Path) -> bool:
+    """Identity comparison, including case-equivalent names before creation."""
+    try:
+        return target.samefile(protected)
+    except FileNotFoundError:
+        if target.parent == target or protected.parent == protected:
+            return target == protected
+        if not same_model_target(target.parent, protected.parent):
+            return False
+        if target.name == protected.name:
+            return True
+        if target.exists() or protected.exists():
+            return False
+        parent = protected.parent
+        while not parent.exists():
+            parent = parent.parent
+        with tempfile.TemporaryDirectory(prefix=".mimir-path-probe-", dir=parent) as probe:
+            reference = Path(probe) / protected.name
+            reference.touch()
+            try:
+                return (Path(probe) / target.name).samefile(reference)
+            except FileNotFoundError:
+                return False
+
+
+def protected_model_targets(home: Path) -> tuple[tuple[Path, bool], ...]:
+    """Server-owned live targets; bool means the whole directory is protected.
+
+    Enumerate live outbox files as well as its root so hard links outside that
+    directory retain protection. Never cache: operator merges replace inodes.
+    Proposal worktrees are not live targets.
+    """
+    store = proposal_path(home)
+    outbox = home / "state/social-outbox"
+    targets = [(store, False), (store.parent, False), (outbox, True)]
+    if outbox.exists():
+        targets.extend((path, False) for path in outbox.rglob("*") if path.is_file())
+    return tuple(targets)
+
+
+def is_protected_model_path(candidate: Path) -> bool:
+    """One unconditional file boundary for all principals and file backends."""
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:
         return False
     try:
-        protected = proposal_path(Path(home).resolve()).resolve()
-        resolved = candidate.resolve()
-        # Path.resolve does not canonicalize case on all filesystems. File
-        # identity also covers case aliases and hard links to the same store.
-        for target in (protected, protected.parent):
-            try:
-                if os.path.samefile(resolved, target):
-                    return True
-            except (OSError, ValueError):
-                # A missing candidate/store still needs lexical protection,
-                # including writes before the proposal store is first created.
-                continue
-        return resolved in {protected, protected.parent}
+        # Python 3.13 leaves symlink loops unresolved with strict=False.
+        # Detect those errors before identity checks so unrelated bad paths
+        # retain their backend/service denial rather than a store denial.
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Future creates still need lexical and case-identity protection.
+            resolved = candidate.resolve()
     except (OSError, RuntimeError, ValueError):
-        # Unresolved unrelated paths retain their existing fail-closed guard;
-        # do not misclassify them as proposal-store accesses.
-        root = Path(home) / ".mimir"
-        return candidate == root or candidate.is_relative_to(root)
+        # Keep unresolved protected spellings closed; unrelated resolution
+        # failures retain the existing backend/service denial and its reason.
+        root = Path(home)
+        store = proposal_path(root)
+        outbox = root / "state/social-outbox"
+        return (candidate in {store, store.parent}
+                or candidate == outbox or candidate.is_relative_to(outbox))
+    try:
+        for target, recursive in protected_model_targets(Path(home).resolve()):
+            protected = target.resolve()
+            if resolved == protected or (recursive and resolved.is_relative_to(protected)):
+                return True
+            candidates = (resolved, *resolved.parents) if recursive else (resolved,)
+            if any(same_model_target(path, protected) for path in candidates):
+                return True
+        return False
+    except (OSError, RuntimeError, ValueError):
+        # A failed protected-target identity lookup must not grant access.
+        return True
+
+
+def is_protected_proposal_path(candidate: Path) -> bool:
+    """Compatibility name for the shared protected-model boundary."""
+    return is_protected_model_path(candidate)
 
 
 def queue_proposal(

@@ -1102,7 +1102,7 @@ _AUTHORITY_KEYS = frozenset({"profile", "tier", "capabilities", "scoped_roots"})
 #: Additive, and optional so every manifest written before it existed still
 #: registers. The required-key check above is deliberately "missing" rather than
 #: an exact-set comparison for that reason.
-_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read", "approved_urls"})
+_OPTIONAL_AUTHORITY_KEYS = frozenset({"shell_commands", "saga_full_corpus_read", "approved_urls", "proposal_surface"})
 _TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,
     CapabilityTier.SCOPED_WITH_PROVENANCE: 1,
@@ -1165,6 +1165,11 @@ def _parse_poller_authority(
     profile = raw["profile"]
     if not isinstance(profile, str) or profile not in TRIGGER_AUTHORITY_PROFILES:
         raise ValueError(f"unknown authority profile: {profile!r}")
+    proposal_surface = raw.get("proposal_surface", "wiki")
+    if not isinstance(proposal_surface, str) or proposal_surface not in ("wiki", "social-outbox"):
+        raise ValueError(f"unknown proposal_surface: {proposal_surface!r}")
+    if proposal_surface != "wiki" and profile != "research":
+        raise ValueError("proposal_surface requires research profile")
     try:
         tier = CapabilityTier(raw["tier"])
     except (TypeError, ValueError) as exc:
@@ -1316,6 +1321,7 @@ def _parse_poller_authority(
         saga_full_corpus_read=saga_full_corpus_read,
         declared_shell_commands=declared_shell_commands,
         approved_urls=tuple(approved_urls),
+        proposal_surface=proposal_surface,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
     )
 

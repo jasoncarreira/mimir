@@ -714,9 +714,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         from .read_policy import is_current_service_scoped_read_path, non_admin_read_filter_enabled
 
         resolved = self._resolve_path(key)
-        from .memory_proposals import is_protected_proposal_path
+        from .memory_proposals import is_protected_model_path
 
-        if is_protected_proposal_path(resolved):
+        if is_protected_model_path(resolved):
             raise ValueError("Read denied: protected_memory_proposal_path")
         auth = getattr(get_current_turn(), "auth_context", None)
         authority = getattr(auth, "service_authority", None)
@@ -737,9 +737,9 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         tool: str,
         on_withheld: Callable[[str], None] | None = None,
     ) -> bool:
-        from .memory_proposals import is_protected_proposal_path
+        from .memory_proposals import is_protected_model_path
 
-        if is_protected_proposal_path(path):
+        if is_protected_model_path(path):
             return True
         try:
             rel_parts = path.resolve().relative_to(self.cwd.resolve()).parts
@@ -1321,7 +1321,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         )
 
         self._resolve_read_path(path)
-        from .memory_proposals import is_protected_proposal_path
+        from .memory_proposals import is_protected_model_path
 
         filtering = non_admin_read_filter_enabled()
         if filtering:
@@ -1354,7 +1354,7 @@ class _BoundedFilesystemBackend(FilesystemBackend):
         filtered = [
             entry for entry in entries
             if Path(str(entry.get("path", "")).rstrip("/")).name not in self._traversal_excludes
-            and not is_protected_proposal_path(
+            and not is_protected_model_path(
                 self._resolve_path(str(entry.get("path", "")).rstrip("/")),
             )
         ]
@@ -1900,9 +1900,9 @@ class WriteGuardBackend:
         resolved = self._resolve_target(file_path)
         if resolved is None:
             return False
-        from .memory_proposals import is_protected_proposal_path
+        from .memory_proposals import is_protected_model_path
 
-        if is_protected_proposal_path(resolved):
+        if is_protected_model_path(resolved):
             return False
         # Resolved target must live under at least one writable root.
         # ``is_relative_to`` was added in Python 3.9; we depend on >=3.11.
@@ -1922,27 +1922,8 @@ class WriteGuardBackend:
         protected resource. Probe/stat errors propagate to the fail-closed
         guards. Do not cache identities: admin updates can replace the file.
         """
-        try:
-            return target.samefile(protected)
-        except FileNotFoundError:
-            if target.parent == target or protected.parent == protected:
-                return target == protected
-            if not WriteGuardBackend._same_write_target(target.parent, protected.parent):
-                return False
-            if target.name == protected.name:
-                return True
-            if target.exists() or protected.exists():
-                return False
-            parent = protected.parent
-            while not parent.exists():
-                parent = parent.parent
-            with tempfile.TemporaryDirectory(prefix=".mimir-path-probe-", dir=parent) as probe:
-                reference = Path(probe) / protected.name
-                reference.touch()
-                try:
-                    return (Path(probe) / target.name).samefile(reference)
-                except FileNotFoundError:
-                    return False
+        from .memory_proposals import same_model_target
+        return same_model_target(target, protected)
 
     def _is_core_memory_write_blocked(self, file_path: str) -> bool:
         """True iff this write should be refused — ``memory/core/`` is
