@@ -27,6 +27,14 @@ class ProposalRefusal(ValueError):
     """A proposal cannot be queued without changing the store."""
 
 
+class ProposalStoreCorrupt(ProposalRefusal):
+    """A malformed record, with a safe location for operator telemetry."""
+
+    def __init__(self, line_number: int):
+        self.line_number = line_number
+        super().__init__(f"malformed proposal store record at line {line_number}")
+
+
 def proposal_path(home: Path) -> Path:
     return home / ".mimir" / "memory-proposals.jsonl"
 
@@ -149,7 +157,7 @@ def _load_records(home: Path) -> list[dict[str, Any]]:
                 if deadline.tzinfo is None:
                     raise ValueError("expiry must have a timezone")
             except (ValueError, TypeError):
-                raise ProposalRefusal(f"malformed proposal store record at line {line_number}") from None
+                raise ProposalStoreCorrupt(line_number) from None
             records.append(record)
     return records
 
@@ -264,7 +272,18 @@ def sync_pending(home: Path) -> None:
     try:
         records = _records(home)
     except ProposalRefusal as exc:
-        logging.getLogger(__name__).warning("Memory proposal registration skipped: %s", exc)
+        logger = logging.getLogger(__name__)
+        logger.warning("Memory proposal registration skipped: %s", exc)
+        if isinstance(exc, ProposalStoreCorrupt):
+            try:
+                from .event_logger import log_event_sync
+
+                log_event_sync(
+                    "memory_proposal_store_corrupt", line_number=exc.line_number,
+                    channel_id=channel,
+                )
+            except Exception:  # Telemetry failure must not turn corruption into a boot crash.
+                logger.debug("Memory proposal corruption event emit failed", exc_info=True)
         return
     for record in records:
         if record.get("status") != "pending":
@@ -378,6 +397,10 @@ async def _complete_reply(home: Path, event: Any, resolution: Any, resolver: Any
     except Exception as exc:
         return f"Could not store {proposal_id}: {exc}"
     if not result.get("stored"):
+        atom_id = result.get("atom_id")
+        if result.get("reason") == "duplicate" and isinstance(atom_id, str) and atom_id.strip():
+            _update(home, proposal_id, "approved", atom_id=atom_id, deduplicated=True)
+            return f"Already in memory as {atom_id}"
         return f"Could not store {proposal_id}: {result.get('reason', 'duplicate')}"
     _update(home, proposal_id, "approved", atom_id=result["atom_id"])
     return f"Stored {proposal_id} as {result['atom_id']}"

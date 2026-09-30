@@ -285,8 +285,12 @@ def test_mint_skips_durable_and_registry_reserved_ids(setup, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bad_line", ["{not json", "{}", "[]"])
-async def test_corrupt_store_does_not_crash_boot_and_refuses_approval(setup, caplog, bad_line):
+async def test_corrupt_store_does_not_crash_boot_and_refuses_approval(setup, caplog, bad_line, monkeypatch):
+    from mimir import event_logger
+
     env = setup
+    events_path = env.home / "events.jsonl"
+    monkeypatch.setattr(event_logger, "_logger", event_logger.EventLogger(events_path, "corrupt-store-test"))
     proposal_id = env.queue()
     path = memory_proposals.proposal_path(env.home)
     with path.open("a") as file:
@@ -296,6 +300,11 @@ async def test_corrupt_store_does_not_crash_boot_and_refuses_approval(setup, cap
     approval_requests._RECENT.clear()
     memory_proposals.configure_approvals(env.home, "discord-1", env.saga)
     assert "registration skipped" in caplog.text
+    logged = [json.loads(line) for line in events_path.read_text().splitlines()]
+    corrupt, = [event for event in logged if event["type"] == "memory_proposal_store_corrupt"]
+    assert corrupt["line_number"] == 2
+    assert corrupt["channel_id"] == "discord-1"
+    assert "some fact" not in events_path.read_text()
     assert approval_requests.pending("discord-1") == ()
     result = await env.agent.run_turn(env.event(f"approve {proposal_id}"))
     assert "malformed proposal store record at line 2" in result.output
@@ -337,7 +346,7 @@ async def test_ambiguous_bare_mp_reply_lists_requests_without_model(setup, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["exception", "duplicate", "hash", "empty_edit"])
+@pytest.mark.parametrize("failure", ["exception", "nonstored", "duplicate_without_id", "hash", "empty_edit"])
 async def test_nonstored_result_can_be_retried_immediately(setup, monkeypatch, failure):
     env = setup
     proposal_id = env.queue()
@@ -348,18 +357,21 @@ async def test_nonstored_result_can_be_retried_immediately(setup, monkeypatch, f
         async def failed(*args, **kwargs):
             raise RuntimeError("embedding unavailable")
         monkeypatch.setattr(env.saga, "store", failed)
-    elif failure == "duplicate":
-        async def duplicate(*args, **kwargs):
-            return {"stored": False, "reason": "duplicate", "atom_id": "not-a-new-atom"}
-        monkeypatch.setattr(env.saga, "store", duplicate)
+    elif failure in {"nonstored", "duplicate_without_id"}:
+        async def nonstored(*args, **kwargs):
+            if failure == "duplicate_without_id":
+                return {"stored": False, "reason": "duplicate"}
+            return {"stored": False, "reason": "session_near_duplicate", "atom_id": "existing-atom"}
+        monkeypatch.setattr(env.saga, "store", nonstored)
     elif failure == "hash":
         record = env.record()
         record["content"] = "changed"
         path.write_text(json.dumps(record) + "\n")
     suffix = ":   " if failure == "empty_edit" else ""
     result = await env.agent.run_turn(env.event(f"approve {proposal_id}{suffix}"))
-    expected = {"exception": "embedding unavailable", "duplicate": "duplicate",
-                "hash": "hash mismatch", "empty_edit": "empty edit"}[failure]
+    expected = {"exception": "embedding unavailable", "nonstored": "session_near_duplicate",
+                "duplicate_without_id": "duplicate", "hash": "hash mismatch",
+                "empty_edit": "empty edit"}[failure]
     assert expected in result.output
     assert "Stored" not in result.output
     assert env.record()["status"] == "pending"
@@ -476,3 +488,65 @@ def test_queue_read_and_update_share_sidecar_lock(setup, monkeypatch):
     operations.clear()
     memory_proposals._update(env.home, proposal_id, "declined")
     assert operations == [memory_proposals.fcntl.LOCK_EX]
+
+
+def test_restore_uncompleted_rejects_resolution_from_another_channel(setup):
+    env = setup
+    proposal_id = env.queue()
+    resolution = approval_requests.resolve(env.event(f"approve {proposal_id}"), env.resolver)
+    recent = approval_requests._RECENT[proposal_id]
+    stale_entry = replace(resolution.entry, channel_id="discord-2")
+    approval_requests.restore_uncompleted(stale_entry)
+    assert proposal_id not in approval_requests._PENDING
+    assert approval_requests._RECENT[proposal_id] == recent
+
+
+def test_restore_uncompleted_rejects_passed_registry_deadline(setup, monkeypatch):
+    env = setup
+    proposal_id = env.queue()
+    resolution = approval_requests.resolve(env.event(f"approve {proposal_id}"), env.resolver)
+    recent = approval_requests._RECENT[proposal_id]
+    # Inspect the raw map: pending() would sweep expiry and mask an invalid restore.
+    monkeypatch.setattr(approval_requests, "time", SimpleNamespace(
+        monotonic=lambda: resolution.entry.expires_at,
+    ))
+    approval_requests.restore_uncompleted(resolution.entry)
+    assert proposal_id not in approval_requests._PENDING
+    assert approval_requests._RECENT[proposal_id] == recent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["preexisting", "update_failed"])
+async def test_exact_duplicate_approval_completes_with_existing_atom(setup, monkeypatch, path):
+    env = setup
+    proposal_id = env.queue()
+    original_update = memory_proposals._update
+    if path == "preexisting":
+        stored = await env.saga.store(env.record()["content"], stream="semantic")
+        assert stored["stored"] is True
+        atom_id = stored["atom_id"]
+    else:
+        def failed_update(*args, **kwargs):
+            raise OSError("decision publication failed")
+        monkeypatch.setattr(memory_proposals, "_update", failed_update)
+        with pytest.raises(OSError, match="decision publication failed"):
+            await env.agent.run_turn(env.event(f"approve {proposal_id}"))
+        assert env.record()["status"] == "pending"
+        assert len(env.atoms()) == 1
+        atom_id = env.atoms()[0][0]
+        assert [entry.approval_id for entry in approval_requests.pending("discord-1")] == [proposal_id]
+        monkeypatch.setattr(memory_proposals, "_update", original_update)
+
+    result = await env.agent.run_turn(env.event(f"approve {proposal_id}"))
+    assert result.output == f"Already in memory as {atom_id}"
+    assert env.notices[-1] == result.output
+    assert "Stored" not in result.output
+    record = env.record()
+    assert record["status"] == "approved"
+    assert record["atom_id"] == atom_id
+    assert record["deduplicated"] is True
+    assert len(env.atoms()) == 1
+    assert approval_requests.pending("discord-1") == ()
+    again = await env.agent.run_turn(env.event(f"approve {proposal_id}"))
+    assert "already decided" in again.output
+    assert len(env.atoms()) == 1
