@@ -6653,6 +6653,134 @@ print('{"poller": "x", "prompt": "ok"}')
     assert "SSL=/some/ca/cert.pem" in combined_stderr
 
 
+# ─── Worklink reasoning effort across the real poller env boundary ────
+
+
+def test_worklink_ready_queue_manifest_forwards_model_and_reasoning_effort() -> None:
+    manifest = (
+        Path(__file__).resolve().parents[1]
+        / "mimir" / "optional-skills" / "chainlink-orchestrator" / "pollers.json"
+    )
+    queue = next(
+        entry for entry in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if entry["name"] == "worklink-ready-queue"
+    )
+    assert {
+        "MIMIR_MODEL_SPEC",
+        "MIMIR_MODEL_REASONING_EFFORT",
+        "MIMIR_WORKLINK_REASONING_EFFORT",
+    } <= set(queue["pass_env"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_effort", "override", "source"),
+    [("high", None, "agent"), ("low", "high", "worklink_override")],
+)
+async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_spec(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+    agent_effort: str, override: str | None, source: str,
+) -> None:
+    """Real env scrub -> queue dispatch -> child -> leaf argv; no dotenv fallback."""
+    root = Path(__file__).resolve().parents[1]
+    skill = root / "mimir" / "optional-skills" / "chainlink-orchestrator"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    result_path = tmp_path / "leaf-spec.json"
+    auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps({"openai": {"type": "oauth", "refresh": "synthetic"}}),
+        encoding="utf-8",
+    )
+    parent_env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "XDG_DATA_HOME": str(tmp_path / ".local" / "share"),
+        "OPENCODE_CONFIG": "",
+        "MIMIR_HOME": str(home),
+        "MIMIR_MODEL_SPEC": "codex-plus:gpt-agent",
+        "MIMIR_MODEL_REASONING_EFFORT": agent_effort,
+        "WORKLINK_REPO": str(repo),
+        "MIMIR_CODING_ENABLED": "1",
+    }
+    if override is not None:
+        parent_env["MIMIR_WORKLINK_REASONING_EFFORT"] = override
+    monkeypatch.setattr(os, "environ", parent_env)
+    assert not (home / ".env").exists()
+    [cfg] = discover_pollers(skill, state_root=home / "state" / "pollers")
+
+    # Stand in for the worklink CLI at the detached launcher boundary. As in
+    # the real orchestrator, only MIMIR_HOME is explicitly put in WorkOrder.env;
+    # effort must have survived into the child process's ambient environment.
+    leaf = tmp_path / "leaf.py"
+    leaf.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        "from mimir.worklink.backends import OpenCodeBackend, WorkOrder\n"
+        f"order = WorkOrder(1844, Path({str(repo)!r}), 'prompt', None, 30, "
+        "{'MIMIR_HOME': os.environ['MIMIR_HOME']})\n"
+        "spec = OpenCodeBackend().work_spec(order, attempt=1, repo_url='u', "
+        "base_ref='main', branch='issue/1844-a1', test_command='true')\n"
+        f"Path({str(result_path)!r}).write_text(json.dumps({{"
+        "'argv': spec.local_argv, 'variant': spec.backend_config['variant'], "
+        "'source': spec.backend_config['variant_source']}), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    driver = tmp_path / "dispatch.py"
+    driver.write_text(
+        "import importlib.util, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        f"loader = importlib.util.spec_from_file_location('queue_under_test', {str(skill / 'scripts' / 'poller.py')!r})\n"
+        "queue = importlib.util.module_from_spec(loader)\n"
+        "sys.modules[loader.name] = queue\n"
+        "loader.loader.exec_module(queue)\n"
+        "children = []\n"
+        "real_popen = subprocess.Popen\n"
+        "def tracked_popen(*args, **kwargs):\n"
+        "    child = real_popen(*args, **kwargs)\n"
+        "    children.append(child)\n"
+        "    return child\n"
+        "queue.subprocess.Popen = tracked_popen\n"
+        "ok = queue._dispatch(item=queue.DispatchItem(1844, 'leaf'), "
+        "home=Path(os.environ['MIMIR_HOME']), repo=os.environ['WORKLINK_REPO'], "
+        "state_dir=Path(os.environ['STATE_DIR']), "
+        f"run_bin=[sys.executable, {str(leaf)!r}], active=0, leaf_cap=2, factory_cap=1)\n"
+        "assert ok and len(children) == 1\n"
+        "try:\n"
+        "    assert children[0].wait(timeout=15) == 0\n"
+        "finally:\n"
+        "    if children[0].poll() is None:\n"
+        "        children[0].kill()\n"
+        "        children[0].wait()\n",
+        encoding="utf-8",
+    )
+    # Keep the actual discovered manifest/pass_env; substitute only discovery
+    # of ready issues, so this test cannot claim locks or launch live work.
+    import shlex
+
+    cfg = replace(
+        cfg, command=f"{shlex.quote(sys.executable)} {shlex.quote(str(driver))}",
+        hooks=None,
+    )
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue(), home=home, timeout=30) == 0
+    dispatch_log = cfg.resolved_persist_dir() / "run-1844.log"
+    assert result_path.exists(), (
+        _read_events(home),
+        dispatch_log.read_text(encoding="utf-8") if dispatch_log.exists() else "no dispatch log",
+    )
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert result["variant"] == "high"
+    assert result["source"] == source
+    index = result["argv"].index("--variant")
+    assert result["argv"][index + 1] == "high"
+    assert result["argv"].count("--variant") == 1
+    assert not (home / ".env").exists()
+
+
 # ─── chainlink #82 sub #83/#85: pass_env passthrough mechanism ─────────
 
 
