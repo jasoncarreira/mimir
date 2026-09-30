@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,12 +34,11 @@ def _ensure_mimir_import_path() -> None:
             return
 
 
-_ensure_mimir_import_path()
+def _withheld(poller: str, reason: str, path: str | None = None) -> None:
+    """Signal the parent event logger without enqueueing an agent turn."""
+    print(json.dumps({"poller": poller, "signal": "social_outbox_dispatch_withheld",
+                      "reason": reason, "path": path}), flush=True)
 
-import yaml
-
-from mimir.outbound_privacy import findings_require_refusal, scan_outbound
-from mimir.proposals import merged_social_outbox_commit
 
 SCRIPTS = Path(__file__).resolve().parent
 CAP = 5
@@ -63,6 +63,8 @@ def _count(platform: str, state_dir: Path) -> int | None:
 
 
 def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int]) -> dict[str, int] | None:
+    import yaml
+
     doc = yaml.safe_load(text)
     if not isinstance(doc, dict) or not isinstance(doc.get("dispatch"), list):
         return None
@@ -100,6 +102,15 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
     root = home / "state" / "social-outbox" / poller
     if not root.is_dir() or root.resolve() != root:
         return
+    try:
+        _ensure_mimir_import_path()
+        import yaml
+        from mimir.outbound_privacy import findings_require_refusal, scan_outbound
+        from mimir.proposals import merged_social_outbox_commit
+    except ImportError:
+        _withheld(poller, "mimir_import_failure")
+        print("social-cli: mimir import failed; withholding dispatch only", file=sys.stderr)
+        return
     ledger = state_dir / "dispatched-ledger.jsonl"
     state_dir.mkdir(parents=True, exist_ok=True)
     with ledger.open("a+", encoding="utf-8") as log:
@@ -122,25 +133,32 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                             raise ValueError("invalid post reservation")
                         reserved[platform] = reserved.get(platform, 0) + units
         except (ValueError, KeyError, TypeError):
+            _withheld(poller, "invalid_dispatch_ledger")
             print("social-cli: invalid dispatched ledger; refusing dispatch", file=sys.stderr)
             return
         for path in sorted(root.glob("outbox-*.yaml")):
             if not path.is_file() or path.is_symlink():
+                _withheld(poller, "nonregular_or_symlink_outbox", path.relative_to(home).as_posix())
                 continue
             rel = path.relative_to(home).as_posix()
             try:
                 tracked = _run(["git", "ls-files", "--stage", "--", rel], home)
                 clean = _run(["git", "diff", "HEAD", "--quiet", "--", rel], home)
                 staged = _run(["git", "diff", "--cached", "HEAD", "--quiet", "--", rel], home)
-                text = path.read_text(encoding="utf-8")
+                text = path.read_bytes().decode("utf-8")
             except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+                _withheld(poller, "outbox_read_failed", rel)
                 print(f"social-cli: outbox check failed for {rel}: {exc}", file=sys.stderr)
                 continue
             if (tracked.returncode != 0 or not tracked.stdout.startswith("100644 ")
                     or clean.returncode != 0 or staged.returncode != 0):
+                _withheld(poller, "untracked_or_content_changed", rel)
                 print(f"social-cli: skipping unmerged or dirty outbox {rel}", file=sys.stderr)
                 continue
-            if merged_social_outbox_commit(home, poller, rel) is None:
+            if merged_social_outbox_commit(
+                home, poller, rel, verified_text=text,
+                on_withheld=lambda reason: _withheld(poller, reason, rel),
+            ) is None:
                 print(f"social-cli: forge merge approval unavailable for {rel}", file=sys.stderr)
                 continue
             digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -148,13 +166,16 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                 continue
             try:
                 if findings_require_refusal(scan_outbound((text,), tool="dispatch", sink_category="network")):
+                    _withheld(poller, "privacy_scan_refused", rel)
                     print(f"social-cli: privacy scan refused {rel}", file=sys.stderr)
                     continue
                 posts = _cap_allows(text, state_dir, reserved)
                 if posts is None:
+                    _withheld(poller, "cap_check_refused", rel)
                     print(f"social-cli: cap check refused {rel}", file=sys.stderr)
                     continue
             except (OSError, ValueError, yaml.YAMLError, subprocess.TimeoutExpired) as exc:
+                _withheld(poller, "scan_or_cap_failed", rel)
                 print(f"social-cli: scan or cap failed for {rel}: {exc}", file=sys.stderr)
                 continue
             log.seek(0, os.SEEK_END)
@@ -165,8 +186,15 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
             for platform, units in posts.items():
                 reserved[platform] = reserved.get(platform, 0) + units
             try:
-                result = _run([bin_path, "dispatch", "--file", str(path)], state_dir)
-                if result.returncode != 0:
-                    print(f"social-cli: dispatch failed for {rel}: {result.stderr[:200]}", file=sys.stderr)
+                # The verified snapshot, not a second read of the live path.
+                # Private directory (0700) and file (0600); retain through child exit.
+                with tempfile.TemporaryDirectory(prefix="social-dispatch-") as private:
+                    snapshot = Path(private) / "outbox.yaml"
+                    with snapshot.open("x", encoding="utf-8", newline="") as output:
+                        snapshot.chmod(0o600)
+                        output.write(text)
+                    result = _run([bin_path, "dispatch", "--file", str(snapshot)], state_dir)
+                    if result.returncode != 0:
+                        print(f"social-cli: dispatch failed for {rel}: {result.stderr[:200]}", file=sys.stderr)
             except (OSError, subprocess.TimeoutExpired) as exc:
                 print(f"social-cli: dispatch failed for {rel}: {exc}", file=sys.stderr)

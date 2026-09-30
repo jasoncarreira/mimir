@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import posixpath
 import re
 import shutil
@@ -929,48 +931,74 @@ def _blob_oid(home: Path, ref: str, path: str) -> str | None:
     return value or None
 
 
-def merged_social_outbox_commit(home: Path, poller: str, path: str) -> str | None:
-    """Prove a live file's last first-parent change was a forge-approved merge.
+def merged_social_outbox_commit(
+    home: Path, poller: str, path: str, *, verified_text: str | None = None,
+    on_withheld: Callable[[str], None] | None = None,
+) -> str | None:
+    """Require forge evidence of a non-agent merge of this exact file.
 
-    A clean HEAD (including the per-turn auto-commit) is not approval. Query
-    terminal PR history, not just the current rolling PR, since the branch is
-    reused. Bounded history or unavailable/malformed forge evidence fails closed.
+    The local content-addressed tree is acceptable only at the commit oid
+    returned by the forge. A clean HEAD or agent-authored merge is not approval.
+    Bounded history and unknown identity/evidence fail closed.
     """
+    def refuse(reason: str) -> None:
+        if on_withheld is not None:
+            on_withheld(reason)
+        return None
+
+    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", self_login):
+        return refuse("agent_identity_unavailable")
+    if not (os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()):
+        return refuse("missing_forge_token")
     try:
         scope = PollerProposalScope(f"poller:{poller}", "dispatch", "dispatch", "dispatch",
                                     "social-outbox")
         if Path(path).parent != scope.surface_root:
-            return None
+            return refuse("invalid_outbox_path")
         last = _git(["log", "--first-parent", "--full-history", "-1", "--format=%H",
                      "HEAD", "--", path], cwd=home)
         commit = (last.stdout or "").strip()
         if last.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
-            return None
+            return refuse("content_changed_after_merge")
         result = _run(
             ["gh", "pr", "list", "--state", "merged", "--head", poller_branch_name(scope),
-             "--json", "state,headRefName,mergeCommit", "--limit", "100"],
+             "--json", "state,headRefName,mergeCommit,mergedBy", "--limit", "100"],
             cwd=home, capture=True,
         )
         if result.returncode != 0:
-            return None
+            return refuse("forge_unreachable")
         prs = json.loads(result.stdout or "")
-        if not isinstance(prs, list):
-            return None
-        approved = any(
-            isinstance(pr, dict) and pr.get("state") == "MERGED"
-            and pr.get("headRefName") == poller_branch_name(scope)
-            and isinstance(pr.get("mergeCommit"), dict)
-            and pr["mergeCommit"].get("oid") == commit
-            for pr in prs
-        )
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            return refuse("malformed_forge_response")
+        approved = False
+        for pr in prs:
+            if (pr.get("state") != "MERGED"
+                    or pr.get("headRefName") != poller_branch_name(scope)
+                    or not isinstance(pr.get("mergeCommit"), dict)
+                    or pr["mergeCommit"].get("oid") != commit):
+                continue
+            merger = pr.get("mergedBy")
+            login = merger.get("login") if isinstance(merger, dict) else None
+            if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                return refuse("malformed_forge_response")
+            if login.casefold() == self_login.casefold():
+                return refuse("agent_login_merge")
+            approved = True
         if not approved:
-            return None
+            return refuse("no_qualifying_merged_pr")
         blob = _blob_oid(home, "HEAD", path)
         if blob is None or blob != _blob_oid(home, commit, path):
-            return None
+            return refuse("content_changed_after_merge")
+        if verified_text is not None:
+            approved_content = _git(["show", f"{commit}:{path}"], cwd=home)
+            if approved_content.returncode != 0 or approved_content.stdout != verified_text:
+                return refuse("content_changed_after_merge")
         return commit
-    except (OSError, ValueError, TypeError, RuntimeError):
-        return None
+    except json.JSONDecodeError:
+        return refuse("malformed_forge_response")
+    except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+        return refuse("forge_unreachable")
 
 
 def _proposal_branch_content_is_on_main(

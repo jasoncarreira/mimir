@@ -15,6 +15,9 @@
       },
       "pass_env": [
         "MIMIR_SOURCE_DIR",
+        "MIMIR_GITHUB_SELF_LOGIN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_LIMIT",
         "MIMIR_SOCIAL_USERS_DIR",
@@ -38,6 +41,9 @@
       },
       "pass_env": [
         "MIMIR_SOURCE_DIR",
+        "MIMIR_GITHUB_SELF_LOGIN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_FEED_LIMIT",
         "SOCIAL_CLI_BIN",

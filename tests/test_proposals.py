@@ -135,6 +135,8 @@ def rolling_forge(monkeypatch):
 def test_dispatch_requires_exact_forge_merge_and_blob(home, monkeypatch, squash):
     import mimir.proposals as proposals
 
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "agent")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-forge-placeholder")
     branch = "poller/feed/social-outbox"
     path = "state/social-outbox/feed/outbox-one.yaml"
     _git("checkout", "-b", branch, cwd=home)
@@ -162,7 +164,8 @@ def test_dispatch_requires_exact_forge_merge_and_blob(home, monkeypatch, squash)
         queries.append(args)
         return subprocess.CompletedProcess(args, 0, json.dumps([
             {"state": "MERGED", "headRefName": branch, "mergeCommit": {"oid": "0" * 40}},
-            {"state": "MERGED", "headRefName": branch, "mergeCommit": {"oid": approved}},
+            {"state": "MERGED", "headRefName": branch, "mergeCommit": {"oid": approved},
+             "mergedBy": {"login": "operator"}},
         ]), "")
 
     monkeypatch.setattr(proposals, "_run", forge)

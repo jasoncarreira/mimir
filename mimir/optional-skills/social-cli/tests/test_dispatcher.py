@@ -43,7 +43,8 @@ def setup(tmp_path: Path, monkeypatch, request):
                       "import json, os, sys\n"
                       "from pathlib import Path\n"
                       "with open(os.environ['CALLS'], 'a') as f:\n"
-                      "    f.write(json.dumps({'argv': sys.argv[1:], 'ledger': Path(os.environ['LEDGER']).read_text() if Path(os.environ['LEDGER']).exists() else ''}) + '\\n')\n"
+                      "    snapshot = Path(sys.argv[3]) if sys.argv[1] == 'dispatch' else None\n"
+                      "    f.write(json.dumps({'argv': sys.argv[1:], 'text': snapshot.read_text() if snapshot else None, 'mode': snapshot.stat().st_mode & 0o777 if snapshot else None, 'parent_mode': snapshot.parent.stat().st_mode & 0o777 if snapshot else None, 'ledger': Path(os.environ['LEDGER']).read_text() if Path(os.environ['LEDGER']).exists() else ''}) + '\\n')\n"
                       "if os.environ.get('CRASH') and sys.argv[1] == 'dispatch': os._exit(7)\n")
     binary.chmod(0o755)
     calls = tmp_path / "calls.jsonl"
@@ -54,6 +55,9 @@ def setup(tmp_path: Path, monkeypatch, request):
     monkeypatch.setenv("POLLER_NAME", poller)
     monkeypatch.setenv("SOCIAL_CLI_BIN", str(binary))
     monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "agent")
+    monkeypatch.setenv("GITHUB_TOKEN", "test-forge-placeholder")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
     module = importlib.import_module("poller" if poller == POLLERS[0] else "feed_poller")
     monkeypatch.setattr(module, "STATE_DIR", state)
     monkeypatch.setattr(module, "CURSOR_FILE", state / "emitted.json")
@@ -68,7 +72,7 @@ def setup(tmp_path: Path, monkeypatch, request):
         history = subprocess.run(["git", "log", "--format=%H %s"], cwd=cwd,
                                  check=True, capture_output=True, text=True).stdout
         prs = [{"state": "MERGED", "headRefName": f"poller/{poller}/social-outbox",
-                "mergeCommit": {"oid": line.split()[0]}}
+                "mergeCommit": {"oid": line.split()[0]}, "mergedBy": {"login": "operator"}}
                for line in history.splitlines() if line.endswith("merge outbox")]
         return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
 
@@ -95,7 +99,12 @@ def test_merged_clean_once_and_before_sync(setup):
     assert module.main() == 0
     records = [json.loads(line) for line in calls.read_text().splitlines()]
     assert len(dispatches(calls)) == 1
-    assert records[0]["argv"] == ["dispatch", "--file", str(path)]
+    assert records[0]["argv"][:2] == ["dispatch", "--file"]
+    assert records[0]["argv"][2] != str(path)
+    assert records[0]["text"] == POST
+    assert records[0]["mode"] == 0o600
+    assert records[0]["parent_mode"] == 0o700
+    assert not Path(records[0]["argv"][2]).exists()
     assert len(state.joinpath("dispatched-ledger.jsonl").read_text().splitlines()) == 1
     assert hashlib.sha256(POST.encode()).hexdigest() in records[0]["ledger"]
 
@@ -208,8 +217,14 @@ def test_autocommit_after_approved_merge_invalidates_approval(setup, capsys):
     assert "forge merge approval unavailable" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("case", ["unavailable", "malformed", "open", "wrong-branch", "wrong-commit"])
-def test_forge_evidence_fails_closed(setup, monkeypatch, case, capsys):
+@pytest.mark.parametrize("case,reason", [
+    ("unavailable", "forge_unreachable"), ("nonzero", "forge_unreachable"),
+    ("malformed", "malformed_forge_response"),
+    ("open", "no_qualifying_merged_pr"), ("wrong-branch", "no_qualifying_merged_pr"),
+    ("wrong-commit", "no_qualifying_merged_pr"), ("agent-merge", "agent_login_merge"),
+    ("missing-merger", "malformed_forge_response"),
+])
+def test_forge_evidence_fails_closed(setup, monkeypatch, case, reason, capsys):
     import mimir.proposals as proposals
 
     home, _, root, calls, module = setup
@@ -222,21 +237,33 @@ def test_forge_evidence_fails_closed(setup, monkeypatch, case, capsys):
             return result
         if case == "unavailable":
             raise OSError("offline")
+        if case == "nonzero":
+            # Even plausible stdout on a failed gh invocation is not approval.
+            return subprocess.CompletedProcess(args, 1, result.stdout, "auth unavailable")
         if case == "malformed":
             return subprocess.CompletedProcess(args, 0, "not json", "")
         prs = json.loads(result.stdout)
-        if case == "open":
+        if case == "agent-merge":
+            prs[0]["mergedBy"] = {"login": "AgEnT"}
+        elif case == "missing-merger":
+            prs[0].pop("mergedBy")
+        elif case == "open":
             prs[0]["state"] = "OPEN"
         elif case == "wrong-branch":
             prs[0]["headRefName"] = "poller/other/social-outbox"
-        else:
+        elif case == "wrong-commit":
             prs[0]["mergeCommit"]["oid"] = "0" * 40
         return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
 
     monkeypatch.setattr(proposals, "_run", forge)
-    module.main()
+    assert module.main() == 0
     assert dispatches(calls) == []
-    assert "forge merge approval unavailable" in capsys.readouterr().err
+    output = capsys.readouterr()
+    assert "forge merge approval unavailable" in output.err
+    signals = [json.loads(line) for line in output.out.splitlines()]
+    assert signals == [{"poller": module.POLLER_NAME,
+                        "signal": "social_outbox_dispatch_withheld", "reason": reason,
+                        "path": (root / "outbox-one.yaml").relative_to(home).as_posix()}]
 
 
 @pytest.mark.parametrize("tracked_target", [False, True])
@@ -276,3 +303,89 @@ def test_real_manifest_has_no_agent_dispatch_capability():
         assert {"open_proposal", "submit_proposal", "abandon_proposal"} <= set(authority["capabilities"])
         assert not {"shell_exec", "bash_jobs_list", "bash_job_output"} & set(authority["capabilities"])
         assert "shell_commands" not in authority
+        assert {"GITHUB_TOKEN", "GH_TOKEN", "MIMIR_GITHUB_SELF_LOGIN", "MIMIR_SOURCE_DIR"} <= set(poller["pass_env"])
+
+
+@pytest.mark.parametrize("missing,reason", [
+    ("GITHUB_TOKEN", "missing_forge_token"),
+    ("MIMIR_GITHUB_SELF_LOGIN", "agent_identity_unavailable"),
+])
+def test_missing_forge_configuration_withholds_with_signal(setup, monkeypatch, capsys, missing, reason):
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    monkeypatch.delenv(missing)
+    assert module.main() == 0
+    assert not dispatches(calls)
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [s["reason"] for s in signals] == [reason]
+    assert signals[0]["signal"] == "social_outbox_dispatch_withheld"
+
+
+@pytest.mark.parametrize("case", ["blob", "read-snapshot"])
+def test_content_mismatch_is_signaled_and_not_dispatched(setup, monkeypatch, capsys, case):
+    import mimir.proposals as proposals
+
+    home, _, root, calls, module = setup
+    path = root / "outbox-one.yaml"
+    commit_file(home, path)
+    if case == "blob":
+        original = proposals._blob_oid
+        monkeypatch.setattr(proposals, "_blob_oid", lambda home, ref, rel:
+                            "different" if ref == "HEAD" else original(home, ref, rel))
+    else:
+        original_read = Path.read_bytes
+        monkeypatch.setattr(Path, "read_bytes", lambda target:
+                            POST.replace("public", "unverified").encode() if target == path
+                            else original_read(target))
+    assert module.main() == 0
+    assert not dispatches(calls)
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [s["reason"] for s in signals] == ["content_changed_after_merge"]
+    assert signals[0]["signal"] == "social_outbox_dispatch_withheld"
+
+
+def test_dispatch_uses_verified_snapshot_when_live_file_changes(setup, monkeypatch):
+    import dispatcher
+
+    home, _, root, calls, module = setup
+    path = root / "outbox-one.yaml"
+    commit_file(home, path)
+    original = dispatcher._cap_allows
+
+    def change_live(text, state, reserved):
+        allowed = original(text, state, reserved)
+        path.write_text(POST.replace("public", "changed after verification"))
+        return allowed
+
+    monkeypatch.setattr(dispatcher, "_cap_allows", change_live)
+    assert module.main() == 0
+    assert dispatches(calls)[0]["text"] == POST
+    assert path.read_text() != POST
+
+
+@pytest.mark.parametrize("missing", ["mimir", "yaml"])
+def test_mimir_import_failure_withholds_only_dispatch(setup, monkeypatch, capsys, missing):
+    import builtins
+
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    original = builtins.__import__
+
+    def no_mimir(name, *args, **kwargs):
+        if name == missing or name.startswith(missing + "."):
+            raise ModuleNotFoundError(missing + " unavailable")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_mimir)
+    # Module-top dispatcher imports must remain independent of mimir, too.
+    importlib.reload(importlib.import_module("dispatcher"))
+    importlib.reload(module)
+    # Notification parsing already requires yaml; startup/sync must still run.
+    expected = 3 if missing == "yaml" and module.POLLER_NAME == POLLERS[0] else 0
+    assert module.main() == expected
+    assert not dispatches(calls)
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert any(r["argv"][0] == ("sync" if module.POLLER_NAME == POLLERS[0] else "feed") for r in records)
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert signals == [{"poller": module.POLLER_NAME, "signal": "social_outbox_dispatch_withheld",
+                        "reason": "mimir_import_failure", "path": None}]
