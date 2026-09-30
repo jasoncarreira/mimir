@@ -106,6 +106,154 @@ def _opener(calls: list[dict]):
     return f
 
 
+@pytest.fixture
+def rolling_forge(monkeypatch):
+    """Record the actual gh commands while git still runs against the bare remote."""
+    import mimir.proposals as proposals
+    original = proposals._run
+    original_which = shutil.which
+    state = {"prs": [], "creates": 0}
+
+    def fake(args, *, cwd, capture):
+        if args[:2] != ["gh", "pr"]:
+            return original(args, cwd=cwd, capture=capture)
+        if args[2] == "list":
+            prs = [pr for pr in state["prs"] if args[args.index("--state") + 1] == "all" or pr["state"] == "OPEN"]
+            return subprocess.CompletedProcess(args, 0, json.dumps(prs[-1:]), "")
+        assert args[2] == "create"
+        state["creates"] += 1
+        url = f"https://example.test/pr/{state['creates']}"
+        state["prs"].append({"number": state["creates"], "state": "OPEN", "url": url})
+        return subprocess.CompletedProcess(args, 0, url + "\n", "")
+
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/gh" if cmd == "gh" else original_which(cmd))
+    monkeypatch.setattr(proposals, "_run", fake)
+    return state
+
+
+def _social_scope(turn: str) -> PollerProposalScope:
+    return PollerProposalScope("poller:feed", turn, "feed:event", "feed:1", "social-outbox")
+
+
+def _social_submit(home: Path, turn: str, text: str):
+    scope = _social_scope(turn)
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok, opened
+    target = opened.worktree / scope.surface_root / f"{turn}.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+    return scope, opened, finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
+
+
+def test_social_rolling_pr_and_terminal_branches(home, rolling_forge):
+    valid = "dispatch:\n  - action: post\n    text: A public update\n"
+    _, first, result = _social_submit(home, "one", valid)
+    assert result.ok and rolling_forge["creates"] == 1
+    assert result.branch == "poller/feed/social-outbox"
+    assert not (home / "state/social-outbox/feed/one.yaml").exists()
+    first_tip = _git("rev-parse", f"origin/{result.branch}", cwd=home).stdout.strip()
+    _, second, result = _social_submit(home, "two", valid)
+    assert result.ok and rolling_forge["creates"] == 1 and result.pr_url == "https://example.test/pr/1"
+    assert _git("merge-base", "--is-ancestor", first_tip, f"origin/{result.branch}", cwd=home).returncode == 0
+    rolling_forge["prs"][-1]["state"] = "MERGED"
+    # Simulate the operator merge; the next PR starts at the newly advanced base.
+    _git("fetch", "origin", result.branch, cwd=home)
+    _git("merge", "--ff-only", f"origin/{result.branch}", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    _, third, result = _social_submit(home, "three", valid)
+    assert result.ok and rolling_forge["creates"] == 2
+    rolling_forge["prs"][-1]["state"] = "CLOSED"
+    _, fourth, result = _social_submit(home, "four", valid)
+    assert result.ok and rolling_forge["creates"] == 3
+    assert _git("show", f"origin/{result.branch}:state/social-outbox/feed/three.yaml", cwd=home, check=False).returncode != 0
+
+
+@pytest.mark.parametrize("bad,reason", [
+    ("dispatch:\n  - action: post\n    text: ghp_" + "A" * 36 + "\n", "privacy"),
+    ("dispatch:\n  - action: post\n    text: Hello\nhook: run\n", "schema"),
+    ("dispatch:\n  - action: execute\n    text: hello\n", "schema"),
+    ("dispatch:\n  - action: post\n    text: hi\n    config: go\n", "schema"),
+    ("dispatch:\n  - action: reply\n    text: hi\n    parent:\n      uri: at://public\n      hook: run\n", "schema"),
+    ("dispatch:\n  - action: thread\n    posts:\n      - text: hi\n        config: run\n", "schema"),
+])
+def test_social_submission_fails_closed(home, rolling_forge, bad, reason):
+    _, opened, result = _social_submit(home, "one", bad)
+    assert result.reason == reason and not result.pushed
+    assert opened.worktree.exists() and rolling_forge["creates"] == 0
+
+
+def test_social_surface_is_exclusive(home, rolling_forge):
+    for scope, stray in (
+        (PollerProposalScope("poller:feed", "wiki", "source", "ref"), "state/social-outbox/feed/x.yaml"),
+        (_social_scope("social"), "state/wiki/x.md"),
+    ):
+        opened = open_proposal(home, lane="poller", poller=scope)
+        assert opened.ok
+        path = opened.worktree / stray
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("stray")
+        result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
+        assert result.reason == "outside_surface" and not result.pushed
+        assert abandon_proposal(home, lane="poller", poller=scope)
+
+
+def test_social_base_drift_conflict_does_not_push(home, rolling_forge):
+    valid = "dispatch:\n  - action: post\n    text: old\n"
+    _, _, first = _social_submit(home, "one", valid)
+    assert first.ok
+    # Move main independently, changing the same file on the rolling branch.
+    target = home / "state/social-outbox/feed/one.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text(valid.replace("old", "base"))
+    _git("add", "state/social-outbox/feed/one.yaml", cwd=home)
+    _git("commit", "-m", "base moved", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    scope = _social_scope("two")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    path = opened.worktree / "state/social-outbox/feed/two.yaml"
+    path.write_text(valid)
+    tip = _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout
+    result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
+    assert result.reason == "rolling_conflict" and not result.pushed
+    assert _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout == tip
+
+
+def test_social_base_drift_rebases_before_push(home, rolling_forge):
+    valid = "dispatch:\n  - action: post\n    text: A public update\n"
+    _, _, first = _social_submit(home, "one", valid)
+    assert first.ok
+    (home / "skills/x.md").write_text("base updated")
+    _git("add", "skills/x.md", cwd=home)
+    _git("commit", "-m", "advance base", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    _, _, second = _social_submit(home, "two", valid)
+    assert second.ok and rolling_forge["creates"] == 1
+    assert _git("merge-base", "--is-ancestor", "origin/main", f"origin/{second.branch}", cwd=home).returncode == 0
+
+
+def test_social_private_term_follows_enforcement(home, rolling_forge, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (home / "private-terms.txt").write_text("unpublished phrase\n")
+    text = "dispatch:\n  - action: post\n    text: unpublished phrase\n"
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
+    _, opened, denied = _social_submit(home, "one", text)
+    assert denied.reason == "privacy" and not denied.pushed
+    (opened.worktree / "state/social-outbox/feed/one.yaml").write_text(text)
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "0")
+    allowed = finalize_proposal(home, lane="poller", poller=_social_scope("one"), title="t", rationale="r")
+    assert allowed.ok
+
+
+def test_social_reply_and_thread_known_fields(home, rolling_forge):
+    text = ("dispatch:\n  - action: reply\n    text: A public answer\n"
+            "    parent:\n      uri: at://public/post\n      cid: public-cid\n"
+            "  - action: thread\n    posts:\n      - text: First public post\n"
+            "      - text: Second public post\n")
+    _, _, result = _social_submit(home, "one", text)
+    assert result.ok and rolling_forge["creates"] == 1
+
+
 # ─── open ────────────────────────────────────────────────────────────
 
 

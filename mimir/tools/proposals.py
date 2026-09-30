@@ -101,6 +101,7 @@ def _run_poller(
             not isinstance(scope, PollerProposalScope)
             or scope.owner != service.canonical
             or scope.origin_ref != context.origin_ref
+            or scope.surface != service.proposal_surface
             or state.worktree != poller_worktree_path(home, scope)
         ):
             raise ToolPolicyRefusal("proposal rejected: state ownership or worktree mismatch")
@@ -120,7 +121,8 @@ def _run_poller(
             ):
                 raise ToolPolicyRefusal("proposal rejected: exact runtime turn required")
             try:
-                requested = PollerProposalScope(service.canonical, turn.turn_id, source, context.origin_ref)
+                requested = PollerProposalScope(service.canonical, turn.turn_id, source, context.origin_ref,
+                                                service.proposal_surface)
             except (TypeError, ValueError) as exc:
                 raise ToolPolicyRefusal(f"proposal rejected: {exc}") from exc
             if scope is not None and scope != requested:
@@ -204,10 +206,11 @@ async def open_proposal(
 
             service = get_trusted_service_from_auth_context(context)
             draft_root = f"state/pollers/{service.canonical.removeprefix('poller:')}/"
+            surface = context.poller_proposal_state.scope.surface_root.as_posix()
             return (
-                f"{'Opened' if result.ok else 'Already open'} `poller` wiki proposal `{result.branch}`.\n"
-                f"Keep drafts under `{draft_root}`. Edit only `{rel}/state/wiki/` "
-                "in this proposal worktree, never the live wiki. "
+                f"{'Opened' if result.ok else 'Already open'} `poller` {context.poller_proposal_state.scope.surface} proposal `{result.branch}`.\n"
+                f"Keep drafts under `{draft_root}`. Edit only `{rel}/{surface}/` "
+                "in this proposal worktree, never the live surface. "
                 "Call submit_proposal(title, rationale) for operator review and merge."
             )
     else:
@@ -306,7 +309,7 @@ async def submit_proposal(
     elif result.reason == "no_changes":
         message = (
             "submit_proposal: you haven't changed anything under the proposal's "
-            + ("state/wiki/" if context is not None else "memory/core/ or prompts/")
+            + (context.poller_proposal_state.scope.surface_root.as_posix() + "/" if context is not None else "memory/core/ or prompts/")
             + " yet — edit a file first, or call "
             "abandon_proposal."
         )

@@ -362,6 +362,7 @@ class ServicePrincipal:
     # Exact delivery destination nominated by trusted poller/schedule config.
     # Prompt assembly uses this carrier instead of client-readable event.extra.
     configured_delivery_channel: str | None = None
+    proposal_surface: str = "wiki"
 
     def can_read_domain(self, domain: str) -> bool:
         return domain in self.readable_domains
@@ -607,6 +608,7 @@ def build_trigger_service_principal(
     channel_memory_directory: str | None = None,
     declared_shell_commands: tuple["DeclaredShellCommand", ...] = (),
     approved_urls: tuple[str, ...] = (),
+    proposal_surface: str = "wiki",
     creation_path: str,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
@@ -725,6 +727,7 @@ def build_trigger_service_principal(
         authority_profile=profile,
         capability_tier=tier,
         declared_shell_commands=declared_shell_commands,
+        proposal_surface=proposal_surface,
     )
 
 
@@ -4624,6 +4627,7 @@ def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | Non
         not home or getattr(state, "active", False) is not True
         or not isinstance(scope, PollerProposalScope)
         or scope.owner != service.canonical
+        or scope.surface != service.proposal_surface
         or not isinstance(worktree, Path)
     ):
         return None
@@ -4634,6 +4638,21 @@ def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | Non
         return expected if expected.is_dir() else None
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def _is_live_social_outbox(path: Path) -> bool:
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return False
+    root = Path(home).resolve() / "state" / "social-outbox"
+    try:
+        lexical = Path(os.path.abspath(path))
+        if lexical == root or lexical.is_relative_to(root):
+            return True
+        resolved = path.resolve(strict=False)
+        return resolved == root or resolved.is_relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _poller_write_roots_refusal_detail(
@@ -4725,8 +4744,13 @@ def _target_within_trigger_service_write_roots(
             for root in roots
             if candidate == root or candidate.is_relative_to(root)
         )
-        if any(
-            WriteResourceAdapter._is_protected_path(relative)
+        scope = getattr(getattr(auth_context, "poller_proposal_state", None), "scope", None)
+        def allowed_surface(root: Path, relative: Path) -> bool:
+            return bool(root == proposal_root and proposal_root is not None
+                        and getattr(scope, "surface", None) == "social-outbox"
+                        and relative.is_relative_to(scope.surface_root))
+        if _is_live_social_outbox(candidate) or any(
+            (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
             or _is_static_service_protected_write_path(
                 relative,
                 under_memory_root=root == memory_root,
@@ -4747,8 +4771,8 @@ def _target_within_trigger_service_write_roots(
         json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError, ValueError,
     ):
         return False
-    return bool(resolved_relatives) and not any(
-        WriteResourceAdapter._is_protected_path(relative)
+    return bool(resolved_relatives) and not _is_live_social_outbox(resolved) and not any(
+        (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
         or _is_static_service_protected_write_path(
             relative,
             under_memory_root=root == memory_root,
@@ -4993,6 +5017,8 @@ def _is_service_protected_read_path(
 ) -> bool:
     """Apply protected names to the full target, including its matched root."""
     target = root / relative
+    if _is_live_social_outbox(target):
+        return True
     protected = {
         part.lower() for part in target.parts
         if part.lower() in _TRIGGER_SERVICE_PROTECTED_READ_NAMES
@@ -7682,6 +7708,8 @@ class WriteResourceAdapter:
     @classmethod
     def _is_protected_path(cls, path: Path) -> bool:
         parts = tuple(part.lower() for part in path.parts)
+        if any(parts[i:i + 2] == ("state", "social-outbox") for i in range(len(parts) - 1)):
+            return True
         for part in parts:
             stem = Path(part).stem
             if (
@@ -7722,7 +7750,7 @@ class WriteResourceAdapter:
             return False
         except StopIteration:
             return False
-        return not cls._is_protected_path(resolved.relative_to(root))
+        return not _is_live_social_outbox(candidate) and not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
     def authorize_skill_write(
@@ -8842,6 +8870,18 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
+        raw_file_target = (target_channel if tool_name in {"write_file", "edit_file"}
+                           else requested_read_target_from_arguments(tool_name, arguments)
+                           if tool_name in {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
+                           else None)
+        file_target = (_resolve_file_tool_target(raw_file_target)
+                       if isinstance(raw_file_target, str) else None)
+        if file_target is not None and _is_live_social_outbox(file_target):
+            return finish(ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=False, reason="protected_social_outbox", enforcement_enabled=True,
+                would_block=True,
+            ))
         if (
             service is not None
             and service.authority_profile == "session-boundary"

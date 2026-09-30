@@ -6294,6 +6294,67 @@ def research_proposal_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return auth, persist, worktree
 
 
+def test_social_outbox_live_file_tools_and_own_worktree(research_proposal_auth, tmp_path):
+    from dataclasses import replace
+    from mimir.proposals import PollerProposalScope, poller_worktree_path
+    from mimir.read_policy import protected_read_denial_reason
+
+    auth, persist, wiki_worktree = research_proposal_auth
+    service = replace(auth.service_authority, proposal_surface="social-outbox")
+    auth.service_authority = service
+    scope = PollerProposalScope("poller:research", "turn-one", "source", "ref", "social-outbox")
+    own = poller_worktree_path(tmp_path, scope)
+    own.mkdir(parents=True, exist_ok=True)
+    auth.poller_proposal_state.scope = scope
+    auth.poller_proposal_state.worktree = own
+    live = tmp_path / "state/social-outbox/research/post.yaml"
+    live.parent.mkdir(parents=True)
+    live.write_text("dispatch: []\n")
+    draft = own / "state/social-outbox/research/post.yaml"
+    draft.parent.mkdir(parents=True)
+    draft.write_text("dispatch: []\n")
+    registry = ToolRegistry()
+    token = set_current_turn(SimpleNamespace(turn_id="turn-one", auth_context=auth))
+    try:
+        for operation in ("write_file", "edit_file"):
+            for enforce in (True, False):
+                assert not registry.authorize_tool(operation, auth, enforce=enforce, target_channel=str(live)).allowed
+            assert registry.authorize_tool(operation, auth, enforce=True, target_channel=str(draft)).allowed
+        for operation in ("read_file", "ls", "glob"):
+            arguments = {"file_path" if operation == "read_file" else "path": str(live)}
+            for enforce in (True, False):
+                assert not registry.authorize_tool(operation, auth, enforce=enforce, arguments=arguments).allowed
+        assert registry.authorize_tool("read_file", auth, enforce=True, arguments={"file_path": str(draft)}).allowed
+        assert protected_read_denial_reason(live) is not None
+        assert protected_read_denial_reason(draft) is None
+        assert not access_control.WriteResourceAdapter._human_target_is_allowed(str(live))
+        assert access_control.WriteResourceAdapter._is_protected_path(live)
+    finally:
+        reset_current_turn(token)
+
+
+def test_social_outbox_live_denied_to_all_principals(research_proposal_auth, tmp_path):
+    auth, _, _ = research_proposal_auth
+    scheduler = _service_auth(
+        access_control.builtin_trigger_service_principal("heartbeat", tmp_path),
+        InformationFlowLabels(),
+    )
+    path = tmp_path / "state/social-outbox/research/post.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text("dispatch: []\n")
+    registry = ToolRegistry()
+    for principal in (auth, scheduler, _write_auth(), None):
+        for operation in ("write_file", "edit_file"):
+            assert not registry.authorize_tool(
+                operation, principal, enforce=False, target_channel=str(path),
+            ).allowed
+        for operation in ("read_file", "ls", "glob"):
+            key = "file_path" if operation == "read_file" else "path"
+            assert not registry.authorize_tool(
+                operation, principal, enforce=False, arguments={key: str(path)},
+            ).allowed
+
+
 @pytest.mark.parametrize("operation", ["write_file", "edit_file"])
 def test_research_proposal_exact_write_grants(
     research_proposal_auth, tmp_path: Path, operation: str,
@@ -6469,6 +6530,15 @@ def test_research_proposal_root_requires_trusted_research_authority(research_pro
             "caps": {"capabilities": ("write_file", "edit_file", "read_file")},
         }[invalid]
         auth.service_authority = replace(auth.service_authority, **change)
+    assert access_control._active_poller_proposal_root(auth) is None
+
+
+def test_proposal_root_cannot_change_declared_surface(research_proposal_auth) -> None:
+    from dataclasses import replace
+
+    auth, _, worktree = research_proposal_auth
+    assert access_control._active_poller_proposal_root(auth) == worktree
+    auth.service_authority = replace(auth.service_authority, proposal_surface="social-outbox")
     assert access_control._active_poller_proposal_root(auth) is None
 
 

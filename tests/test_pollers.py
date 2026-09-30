@@ -380,6 +380,9 @@ def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, o
     )
     authority = _authority(capabilities=[operation, "write_file"])
     service = _parse_poller_authority(authority, **arguments)
+    assert service.proposal_surface == "wiki"
+    social = _parse_poller_authority({**authority, "proposal_surface": "social-outbox"}, **arguments)
+    assert social.proposal_surface == "social-outbox"
     assert service.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
     assert service.sink_policy_for(operation).adapter == "poller_proposal"
     assert service.sink_policy_for(operation).destination == "poller:research"
@@ -388,6 +391,7 @@ def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, o
         ({"profile": "custom"}, "outside.*profile"),
         ({"tier": "scope-contained"}, "exceeds declared tier"),
         ({"scoped_roots": ["state", "wiki:papers"]}, "only declare their own state"),
+        ({"proposal_surface": "bogus"}, "unknown proposal_surface"),
     ]:
         with pytest.raises(ValueError, match=message):
             _parse_poller_authority({**authority, **change}, **arguments)

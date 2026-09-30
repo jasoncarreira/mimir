@@ -35,6 +35,7 @@ import posixpath
 import re
 import shutil
 import time
+import yaml
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Mapping
@@ -44,6 +45,8 @@ from typing import Callable, Literal, Mapping
 # subprocess wrapper. One redactor is the point — core diffs must not leak creds.
 from .event_logger import log_event_sync
 from .git_bootstrap import _redact, _run
+from .env import env_bool
+from .outbound_privacy import scan_outbound
 
 #: Protected surfaces a proposal can change, relative to the home / repo root.
 #: Both are git-tracked and blocked from live agent writes (memory/core via the
@@ -82,6 +85,7 @@ class PollerProposalScope:
     turn_id: str
     source: str
     origin_ref: str
+    surface: str = "wiki"
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"poller:[a-z0-9][a-z0-9_-]*", self.owner):
@@ -90,10 +94,19 @@ class PollerProposalScope:
             value = getattr(self, field)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"poller {field} must be nonempty")
+        if self.surface not in ("wiki", "social-outbox"):
+            raise ValueError("unsupported poller proposal surface")
+
+    @property
+    def surface_root(self) -> Path:
+        return (Path("state/wiki") if self.surface == "wiki" else
+                Path("state/social-outbox") / self.owner.removeprefix("poller:"))
 
 
 def poller_branch_name(poller: PollerProposalScope) -> str:
     """Deterministic branch keyed by owner and the exact, unsanitized turn ID."""
+    if poller.surface == "social-outbox":
+        return f"poller/{poller.owner.removeprefix('poller:')}/social-outbox"
     slug = re.sub(r"[^a-z0-9_-]+", "-", poller.turn_id.lower()).strip("-")[:40] or "turn"
     digest = hashlib.sha256(poller.turn_id.encode()).hexdigest()[:24]
     return f"poller/{poller.owner.removeprefix('poller:')}/{slug}-{digest}"
@@ -194,6 +207,25 @@ def _git(args: list[str], cwd: Path):
 def _has_origin_remote(home: Path) -> bool:
     res = _git(["remote", "get-url", "origin"], cwd=home)
     return res.returncode == 0 and bool((res.stdout or "").strip())
+
+
+def _rolling_pr(home: Path, branch: str) -> tuple[ProposalPrState | None, str | None]:
+    """Ask the forge for the current head; unknown state must never create a PR."""
+    state = _proposal_branch_pr_state(home, branch)
+    if state != "open":
+        return state, None
+    res = _run(
+        ["gh", "pr", "list", "--state", "open", "--head", branch,
+         "--json", "number,state,url", "--limit", "1"],
+        cwd=home, capture=True,
+    )
+    try:
+        prs = json.loads(res.stdout or "[]") if res.returncode == 0 else []
+        if len(prs) == 1 and prs[0].get("state") == "OPEN" and isinstance(prs[0].get("url"), str) and prs[0]["url"]:
+            return "open", prs[0]["url"]
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None, None
 
 
 def _scan_for_secrets(text: str) -> bool:
@@ -381,10 +413,22 @@ def open_proposal(
             detail=_redact(f"git fetch origin {base} failed: {(fetch.stderr or '').strip()}"),
         )
     branch = poller_branch_name(poller) if poller else branch or default_branch_name(lane=lane)
+    start_ref = f"origin/{base}"
+    if poller and poller.surface == "social-outbox":
+        pr_state, _ = _rolling_pr(home, branch)
+        if pr_state is None:
+            return OpenResult(False, branch, None, "error", "rolling PR state unavailable")
+        if pr_state == "open":
+            fetched = _git(["fetch", "origin", branch], cwd=home)
+            if fetched.returncode != 0:
+                return OpenResult(False, branch, None, "error", "rolling branch fetch failed")
+            start_ref = f"origin/{branch}"
+        # A closed or merged PR's remote head must not become the next draft.
+        _git(["branch", "-D", branch], cwd=home)
     wt = poller_worktree_path(home, poller) if poller else _worktree_dir(home, branch, lane=lane)
     wt.parent.mkdir(parents=True, exist_ok=True)
     add = _git(
-        ["worktree", "add", "--no-checkout", "-b", branch, str(wt), f"origin/{base}"],
+        ["worktree", "add", "--no-checkout", "-b", branch, str(wt), start_ref],
         cwd=home,
     )
     if add.returncode != 0:
@@ -395,7 +439,7 @@ def open_proposal(
     # Sparse-checkout just the proposable surfaces so the worktree stays small
     # and the agent only sees what it can change (submit stages them regardless).
     # Cone mode also materializes top-level files, which is harmless.
-    surfaces = [s.as_posix() for s in (POLLER_PROPOSAL_SURFACES if poller else PROPOSAL_SURFACES)]
+    surfaces = [s.as_posix() for s in ((poller.surface_root,) if poller else PROPOSAL_SURFACES)]
     for step in (["sparse-checkout", "set", "--cone", *surfaces], ["checkout"]):
         r = _git(step, cwd=wt)
         if r.returncode != 0:
@@ -435,7 +479,7 @@ def _cleanup_worktree(home: Path, worktree: Path, branch: str) -> None:
     _git(["branch", "-D", branch], cwd=home)
 
 
-def _check_poller_surface(worktree: Path) -> str | None:
+def _check_poller_surface(worktree: Path, surface: Path = Path("state/wiki")) -> str | None:
     """Inspect both index and disk, without rename folding or ignore exclusions."""
     def checked(args: list[str]) -> str:
         result = _git(args, cwd=worktree)
@@ -444,7 +488,7 @@ def _check_poller_surface(worktree: Path) -> str | None:
         return result.stdout or ""
 
     def inside(path: str) -> bool:
-        return path.startswith("state/wiki/") and ".." not in Path(path).parts
+        return path.startswith(surface.as_posix() + "/") and ".." not in Path(path).parts
 
     for args in (
         ["diff", "--cached", "--no-renames", "--name-only", "-z"],
@@ -476,13 +520,94 @@ def _check_poller_surface(worktree: Path) -> str | None:
             # Follow staged links, including directory components, not just disk links.
             prefix = next((p for p in links if target == p or target.startswith(p + "/")), None)
             if prefix is None:
-                if not (worktree / target).resolve().is_relative_to(worktree / "state/wiki"):
+                if not (worktree / target).resolve().is_relative_to(worktree / surface):
                     return _redact(f"outside_surface: symlink {path}")
                 break
             if prefix in seen:
                 return _redact(f"outside_surface: cyclic symlink {path}")
             seen.add(prefix)
             path, target = prefix, links[prefix] + target[len(prefix):]
+    return None
+
+
+class _OutboxLoader(yaml.SafeLoader):
+    pass
+
+
+def _outbox_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict:
+    result: dict = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node)
+        if not isinstance(key, str) or key in result:
+            raise ValueError("duplicate or non-string outbox key")
+        result[key] = loader.construct_object(value_node)
+    return result
+
+
+_OutboxLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _outbox_mapping)
+
+
+def _valid_outbox(text: str) -> bool:
+    try:
+        doc = yaml.load(text, Loader=_OutboxLoader)
+    except (yaml.YAMLError, ValueError, TypeError):
+        return False
+    if not isinstance(doc, dict) or set(doc) != {"dispatch"}:
+        return False
+    items = doc["dispatch"]
+    if not isinstance(items, list) or not items:
+        return False
+    fields = {
+        "post": ({"text"}, {"text"}),
+        "reply": ({"text", "uri", "cid", "parent"}, {"text"}),
+        "like": ({"uri", "cid"}, {"uri", "cid"}),
+        "repost": ({"uri", "cid"}, {"uri", "cid"}),
+        "thread": ({"posts"}, {"posts"}),
+    }
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("action"), str):
+            return False
+        rule = fields.get(item["action"])
+        if rule is None or not rule[1].issubset(item) or not set(item).issubset({"action"} | rule[0]):
+            return False
+        if item["action"] == "reply" and "parent" not in item and not {"uri", "cid"}.issubset(item):
+            return False
+        for key, value in item.items():
+            if key == "action":
+                continue
+            if key == "parent" and isinstance(value, dict):
+                if set(value) != {"uri", "cid"} or not all(isinstance(v, str) and v.strip() for v in value.values()):
+                    return False
+                continue
+            if key == "posts":
+                if not isinstance(value, list) or not value or not all(
+                    isinstance(post, str) and post.strip() or
+                    isinstance(post, dict) and set(post) == {"text"} and
+                    isinstance(post["text"], str) and post["text"].strip()
+                    for post in value
+                ):
+                    return False
+            elif not isinstance(value, str) or not value.strip():
+                return False
+    return True
+
+
+def _check_outbox_files(worktree: Path) -> str | None:
+    """Scan all changed outbox content, including edits, before any commit/push."""
+    res = _git(["diff", "--cached", "--diff-filter=ACMT", "--name-only", "-z"], cwd=worktree)
+    if res.returncode != 0:
+        return "error"
+    for rel in filter(None, (res.stdout or "").split("\0")):
+        try:
+            text = (worktree / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return "schema"
+        findings = scan_outbound((text,), tool="submit_proposal", sink_category="network")
+        if any(f.detector == "credential" or env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False)
+               for f in findings):
+            return "privacy"
+        if not _valid_outbox(text):
+            return "schema"
     return None
 
 
@@ -527,18 +652,18 @@ def finalize_proposal(
 
     if poller:
         try:
-            outside = _check_poller_surface(wt)
+            outside = _check_poller_surface(wt, poller.surface_root)
         except (RuntimeError, OSError, ValueError) as exc:
             return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
         if outside:
             return ProposalResult(False, branch, False, None, "outside_surface", outside)
-    surfaces = POLLER_PROPOSAL_SURFACES if poller else PROPOSAL_SURFACES
+    surfaces = (poller.surface_root,) if poller else PROPOSAL_SURFACES
     add = _git(["add", *[s.as_posix() for s in surfaces]], cwd=wt)
     if poller and add.returncode != 0:
         return ProposalResult(False, branch, False, None, "error", _redact(add.stderr or "git add failed"))
     if poller:
         try:
-            outside = _check_poller_surface(wt)
+            outside = _check_poller_surface(wt, poller.surface_root)
         except (RuntimeError, OSError, ValueError) as exc:
             return ProposalResult(False, branch, False, None, "error", _redact(str(exc)))
         if outside:
@@ -551,6 +676,11 @@ def finalize_proposal(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="no_changes",
             detail=f"no changes under {', '.join(map(str, surfaces))} to propose",
         )
+
+    if poller and poller.surface == "social-outbox":
+        failure = _check_outbox_files(wt)
+        if failure:
+            return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed")
 
     try:
         conflict_marked = _staged_conflict_marker_paths(wt, fail_closed=poller is not None)
@@ -590,13 +720,47 @@ def finalize_proposal(
         )
     safe_title = _redact(title)
     safe_rationale = _redact(rationale + attribution)
+    rolling_state: ProposalPrState | None = None
+    rolling_url: str | None = None
+    rebased = False
+    if poller and poller.surface == "social-outbox":
+        rolling_state, rolling_url = _rolling_pr(home, branch)
+        if rolling_state is None:
+            return ProposalResult(False, branch, False, None, "error", "rolling PR state unavailable")
+        fetched = _git(["fetch", "origin", base], cwd=wt)
+        if fetched.returncode != 0:
+            return ProposalResult(False, branch, False, None, "error", "base fetch failed")
+        # Rebase before committing the new addition, retaining staged content.
+        drift = _git(["merge-base", "--is-ancestor", f"origin/{base}", "HEAD"], cwd=wt)
+        if drift.returncode != 0:
+            rebased = True
+            if _git(["stash", "push", "--include-untracked"], cwd=wt).returncode != 0:
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "cannot save draft before rebase")
+            rebase_result = _git(["rebase", f"origin/{base}"], cwd=wt)
+            if rebase_result.returncode != 0:
+                _git(["rebase", "--abort"], cwd=wt)
+                _git(["stash", "pop", "--index"], cwd=wt)
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "rolling branch conflicts with base")
+            restored = _git(["stash", "pop", "--index"], cwd=wt)
+            if restored.returncode != 0:
+                return ProposalResult(False, branch, False, None, "rolling_conflict", "draft conflicts with rebased base")
+            failure = _check_outbox_files(wt)
+            if failure:
+                return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed")
     commit = _git(["commit", "-m", f"{safe_title}\n\n{safe_rationale}"], cwd=wt)
     if commit.returncode != 0:
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="error",
             detail=_redact(f"git commit failed: {(commit.stderr or '').strip()}"),
         )
-    push = _git(["push", "-u", "origin", branch], cwd=wt)
+    push_args = ["push", "-u", "origin", branch]
+    if poller and poller.surface == "social-outbox" and (rolling_state != "open" or rebased):
+        old = _git(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=wt)
+        if old.returncode != 0:
+            return ProposalResult(False, branch, False, None, "error", "rolling head lookup failed")
+        sha = (old.stdout or "").split("\t", 1)[0].strip()
+        push_args.insert(1, f"--force-with-lease=refs/heads/{branch}:{sha}")
+    push = _git(push_args, cwd=wt)
     if push.returncode != 0:
         return ProposalResult(
             ok=False, branch=branch, pushed=False, pr_url=None, reason="error",
@@ -610,6 +774,9 @@ def finalize_proposal(
         "Approval = merge; live files update after the merge (#340)."
     )
     opener = open_pr or _default_open_pr
+    if rolling_state == "open" and rolling_url:
+        _cleanup_worktree(home, wt, branch)
+        return ProposalResult(True, branch, True, rolling_url, None)
     try:
         pr_url = opener(home, branch, base, safe_title, body)
     except ProposalPrError as exc:
