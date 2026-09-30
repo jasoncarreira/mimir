@@ -150,6 +150,8 @@ class TriageConfig:
     drop_below: float
     always_emit: tuple[str, ...]
     shadow: bool
+    mode: str = "drop_skips"
+    notify_at: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -191,6 +193,8 @@ def _load_triage(
         model = raw.get("model", DEFAULT_JEV_MODEL)
         questions = raw.get("questions")
         drop_below = raw.get("drop_below", 0.10)
+        mode = raw.get("mode", "drop_skips")
+        notify_at = raw.get("notify_at", 0.5)
         always_emit = raw.get("always_emit", [])
         shadow = raw.get("shadow", False)
 
@@ -198,9 +202,15 @@ def _load_triage(
             problem = "model must be a non-empty string"
         elif not isinstance(questions, dict) or not questions:
             problem = "questions must be a non-empty object"
-        elif isinstance(drop_below, bool) or not isinstance(drop_below, (int, float)):
+        elif not isinstance(mode, str) or mode not in {"drop_skips", "decide"}:
+            problem = "mode must be 'drop_skips' or 'decide'"
+        elif not _valid_probability(notify_at):
+            problem = "notify_at must be a number from 0 to 1"
+        elif mode == "drop_skips" and (
+            isinstance(drop_below, bool) or not isinstance(drop_below, (int, float))
+        ):
             problem = "drop_below must be a number from 0 to 1"
-        elif not 0 <= drop_below <= 1:
+        elif mode == "drop_skips" and not 0 <= drop_below <= 1:
             problem = "drop_below must be a number from 0 to 1"
         elif not isinstance(always_emit, list) or not all(
             isinstance(item, str) and item.strip() for item in always_emit
@@ -297,9 +307,11 @@ def _load_triage(
     return TriageConfig(
         model=model.strip(),
         questions=questions,
-        drop_below=float(drop_below),
+        drop_below=float(drop_below) if mode == "drop_skips" else 0.10,
         always_emit=tuple(item.strip().lower().lstrip("@") for item in always_emit),
         shadow=shadow,
+        mode=mode,
+        notify_at=float(notify_at),
     )
 
 
@@ -696,7 +708,9 @@ def _triage_message(event: dict, account: Account) -> dict | None:
         return None
 
 
-def _audit_drop(event: dict, triage_result: dict, *, shadow: bool = False) -> bool:
+def _audit_drop(
+    event: dict, triage_result: dict, *, shadow: bool = False, mode: str = "drop_skips"
+) -> bool:
     """Persist a drop record; return False so audit failures fail open."""
     record = {
         "message_id": event["message_id"],
@@ -708,6 +722,8 @@ def _audit_drop(event: dict, triage_result: dict, *, shadow: bool = False) -> bo
     }
     if shadow:
         record["shadow"] = True
+    if mode == "decide":
+        record["mode"] = "decide"
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with TRIAGE_DROPPED_FILE.open("a", encoding="utf-8") as audit:
@@ -830,12 +846,17 @@ def main() -> int:
                 triage_result = _triage_message(event, account)
             if triage_result is not None:
                 notify = triage_result["answers"]["notify"]["noul"]
-                would_drop = notify <= account.triage.drop_below
+                decide = account.triage.mode == "decide"
+                would_drop = (
+                    notify < account.triage.notify_at
+                    if decide else notify <= account.triage.drop_below
+                )
+                audit_mode = {"mode": "decide"} if decide else {}
                 if account.triage.shadow:
                     triage_result["would_drop"] = would_drop
                     if would_drop:
-                        _audit_drop(event, triage_result, shadow=True)
-                elif would_drop and _audit_drop(event, triage_result):
+                        _audit_drop(event, triage_result, shadow=True, **audit_mode)
+                elif would_drop and _audit_drop(event, triage_result, **audit_mode):
                     new_ids.append(mid)
                     seen.add(mid)
                     dropped += 1
@@ -845,6 +866,11 @@ def main() -> int:
                     "\nJev triage answers: "
                     + json.dumps(triage_result, separators=(",", ":"))
                 )
+                if decide and not account.triage.shadow and not would_drop:
+                    event["prompt"] += (
+                        "\nJev triage: NOTIFY — send the operator alert for this email; "
+                        "do not skip it."
+                    )
             print(json.dumps(event), flush=True)
             new_ids.append(mid)
             seen.add(mid)

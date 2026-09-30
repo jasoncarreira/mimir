@@ -132,9 +132,11 @@ The fields are:
 |---|---|---|
 | `model` | no | Versioned Jev model name. Defaults to the pinned `jev-1.13.0`, not a `-latest` alias. |
 | `questions` | yes | Operator-written Jev question map. It must include `notify` as a `noul` question. Questions normally use literal `instructions`; `choice.criteria` is an object and `score.criteria` is a list of 2-10 strings. The `notify` question may use `instructions_from: "prompt"` instead, as described below. Email content and model output cannot alter this map. |
-| `drop_below` | no | Inclusive `notify.noul` drop threshold from 0 to 1. Defaults to `0.10`; therefore `0.10` drops and `0.11` emits. |
+| `mode` | no | `"drop_skips"` (default) drops confident skips and leaves the agent to decide on emitted mail. `"decide"` uses Jev's score to decide both skips and alerts. |
+| `drop_below` | no | Inclusive `notify.noul` drop threshold from 0 to 1 in `drop_skips` mode. Defaults to `0.10`; therefore `0.10` drops and `0.11` emits. Ignored in `decide` mode. |
+| `notify_at` | no | `decide` threshold from 0 to 1 (default `0.5`). Scores below it drop; scores at or above it emit marked NOTIFY. Tune for your mail: a `0.5` cut can drop actionable alerts. |
 | `always_emit` | no | Sender addresses or exact domains that bypass Jev and always emit. Matching is case-insensitive. A leading `@` on domains is optional. Domain matches are exact: list subdomains separately when needed. |
-| `shadow` | no | When `true`, run and record triage but emit every message. Defaults to `false`. Use this to calibrate `drop_below` before enabling drops. |
+| `shadow` | no | When `true`, run and record triage but emit every message without a NOTIFY instruction. Defaults to `false`. Use this to calibrate the threshold before enabling drops. |
 
 For `notify`, `instructions_from: "prompt"` makes the account prompt the single
 source of truth for both Jev and the agent. The prompt file is read again on every
@@ -158,7 +160,12 @@ Each new message is evaluated separately. Deterministic `always_emit` matching
 runs before any request. Otherwise, the poller sends one request containing
 only `model`, the fixed `questions`, and a `state` made from sender, subject,
 and snippet. A message is dropped only when the documented noul answer is valid
-and `answers.notify.noul <= drop_below`. A noul answer has no `confidence`
+and `answers.notify.noul <= drop_below` in the default `drop_skips` mode.
+In `decide` mode, scores strictly below `notify_at` drop; scores at or above
+it emit with `Jev triage: NOTIFY — send the operator alert for this email; do
+not skip it.` in the prompt. The agent does not choose whether to skip these
+successfully triaged messages. `always_emit` senders bypass Jev and do not
+receive the NOTIFY line. A noul answer has no `confidence`
 field. Emitted, successfully triaged events include a `triage` extra with the
 resolved model and returned answers, plus a `Jev triage answers:` line in the
 prompt. These values remain untrusted email-ingest context and do not change
@@ -166,7 +173,8 @@ the event's trust tier.
 
 Every dropped message is still added to the cursor and appended to
 `<persist>/triage-dropped.jsonl` with its message ID, thread URL, sender,
-subject, answers, and resolved model. That audit file is gitignored. Runs with
+subject, answers, and resolved model (plus `"mode": "decide"` in decide mode).
+That audit file is gitignored. Runs with
 at least one valid triage configuration log `dropped=N` on stderr; deployments
 without triage retain the original empty-stderr behavior. If `JEV_KEY` is
 missing, configuration is invalid, the request times out after five seconds,
@@ -175,12 +183,15 @@ cannot be written, the poller fails open: it emits the message as before and
 logs one diagnostic instead of
 dropping mail.
 
-For rollout, start with `shadow: true` and inspect emitted events plus
-`triage-dropped.jsonl` on real mail. Messages at or below the threshold remain
+For rollout, set `mode: "decide"` with `shadow: true` first and inspect emitted
+events plus `triage-dropped.jsonl` on real mail. Messages below `notify_at` remain
 emitted with `triage.would_drop: true` and receive an audit record containing
-`"shadow": true`; messages above it have `triage.would_drop: false` and no audit
-record. After choosing a safe `drop_below`, remove `shadow` (or set it to
-`false`) to enable dropping.
+`"shadow": true` and `"mode": "decide"`; messages at or above it have
+`triage.would_drop: false` and no audit record. Shadow emits no NOTIFY line,
+keeping the agent's decision independent. Compare the scores with real alert
+outcomes, tune `notify_at`, then remove `shadow` (or set it to `false`) to enable
+the live decision. In `drop_skips` shadow, the inclusive `drop_below` threshold
+still applies to `would_drop`.
 
 5. **Bring it live:** arrange an operator-managed reload or restart.
 
