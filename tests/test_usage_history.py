@@ -126,6 +126,22 @@ def test_normalize_codex_plus():
     assert set(out["codex_plus"].keys()) == {"five_hour", "seven_day"}
 
 
+def test_normalize_codex_rejected_and_inconsistent_dashboard_state():
+    event = _codex_event(_ts(0), 0.20, 0.95)
+    event["recorded"]["seven_day"].update(
+        status="rejected",
+        inconsistent=True,
+        min_utilization=0.0,
+        max_utilization=1.0,
+    )
+    point = compute_usage_history([event])["codex_plus"]["seven_day"][0]
+    assert point["status"] == "rejected"
+    assert point["pressure"] == "blocked"
+    assert point["inconsistent"] is True
+    assert point["min_utilization"] == 0.0
+    assert point["max_utilization"] == 1.0
+
+
 def test_normalize_multi_provider_deployment():
     # User-stated case: Opus on Anthropic Max OAuth for chat + Codex
     # Plus for saga LLM calls. BOTH providers appear in the output.

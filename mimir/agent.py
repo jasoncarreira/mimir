@@ -3059,6 +3059,9 @@ class Agent:
             try:
                 from .quota_pause import QuotaPauseTracker, is_quota_exhaustion
                 if is_quota_exhaustion(exc):
+                    from .billing import record_codex_plus_rejection
+
+                    record_codex_plus_rejection(self._rate_limits, exc)
                     tracker = QuotaPauseTracker(
                         self._config.home / ".mimir" / "quota_pause.json"
                     )

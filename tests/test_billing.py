@@ -20,6 +20,8 @@ from mimir.billing import (
     evaluate_quota_severity,
     parse_codex_usage_payload,
     poll_codex_usage_once,
+    record_codex_plus_rate_limits,
+    record_codex_plus_rejection,
     OpenAIQuotaProvider,
 )
 from mimir.budget import HomeostaticArbiter
@@ -1300,6 +1302,123 @@ def _codex_usage_payload(*, pro: bool = False, used: float = 12.0) -> dict:
             "reset_at": now + 6 * 86400,
         }
     return {"plan_type": "pro" if pro else "plus", "rate_limit": rate_limit}
+
+
+def test_codex_usage_verdict_rejects_limiting_window_and_saturates_gate(
+    tmp_path, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append({"type": kind, **fields}),
+    )
+    payload = _codex_usage_payload(pro=True, used=95)
+    payload["rate_limit"].update(allowed=False, limit_reached=True)
+    parsed = parse_codex_usage_payload(payload)
+    store = RateLimitStore(tmp_path / "rl.json")
+
+    assert record_codex_plus_rate_limits(store, parsed, source="probe")
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "rejected"
+    assert snap.utilization == pytest.approx(0.95)
+    assert events[-1]["recorded"]["seven_day"]["status"] == "rejected"
+    result = evaluate_quota_severity([OpenAIQuotaProvider(store)])
+    assert result.severity is Severity.TIGHT
+    assert result.reason == "quota_saturated:openai:seven_day@1.00"
+
+
+@pytest.mark.parametrize("verdict", [
+    {"allowed": True, "limit_reached": True},
+    {"allowed": False, "limit_reached": False},
+])
+def test_each_codex_rejection_verdict_is_independently_binding(tmp_path, verdict):
+    payload = _codex_usage_payload(pro=True, used=20)
+    payload["rate_limit"].update(verdict)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "rejected"
+    assert snap.utilization == pytest.approx(0.20)
+    assert evaluate_quota_severity(
+        [OpenAIQuotaProvider(store)]
+    ).severity is Severity.TIGHT
+
+
+@pytest.mark.parametrize("verdict", [
+    {"allowed": True, "limit_reached": False},
+    {},
+])
+def test_codex_usage_allowed_or_absent_verdict_stays_allowed(tmp_path, verdict):
+    payload = _codex_usage_payload(pro=True, used=25)
+    payload["rate_limit"].update(verdict)
+    parsed = parse_codex_usage_payload(payload)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rate_limits(store, parsed, source="probe")
+    assert store.current()["openai_seven_day"].status == "allowed"
+
+
+def test_codex_probe_uses_rolling_max_and_reports_inconsistency(
+    tmp_path, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: events.append({"type": kind, **fields}),
+    )
+    store = RateLimitStore(tmp_path / "rl.json")
+    base = datetime.now(tz=timezone.utc)
+
+    def record(minutes: int, used: float) -> None:
+        parsed = parse_codex_usage_payload(_codex_usage_payload(pro=True, used=used))
+        assert record_codex_plus_rate_limits(
+            store, parsed, source="probe",
+            observed_at=(base + timedelta(minutes=minutes)).isoformat(),
+        )
+
+    record(0, 100)
+    record(1, 94)
+    record(2, 0)
+    assert [event["recorded"]["seven_day"]["utilization"] for event in events] == [
+        1.0, 1.0, 1.0,
+    ]
+    assert events[-1]["inconsistent"] is True
+    assert events[-1]["min_utilization"] == 0.0
+    assert events[-1]["max_utilization"] == 1.0
+
+    record(16, 94)
+    assert events[-1]["recorded"]["seven_day"]["utilization"] == pytest.approx(0.94)
+
+
+class _CodexUsageLimitError(RuntimeError):
+    def __init__(self, reset_at: int):
+        super().__init__("usage limit reached")
+        self.status_code = 429
+        self.type = "usage_limit_reached"
+        self.raw = {"error": {"type": self.type, "resets_at": reset_at}}
+        self.rate_limits = None
+
+
+def test_generation_rejection_beats_probe_until_successful_generation(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    reset_at = int(time.time()) + 3 * 86400
+    assert record_codex_plus_rejection(store, _CodexUsageLimitError(reset_at))
+    assert store.current()["openai_seven_day"].status == "rejected"
+
+    payload = _codex_usage_payload(pro=True, used=95)
+    payload["rate_limit"].update(allowed=True, limit_reached=False)
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    assert store.current()["openai_seven_day"].status == "rejected"
+
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="response",
+    )
+    snap = store.current()["openai_seven_day"]
+    assert snap.status == "allowed"
+    assert snap.utilization == pytest.approx(0.95)
 
 
 def test_parse_codex_usage_maps_plus_and_pro_by_declared_duration():

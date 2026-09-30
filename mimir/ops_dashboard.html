@@ -119,6 +119,8 @@
       summary { cursor: pointer; color: var(--muted); font-size: 0.85rem; }
       pre { background: var(--paper-strong); border: 1px solid var(--line); padding: 0.6rem; border-radius: 4px; font-size: 0.78rem; overflow-x: auto; }
       .hint { color: var(--muted); font-size: 0.85rem; margin: 0.2rem 0 0.7rem; }
+      .usage-alert { color: var(--bad); font-size: 0.85rem; font-weight: 600; margin: 0.25rem 0.2rem; }
+      .usage-alert.disagree { color: var(--warn); }
       .resolution-grid {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -545,6 +547,22 @@
           const windows = usageHistory[provider];
           const datasets = [];
           for (const [windowName, points] of Object.entries(windows)) {
+            const latest = points.length ? points[points.length - 1] : null;
+            if (provider === 'codex_plus' && latest && latest.status === 'rejected') {
+              const alert = document.createElement('div');
+              alert.className = 'usage-alert';
+              const reset = latest.resets_at == null
+                ? 'unknown reset time'
+                : new Date(latest.resets_at * 1000).toLocaleString();
+              alert.textContent = windowName + ': limit reached until ' + reset;
+              wrap.insertBefore(alert, canvas);
+            }
+            if (provider === 'codex_plus' && latest && latest.inconsistent) {
+              const alert = document.createElement('div');
+              alert.className = 'usage-alert disagree';
+              alert.textContent = windowName + ': readings disagree';
+              wrap.insertBefore(alert, canvas);
+            }
             datasets.push({
               label: windowName,
               data: points.map(p => ({
