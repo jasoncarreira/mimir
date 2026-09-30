@@ -1054,6 +1054,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.setenv("MIMIR_MODEL_REASONING_EFFORT", "high")
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
@@ -1102,6 +1103,7 @@ async def test_feature_factory_launch_remains_shell_free_argv(
         "feature",
         " --autonomous --max-retries 5 chainlink-1606",
     )
+    assert "--variant" not in spec.local_argv
     assert "shell" not in calls[0]["kwargs"]
     assert calls[0]["checkout"] == tmp_path
 
@@ -1124,6 +1126,7 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.6-luna")
+    monkeypatch.setenv("MIMIR_MODEL_REASONING_EFFORT", "high")
     auth = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     auth.parent.mkdir(parents=True)
     auth.write_text(
@@ -1162,11 +1165,13 @@ async def test_opencode_backend_invokes_run_dir_with_prompt_guard(
     assert result.backend_status == "success"
     assert calls[0]["args"] == (
         "opencode", "run", "--dir", str(order.checkout),
-        "-m", "openai/gpt-5.6-luna", "--", "-starts with dash"
+        "-m", "openai/gpt-5.6-luna", "--variant", "high", "--", "-starts with dash"
     )
     assert calls[0]["args"].count("-m") == 1
     assert spec.backend_config["model"] == "openai/gpt-5.6-luna"
     assert spec.backend_config["model_diverged"] is False
+    assert spec.backend_config["variant"] == "high"
+    assert spec.backend_config["variant_source"] == "agent"
     assert spec.test_command == "uv run pytest -q"
     assert "MIMIR_MODEL_SPEC" not in calls[0]["kwargs"]["env"]
     permission = json.loads(calls[0]["kwargs"]["env"]["OPENCODE_PERMISSION"])
@@ -1475,6 +1480,8 @@ def test_registry_builds_opencode_backend_with_settings() -> None:
         (["--model", "openai/gpt-5.5"], "--model"),
         (["-m", "openai/gpt-5.5"], "-m"),
         (["--model=openai/gpt-5.5"], "--model=openai/gpt-5.5"),
+        (["--variant", "high"], "--variant"),
+        (["--variant=high"], "--variant=high"),
         (["--dir", "/tmp/other"], "--dir"),
         (["--"], "--"),
     ],
@@ -1839,6 +1846,96 @@ def _write_opencode_auth(tmp_path: Path, payload: object) -> None:
     path = tmp_path / ".local" / "share" / "opencode" / "auth.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("agent", "override", "expected", "source"),
+    [
+        ("high", None, "high", "agent"),
+        ("high", "xhigh", "xhigh", "worklink_override"),
+        ("high", "", "high", "agent"),
+        (None, None, None, "none"),
+        ("none", None, None, "none"),
+        ("high", "none", None, "none"),
+        ("max", None, "max", "agent"),
+        ("ultra", None, "ultra", "agent"),
+    ],
+)
+def test_opencode_leaf_reasoning_variant(
+    tmp_path: Path, agent: str | None, override: str | None,
+    expected: str | None, source: str,
+) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent")
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    if agent is not None:
+        env["MIMIR_MODEL_REASONING_EFFORT"] = agent
+    if override is not None:
+        env["MIMIR_WORKLINK_REASONING_EFFORT"] = override
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="uv run pytest -q",
+    )
+    args = spec.backend_config["args"]
+    assert args[:2] == ["-m", "openai/gpt-agent"]
+    assert args[2:] == (["--variant", expected] if expected else [])
+    assert spec.backend_config["variant"] == expected
+    assert spec.backend_config["variant_source"] == source
+    assert spec.backend_config["model_source"] == "agent_model"
+    assert spec.local_argv[4:4 + len(args)] == tuple(args)
+
+
+def test_opencode_leaf_reasoning_from_home_dotenv_and_native_model(tmp_path: Path) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent")
+    env.pop("MIMIR_MODEL_SPEC")
+    home = Path(env["MIMIR_HOME"])
+    (home / ".env").write_text(
+        "MIMIR_MODEL_SPEC=codex-plus:gpt-agent\n"
+        "MIMIR_MODEL_REASONING_EFFORT=low\n"
+        "MIMIR_WORKLINK_REASONING_EFFORT=xhigh\n", encoding="utf-8",
+    )
+    config = tmp_path / ".config" / "opencode" / "opencode.jsonc"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"model":"openai/gpt-native"}', encoding="utf-8")
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="true",
+    )
+    assert spec.backend_config["args"] == ["-m", "openai/gpt-native", "--variant", "xhigh"]
+    assert spec.backend_config["model_source"] == "opencode_config"
+    assert spec.backend_config["variant_source"] == "worklink_override"
+
+
+@pytest.mark.parametrize("name", ["MIMIR_MODEL_REASONING_EFFORT", "MIMIR_WORKLINK_REASONING_EFFORT"])
+def test_opencode_leaf_invalid_openai_effort_fails_before_invocation(
+    tmp_path: Path, name: str,
+) -> None:
+    env = _provider_env(tmp_path, "codex-plus:gpt-agent", **{name: "turbo"})
+    _write_opencode_auth(tmp_path, {"openai": {"type": "oauth", "refresh": "subscription"}})
+    with pytest.raises(ValueError) as excinfo:
+        OpenCodeBackend().work_spec(
+            WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+            attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+            test_command="true",
+        )
+    assert name in str(excinfo.value)
+    assert "turbo" in str(excinfo.value)
+    assert "max" in str(excinfo.value) and "ultra" in str(excinfo.value)
+
+
+def test_opencode_leaf_other_provider_passes_variant_through(tmp_path: Path) -> None:
+    env = _provider_env(tmp_path, "openrouter:anthropic/claude-opus", MIMIR_MODEL_REASONING_EFFORT="turbo")
+    _write_opencode_auth(tmp_path, {"openrouter": {"type": "api", "key": "synthetic"}})
+    spec = OpenCodeBackend().work_spec(
+        WorkOrder(1844, tmp_path, "prompt", None, 30, env),
+        attempt=1, repo_url="u", base_ref="main", branch="issue/1844-a1",
+        test_command="true",
+    )
+    assert spec.backend_config["args"] == [
+        "-m", "openrouter/anthropic/claude-opus", "--variant", "turbo",
+    ]
 
 
 @pytest.mark.parametrize("credential", ["saved_auth", "ambient_key"])

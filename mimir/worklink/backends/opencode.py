@@ -13,6 +13,7 @@ import re
 import time
 from typing import Awaitable, Callable, Mapping, Sequence
 
+from ..._reasoning_effort import validate_effort
 from ...config import model_spec_at_call_time
 from ...opencode_config import (
     OpenCodeInvocation,
@@ -46,7 +47,7 @@ DERIVABLE_TEST_RUNNERS: frozenset[str] = frozenset({
     "uv",
     "yarn",
 })
-_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--dir", "--")
+_INJECTED_FLAGS: tuple[str, ...] = ("-m", "--model", "--variant", "--dir", "--")
 # Five total attempts wait 0.1 + 0.2 + 0.4 + 0.8 = 1.5 seconds. That
 # comfortably spans the observed sub-second SQLite startup lock while bounding
 # a genuinely stuck session store to a short delay.
@@ -171,6 +172,23 @@ class OpenCodeBackend:
         invocation = resolution.invocation
         resolution_env = resolution.env
         args.extend(("-m", invocation.model))
+        override = resolution_env.get("MIMIR_WORKLINK_REASONING_EFFORT", "")
+        agent_effort = resolution_env.get("MIMIR_MODEL_REASONING_EFFORT", "")
+        effort_name = "MIMIR_WORKLINK_REASONING_EFFORT" if override else "MIMIR_MODEL_REASONING_EFFORT"
+        raw_effort = override or agent_effort
+        try:
+            effort = (
+                validate_effort("codex-plus", raw_effort)
+                if invocation.provider == "openai" else raw_effort
+            )
+        except ValueError as exc:
+            raise ValueError(f"{effort_name}: {exc}") from exc
+        variant = effort if effort and effort != "none" else None
+        variant_source = (
+            "worklink_override" if override else "agent"
+        ) if variant else "none"
+        if variant:
+            args.extend(("--variant", variant))
         if invocation.config_path.exists() or "OPENCODE_CONFIG" in env:
             env["OPENCODE_CONFIG"] = str(invocation.config_path)
         for key in invocation.pass_env:
@@ -193,6 +211,8 @@ class OpenCodeBackend:
             "configured_model": resolution.configured_model,
             "model_diverged": resolution.model_diverged,
             "model_source": invocation.model_source,
+            "variant": variant,
+            "variant_source": variant_source,
             "test_env": dict(self.test_env),
         }
         enabled = _coding_enabled()
