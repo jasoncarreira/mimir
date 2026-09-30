@@ -2411,6 +2411,15 @@ async def run_poller(
                 enqueue=enqueue_recovered,
                 service_principal=authority.canonical,
                 service_authority=authority,
+                trust_source=poller.trust_source,
+                github_token=poller.env.get(
+                    "GITHUB_TOKEN", os.environ.get("GITHUB_TOKEN", "")
+                    if "GITHUB_TOKEN" in poller.pass_env else "",
+                ),
+                github_self_login=poller.env.get(
+                    "MIMIR_GITHUB_SELF_LOGIN", os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "")
+                    if "MIMIR_GITHUB_SELF_LOGIN" in poller.pass_env else "",
+                ),
                 recover_failed_turns=poller.recover_failed_turns,
                 relevance_check=relevance_check,
             )
