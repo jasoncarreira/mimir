@@ -17,6 +17,7 @@ was the most concerning zero-coverage module; this file pins:
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -380,6 +381,25 @@ class TestRenderSagaSessionEnd:
             assert "canonical source" in tmpl
             assert "[verify before quoting]" in tmpl
             assert "`closed_since` is only for refs you confirmed resolved" in tmpl
+
+    def test_rendered_synthesis_only_requests_available_tools_and_new_files(self) -> None:
+        from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
+
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            tools = set(re.findall(
+                r"\b(?:mimir_get_turn|memory_get|saga_\w+|write_file|read_file|edit_file|memory_query)\b",
+                prompt,
+            ))
+            assert tools <= TRIGGER_AUTHORITY_PROFILES["session-boundary"]
+            assert "create new files" in prompt
+            assert "memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md" in prompt
+            assert "learnings-pending/" not in prompt
+            assert "learnings-pending.md" not in prompt
+            assert not re.search(r"\b(?:edit|append|overwrite) (?:files?|it|to)\b", prompt)
 
 
 # ─── chainlink #388: malformed operator template must not crash synthesis ──

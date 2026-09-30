@@ -298,6 +298,65 @@ def test_overgrown_learnings_pending_is_reported(tmp_path: Path) -> None:
     assert section.metrics["overgrown"] == 1
 
 
+@pytest.mark.parametrize("legacy_buffer", [False, True])
+def test_synthesis_inbox_candidate_is_visible_to_reflection_and_doctor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_buffer: bool,
+) -> None:
+    import re
+    from dataclasses import replace
+
+    from mimir import access_control
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.readonly_backend import WriteGuardBackend
+    from mimir.access_control import ToolRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    if legacy_buffer:
+        _write(home / "memory/learnings-pending.md", "# Learnings Pending\n")
+    principal = access_control.builtin_trigger_service_principal("session-boundary", home)
+    auth = access_control.create_auth_context(AgentEvent(
+        trigger="saga_session_end", channel_id="chan-a", content="synthesize",
+        service_principal=principal.canonical, service_authority=principal,
+    ), enforce=True)
+    auth = replace(auth, ifc_labels=InformationFlowLabels())
+    target = "memory/learnings-inbox/2026-09-30-synthesis-turn-1.md"
+    body = "What I noticed: x\nWhat works: y\nTrigger: z\nSource: turn-1\n"
+    decision = ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=True, target_channel=target,
+    )
+    assert decision.allowed, decision.reason
+    backend = WriteGuardBackend(home, ["memory"])
+    assert backend.write("/" + target, body).error is None
+    assert backend.write("/" + target, "replacement").error is not None
+    assert (home / target).read_text() == body
+    _write(home / "memory/learnings-pending/2026-W40.md", "weekly history")
+    _write(home / "memory/learnings-inbox/archive/older.md", "inbox history")
+    _write(home / "memory/learnings-inbox/reviewed.md", "<!-- learnings-inbox: reviewed -->\narchive: older.md\n")
+
+    prompt = (Path(__file__).parents[1] / "mimir/prompt_templates/reflect.md").read_text()
+    inbox_glob = re.search(r"Discover `([^`]+)` with `glob`", prompt)
+    assert inbox_glob is not None
+    assert list(home.glob(inbox_glob.group(1)))
+    assert home / target in list(home.glob(inbox_glob.group(1)))
+    assert "even when the buffer is absent or empty" in prompt
+    assert "<!-- learnings-inbox: reviewed -->" in prompt
+    assert "memory/learnings-inbox/archive/<original-name>.md" in prompt
+    assert "Only after the pending entry (when needed) and archive are verified" in prompt
+    assert "replace the original file's content" in prompt
+    assert not re.fullmatch(r"\d{4}-W\d{2}\.md", Path(target).name)
+    assert home / target not in list((home / "memory/learnings-pending").glob("[0-9][0-9][0-9][0-9]-W[0-9][0-9].md"))
+
+    report = run_doctor(home)
+    section = next(s for s in report.sections if s.name == "learnings-inbox")
+    assert section.metrics == {
+        "files": 1, "bytes": len(body.encode()), "lines": 4, "reviewed_receipts": 1,
+    }
+    finding = _find(report, layer="learnings-inbox", check="pending", path="memory/learnings-inbox")
+    assert "await reflection" in finding.message
+
+
 def test_duplicate_issue_note_detection(tmp_path: Path) -> None:
     _seed_clean_home(tmp_path)
     body = "<!-- desc: duplicate incident -->\n# Incident\nsame facts"

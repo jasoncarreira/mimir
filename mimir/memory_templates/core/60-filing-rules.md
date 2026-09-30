@@ -46,8 +46,14 @@ how urgent the cleanup is and what the right home looks like.
 - **`memory/learnings-pending.md`** — append-only buffer for candidate
   learned behaviors. Reflection PROPOSES promoting durable ones to
   `core/40-learned-behaviors.md` (core is read-only at runtime — the
-  promotion lands as a core-memory PR). Synthesis turns capture here,
-  NOT direct-to-core.
+  promotion lands as a core-memory PR). Reflection carries pending inbox
+  candidates here; synthesis cannot edit this buffer.
+- **`memory/learnings-inbox/`** — synthesis create-only candidate files named
+  `<YYYY-MM-DD>-<turn_id>-<n>.md` (UTC date). Reflection reads the top-level
+  `*.md` files alongside the buffer, keeps/drops/proposes each, then archives
+  content under `learnings-inbox/archive/` and drains source files to reviewed
+  receipts. This is separate from the weekly historical archives at
+  `memory/learnings-pending/<YYYY-WNN>.md`. Never capture directly to core.
 - **`memory/INDEX.md`** — auto-managed; hand-edits overwritten. The
   convention to enforce is the per-file `<!-- desc: ... -->` first-line.
 
@@ -160,6 +166,9 @@ internal layer's discoverability rots.
   promote/drop). `memory/core/40-learned-behaviors.md` remains
   append-shaped, but edits land only through protected-surface proposal
   PRs merged by the operator.
+- **Create-only synthesis inbox**: `memory/learnings-inbox/*.md`; reflection
+  archives and drains reviewed content to receipts (does not delete files).
+  Weekly `memory/learnings-pending/<YYYY-WNN>.md` files remain history.
 - **Edit-in-place**: most other layers — channels, issues, wiki
   concepts/topics/entities, spec docs in flight.
 - **Auto-managed**: `memory/INDEX.md`, `state/INDEX.md`,

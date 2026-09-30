@@ -360,6 +360,46 @@ def is_memory_read_path(path: Path) -> bool:
     return resolved == memory or resolved.is_relative_to(memory)
 
 
+def is_own_missing_channel_memory_path(path: Path, auth_context: Any) -> bool:
+    """Allow a missing own-channel file to reach the backend's not-found response.
+
+    Require both the caller's spelling and its resolved parent chain to stay
+    within the channel. Other channels must retain the same denial whether or
+    not the requested file exists.
+    """
+    home = _resolved_mimir_home()
+    if home is None:
+        return False
+    authority = getattr(auth_context, "service_authority", None)
+    channel = getattr(auth_context, "channel_id", None)
+    if (
+        getattr(authority, "canonical", None) == "scheduler"
+        and getattr(authority, "trigger", None) == "scheduled_tick"
+    ):
+        channel = getattr(authority, "channel_memory_directory", None)
+    if not isinstance(channel, str) or not channel or channel in {".", ".."} or "/" in channel:
+        return False
+    root = home / "memory" / "channels" / channel
+    from .access_control import _is_trigger_service_protected_read_path
+
+    if (
+        not path.is_relative_to(root) or path == root
+        or _has_protected_read_name(path)
+        or _is_trigger_service_protected_read_path(path.relative_to(home / "memory"))
+    ):
+        return False
+    try:
+        path.resolve(strict=True)
+    except FileNotFoundError:
+        try:
+            return path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
+        except (OSError, RuntimeError):
+            return False
+    except (OSError, RuntimeError):
+        return False
+    return False
+
+
 def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     """Apply channel scope to memory reads, except for job-bound scheduled ticks."""
     home = _resolved_mimir_home()
@@ -376,6 +416,8 @@ def is_memory_read_path_allowed(path: Path, auth_context: Any) -> bool:
     try:
         resolved = path.resolve(strict=True)
         resolved_memory = memory.resolve(strict=True)
+    except FileNotFoundError:
+        return is_own_missing_channel_memory_path(path, auth_context)
     except (OSError, RuntimeError):
         return False
     if not (resolved == resolved_memory or resolved.is_relative_to(resolved_memory)):

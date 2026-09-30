@@ -4893,16 +4893,31 @@ def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bo
     candidate = Path(target)
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
+    home_root = Path(home).resolve()
     try:
-        candidate.resolve().relative_to(
-            (Path(home).resolve() / "memory" / "channels").resolve()
-        )
-    except (OSError, RuntimeError):
+        lexical = candidate.relative_to(home_root)
+        resolved = candidate.resolve().relative_to(home_root)
+    except (OSError, RuntimeError, ValueError):
         return False
-    except ValueError:
-        # The prompt also authorizes shared non-channel memory and state paths.
-        return True
-    return _synthesis_channel_target_matches_session(target, channel_id)
+    if lexical.is_relative_to(Path("memory/channels")):
+        return _synthesis_channel_target_matches_session(target, channel_id)
+    # Create-only synthesis capture roots. In particular, the legacy buffer
+    # and its weekly archive directory are not destinations for new learnings.
+    inbox = Path("memory/learnings-inbox")
+    if lexical.is_relative_to(inbox) or resolved.is_relative_to(inbox):
+        return (
+            lexical.parent == inbox and resolved.parent == inbox
+            and lexical.suffix == ".md" and resolved.suffix == ".md"
+        )
+    roots = (
+        Path("memory/issues"),
+        Path("state/wiki/concepts"), Path("state/wiki/topics"),
+    )
+    return any(
+        lexical != root and lexical.is_relative_to(root)
+        and resolved != root and resolved.is_relative_to(root)
+        for root in roots
+    )
 
 
 def resolve_trigger_service_write_target(
@@ -4972,6 +4987,7 @@ def _trigger_service_read_target_is_allowed(
     from .read_policy import (
         _has_protected_read_name,
         file_contains_secret,
+        is_own_missing_channel_memory_path,
         is_memory_read_path,
         is_memory_read_path_allowed,
         is_operator_secret_read_path,
@@ -5001,6 +5017,13 @@ def _trigger_service_read_target_is_allowed(
             memory_candidate = home_root / raw.lstrip("/")
         try:
             resolved_memory_candidate = memory_candidate.resolve(strict=True)
+        except FileNotFoundError:
+            if (
+                tool_name in {"read_file", "aread"}
+                and is_own_missing_channel_memory_path(memory_candidate, auth_context)
+            ):
+                return True
+            resolved_memory_candidate = None
         except (OSError, RuntimeError):
             resolved_memory_candidate = None
         if (
@@ -8785,6 +8808,29 @@ class ToolRegistry:
             and service.authority_profile == "session-boundary"
             and not service.has_capability(tool_name)
         ):
+            from ._context import get_current_turn
+
+            turn = get_current_turn()
+            raw_path = (arguments or {}).get("file_path") if isinstance(arguments, dict) else None
+            artifact = (
+                resolve_large_tool_results_target(raw_path)
+                if tool_name == "read_file" and isinstance(raw_path, str) else None
+            )
+            artifact_root = framework_large_tool_results_root()
+            if (
+                turn is not None
+                and artifact_root is not None
+                and artifact is not None
+                and artifact.parent == artifact_root
+                and artifact.name in turn.evicted_tool_result_ids
+            ):
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.OPEN,
+                    allowed=True,
+                    enforcement_enabled=True,
+                    would_block=False,
+                ))
             # Synthesis must not ingest around its trusted-turn input filter,
             # including through generally available read tools in shadow mode.
             return finish(ToolAuthorization(

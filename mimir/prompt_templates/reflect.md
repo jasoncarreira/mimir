@@ -84,9 +84,10 @@ Before either track, gather inputs:
   missing exact top-N ranking as an evidence limitation rather than routing
   around the profile.
 - All core-memory blocks already rendered in the system prompt
-- `memory/learnings-pending.md` — candidate behaviors captured by
-  `saga_session_end` synthesis turns since last reflection. Promote /
-  drop / keep per §B.4.
+- `memory/learnings-inbox/*.md` — create-only candidate behaviors captured by
+  `saga_session_end` synthesis turns since last reflection. Read these alongside
+  `memory/learnings-pending.md` (the legacy live buffer).
+  Promote / drop / keep per §B.4. Do not confuse the inbox with weekly archives.
 - File-count and mtime distribution under `memory/<anywhere>/` and
   `state/wiki/` (Glob + `os.stat`; cheap)
 - **Applied-proposals audit** — read the newest
@@ -216,12 +217,36 @@ access history in the prior 90d, or fresh atoms before consolidation has labeled
 them), fall back to cumulative contributed retrieval evidence. The P47 trend
 filter is additive, not a hard gate.
 
-### B.4 — Pending-learnings buffer review
+### B.4 — Pending-learnings buffer and inbox review
 
-**Pre-step — size check + rotate if needed.** `memory/learnings-pending.md`
-is append-only between reflections. Inspect it with paginated `read_file`; if it
-has grown past Read's single-call limit (~1000 lines / 25k tokens), rotate before
-reviewing.
+**Inbox intake — every reflection, even when the buffer is absent or empty.**
+Discover `memory/learnings-inbox/*.md` with `glob` and read each top-level file
+with paginated `read_file`. Ignore `archive/` and files beginning with
+`<!-- learnings-inbox: reviewed -->` (drained receipts). Walk each candidate
+alongside the buffer using the Promote / Drop / Keep pending criteria below.
+Do not mistake `memory/learnings-pending/<YYYY-WNN>.md` weekly history for the inbox.
+
+**Drain reviewed inbox files during this rotation.** For Keep pending and
+Promote awaiting merge, first copy the candidate into `learnings-pending.md`
+with its source inbox path as a deduplication key; leave it there until the
+promotion lands. Do not duplicate an entry already carrying that source path.
+For each reviewed candidate (including Drop), create a verbatim archive copy
+at `memory/learnings-inbox/archive/<original-name>.md` with `write_file`.
+If that archive already exists, read it and verify it matches before proceeding.
+Only after the pending entry (when needed) and archive are verified, use
+`edit_file` to replace the original file's content with a small receipt starting
+`<!-- learnings-inbox: reviewed -->`, followed by the archive path and disposition.
+This clears the active inbox without deleting files or invoking shell commands;
+physical receipt deletion remains propose-only. If any step fails, keep the
+source candidate intact and report the unfinished rotation. Process only the
+files discovered at intake; later concurrent synthesis writes wait for next week.
+
+**Buffer pre-step — before inbox intake, size check + rotate if needed.**
+`memory/learnings-pending.md` is append-only between reflections. Inspect it
+with paginated `read_file`; if it has grown past Read's single-call limit
+(~1000 lines / 25k tokens), rotate before transferring inbox candidates.
+If the buffer is absent, create it with the standard header before carrying
+forward any candidate. Review inbox candidates regardless of buffer size.
 
 To rotate:
 1. Identify the closing ISO week from the system date (or the week containing
@@ -232,13 +257,13 @@ To rotate:
    Do not use `wc`, `date`, `mv`, shell expansion, or redirection.
 3. Seed the fresh live file with just the standard header (the `<!-- desc: -->`
    line, the `# Learnings Pending` heading, and the lifecycle intro — no
-   content entries; synthesis turns will fill it with this week's candidates).
+   content entries; reflection inbox intake carries forward pending candidates).
 4. Run the carry-forward audit **against the archived file** (the file you
    just renamed). The live file starts empty and need not be reviewed yet.
 
 Archives live at `memory/learnings-pending/<YYYY-WNN>.md` (one per week).
 The most recent archive is always the primary review target when rotation
-just happened; in non-rotation weeks the live file is the only target.
+just happened; in non-rotation weeks review the live file and the inbox.
 
 Walk `memory/learnings-pending.md` (and the most recent archive if it was
 just rotated or is only one week old) entry-by-entry. For each:
@@ -291,8 +316,9 @@ Conservative defaults the policy ships with:
 - **Autonomous** (low-risk, reversible / additive):
   - SAGA atom decay calls
   - SAGA triples linking (additive)
-  - Promote/drop entries in `memory/learnings-pending.md` (the
-    weekly review pass — see §B.4 below)
+  - Review `memory/learnings-inbox/*.md` alongside `memory/learnings-pending.md`,
+    archive and drain reviewed inbox content, and keep/drop pending entries
+    (the weekly review pass — see §B.4 above; no physical file deletion)
   - Wiki orphan tagging (just flag, don't delete)
 
 - **Propose-only** (HITL — operator review before effect):
