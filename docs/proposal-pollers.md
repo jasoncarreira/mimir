@@ -15,8 +15,8 @@ turn. Emit nothing when there is nothing new to propose. Use `STATE_DIR` for
 the script's cursor and for the agent's draft notes; `scoped_roots: ["state"]`
 grants this poller only `state/pollers/<name>/`, not all of `<home>/state`.
 
-For example, an arxiv-style manifest excerpt (retain any grants needed to
-fetch the feed in the real deployment):
+For example, an arxiv-style manifest excerpt that lets the agent turn fetch
+papers from arxiv (the script fetches the feed independently):
 
 ```json
 {
@@ -28,6 +28,7 @@ fetch the feed in the real deployment):
       "profile": "research",
       "tier": "scoped-with-provenance",
       "scoped_roots": ["state"],
+      "approved_urls": ["https://arxiv.org/"],
       "capabilities": [
         "read_file", "write_file", "edit_file",
         "open_proposal", "submit_proposal", "abandon_proposal"
@@ -36,6 +37,11 @@ fetch the feed in the real deployment):
   }]
 }
 ```
+
+For a research poller, `approved_urls` grants the agent turn's `fetch_url`
+access to exact HTTPS URL prefixes; `fetch_url` is added automatically when
+this list is non-empty and is rejected without it. This grant lets the agent
+read papers, not the script fetch the feed.
 
 The operator owns these manifest authority fields. `profile: research` and
 `tier: scoped-with-provenance` enable the proposal capabilities; the file

@@ -39,6 +39,11 @@ def test_proposal_poller_guide_is_linked() -> None:
     root = Path(__file__).resolve().parents[1]
     guide = root / "docs/proposal-pollers.md"
     assert guide.is_file()
+    guide_text = guide.read_text()
+    manifest = json.loads(guide_text.split("```json\n", 1)[1].split("```", 1)[0])
+    assert manifest["pollers"][0]["authority"]["approved_urls"] == ["https://arxiv.org/"]
+    assert "`approved_urls`" in guide_text
+    assert "`fetch_url`" in guide_text
     assert "(proposal-pollers.md)" in (root / "docs/proposals.md").read_text()
     assert "(../../../docs/proposal-pollers.md)" in (
         root / "mimir/skills/pollers/SKILL.md"
