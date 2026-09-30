@@ -465,7 +465,7 @@ def test_config_max_tokens_env_override(monkeypatch: pytest.MonkeyPatch) -> None
 # ─── reasoning_effort threading (settable across providers) ──────────
 
 
-def test_codex_plus_reasoning_effort_defaults_none(
+def test_codex_plus_reasoning_effort_defaults_to_model_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pytest.importorskip("langchain_codex_plus")
@@ -477,11 +477,13 @@ def test_codex_plus_reasoning_effort_defaults_none(
 
     monkeypatch.setattr("langchain_codex_plus.ChatCodexPlus", _fake)
     _resolve_model("codex-plus:gpt-5.4")
-    assert captured["reasoning_effort"] == "none"
+    assert captured["reasoning_effort"] is None
 
 
+@pytest.mark.parametrize("effort", ["ultra", "none"])
 def test_codex_plus_reasoning_effort_configurable(
     monkeypatch: pytest.MonkeyPatch,
+    effort: str,
 ) -> None:
     pytest.importorskip("langchain_codex_plus")
     captured: dict[str, Any] = {}
@@ -491,8 +493,27 @@ def test_codex_plus_reasoning_effort_configurable(
         return "M"
 
     monkeypatch.setattr("langchain_codex_plus.ChatCodexPlus", _fake)
-    _resolve_model("codex-plus:gpt-5.4", reasoning_effort="medium")
-    assert captured["reasoning_effort"] == "medium"
+    _resolve_model("codex-plus:gpt-5.4", reasoning_effort=effort)
+    assert captured["reasoning_effort"] == effort
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected_reasoning"),
+    [("", None), ("ultra", {"effort": "ultra"}), ("none", {"effort": "none"})],
+)
+def test_codex_plus_request_body_reasoning(
+    effort: str,
+    expected_reasoning: dict[str, str] | None,
+) -> None:
+    from langchain_core.messages import HumanMessage
+
+    model = _resolve_model("codex-plus:gpt-5.6-sol", reasoning_effort=effort)
+    body = model._build_body([HumanMessage(content="hello")])
+
+    if expected_reasoning is None:
+        assert "reasoning" not in body
+    else:
+        assert body["reasoning"] == expected_reasoning
 
 
 def test_openai_reasoning_effort_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -607,9 +628,8 @@ def test_claude_code_omits_effort_when_unset(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_codex_invalid_effort_raises() -> None:
     pytest.importorskip("langchain_codex_plus")
-    # "max" is valid for Claude but not Codex (none/low/medium/high/xhigh).
     with pytest.raises(ValueError, match="codex-plus"):
-        _resolve_model("codex-plus:gpt-5.4", reasoning_effort="max")
+        _resolve_model("codex-plus:gpt-5.4", reasoning_effort="turbo")
 
 
 def test_openai_invalid_effort_raises() -> None:

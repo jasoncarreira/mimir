@@ -266,7 +266,7 @@ _DEFAULTS = {
         "model": "mistralai/mistral-large-3-675b-instruct-2512",
         "api_key_env": "NVIDIA_NIM_API_KEY",
         "timeout_seconds": 30,
-        "reasoning_effort": "none",
+        "reasoning_effort": "",
     },
     "annotation": {
         # Per-subsystem overrides; if absent, [llm] is used.
@@ -903,7 +903,7 @@ def resolve_llm_config(subsystem: str) -> dict:
     reasoning_effort = (
         cfg(subsystem, 'reasoning_effort', None)
         or cfg('llm', 'reasoning_effort', None)
-        or 'none'
+        or ''
     )
 
     return {
@@ -912,7 +912,7 @@ def resolve_llm_config(subsystem: str) -> dict:
         "api_key": api_key,
         "timeout": int(timeout),
         "provider": str(provider),
-        "reasoning_effort": str(reasoning_effort),
+        "reasoning_effort": str(reasoning_effort) if reasoning_effort else None,
     }
 
 

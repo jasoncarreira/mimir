@@ -92,7 +92,7 @@ def _load_llm_config(monkeypatch, tmp_path, toml: str) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_codex_plus_builds_with_model_and_reasoning_none(monkeypatch):
+async def test_codex_plus_builds_with_model_and_unset_reasoning(monkeypatch):
     from mimir.saga import _llm
 
     captured = _install_fake_codex(monkeypatch, content="S|P|O")
@@ -102,7 +102,7 @@ async def test_codex_plus_builds_with_model_and_reasoning_none(monkeypatch):
     )
     assert out == "S|P|O"
     assert captured["model"] == "gpt-5.4-mini"
-    assert captured["reasoning_effort"] == "none"
+    assert captured["reasoning_effort"] is None
     assert captured["timeout_seconds"] == 45.0
     # Both system + user messages are passed through.
     assert len(captured["messages"]) == 2
@@ -112,10 +112,10 @@ async def test_codex_plus_builds_with_model_and_reasoning_none(monkeypatch):
 @pytest.mark.parametrize(
     ("toml", "expected"),
     [
-        ("[llm]\nprovider = 'codex_plus'\n", "none"),
+        ("[llm]\nprovider = 'codex_plus'\n", None),
         (
-            "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'medium'\n",
-            "medium",
+            "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'low'\n",
+            "low",
         ),
         (
             "[llm]\nprovider = 'codex_plus'\nreasoning_effort = 'medium'\n"
@@ -165,9 +165,43 @@ async def test_codex_plus_rejects_invalid_resolved_reasoning_effort(
     message = str(exc_info.value)
     assert "codex-plus" in message
     assert "bogus" in message
-    for level in ("none", "low", "medium", "high", "xhigh"):
+    for level in ("none", "low", "medium", "high", "xhigh", "max", "ultra"):
         assert level in message
     assert captured == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reasoning_effort", "expected_reasoning"),
+    [(None, None), ("low", {"effort": "low"}), ("none", {"effort": "none"})],
+)
+async def test_codex_plus_request_body_reasoning(
+    monkeypatch, reasoning_effort, expected_reasoning
+):
+    from langchain_codex_plus import ChatCodexPlus
+
+    from mimir.saga import _llm
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_ainvoke(self, messages):
+        captured["reasoning_effort"] = self.reasoning_effort
+        captured["body"] = self._build_body(messages)
+        return _FakeMsg("ok")
+
+    monkeypatch.setattr(ChatCodexPlus, "ainvoke", _fake_ainvoke)
+    llm = {"provider": "codex_plus", "model": "gpt-5.6-sol"}
+    if reasoning_effort is not None:
+        llm["reasoning_effort"] = reasoning_effort
+
+    assert await _llm._call_codex_plus_async(
+        llm, prompt="hello", max_tokens=64, temperature=0.0, system=None
+    ) == "ok"
+    assert captured["reasoning_effort"] == reasoning_effort
+    if expected_reasoning is None:
+        assert "reasoning" not in captured["body"]
+    else:
+        assert captured["body"]["reasoning"] == expected_reasoning
 
 
 @pytest.mark.asyncio
