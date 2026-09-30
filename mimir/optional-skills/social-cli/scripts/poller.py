@@ -335,17 +335,20 @@ def _format_event(notif: dict) -> dict | None:
     # outbound is needed — the hint still applies if it DOES decide
     # to acknowledge.
     target_id = post_id or nid
+    home = Path(os.environ.get("MIMIR_HOME", "/mimir-home"))
+    outbox = STATE_DIR / f"outbox-{platform}.yaml"
+    if outbox.is_relative_to(home):
+        outbox = outbox.relative_to(home)
     action_hint = (
-        f"\n\n→ To reply or react: append to <STATE_DIR>/outbox-{platform}.yaml"
-        f" + run `social-cli dispatch --platform {platform}`.\n"
-        "  Minimal shape:\n"
-        "    dispatch:\n"
-        f"      - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
-        f"      - like:  {{ platform: {platform}, id: \"{target_id}\" }}\n"
-        f"      - ignore: {{ id: \"{nid}\", reason: \"...\" }}   # skip without action\n"
-        f"  The -{platform} suffix is required: dispatch reads outbox-{platform}.yaml\n"
-        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
-        f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
+        f"\n\n→ Add to {outbox}: read_file + edit_file if present; write_file only creates.\n"
+        f"`bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh {POLLER_NAME} dispatch --platform {platform}`\n"
+        "Count first: posts/replies cap 5/UTC day.\n"
+        "dispatch:\n"
+        f"  - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
+        f"  - like: {{ platform: {platform}, id: \"{target_id}\" }}\n"
+        f"  - ignore: {{ id: \"{nid}\", reason: \"...\" }}\n"
+        'Bare outbox.yaml: "No outbox file found".\n'
+        f"send_message is chat, NOT {platform}."
     )
     prompt = (
         f"[{platform}] {ntype} from {author}"

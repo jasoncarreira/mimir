@@ -418,8 +418,11 @@ def test_action_hint_names_the_platform_suffixed_outbox(
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert "<STATE_DIR>/outbox-bsky.yaml" in prompt
-    assert "social-cli dispatch --platform bsky" in prompt
+    assert f"{tmp_path}/outbox-bsky.yaml" in prompt
+    assert "run-social-cli.sh social-cli-notifications dispatch --platform bsky" in prompt
+    assert "`social-cli dispatch" not in prompt
+    assert "Count first: posts/replies cap 5/UTC day" in prompt
+    assert '- ignore: { id: "n1", reason: "..." }' in prompt
     # the unsuffixed path must not be offered as the thing to write
     assert "<STATE_DIR>/outbox.yaml" not in prompt
     assert "append to <STATE_DIR>/outbox.yaml" not in prompt
@@ -438,9 +441,47 @@ def test_action_hint_suffix_tracks_the_platform(
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert "<STATE_DIR>/outbox-x.yaml" in prompt
-    assert "social-cli dispatch --platform x" in prompt
+    assert f"{tmp_path}/outbox-x.yaml" in prompt
+    assert "run-social-cli.sh social-cli-notifications dispatch --platform x" in prompt
     assert "outbox-bsky.yaml" not in prompt
+
+
+def test_hint_uses_custom_poller_and_home_relative_state(fresh_poller, monkeypatch, tmp_path):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(fresh_poller, "POLLER_NAME", "custom-notifications")
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path / "state/pollers/custom-notifications")
+    prompt = fresh_poller._format_event(_notif("n1"))["prompt"]
+    assert "state/pollers/custom-notifications/outbox-bsky.yaml" in prompt
+    assert str(tmp_path) not in prompt
+    assert "run-social-cli.sh custom-notifications dispatch --platform bsky" in prompt
+    assert "read_file + edit_file if present; write_file only creates" in prompt
+    assert "<STATE_DIR>" not in prompt and "append to" not in prompt
+    assert '- ignore: { id: "n1", reason: "..." }' in prompt
+
+
+@pytest.mark.parametrize("nid", ["n1", "at://did:plc:abcdefghijklmnopqrstuvwx/app.bsky.feed.post/3mabcdef12345"])
+@pytest.mark.parametrize("poller_name", ["social-cli-notifications", "custom-notifications"])
+def test_notifications_hint_fits_existing_main_budget(fresh_poller, monkeypatch, tmp_path, nid, poller_name):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(fresh_poller, "POLLER_NAME", poller_name)
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path / "state/pollers" / poller_name)
+    prompt = fresh_poller._format_event(_notif(nid))["prompt"]
+    hint = "\n\n→" + prompt.split("\n\n→", 1)[1]
+    # Main's pre-change string is the spec's budget, not an arbitrary 600.
+    main_hint = (
+        "\n\n→ To reply or react: append to <STATE_DIR>/outbox-bsky.yaml"
+        " + run `social-cli dispatch --platform bsky`.\n"
+        "  Minimal shape:\n"
+        "    dispatch:\n"
+        f'      - reply: {{ platform: bsky, id: "{nid}", text: "..." }}\n'
+        f'      - like:  {{ platform: bsky, id: "{nid}" }}\n'
+        f'      - ignore: {{ id: "{nid}", reason: "..." }}   # skip without action\n'
+        "  The -bsky suffix is required: dispatch reads outbox-bsky.yaml\n"
+        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
+        "  send_message routes to Discord/Slack — NOT to bsky. Use outbox."
+    )
+    assert len(hint) <= len(main_hint)
+    assert f'- ignore: {{ id: "{nid}", reason: "..." }}' in hint
 
 
 def test_seeds_state_gitignore(fresh_poller, tmp_path):
