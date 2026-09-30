@@ -246,9 +246,13 @@ class Dispatcher:
                         from .tools.registry import _STATE
 
                         channels = _STATE.get("channel_registry")
-                        if channels is not None:
+                        if channels is None:
+                            log.warning("Could not send approval reply notice: channel registry unavailable")
+                        else:
                             try:
-                                await channels.send(channel_id, notice, final=False)
+                                result = await channels.send(channel_id, notice, final=False)
+                                if not getattr(result, "sent", True):
+                                    log.warning("Could not send approval reply notice: delivery refused")
                             except Exception:  # best-effort notice must not replay an accepted reply
                                 log.warning("Could not send approval reply notice", exc_info=True)
                     await log_event("mid_turn_injected", channel_id=channel_id)

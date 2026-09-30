@@ -158,6 +158,41 @@ def test_edit_requires_kind_support_and_cancel_preserves_recent_id(registry):
     assert requests.resolve(reply(f"approve {op.approval_id}"), identity, now=102).status == "already_resolved"
 
 
+@pytest.mark.parametrize("action", ["approve", "decline", "cancel", "expire"])
+def test_recent_id_responses_do_not_disclose_other_channels(registry, action):
+    identity, calls, add = registry
+    entry = add("op", expires_at=102)
+    if action in {"approve", "decline"}:
+        requests.resolve(reply(f"{action} {entry.approval_id}"), identity, now=101)
+    elif action == "cancel":
+        requests.cancel(entry.approval_id)
+    else:
+        assert requests.pending("discord-1", now=103) == ()
+    original_calls = list(calls)
+    other = reply(f"approve {entry.approval_id}")
+    other.channel_id = "discord-2"
+    resolution = requests.resolve(other, identity, now=103)
+    assert resolution.status == "no_pending_request"
+    assert resolution.message == f"no pending request {entry.approval_id}"
+    same_channel = requests.resolve(reply(f"approve {entry.approval_id}"), identity, now=103)
+    expected = "no_pending_request" if action == "expire" else "already_resolved"
+    assert same_channel.status == expected
+    assert calls == original_calls
+
+
+def test_recent_ids_are_reusable_only_after_retention_expires(registry):
+    identity, _, add = registry
+    entry = add("op")
+    requests.resolve(reply(f"decline {entry.approval_id}"), identity, now=101)
+    assert requests.pending("discord-1", now=101 + requests._RECENT_SECONDS) == ()
+    replacement = requests.register(
+        kind="op", channel_id="discord-2", description="replacement",
+        now=102 + requests._RECENT_SECONDS, expires_at=200 + requests._RECENT_SECONDS,
+        resolver=lambda *args: "declined", approval_id=entry.approval_id,
+    )
+    assert replacement.channel_id == "discord-2"
+
+
 def test_pending_id_cannot_be_registered_twice(registry):
     _, _, add = registry
     op = add("op")

@@ -823,7 +823,10 @@ async def request_operator_approval(
         return "request_operator_approval refused: operator is unreachable"
     from ..approval_requests import set_prompt_message_id
 
-    set_prompt_message_id(request.request_id, getattr(result, "message_id", None))
+    set_prompt_message_id(
+        request.request_id,
+        getattr(result, "first_message_id", None) or getattr(result, "message_id", None),
+    )
     if category is not None:
         return "Operator approval is pending for the sink category."
     return "Operator approval is pending for the exact tool and target."

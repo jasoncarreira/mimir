@@ -41,7 +41,9 @@ class Resolution:
 
 
 _PENDING: dict[str, ApprovalEntry] = {}
-_RECENT: dict[str, float] = {}
+# Keep the originating channel with each reserved ID; other channels must
+# receive the same answer as an unknown ID.
+_RECENT: dict[str, tuple[float, str]] = {}
 _EXPIRED: set[str] = set()
 _LOCK = threading.Lock()
 
@@ -50,9 +52,9 @@ def _expire(now: float) -> None:
     for approval_id, entry in tuple(_PENDING.items()):
         if entry.expires_at <= now:
             _PENDING.pop(approval_id, None)
-            _RECENT[approval_id] = now + _RECENT_SECONDS
+            _RECENT[approval_id] = (now + _RECENT_SECONDS, entry.channel_id)
             _EXPIRED.add(approval_id)
-    for approval_id, until in tuple(_RECENT.items()):
+    for approval_id, (until, _channel_id) in tuple(_RECENT.items()):
         if until <= now:
             _RECENT.pop(approval_id, None)
             _EXPIRED.discard(approval_id)
@@ -96,8 +98,9 @@ def set_prompt_message_id(approval_id: str, message_id: str | None) -> None:
 
 def cancel(approval_id: str, *, expired: bool = False) -> None:
     with _LOCK:
-        if _PENDING.pop(approval_id, None) is not None:
-            _RECENT[approval_id] = time.monotonic() + _RECENT_SECONDS
+        entry = _PENDING.pop(approval_id, None)
+        if entry is not None:
+            _RECENT[approval_id] = (time.monotonic() + _RECENT_SECONDS, entry.channel_id)
             if expired:
                 _EXPIRED.add(approval_id)
 
@@ -131,7 +134,9 @@ def resolve(
         if named_id:
             entry = _PENDING.get(named_id)
             if entry is None or entry.channel_id != event.channel_id:
-                if named_id in _RECENT and entry is None and named_id not in _EXPIRED:
+                recent = _RECENT.get(named_id)
+                if (recent is not None and recent[1] == event.channel_id
+                        and entry is None and named_id not in _EXPIRED):
                     return Resolution("already_resolved", message=f"already resolved {named_id}")
                 return Resolution("no_pending_request", message=f"no pending request {named_id}")
         else:
@@ -150,7 +155,7 @@ def resolve(
         if edit is not None and not entry.supports_edits:
             return Resolution("not_an_approval_response")
         _PENDING.pop(entry.approval_id)
-        _RECENT[entry.approval_id] = now + _RECENT_SECONDS
+        _RECENT[entry.approval_id] = (now + _RECENT_SECONDS, entry.channel_id)
     status = entry.resolver(decision.lower(), edit, event, identity_resolver, now,
                             approval_event, reply_source)
     return Resolution(status, entry)

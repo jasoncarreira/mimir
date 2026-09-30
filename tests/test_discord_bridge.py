@@ -404,6 +404,53 @@ async def test_send_returns_message_id(bridge_with_fake_client):
 
 
 @pytest.mark.asyncio
+async def test_chunked_approval_alert_retains_first_chunk_reply_anchor(
+    bridge_with_fake_client, tmp_path, monkeypatch,
+):
+    from mimir import approval_requests as requests
+    from mimir.identities import IdentityResolver
+
+    monkeypatch.setattr(requests, "_PENDING", {})
+    monkeypatch.setattr(requests, "_RECENT", {})
+    monkeypatch.setattr(requests, "_EXPIRED", set())
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: operator\n    aliases: [discord-99]\n"
+        "    access: {roles: [admin]}\n", encoding="utf-8",
+    )
+    identity = IdentityResolver(tmp_path)
+    identity.reload()
+    calls = []
+    op = requests.register(
+        kind="op", channel_id="discord-1", description="category request",
+        now=100, expires_at=400, resolver=lambda *args: calls.append("op") or "declined",
+    )
+    mp = requests.register(
+        kind="mp", channel_id="discord-1", description="memory request",
+        now=100, expires_at=400, resolver=lambda *args: calls.append("mp") or "declined",
+    )
+    bridge, _, sent = bridge_with_fake_client
+    result = await bridge.send(
+        "discord-1", f"Operator approval requested ({op.approval_id})\n"
+        f"Reply `approve {op.approval_id}` or `decline {op.approval_id}`\n"
+        + "source summary " * 400,
+    )
+    assert result.sent and result.chunks > 1
+    assert op.approval_id in sent[0]["content"]
+    assert result.first_message_id == "1001"
+    assert result.message_id != result.first_message_id
+    requests.set_prompt_message_id(op.approval_id, result.first_message_id)
+    event = AgentEvent(
+        trigger="user_message", channel_id="discord-1", author="discord-99",
+        source="discord", content="decline", extra={"reply_to_message_id": "1001"},
+    )
+    assert requests.resolve(event, identity, now=101).entry.approval_id == op.approval_id
+    assert calls == ["op"]
+    assert requests.pending("discord-1", now=101) == (mp,)
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_whitespace_only_message(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
 
