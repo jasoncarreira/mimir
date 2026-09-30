@@ -21,6 +21,31 @@ _REQUIRES_DEPLOYMENT_BASH = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("skill_name,expected_names", [
+    ("gmail-poller", {"gmail-inbox"}),
+    ("social-cli", {"social-cli-notifications", "social-cli-feed"}),
+])
+def test_shipped_poller_manifests_omit_unusable_grants_and_options(
+    skill_name: str, expected_names: set[str],
+) -> None:
+    manifest = json.loads(
+        (_OPTIONAL_SKILLS / skill_name / "pollers.json").read_text(encoding="utf-8")
+    )
+    pollers = manifest["pollers"]
+    assert {poller["name"] for poller in pollers} == expected_names
+    for poller in pollers:
+        assert not {"memory_store", "saga_feedback", "saga_mark_contributions"} & set(
+            poller["authority"]["capabilities"]
+        ), poller["name"]
+        if skill_name == "social-cli":
+            wrappers = [
+                command for command in poller["authority"]["shell_commands"]
+                if command.get("script", "").endswith("run-social-cli.sh")
+            ]
+            assert len(wrappers) == 1, poller["name"]
+            assert "--dry-run" not in wrappers[0]["options"]
+
+
 @_REQUIRES_DEPLOYMENT_BASH
 @pytest.mark.parametrize("skill_name", _DECLARING_SKILLS)
 def test_shipped_shell_commands_parse_in_installed_skill(
