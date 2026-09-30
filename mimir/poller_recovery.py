@@ -509,15 +509,18 @@ def _read_last_unclean_restart(events_path: Path, since_dt: datetime) -> str:
     return ""
 
 
-def _restore_event(
+async def _restore_event(
     entry: dict,
     *,
     poller_name: str,
     channel_id: str,
     service_principal: str | None,
     service_authority: Any,
+    trust_source: str,
+    github_token: str,
+    github_self_login: str,
 ) -> AgentEvent | None:
-    """Rebuild a stashed event and reapply scheduler-owned identity fields."""
+    """Rebuild a stashed event and re-attest its service integrity from live state."""
     event = _event_from_stash(entry.get("event"))
     if event is None:
         return None
@@ -532,6 +535,49 @@ def _restore_event(
     event.repo_pr_action_scope = None
     event.continuation_auth_context = None
     event.source_session_acl = None
+    trusted = trust_source == "trusted_system"
+    if trust_source == "github":
+        from .pollers import (
+            _GITHUB_ACTOR_EVENT_TYPES,
+            _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES,
+            _github_author_is_trusted,
+            _github_content_author,
+            _github_framework_trigger_is_trusted,
+        )
+
+        items = event.extra.get("items") if isinstance(event.extra, dict) else None
+        trusted = isinstance(items, list) and bool(items)
+        if trusted:
+            for item in items:
+                item_trusted = False
+                if isinstance(item, dict):
+                    repo = item.get("repo")
+                    event_type = item.get("event_type")
+                    try:
+                        if event_type in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES:
+                            item_trusted = await asyncio.to_thread(
+                                _github_framework_trigger_is_trusted,
+                                repo, item, github_token, github_self_login,
+                            )
+                        elif event_type in _GITHUB_ACTOR_EVENT_TYPES:
+                            # Clear stashed claims even if the live lookup raises.
+                            item["actor"] = None
+                            item["author_is_trusted"] = False
+                            author = await asyncio.to_thread(
+                                _github_content_author, repo, item, github_token,
+                            )
+                            item_trusted = await asyncio.to_thread(
+                                _github_author_is_trusted, repo, author, github_token,
+                            ) is True
+                            # Poller-writable actor and verdict claims are not authority.
+                            item["actor"] = author
+                            item["author_is_trusted"] = item_trusted
+                    except Exception as exc:  # noqa: BLE001 - attestation fails closed
+                        log.warning(
+                            "poller recovery: GitHub attestation failed (%s)",
+                            type(exc).__name__,
+                        )
+                trusted = trusted and item_trusted
     if service_authority is not None and service_principal:
         source_principal = f"service:{service_principal}"
         event.ifc_labels = InformationFlowLabels().with_channel(
@@ -539,11 +585,13 @@ def _restore_event(
         ).with_source(SourceLabel(
             principal=source_principal,
             domain="channel",
+            domain_qualifier="poller_recovery",
             resource_id=channel_id,
             bridge_instance="poller",
             sensitivity="internal",
             authorized_principals=frozenset({source_principal}),
             source_kind="service",
+            integrity="trusted" if trusted else "untrusted",
         ))
     if isinstance(event.extra, dict):
         event.extra.pop(HTTP_EVENT_INGRESS_EXTRA_KEY, None)
@@ -602,6 +650,9 @@ async def reconcile_failed_turns(
     enqueue: EnqueueFn,
     service_principal: str | None = None,
     service_authority: Any = None,
+    trust_source: str = "external",
+    github_token: str = "",
+    github_self_login: str = "",
     recover_failed_turns: bool = True,
     relevance_check: RelevanceFn | None = None,
     max_attempts: int = DEFAULT_MAX_RECOVERY_ATTEMPTS,
@@ -769,12 +820,15 @@ async def reconcile_failed_turns(
                         watermark = max(watermark, ts)
                     continue
                 attempts = int(entry.get("attempts", 0)) + 1
-                event = _restore_event(
+                event = await _restore_event(
                     entry,
                     poller_name=poller_name,
                     channel_id=channel_id,
                     service_principal=service_principal,
                     service_authority=service_authority,
+                    trust_source=trust_source,
+                    github_token=github_token,
+                    github_self_login=github_self_login,
                 )
                 if event is not None and await _is_stale(event, relevance_check):
                     del inflight[source_id]
@@ -906,12 +960,15 @@ async def reconcile_failed_turns(
             ):
                 continue
             attempts = int(entry.get("attempts", 0)) + 1
-            event = _restore_event(
+            event = await _restore_event(
                 entry,
                 poller_name=poller_name,
                 channel_id=channel_id,
                 service_principal=service_principal,
                 service_authority=service_authority,
+                trust_source=trust_source,
+                github_token=github_token,
+                github_self_login=github_self_login,
             )
             if event is not None and await _is_stale(event, relevance_check):
                 del inflight[source_id]

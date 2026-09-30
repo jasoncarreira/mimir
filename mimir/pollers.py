@@ -2390,59 +2390,6 @@ async def run_poller(
         # Fall through; the subprocess might handle a missing dir,
         # OR fail and surface as poller_nonzero_exit.
 
-    # Framework recovery of prior lost/failed turns. Before this
-    # cycle's poll, reconcile in-flight events against turn outcomes —
-    # re-enqueue (capped) the ones whose triggered turn died, drop the ones
-    # that completed. Failed-turn retry is opt-in; unclean-restart replay is
-    # always enabled. Runs only when the
-    # circuit is closed (the poll is proceeding); a poll-side outage defers
-    # recovery until the poller is healthy again — the recovery watermark
-    # spans the gap, so nothing is lost. Wrapped so a recovery hiccup can
-    # never break the poll cycle that follows.
-    _events_path = get_events_path()
-    if _events_path is not None:
-        try:
-            authority = poller.resolved_authority()
-            _rec = await poller_recovery.reconcile_failed_turns(
-                poller_name=poller.name,
-                channel_id=poller.channel_id(),
-                persist_dir=persist_dir,
-                events_path=_events_path,
-                enqueue=enqueue_recovered,
-                service_principal=authority.canonical,
-                service_authority=authority,
-                recover_failed_turns=poller.recover_failed_turns,
-                relevance_check=relevance_check,
-            )
-            if _rec["state_unreadable"]:
-                await log_event(
-                    "poller_recovery_state_unreadable",
-                    poller=poller.name,
-                    path=_rec["state_unreadable"],
-                )
-            if any(
-                _rec[key]
-                for key in (
-                    "reenqueued", "gave_up", "expired", "dropped", "stale_dropped",
-                )
-            ):
-                await log_event(
-                    "poller_recovery",
-                    poller=poller.name,
-                    reenqueued=_rec["reenqueued"],
-                    completed=_rec["completed"],
-                    gave_up=_rec["gave_up"],
-                    unclean_reenqueued=_rec["unclean_reenqueued"],
-                    expired=_rec["expired"],
-                    dropped=_rec["dropped"],
-                    stale_dropped=_rec["stale_dropped"],
-                )
-        except Exception as exc:  # noqa: BLE001 — recovery must not break polling
-            log.warning(
-                "poller recovery: reconcile failed for %s: %s",
-                poller.name, exc,
-            )
-
     # CR2 (external I/O) fix: previously this passed ``{**os.environ,
     # **poller.env}`` — the entire mimir process env (including
     # MIMIR_API_KEY, ANTHROPIC_API_KEY, DISCORD_TOKEN,
@@ -2576,6 +2523,58 @@ async def run_poller(
     env["MIMIR_HOME"] = str(
         home if home is not None else poller.skill_dir.parent.parent
     )
+
+    # Framework recovery of prior lost/failed turns. Before this cycle's
+    # subprocess poll, reconcile in-flight events against turn outcomes.
+    # Share the assembled fire environment so attestation credentials obey
+    # the same filtering, pass_env and literal-overlay precedence rules.
+    # Recovery remains independent of env_required and cannot break polling.
+    _events_path = get_events_path()
+    if _events_path is not None:
+        try:
+            authority = poller.resolved_authority()
+            _rec = await poller_recovery.reconcile_failed_turns(
+                poller_name=poller.name,
+                channel_id=poller.channel_id(),
+                persist_dir=persist_dir,
+                events_path=_events_path,
+                enqueue=enqueue_recovered,
+                service_principal=authority.canonical,
+                service_authority=authority,
+                trust_source=poller.trust_source,
+                github_token=env.get("GITHUB_TOKEN", ""),
+                github_self_login=env.get("MIMIR_GITHUB_SELF_LOGIN", ""),
+                recover_failed_turns=poller.recover_failed_turns,
+                relevance_check=relevance_check,
+            )
+            if _rec["state_unreadable"]:
+                await log_event(
+                    "poller_recovery_state_unreadable",
+                    poller=poller.name,
+                    path=_rec["state_unreadable"],
+                )
+            if any(
+                _rec[key]
+                for key in (
+                    "reenqueued", "gave_up", "expired", "dropped", "stale_dropped",
+                )
+            ):
+                await log_event(
+                    "poller_recovery",
+                    poller=poller.name,
+                    reenqueued=_rec["reenqueued"],
+                    completed=_rec["completed"],
+                    gave_up=_rec["gave_up"],
+                    unclean_reenqueued=_rec["unclean_reenqueued"],
+                    expired=_rec["expired"],
+                    dropped=_rec["dropped"],
+                    stale_dropped=_rec["stale_dropped"],
+                )
+        except Exception as exc:  # noqa: BLE001 — recovery must not break polling
+            log.warning(
+                "poller recovery: reconcile failed for %s: %s",
+                poller.name, exc,
+            )
 
     # chainlink #108: env_required validation — check after the env dict is
     # fully assembled (allowlist + pass_env + poller.env + injected vars).

@@ -15,7 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from mimir import event_logger, poller_recovery
+from mimir import event_logger, poller_recovery, pollers
+from mimir.access_control import (
+    CapabilityTier, SinkGate, build_trigger_service_principal, create_auth_context,
+)
 from mimir.models import AgentEvent, InformationFlowLabels, SourceLabel
 
 
@@ -70,6 +73,230 @@ class _FakeEnqueue:
     async def __call__(self, event: AgentEvent) -> bool:
         self.calls.append(event)
         return True
+
+
+@pytest.mark.parametrize(
+    ("live_head", "live_author", "stashed_integrity", "expected"),
+    [
+        ("a" * 40, "mimir-bot", "untrusted", "trusted"),
+        ("c" * 40, "mimir-bot", "trusted", "untrusted"),
+        ("a" * 40, "other-user", "trusted", "untrusted"),
+        (None, "mimir-bot", "trusted", "untrusted"),
+    ],
+)
+async def test_unclean_replay_reattests_live_pr_and_ignores_stashed_integrity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    live_head: str | None, live_author: str, stashed_integrity: str, expected: str,
+) -> None:
+    authority = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
+        creation_path="test",
+    )
+    item = {
+        "event_type": "pr_mergeability_rebase", "repo": "acme/widget", "number": 11,
+        "url": "https://github.com/acme/widget/pull/11", "author": "mimir-bot",
+        "head_repo": "acme/widget", "head_remote": "origin",
+        "head_ref": "worklink/11", "head_sha": "a" * 40,
+        "base_ref": "main", "base_sha": "b" * 40,
+    }
+    live = {
+        "state": "open", "number": 11, "html_url": item["url"],
+        "user": {"login": live_author},
+        "head": {"ref": item["head_ref"], "sha": live_head,
+                 "repo": {"full_name": item["repo"]}},
+        "base": {"ref": item["base_ref"], "sha": item["base_sha"]},
+    }
+    calls: list[str] = []
+
+    def attest(endpoint: str, token: str):
+        calls.append(endpoint)
+        assert token == "server-token"
+        assert endpoint == "repos/acme/widget/pulls/11"
+        return (200, live) if live_head is not None else None
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", attest)
+    event = _make_event("sid-pr", channel_id="poller:github-activity", items=[item])
+    event.service_principal = authority.canonical
+    event.service_authority = authority
+    event.ifc_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal=f"service:{authority.canonical}", domain="channel",
+        resource_id=event.channel_id, bridge_instance="poller",
+        sensitivity="internal",
+        authorized_principals=frozenset({f"service:{authority.canonical}"}),
+        source_kind="service", integrity=stashed_integrity,
+    ))
+    await poller_recovery.stash_enqueued_event(tmp_path, event)
+    _set_enqueued_at(tmp_path, event.source_id, _ts(30))
+    events = tmp_path / "events.jsonl"
+    _write_unclean_restart(events, ts=_ts(10))
+    enqueue = _FakeEnqueue()
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=events, enqueue=enqueue,
+        service_principal=authority.canonical, service_authority=authority,
+        trust_source="github", github_token="server-token",
+        github_self_login="mimir-bot", recover_failed_turns=False,
+    )
+
+    assert summary["unclean_reenqueued"] == 1
+    assert calls == ["repos/acme/widget/pulls/11"]
+    [replayed] = enqueue.calls
+    [source] = replayed.ifc_labels.sources
+    assert source.integrity == expected
+    assert source.domain_qualifier == "poller_recovery"
+    assert replayed.extra[poller_recovery.POLLER_RECOVERY_REPLAY_EXTRA_KEY] is True
+    auth = create_auth_context(replayed, enforce=True)
+    assert auth.repo_pr_action_scope is None  # recovery cannot mint poller payload scopes
+    decision = SinkGate.check_sink_flow(
+        "repo_test", "acme/widget#pull/11", replayed.ifc_labels, auth,
+        enforce=True, repo_pr_action_scope=object(),
+    )
+    assert decision.allowed is (expected == "trusted")
+
+
+async def test_unclean_replay_actor_attestation_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = {
+        "repo": "acme/widget", "event_type": "issue_opened",
+        "url": "https://github.com/acme/widget/issues/12",
+        "actor": "forged", "author_is_trusted": True,
+    }
+    event = _make_event("sid-actor", channel_id="poller:github-activity", items=[item])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    calls: list[str] = []
+
+    def attest(endpoint: str, token: str):
+        calls.append(endpoint)
+        if endpoint == "repos/acme/widget/issues/12":
+            return 200, {"user": {"login": "former-member"}}
+        return 404, None
+
+    monkeypatch.setattr(pollers, "_github_api_attestation", attest)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    assert replayed.extra["items"][0]["actor"] == "former-member"
+    assert replayed.extra["items"][0]["author_is_trusted"] is False
+    assert calls == [
+        "repos/acme/widget/issues/12",
+        "repos/acme/widget/collaborators/former-member",
+        "orgs/acme/memberships/former-member",
+    ]
+
+
+@pytest.mark.parametrize("items", [[], [{
+    "repo": "acme/widget", "event_type": "issue_opened",
+    "url": "https://github.com/acme/widget/issues/12",
+    "actor": "forged", "author_is_trusted": True,
+}]])
+async def test_recovery_does_not_trust_empty_or_unattested_github_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, items: list[dict],
+) -> None:
+    monkeypatch.setattr(pollers, "_github_api_attestation", lambda *args: None)
+    event = _make_event("sid-batch", channel_id="poller:github-activity", items=items)
+    # _make_event uses its default item for an empty list; explicitly restore it.
+    event.extra["items"] = items
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    if items:
+        assert replayed.extra["items"][0]["actor"] is None
+        assert replayed.extra["items"][0]["author_is_trusted"] is False
+
+
+@pytest.mark.parametrize("trusted_first", [True, False])
+async def test_recovery_mixed_batch_requires_every_item_to_attest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_first: bool,
+) -> None:
+    items = [{
+        "repo": "acme/widget", "event_type": "issue_opened",
+        "url": f"https://github.com/acme/widget/issues/{number}",
+        "actor": "stashed-actor", "author_is_trusted": True,
+    } for number in (11, 12)]
+    if not trusted_first:
+        items.reverse()
+    calls = []
+
+    def content_author(repo, item, token):
+        calls.append(item["url"])
+        return "member" if item["url"].endswith("/11") else "outsider"
+
+    monkeypatch.setattr(pollers, "_github_content_author", content_author)
+    monkeypatch.setattr(
+        pollers, "_github_author_is_trusted",
+        lambda repo, author, token: author == "member",
+    )
+    event = _make_event("sid-mixed", channel_id="poller:github-activity", items=items)
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    assert calls == [item["url"] for item in items]
+    assert [item["author_is_trusted"] for item in replayed.extra["items"]] == (
+        [True, False] if trusted_first else [False, True]
+    )
+
+
+@pytest.mark.parametrize("raising_helper", [
+    "_github_content_author", "_github_author_is_trusted",
+    "_github_framework_trigger_is_trusted",
+])
+async def test_recovery_attestation_exception_fails_closed_and_clears_actor_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raising_helper: str,
+) -> None:
+    framework = raising_helper == "_github_framework_trigger_is_trusted"
+    item = {
+        "repo": "acme/widget",
+        "event_type": "pr_mergeability_rebase" if framework else "issue_opened",
+        "url": "https://github.com/acme/widget/issues/12",
+        "actor": "stashed-actor", "author_is_trusted": True,
+    }
+    calls = []
+
+    def raises(*args):
+        calls.append(raising_helper)
+        raise RuntimeError("test attestation unavailable")
+
+    monkeypatch.setattr(pollers, "_github_content_author", lambda *args: "live-member")
+    monkeypatch.setattr(pollers, "_github_author_is_trusted", lambda *args: True)
+    monkeypatch.setattr(pollers, raising_helper, raises)
+    event = _make_event("sid-exception", channel_id="poller:github-activity", items=[item])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    assert calls == [raising_helper]
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    if not framework:
+        [replayed_item] = replayed.extra["items"]
+        assert replayed_item["actor"] is None
+        assert replayed_item["author_is_trusted"] is False
 
 
 # ── stash ────────────────────────────────────────────────────────────
