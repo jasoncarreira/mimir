@@ -605,7 +605,6 @@ CODEX_USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_USAGE_TIMEOUT_SECONDS = 15.0
 CODEX_USAGE_BACKOFF_INITIAL_SECONDS = 180.0
 CODEX_USAGE_BACKOFF_MAX_SECONDS = 30.0 * 60.0
-CODEX_CANARY_MODEL = "gpt-4.1-mini"
 _CODEX_WINDOW_SECONDS = {5 * 3600, 7 * 24 * 3600}
 
 
@@ -804,29 +803,39 @@ def record_codex_plus_rejection(
         if reset_at is None and isinstance(raw_seconds, (int, float)) and not isinstance(raw_seconds, bool):
             reset_at = int(now.timestamp() + max(0, raw_seconds))
 
-    limiting = None
-    windows = getattr(exc, "rate_limits", None)
-    candidates = [
-        window for window in (
-            getattr(windows, "primary", None), getattr(windows, "secondary", None)
-        )
-        if window is not None
-    ]
-    numeric_candidates = [
-        window for window in candidates
-        if isinstance(getattr(window, "used_percent", None), (int, float))
-        and not isinstance(getattr(window, "used_percent", None), bool)
-    ]
-    if numeric_candidates:
-        limiting = max(numeric_candidates, key=lambda window: float(window.used_percent))
-    minutes = getattr(limiting, "window_minutes", None)
-    if isinstance(minutes, (int, float)):
-        store_key = "openai_seven_day" if minutes >= 1440 else "openai_five_hour"
-    elif reset_at is not None and reset_at - int(now.timestamp()) > 5 * 3600 + 300:
-        store_key = "openai_seven_day"
-    else:
+    def finite_number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    # CodexResponseError carries headers/raw, not a rate_limits attribute.
+    # A nearly-expired seven-day window is still seven-day: never infer its
+    # identity from the remaining reset horizon.
+    headers = getattr(exc, "headers", None)
+    headers = (
+        {str(key).lower(): value for key, value in headers.items()}
+        if hasattr(headers, "items") else {}
+    )
+    candidates: list[tuple[float, str]] = []
+    for name in ("primary", "secondary"):
+        minutes = finite_number(headers.get(f"x-codex-{name}-window-minutes"))
+        used = finite_number(headers.get(f"x-codex-{name}-used-percent"))
+        key = {300: "openai_five_hour", 10080: "openai_seven_day"}.get(minutes)
+        if key is not None:
+            candidates.append((used if used is not None else -1.0, key))
+    store_key = max(candidates, key=lambda item: item[0])[1] if candidates else None
+    if store_key is None and body is not None:
+        minutes = finite_number(body.get("limit_window_minutes"))
+        store_key = {300: "openai_five_hour", 10080: "openai_seven_day"}.get(minutes)
+    if store_key is None:
+        # No window evidence: preserve an enforced verdict conservatively,
+        # without pretending the reset timestamp identifies the window.
         store_key = "openai_five_hour"
-    return store.record_codex_rejection_sync(
+    persisted = store.record_codex_rejection_sync(
         store_key,
         RateLimitSnapshot(
             status="rejected",
@@ -835,6 +844,19 @@ def record_codex_plus_rejection(
             observed_at=observed,
         ),
     )
+    if persisted:
+        from .event_logger import log_event_sync
+
+        try:
+            log_event_sync("codex_plus_usage_ok", recorded={
+                store_key.removeprefix("openai_"): {
+                    "status": "rejected", "utilization": 1.0,
+                    "resets_at": reset_at,
+                },
+            })
+        except (RuntimeError, OSError):
+            pass
+    return persisted
 
 
 async def run_codex_quota_canary(
@@ -844,9 +866,13 @@ async def run_codex_quota_canary(
 ) -> None:
     """Make one minimal generation call; raise unchanged on refusal."""
     from langchain_codex_plus import ChatCodexPlus  # type: ignore[import-untyped]
+    from .config import model_spec_at_call_time
 
+    provider, separator, model_name = model_spec_at_call_time().partition(":")
+    if provider != "codex-plus" or not separator or not model_name.strip():
+        raise ValueError("codex_canary_requires_configured_codex_model")
     model = ChatCodexPlus(
-        model=CODEX_CANARY_MODEL,
+        model=model_name.strip(),
         auth_file_path=auth_path,
         rate_limit_callback=make_codex_plus_rate_limit_callback(store),
     )

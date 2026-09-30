@@ -6240,6 +6240,10 @@ async def test_codex_quota_recheck_denied_usage_skips_canary(
     assert QuotaPauseTracker(
         home / ".mimir" / "quota_pause.json"
     ).is_paused().paused
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [outcome] = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert outcome["outcome"] == "still_limited"
+    assert outcome["stage"] == "usage"
 
 
 @pytest.mark.asyncio
@@ -6296,6 +6300,11 @@ async def test_codex_quota_recheck_refreshes_usage_limit_pause(
     refreshed = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
     assert refreshed.is_paused().paused
     assert int(refreshed.reset_at.timestamp()) == refreshed_reset
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    [outcome] = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert outcome["outcome"] == "still_limited"
+    assert outcome["stage"] == "canary"
+    assert outcome["exception_type"] == "RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -6332,9 +6341,63 @@ async def test_codex_quota_recheck_caps_canaries_at_four_per_hour(
 
     monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
     monkeypatch.setattr("mimir.billing.run_codex_quota_canary", failed)
+    clock = [0.0]
+    monkeypatch.setattr("mimir.scheduler.time.monotonic", lambda: clock[0])
+    # Isolate the independent hourly cap from the 15-minute throttle.
+    monkeypatch.setattr("mimir.scheduler._CODEX_QUOTA_RECHECK_SECONDS", 1)
     for _ in range(5):
         await sched._recheck_quota_pause()
+        clock[0] += 1
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize("configured,expected", [
+    (None, 180), ("75", 75), ("1", 30), ("invalid", 180),
+])
+def test_shared_quota_recheck_cadence_preserves_env_knob(monkeypatch, configured, expected):
+    from mimir.scheduler import _quota_recheck_seconds
+
+    if configured is None:
+        monkeypatch.delenv("MIMIR_QUOTA_RECHECK_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_QUOTA_RECHECK_SECONDS", configured)
+    assert _quota_recheck_seconds() == expected
+
+
+@pytest.mark.asyncio
+async def test_codex_canary_cadence_is_fifteen_minutes_not_shared_interval(
+    tmp_path, monkeypatch,
+):
+    sched, home, _store = _paused_scheduler(tmp_path, [])
+    _record_codex_pause(home)
+    clock = [0.0]
+    monkeypatch.setattr("mimir.scheduler.time.monotonic", lambda: clock[0])
+    monkeypatch.setenv("MIMIR_QUOTA_RECHECK_SECONDS", "30")
+    calls = []
+    probes = []
+
+    async def allowed(*args, **kwargs):
+        probes.append(clock[0])
+        return True
+
+    async def failed(*args, **kwargs):
+        calls.append(clock[0])
+        raise RuntimeError("not a quota error; secret diagnostic text")
+
+    monkeypatch.setattr("mimir.billing.poll_codex_usage_once", allowed)
+    monkeypatch.setattr("mimir.billing.run_codex_quota_canary", failed)
+    for tick in (0, 30, 180, 899, 900):
+        clock[0] = tick
+        await sched._recheck_quota_pause()
+    assert calls == [0, 900]
+    assert probes == [0, 900]
+    events = _read_event_types(tmp_path / "logs" / "events.jsonl")
+    outcomes = [e for e in events if e["type"] == "quota_pause_recheck"]
+    assert len(outcomes) == 2
+    assert all(e["outcome"] == "error" for e in outcomes)
+    assert all(e["exception_type"] == "RuntimeError" for e in outcomes)
+    assert all(e["classification_kind"] == "unknown" for e in outcomes)
+    assert "secret diagnostic text" not in str(outcomes)
 
 
 # ─── chainlink #508: deliver: channel ────────────────────────────────

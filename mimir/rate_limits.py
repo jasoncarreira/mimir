@@ -254,6 +254,16 @@ class RateLimitStore:
             data = self._load()
             for key in owned:
                 if key not in updates:
+                    previous = data.get(key)
+                    if isinstance(previous, dict):
+                        reset = _as_timestamp(previous.get("resets_at"))
+                        if (
+                            previous.get("status") == "rejected"
+                            and previous.get("_codex_rejection_source") == "generation"
+                            and (reset is None or reset > observed_epoch)
+                        ):
+                            # Missing probe windows do not revoke a live 429.
+                            continue
                     data.pop(key, None)
             for key, snapshot in updates.items():
                 previous = data.get(key)

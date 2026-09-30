@@ -1396,8 +1396,11 @@ class _CodexUsageLimitError(RuntimeError):
         super().__init__("usage limit reached")
         self.status_code = 429
         self.type = "usage_limit_reached"
-        self.raw = {"error": {"type": self.type, "resets_at": reset_at}}
-        self.rate_limits = None
+        self.raw = {"error": {
+            "type": self.type, "resets_at": reset_at,
+            "limit_window_minutes": 10080,
+        }}
+        self.headers = {}
 
 
 def test_generation_rejection_beats_probe_until_successful_generation(tmp_path):
@@ -1419,6 +1422,118 @@ def test_generation_rejection_beats_probe_until_successful_generation(tmp_path):
     snap = store.current()["openai_seven_day"]
     assert snap.status == "allowed"
     assert snap.utilization == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize("minutes,key", [
+    (300, "openai_five_hour"), (10080, "openai_seven_day"),
+])
+def test_codex_generation_rejection_uses_real_error_headers_not_reset_horizon(
+    tmp_path, monkeypatch, minutes, key,
+):
+    from langchain_codex_plus import CodexResponseError
+
+    # Use the real exception type and its public shape, without binding this
+    # regression to the adapter's exception-constructor signature.
+    exc = CodexResponseError.__new__(CodexResponseError)
+    Exception.__init__(exc, "usage limit reached")
+    exc.status_code = 429
+    exc.type = "usage_limit_reached"
+    exc.code = None
+    exc.raw = {"error": {
+        "type": exc.type, "resets_at": int(time.time()) + 60,
+    }}
+    exc.headers = {
+        "x-codex-primary-window-minutes": str(minutes),
+        "x-codex-primary-used-percent": "100",
+        "x-codex-secondary-window-minutes": "10080" if minutes == 300 else "300",
+        "x-codex-secondary-used-percent": "10",
+    }
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rejection(store, exc)
+    assert set(store.current()) == {key}
+    assert store.current()[key].status == "rejected"
+    assert events[-1][0] == "codex_plus_usage_ok"
+    assert events[-1][1]["recorded"][key.removeprefix("openai_")]["status"] == "rejected"
+
+    payload = _codex_usage_payload(pro=True, used=1)
+    payload["rate_limit"].update(allowed=True, limit_reached=False)
+    assert record_codex_plus_rate_limits(
+        store, parse_codex_usage_payload(payload), source="probe",
+    )
+    assert store.current()[key].status == "rejected"
+    assert evaluate_quota_severity([OpenAIQuotaProvider(store)]).severity is Severity.TIGHT
+
+
+@pytest.mark.parametrize("minutes,key", [
+    (300, "openai_five_hour"), (10080, "openai_seven_day"),
+])
+def test_codex_rejection_body_window_does_not_depend_on_reset_time(tmp_path, minutes, key):
+    exc = _CodexUsageLimitError(int(time.time()) + 60)
+    exc.raw["error"]["limit_window_minutes"] = minutes
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert record_codex_plus_rejection(store, exc)
+    assert set(store.current()) == {key}
+
+
+def test_codex_probe_preserves_missing_generation_rejection_without_reset(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_five_hour", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=None,
+    ))
+    assert store.reconcile_codex_probe_sync(
+        {"openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.01)},
+        owned_keys=("openai_five_hour", "openai_seven_day"), observed_epoch=time.time(),
+    )[0]
+    assert store.current()["openai_five_hour"].status == "rejected"
+
+
+def test_codex_probe_removes_expired_missing_generation_rejection(tmp_path):
+    store = RateLimitStore(tmp_path / "rl.json")
+    now = time.time()
+    assert store.record_codex_rejection_sync("openai_five_hour", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(now) - 1,
+    ))
+    assert store.reconcile_codex_probe_sync(
+        {"openai_seven_day": RateLimitSnapshot(status="allowed", utilization=0.01)},
+        owned_keys=("openai_five_hour", "openai_seven_day"), observed_epoch=now,
+    )[0]
+    assert set(store.current()) == {"openai_seven_day"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_name", ["gpt-5.6-luna", "gpt-6.1-sol"])
+async def test_codex_canary_uses_configured_model_through_chat_adapter(
+    tmp_path, monkeypatch, model_name,
+):
+    from langchain_codex_plus import ChatCodexPlus
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:" + model_name)
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    seen = []
+
+    async def fake_generate(self, messages, **kwargs):
+        # Keep ChatCodexPlus construction and LangChain invocation real; replace
+        # only its generation/transport boundary (no OAuth or network in tests).
+        seen.append((self.model, messages, self.reasoning_effort))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", fake_generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    await run_codex_quota_canary(store, auth_path=tmp_path / "unused-auth.json")
+    assert len(seen) == 1
+    assert seen[0][0] == model_name
+    assert seen[0][1][0].content == "ping"
+    assert seen[0][2] is None
+    assert store.current()["openai_seven_day"].status == "allowed"
 
 
 def test_parse_codex_usage_maps_plus_and_pro_by_declared_duration():

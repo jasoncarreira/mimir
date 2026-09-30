@@ -826,12 +826,21 @@ _QUOTA_RECOVERY_JOB_ID = "__quota_recovery__"
 # provider looks healthy again, instead of sitting out the full
 # recorded window.
 _QUOTA_RECHECK_JOB_ID = "__quota_pause_recheck__"
-_QUOTA_RECHECK_SECONDS_DEFAULT = 15 * 60
+_QUOTA_RECHECK_SECONDS_DEFAULT = 180
+_QUOTA_RECHECK_SECONDS_MIN = 30
+_CODEX_QUOTA_RECHECK_SECONDS = 15 * 60
 
 
 def _quota_recheck_seconds() -> int:
-    """Active Codex pauses are rechecked at the settled 15-minute cadence."""
-    return _QUOTA_RECHECK_SECONDS_DEFAULT
+    """Shared early-recovery cadence; Codex is throttled separately."""
+    try:
+        val = int(os.environ.get(
+            "MIMIR_QUOTA_RECHECK_SECONDS",
+            str(_QUOTA_RECHECK_SECONDS_DEFAULT),
+        ))
+    except ValueError:
+        val = _QUOTA_RECHECK_SECONDS_DEFAULT
+    return max(_QUOTA_RECHECK_SECONDS_MIN, val)
 
 
 def _parse_iso_ts(raw: object) -> datetime | None:
@@ -935,6 +944,7 @@ class Scheduler:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._codex_auth_path: Path | None = None
         self._codex_canary_attempts: list[float] = []
+        self._codex_recheck_last_attempt: float | None = None
 
         # APScheduler ``EVENT_JOB_MISSED`` listener — emits a
         # ``poller_misfired`` algedonic event whenever a job's fire
@@ -1627,21 +1637,29 @@ class Scheduler:
         store = getattr(self._arbiter, "rate_limit_store", None)
         if store is None:
             return
-        allowed = await poll_codex_usage_once(
-            store,
-            auth_path=self._codex_auth_path,
-            require_allowed=True,
-        )
-        if not allowed:
-            return
-
         now = time.monotonic()
+        if (
+            self._codex_recheck_last_attempt is not None
+            and now - self._codex_recheck_last_attempt < _CODEX_QUOTA_RECHECK_SECONDS
+        ):
+            return
         self._codex_canary_attempts = [
             attempted for attempted in self._codex_canary_attempts
             if attempted > now - 3600
         ]
         if len(self._codex_canary_attempts) >= 4:
             return
+        self._codex_recheck_last_attempt = now
+        allowed = await poll_codex_usage_once(
+            store,
+            auth_path=self._codex_auth_path,
+            require_allowed=True,
+        )
+        if not allowed:
+            await log_event("quota_pause_recheck", provider="codex-plus",
+                            outcome="still_limited", stage="usage")
+            return
+
         self._codex_canary_attempts.append(now)
         try:
             await run_codex_quota_canary(
@@ -1650,6 +1668,13 @@ class Scheduler:
             )
         except Exception as exc:  # noqa: BLE001 - provider boundary
             classification = classify_provider_error(exc, provider="codex_plus")
+            # Safe diagnostics: no exception text, headers, or raw payload.
+            await log_event(
+                "quota_pause_recheck", provider="codex-plus", stage="canary",
+                outcome="still_limited" if classification.quota_exhausted else "error",
+                exception_type=type(exc).__name__,
+                classification_kind=classification.kind.value,
+            )
             if classification.quota_exhausted:
                 record_codex_plus_rejection(store, exc)
                 reset_at, _reason = await asyncio.to_thread(
@@ -1659,6 +1684,8 @@ class Scheduler:
                     self.arm_quota_recovery_wake(reset_at)
             return
 
+        await log_event("quota_pause_recheck", provider="codex-plus",
+                        outcome="success", stage="canary")
         if not await asyncio.to_thread(
             tracker.clear_if_current, recorded_at=recorded_at,
         ):
