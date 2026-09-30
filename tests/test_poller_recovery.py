@@ -219,6 +219,86 @@ async def test_recovery_does_not_trust_empty_or_unattested_github_batch(
         assert replayed.extra["items"][0]["author_is_trusted"] is False
 
 
+@pytest.mark.parametrize("trusted_first", [True, False])
+async def test_recovery_mixed_batch_requires_every_item_to_attest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_first: bool,
+) -> None:
+    items = [{
+        "repo": "acme/widget", "event_type": "issue_opened",
+        "url": f"https://github.com/acme/widget/issues/{number}",
+        "actor": "stashed-actor", "author_is_trusted": True,
+    } for number in (11, 12)]
+    if not trusted_first:
+        items.reverse()
+    calls = []
+
+    def content_author(repo, item, token):
+        calls.append(item["url"])
+        return "member" if item["url"].endswith("/11") else "outsider"
+
+    monkeypatch.setattr(pollers, "_github_content_author", content_author)
+    monkeypatch.setattr(
+        pollers, "_github_author_is_trusted",
+        lambda repo, author, token: author == "member",
+    )
+    event = _make_event("sid-mixed", channel_id="poller:github-activity", items=items)
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    assert calls == [item["url"] for item in items]
+    assert [item["author_is_trusted"] for item in replayed.extra["items"]] == (
+        [True, False] if trusted_first else [False, True]
+    )
+
+
+@pytest.mark.parametrize("raising_helper", [
+    "_github_content_author", "_github_author_is_trusted",
+    "_github_framework_trigger_is_trusted",
+])
+async def test_recovery_attestation_exception_fails_closed_and_clears_actor_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raising_helper: str,
+) -> None:
+    framework = raising_helper == "_github_framework_trigger_is_trusted"
+    item = {
+        "repo": "acme/widget",
+        "event_type": "pr_mergeability_rebase" if framework else "issue_opened",
+        "url": "https://github.com/acme/widget/issues/12",
+        "actor": "stashed-actor", "author_is_trusted": True,
+    }
+    calls = []
+
+    def raises(*args):
+        calls.append(raising_helper)
+        raise RuntimeError("test attestation unavailable")
+
+    monkeypatch.setattr(pollers, "_github_content_author", lambda *args: "live-member")
+    monkeypatch.setattr(pollers, "_github_author_is_trusted", lambda *args: True)
+    monkeypatch.setattr(pollers, raising_helper, raises)
+    event = _make_event("sid-exception", channel_id="poller:github-activity", items=[item])
+    await poller_recovery.stash_enqueued_event(tmp_path, event, pending_enqueue=True)
+    enqueue = _FakeEnqueue()
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=tmp_path / "events.jsonl", enqueue=enqueue,
+        service_principal="poller:github-activity", service_authority=object(),
+        trust_source="github", github_token="server-token",
+    )
+    assert calls == [raising_helper]
+    [replayed] = enqueue.calls
+    assert replayed.ifc_labels.sources[0].integrity == "untrusted"
+    if not framework:
+        [replayed_item] = replayed.extra["items"]
+        assert replayed_item["actor"] is None
+        assert replayed_item["author_is_trusted"] is False
+
+
 # ── stash ────────────────────────────────────────────────────────────
 
 
