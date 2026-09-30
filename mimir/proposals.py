@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 import posixpath
 import re
 import shutil
@@ -183,6 +185,7 @@ class ProposalResult:
     #: "conflict_marker" | "pr_open" | "error".
     reason: str | None
     detail: str | None = None
+    reused_pr: bool = False
 
 
 @dataclass
@@ -782,7 +785,7 @@ def finalize_proposal(
     opener = open_pr or _default_open_pr
     if rolling_state == "open" and rolling_url:
         _cleanup_worktree(home, wt, branch)
-        return ProposalResult(True, branch, True, rolling_url, None)
+        return ProposalResult(True, branch, True, rolling_url, None, reused_pr=True)
     try:
         pr_url = opener(home, branch, base, safe_title, body)
     except ProposalPrError as exc:
@@ -926,6 +929,82 @@ def _blob_oid(home: Path, ref: str, path: str) -> str | None:
         return None
     value = (res.stdout or "").strip()
     return value or None
+
+
+def merged_social_outbox_commit(
+    home: Path, poller: str, path: str, *, verified_text: str | None = None,
+    on_withheld: Callable[[str], None] | None = None,
+) -> str | None:
+    """Require forge evidence of an allowlisted merge of this exact file.
+
+    The local content-addressed tree is acceptable only at the commit oid
+    returned by the forge. A clean HEAD alone is not approval. The allowlist
+    authorizes a forge actor, not an independent human: a shared credential
+    cannot distinguish operator actions from agent actions. Unknown or empty
+    approver configuration and unknown forge evidence fail closed.
+    """
+    def refuse(reason: str) -> None:
+        if on_withheld is not None:
+            on_withheld(reason)
+        return None
+
+    configured = os.environ.get("MIMIR_SOCIAL_OUTBOX_APPROVERS", "").strip()
+    entries = [entry.strip() for entry in configured.split(",") if entry.strip()]
+    if not entries:
+        return refuse("no_approvers_configured")
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", entry) for entry in entries):
+        return refuse("invalid_approvers_configured")
+    approvers = {entry.casefold() for entry in entries}
+    if not (os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()):
+        return refuse("missing_forge_token")
+    try:
+        scope = PollerProposalScope(f"poller:{poller}", "dispatch", "dispatch", "dispatch",
+                                    "social-outbox")
+        if Path(path).parent != scope.surface_root:
+            return refuse("invalid_outbox_path")
+        last = _git(["log", "--first-parent", "--full-history", "-1", "--format=%H",
+                     "HEAD", "--", path], cwd=home)
+        commit = (last.stdout or "").strip()
+        if last.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return refuse("content_changed_after_merge")
+        result = _run(
+            ["gh", "pr", "list", "--state", "merged", "--head", poller_branch_name(scope),
+             "--json", "state,headRefName,mergeCommit,mergedBy", "--limit", "100"],
+            cwd=home, capture=True,
+        )
+        if result.returncode != 0:
+            return refuse("forge_unreachable")
+        prs = json.loads(result.stdout or "")
+        if not isinstance(prs, list) or any(not isinstance(pr, dict) for pr in prs):
+            return refuse("malformed_forge_response")
+        approved = False
+        for pr in prs:
+            if (pr.get("state") != "MERGED"
+                    or pr.get("headRefName") != poller_branch_name(scope)
+                    or not isinstance(pr.get("mergeCommit"), dict)
+                    or pr["mergeCommit"].get("oid") != commit):
+                continue
+            merger = pr.get("mergedBy")
+            login = merger.get("login") if isinstance(merger, dict) else None
+            if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                return refuse("malformed_forge_response")
+            if login.casefold() not in approvers:
+                return refuse("merger_not_approved")
+            approved = True
+        if not approved:
+            return refuse("no_qualifying_merged_pr")
+        blob = _blob_oid(home, "HEAD", path)
+        if blob is None or blob != _blob_oid(home, commit, path):
+            return refuse("content_changed_after_merge")
+        if verified_text is not None:
+            approved_content = _git(["show", f"{commit}:{path}"], cwd=home)
+            if approved_content.returncode != 0 or approved_content.stdout != verified_text:
+                return refuse("content_changed_after_merge")
+        return commit
+    except json.JSONDecodeError:
+        return refuse("malformed_forge_response")
+    except (OSError, ValueError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+        return refuse("forge_unreachable")
 
 
 def _proposal_branch_content_is_on_main(

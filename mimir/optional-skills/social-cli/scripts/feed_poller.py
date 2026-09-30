@@ -49,9 +49,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dispatcher import _count, dispatch_merged
+
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "emitted.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "social-cli-feed")
+_TODAY_COUNTS: dict[str, int | None] = {}
 
 # Cursor cap. Feed traffic is denser than notifications, so we keep
 # a larger window — at limit=50/platform × 2 platforms × 12 pulls/day,
@@ -169,7 +172,7 @@ def _format_event(post: dict) -> dict | None:
 
     text_line = f"\n  > {text}" if text else ""
     stats = f"likes:{likes} replies:{replies} reposts:{reposts}"
-    # Action hint: surfaces the right tool (outbox + dispatch) for any
+    # Action hint: surfaces the proposal flow for any
     # engagement decision the agent makes about this post. Without it,
     # the agent's instinct is to reach for ``send_message`` — which
     # routes to a Discord/Slack channel, NOT back to Bluesky/X. Caught
@@ -178,21 +181,17 @@ def _format_event(post: dict) -> dict | None:
     # chars (was ~270; the suffix warning adds a measured +150);
     # bounded by ``batch_size`` (default 10 for feed).
     #
-    # The platform suffix is mandatory — see the longer note on the
-    # matching hint in ``poller.py``.
-    home = Path(os.environ.get("MIMIR_HOME", "/mimir-home"))
-    outbox = STATE_DIR / f"outbox-{platform}.yaml"
-    if outbox.is_relative_to(home):
-        outbox = outbox.relative_to(home)
+    count = _TODAY_COUNTS.get(platform)
+    count_text = str(count) if count is not None else "unknown (treat as cap reached)"
     action_hint = (
-        f"\n\n→ Add entries to {outbox}: read_file + edit_file if present; write_file only creates.\n"
-        f"`bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh {POLLER_NAME} dispatch --platform {platform}`\n"
-        "Check count before posts/replies (cap 5 per UTC day).\n"
+        f"\n\n→ Today {platform} posts/replies: {count_text} / 5 per UTC day.\n"
+        "Propose via open_proposal(source=id), edit_file in returned worktree "
+        "(write_file for a new file), then submit_proposal(title, rationale).\n"
+        f"Add a new outbox-*.yaml under state/social-outbox/{POLLER_NAME}/ in that worktree.\n"
+        "The server pings the operator automatically after submission.\n"
         "dispatch:\n"
-        f"  - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
-        f"  - like: {{ platform: {platform}, id: \"{pid}\" }}\n"
-        'Bare outbox.yaml: "No outbox file found".\n'
-        f"send_message is chat, NOT {platform}."
+        f"  - action: reply\n    parent: {{ uri: \"{pid}\", cid: \"<cid>\" }}\n"
+        "    text: \"...\""
     )
     prompt = (
         f"[{platform}] feed post from {author}"
@@ -266,6 +265,8 @@ def main() -> int:
     limit = max(1, min(limit, 200))
 
     bin_path = os.environ.get("SOCIAL_CLI_BIN", "").strip() or "social-cli"
+    if os.environ.get("MIMIR_HOME"):
+        dispatch_merged(Path(os.environ["MIMIR_HOME"]).resolve(), STATE_DIR, POLLER_NAME, bin_path)
 
     # Preserve cursor insertion order so LRU eviction at the head
     # works without metadata. Same shape as the notifications poller.
@@ -285,6 +286,9 @@ def main() -> int:
         except (OSError, ValueError) as exc:
             _eprint(f"social-cli: feed parse failed for {platform}: {exc}")
             continue
+
+        global _TODAY_COUNTS
+        _TODAY_COUNTS[platform] = _count(platform, STATE_DIR) if posts else None
 
         for post in posts:
             event = _format_event(post)

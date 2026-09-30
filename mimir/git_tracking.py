@@ -597,9 +597,12 @@ async def _stage_and_commit(*, turn_id: str, trigger: str, home: Path) -> bool:
 
     porcelain = result.stdout
 
-    # 2. Stage everything not gitignored. -A respects .gitignore.
+    # 2. Social outboxes must arrive through a reviewed forge merge, never the
+    # per-turn auto-commit. Exclude them even when already tracked; unstage any
+    # pre-staged changes without changing the worktree or approved HEAD blobs.
     try:
-        await _git("add", "-A", cwd=home)
+        await _git("add", "-A", "--", ".", ":(top,exclude)state/social-outbox", cwd=home)
+        await _git("reset", "-q", "HEAD", "--", "state/social-outbox", cwd=home)
     except (GitError, asyncio.TimeoutError, OSError) as exc:
         await _record_index_lock_block(
             home=home, turn_id=turn_id, operation="commit", exc=exc,

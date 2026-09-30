@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import json
+import logging
+import subprocess
+from collections import Counter
 from pathlib import Path
+
+import yaml
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException, tool
@@ -39,6 +45,34 @@ from ..proposals import (
 from ..event_logger import log_event
 from .refusals import ToolPolicyRefusal
 from .repo import _bind_injected_runtime
+from .operator_alert import send_social_proposal_ping
+
+_log = logging.getLogger(__name__)
+
+
+def _social_additions(worktree: Path, scope: PollerProposalScope) -> list[tuple[str, str]]:
+    """Describe only new entries relative to the worktree's HEAD."""
+    additions: list[tuple[str, str]] = []
+    for path in sorted((worktree / scope.surface_root).glob("outbox-*.yaml")):
+        rel = path.relative_to(worktree).as_posix()
+        before = subprocess.run(["git", "show", f"HEAD:{rel}"], cwd=worktree,
+                                capture_output=True, text=True, check=False, timeout=10)
+        old = yaml.safe_load(before.stdout) if before.returncode == 0 else {}
+        new = yaml.safe_load(path.read_text(encoding="utf-8"))
+        previous = Counter(json.dumps(item, sort_keys=True) for item in old.get("dispatch", []))
+        for entry in new["dispatch"]:
+            key = json.dumps(entry, sort_keys=True)
+            if previous[key]:
+                previous[key] -= 1
+                continue
+            action = entry["action"]
+            posts = entry.get("posts", []) if action == "thread" else [entry.get("text", "")]
+            preview = " | ".join(
+                " ".join((post.get("text", "") if isinstance(post, dict) else post).split())[:80]
+                for post in posts
+            )
+            additions.append((action, preview))
+    return additions
 
 
 def _home() -> Path | None:
@@ -149,7 +183,14 @@ def _run_poller(
             raise ToolPolicyRefusal("proposal rejected: worktree path changed")
         try:
             if operation == "submit_proposal":
-                return _finalize_proposal(home, title=title, rationale=rationale, lane="poller", poller=scope)
+                additions = []
+                if scope.surface == "social-outbox":
+                    try:
+                        additions = _social_additions(expected, scope)
+                    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError, subprocess.TimeoutExpired):
+                        _log.warning("social-outbox proposal: could not summarize draft", exc_info=True)
+                result = _finalize_proposal(home, title=title, rationale=rationale, lane="poller", poller=scope)
+                return (result, additions) if scope.surface == "social-outbox" else result
             return _abandon_proposal(home, lane="poller", poller=scope)
         finally:
             if not expected.exists() and not expected.is_symlink():
@@ -283,10 +324,12 @@ async def submit_proposal(
             lane=lane,
         )
     if context is not None:
-        result = await asyncio.to_thread(
+        response = await asyncio.to_thread(
             _run_poller, context, home, "submit_proposal", title=title, rationale=rationale,
         )
+        result, additions = response if isinstance(response, tuple) else (response, None)
     else:
+        additions = None
         result = await asyncio.to_thread(
             _finalize_proposal, home, title=title, rationale=rationale, lane=lane
         )
@@ -295,10 +338,21 @@ async def submit_proposal(
         # prompt's feedback block and supersedes the open-proposal nudge (which
         # auto-clears now that the worktree is gone).
         await log_event("proposal_pr_opened", pr_url=result.pr_url, branch=result.branch, lane=lane)
+        if additions is not None:
+            poller = context.poller_proposal_state.scope.owner.removeprefix("poller:")
+            # Preview text is untrusted social content, not mention authority.
+            details = "; ".join(f"{action}: {preview}" for action, preview in additions[:20])
+            details = details.replace("@", "＠")
+            await send_social_proposal_ping(
+                f"Social outbox proposal from {poller}: {len(additions)} entries added. "
+                f"{details}\nReview and merge: {result.pr_url}"
+            )
         return (
-            f"Opened a change-proposal PR: {result.pr_url}\n"
-            "Give the operator this URL and ask them to review and merge. "
-            "Nothing changed in the live files yet — it applies only after they "
+            (f"Updated the rolling outbox PR: {result.pr_url}\n" if result.reused_pr else
+             f"Opened a change-proposal PR: {result.pr_url}\n")
+            + ("The operator was notified automatically. " if additions is not None else
+               "Give the operator this URL and ask them to review and merge. ")
+            + "Nothing changed in the live files yet — it applies only after they "
             "merge."
         )
     if result.reason == "no_open":

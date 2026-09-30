@@ -272,10 +272,7 @@ def test_load_feed_degrades_without_pyyaml(fresh_feed_poller, monkeypatch, tmp_p
 def test_action_hint_names_the_platform_suffixed_outbox(
     fresh_feed_poller, monkeypatch, capsys, tmp_path,
 ):
-    """Same regression as the notifications poller: the feed hint must name
-    ``outbox-<platform>.yaml`` plus a matching ``--platform``, because
-    ``dispatch --platform`` never falls back to a shared ``outbox.yaml``.
-    """
+    """Feed turns must propose rather than invoke social-cli themselves."""
     monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
     _write_feed(tmp_path, "bsky", [_post("p1")])
     _stub_fetch(monkeypatch, fresh_feed_poller)
@@ -283,12 +280,10 @@ def test_action_hint_names_the_platform_suffixed_outbox(
     fresh_feed_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert f"{tmp_path}/outbox-bsky.yaml" in prompt
-    assert "run-social-cli.sh social-cli-feed dispatch --platform bsky" in prompt
-    assert "`social-cli dispatch" not in prompt
-    assert "Check count before posts/replies (cap 5 per UTC day)" in prompt
-    assert "<STATE_DIR>/outbox.yaml" not in prompt
-    assert "No outbox file found" in prompt
+    assert "state/social-outbox/social-cli-feed/" in prompt
+    assert "Today bsky posts/replies: 0 / 5 per UTC day" in prompt
+    assert all(tool in prompt for tool in ("open_proposal", "edit_file", "write_file", "submit_proposal"))
+    assert "dispatch --" not in prompt and "run-social-cli.sh" not in prompt
 
 
 def test_hint_uses_custom_poller_and_home_relative_state(fresh_feed_poller, monkeypatch, tmp_path):
@@ -296,12 +291,43 @@ def test_hint_uses_custom_poller_and_home_relative_state(fresh_feed_poller, monk
     monkeypatch.setattr(fresh_feed_poller, "POLLER_NAME", "custom-feed")
     monkeypatch.setattr(fresh_feed_poller, "STATE_DIR", tmp_path / "state/pollers/custom-feed")
     prompt = fresh_feed_poller._format_event(_post("p1"))["prompt"]
-    assert "state/pollers/custom-feed/outbox-bsky.yaml" in prompt
+    assert "state/social-outbox/custom-feed/" in prompt
     assert str(tmp_path) not in prompt
-    assert "run-social-cli.sh custom-feed dispatch --platform bsky" in prompt
-    assert "read_file + edit_file if present; write_file only creates" in prompt
-    assert "<STATE_DIR>" not in prompt and "append to" not in prompt
-    assert len(prompt.split("\n\n→", 1)[1]) <= 600
+    assert "submit_proposal" in prompt
+    assert len(prompt.split("\n\n→", 1)[1]) <= 650
+
+
+def test_prompt_count_comes_from_todays_sent_ledger(fresh_feed_poller, monkeypatch, capsys, tmp_path):
+    from datetime import datetime, timezone
+    import yaml
+
+    state = tmp_path / "social-cli-feed"
+    state.mkdir()
+    monkeypatch.setattr(fresh_feed_poller, "STATE_DIR", state)
+    monkeypatch.setattr(fresh_feed_poller, "CURSOR_FILE", state / "emitted.json")
+    today = datetime.now(timezone.utc).isoformat()
+    (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
+        {"action": "post", "platform": "bsky", "timestamp": today, "createdId": str(i)}
+        for i in range(2)
+    ]))
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
+    _write_feed(state, "bsky", [_post("p1")])
+    _stub_fetch(monkeypatch, fresh_feed_poller)
+    fresh_feed_poller.main()
+    assert "Today bsky posts/replies: 2 / 5 per UTC day" in _capture_emits(capsys)[0]["prompt"]
+
+
+def test_prompt_does_not_assume_headroom_when_count_fails(fresh_feed_poller, monkeypatch, capsys, tmp_path):
+    state = tmp_path / "social-cli-feed"
+    state.mkdir()
+    monkeypatch.setattr(fresh_feed_poller, "STATE_DIR", state)
+    monkeypatch.setattr(fresh_feed_poller, "CURSOR_FILE", state / "emitted.json")
+    (state / "sent_ledger-bsky.yaml").write_text("not a valid ledger\n")
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
+    _write_feed(state, "bsky", [_post("p1")])
+    _stub_fetch(monkeypatch, fresh_feed_poller)
+    fresh_feed_poller.main()
+    assert "unknown (treat as cap reached)" in _capture_emits(capsys)[0]["prompt"]
 
 
 def test_seeds_state_gitignore(fresh_feed_poller, tmp_path):

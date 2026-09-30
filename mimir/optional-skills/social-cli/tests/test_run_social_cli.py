@@ -113,12 +113,10 @@ def test_credentials_and_debugging_are_operator_only():
         if ".env" in line:
             assert "operator-only" in heading.lower(), (heading, line)
     assert "**Count works:**" not in text
-    assert "**Sync works** (operator)" in text
     assert "never read `.env`" in text
-    assert "`read_file` it and use" in text and "`edit_file` to add entries" in text
-    assert "`write_file` only" in text
-    assert "counts once per published post" in text
-    assert "Operator-only: from `docker exec`, `--dry-run`" in text
+    assert "`edit_file` to add" in text and "`write_file`" in text
+    assert "one slot per post" in text
+    assert "poller turns have no" in text.lower()
 
 
 def test_service_read_tools_are_admitted_for_both_pollers():
@@ -127,5 +125,4 @@ def test_service_read_tools_are_admitted_for_both_pollers():
         capabilities = set(poller["authority"]["capabilities"])
         assert {"read_file", "grep", "glob"} <= capabilities
         assert not {"memory_store", "saga_feedback", "saga_mark_contributions"} & capabilities
-        assert all("--dry-run" not in cmd.get("options", [])
-                   for cmd in poller["authority"]["shell_commands"])
+        assert "shell_commands" not in poller["authority"]

@@ -697,6 +697,33 @@ def home_repo(tmp_path: Path) -> Path:
     return home
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pre_staged", [False, True])
+async def test_auto_commit_excludes_new_and_tracked_social_outboxes(home_repo, pre_staged):
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=home_repo, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    root = home_repo / "state/social-outbox/feed"
+    root.mkdir(parents=True)
+    approved = root / "outbox-approved.yaml"
+    approved.write_text("approved\n")
+    git("add", "-A")
+    git("commit", "-qm", "operator merged outbox")
+    approved.write_text("unreviewed edit\n")
+    new = root / "outbox-new.yaml"
+    new.write_text("unreviewed new file\n")
+    if pre_staged:
+        git("add", "-A")
+    (home_repo / "README.md").write_text("ordinary turn change\n")
+    assert await git_tracking._stage_and_commit(turn_id="outbox", trigger="test", home=home_repo)
+    assert git("show", "HEAD:state/social-outbox/feed/outbox-approved.yaml") == "approved"
+    assert git("show", "HEAD:README.md") == "ordinary turn change"
+    assert "outbox-new.yaml" not in git("ls-tree", "-r", "--name-only", "HEAD")
+    assert approved.read_text() == "unreviewed edit\n" and new.read_text() == "unreviewed new file\n"
+    assert git("diff", "--cached", "--name-only") == ""
+
+
 def _events_log(tmp_path: Path) -> Path:
     return tmp_path / "logs" / "events.jsonl"
 
