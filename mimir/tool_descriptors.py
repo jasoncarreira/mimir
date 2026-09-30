@@ -319,6 +319,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "http_request": _D(SinkCategory.HTTP_WEBHOOK, _url_target, "network", sink_payload_extractor=_argument_payload("url", "body")),
     "issue_comment": _D(SinkCategory.FORGE, _generic_target, "configured_repository_issue", sink_payload_extractor=_argument_payload("body")),
     "memory_store": _D(SinkCategory.SAGA, _generic_target, "saga", result_origin=_N),
+    "memory_propose": _D(SinkCategory.SAGA, _fixed_target("memory_proposals"), "memory_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("content", "rationale")),
     "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification", sink_payload_extractor=None),
     "open_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
     "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
