@@ -3012,6 +3012,31 @@ class Scheduler:
             coalesce=True,
         )
 
+    # ---- Memory proposal review digest --------------------------------
+
+    def add_memory_proposal_digest_job(
+        self, home: Path, channel: str, send: Callable[..., Awaitable[Any]],
+    ) -> bool:
+        """Server-owned delivery; the model receives no digest callable or prompt."""
+        from .memory_proposals import post_review_digest
+
+        warned = False
+
+        async def _fire() -> None:
+            nonlocal warned
+            if not channel.strip():
+                if not warned:
+                    warned = True
+                    log.warning("memory proposal digest: operator alert channel unset")
+                    await log_event("memory_proposal_digest_channel_unset")
+                return
+            await post_review_digest(home, channel, send)
+
+        return self.register_callable(
+            name="memory-proposal-digest", fn=_fire, default_cron="*/5 * * * *",
+            max_instances=1, coalesce=True,
+        )
+
     # ---- Proposed-changes backlog cron --------------------------------
 
     def add_proposed_changes_backlog_job(

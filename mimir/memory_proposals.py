@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import approval_requests
+from .redaction import redact_text
 
 
 # Configured only by the server's Agent; a tool cannot install an approval.
@@ -261,6 +262,112 @@ def _records(home: Path) -> list[dict[str, Any]]:
         return _load_records(home)
 
 
+def list_proposals(home: Path, *, status: str = "pending") -> list[dict[str, Any]]:
+    """Operator view of the durable queue (never exposed as a model tool)."""
+    if status not in {"pending", "all"}:
+        raise ValueError("status must be pending or all")
+    return [r for r in _records(home) if status == "all" or r["status"] == status]
+
+
+def _digest_path(home: Path) -> Path:
+    return proposal_path(home).with_name("memory-proposal-digest.json")
+
+
+def _digest_state(home: Path) -> dict[str, Any]:
+    path = _digest_path(home)
+    if not path.exists():
+        return {"last_sent": None, "sent": {}}
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r", encoding="utf-8") as file:
+            state = json.load(file)
+        if (not isinstance(state, dict) or not isinstance(state.get("sent"), dict)
+                or (state.get("last_sent") is not None and
+                    not isinstance(state.get("last_sent"), str))):
+            raise ValueError("invalid digest state")
+        for entry in state["sent"].values():
+            if (not isinstance(entry, dict) or not isinstance(entry.get("first"), str)
+                    or not isinstance(entry.get("reminded"), bool)):
+                raise ValueError("invalid digest entry")
+            datetime.fromisoformat(entry["first"])
+        if state["last_sent"] is not None:
+            datetime.fromisoformat(state["last_sent"])
+        return state
+    except (OSError, ValueError, TypeError) as exc:
+        raise ProposalRefusal("invalid memory proposal digest state") from exc
+
+
+def _save_digest_state(home: Path, state: dict[str, Any]) -> None:
+    path = _digest_path(home)
+    fd, temporary = tempfile.mkstemp(prefix=".memory-proposal-digest-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(state, file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _safe_digest_field(value: Any) -> str:
+    """Redact and render untrusted bytes inert in Markdown and chat bridges."""
+    text = redact_text(str(value) if value is not None else "(none)")
+    text = " ".join(text.splitlines())
+    for char in "\\`*_~|[]()<>":
+        text = text.replace(char, "\\" + char)
+    return text.replace("@", "@\u200b").replace(":", ":\u200b").replace(".", ".\u200b")
+
+
+async def post_review_digest(
+    home: Path, channel: str, send: Any, *, now: datetime | None = None,
+) -> bool:
+    """Server-only scheduled digest. Record a delivery only after the bridge accepts it."""
+    if not channel.strip():
+        return False
+    now = now or datetime.now(timezone.utc)
+    with _store_lock(home, exclusive=False):
+        records = _load_records(home)
+        state = _digest_state(home)
+    last = state["last_sent"]
+    if last and now - datetime.fromisoformat(last) < timedelta(minutes=30):
+        return False
+    eligible = []
+    for record in records:
+        if record["status"] != "pending" or datetime.fromisoformat(record["expires_at"]) <= now:
+            continue
+        prior = state["sent"].get(record["id"])
+        if prior is None or (not prior["reminded"] and
+                            now - datetime.fromisoformat(prior["first"]) >= timedelta(hours=24)):
+            eligible.append(record)
+    if not eligible:
+        return False
+    lines = ["Pending memory proposals — derived from untrusted external content — approve only if true and worth keeping"]
+    for record in eligible:
+        proposal_id = record["id"]
+        lines.extend((
+            f"\n{_safe_digest_field(proposal_id)} ({_safe_digest_field(record['stream'])})",
+            f"Content: {_safe_digest_field(record['content'])}",
+            f"Origin: {_safe_digest_field(record['proposed_by'])} / {_safe_digest_field(record.get('origin_ref'))}",
+            f"Rationale: {_safe_digest_field(record['rationale'])}",
+            f"approve {proposal_id} / decline {proposal_id} / approve {proposal_id}: <edited text>",
+        ))
+    result = await send(channel, "\n".join(lines), final=True)
+    if not getattr(result, "sent", False):
+        return False
+    with _store_lock(home, exclusive=True):
+        state = _digest_state(home)
+        state["last_sent"] = now.isoformat()
+        for record in eligible:
+            entry = state["sent"].get(record["id"])
+            if entry is None:
+                state["sent"][record["id"]] = {"first": now.isoformat(), "reminded": False}
+            else:
+                entry["reminded"] = True
+        _save_digest_state(home, state)
+    return True
+
+
 def sync_pending(home: Path) -> None:
     """Reconcile the durable queue with the registry; also sweeps expired records."""
     backend = _APPROVAL_BACKENDS.get(home)
@@ -367,6 +474,20 @@ async def _complete_reply(home: Path, event: Any, resolution: Any, resolver: Any
     action_home, proposal_id, decision, edit = action
     if action_home != home or action_home not in _APPROVAL_BACKENDS:
         return f"no pending request {proposal_id}"
+    return await decide_proposal(
+        home, proposal_id, decision, edit=edit,
+        approved_by=resolver.resolve(event.author), approval_event_id=event.source_id,
+        saga_store=_APPROVAL_BACKENDS[home][1],
+    )
+
+
+async def decide_proposal(
+    home: Path, proposal_id: str, decision: str, *, edit: str | None = None,
+    approved_by: str, approval_event_id: str | None, saga_store: Any,
+) -> str:
+    """Shared operator decision and B3b validation/storage path."""
+    if decision not in {"approve", "decline"} or not _NAMED_MP.fullmatch(f"{decision} {proposal_id}"):
+        return f"no pending request {proposal_id}"
     record = next((r for r in _records(home) if r.get("id") == proposal_id), None)
     if record is None or record.get("status") != "pending":
         return f"already decided {proposal_id}"
@@ -382,13 +503,11 @@ async def _complete_reply(home: Path, event: Any, resolution: Any, resolver: Any
     if not content:
         return f"empty edit for {proposal_id}"
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    saga_store = _APPROVAL_BACKENDS[home][1]
-    principal = resolver.resolve(event.author)
     try:
         result = await saga_store.store(
             content, stream=record["stream"], source_type="operator_approved_proposal",
             provenance={
-                "approved_by": principal, "approval_event_id": event.source_id,
+                "approved_by": approved_by, "approval_event_id": approval_event_id,
                 "proposal_id": proposal_id, "proposed_by": record["proposed_by"],
                 "proposal_turn_id": record["turn_id"], "origin_ref": record["origin_ref"],
                 "content_sha256": digest, "edited": edit is not None,

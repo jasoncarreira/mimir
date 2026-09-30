@@ -1849,6 +1849,13 @@ def build_app(config: Config) -> web.Application:
                 job="proposed-changes-backlog",
             )
 
+        try:
+            scheduler.add_memory_proposal_digest_job(
+                config.home, config.operator_alert_channel, channels.send,
+            )
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="memory-proposal-digest")
+
         # Register daily PyPI update-check. Surfaces newer mimir
         # releases as a positive algedonic event so operators see
         # "newer version available" in the agent's per-turn block
