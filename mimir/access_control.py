@@ -174,6 +174,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "memory_query": ToolFlowDirection.SOURCE,
     "memory_get": ToolFlowDirection.SOURCE,
     "memory_store": ToolFlowDirection.SINK,
+    "memory_propose": ToolFlowDirection.SINK,
     "open_proposal": ToolFlowDirection.SINK,
     "submit_proposal": ToolFlowDirection.SINK,
     "abandon_proposal": ToolFlowDirection.SINK,
@@ -404,6 +405,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "send_message": CapabilityTier.SCOPE_CONTAINED,
     "operator_alert": CapabilityTier.SCOPE_CONTAINED,
     "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "memory_propose": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -5613,6 +5615,18 @@ SAGA_TAINT_REFUSAL = (
 )
 
 
+def _saga_taint_refusal_for_turn(auth_context: Any) -> str:
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is None or turn.auth_context is not auth_context:
+        return SAGA_TAINT_REFUSAL
+    service = get_trusted_service_from_auth_context(auth_context)
+    if is_admin(auth_context) or service_can_invoke_operation(service, "memory_propose"):
+        return SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
+    return SAGA_TAINT_REFUSAL
+
+
 def saga_mutation_taint_refusal(
     auth_context: Any, fallback: Any = None,
 ) -> str | None:
@@ -5620,24 +5634,24 @@ def saga_mutation_taint_refusal(
     from .models import InformationFlowLabels
 
     if auth_context is None:
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     state = getattr(auth_context, "ifc_state", None)
     get_current = getattr(state, "current", None)
     if not callable(get_current):
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     try:
         labels = get_current(
             fallback if fallback is not None else getattr(auth_context, "ifc_labels", None)
         )
     except Exception:
         log.exception("saga_mutation_integrity_evaluation_failed")
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     if (
         not isinstance(labels, InformationFlowLabels)
         or not labels.sources
         or labels.has_untrusted_active_ingest
     ):
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     return None
 
 
@@ -6274,6 +6288,14 @@ class SinkGate:
                 would_block=True,
             )
 
+        if tool_name == "memory_propose":
+            # Review queue only: no atom is written. Keep normal capability
+            # checks in authorize_tool, but do not impose SAGA's trust gate.
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.OPEN,
+                allowed=True, reason="memory_proposal_queue",
+                service_principal=service, enforcement_enabled=enforce,
+            )
         if sink_category is SinkCategory.SAGA:
             taint_refusal = saga_mutation_taint_refusal(auth_context, ifc_labels)
             if taint_refusal is not None:
@@ -7574,7 +7596,7 @@ class WriteResourceAdapter:
     _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
     _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
     _PROTECTED_NAMES: frozenset[str] = frozenset({
-        ".env", ".git", "compose.env", "rate_limits.json",
+        ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
         "core-memory", "core_memory", "corememory", "prompts",
     })
@@ -7793,6 +7815,7 @@ class OperationCatalog:
         "spawn_open_code",
         "task",
         "memory_store",
+        "memory_propose",
         "saga_feedback",
         "saga_mark_contributions",
         "saga_end_session",
@@ -8748,6 +8771,28 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in {"read_file", "write_file", "edit_file", "ls"}:
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            args = arguments or {}
+            raw_path = args.get("file_path") or args.get("path") or target_channel
+            if home and isinstance(raw_path, str) and raw_path.strip():
+                root = Path(home).resolve() / ".mimir"
+                protected_file = root / "memory-proposals.jsonl"
+                candidate = Path(raw_path)
+                if not candidate.is_absolute():
+                    candidate = Path(home) / raw_path.lstrip("/")
+                try:
+                    protected = candidate == protected_file or candidate.resolve() == protected_file.resolve() or (
+                        tool_name == "ls" and (candidate == root or candidate.resolve() == root.resolve())
+                    )
+                except (OSError, RuntimeError):
+                    protected = candidate == protected_file or (tool_name == "ls" and candidate == root)
+                if protected:
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="protected_memory_proposal_path",
+                        enforcement_enabled=True, would_block=True,
+                    ))
         if (
             service is not None
             and service.authority_profile == "session-boundary"

@@ -3066,6 +3066,7 @@ def all_mimir_tools(
     """
     from .memory import memory_get, memory_query
     from .store import memory_store
+    from .memory_propose import memory_propose
     from .proposals import (
         abandon_proposal,
         open_proposal,
@@ -3088,7 +3089,7 @@ def all_mimir_tools(
         clear_ingest_taint,
         request_operator_approval,
         # Memory (read + write)
-        memory_query, memory_get, memory_store,
+        memory_query, memory_get, memory_store, memory_propose,
         # Change proposals for protected files (PR-gated; never writes live).
         # The sanctioned path for the agent to change memory/core/* or
         # prompts/*: open a worktree sandbox under scratch/, edit it natively,
