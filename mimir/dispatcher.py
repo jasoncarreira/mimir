@@ -30,6 +30,7 @@ from .worklink.continuation import (
 )
 
 if TYPE_CHECKING:
+    from .bridges.base import SendResult
     from .identities import IdentityResolver
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ log = logging.getLogger(__name__)
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
 RelevanceCheck = Callable[[AgentEvent], Awaitable[bool | None]]
 InjectCallback = Callable[[AgentEvent], Awaitable[None]]
+NoticeSender = Callable[[str, str], Awaitable["SendResult"]]
 # Best-effort observer fired (fire-and-forget) for each enqueued inbound
 # event — used for first-contact DM-channel capture (server.py). Must not
 # raise into enqueue and must not block it.
@@ -104,6 +106,7 @@ class Dispatcher:
         # interleaved with the turn's mid-flight replies) instead of at turn end.
         # None until wired (server.py); injection still works without it.
         self._on_inject: InjectCallback | None = None
+        self._notice_sender: NoticeSender | None = None
         # Best-effort per-event observer (DM-channel capture). Fire-and-forget;
         # tasks tracked in ``_bg_tasks`` so they aren't GC'd mid-flight
         # (the asyncio strong-ref gotcha, chainlink #118).
@@ -156,6 +159,28 @@ class Dispatcher:
         event when a mid-turn message is folded into a running turn, so the agent
         records it in chat history at its true arrival time."""
         self._on_inject = on_inject
+
+    def set_notice_sender(self, sender: NoticeSender | None) -> None:
+        """Late-bind server-owned approval reply delivery from runtime adapters."""
+        self._notice_sender = sender
+
+    async def _send_approval_notice(self, channel_id: str, notice: str) -> None:
+        reason = None
+        if self._notice_sender is None:
+            reason = "sender_unavailable"
+        else:
+            try:
+                result = await self._notice_sender(channel_id, notice)
+                if not result.sent:
+                    reason = "delivery_refused"
+            except Exception:  # best-effort notice must not replay an accepted reply
+                reason = "delivery_exception"
+                log.warning("Could not send approval reply notice", exc_info=True)
+        if reason is not None:
+            log.warning("Could not send approval reply notice: %s", reason)
+            await log_event(
+                "approval_notice_undelivered", channel_id=channel_id, reason=reason,
+            )
 
     def set_on_event(self, on_event: "EventObserver | None") -> None:
         """Late-bind a best-effort per-event observer (DM-channel capture).
@@ -241,6 +266,9 @@ class Dispatcher:
                 if inject_authenticated_message(
                     channel_id, event, self._identity_resolver,
                 ) == "injected":
+                    notice = event.extra.pop("operator_approval_reply", None)
+                    if notice:
+                        await self._send_approval_notice(channel_id, notice)
                     await log_event("mid_turn_injected", channel_id=channel_id)
                     # PR 4: record the message in chat history NOW (true arrival
                     # time), so it threads ahead of the running turn's later

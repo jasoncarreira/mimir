@@ -48,18 +48,21 @@ def test_dispatcher_callbacks_and_runner_can_be_cleared(tmp_path: Path):
     disp = Dispatcher(_make_config(tmp_path))
     disp.set_run_turn(callback)
     disp.set_on_inject(callback)
+    disp.set_notice_sender(callback)
     disp.set_on_event(callback)
     disp.set_on_pairing_required(callback)
     disp.set_on_channel_idle(lambda channel_id: None)
 
     disp.set_run_turn(None)
     disp.set_on_inject(None)
+    disp.set_notice_sender(None)
     disp.set_on_event(None)
     disp.set_on_pairing_required(None)
     disp.set_on_channel_idle(None)
 
     assert disp._run_turn is None
     assert disp._on_inject is None
+    assert disp._notice_sender is None
     assert disp._on_event is None
     assert disp._on_pairing_required is None
     assert disp._on_channel_idle is None

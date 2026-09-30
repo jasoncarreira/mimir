@@ -567,6 +567,7 @@ class DiscordBridge(Bridge):
             except (TypeError, ValueError):
                 pass
 
+        first_id: str | None = None
         last_id: str | None = None
         sent_count = 0
         upload_count = 0
@@ -591,11 +592,13 @@ class DiscordBridge(Bridge):
                 last_id = str(getattr(sent_msg, "id", "") or "") or last_id
                 sent_count += 1
                 if i == 0:
+                    first_id = last_id
                     upload_count = len(files)
         except discord.DiscordException as exc:
             return SendResult(
                 sent=False,
                 message_id=last_id,
+                first_message_id=first_id,
                 chunks=sent_count,
                 uploads=upload_count,
                 error=f"discord send error after {sent_count} chunk(s): {exc}",
@@ -603,7 +606,8 @@ class DiscordBridge(Bridge):
         finally:
             for file in files:
                 file.close()
-        return SendResult(sent=True, message_id=last_id, chunks=sent_count, uploads=upload_count)
+        return SendResult(sent=True, message_id=last_id, first_message_id=first_id,
+                          chunks=sent_count, uploads=upload_count)
 
     async def send_typing_indicator(self, channel_id: str) -> None:
         """Hold the Discord typing indicator open until ``send()`` /
@@ -973,6 +977,8 @@ class DiscordBridge(Bridge):
         # Platform-prefixed stable id is the matching key for cross-channel
         # / cross-platform pull (FUTURE_WORK §6.1).
         author_key = f"discord-{author_id}" if author_id else None
+        reference = getattr(message, "reference", None)
+        reply_id = getattr(reference, "message_id", None)
 
         event = AgentEvent(
             trigger="user_message",
@@ -991,6 +997,7 @@ class DiscordBridge(Bridge):
                 "channel_conversation_type": conv_type,
                 "channel_visibility": visibility,
                 "channel_name": channel_name,
+                **({"reply_to_message_id": str(reply_id)} if reply_id is not None else {}),
                 **(
                     {"inbound_attachment_urls": attachment_urls}
                     if attachment_urls else {}

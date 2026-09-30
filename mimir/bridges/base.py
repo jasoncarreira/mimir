@@ -34,6 +34,9 @@ class SendResult:
     chunks: int = 0
     error: str | None = None
     uploads: int = 0
+    # The header/reply anchor for chunked sends, without changing message_id's
+    # existing last-message/partial-progress contract.
+    first_message_id: str | None = None
 
 
 @dataclass
