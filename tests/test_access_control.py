@@ -9709,6 +9709,126 @@ def test_forge_repository_result_from_different_observed_head_is_refused() -> No
     assert mismatch == ("owner/repo", "17", "observed_head_sha")
 
 
+@pytest.mark.parametrize("tool_name", ["pr_comment", "pr_rerequest_review", "repo_cleanup", "repo_test"])
+def test_verified_push_lineage_allows_exact_pr_through_registry(tool_name) -> None:
+    state = _review_state("owner/repo", 17, "fix", "/srv/repo")
+    scope = state.action_scope
+    old = scope.observed_head_sha
+    labels = _trusted_operator_write_auth(admin=True).ifc_labels.with_source(
+        replace(_repository_result_labels("owner/repo", 17, old).sources[0],
+                integrity_effect=IntegrityEffect.ACTIVE_INGEST)
+    )
+    auth = replace(_trusted_operator_write_auth(admin=True), ifc_labels=labels,
+                   repo_review_state=state, repo_pr_action_scope=scope,
+                   repo_pr_scope_registry=RepoPRScopeRegistry((state,)))
+    object.__setattr__(scope, "observed_head_sha", "b" * 40)
+    arguments = {"repository": "owner/repo", "pull_request": 17}
+    registry = ToolRegistry()
+    before = registry.authorize_tool(tool_name, auth, enforce=True, arguments=arguments)
+    assert not before.allowed
+    assert before.forge_scope_mismatch["component"] == "observed_head_sha"
+
+    auth.ifc_state.record_own_push("owner/repo", 17, old)
+    after = registry.authorize_tool(tool_name, auth, enforce=True, arguments=arguments)
+    assert after.allowed, (tool_name, after.reason, after.refusal_detail)
+    assert labels.sources[-1].resource_id.endswith("@" + old)
+
+
+@pytest.mark.parametrize(("repo", "pr", "component"), [
+    ("owner/repo", 18, "pr_number"),
+    ("other/repo", 17, "canonical_repo"),
+    ("owner/repo", 17, "observed_head_sha"),
+])
+def test_lineage_never_admits_foreign_repository_pr_or_head(repo, pr, component) -> None:
+    scope = replace(_review_state("owner/repo", 17, "fix", "/srv/repo").action_scope,
+                    observed_head_sha="b" * 40)
+    auth = _trusted_operator_write_auth(admin=True)
+    auth.ifc_state.record_own_push("other/repo", 17, "a" * 40)
+    auth.ifc_state.record_own_push("owner/repo", 18, "a" * 40)
+    auth.ifc_state.record_own_push("owner/repo", 17, "c" * 40)
+    labels = auth.ifc_labels.with_source(_repository_result_labels(repo, pr, "a" * 40).sources[0])
+    auth = replace(auth, ifc_labels=labels)
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert not decision.allowed
+    assert decision.forge_scope_mismatch["component"] == component
+
+
+@pytest.mark.parametrize("lineage_target", [("other/repo", 17), ("owner/repo", 18)])
+def test_lineage_key_is_exact_even_for_same_old_head(lineage_target) -> None:
+    scope = replace(_review_state("owner/repo", 17, "fix", "/srv/repo").action_scope,
+                    observed_head_sha="b" * 40)
+    auth = _trusted_operator_write_auth(admin=True)
+    labels = auth.ifc_labels.with_source(_repository_result_labels("owner/repo", 17, "a" * 40).sources[0])
+    auth.ifc_state.record_own_push(*lineage_target, "a" * 40)
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    assert not decision.allowed
+    assert decision.forge_scope_mismatch["component"] == "observed_head_sha"
+
+
+def test_repo_test_service_tier_requires_exact_verified_lineage() -> None:
+    scope = replace(_review_state("owner/repo", 17, "fix", "/srv/repo").action_scope,
+                    observed_head_sha="b" * 40)
+    source = replace(_repository_result_labels("owner/repo", 17, "a" * 40).sources[0],
+                     integrity_effect=IntegrityEffect.ACTIVE_INGEST)
+    labels = InformationFlowLabels(sources=(source,))
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",), creation_path="test",
+    )
+    auth = _service_auth(service, labels)
+    assert SinkGate._service_tier_allows(
+        "repo_test", labels, auth, service, repo_pr_action_scope=scope,
+    )[0] is False
+    auth.ifc_state.record_own_push("owner/repo", 17, "a" * 40)
+    assert SinkGate._service_tier_allows(
+        "repo_test", labels, auth, service, repo_pr_action_scope=scope,
+    )[0] is True
+
+
+@pytest.mark.asyncio
+async def test_forge_mismatch_audit_names_actual_source_before_untrusted_ingest(monkeypatch) -> None:
+    import asyncio
+
+    scope = replace(_review_state("owner/repo", 17, "fix", "/srv/repo").action_scope,
+                    observed_head_sha="b" * 40)
+    auth = _trusted_operator_write_auth(admin=True)
+    other = replace(_repository_result_labels("owner/repo", 17, "a" * 40).sources[0],
+                    integrity="untrusted", integrity_effect="active_ingest")
+    mismatch = replace(other, resource_id=f"owner/repo#pull/17@{'c' * 40}",
+                       integrity="trusted")
+    labels = auth.ifc_labels.with_source(other).with_source(mismatch)
+    auth.ifc_state.record_own_push("owner/repo", 17, "a" * 40)
+    decision = SinkGate.check_sink_flow(
+        "pr_comment", "owner/repo", labels, auth, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    )
+    source, classification = access_control._ifc_blocking_source(
+        labels, auth, SinkCategory.FORGE, forge_scope=decision.repo_pr_action_scope,
+    )
+    assert decision.forge_scope_mismatch["source_observed_head_sha"] == "c" * 40
+    assert source is mismatch and classification == "causing_source"
+    emitted = asyncio.get_running_loop().create_future()
+
+    async def capture(event, **fields):
+        emitted.set_result(fields)
+
+    monkeypatch.setattr("mimir.event_logger.log_event", capture)
+    registry = ToolRegistry()
+    registry.enable_shadow_logging()
+    registry._emit_shadow_decision(
+        decision, auth_context=auth, ifc_labels=labels, sink_category=SinkCategory.FORGE,
+    )
+    fields = await asyncio.wait_for(emitted, timeout=5)
+    assert fields["ifc_source"]["resource_id"] == mismatch.resource_id
+    assert fields["ifc_source_scope"] == "causing_source"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("enforce", [True, False])
 @pytest.mark.parametrize(

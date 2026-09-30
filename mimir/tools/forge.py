@@ -568,7 +568,9 @@ def remediation_checkout_preflight(
         ):
             return None, "pull request checks are no longer failing"
         if fresh is not None:
-            return cache.remember_remint(original, fresh), None
+            reminted = cache.remember_remint(original, fresh)
+            _seed_verified_remint(context, original.action_scope, reminted.action_scope)
+            return reminted, None
         return original, None
     if snapshot.head_sha.lower() == scope.observed_head_sha.lower():
         return original, None
@@ -607,7 +609,28 @@ def remediation_checkout_preflight(
             latest[review.author] = state
         if "CHANGES_REQUESTED" not in latest.values():
             return None, "pull request no longer has a blocking changes-requested review"
-    return cache.remember_remint(original, fresh), None
+    reminted = cache.remember_remint(original, fresh)
+    _seed_verified_remint(context, original.action_scope, reminted.action_scope)
+    return reminted, None
+
+
+def _seed_verified_remint(
+    context: AuthContext | None, old: RepoPRActionScope, new: RepoPRActionScope,
+) -> None:
+    from ..repo_tools import was_verified_push
+
+    if (
+        context is not None
+        and context.ifc_state is not None
+        and old.canonical_repo.casefold() == new.canonical_repo.casefold()
+        and old.pr_number == new.pr_number
+        and was_verified_push(
+            old.canonical_repo, old.pr_number, old.observed_head_sha, new.observed_head_sha,
+        )
+    ):
+        context.ifc_state.record_own_push(
+            old.canonical_repo, old.pr_number, old.observed_head_sha,
+        )
 
 
 def _client(scope: RepoPRActionScope) -> ForgeClient:
@@ -724,9 +747,11 @@ def _publish_author_attestation(
     failed_authors = []
     unavailable_authors = []
     for author in dict.fromkeys(authors):
-        if not isinstance(author, str) or not author:
+        if not isinstance(author, str) or not author or author == "<head-mismatch>":
             trusted = False
-            failed_authors.append("<missing-author>")
+            failed_authors.append(
+                "<head-mismatch>" if author == "<head-mismatch>" else "<missing-author>"
+            )
             continue
         verdict = context.ifc_state.repository_author_trust.resolve(
             scope.canonical_repo, author,
@@ -775,8 +800,10 @@ def _publish_author_attestation(
 def _pr_content_authors(client: ForgeClient, scope: RepoPRActionScope) -> tuple[str, ...]:
     """Bind PR-owned diff/file text to API authorship at the scoped head."""
     metadata = client.get_pull_request(scope)
-    if metadata.number != scope.pr_number or metadata.head_sha != scope.observed_head_sha:
+    if metadata.number != scope.pr_number:
         return ("",)
+    if metadata.head_sha != scope.observed_head_sha:
+        return ("<head-mismatch>",)
     return (metadata.author,)
 
 
@@ -789,9 +816,8 @@ def pr_metadata(
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
     metadata = _call(lambda: _client(scope).get_pull_request(scope))
-    authors = (metadata.author,) if (
-        metadata.number == scope.pr_number and metadata.head_sha == scope.observed_head_sha
-    ) else ("",)
+    authors = ((metadata.author,) if metadata.head_sha == scope.observed_head_sha
+               else ("<head-mismatch>",)) if metadata.number == scope.pr_number else ("",)
     _publish_author_attestation(runtime, scope, authors)
     return asdict(metadata)
 
