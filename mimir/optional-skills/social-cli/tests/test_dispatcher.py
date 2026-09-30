@@ -55,7 +55,8 @@ def setup(tmp_path: Path, monkeypatch, request):
     monkeypatch.setenv("POLLER_NAME", poller)
     monkeypatch.setenv("SOCIAL_CLI_BIN", str(binary))
     monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", "bsky")
-    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "agent")
+    monkeypatch.setenv("MIMIR_SOCIAL_OUTBOX_APPROVERS", "operator")
+    monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "test-forge-placeholder")
     monkeypatch.delenv("GH_TOKEN", raising=False)
     module = importlib.import_module("poller" if poller == POLLERS[0] else "feed_poller")
@@ -221,7 +222,7 @@ def test_autocommit_after_approved_merge_invalidates_approval(setup, capsys):
     ("unavailable", "forge_unreachable"), ("nonzero", "forge_unreachable"),
     ("malformed", "malformed_forge_response"),
     ("open", "no_qualifying_merged_pr"), ("wrong-branch", "no_qualifying_merged_pr"),
-    ("wrong-commit", "no_qualifying_merged_pr"), ("agent-merge", "agent_login_merge"),
+    ("wrong-commit", "no_qualifying_merged_pr"), ("unlisted-merger", "merger_not_approved"),
     ("missing-merger", "malformed_forge_response"),
 ])
 def test_forge_evidence_fails_closed(setup, monkeypatch, case, reason, capsys):
@@ -243,8 +244,8 @@ def test_forge_evidence_fails_closed(setup, monkeypatch, case, reason, capsys):
         if case == "malformed":
             return subprocess.CompletedProcess(args, 0, "not json", "")
         prs = json.loads(result.stdout)
-        if case == "agent-merge":
-            prs[0]["mergedBy"] = {"login": "AgEnT"}
+        if case == "unlisted-merger":
+            prs[0]["mergedBy"] = {"login": "UnLiStEd"}
         elif case == "missing-merger":
             prs[0].pop("mergedBy")
         elif case == "open":
@@ -303,12 +304,12 @@ def test_real_manifest_has_no_agent_dispatch_capability():
         assert {"open_proposal", "submit_proposal", "abandon_proposal"} <= set(authority["capabilities"])
         assert not {"shell_exec", "bash_jobs_list", "bash_job_output"} & set(authority["capabilities"])
         assert "shell_commands" not in authority
-        assert {"GITHUB_TOKEN", "GH_TOKEN", "MIMIR_GITHUB_SELF_LOGIN", "MIMIR_SOURCE_DIR"} <= set(poller["pass_env"])
+        assert {"GITHUB_TOKEN", "GH_TOKEN", "MIMIR_SOCIAL_OUTBOX_APPROVERS", "MIMIR_SOURCE_DIR"} <= set(poller["pass_env"])
 
 
 @pytest.mark.parametrize("missing,reason", [
     ("GITHUB_TOKEN", "missing_forge_token"),
-    ("MIMIR_GITHUB_SELF_LOGIN", "agent_identity_unavailable"),
+    ("MIMIR_SOCIAL_OUTBOX_APPROVERS", "no_approvers_configured"),
 ])
 def test_missing_forge_configuration_withholds_with_signal(setup, monkeypatch, capsys, missing, reason):
     home, _, root, calls, module = setup
@@ -319,6 +320,59 @@ def test_missing_forge_configuration_withholds_with_signal(setup, monkeypatch, c
     signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert [s["reason"] for s in signals] == [reason]
     assert signals[0]["signal"] == "social_outbox_dispatch_withheld"
+
+
+@pytest.mark.parametrize("configured", ["", "   ", " , , "])
+def test_empty_approver_list_never_dispatches(setup, monkeypatch, capsys, configured):
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    monkeypatch.setenv("MIMIR_SOCIAL_OUTBOX_APPROVERS", configured)
+    assert module.main() == 0
+    assert not dispatches(calls)
+    # Notification/feed polling must continue even while dispatch is disabled.
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert any(r["argv"][0] == ("sync" if module.POLLER_NAME == POLLERS[0] else "feed") for r in records)
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [s["reason"] for s in signals] == ["no_approvers_configured"]
+    assert signals[0]["signal"] == "social_outbox_dispatch_withheld"
+
+
+@pytest.mark.parametrize("configured", ["operator,bad login", "*", "operator,@other"])
+def test_malformed_approver_list_fails_closed(setup, monkeypatch, capsys, configured):
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    monkeypatch.setenv("MIMIR_SOCIAL_OUTBOX_APPROVERS", configured)
+    assert module.main() == 0
+    assert not dispatches(calls)
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [s["reason"] for s in signals] == ["invalid_approvers_configured"]
+
+
+@pytest.mark.parametrize("self_login", [None, "operator", "different-agent"])
+def test_allowlisted_merger_does_not_require_separate_agent_identity(setup, monkeypatch, self_login):
+    import mimir.proposals as proposals
+
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    monkeypatch.setenv("MIMIR_SOCIAL_OUTBOX_APPROVERS", " other, OpErAtOr,other ")
+    if self_login is None:
+        monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", self_login)
+    original = proposals._run
+    forge_queries = []
+
+    def forge(args, *, cwd, capture):
+        if args[0] == "gh":
+            forge_queries.append(args)
+            # No credential identity lookup: the forge merger allowlist is the gate.
+            assert args[:3] == ["gh", "pr", "list"]
+        return original(args, cwd=cwd, capture=capture)
+
+    monkeypatch.setattr(proposals, "_run", forge)
+    assert module.main() == 0
+    assert len(dispatches(calls)) == 1
+    assert len(forge_queries) == 1
 
 
 @pytest.mark.parametrize("case", ["blob", "read-snapshot"])

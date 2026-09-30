@@ -935,20 +935,26 @@ def merged_social_outbox_commit(
     home: Path, poller: str, path: str, *, verified_text: str | None = None,
     on_withheld: Callable[[str], None] | None = None,
 ) -> str | None:
-    """Require forge evidence of a non-agent merge of this exact file.
+    """Require forge evidence of an allowlisted merge of this exact file.
 
     The local content-addressed tree is acceptable only at the commit oid
-    returned by the forge. A clean HEAD or agent-authored merge is not approval.
-    Bounded history and unknown identity/evidence fail closed.
+    returned by the forge. A clean HEAD alone is not approval. The allowlist
+    authorizes a forge actor, not an independent human: a shared credential
+    cannot distinguish operator actions from agent actions. Unknown or empty
+    approver configuration and unknown forge evidence fail closed.
     """
     def refuse(reason: str) -> None:
         if on_withheld is not None:
             on_withheld(reason)
         return None
 
-    self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", self_login):
-        return refuse("agent_identity_unavailable")
+    configured = os.environ.get("MIMIR_SOCIAL_OUTBOX_APPROVERS", "").strip()
+    entries = [entry.strip() for entry in configured.split(",") if entry.strip()]
+    if not entries:
+        return refuse("no_approvers_configured")
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", entry) for entry in entries):
+        return refuse("invalid_approvers_configured")
+    approvers = {entry.casefold() for entry in entries}
     if not (os.environ.get("GITHUB_TOKEN", "").strip() or os.environ.get("GH_TOKEN", "").strip()):
         return refuse("missing_forge_token")
     try:
@@ -982,8 +988,8 @@ def merged_social_outbox_commit(
             login = merger.get("login") if isinstance(merger, dict) else None
             if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
                 return refuse("malformed_forge_response")
-            if login.casefold() == self_login.casefold():
-                return refuse("agent_login_merge")
+            if login.casefold() not in approvers:
+                return refuse("merger_not_approved")
             approved = True
         if not approved:
             return refuse("no_qualifying_merged_pr")

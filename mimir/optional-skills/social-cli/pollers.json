@@ -15,7 +15,7 @@
       },
       "pass_env": [
         "MIMIR_SOURCE_DIR",
-        "MIMIR_GITHUB_SELF_LOGIN",
+        "MIMIR_SOCIAL_OUTBOX_APPROVERS",
         "GITHUB_TOKEN",
         "GH_TOKEN",
         "MIMIR_SOCIAL_PLATFORMS",
@@ -41,7 +41,7 @@
       },
       "pass_env": [
         "MIMIR_SOURCE_DIR",
-        "MIMIR_GITHUB_SELF_LOGIN",
+        "MIMIR_SOCIAL_OUTBOX_APPROVERS",
         "GITHUB_TOKEN",
         "GH_TOKEN",
         "MIMIR_SOCIAL_PLATFORMS",

@@ -135,7 +135,8 @@ def rolling_forge(monkeypatch):
 def test_dispatch_requires_exact_forge_merge_and_blob(home, monkeypatch, squash):
     import mimir.proposals as proposals
 
-    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "agent")
+    monkeypatch.setenv("MIMIR_SOCIAL_OUTBOX_APPROVERS", "operator")
+    monkeypatch.delenv("MIMIR_GITHUB_SELF_LOGIN", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "test-forge-placeholder")
     branch = "poller/feed/social-outbox"
     path = "state/social-outbox/feed/outbox-one.yaml"

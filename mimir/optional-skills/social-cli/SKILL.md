@@ -57,8 +57,16 @@ the poller checks its own `state/social-outbox/<poller>/outbox-*.yaml` files.
 Only regular, non-symlink, git-tracked files clean and identical to `HEAD`
 qualify. The last first-parent commit touching each file must be the forge's
 merge/squash commit of a **merged** PR from this poller's rolling outbox branch,
-and the file's blob at that commit must equal its blob at `HEAD`. Unknown or
-unavailable forge evidence refuses dispatch. A per-turn auto-commit is not
+and the file's blob at that commit must equal its blob at `HEAD`. The forge's
+`mergedBy.login` must appear in the operator-configured
+`MIMIR_SOCIAL_OUTBOX_APPROVERS` comma-separated allowlist (case-insensitive).
+Unset or empty lists withhold everything (`no_approvers_configured`); a merger
+outside the list is withheld (`merger_not_approved`). Malformed configuration
+or unknown/unavailable forge evidence also refuses dispatch. Dispatch does not
+require `MIMIR_GITHUB_SELF_LOGIN` or compare the merger with the token's login.
+**Accepted risk:** the allowlist authorizes a GitHub actor, not an independent
+human. An agent holding an allowlisted operator's token could self-merge;
+a separate agent identity is needed to close that gap. A per-turn auto-commit is not
 approval; the auto-commit also excludes `state/social-outbox/`. A durable
 `state/pollers/<poller>/dispatched-ledger.jsonl` records the SHA-256 **before**
 the binary is invoked; a crash cannot repost the same file. The poller re-scans
@@ -77,7 +85,11 @@ The skill's `dockerfile.fragment` installs `social-cli`. Configure credentials
 in each poller's `state/pollers/<poller>/.env` (mode 600); the feed poller may
 symlink the notifications poller's `.env`. Set `MIMIR_SOCIAL_PLATFORMS` to the
 configured platforms (`bsky,x` by default); `SOCIAL_CLI_BIN` overrides the
-binary for both pollers. Notifications accept `MIMIR_SOCIAL_LIMIT` and
+binary for both pollers. Set `MIMIR_SOCIAL_OUTBOX_APPROVERS` in the deployment
+environment to the GitHub logins allowed to approve rolling outbox PRs (for
+example `jasoncarreira` or `alice,bob`). Both manifests forward it alongside
+`GITHUB_TOKEN`/`GH_TOKEN` and `MIMIR_SOURCE_DIR`; leaving it unset disables
+dispatch without disabling notifications/feed polling. Notifications accept `MIMIR_SOCIAL_LIMIT` and
 `MIMIR_SOCIAL_USERS_DIR`; the feed accepts `MIMIR_SOCIAL_FEED_LIMIT`.
 The operator may run `social-cli` directly from a trusted operator session.
 Agent turns never read `.env`.
