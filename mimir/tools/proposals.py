@@ -340,13 +340,16 @@ async def submit_proposal(
         await log_event("proposal_pr_opened", pr_url=result.pr_url, branch=result.branch, lane=lane)
         if additions is not None:
             poller = context.poller_proposal_state.scope.owner.removeprefix("poller:")
+            # Preview text is untrusted social content, not mention authority.
             details = "; ".join(f"{action}: {preview}" for action, preview in additions[:20])
+            details = details.replace("@", "＠")
             await send_social_proposal_ping(
                 f"Social outbox proposal from {poller}: {len(additions)} entries added. "
                 f"{details}\nReview and merge: {result.pr_url}"
             )
         return (
-            f"Opened a change-proposal PR: {result.pr_url}\n"
+            (f"Updated the rolling outbox PR: {result.pr_url}\n" if result.reused_pr else
+             f"Opened a change-proposal PR: {result.pr_url}\n")
             + ("The operator was notified automatically. " if additions is not None else
                "Give the operator this URL and ask them to review and merge. ")
             + "Nothing changed in the live files yet — it applies only after they "

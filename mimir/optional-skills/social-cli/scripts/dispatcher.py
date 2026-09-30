@@ -1,4 +1,4 @@
-"""Dispatch only committed, HEAD-clean social outboxes from the poller process."""
+"""Dispatch only forge-merged, HEAD-clean social outboxes from the poller process."""
 
 from __future__ import annotations
 
@@ -12,9 +12,33 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+def _ensure_mimir_import_path() -> None:
+    """Bootstrap installed copies before importing the package or its deps."""
+    exe = Path(sys.executable)
+    venv_root = exe.parent.parent  # Do not resolve the venv's interpreter symlink.
+    candidates = [Path(__file__).resolve().parents[4]]
+    if source_dir := os.environ.get("MIMIR_SOURCE_DIR"):
+        candidates.append(Path(source_dir))
+    if venv_root.name in {".venv", "venv"}:
+        candidates.append(venv_root.parent)
+    for candidate in candidates:
+        if (candidate / "mimir" / "__init__.py").is_file():
+            source = str(candidate)
+            while source in sys.path:
+                sys.path.remove(source)
+            sys.path.insert(0, source)
+            for site in sorted((candidate / ".venv" / "lib").glob("python*/site-packages")):
+                if str(site) not in sys.path:
+                    sys.path.append(str(site))
+            return
+
+
+_ensure_mimir_import_path()
+
 import yaml
 
 from mimir.outbound_privacy import findings_require_refusal, scan_outbound
+from mimir.proposals import merged_social_outbox_commit
 
 SCRIPTS = Path(__file__).resolve().parent
 CAP = 5
@@ -115,6 +139,9 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
             if (tracked.returncode != 0 or not tracked.stdout.startswith("100644 ")
                     or clean.returncode != 0 or staged.returncode != 0):
                 print(f"social-cli: skipping unmerged or dirty outbox {rel}", file=sys.stderr)
+                continue
+            if merged_social_outbox_commit(home, poller, rel) is None:
+                print(f"social-cli: forge merge approval unavailable for {rel}", file=sys.stderr)
                 continue
             digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if digest in seen:

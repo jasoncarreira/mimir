@@ -58,6 +58,21 @@ def setup(tmp_path: Path, monkeypatch, request):
     monkeypatch.setattr(module, "STATE_DIR", state)
     monkeypatch.setattr(module, "CURSOR_FILE", state / "emitted.json")
     monkeypatch.setattr(module, "POLLER_NAME", poller)
+    # Fake only the forge transport; production Git/provenance checks still run.
+    import mimir.proposals as proposals
+    original = proposals._run
+
+    def forge(args, *, cwd, capture):
+        if args[:3] != ["gh", "pr", "list"]:
+            return original(args, cwd=cwd, capture=capture)
+        history = subprocess.run(["git", "log", "--format=%H %s"], cwd=cwd,
+                                 check=True, capture_output=True, text=True).stdout
+        prs = [{"state": "MERGED", "headRefName": f"poller/{poller}/social-outbox",
+                "mergeCommit": {"oid": line.split()[0]}}
+               for line in history.splitlines() if line.endswith("merge outbox")]
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", forge)
     return home, state, outbox, calls, module
 
 
@@ -168,6 +183,88 @@ def test_cap_check_divergence_blocks_even_with_numeric_headroom(setup, capsys):
     module.main()
     assert not dispatches(calls)
     assert "cap check refused" in capsys.readouterr().err
+
+
+def test_live_autocommitted_file_is_not_merge_approval(setup, capsys):
+    home, _, root, calls, module = setup
+    path = root / "outbox-one.yaml"
+    path.write_text(POST)
+    git(home, "add", "-A")
+    git(home, "commit", "-qm", "turn auto-commit (not reviewed)")
+    module.main()
+    assert dispatches(calls) == []
+    assert "forge merge approval unavailable" in capsys.readouterr().err
+
+
+def test_autocommit_after_approved_merge_invalidates_approval(setup, capsys):
+    home, _, root, calls, module = setup
+    path = root / "outbox-one.yaml"
+    commit_file(home, path)
+    path.write_text(POST.replace("public", "unreviewed"))
+    git(home, "add", "-A")
+    git(home, "commit", "-qm", "turn changed outbox")
+    module.main()
+    assert dispatches(calls) == []
+    assert "forge merge approval unavailable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("case", ["unavailable", "malformed", "open", "wrong-branch", "wrong-commit"])
+def test_forge_evidence_fails_closed(setup, monkeypatch, case, capsys):
+    import mimir.proposals as proposals
+
+    home, _, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    original = proposals._run
+
+    def forge(args, *, cwd, capture):
+        result = original(args, cwd=cwd, capture=capture)
+        if args[:3] != ["gh", "pr", "list"]:
+            return result
+        if case == "unavailable":
+            raise OSError("offline")
+        if case == "malformed":
+            return subprocess.CompletedProcess(args, 0, "not json", "")
+        prs = json.loads(result.stdout)
+        if case == "open":
+            prs[0]["state"] = "OPEN"
+        elif case == "wrong-branch":
+            prs[0]["headRefName"] = "poller/other/social-outbox"
+        else:
+            prs[0]["mergeCommit"]["oid"] = "0" * 40
+        return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+
+    monkeypatch.setattr(proposals, "_run", forge)
+    module.main()
+    assert dispatches(calls) == []
+    assert "forge merge approval unavailable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tracked_target", [False, True])
+def test_symlink_outbox_skipped_before_eligibility_checks(setup, monkeypatch, tracked_target):
+    import dispatcher
+
+    home, _, root, calls, module = setup
+    target = home / "elsewhere.yaml"
+    if tracked_target:
+        commit_file(home, target)
+    else:
+        target.write_text(POST)
+    path = root / "outbox-link.yaml"
+    path.symlink_to(target)
+    original = dispatcher._run
+    checked = []
+
+    def observe(args, cwd):
+        if args[0] == "git" and path.relative_to(home).as_posix() in args:
+            checked.append(args)
+        return original(args, cwd)
+
+    monkeypatch.setattr(dispatcher, "_run", observe)
+    module.main()
+    assert dispatches(calls) == []
+    # Pin the early symlink refusal independently of the tracked/mode gate:
+    # removing is_symlink() must fail this assertion, not pass incidentally.
+    assert checked == []
 
 
 def test_real_manifest_has_no_agent_dispatch_capability():

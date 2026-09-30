@@ -14,6 +14,7 @@
         "proposal_surface": "social-outbox"
       },
       "pass_env": [
+        "MIMIR_SOURCE_DIR",
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_LIMIT",
         "MIMIR_SOCIAL_USERS_DIR",
@@ -36,6 +37,7 @@
         "proposal_surface": "social-outbox"
       },
       "pass_env": [
+        "MIMIR_SOURCE_DIR",
         "MIMIR_SOCIAL_PLATFORMS",
         "MIMIR_SOCIAL_FEED_LIMIT",
         "SOCIAL_CLI_BIN",

@@ -131,6 +131,49 @@ def rolling_forge(monkeypatch):
     return state
 
 
+@pytest.mark.parametrize("squash", [False, True])
+def test_dispatch_requires_exact_forge_merge_and_blob(home, monkeypatch, squash):
+    import mimir.proposals as proposals
+
+    branch = "poller/feed/social-outbox"
+    path = "state/social-outbox/feed/outbox-one.yaml"
+    _git("checkout", "-b", branch, cwd=home)
+    target = home / path
+    target.parent.mkdir(parents=True)
+    target.write_text("dispatch:\n  - action: post\n    text: approved\n")
+    _git("add", path, cwd=home)
+    _git("commit", "-qm", "proposal", cwd=home)
+    _git("checkout", "main", cwd=home)
+    if squash:
+        _git("merge", "--squash", branch, cwd=home)
+        _git("commit", "-qm", "squash approval", cwd=home)
+    else:
+        _git("merge", "--no-ff", "-m", "merge approval", branch, cwd=home)
+    approved = _git("rev-parse", "HEAD", cwd=home).stdout.strip()
+    # Later unrelated commits and reuse of the rolling branch do not erase
+    # a previous merged PR's authorization for this exact file.
+    _git("commit", "--allow-empty", "-m", "later turn", cwd=home)
+    original = proposals._run
+    queries = []
+
+    def forge(args, *, cwd, capture):
+        if args[:3] != ["gh", "pr", "list"]:
+            return original(args, cwd=cwd, capture=capture)
+        queries.append(args)
+        return subprocess.CompletedProcess(args, 0, json.dumps([
+            {"state": "MERGED", "headRefName": branch, "mergeCommit": {"oid": "0" * 40}},
+            {"state": "MERGED", "headRefName": branch, "mergeCommit": {"oid": approved}},
+        ]), "")
+
+    monkeypatch.setattr(proposals, "_run", forge)
+    assert proposals.merged_social_outbox_commit(home, "feed", path) == approved
+    assert queries[0][queries[0].index("--state") + 1] == "merged"
+    blob = proposals._blob_oid
+    monkeypatch.setattr(proposals, "_blob_oid", lambda home, ref, path:
+                        "different" if ref == "HEAD" else blob(home, ref, path))
+    assert proposals.merged_social_outbox_commit(home, "feed", path) is None
+
+
 def _social_scope(turn: str) -> PollerProposalScope:
     return PollerProposalScope("poller:feed", turn, "feed:event", "feed:1", "social-outbox")
 
@@ -153,7 +196,8 @@ def test_social_rolling_pr_and_terminal_branches(home, rolling_forge):
     assert not (home / "state/social-outbox/feed/one.yaml").exists()
     first_tip = _git("rev-parse", f"origin/{result.branch}", cwd=home).stdout.strip()
     _, second, result = _social_submit(home, "two", valid)
-    assert result.ok and rolling_forge["creates"] == 1 and result.pr_url == "https://example.test/pr/1"
+    assert result.ok and result.reused_pr
+    assert rolling_forge["creates"] == 1 and result.pr_url == "https://example.test/pr/1"
     assert _git("merge-base", "--is-ancestor", first_tip, f"origin/{result.branch}", cwd=home).returncode == 0
     rolling_forge["prs"][-1]["state"] = "MERGED"
     # Simulate the operator merge; the next PR starts at the newly advanced base.

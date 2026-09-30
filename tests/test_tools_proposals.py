@@ -732,7 +732,7 @@ def test_poller_proposal_middleware_defaults_and_backend_reads(
     assert "Abandoned" in invoke(tp.abandon_proposal)
 
 
-@pytest.mark.parametrize("outcome", ["success", "failed", "unset"])
+@pytest.mark.parametrize("outcome", ["success", "updated", "mentions", "failed", "unset"])
 def test_social_submit_server_pings_once_with_added_entries(
     monkeypatch, proposal_home, poller_runtime, caplog, outcome,
 ):
@@ -753,6 +753,8 @@ def test_social_submit_server_pings_once_with_added_entries(
                       "  - action: like\n    uri: at://public\n    cid: public\n"
                       "  - action: thread\n    posts:\n      - " + "B" * 90 +
                       "\n      - text: " + "C" * 90 + "\n")
+    if outcome == "mentions":
+        target.write_text('dispatch:\n  - action: post\n    text: "@everyone @here <@123> <@!123> <@&123>"\n')
     state.active = True
     sent = []
 
@@ -768,7 +770,8 @@ def test_social_submit_server_pings_once_with_added_entries(
     def finalize(*args, **kwargs):
         return ProposalResult(outcome != "failed", "branch", outcome != "failed",
                               "https://example.org/pr/42" if outcome != "failed" else None,
-                              "secret" if outcome == "failed" else None)
+                              "secret" if outcome == "failed" else None,
+                              reused_pr=outcome == "updated")
 
     monkeypatch.setattr(tp, "_finalize_proposal", finalize)
 
@@ -780,15 +783,21 @@ def test_social_submit_server_pings_once_with_added_entries(
         with pytest.raises(tp.ProposalSubmissionError):
             _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
     else:
-        _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
-    if outcome == "success":
+        reply = _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
+        assert ("Updated the rolling outbox PR" if outcome == "updated" else
+                "Opened a change-proposal PR") in reply
+    if outcome in {"success", "updated", "mentions"}:
         assert len(sent) == 1
         channel, text, final = sent[0]
         assert channel == "operator-channel" and final
-        assert "papers: 3 entries added" in text
-        assert "post: " + "A" * 80 in text and "A" * 81 not in text
-        assert "like:" in text and "thread: " + "B" * 80 in text
-        assert " | " + "C" * 80 in text and "https://example.org/pr/42" in text
+        if outcome == "mentions":
+            assert "@everyone" not in text and "@here" not in text and "<@" not in text
+            assert "＠everyone" in text
+        else:
+            assert "papers: 3 entries added" in text
+            assert "post: " + "A" * 80 in text and "A" * 81 not in text
+            assert "like:" in text and "thread: " + "B" * 80 in text
+            assert " | " + "C" * 80 in text and "https://example.org/pr/42" in text
     else:
         assert sent == []
     assert sum("operator alert channel is unset" in r.message for r in caplog.records) == (outcome == "unset")

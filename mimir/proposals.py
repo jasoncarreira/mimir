@@ -183,6 +183,7 @@ class ProposalResult:
     #: "conflict_marker" | "pr_open" | "error".
     reason: str | None
     detail: str | None = None
+    reused_pr: bool = False
 
 
 @dataclass
@@ -782,7 +783,7 @@ def finalize_proposal(
     opener = open_pr or _default_open_pr
     if rolling_state == "open" and rolling_url:
         _cleanup_worktree(home, wt, branch)
-        return ProposalResult(True, branch, True, rolling_url, None)
+        return ProposalResult(True, branch, True, rolling_url, None, reused_pr=True)
     try:
         pr_url = opener(home, branch, base, safe_title, body)
     except ProposalPrError as exc:
@@ -926,6 +927,50 @@ def _blob_oid(home: Path, ref: str, path: str) -> str | None:
         return None
     value = (res.stdout or "").strip()
     return value or None
+
+
+def merged_social_outbox_commit(home: Path, poller: str, path: str) -> str | None:
+    """Prove a live file's last first-parent change was a forge-approved merge.
+
+    A clean HEAD (including the per-turn auto-commit) is not approval. Query
+    terminal PR history, not just the current rolling PR, since the branch is
+    reused. Bounded history or unavailable/malformed forge evidence fails closed.
+    """
+    try:
+        scope = PollerProposalScope(f"poller:{poller}", "dispatch", "dispatch", "dispatch",
+                                    "social-outbox")
+        if Path(path).parent != scope.surface_root:
+            return None
+        last = _git(["log", "--first-parent", "--full-history", "-1", "--format=%H",
+                     "HEAD", "--", path], cwd=home)
+        commit = (last.stdout or "").strip()
+        if last.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return None
+        result = _run(
+            ["gh", "pr", "list", "--state", "merged", "--head", poller_branch_name(scope),
+             "--json", "state,headRefName,mergeCommit", "--limit", "100"],
+            cwd=home, capture=True,
+        )
+        if result.returncode != 0:
+            return None
+        prs = json.loads(result.stdout or "")
+        if not isinstance(prs, list):
+            return None
+        approved = any(
+            isinstance(pr, dict) and pr.get("state") == "MERGED"
+            and pr.get("headRefName") == poller_branch_name(scope)
+            and isinstance(pr.get("mergeCommit"), dict)
+            and pr["mergeCommit"].get("oid") == commit
+            for pr in prs
+        )
+        if not approved:
+            return None
+        blob = _blob_oid(home, "HEAD", path)
+        if blob is None or blob != _blob_oid(home, commit, path):
+            return None
+        return commit
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return None
 
 
 def _proposal_branch_content_is_on_main(

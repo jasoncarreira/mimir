@@ -54,7 +54,12 @@ turn to bypass the review flow.
 
 At the start of each poller fire, before sync/feed fetch and without an LLM,
 the poller checks its own `state/social-outbox/<poller>/outbox-*.yaml` files.
-Only git-tracked files clean and identical to `HEAD` qualify. A durable
+Only regular, non-symlink, git-tracked files clean and identical to `HEAD`
+qualify. The last first-parent commit touching each file must be the forge's
+merge/squash commit of a **merged** PR from this poller's rolling outbox branch,
+and the file's blob at that commit must equal its blob at `HEAD`. Unknown or
+unavailable forge evidence refuses dispatch. A per-turn auto-commit is not
+approval; the auto-commit also excludes `state/social-outbox/`. A durable
 `state/pollers/<poller>/dispatched-ledger.jsonl` records the SHA-256 **before**
 the binary is invoked; a crash cannot repost the same file. The poller re-scans
 content for outbound privacy and checks the daily cap before sending; failures
