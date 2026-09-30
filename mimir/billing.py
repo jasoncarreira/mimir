@@ -812,7 +812,7 @@ def record_codex_plus_rejection(
             return None
         return number if math.isfinite(number) else None
 
-    # CodexResponseError carries headers/raw, not a rate_limits attribute.
+    # Classify the window from CodexResponseError's headers/raw evidence.
     # A nearly-expired seven-day window is still seven-day: never infer its
     # identity from the remaining reset horizon.
     headers = getattr(exc, "headers", None)
@@ -859,6 +859,45 @@ def record_codex_plus_rejection(
     return persisted
 
 
+async def _first_codex_canary_model(
+    *, auth_path: Path | None, client_version: str,
+) -> str:
+    """Read the first live catalogue model without hardcoding a model/version."""
+    import aiohttp
+
+    from .codex_auth import CODEX_API_BASE, load_codex_auth
+
+    auth = await asyncio.to_thread(load_codex_auth, auth_path)
+    if auth is None:
+        raise ValueError("codex_canary_auth_missing")
+    headers = {
+        "Authorization": f"Bearer {auth.access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex-cli (mimir quota recheck)",
+    }
+    if auth.account_id:
+        headers["ChatGPT-Account-Id"] = auth.account_id
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{CODEX_API_BASE}/codex/models",
+            params={"client_version": client_version},
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=CODEX_USAGE_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status != 200:
+                raise ValueError("codex_canary_models_http_error")
+            try:
+                data = json.loads(await response.text())
+            except (json.JSONDecodeError, UnicodeError):
+                raise ValueError("codex_canary_models_invalid_json") from None
+    models = data.get("models") if isinstance(data, dict) else None
+    first = models[0] if isinstance(models, list) and models else None
+    slug = first.get("slug") if isinstance(first, dict) else None
+    if not isinstance(slug, str) or not slug.strip():
+        raise ValueError("codex_canary_models_missing_first_slug")
+    return slug.strip()
+
+
 async def run_codex_quota_canary(
     store: RateLimitStore,
     *,
@@ -869,13 +908,19 @@ async def run_codex_quota_canary(
     from .config import model_spec_at_call_time
 
     provider, separator, model_name = model_spec_at_call_time().partition(":")
-    if provider != "codex-plus" or not separator or not model_name.strip():
-        raise ValueError("codex_canary_requires_configured_codex_model")
+    configured_codex = provider == "codex-plus" and separator and model_name.strip()
     model = ChatCodexPlus(
-        model=model_name.strip(),
+        **({"model": model_name.strip()} if configured_codex else {}),
         auth_file_path=auth_path,
         rate_limit_callback=make_codex_plus_rate_limit_callback(store),
     )
+    if not configured_codex:
+        # Other providers may drive the main agent while Saga/Worklink uses
+        # Codex. Match the adapter's configured protocol version, and replace
+        # its default model before any generation with the first live slug.
+        model.model = await _first_codex_canary_model(
+            auth_path=auth_path, client_version=model.client_version,
+        )
     await model.ainvoke("ping")
     await asyncio.to_thread(store.clear_codex_generation_rejections_sync)
 

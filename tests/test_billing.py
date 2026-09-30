@@ -1536,6 +1536,125 @@ async def test_codex_canary_uses_configured_model_through_chat_adapter(
     assert store.current()["openai_seven_day"].status == "allowed"
 
 
+@pytest.mark.asyncio
+async def test_codex_canary_non_codex_spec_uses_first_live_model(tmp_path, monkeypatch):
+    import aiohttp
+    from langchain_codex_plus import ChatCodexPlus
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "anthropic:claude-sonnet-4-6")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "test-token")
+    requests, generations, closes = [], [], []
+
+    def configured_adapter(**kwargs):
+        return ChatCodexPlus(client_version="0.159.1-test", **kwargs)
+
+    monkeypatch.setattr("langchain_codex_plus.ChatCodexPlus", configured_adapter)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            closes.append(True)
+
+        def get(self, endpoint, *, params, headers, timeout):
+            requests.append((endpoint, params, headers, timeout.total))
+            return _UsageResponse(200, {"models": [
+                {"slug": "first-live-model"}, {"slug": "second-live-model"},
+            ]})
+
+    async def generate(self, messages, **kwargs):
+        generations.append((self.model, self.client_version, self.reasoning_effort,
+                            self.auth_file_path, messages[0].content))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    await run_codex_quota_canary(store, auth_path=auth_path)
+    assert len(generations) == len(requests) == len(closes) == 1
+    model, version, effort, used_auth_path, prompt = generations[0]
+    assert (model, effort, used_auth_path, prompt) == (
+        "first-live-model", None, auth_path, "ping",
+    )
+    assert requests[0] == (
+        "https://chatgpt.com/backend-api/codex/models",
+        {"client_version": version},
+        {"Authorization": "Bearer test-token", "Accept": "application/json",
+         "User-Agent": "codex-cli (mimir quota recheck)",
+         "ChatGPT-Account-Id": "acct-secret"},
+        15.0,
+    )
+    assert version == "0.159.1-test"
+    assert store.current()["openai_seven_day"].status == "allowed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,body", [
+    (503, {"error": "private-response-must-not-leak"}),
+    (200, "private-response-must-not-leak"),
+    (200, {"models": []}),
+    (200, {"models": [{"slug": ""}, {"slug": "later-model"}]}),
+    (200, {"models": [{"slug": 123}]}),
+])
+async def test_codex_canary_listing_failure_preserves_rejection(
+    tmp_path, monkeypatch, status, body,
+):
+    import aiohttp
+    from langchain_codex_plus import ChatCodexPlus
+    from mimir.billing import run_codex_quota_canary
+
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-other")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    auth_path = tmp_path / "auth.json"
+    _write_codex_auth(auth_path, "test-token")
+    closes = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            closes.append(True)
+
+        def get(self, *_args, **_kwargs):
+            return _UsageResponse(status, body)
+
+    async def generate(*_args, **_kwargs):
+        pytest.fail("listing failure must not attempt generation")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", Session)
+    monkeypatch.setattr(ChatCodexPlus, "_agenerate", generate)
+    store = RateLimitStore(tmp_path / "rl.json")
+    assert store.record_codex_rejection_sync("openai_seven_day", RateLimitSnapshot(
+        status="rejected", utilization=1.0, resets_at=int(time.time()) + 60,
+    ))
+    before = (tmp_path / "rl.json").read_bytes()
+    with pytest.raises(ValueError, match="codex_canary_models_") as error:
+        await run_codex_quota_canary(store, auth_path=auth_path)
+    assert "private-response" not in str(error.value)
+    assert closes == [True]
+    assert (tmp_path / "rl.json").read_bytes() == before
+
+
+def test_codex_canary_documentation_preserves_shared_knob():
+    root = Path(__file__).resolve().parents[1]
+    for relative in ("SPEC.md", "docs/configuration.md"):
+        text = (root / relative).read_text()
+        for required in ("MIMIR_QUOTA_RECHECK_SECONDS", "180", "30",
+                         "15-minute", "4 per hour", "/codex/models",
+                         "quota_pause_recheck", "quota_pause_cleared"):
+            assert required in text, (relative, required)
+
+
 def test_parse_codex_usage_maps_plus_and_pro_by_declared_duration():
     plus = parse_codex_usage_payload(_codex_usage_payload())
     assert plus.primary.window_minutes == 300
