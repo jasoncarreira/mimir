@@ -263,9 +263,19 @@ class Dispatcher:
             existing = self._queues.get(channel_id)
             if existing is None or existing.qsize() == 0:
                 from .mid_turn_injection import inject_authenticated_message
-                if inject_authenticated_message(
+                injection_status = inject_authenticated_message(
                     channel_id, event, self._identity_resolver,
-                ) == "injected":
+                )
+                if injection_status == "consumed":
+                    from .memory_proposals import complete_reply
+                    resolution = event.extra.pop("_memory_proposal_resolution")
+                    notice = await complete_reply(
+                        self._config.home, event, resolution, self._identity_resolver,
+                    )
+                    if notice:
+                        await self._send_approval_notice(channel_id, notice)
+                    return True
+                if injection_status == "injected":
                     notice = event.extra.pop("operator_approval_reply", None)
                     if notice:
                         await self._send_approval_notice(channel_id, notice)

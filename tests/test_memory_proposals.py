@@ -89,7 +89,7 @@ def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_tur
     content = "Fact with newline\nkept verbatim"
     result = env.call(content=content)
     record, = _records(env.home)
-    assert re.search(r"Proposed memory mp-[0-9a-f]{8} queued", result)
+    assert re.search(r"Proposed memory mp-[a-z2-7]{4} queued", result)
     assert "nothing is stored yet" in result and "do not notify the operator" in result
     assert record == {
         "id": record["id"], "content": content, "stream": "semantic",
@@ -143,6 +143,42 @@ def test_clean_turn_refuses_directs_to_memory_store(proposal_turn):
 def test_invalid_content_writes_nothing(proposal_turn, content, reason):
     assert reason in proposal_turn.call(content=content)
     assert _records(proposal_turn.home) == []
+
+
+def test_queue_strips_content_before_hashing_and_rejects_blank(proposal_turn):
+    assert "queued" in proposal_turn.call(content="  some fact\n")
+    record, = _records(proposal_turn.home)
+    assert record["content"] == "some fact"
+    assert record["content_sha256"] == hashlib.sha256(b"some fact").hexdigest()
+    assert "content is required" in proposal_turn.call(content=" \n\t ")
+    assert len(_records(proposal_turn.home)) == 1
+
+
+def test_store_guard_survives_writable_roots_including_mimir(proposal_turn):
+    from mimir.readonly_backend import WriteGuardBackend
+
+    proposal_turn.call()
+    backend = WriteGuardBackend(root_dir=proposal_turn.home, writable_dirs=[".mimir", "."])
+    path = str(proposal_path(proposal_turn.home))
+    assert backend.write(path, "replacement").error
+    assert backend.edit(path, "pending", "approved").error
+    wide = build_trigger_service_principal(
+        canonical="poller:wide", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("write_file", "edit_file"), roots=(proposal_turn.home / ".mimir",),
+        creation_path="test",
+    )
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=wide.canonical, source="poller",
+        source_id="wide", service_principal=wide.canonical, service_authority=wide,
+    ), enforce=True, ifc_labels=proposal_turn.labels)
+    for tool in ("write_file", "edit_file"):
+        decision = get_tool_registry().authorize_tool(
+            tool, auth, enforce=True, target_channel=path,
+            arguments={"file_path": path}, ifc_labels=proposal_turn.labels,
+        )
+        assert not decision.allowed and decision.reason == "protected_memory_proposal_path"
+    assert _records(proposal_turn.home)[0]["status"] == "pending"
 
 
 def test_duplicate_pending_proposal_is_refused(proposal_turn):

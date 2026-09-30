@@ -984,9 +984,10 @@ def test_authenticated_injection_is_only_production_approval_recorder():
         for name in _approval_recorder_calls(path.read_text(encoding="utf-8")):
             callers.append((relative, name))
 
-    # The sole compatibility wrapper call is explicitly allowlisted; no
-    # production site may call that wrapper. It is retained for existing tests.
+    # The agent resolves authenticated memory replies before any model turn.
+    # The operator_approval wrapper is retained for existing tests.
     assert callers == [
+        ("agent.py", "resolve"),
         ("mid_turn_injection.py", "resolve"),
         ("operator_approval.py", "resolve"),
     ]
@@ -1107,7 +1108,9 @@ async def test_dispatcher_logs_undeliverable_approval_notice(
     assert calls == []
     assert mp in requests.pending("slack-C1")
     assert approval.pending_request("slack-C1") == request
-    assert len(mti._drain("slack-C1")) == 1
+    # Both named replies and ambiguous bare replies with mp pending are
+    # consumed by the server, even when notice delivery fails.
+    assert mti._drain("slack-C1") == []
 
 
 def test_model_queue_cannot_resolve_typed_registry_entry(tmp_path):

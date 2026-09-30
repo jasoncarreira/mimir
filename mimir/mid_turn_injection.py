@@ -241,8 +241,10 @@ def inject_authenticated_message(
         if not can_inject_authenticated_message(channel_id, event, resolver):
             return "principal_mismatch"
         from .agent import _initialize_ifc_labels
-        from .approval_requests import resolve
+        from .approval_requests import pending, resolve
 
+        bare_mp_reply = ((event.content or "").strip().lower() in {"approve", "decline"}
+                         and any(entry.kind == "mp" for entry in pending(channel_id)))
         event_labels = _initialize_ifc_labels(event, resolver=resolver)
         reply_source = event_labels.sources[-1] if event_labels.sources else None
         resolution = resolve(
@@ -251,6 +253,11 @@ def inject_authenticated_message(
             approval_event=event,
             reply_source=reply_source,
         )
+        from .memory_proposals import is_mp_reply
+        if (resolution.entry is not None and not resolution.entry.inject_into_turn
+                or resolution.entry is None and (is_mp_reply(event) or bare_mp_reply)):
+            event.extra["_memory_proposal_resolution"] = resolution
+            return "consumed"
         if resolution.message:
             event.extra["operator_approval_reply"] = resolution.message
         if resolution.status == "granted" and resolution.entry is not None and resolution.entry.kind == "op":

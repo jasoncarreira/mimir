@@ -31,6 +31,7 @@ class ApprovalEntry:
     resolver: Resolver
     prompt_message_id: str | None = None
     supports_edits: bool = False
+    inject_into_turn: bool = True
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,19 @@ _EXPIRED: set[str] = set()
 _LOCK = threading.Lock()
 
 
+def mint_id(kind: str, *, excluded: frozenset[str] = frozenset()) -> str:
+    """Mint an unused typed ID, including callers' durable reservations."""
+    if not re.fullmatch(r"[a-z]+", kind):
+        raise ValueError("invalid approval kind")
+    with _LOCK:
+        _expire(time.monotonic())
+        for _ in range(1024):
+            candidate = f"{kind}-" + "".join(secrets.choice(_ALPHABET) for _ in range(4))
+            if candidate not in excluded and candidate not in _PENDING and candidate not in _RECENT:
+                return candidate
+    raise RuntimeError("approval IDs exhausted")
+
+
 def _expire(now: float) -> None:
     for approval_id, entry in tuple(_PENDING.items()):
         if entry.expires_at <= now:
@@ -63,7 +77,7 @@ def _expire(now: float) -> None:
 def register(
     *, kind: str, channel_id: str, description: str, expires_at: float,
     resolver: Resolver, now: float | None = None, approval_id: str | None = None,
-    supports_edits: bool = False,
+    supports_edits: bool = False, inject_into_turn: bool = True,
 ) -> ApprovalEntry:
     """Register an in-memory request (persistent kinds re-register on boot)."""
     now = time.monotonic() if now is None else now
@@ -83,7 +97,7 @@ def register(
                 or approval_id in _PENDING or approval_id in _RECENT):
             raise ValueError("approval ID unavailable")
         entry = ApprovalEntry(approval_id, kind, channel_id, " ".join(description.split())[:160], now, expires_at,
-                              resolver, supports_edits=supports_edits)
+                              resolver, supports_edits=supports_edits, inject_into_turn=inject_into_turn)
         _PENDING[approval_id] = entry
         return entry
 
@@ -103,6 +117,18 @@ def cancel(approval_id: str, *, expired: bool = False) -> None:
             _RECENT[approval_id] = (time.monotonic() + _RECENT_SECONDS, entry.channel_id)
             if expired:
                 _EXPIRED.add(approval_id)
+
+
+def restore_uncompleted(entry: ApprovalEntry) -> None:
+    """Undo only this entry's transient resolution after durable completion failed."""
+    with _LOCK:
+        recent = _RECENT.get(entry.approval_id)
+        if (recent is not None and recent[1] == entry.channel_id
+                and entry.approval_id not in _PENDING
+                and entry.expires_at > time.monotonic()):
+            _RECENT.pop(entry.approval_id)
+            _EXPIRED.discard(entry.approval_id)
+            _PENDING[entry.approval_id] = entry
 
 
 def pending(channel_id: str, *, now: float | None = None) -> tuple[ApprovalEntry, ...]:
