@@ -1075,6 +1075,88 @@ def test_large_tool_result_root_respects_service_capabilities(
     ) is False
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_synthesis_only_reads_its_own_successfully_evicted_result(
+    asynchronous: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import ToolMessage
+
+    from mimir.read_policy import framework_large_tool_results_root
+    from mimir.readonly_backend import MimirFilesystemMiddleware, WriteGuardBackend
+
+    home = tmp_path / "home"
+    (home / "state").mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    root = framework_large_tool_results_root(home)
+    assert root is not None
+    root.mkdir()
+    other = root / "other-id"
+    other.write_text("another turn's content\n")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / "call_one").write_text("nested result\n")
+    backend = WriteGuardBackend(home, ["state"])
+    middleware = MimirFilesystemMiddleware(backend=backend, tool_token_limit_before_evict=1)
+    service = access_control.builtin_trigger_service_principal("session-boundary", home)
+    auth = replace(_service_auth(service, InformationFlowLabels()), channel_id="chan-a")
+    registry = ToolRegistry()
+
+    def decision(tool: str, args: dict) -> access_control.ToolAuthorization:
+        return registry.authorize_tool(tool, auth, enforce=True, arguments=args)
+
+    first = TurnContext("turn-1", "chan-a", "saga_session_end", "chan-a", 0, auth_context=auth)
+    second = TurnContext("turn-2", "chan-a", "saga_session_end", "chan-a", 0, auth_context=auth)
+    content = "large result from mimir_get_turn\n" * 30
+    message = ToolMessage(content=content, tool_call_id="call/one", name="mimir_get_turn")
+    token = set_current_turn(first)
+    try:
+        small = ToolMessage(content="ok", tool_call_id="small-id", name="mimir_get_turn")
+        if asynchronous:
+            unchanged, small_evicted = await middleware._aprocess_large_message(small, backend)
+        else:
+            unchanged, small_evicted = middleware._process_large_message(small, backend)
+        assert not small_evicted and unchanged is small
+        assert first.evicted_tool_result_ids == []
+        if asynchronous:
+            processed, evicted = await middleware._aprocess_large_message(message, backend)
+        else:
+            processed, evicted = middleware._process_large_message(message, backend)
+        assert evicted
+        assert "/large_tool_results/call_one" in str(processed.content)
+        assert first.evicted_tool_result_ids == ["call_one"]
+        own_path = "/large_tool_results/call_one"
+        assert decision("read_file", {"file_path": own_path, "offset": 0, "limit": 50}).allowed
+        provenance_token = access_control.begin_protected_result_capture()
+        try:
+            result = backend.aread(own_path, offset=0, limit=50) if asynchronous else backend.read(own_path, offset=0, limit=50)
+            if asynchronous:
+                result = await result
+        finally:
+            provenance = access_control.end_protected_result_capture(provenance_token)
+        assert result.error is None
+        assert content in result.file_data["content"]
+        assert provenance is not None and provenance.sources == ()
+        for path in (str(other), str(root), str(nested / "call_one"), "/large_tool_results/other-id"):
+            denied = decision("read_file", {"file_path": path})
+            assert (denied.allowed, denied.reason) == (False, "session_boundary_capability_denied")
+        for tool, args in (
+            ("ls", {"path": str(root), "file_path": own_path}),
+            ("glob", {"path": str(root), "pattern": "*"}),
+            ("grep", {"path": str(root), "pattern": "result"}),
+        ):
+            assert decision(tool, args).reason == "session_boundary_capability_denied"
+    finally:
+        reset_current_turn(token)
+
+    token = set_current_turn(second)
+    try:
+        assert not second.evicted_tool_result_ids
+        denied = decision("read_file", {"file_path": "/large_tool_results/call_one"})
+        assert (denied.allowed, denied.reason) == (False, "session_boundary_capability_denied")
+    finally:
+        reset_current_turn(token)
+
+
 @pytest.mark.parametrize("tool_name", ["read_file", "ls", "glob", "grep"])
 def test_large_tool_result_root_is_available_to_interactive_non_admins(
     tool_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

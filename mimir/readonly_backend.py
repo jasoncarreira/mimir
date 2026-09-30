@@ -370,6 +370,29 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
         kwargs["tools"] = list(_FILESYSTEM_TOOLS)
         super().__init__(**kwargs)
 
+    @staticmethod
+    def _record_eviction(message: ToolMessage, evicted: bool) -> None:
+        if not evicted or not message.tool_call_id:
+            return
+        from ._context import get_current_turn
+
+        turn = get_current_turn()
+        ids = getattr(turn, "evicted_tool_result_ids", None)
+        if ids is not None:
+            ids.append(
+                deepagents_filesystem.sanitize_tool_call_id(message.tool_call_id)
+            )
+
+    def _process_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
+        processed, evicted = super()._process_large_message(message, resolved_backend)
+        self._record_eviction(message, evicted)
+        return processed, evicted
+
+    async def _aprocess_large_message(self, message: ToolMessage, resolved_backend: Any) -> tuple[ToolMessage, bool]:
+        processed, evicted = await super()._aprocess_large_message(message, resolved_backend)
+        self._record_eviction(message, evicted)
+        return processed, evicted
+
     def _create_grep_tool(self) -> BaseTool:
         stock_tool = super()._create_grep_tool()
 
@@ -1501,16 +1524,26 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             protected_result_source,
             publish_protected_result,
         )
+        from .read_policy import framework_large_tool_results_root
 
         turn = get_current_turn()
         auth_context = getattr(turn, "auth_context", None)
         resolved_paths = []
+        artifact_root = framework_large_tool_results_root()
         for file_path in dict.fromkeys(file_paths):
             try:
-                resolved_paths.append(str(self._resolve_path(file_path).resolve(strict=True)))
+                resolved = self._resolve_path(file_path).resolve(strict=True)
             except (OSError, RuntimeError, ValueError):
                 invalidate_protected_result_capture()
                 return
+            # Reading back this turn's own offload is not a new IFC input.
+            if (
+                turn is not None and artifact_root is not None
+                and resolved.parent == artifact_root
+                and resolved.name in getattr(turn, "evicted_tool_result_ids", ())
+            ):
+                continue
+            resolved_paths.append(str(resolved))
         publish_protected_result(tuple(
             protected_result_source(
                 auth_context,

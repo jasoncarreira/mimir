@@ -33,91 +33,36 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do three things, in order (plus optional Steps 1b and 1c — inline atom
-storage and skill-specific learnings — see below):
+Do three things, in order:
 
 ### 1. Capture memories worth keeping
 
 Skim the turn summaries below. If anything is worth remembering long-term
 — facts about people in this channel, decisions, recurring patterns,
-useful context for future sessions — write or edit files under:
+useful context for future sessions — create new files with `write_file` under:
 
   memory/channels/{channel_id}/   # channel-specific notes
   memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
   state/wiki/concepts/            # cross-channel patterns / frameworks
   state/wiki/topics/              # cross-channel long-form synthesis
-  memory/learnings-pending.md     # candidate learned behaviors (see below)
+  memory/learnings-pending/       # candidate learned behaviors (see below)
 
 If the session surfaced something that *might* be a durable behavior
 worth remembering across all future turns — a heuristic that worked, a
-failure mode worth avoiding, an approach that beat the default — append
-it to `memory/learnings-pending.md` in the canonical 4-field shape
-(`What I noticed / What works / Trigger / Source:`). The weekly
-reflection turn reviews that buffer and *proposes* promoting durable
-entries into `memory/core/40-learned-behaviors.md` (core memory is
-read-only at runtime — the operator merges the change as a PR), and
-drops one-offs. **Do NOT write directly to
+failure mode worth avoiding, an approach that beat the default — create a
+new file under `memory/learnings-pending/` in the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`) for later review.
+Durable rules belong in `memory/core/40-learned-behaviors.md` only after
+operator review (core memory is read-only at runtime). **Do NOT write directly to
 `memory/core/40-learned-behaviors.md`** — it's blocked at runtime, and
 synthesis turns have narrow context (one session) and have been observed
-confabulating durable rules from one-off events. The pending buffer is
+confabulating durable rules from one-off events. A new candidate file is
 the safe path.
 
-Use the file-op tools. Call `mimir_get_turn` only for turns
+Use `write_file` to create new files; it cannot overwrite existing files.
+Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
-
-### 1b. Store SAGA atoms for cross-session semantic facts
-
-If the session surfaced concrete, positive, world-facts that benefit
-from embedding-based cross-session retrieval (and aren't already going
-into a file under Step 1), call saga_store for each.
-
-**Good shapes:**
-
-- **semantic** — facts, preferences, knowledge about people, places,
-  things, concepts ("Alice prefers Slack DMs over email for urgent
-  asks"; "Brander's actors thesis: LLM agents map to Hewitt's actor
-  model"; "The Mariana Trench is the deepest known oceanic trench").
-- **episodic** — dated events about specific entities ("Alice joined
-  the Atlas project on 2025-03-12"; "The Hindenburg disaster occurred
-  on 1937-05-06"). Dates verbatim where they appear.
-- **procedural** — recurring how-tos / workflow patterns ("When
-  summarizing a long document, lead with the thesis and supporting
-  evidence"; "Use a hot pan and high heat for searing meat").
-
-**Do NOT store:**
-
-- Meta-observations about this turn or the runtime itself ("the
-  synthesis prompt ran"; "the scheduler fired silently")
-- Self-state claims ("I'm uncertain about X", "no info about Y")
-- Negative / absence claims ("nothing happened today")
-- Generic session-retell — the boundary's `summary` field handles
-  that
-- Duplicates of content already going into a file under Step 1, or
-  already covered by a recent boundary's summary/topics/decisions
-
-One fact per call. Single self-contained sentence. Dates and numbers
-verbatim. If nothing fits, skip this step entirely — silence is fine.
-
-### 1c. Record skill-specific learnings
-
-If running a **skill** this session taught you something its *next* run
-should know — a gotcha that cost you time, an input quirk, a performance
-caveat, a tip, or an approach that worked — capture it with:
-
-  saga_record_skill_learning(
-    skill="<skill name>",      # e.g. "memory", "github-poller"
-    kind="<kind>",             # failure-mode | input-quirk | perf-caveat
-                               #   (cautionary) ·· tip | success-pattern (how-to)
-    content="<one self-contained sentence>",
-  )
-
-This is *scoped* memory: the learning resurfaces automatically the next
-time that skill loads and never leaks into unrelated turns — which is why
-it goes here, not in Step 1b's general atoms. Record the cautionary ones
-especially: a `failure-mode` you actually hit is the single most valuable
-thing to leave for the next run. One learning per call. Skip entirely if
-no skill taught you anything this session — don't manufacture entries.
 
 ### 2. Score SAGA atoms
 
@@ -129,8 +74,7 @@ stale — load the cited ids in ONE call with:
 
   memory_get(["<atom_id>", "<atom_id>", ...])   # batch by-id, exact load
 
-Do NOT score atoms blind, and do NOT pass ids to memory_query or fan out
-one lookup per id. For each atom, call:
+Do NOT score atoms blind or fan out one lookup per id. For each atom, call:
 
   saga_feedback(atom_id, "useful")     # genuinely informed a reply
   saga_feedback(atom_id, "incorrect")  # was wrong or misleading
@@ -204,9 +148,7 @@ After step 3, do not send any user-facing message — this is a bookkeeping turn
 # bookkeeping turn for the contribution-credit + atom-scoring
 # scaffolding; when the session genuinely has zero atoms cited there's
 # nothing to credit and the scaffolding is pure cost. The lean
-# variant keeps memory capture (step 1), the optional inline atom
-# storage step (step 1b — added 2026-05-10 per operator discussion on
-# why mimir rarely reaches for saga_store), and the boundary record
+# variant keeps memory capture (step 1) and the boundary record
 # (step 2 — renumbered from step 3 in the full template) and drops:
 #   - the dedicated atom-scoring step (Score SAGA atoms)
 #   - the trailing ``## Atoms cited across the session`` block
@@ -231,91 +173,36 @@ that fed that turn isn't useful for synthesis and re-embedding it is
 exactly the cost path we're avoiding). Be surgical — most turns won't
 be worth re-reading.
 
-Do two things, in order (plus optional Steps 1b and 1c — inline atom
-storage and skill-specific learnings — see below):
+Do two things, in order:
 
 ### 1. Capture memories worth keeping
 
 Skim the turn summaries below. If anything is worth remembering long-term
 — facts about people in this channel, decisions, recurring patterns,
-useful context for future sessions — write or edit files under:
+useful context for future sessions — create new files with `write_file` under:
 
   memory/channels/{channel_id}/   # channel-specific notes
   memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
   state/wiki/concepts/            # cross-channel patterns / frameworks
   state/wiki/topics/              # cross-channel long-form synthesis
-  memory/learnings-pending.md     # candidate learned behaviors (see below)
+  memory/learnings-pending/       # candidate learned behaviors (see below)
 
 If the session surfaced something that *might* be a durable behavior
 worth remembering across all future turns — a heuristic that worked, a
-failure mode worth avoiding, an approach that beat the default — append
-it to `memory/learnings-pending.md` in the canonical 4-field shape
-(`What I noticed / What works / Trigger / Source:`). The weekly
-reflection turn reviews that buffer and *proposes* promoting durable
-entries into `memory/core/40-learned-behaviors.md` (core memory is
-read-only at runtime — the operator merges the change as a PR), and
-drops one-offs. **Do NOT write directly to
+failure mode worth avoiding, an approach that beat the default — create a
+new file under `memory/learnings-pending/` in the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`) for later review.
+Durable rules belong in `memory/core/40-learned-behaviors.md` only after
+operator review (core memory is read-only at runtime). **Do NOT write directly to
 `memory/core/40-learned-behaviors.md`** — it's blocked at runtime, and
 synthesis turns have narrow context (one session) and have been observed
-confabulating durable rules from one-off events. The pending buffer is
+confabulating durable rules from one-off events. A new candidate file is
 the safe path.
 
-Use the file-op tools. Call `mimir_get_turn` only for turns
+Use `write_file` to create new files; it cannot overwrite existing files.
+Call `mimir_get_turn` only for turns
 whose summary suggests they're worth a closer look. Skip this step
 entirely if nothing notable came up — no need to manufacture content.
-
-### 1b. Store SAGA atoms for cross-session semantic facts
-
-If the session surfaced concrete, positive, world-facts that benefit
-from embedding-based cross-session retrieval (and aren't already going
-into a file under Step 1), call saga_store for each.
-
-**Good shapes:**
-
-- **semantic** — facts, preferences, knowledge about people, places,
-  things, concepts ("Alice prefers Slack DMs over email for urgent
-  asks"; "Brander's actors thesis: LLM agents map to Hewitt's actor
-  model"; "The Mariana Trench is the deepest known oceanic trench").
-- **episodic** — dated events about specific entities ("Alice joined
-  the Atlas project on 2025-03-12"; "The Hindenburg disaster occurred
-  on 1937-05-06"). Dates verbatim where they appear.
-- **procedural** — recurring how-tos / workflow patterns ("When
-  summarizing a long document, lead with the thesis and supporting
-  evidence"; "Use a hot pan and high heat for searing meat").
-
-**Do NOT store:**
-
-- Meta-observations about this turn or the runtime itself ("the
-  synthesis prompt ran"; "the scheduler fired silently")
-- Self-state claims ("I'm uncertain about X", "no info about Y")
-- Negative / absence claims ("nothing happened today")
-- Generic session-retell — the boundary's `summary` field handles
-  that
-- Duplicates of content already going into a file under Step 1, or
-  already covered by a recent boundary's summary/topics/decisions
-
-One fact per call. Single self-contained sentence. Dates and numbers
-verbatim. If nothing fits, skip this step entirely — silence is fine.
-
-### 1c. Record skill-specific learnings
-
-If running a **skill** this session taught you something its *next* run
-should know — a gotcha that cost you time, an input quirk, a performance
-caveat, a tip, or an approach that worked — capture it with:
-
-  saga_record_skill_learning(
-    skill="<skill name>",      # e.g. "memory", "github-poller"
-    kind="<kind>",             # failure-mode | input-quirk | perf-caveat
-                               #   (cautionary) ·· tip | success-pattern (how-to)
-    content="<one self-contained sentence>",
-  )
-
-This is *scoped* memory: the learning resurfaces automatically the next
-time that skill loads and never leaks into unrelated turns — which is why
-it goes here, not in Step 1b's general atoms. Record the cautionary ones
-especially: a `failure-mode` you actually hit is the single most valuable
-thing to leave for the next run. One learning per call. Skip entirely if
-no skill taught you anything this session — don't manufacture entries.
 
 ### 2. Record the session boundary
 

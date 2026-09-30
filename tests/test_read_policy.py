@@ -9,9 +9,33 @@ from mimir.read_policy import (
     configured_non_admin_read_roots,
     derived_pr_checkout_read_root,
     is_protected_read_path,
+    is_own_missing_channel_memory_path,
     protected_read_denial_reason,
     resolve_non_admin_read_target,
 )
+
+
+def test_missing_channel_note_is_only_own_channel_and_cannot_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    home = tmp_path / "home"
+    own = home / "memory" / "channels" / "scheduler:heartbeat"
+    own.mkdir(parents=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = SimpleNamespace(channel_id="scheduler:heartbeat", service_authority=None)
+    assert is_own_missing_channel_memory_path(own / "missing.md", auth)
+    assert not is_own_missing_channel_memory_path(
+        home / "memory" / "channels" / "other" / "missing.md", auth,
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (own / "escape").symlink_to(outside, target_is_directory=True)
+    assert not is_own_missing_channel_memory_path(own / "escape" / "missing.md", auth)
+    assert not is_own_missing_channel_memory_path(own / ".git" / "missing.md", auth)
+    (own / "existing.md").write_text("real content")
+    assert not is_own_missing_channel_memory_path(own / "existing.md", auth)
 
 
 @pytest.mark.parametrize("stem", [

@@ -1578,6 +1578,44 @@ async def test_heartbeat_turn_reads_explicitly_mapped_channel_memory(
     assert fake_agent.result.content == "heartbeat note\n"
 
 
+@pytest.mark.parametrize("channel,exists,expected", [
+    ("scheduler:heartbeat", False, "not found"),
+    ("other", False, "read_scope"),
+    ("other", True, "read_scope"),
+])
+async def test_heartbeat_channel_note_reports_only_own_not_found(
+    channel: str, exists: bool, expected: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import builtin_trigger_service_principal
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = tmp_path / "home"
+    (home / "memory" / "channels" / "scheduler:heartbeat").mkdir(parents=True)
+    if exists:
+        other = home / "memory" / "channels" / channel
+        other.mkdir(parents=True)
+        (other / "x.md").write_text("other channel's content\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    authority = builtin_trigger_service_principal("heartbeat", home)
+    fake_agent = _ServiceMemoryReadProbeAgent(
+        WriteGuardBackend(home, ["state", "memory"]),
+        f"/memory/channels/{channel}/x.md",
+    )
+    agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=_FakeSaga())
+    agent._config.access_control_enforced = True
+
+    record = await agent.run_turn(AgentEvent(
+        trigger="scheduled_tick", channel_id="scheduler:heartbeat",
+        content="check your notes", service_principal=authority.canonical,
+        service_authority=authority,
+    ))
+    assert record.error is None
+    assert fake_agent.result is not None
+    assert fake_agent.result.status == "error"
+    assert expected in str(fake_agent.result.content)
+
+
 async def test_server_session_idle_event_reaches_live_synthesis_middleware(
     tmp_path: Path,
 ):
