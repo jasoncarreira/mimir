@@ -1035,11 +1035,15 @@ async def test_dispatcher_ambiguity_and_named_memory_reply_are_server_owned(tmp_
     )
     notices = []
 
-    class Channels:
-        async def send(self, channel_id, text, *, final=True):
-            notices.append((channel_id, text))
+    from mimir.bridges.base import SendResult
 
-    monkeypatch.setitem(tool_registry._STATE, "channel_registry", Channels())
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+        return SendResult(sent=True)
+
+    dispatcher.set_notice_sender(send_notice)
+    # Notice delivery belongs to the dispatcher, not tool-runtime globals.
+    monkeypatch.setitem(tool_registry._STATE, "channel_registry", None)
     monkeypatch.setattr("mimir.dispatcher.log_event", lambda *a, **kw: asyncio.sleep(0))
 
     assert await dispatcher.enqueue(_approval_event("approve"))
@@ -1054,9 +1058,14 @@ async def test_dispatcher_ambiguity_and_named_memory_reply_are_server_owned(tmp_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["unavailable", "refused", "raises"])
+@pytest.mark.parametrize("delivery, reason", [
+    ("unavailable", "sender_unavailable"),
+    ("refused", "delivery_refused"),
+    ("raises", "delivery_exception"),
+])
+@pytest.mark.parametrize("reply", ["approve", "named"])
 async def test_dispatcher_logs_undeliverable_approval_notice(
-    tmp_path, monkeypatch, caplog, delivery,
+    tmp_path, monkeypatch, caplog, delivery, reason, reply,
 ):
     from mimir.access_control import create_auth_context
     from mimir.bridges.base import SendResult
@@ -1069,23 +1078,34 @@ async def test_dispatcher_logs_undeliverable_approval_notice(
     request, _ = _create_bound_request_for_test(requesting_principal="operator")
     assert request is not None
     calls = []
-    requests.register(
+    mp = requests.register(
         kind="mp", channel_id="slack-C1", description="memory",
         expires_at=time.monotonic() + 300, resolver=lambda *args: calls.append(args) or "granted",
     )
 
-    class Channels:
-        async def send(self, channel_id, text, *, final=True):
-            if delivery == "raises":
-                raise RuntimeError("delivery failed")
-            return SendResult(sent=False, error="offline")
+    async def send_notice(channel_id, text):
+        if delivery == "raises":
+            raise RuntimeError("delivery failed")
+        return SendResult(sent=False, error="offline")
 
-    monkeypatch.setitem(tool_registry._STATE, "channel_registry",
-                        None if delivery == "unavailable" else Channels())
-    monkeypatch.setattr("mimir.dispatcher.log_event", lambda *a, **kw: asyncio.sleep(0))
-    assert await dispatcher.enqueue(_approval_event("approve"))
+    if delivery != "unavailable":
+        dispatcher.set_notice_sender(send_notice)
+    events = []
+
+    async def record_event(name, **fields):
+        events.append((name, fields))
+
+    monkeypatch.setattr("mimir.dispatcher.log_event", record_event)
+    # A successful resolution has no server notice; ambiguity and unknown
+    # named IDs do. Neither may replay or resolve a request on send failure.
+    text = "approve" if reply == "approve" else "approve mp-aaaa"
+    assert await dispatcher.enqueue(_approval_event(text))
     assert "Could not send approval reply notice" in caplog.text
+    assert ("approval_notice_undelivered", {
+        "channel_id": "slack-C1", "reason": reason,
+    }) in events
     assert calls == []
+    assert mp in requests.pending("slack-C1")
     assert approval.pending_request("slack-C1") == request
     assert len(mti._drain("slack-C1")) == 1
 

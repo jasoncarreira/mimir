@@ -40,6 +40,7 @@ class _Dispatcher:
         self._run_turn = None
         self._on_channel_idle = None
         self._on_inject = None
+        self._notice_sender = None
         self._on_event = None
         self._on_pairing_required = None
 
@@ -54,6 +55,10 @@ class _Dispatcher:
     def set_on_inject(self, value: Any) -> None:
         self._on_inject = value
         self.events.append(("inject", value))
+
+    def set_notice_sender(self, value: Any) -> None:
+        self._notice_sender = value
+        self.events.append(("notice_sender", value))
 
     def set_on_event(self, value: Any) -> None:
         self._on_event = value
@@ -318,6 +323,7 @@ def _assert_runtime_callbacks_cleared(
     assert adapters.dispatcher._run_turn is None
     assert adapters.dispatcher._on_channel_idle is None
     assert adapters.dispatcher._on_inject is None
+    assert adapters.dispatcher._notice_sender is None
     assert adapters.dispatcher._on_event is None
     assert adapters.dispatcher._on_pairing_required is None
     if sessions is not None:
@@ -646,6 +652,11 @@ async def test_runtime_enforces_fresh_adapter_preconditions(tmp_path: Path) -> N
         await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
 
     adapters = _adapters(events)
+    adapters.dispatcher._notice_sender = object()
+    with pytest.raises(ValueError, match="runtime callbacks"):
+        await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+
+    adapters = _adapters(events)
     adapters.scheduler._started = True
     with pytest.raises(ValueError, match="must not have been started"):
         await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
@@ -945,6 +956,40 @@ async def test_runtime_registers_closers_as_resources_are_constructed(
 
 
 @pytest.mark.asyncio
+async def test_runtime_installs_notice_sender_from_adapters_and_clears_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    import mimir.tools
+    from mimir.bridges.base import SendResult
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    deliveries = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id, text, *, final=True):
+            deliveries.append((channel_id, text, final))
+            return SendResult(sent=True)
+
+    dispatcher = Dispatcher(replace(Config.from_env(), home=tmp_path))
+    adapters = replace(_adapters(events), dispatcher=dispatcher, channels=Channels())
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+    try:
+        assert dispatcher._notice_sender is not None
+        # Tool lifecycle changes must not disconnect runtime-owned notices.
+        mimir.tools.set_channel_registry(None)
+        await dispatcher._send_approval_notice("slack-C1", "no pending request mp-aaaa")
+        assert deliveries == [("slack-C1", "no pending request mp-aaaa", False)]
+    finally:
+        await bundle.aclose()
+    assert dispatcher._notice_sender is None
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_and_session_callback_parity_and_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1031,11 +1076,12 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         kind
         for kind, value in events
         if value is not None
-        and kind in {"channel_idle", "inject", "event", "pairing", "session_idle", "session_busy"}
+        and kind in {"channel_idle", "inject", "notice_sender", "event", "pairing", "session_idle", "session_busy"}
     ]
     assert bindings == [
         "channel_idle",
         "inject",
+        "notice_sender",
         "event",
         "pairing",
         "session_idle",
@@ -1286,6 +1332,7 @@ async def test_bundle_aclose_is_idempotent_and_reverses_resources(
     assert adapters.dispatcher._run_turn is None
     assert adapters.dispatcher._on_channel_idle is None
     assert adapters.dispatcher._on_inject is None
+    assert adapters.dispatcher._notice_sender is None
     assert adapters.dispatcher._on_event is None
     assert adapters.dispatcher._on_pairing_required is None
     assert bundle.sessions.on_idle is None

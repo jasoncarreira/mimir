@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from .agent import Agent
+    from .bridges.base import SendResult
     from .channel_registry import ChannelRegistry
     from .chat_skills import ChatSkillRegistry
     from .commitments import CommitmentsStore
@@ -562,8 +563,12 @@ async def create_agent_runtime(
         on_injected = agent.on_message_injected
         is_busy = adapters.dispatcher.is_channel_busy
 
+        async def send_notice(channel_id: str, notice: str) -> SendResult:
+            return await adapters.channels.send(channel_id, notice, final=False)
+
         adapters.dispatcher.set_on_channel_idle(on_channel_idle)
         adapters.dispatcher.set_on_inject(on_injected)
+        adapters.dispatcher.set_notice_sender(send_notice)
         adapters.dispatcher.set_on_event(capture_dm_channel)
         adapters.dispatcher.set_on_pairing_required(request_dm_pairing)
         sessions.set_on_idle(on_session_idle)
@@ -625,6 +630,7 @@ def _validate_adapters(adapters: RuntimeAdapters) -> None:
     callback_names = (
         "_on_channel_idle",
         "_on_inject",
+        "_notice_sender",
         "_on_event",
         "_on_pairing_required",
     )
@@ -726,6 +732,7 @@ async def _cleanup_runtime(
         lambda: dispatcher.set_run_turn(None),
         lambda: dispatcher.set_on_channel_idle(None),
         lambda: dispatcher.set_on_inject(None),
+        lambda: dispatcher.set_notice_sender(None),
         lambda: dispatcher.set_on_event(None),
         lambda: dispatcher.set_on_pairing_required(None),
     ]
