@@ -20,6 +20,22 @@ def proposal_path(home: Path) -> Path:
     return home / ".mimir" / "memory-proposals.jsonl"
 
 
+def is_protected_proposal_path(candidate: Path) -> bool:
+    """Unconditional model-file boundary, including resolved virtual aliases."""
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return False
+    try:
+        protected = proposal_path(Path(home).resolve()).resolve()
+        resolved = candidate.resolve()
+        return resolved in {protected, protected.parent}
+    except (OSError, RuntimeError, ValueError):
+        # Unresolved unrelated paths retain their existing fail-closed guard;
+        # do not misclassify them as proposal-store accesses.
+        root = Path(home) / ".mimir"
+        return candidate == root or candidate.is_relative_to(root)
+
+
 def queue_proposal(
     home: Path, *, content: str, stream: str, rationale: str,
     proposed_by: str, turn_id: str, origin_trigger: str, origin_ref: str | None,
@@ -48,8 +64,17 @@ def queue_proposal(
     ) as file:
         fcntl.flock(file.fileno(), fcntl.LOCK_EX)
         pending = []
-        for line in file:
-            record = json.loads(line)
+        for line_number, line in enumerate(file, 1):
+            try:
+                record = json.loads(line)
+            except ValueError:
+                raise ProposalRefusal(f"malformed proposal store record at line {line_number}") from None
+            required = ("status", "content_sha256", "proposed_by", "id")
+            if not isinstance(record, dict) or any(
+                not isinstance(record.get(key), str) or not record[key].strip()
+                for key in required
+            ):
+                raise ProposalRefusal(f"malformed proposal store record at line {line_number}")
             if record["status"] == "pending":
                 pending.append(record)
         if any(record["content_sha256"] == digest for record in pending):

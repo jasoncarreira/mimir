@@ -69,9 +69,21 @@ def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_tur
 
     saga_db = env.home / "saga.db"
     saga = SagaStore(db_path=saga_db, embedding_dim=4)
+    # A misplaced SAGA write must reach the unchanged-store assertion, not
+    # fail incidentally on ambient provider availability or vector dimensions.
+    import struct
+
+    monkeypatch.setattr(
+        "mimir.saga.client._embed_text_sync",
+        lambda text: (struct.pack("4f", 1.0, 0.0, 0.0, 0.0), "stub", "stub", 4),
+    )
     monkeypatch.setitem(_MEMORY_STATE, "client", saga)
+    # Exercise a real write before taking the baseline: this fake embedder
+    # supports the write path a faulty memory_propose implementation might use.
+    asyncio.run(saga.store("Existing fixture fact", stream="semantic"))
     conn = saga._ensure_conn()
     before_atoms = conn.execute("SELECT COUNT(*) FROM atoms").fetchone()[0]
+    assert before_atoms == 1
     before_tables = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
     before = saga_db.read_bytes()
     content = "Fact with newline\nkept verbatim"
@@ -151,25 +163,82 @@ def test_21st_pending_per_principal_is_refused(proposal_turn):
 def test_file_tools_cannot_access_proposal_path(proposal_turn):
     env = proposal_turn
     env.call()
-    path = str(proposal_path(env.home))
+    paths = (
+        str(proposal_path(env.home)), "/.mimir/memory-proposals.jsonl",
+        ".mimir/memory-proposals.jsonl", str(proposal_path(env.home).parent),
+        "/.mimir", ".mimir",
+    )
     registry = get_tool_registry()
     human = create_auth_context(AgentEvent(
         trigger="user_message", channel_id="web-operator", source="web",
         source_id="message-1", author="viewer",
     ), enforce=True, ifc_labels=env.labels)
     for auth in (env.auth, replace(env.auth, roles=("admin",)), human):
-        for tool in ("read_file", "write_file", "edit_file", "ls"):
-            args = {"file_path": path} if tool == "read_file" else {"path": path}
-            if tool in {"write_file", "edit_file"}:
-                args["file_path"] = path
-            decision = registry.authorize_tool(tool, auth, enforce=True,
-                                                target_channel=path, arguments=args,
-                                                ifc_labels=env.labels)
-            assert not decision.allowed, (tool, decision)
-            assert decision.reason == "protected_memory_proposal_path"
-        assert not registry.authorize_tool(
-            "ls", auth, enforce=True, arguments={"path": str(proposal_path(env.home).parent)},
-        ).allowed
+        for path in paths:
+            for tool in (
+                "read_file", "aread", "write_file", "edit_file", "ls", "als",
+                "glob", "aglob", "grep", "agrep",
+            ):
+                key = "file_path" if tool in {"read_file", "aread", "write_file", "edit_file"} else "path"
+                decision = registry.authorize_tool(
+                    tool, auth, enforce=True, target_channel=path,
+                    arguments={key: path}, ifc_labels=env.labels,
+                )
+                assert not decision.allowed, (tool, path, decision)
+                assert decision.reason == "protected_memory_proposal_path"
+
+
+def test_backend_keeps_store_out_of_admin_reads_and_broad_searches(proposal_turn):
+    from mimir.readonly_backend import WriteGuardBackend
+
+    env = proposal_turn
+    env.call()
+    env.turn.auth_context = replace(env.auth, roles=("admin",), service_authority=None)
+    backend = WriteGuardBackend(root_dir=env.home, writable_dirs=[".mimir", "state"])
+    for path in (str(proposal_path(env.home)), "/.mimir/memory-proposals.jsonl", ".mimir/memory-proposals.jsonl"):
+        assert backend.read(path).error
+        assert asyncio.run(backend.aread(path)).error
+        assert backend.write(path, "replacement").error
+        assert backend.edit(path, "pending", "approved").error
+    for path in (str(proposal_path(env.home).parent), "/.mimir", ".mimir"):
+        assert backend.ls(path).error
+        assert asyncio.run(backend.als(path)).error
+    (env.home / "public.jsonl").write_text("A useful fact\n")
+    for result in (backend.glob("*.jsonl", "/"), asyncio.run(backend.aglob("*.jsonl", "/"))):
+        assert [match["path"] for match in result.matches] == ["/public.jsonl"]
+    for result in (backend.grep("A useful fact", "/"), asyncio.run(backend.agrep("A useful fact", "/"))):
+        assert [match["path"] for match in result.matches] == ["/public.jsonl"]
+    listing = backend.ls("/")
+    assert any(entry["path"] == "/public.jsonl" for entry in listing.entries)
+    assert not any(".mimir" in entry["path"] for entry in listing.entries)
+
+
+@pytest.mark.parametrize("bad_record", [
+    {}, [], None, 42, "record", {"status": "pending"},
+    {"status": "pending", "content_sha256": [], "proposed_by": "p", "id": "mp-1"},
+    *({key: value for key, value in {"status": "pending", "content_sha256": "hash", "proposed_by": "p", "id": "mp-1"}.items() if key != omitted}
+      for omitted in ("status", "content_sha256", "proposed_by", "id")),
+])
+def test_malformed_store_refuses_without_writing(proposal_turn, bad_record):
+    env = proposal_turn
+    assert "queued" in env.call()
+    path = proposal_path(env.home)
+    with path.open("a") as handle:
+        handle.write(json.dumps(bad_record) + "\n")
+    before = path.read_bytes()
+    assert "malformed proposal store record at line 2" in env.call(content="Another fact")
+    assert path.read_bytes() == before
+
+
+def test_invalid_json_store_refuses_without_writing(proposal_turn):
+    env = proposal_turn
+    assert "queued" in env.call()
+    path = proposal_path(env.home)
+    with path.open("a") as handle:
+        handle.write("not json\n")
+    before = path.read_bytes()
+    assert "malformed proposal store record at line 2" in env.call(content="Another fact")
+    assert path.read_bytes() == before
 
 
 def test_taint_refusal_hint_only_when_tool_granted(proposal_turn):

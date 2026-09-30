@@ -5622,6 +5622,7 @@ def _saga_taint_refusal_for_turn(auth_context: Any) -> str:
     if turn is None or turn.auth_context is not auth_context:
         return SAGA_TAINT_REFUSAL
     service = get_trusted_service_from_auth_context(auth_context)
+    # Keep this identical to memory_propose's admin/service capability gate.
     if is_admin(auth_context) or service_can_invoke_operation(service, "memory_propose"):
         return SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
     return SAGA_TAINT_REFUSAL
@@ -8771,23 +8772,22 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
-        if tool_name in {"read_file", "write_file", "edit_file", "ls"}:
+        if tool_name in {
+            "read_file", "aread", "write_file", "edit_file",
+            "ls", "als", "glob", "aglob", "grep", "agrep",
+        }:
             home = os.environ.get("MIMIR_HOME", "").strip()
             args = arguments or {}
             raw_path = args.get("file_path") or args.get("path") or target_channel
             if home and isinstance(raw_path, str) and raw_path.strip():
-                root = Path(home).resolve() / ".mimir"
-                protected_file = root / "memory-proposals.jsonl"
+                from .memory_proposals import is_protected_proposal_path
+
+                home_root = Path(home).resolve()
                 candidate = Path(raw_path)
-                if not candidate.is_absolute():
-                    candidate = Path(home) / raw_path.lstrip("/")
-                try:
-                    protected = candidate == protected_file or candidate.resolve() == protected_file.resolve() or (
-                        tool_name == "ls" and (candidate == root or candidate.resolve() == root.resolve())
-                    )
-                except (OSError, RuntimeError):
-                    protected = candidate == protected_file or (tool_name == "ls" and candidate == root)
-                if protected:
+                # Match the home backend's host, virtual and relative spellings.
+                if not candidate.is_relative_to(home_root):
+                    candidate = home_root / raw_path.lstrip("/")
+                if is_protected_proposal_path(candidate):
                     return finish(ToolAuthorization(
                         tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
                         allowed=False, reason="protected_memory_proposal_path",
