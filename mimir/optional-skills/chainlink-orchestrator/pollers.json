@@ -21,6 +21,8 @@
       "pass_env": [
         "MIMIR_HOME",
         "MIMIR_MODEL_SPEC",
+        "MIMIR_MODEL_REASONING_EFFORT",
+        "MIMIR_WORKLINK_REASONING_EFFORT",
         "MIMIR_SOURCE_DIR",
         "MIMIR_CODING_ENABLED",
         "CHAINLINK_BIN",
