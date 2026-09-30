@@ -213,6 +213,65 @@ def test_backend_keeps_store_out_of_admin_reads_and_broad_searches(proposal_turn
     assert not any(".mimir" in entry["path"] for entry in listing.entries)
 
 
+@pytest.mark.parametrize("alias_kind", ["hard_link", "directory_case", "filename_case"])
+def test_store_identity_aliases_are_protected(proposal_turn, alias_kind):
+    from mimir.memory_proposals import is_protected_proposal_path
+    from mimir.readonly_backend import WriteGuardBackend
+
+    env = proposal_turn
+    assert "queued" in env.call()
+    store = proposal_path(env.home)
+    if alias_kind == "hard_link":
+        alias = env.home / "proposal-alias.jsonl"
+        alias.hardlink_to(store)
+    else:
+        # Exercise native case equivalence only where the fixture filesystem
+        # supports it; the hard-link case proves identity matching everywhere.
+        probe = env.home / "case-probe"
+        probe.write_text("fixture")
+        if not (env.home / "CASE-PROBE").exists():
+            pytest.skip("fixture filesystem is case-sensitive")
+        alias = (env.home / ".MIMIR" / store.name if alias_kind == "directory_case"
+                 else store.with_name("MEMORY-PROPOSALS.JSONL"))
+    assert alias.samefile(store)
+    assert is_protected_proposal_path(alias)
+    if alias_kind == "directory_case":
+        assert is_protected_proposal_path(alias.parent)
+
+    admin = replace(env.auth, roles=("admin",), service_authority=None)
+    env.turn.auth_context = admin
+    backend = WriteGuardBackend(root_dir=env.home, writable_dirs=["."])
+    virtual = "/" + alias.relative_to(env.home).as_posix()
+    for path in (str(alias), virtual):
+        assert backend.read(path).error
+        assert asyncio.run(backend.aread(path)).error
+        assert backend.write(path, "replacement").error
+        assert backend.edit(path, "pending", "approved").error
+        for auth in (env.auth, admin):
+            for tool in ("read_file", "aread", "write_file", "edit_file", "glob", "grep"):
+                key = "path" if tool in {"glob", "grep"} else "file_path"
+                decision = get_tool_registry().authorize_tool(
+                    tool, auth, enforce=True, target_channel=path,
+                    arguments={key: path}, ifc_labels=env.labels,
+                )
+                assert not decision.allowed
+                assert decision.reason == "protected_memory_proposal_path"
+    public = env.home / "public.jsonl"
+    public.write_text("A useful fact\n")
+    assert [match["path"] for match in backend.glob("*.jsonl", "/").matches] == ["/public.jsonl"]
+    assert [match["path"] for match in backend.grep("A useful fact", "/").matches] == ["/public.jsonl"]
+
+
+def test_protected_path_before_store_creation(proposal_turn):
+    from mimir.memory_proposals import is_protected_proposal_path
+
+    store = proposal_path(proposal_turn.home)
+    assert not store.exists()
+    assert is_protected_proposal_path(store)
+    assert is_protected_proposal_path(store.parent)
+    assert not is_protected_proposal_path(proposal_turn.home / "public.jsonl")
+
+
 @pytest.mark.parametrize("bad_record", [
     {}, [], None, 42, "record", {"status": "pending"},
     {"status": "pending", "content_sha256": [], "proposed_by": "p", "id": "mp-1"},
@@ -241,20 +300,47 @@ def test_invalid_json_store_refuses_without_writing(proposal_turn):
     assert path.read_bytes() == before
 
 
-def test_taint_refusal_hint_only_when_tool_granted(proposal_turn):
+@pytest.mark.parametrize("principal", ["admin", "granted_service", "ungranted_service"])
+@pytest.mark.parametrize("override", [None, False, True])
+def test_taint_refusal_hint_and_tool_share_capability_gate(proposal_turn, monkeypatch, principal, override):
+    from mimir import access_control
+
     env = proposal_turn
-    assert "memory_propose" in saga_mutation_taint_refusal(env.auth)
-    service = build_trigger_service_principal(
-        canonical="poller:other", trigger="poller", profile="research",
-        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-        capabilities=("memory_store",), roots=(env.home / "state",), creation_path="test",
-    )
-    other = create_auth_context(AgentEvent(
-        trigger="poller", channel_id=service.canonical, source="poller",
-        source_id="other", service_principal=service.canonical,
-        service_authority=service,
-    ), enforce=True, ifc_labels=env.labels)
-    assert saga_mutation_taint_refusal(other) == SAGA_TAINT_REFUSAL
+    if principal == "admin":
+        auth = replace(env.auth, roles=("admin",), service_authority=None)
+    elif principal == "granted_service":
+        auth = env.auth
+    else:
+        service = build_trigger_service_principal(
+            canonical="poller:other", trigger="poller", profile="research",
+            tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+            capabilities=("memory_store",), roots=(env.home / "state",), creation_path="test",
+        )
+        auth = create_auth_context(AgentEvent(
+            trigger="poller", channel_id=service.canonical, source="poller",
+            source_id="other", service_principal=service.canonical,
+            service_authority=service,
+        ), enforce=True, ifc_labels=env.labels)
+    env.turn.auth_context = auth
+    expected = principal != "ungranted_service" if override is None else override
+    if override is not None:
+        # Changing the one shared gate must affect both consumers, rather than
+        # allowing copied permission checks to pass the agreement test.
+        monkeypatch.setattr(access_control, "can_propose_memory", lambda context: override)
+    assert access_control.can_propose_memory(auth) is expected
+    refusal = saga_mutation_taint_refusal(auth)
+    assert ("memory_propose" in refusal) is expected
+    if not expected:
+        assert refusal == SAGA_TAINT_REFUSAL
+    runtime = ToolRuntime(state={}, context=auth, config={}, stream_writer=lambda _: None,
+                          tool_call_id="gate-agreement", store=None)
+    result = asyncio.run(memory_propose.coroutine(
+        content="fact", stream="semantic", rationale="why", runtime=runtime,
+    ))
+    assert ("queued" in result) is expected
+    assert len(_records(env.home)) == int(expected)
+    if not expected:
+        assert "write access denied" in result
 
 
 def test_missing_ifc_sources_cannot_queue(proposal_turn):

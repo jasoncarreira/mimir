@@ -8,10 +8,7 @@ from pathlib import Path
 from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
-from ..access_control import (
-    get_trusted_service_from_auth_context, is_admin,
-    saga_mutation_taint_refusal, service_can_invoke_operation,
-)
+from .. import access_control
 from ..memory_proposals import ProposalRefusal, queue_proposal
 from ..models import AuthContext, InformationFlowLabels
 from ..read_policy import text_contains_secret
@@ -33,11 +30,9 @@ async def memory_propose(
     auth = runtime.context if runtime is not None and isinstance(runtime.context, AuthContext) else None
     if auth is None:
         return "memory_propose refused: missing turn authority"
-    if saga_mutation_taint_refusal(auth) is None:
+    if access_control.saga_mutation_taint_refusal(auth) is None:
         return "memory_propose refused: this turn can store directly; use memory_store"
-    if not (is_admin(auth) or service_can_invoke_operation(
-        get_trusted_service_from_auth_context(auth), "memory_propose",
-    )):
+    if not access_control.can_propose_memory(auth):
         return "memory_propose refused: write access denied"
     labels = auth.ifc_state.current(auth.ifc_labels)
     if not isinstance(labels, InformationFlowLabels) or not labels.sources:

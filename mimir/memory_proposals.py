@@ -28,6 +28,16 @@ def is_protected_proposal_path(candidate: Path) -> bool:
     try:
         protected = proposal_path(Path(home).resolve()).resolve()
         resolved = candidate.resolve()
+        # Path.resolve does not canonicalize case on all filesystems. File
+        # identity also covers case aliases and hard links to the same store.
+        for target in (protected, protected.parent):
+            try:
+                if os.path.samefile(resolved, target):
+                    return True
+            except (OSError, ValueError):
+                # A missing candidate/store still needs lexical protection,
+                # including writes before the proposal store is first created.
+                continue
         return resolved in {protected, protected.parent}
     except (OSError, RuntimeError, ValueError):
         # Unresolved unrelated paths retain their existing fail-closed guard;

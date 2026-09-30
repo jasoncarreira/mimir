@@ -5615,15 +5615,20 @@ SAGA_TAINT_REFUSAL = (
 )
 
 
+def can_propose_memory(auth_context: Any) -> bool:
+    """Shared capability gate for the proposal tool and its taint-refusal hint."""
+    return is_admin(auth_context) or service_can_invoke_operation(
+        get_trusted_service_from_auth_context(auth_context), "memory_propose",
+    )
+
+
 def _saga_taint_refusal_for_turn(auth_context: Any) -> str:
     from ._context import get_current_turn
 
     turn = get_current_turn()
     if turn is None or turn.auth_context is not auth_context:
         return SAGA_TAINT_REFUSAL
-    service = get_trusted_service_from_auth_context(auth_context)
-    # Keep this identical to memory_propose's admin/service capability gate.
-    if is_admin(auth_context) or service_can_invoke_operation(service, "memory_propose"):
+    if can_propose_memory(auth_context):
         return SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
     return SAGA_TAINT_REFUSAL
 
