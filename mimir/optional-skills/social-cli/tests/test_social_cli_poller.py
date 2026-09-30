@@ -403,31 +403,17 @@ def test_own_handle_missing_env_returns_empty(fresh_poller, monkeypatch, tmp_pat
 def test_action_hint_names_the_platform_suffixed_outbox(
     fresh_poller, monkeypatch, capsys, tmp_path,
 ):
-    """The wake-up hint must name ``outbox-<platform>.yaml`` and a matching
-    ``dispatch --platform <platform>``.
-
-    Regression for the silent no-op: ``dispatch --platform bsky`` resolves
-    ``outbox-bsky.yaml`` and takes no fallback to a shared ``outbox.yaml`` —
-    it logs "No outbox file found" and exits 0. A hint naming the unsuffixed
-    file therefore instructs the agent into a guaranteed miss that looks like
-    success. muninn-mimir filed this five times before the hint was fixed.
-    """
+    """The wake-up hint routes to the proposal surface with a real count."""
     _write_inbox(tmp_path, [_notif("n1", platform="bsky")])
     monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
 
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert f"{tmp_path}/outbox-bsky.yaml" in prompt
-    assert "run-social-cli.sh social-cli-notifications dispatch --platform bsky" in prompt
-    assert "`social-cli dispatch" not in prompt
-    assert "Count first: posts/replies cap 5/UTC day" in prompt
-    assert '- ignore: { id: "n1", reason: "..." }' in prompt
-    # the unsuffixed path must not be offered as the thing to write
-    assert "<STATE_DIR>/outbox.yaml" not in prompt
-    assert "append to <STATE_DIR>/outbox.yaml" not in prompt
-    # and the reason the suffix matters travels with it
-    assert "No outbox file found" in prompt
+    assert "state/social-outbox/social-cli-notifications/" in prompt
+    assert "Today bsky posts/replies: 0 / 5 per UTC day" in prompt
+    assert all(tool in prompt for tool in ("open_proposal", "edit_file", "write_file", "submit_proposal"))
+    assert "dispatch --" not in prompt and "run-social-cli.sh" not in prompt
 
 
 def test_action_hint_suffix_tracks_the_platform(
@@ -441,9 +427,38 @@ def test_action_hint_suffix_tracks_the_platform(
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert f"{tmp_path}/outbox-x.yaml" in prompt
-    assert "run-social-cli.sh social-cli-notifications dispatch --platform x" in prompt
-    assert "outbox-bsky.yaml" not in prompt
+    assert "Today x posts/replies: 0 / 5 per UTC day" in prompt
+
+
+def test_prompt_count_comes_from_todays_sent_ledger(fresh_poller, monkeypatch, capsys, tmp_path):
+    from datetime import datetime, timezone
+    import yaml
+
+    state = tmp_path / "social-cli-notifications"
+    state.mkdir()
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", state)
+    monkeypatch.setattr(fresh_poller, "CURSOR_FILE", state / "emitted.json")
+    today = datetime.now(timezone.utc).isoformat()
+    (state / "sent_ledger-bsky.yaml").write_text(yaml.safe_dump([
+        {"action": "reply", "platform": "bsky", "timestamp": today, "createdId": str(i)}
+        for i in range(2)
+    ]))
+    _write_inbox(state, [_notif("n1")])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+    fresh_poller.main()
+    assert "Today bsky posts/replies: 2 / 5 per UTC day" in _capture_emits(capsys)[0]["prompt"]
+
+
+def test_prompt_does_not_assume_headroom_when_count_fails(fresh_poller, monkeypatch, capsys, tmp_path):
+    state = tmp_path / "social-cli-notifications"
+    state.mkdir()
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", state)
+    monkeypatch.setattr(fresh_poller, "CURSOR_FILE", state / "emitted.json")
+    (state / "sent_ledger-bsky.yaml").write_text("not a valid ledger\n")
+    _write_inbox(state, [_notif("n1")])
+    monkeypatch.setattr(fresh_poller, "_sync", lambda *a, **k: None)
+    fresh_poller.main()
+    assert "unknown (treat as cap reached)" in _capture_emits(capsys)[0]["prompt"]
 
 
 def test_hint_uses_custom_poller_and_home_relative_state(fresh_poller, monkeypatch, tmp_path):
@@ -451,12 +466,9 @@ def test_hint_uses_custom_poller_and_home_relative_state(fresh_poller, monkeypat
     monkeypatch.setattr(fresh_poller, "POLLER_NAME", "custom-notifications")
     monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path / "state/pollers/custom-notifications")
     prompt = fresh_poller._format_event(_notif("n1"))["prompt"]
-    assert "state/pollers/custom-notifications/outbox-bsky.yaml" in prompt
+    assert "state/social-outbox/custom-notifications/" in prompt
     assert str(tmp_path) not in prompt
-    assert "run-social-cli.sh custom-notifications dispatch --platform bsky" in prompt
-    assert "read_file + edit_file if present; write_file only creates" in prompt
-    assert "<STATE_DIR>" not in prompt and "append to" not in prompt
-    assert '- ignore: { id: "n1", reason: "..." }' in prompt
+    assert "submit_proposal" in prompt
 
 
 @pytest.mark.parametrize("nid", ["n1", "at://did:plc:abcdefghijklmnopqrstuvwx/app.bsky.feed.post/3mabcdef12345"])
@@ -467,21 +479,8 @@ def test_notifications_hint_fits_existing_main_budget(fresh_poller, monkeypatch,
     monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path / "state/pollers" / poller_name)
     prompt = fresh_poller._format_event(_notif(nid))["prompt"]
     hint = "\n\n→" + prompt.split("\n\n→", 1)[1]
-    # Main's pre-change string is the spec's budget, not an arbitrary 600.
-    main_hint = (
-        "\n\n→ To reply or react: append to <STATE_DIR>/outbox-bsky.yaml"
-        " + run `social-cli dispatch --platform bsky`.\n"
-        "  Minimal shape:\n"
-        "    dispatch:\n"
-        f'      - reply: {{ platform: bsky, id: "{nid}", text: "..." }}\n'
-        f'      - like:  {{ platform: bsky, id: "{nid}" }}\n'
-        f'      - ignore: {{ id: "{nid}", reason: "..." }}   # skip without action\n'
-        "  The -bsky suffix is required: dispatch reads outbox-bsky.yaml\n"
-        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
-        "  send_message routes to Discord/Slack — NOT to bsky. Use outbox."
-    )
-    assert len(hint) <= len(main_hint)
-    assert f'- ignore: {{ id: "{nid}", reason: "..." }}' in hint
+    assert len(hint) <= 650
+    assert f'uri: "{nid}"' in hint
 
 
 def test_seeds_state_gitignore(fresh_poller, tmp_path):

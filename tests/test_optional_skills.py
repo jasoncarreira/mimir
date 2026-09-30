@@ -14,7 +14,8 @@ from mimir.access_control import agent_writable_roots, parse_declared_shell_comm
 
 _ROOT = Path(__file__).resolve().parents[1]
 _OPTIONAL_SKILLS = _ROOT / "mimir" / "optional-skills"
-_DECLARING_SKILLS = ("social-cli", "gmail-poller")
+_DECLARING_SKILLS = ("gmail-poller",)
+_WRAPPER_SKILLS = ("social-cli", "gmail-poller")
 _REQUIRES_DEPLOYMENT_BASH = pytest.mark.skipif(
     not Path("/usr/bin/bash").exists(),
     reason="requires deployment-image executable path /usr/bin/bash",
@@ -38,12 +39,11 @@ def test_shipped_poller_manifests_omit_unusable_grants_and_options(
             poller["authority"]["capabilities"]
         ), poller["name"]
         if skill_name == "social-cli":
-            wrappers = [
-                command for command in poller["authority"]["shell_commands"]
-                if command.get("script", "").endswith("run-social-cli.sh")
-            ]
-            assert len(wrappers) == 1, poller["name"]
-            assert "--dry-run" not in wrappers[0]["options"]
+            assert "shell_commands" not in poller["authority"]
+            assert not {"shell_exec", "bash_jobs_list", "bash_job_output"} & set(
+                poller["authority"]["capabilities"]
+            )
+            assert poller["authority"]["proposal_surface"] == "social-outbox"
 
 
 @_REQUIRES_DEPLOYMENT_BASH
@@ -73,7 +73,7 @@ def test_shipped_shell_commands_parse_in_installed_skill(
         assert len(parsed) == len(declarations)
 
 
-@pytest.mark.parametrize("skill_name", _DECLARING_SKILLS)
+@pytest.mark.parametrize("skill_name", _WRAPPER_SKILLS)
 def test_shell_wrappers_do_not_expose_interpreter_passthrough(skill_name: str) -> None:
     scripts = (_OPTIONAL_SKILLS / skill_name / "scripts").glob("run-*.sh")
     wrappers = list(scripts)

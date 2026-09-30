@@ -730,3 +730,65 @@ def test_poller_proposal_middleware_defaults_and_backend_reads(
     # Abandon also receives the materialized default and reaches only this scope.
     invoke(tp.open_proposal, source="https://arxiv.org/abs/2609.00042")
     assert "Abandoned" in invoke(tp.abandon_proposal)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failed", "unset"])
+def test_social_submit_server_pings_once_with_added_entries(
+    monkeypatch, proposal_home, poller_runtime, caplog, outcome,
+):
+    import importlib
+    alerts = importlib.import_module("mimir.tools.operator_alert")
+
+    auth = replace(poller_runtime.context, service_authority=replace(
+        poller_runtime.context.service_authority, proposal_surface="social-outbox"))
+    poller_runtime = replace(poller_runtime, context=auth)
+    scope = PollerProposalScope("poller:papers", "papers-turn-42", "feed:item:42",
+                                "feed:item:42", "social-outbox")
+    state = auth.poller_proposal_state
+    state.scope = scope
+    state.worktree = poller_worktree_path(proposal_home, scope)
+    target = state.worktree / scope.surface_root / "outbox-one.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("dispatch:\n  - action: post\n    text: " + "A" * 90 + "\n"
+                      "  - action: like\n    uri: at://public\n    cid: public\n"
+                      "  - action: thread\n    posts:\n      - " + "B" * 90 +
+                      "\n      - text: " + "C" * 90 + "\n")
+    state.active = True
+    sent = []
+
+    class Channels:
+        async def send(self, channel, text, *, final):
+            sent.append((channel, text, final))
+            return SimpleNamespace(sent=True)
+
+    monkeypatch.setattr(alerts, "_channel_registry", Channels())
+    monkeypatch.setattr(alerts, "_config", SimpleNamespace(
+        operator_alert_channel="" if outcome == "unset" else "operator-channel"))
+
+    def finalize(*args, **kwargs):
+        return ProposalResult(outcome != "failed", "branch", outcome != "failed",
+                              "https://example.org/pr/42" if outcome != "failed" else None,
+                              "secret" if outcome == "failed" else None)
+
+    monkeypatch.setattr(tp, "_finalize_proposal", finalize)
+
+    async def log(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(tp, "log_event", log)
+    if outcome == "failed":
+        with pytest.raises(tp.ProposalSubmissionError):
+            _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
+    else:
+        _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
+    if outcome == "success":
+        assert len(sent) == 1
+        channel, text, final = sent[0]
+        assert channel == "operator-channel" and final
+        assert "papers: 3 entries added" in text
+        assert "post: " + "A" * 80 in text and "A" * 81 not in text
+        assert "like:" in text and "thread: " + "B" * 80 in text
+        assert " | " + "C" * 80 in text and "https://example.org/pr/42" in text
+    else:
+        assert sent == []
+    assert sum("operator alert channel is unset" in r.message for r in caplog.records) == (outcome == "unset")

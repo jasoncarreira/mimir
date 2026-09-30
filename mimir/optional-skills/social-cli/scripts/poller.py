@@ -5,10 +5,8 @@ Runs `social-cli sync` (which writes one `inbox-<platform>.yaml` per
 platform in the working directory), then walks the parsed YAML and emits one JSONL event
 per never-before-seen notification ID.
 
-The poller does NOT call `social-cli dispatch` — that's the agent's
-job (decide what to do, write `outbox-<platform>.yaml`, then
-dispatch). The poller's only responsibility is signaling that
-there's something new to look at. Re-emit prevention is cursor-side:
+The poller dispatches only merged outbox files before sync, then signals
+new notifications. Re-emit prevention is cursor-side:
 we track which notification IDs we've already surfaced, and skip
 them on subsequent polls even if they're still pending in
 inbox-<platform>.yaml (i.e. the agent hasn't dispatched yet).
@@ -59,9 +57,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from dispatcher import _count, dispatch_merged
+
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "emitted.json"
 POLLER_NAME = os.environ.get("POLLER_NAME", "social-cli-notifications")
+_TODAY_COUNTS: dict[str, int | None] = {}
 
 # Cursor cap. Notification IDs are larger than Gmail message IDs
 # (Bluesky AT URIs run ~80 chars), so 1000 = ~100KB on disk. Covers
@@ -313,7 +314,7 @@ def _format_event(notif: dict) -> dict | None:
     )
 
     text_line = f"\n  > {text}" if text else ""
-    # Action hint: identifies the right tool (outbox + dispatch) for any
+    # Action hint: identifies the proposal surface for any
     # response the agent makes to this notification. The bare event
     # ("mention from X / > text / id: ...") doesn't tell the agent
     # WHERE to send the reply, so the default reach is ``send_message``
@@ -322,33 +323,19 @@ def _format_event(notif: dict) -> dict | None:
     # (was ~250; the suffix warning below adds a measured +150);
     # bounded by ``batch_size`` (default 3 for notifications).
     #
-    # The filename MUST carry the platform suffix. ``dispatch``
-    # resolves ``outbox-<platform>.yaml`` whenever social-cli's
-    # ``state.platformIsolation`` is on (its default), and the
-    # ``--platform`` path takes no legacy fallback to a shared
-    # ``outbox.yaml`` — it logs "No outbox file found" and exits 0.
-    # This hint named the unsuffixed file until 2026-08-04: the same
-    # defect ``_load_inbox`` already documents on the read side.
-    #
-    # For ``like`` / ``follow`` / ``repost`` notifications (where the
-    # user is signaling, not asking), the agent may decide no
-    # outbound is needed — the hint still applies if it DOES decide
-    # to acknowledge.
+    # The worktree path is returned by open_proposal, never inferred here.
     target_id = post_id or nid
-    home = Path(os.environ.get("MIMIR_HOME", "/mimir-home"))
-    outbox = STATE_DIR / f"outbox-{platform}.yaml"
-    if outbox.is_relative_to(home):
-        outbox = outbox.relative_to(home)
+    count = _TODAY_COUNTS.get(platform)
+    count_text = str(count) if count is not None else "unknown (treat as cap reached)"
     action_hint = (
-        f"\n\n→ Add to {outbox}: read_file + edit_file if present; write_file only creates.\n"
-        f"`bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh {POLLER_NAME} dispatch --platform {platform}`\n"
-        "Count first: posts/replies cap 5/UTC day.\n"
+        f"\n\n→ Today {platform} posts/replies: {count_text} / 5 per UTC day.\n"
+        "Propose via open_proposal(source=id), edit_file in returned worktree "
+        "(write_file for a new file), then submit_proposal(title, rationale).\n"
+        f"Add a new outbox-*.yaml under state/social-outbox/{POLLER_NAME}/ in that worktree.\n"
+        "The server pings the operator automatically after submission.\n"
         "dispatch:\n"
-        f"  - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
-        f"  - like: {{ platform: {platform}, id: \"{target_id}\" }}\n"
-        f"  - ignore: {{ id: \"{nid}\", reason: \"...\" }}\n"
-        'Bare outbox.yaml: "No outbox file found".\n'
-        f"send_message is chat, NOT {platform}."
+        f"  - action: reply\n    parent: {{ uri: \"{target_id}\", cid: \"<cid>\" }}\n"
+        "    text: \"...\""
     )
     prompt = (
         f"[{platform}] {ntype} from {author}"
@@ -427,6 +414,10 @@ def main() -> int:
     users_dir = os.environ.get("MIMIR_SOCIAL_USERS_DIR", "").strip() or None
     bin_path = os.environ.get("SOCIAL_CLI_BIN", "").strip() or "social-cli"
 
+    home = Path(os.environ.get("MIMIR_HOME", "")).resolve()
+    if os.environ.get("MIMIR_HOME"):
+        dispatch_merged(home, STATE_DIR, POLLER_NAME, bin_path)
+
     # Step 1: sync — populates inbox-<platform>.yaml in STATE_DIR.
     try:
         _sync(platforms, limit, users_dir, bin_path)
@@ -440,6 +431,9 @@ def main() -> int:
     except (ImportError, OSError) as exc:
         _eprint(f"social-cli: inbox parse failed: {exc}")
         return 3
+
+    global _TODAY_COUNTS
+    _TODAY_COUNTS = {platform: _count(platform, STATE_DIR) for platform in platforms} if notifications else {}
 
     # Step 3: emit new IDs only.
     cursor = _load_cursor()

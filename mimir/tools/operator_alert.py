@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import logging
 
 from langchain_core.tools import ToolException, tool
 
@@ -14,6 +15,24 @@ OPERATOR_ALERT_MAX_PER_TURN = 3
 
 _channel_registry: Any = None
 _config: Any = None
+_log = logging.getLogger(__name__)
+
+
+async def send_social_proposal_ping(text: str) -> None:
+    """Server-owned proposal notification; no model-selected channel or text."""
+    channel = (getattr(_config, "operator_alert_channel", "") or "").strip()
+    if not channel:
+        _log.warning("social-outbox proposal: operator alert channel is unset")
+        return
+    if _channel_registry is None:
+        _log.warning("social-outbox proposal: channel registry is unavailable")
+        return
+    try:
+        result = await _channel_registry.send(channel, text, final=True)
+        if not getattr(result, "sent", True):
+            _log.warning("social-outbox proposal: operator notification not delivered")
+    except Exception:
+        _log.exception("social-outbox proposal: operator notification failed")
 
 
 def set_operator_alert_dependencies(channel_registry: Any, config: Any) -> None:

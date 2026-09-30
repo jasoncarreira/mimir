@@ -9,18 +9,9 @@
         "profile": "research",
         "tier": "scoped-with-provenance",
         "saga_full_corpus_read": true,
-        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"],
-        "shell_commands": [
-          {
-            "exec": "bash",
-            "path": "/usr/bin/bash",
-            "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
-            "options": ["--platform", "--action", "--since", "--json"]
-          },
-          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
-          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
-        ]
+        "proposal_surface": "social-outbox"
       },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
@@ -40,18 +31,9 @@
         "profile": "research",
         "tier": "scoped-with-provenance",
         "saga_full_corpus_read": true,
-        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "send_message", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"],
-        "shell_commands": [
-          {
-            "exec": "bash",
-            "path": "/usr/bin/bash",
-            "script": "/mimir-home/skills/social-cli/scripts/run-social-cli.sh",
-            "options": ["--platform", "--action", "--since", "--json"]
-          },
-          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
-          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
-        ]
+        "proposal_surface": "social-outbox"
       },
       "pass_env": [
         "MIMIR_SOCIAL_PLATFORMS",
