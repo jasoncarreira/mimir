@@ -45,6 +45,7 @@ from langchain_core.tools import ToolException
 
 from .channel_registry import OPERATOR_CHANNEL_SENTINEL, resolve_deliver_channel
 from .identities import AccessMetadata
+from .memory_proposals import is_protected_model_path
 from .models import (
     NormalizedPullRequestSnapshot,
     RetainedFactoryScope,
@@ -174,6 +175,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "memory_query": ToolFlowDirection.SOURCE,
     "memory_get": ToolFlowDirection.SOURCE,
     "memory_store": ToolFlowDirection.SINK,
+    "memory_propose": ToolFlowDirection.SINK,
     "open_proposal": ToolFlowDirection.SINK,
     "submit_proposal": ToolFlowDirection.SINK,
     "abandon_proposal": ToolFlowDirection.SINK,
@@ -405,6 +407,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "send_message": CapabilityTier.SCOPE_CONTAINED,
     "operator_alert": CapabilityTier.SCOPE_CONTAINED,
     "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
+    "memory_propose": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
     "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
@@ -4640,21 +4643,6 @@ def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | Non
         return None
 
 
-def _is_live_social_outbox(path: Path) -> bool:
-    home = os.environ.get("MIMIR_HOME", "").strip()
-    if not home:
-        return False
-    root = Path(home).resolve() / "state" / "social-outbox"
-    try:
-        lexical = Path(os.path.abspath(path))
-        if lexical == root or lexical.is_relative_to(root):
-            return True
-        resolved = path.resolve(strict=False)
-        return resolved == root or resolved.is_relative_to(root)
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
 def _poller_write_roots_refusal_detail(
     service: ServicePrincipal, policy: ServiceSinkPolicy | None,
     auth_context: AuthContext | None,
@@ -4749,7 +4737,7 @@ def _target_within_trigger_service_write_roots(
             return bool(root == proposal_root and proposal_root is not None
                         and getattr(scope, "surface", None) == "social-outbox"
                         and relative.is_relative_to(scope.surface_root))
-        if _is_live_social_outbox(candidate) or any(
+        if is_protected_model_path(candidate) or any(
             (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
             or _is_static_service_protected_write_path(
                 relative,
@@ -4771,7 +4759,7 @@ def _target_within_trigger_service_write_roots(
         json.JSONDecodeError, OSError, PathOutsideHomeError, RuntimeError, ValueError,
     ):
         return False
-    return bool(resolved_relatives) and not _is_live_social_outbox(resolved) and not any(
+    return bool(resolved_relatives) and not is_protected_model_path(resolved) and not any(
         (WriteResourceAdapter._is_protected_path(relative) and not allowed_surface(root, relative))
         or _is_static_service_protected_write_path(
             relative,
@@ -5017,7 +5005,7 @@ def _is_service_protected_read_path(
 ) -> bool:
     """Apply protected names to the full target, including its matched root."""
     target = root / relative
-    if _is_live_social_outbox(target):
+    if is_protected_model_path(target):
         return True
     protected = {
         part.lower() for part in target.parts
@@ -5693,6 +5681,24 @@ SAGA_TAINT_REFUSAL = (
 )
 
 
+def can_propose_memory(auth_context: Any) -> bool:
+    """Shared capability gate for the proposal tool and its taint-refusal hint."""
+    return is_admin(auth_context) or service_can_invoke_operation(
+        get_trusted_service_from_auth_context(auth_context), "memory_propose",
+    )
+
+
+def _saga_taint_refusal_for_turn(auth_context: Any) -> str:
+    from ._context import get_current_turn
+
+    turn = get_current_turn()
+    if turn is None or turn.auth_context is not auth_context:
+        return SAGA_TAINT_REFUSAL
+    if can_propose_memory(auth_context):
+        return SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
+    return SAGA_TAINT_REFUSAL
+
+
 def saga_mutation_taint_refusal(
     auth_context: Any, fallback: Any = None,
 ) -> str | None:
@@ -5700,24 +5706,24 @@ def saga_mutation_taint_refusal(
     from .models import InformationFlowLabels
 
     if auth_context is None:
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     state = getattr(auth_context, "ifc_state", None)
     get_current = getattr(state, "current", None)
     if not callable(get_current):
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     try:
         labels = get_current(
             fallback if fallback is not None else getattr(auth_context, "ifc_labels", None)
         )
     except Exception:
         log.exception("saga_mutation_integrity_evaluation_failed")
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     if (
         not isinstance(labels, InformationFlowLabels)
         or not labels.sources
         or labels.has_untrusted_active_ingest
     ):
-        return SAGA_TAINT_REFUSAL
+        return _saga_taint_refusal_for_turn(auth_context)
     return None
 
 
@@ -6373,6 +6379,14 @@ class SinkGate:
                 would_block=True,
             )
 
+        if tool_name == "memory_propose":
+            # Review queue only: no atom is written. Keep normal capability
+            # checks in authorize_tool, but do not impose SAGA's trust gate.
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.OPEN,
+                allowed=True, reason="memory_proposal_queue",
+                service_principal=service, enforcement_enabled=enforce,
+            )
         if sink_category is SinkCategory.SAGA:
             taint_refusal = saga_mutation_taint_refusal(auth_context, ifc_labels)
             if taint_refusal is not None:
@@ -7690,7 +7704,7 @@ class WriteResourceAdapter:
     _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
     _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
     _PROTECTED_NAMES: frozenset[str] = frozenset({
-        ".env", ".git", "compose.env", "rate_limits.json",
+        ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
         "core-memory", "core_memory", "corememory", "prompts",
     })
@@ -7750,7 +7764,7 @@ class WriteResourceAdapter:
             return False
         except StopIteration:
             return False
-        return not _is_live_social_outbox(candidate) and not cls._is_protected_path(resolved.relative_to(root))
+        return not is_protected_model_path(candidate) and not cls._is_protected_path(resolved.relative_to(root))
 
     @classmethod
     def authorize_skill_write(
@@ -7911,6 +7925,7 @@ class OperationCatalog:
         "spawn_open_code",
         "task",
         "memory_store",
+        "memory_propose",
         "saga_feedback",
         "saga_mark_contributions",
         "saga_end_session",
@@ -8870,18 +8885,27 @@ class ToolRegistry:
             return auth
 
         service = get_trusted_service_from_auth_context(auth_context)
-        raw_file_target = (target_channel if tool_name in {"write_file", "edit_file"}
-                           else requested_read_target_from_arguments(tool_name, arguments)
-                           if tool_name in {"read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep"}
-                           else None)
-        file_target = (_resolve_file_tool_target(raw_file_target)
-                       if isinstance(raw_file_target, str) else None)
-        if file_target is not None and _is_live_social_outbox(file_target):
-            return finish(ToolAuthorization(
-                tool_name=tool_name, decision=OperationDecision.RESOURCE_SCOPED,
-                allowed=False, reason="protected_social_outbox", enforcement_enabled=True,
-                would_block=True,
-            ))
+        if tool_name in {
+            "read_file", "aread", "write_file", "edit_file",
+            "ls", "als", "glob", "aglob", "grep", "agrep",
+        }:
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            args = arguments or {}
+            raw_path = args.get("file_path") or args.get("path") or target_channel
+            if home and isinstance(raw_path, str) and raw_path.strip():
+                from .memory_proposals import is_protected_model_path
+
+                home_root = Path(home).resolve()
+                candidate = Path(raw_path)
+                # Match the home backend's host, virtual and relative spellings.
+                if not candidate.is_relative_to(home_root):
+                    candidate = home_root / raw_path.lstrip("/")
+                if is_protected_model_path(candidate):
+                    return finish(ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="protected_memory_proposal_path",
+                        enforcement_enabled=True, would_block=True,
+                    ))
         if (
             service is not None
             and service.authority_profile == "session-boundary"

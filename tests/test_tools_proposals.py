@@ -329,6 +329,23 @@ def test_poller_real_git_flow(monkeypatch, proposal_home, poller_runtime, finish
     assert (proposal_home / "state/wiki/paper.md").read_text() == "original\n"
 
 
+@pytest.mark.parametrize("operation", ["open", "submit", "abandon"])
+def test_tool_layer_refuses_declared_surface_mismatch(monkeypatch, proposal_home, poller_runtime, operation):
+    _inv(tp.open_proposal, runtime=poller_runtime, source="paper:42")
+    state = poller_runtime.context.poller_proposal_state
+    scope = replace(state.scope, surface="social-outbox")
+    state.scope = scope
+    state.worktree = poller_worktree_path(proposal_home, scope)
+    # Exercise the tool's own invariant without the outer access-control gate.
+    for name in ("_open_proposal", "_finalize_proposal", "_abandon_proposal", "list_open_proposals"):
+        monkeypatch.setattr(tp, name, lambda *a, **k: pytest.fail("surface mismatch reached core"))
+    kwargs = {"source": "paper:42"} if operation == "open" else (
+        {"title": "T", "rationale": "R"} if operation == "submit" else {})
+    tool = {"open": tp.open_proposal, "submit": tp.submit_proposal, "abandon": tp.abandon_proposal}[operation]
+    with pytest.raises(ToolPolicyRefusal, match="ownership or worktree mismatch"):
+        asyncio.run(tool.coroutine(runtime=poller_runtime, **kwargs))
+
+
 @pytest.mark.parametrize("tool,kwargs", [
     (tp.open_proposal, {"source": "paper:42"}),
     (tp.submit_proposal, {"title": "T", "rationale": "R"}),

@@ -392,6 +392,9 @@ def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, o
         ({"tier": "scope-contained"}, "exceeds declared tier"),
         ({"scoped_roots": ["state", "wiki:papers"]}, "only declare their own state"),
         ({"proposal_surface": "bogus"}, "unknown proposal_surface"),
+        ({"proposal_surface": []}, "unknown proposal_surface"),
+        ({"proposal_surface": {}}, "unknown proposal_surface"),
+        ({"proposal_surface": None}, "unknown proposal_surface"),
     ]:
         with pytest.raises(ValueError, match=message):
             _parse_poller_authority({**authority, **change}, **arguments)
@@ -3392,6 +3395,62 @@ async def test_run_poller_reconciles_failed_turn_before_next_poll(
     assert recovery_events[-1]["reenqueued"] == 1
     assert recovery_events[-1]["expired"] == 0
     assert recovery_events[-1]["dropped"] == 0
+
+
+@pytest.mark.parametrize("env_mode", ["forwarded", "overlay", "filtered", "unset"])
+async def test_run_poller_recovery_uses_manifest_trust_and_fire_env(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch, env_mode: str,
+) -> None:
+    """Pin the real run_poller activation hook, not just the reconciler API."""
+    skills = tmp_path / "skills"
+    skill_dir = skills / "github-poller"
+    keys = ("GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN")
+    for key, value in zip(keys, ("test-forwarded-token", "test-forwarded-login")):
+        if env_mode == "unset":
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    overlay = dict(zip(keys, ("test-overlay-token", "test-overlay-login")))
+    _install_script(skill_dir, "poller.py", """
+import json, os
+from pathlib import Path
+state = Path(os.environ["STATE_DIR"])
+assert (state / "recovery-called").exists()
+(state / "fire-env.json").write_text(json.dumps({
+    key: os.environ.get(key, "")
+    for key in ("GITHUB_TOKEN", "MIMIR_GITHUB_SELF_LOGIN")
+}))
+""")
+    _write_pollers_json(skill_dir, [{
+        "name": "github-activity", "command": f"{sys.executable} poller.py",
+        "cron": "* * * * *", "trust_source": "github",
+        "pass_env": [] if env_mode == "filtered" else list(keys),
+        "env": overlay if env_mode == "overlay" else {},
+        "recover_failed_turns": True,
+    }])
+    [cfg] = discover_pollers(skills, state_root=tmp_path / "persist")
+    calls = []
+    reconcile = poller_recovery.reconcile_failed_turns
+
+    async def capture_reconcile(**kwargs):
+        calls.append(kwargs)
+        (kwargs["persist_dir"] / "recovery-called").touch()
+        return await reconcile(**kwargs)
+
+    monkeypatch.setattr(poller_recovery, "reconcile_failed_turns", capture_reconcile)
+    assert await run_poller(cfg, enqueue=_CapturingEnqueue()) == 0
+    [call] = calls
+    assert call["trust_source"] == "github"
+    expected = (
+        overlay if env_mode == "overlay" else
+        dict(zip(keys, ("test-forwarded-token", "test-forwarded-login")))
+        if env_mode == "forwarded" else dict.fromkeys(keys, "")
+    )
+    assert call["github_token"] == expected["GITHUB_TOKEN"]
+    assert call["github_self_login"] == expected["MIMIR_GITHUB_SELF_LOGIN"]
+    assert call["recover_failed_turns"] is True
+    assert json.loads((cfg.resolved_persist_dir() / "fire-env.json").read_text()) == expected
+    assert not any(e["type"] == "poller_nonzero_exit" for e in _read_events(home))
 
 
 @pytest.mark.parametrize(

@@ -45,8 +45,7 @@ from typing import Callable, Literal, Mapping
 # subprocess wrapper. One redactor is the point — core diffs must not leak creds.
 from .event_logger import log_event_sync
 from .git_bootstrap import _redact, _run
-from .env import env_bool
-from .outbound_privacy import scan_outbound
+from .outbound_privacy import findings_require_refusal, scan_outbound
 
 #: Protected surfaces a proposal can change, relative to the home / repo root.
 #: Both are git-tracked and blocked from live agent writes (memory/core via the
@@ -592,19 +591,26 @@ def _valid_outbox(text: str) -> bool:
     return True
 
 
-def _check_outbox_files(worktree: Path) -> str | None:
-    """Scan all changed outbox content, including edits, before any commit/push."""
-    res = _git(["diff", "--cached", "--diff-filter=ACMT", "--name-only", "-z"], cwd=worktree)
-    if res.returncode != 0:
-        return "error"
-    for rel in filter(None, (res.stdout or "").split("\0")):
+def _check_outbox_files(worktree: Path, surface: Path | None = None) -> str | None:
+    """Scan staged content, or the complete surface after importing a new base."""
+    if surface is None:
+        res = _git(["diff", "--cached", "--diff-filter=ACMT", "--name-only", "-z"], cwd=worktree)
+        if res.returncode != 0:
+            return "error"
+        paths = list(filter(None, (res.stdout or "").split("\0")))
+    else:
+        try:
+            paths = [str(path.relative_to(worktree))
+                     for path in (worktree / surface).rglob("*") if path.is_file()]
+        except OSError:
+            return "error"
+    for rel in paths:
         try:
             text = (worktree / rel).read_text(encoding="utf-8")
         except (OSError, UnicodeError):
-            return "schema"
+            return "error"
         findings = scan_outbound((text,), tool="submit_proposal", sink_category="network")
-        if any(f.detector == "credential" or env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False)
-               for f in findings):
+        if findings_require_refusal(findings):
             return "privacy"
         if not _valid_outbox(text):
             return "schema"
@@ -744,9 +750,9 @@ def finalize_proposal(
             restored = _git(["stash", "pop", "--index"], cwd=wt)
             if restored.returncode != 0:
                 return ProposalResult(False, branch, False, None, "rolling_conflict", "draft conflicts with rebased base")
-            failure = _check_outbox_files(wt)
+            failure = _check_outbox_files(wt, poller.surface_root)
             if failure:
-                return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed")
+                return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed after rebase")
     commit = _git(["commit", "-m", f"{safe_title}\n\n{safe_rationale}"], cwd=wt)
     if commit.returncode != 0:
         return ProposalResult(

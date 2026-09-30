@@ -245,6 +245,98 @@ def test_social_private_term_follows_enforcement(home, rolling_forge, monkeypatc
     assert allowed.ok
 
 
+def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling_forge, monkeypatch):
+    import mimir.proposals as proposals
+
+    scope = _social_scope("one")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    path = opened.worktree / scope.surface_root / "one.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
+    monkeypatch.setattr(proposals, "_rolling_pr", lambda *a: (None, None))
+    result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
+    assert result.reason == "error" and "unavailable" in result.detail
+    assert not result.pushed and rolling_forge["creates"] == 0
+    assert _git("rev-parse", "HEAD", cwd=opened.worktree).stdout == before
+    assert not _git("ls-remote", "origin", f"refs/heads/{result.branch}", cwd=home).stdout
+
+
+def test_social_rebase_scans_content_imported_from_base(home, rolling_forge):
+    valid = "dispatch:\n  - action: post\n    text: Public update\n"
+    _, _, first = _social_submit(home, "one", valid)
+    imported = home / "state/social-outbox/feed/base.yaml"
+    imported.parent.mkdir(parents=True)
+    imported.write_text("dispatch:\n  - action: post\n    text: public\nunknown: value\n")
+    _git("add", "state/social-outbox/feed/base.yaml", cwd=home)
+    _git("commit", "-m", "base outbox changed", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    tip = _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout
+    _, opened, result = _social_submit(home, "two", valid)
+    assert result.reason == "schema" and "after rebase" in result.detail
+    assert not result.pushed and opened.worktree.exists()
+    assert _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout == tip
+
+
+def test_social_rolling_push_has_exact_lease_and_preserves_concurrent_push(home, rolling_forge, monkeypatch):
+    import mimir.proposals as proposals
+
+    valid = "dispatch:\n  - action: post\n    text: Public update\n"
+    _, _, first = _social_submit(home, "one", valid)
+    rolling_forge["prs"][-1]["state"] = "CLOSED"
+    original = proposals._git
+    observed = []
+    _git("fetch", "origin", first.branch, cwd=home)
+    _git("merge", "--ff-only", f"origin/{first.branch}", cwd=home)
+    _git("commit", "--allow-empty", "-m", "concurrent candidate", cwd=home)
+    concurrent = _git("rev-parse", "HEAD", cwd=home).stdout.strip()
+
+    def racing_git(args, *, cwd):
+        if args and args[0] == "push":
+            leases = [arg for arg in args if arg.startswith("--force-with-lease=")]
+            assert len(leases) == 1 and "--force" not in args
+            assert leases[0].startswith(f"--force-with-lease=refs/heads/{first.branch}:")
+            observed.append(leases[0])
+            # Simulate a second publisher after the lookup, using the fixture remote.
+            _git("push", "origin", f"{concurrent}:refs/heads/{first.branch}", cwd=home)
+        return original(args, cwd=cwd)
+
+    monkeypatch.setattr(proposals, "_git", racing_git)
+    _, opened, result = _social_submit(home, "two", valid)
+    assert observed and not result.ok and not result.pushed
+    assert opened.worktree.exists()
+    assert _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout.startswith(concurrent)
+
+
+@pytest.mark.parametrize("failure", [OSError("unreadable"), UnicodeError("invalid encoding")])
+def test_outbox_unreadable_is_error_not_schema(tmp_path, monkeypatch, failure):
+    import mimir.proposals as proposals
+
+    monkeypatch.setattr(proposals, "_git", lambda *a, **k: subprocess.CompletedProcess([], 0, "x.yaml\0", ""))
+    def unreadable(*a, **k):
+        raise failure
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    assert proposals._check_outbox_files(tmp_path) == "error"
+
+
+@pytest.mark.parametrize("detector,enforced,blocked", [
+    ("credential", "0", True), ("credential", "1", True),
+    ("private_term", "0", False), ("private_term", "1", True),
+    ("pii", "0", False), ("pii", "1", True),
+])
+def test_outbox_shared_privacy_rule(tmp_path, monkeypatch, detector, enforced, blocked):
+    import mimir.proposals as proposals
+    from mimir.outbound_privacy import OutboundFinding, findings_require_refusal
+
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", enforced)
+    (tmp_path / "x.yaml").write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    monkeypatch.setattr(proposals, "_git", lambda *a, **k: subprocess.CompletedProcess([], 0, "x.yaml\0", ""))
+    findings = [OutboundFinding(detector, "test", 1, None)]
+    monkeypatch.setattr(proposals, "scan_outbound", lambda *a, **k: findings)
+    assert findings_require_refusal(findings) is blocked
+    assert proposals._check_outbox_files(tmp_path) == ("privacy" if blocked else None)
+
+
 def test_social_reply_and_thread_known_fields(home, rolling_forge):
     text = ("dispatch:\n  - action: reply\n    text: A public answer\n"
             "    parent:\n      uri: at://public/post\n      cid: public-cid\n"

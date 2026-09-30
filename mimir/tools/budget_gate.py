@@ -894,7 +894,7 @@ def _outbound_privacy_refusal(
             descriptor.sink_category if descriptor is not None else SinkCategory.EXTERNAL_MCP
         )
     )
-    from ..outbound_privacy import scan_outbound
+    from ..outbound_privacy import findings_require_refusal, scan_outbound
 
     findings = (
         list(findings_override)
@@ -927,9 +927,8 @@ def _outbound_privacy_refusal(
     credential_match = any(finding.detector == "credential" for finding in findings)
     private_match = any(finding.detector == "private_term" for finding in findings)
     pii_match = any(finding.detector == "pii" for finding in findings)
-    private_enforced = env_bool("MIMIR_OUTBOUND_PRIVACY_ENFORCE", False, logger=log)
 
-    if not credential_match and (private_match or pii_match) and not private_enforced:
+    if not findings_require_refusal(findings):
         from ..redaction import redact_payload
 
         detector = "private_term" if private_match else "pii"

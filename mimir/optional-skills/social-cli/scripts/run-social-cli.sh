@@ -38,5 +38,13 @@ fi
 
 export STATE_DIR
 export PYTHONPATH="/home/mimir/venv/lib/python3.11/site-packages"
+helper="$(dirname "$(readlink -f "$0")")/count.py"
 cd "$STATE_DIR"
+if [[ "$SUBCOMMAND" == count ]]; then
+  if [[ -f "$helper" ]]; then
+    exec python3 "$helper" "$@"
+  fi
+  echo "social-cli count: count.py helper not found" >&2
+  exit 127
+fi
 exec /usr/local/bin/social-cli "$SUBCOMMAND" "$@"

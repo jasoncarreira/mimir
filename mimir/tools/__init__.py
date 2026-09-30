@@ -13,6 +13,7 @@ API is the flat ``mimir.tools`` namespace.
 
 from .memory import memory_get, memory_query, set_memory_client
 from .store import memory_store
+from .memory_propose import memory_propose
 from .operator_alert import operator_alert, set_operator_alert_dependencies
 from .extra import (
     file_search,
@@ -108,6 +109,7 @@ __all__ = [
     "memory_query",
     "memory_get",
     "memory_store",
+    "memory_propose",
     "file_search",
     "rebuild_index",
     "mimir_get_turn",

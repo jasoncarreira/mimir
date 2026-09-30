@@ -35,7 +35,7 @@ _OLD_SINK_CATEGORIES = {
         "adownload_files", "rebuild_index", "request_mimir_update",
     },
     SinkCategory.SAGA: {
-        "memory_store", "saga_record_skill_learning", "saga_feedback",
+        "memory_store", "memory_propose", "saga_record_skill_learning", "saga_feedback",
         "saga_mark_contributions", "saga_forget", "saga_end_session",
         "commitment_complete", "commitment_snooze", "commitment_dismiss",
         "defer_injected_message",
@@ -97,7 +97,7 @@ _OLD_SINK_DESTINATIONS = {
 
 _OLD_NON_INGESTING = {
     "hands_request_scope", "approve_declassification", "clear_ingest_taint",
-    "request_operator_approval", "memory_store", "open_proposal",
+    "request_operator_approval", "memory_store", "memory_propose", "open_proposal",
     "submit_proposal", "abandon_proposal", "saga_feedback",
     "saga_mark_contributions", "saga_end_session", "saga_record_skill_learning",
     "rebuild_index", "bash_async", "fetch_url", "operator_alert", "send_message",
@@ -158,6 +158,7 @@ _OLD_SPECIAL_EXTRACTORS = {
     "defer_injected_message": "_injected_message_target",
     "request_mimir_update": "_update_target",
     "rebuild_index": "_index_target",
+    "memory_propose": "extract",
     **{
         name: "_repo_pr_target"
         for name in {
@@ -215,7 +216,7 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
             expected_extractor = "_generic_target"
 
         assert descriptor.sink_category is old_categories.get(name), name
-        assert descriptor.sink_destination == old_destinations.get(name), name
+        assert descriptor.sink_destination == ("memory_proposals" if name == "memory_propose" else old_destinations.get(name)), name
         assert descriptor.fetch_authorization is _OLD_FETCH_AUTHORIZATION.get(
             name, FetchAuthorizationKind.NONE
         ), name
@@ -263,3 +264,11 @@ def test_tool_descriptors_are_immutable() -> None:
         TOOL_DESCRIPTORS["send_message"].budget_exempt = False
     with pytest.raises(TypeError):
         TOOL_DESCRIPTORS["new_tool"] = ToolDescriptor()
+
+
+def test_memory_propose_privacy_payload() -> None:
+    descriptor = TOOL_DESCRIPTORS["memory_propose"]
+    assert descriptor.sink_category is SinkCategory.SAGA
+    assert descriptor.sink_payload_extractor(
+        "memory_propose", {"content": "fact", "rationale": "why", "stream": "semantic"}, None,
+    ) == ("fact", "why")
