@@ -296,8 +296,11 @@ def test_poller_real_git_flow(monkeypatch, proposal_home, poller_runtime, finish
     assert state.scope.turn_id == "papers-turn-42"
     assert state.worktree == poller_worktree_path(proposal_home, state.scope)
     assert "state/wiki/" in result and "memory/core/" not in result
+    assert "state/pollers/papers/" in result
+    assert f"{state.worktree.relative_to(proposal_home)}/state/wiki/" in result
     scope = state.scope
-    assert "Already open" in _inv(tp.open_proposal, runtime=poller_runtime, source=scope.source)
+    existing = _inv(tp.open_proposal, runtime=poller_runtime, source=scope.source)
+    assert "Already open" in existing and "state/pollers/papers/" in existing
     assert state.scope == scope
     if finish == "abandon":
         assert "Abandoned" in _inv(tp.abandon_proposal, runtime=poller_runtime)

@@ -35,6 +35,16 @@ TEMPLATE = Path(mimir.__file__).parent / "templates" / "git" / "gitignore"
 SEED = "# Learned behaviors\n\n- original entry\n"
 
 
+def test_proposal_poller_guide_is_linked() -> None:
+    root = Path(__file__).resolve().parents[1]
+    guide = root / "docs/proposal-pollers.md"
+    assert guide.is_file()
+    assert "(proposal-pollers.md)" in (root / "docs/proposals.md").read_text()
+    assert "(../../../docs/proposal-pollers.md)" in (
+        root / "mimir/skills/pollers/SKILL.md"
+    ).read_text()
+
+
 def _git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=check

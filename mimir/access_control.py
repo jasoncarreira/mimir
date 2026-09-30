@@ -4636,6 +4636,37 @@ def _active_poller_proposal_root(auth_context: AuthContext | None) -> Path | Non
         return None
 
 
+def _poller_write_roots_refusal_detail(
+    service: ServicePrincipal, policy: ServiceSinkPolicy | None,
+    auth_context: AuthContext | None,
+) -> str | None:
+    """Describe the research poller's granted roots without changing admission."""
+    if (
+        not _is_research_proposal_poller(service)
+        or policy is None
+        or policy.adapter != "trigger_service_write_roots"
+    ):
+        return None
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    if not home:
+        return None
+    home_root = Path(home).resolve()
+    persist = home_root / "state" / "pollers" / service.canonical.removeprefix("poller:")
+    try:
+        if str(persist) not in json.loads(policy.destination):
+            return None
+    except (TypeError, ValueError):
+        return None
+    roots = [f"`{persist.relative_to(home_root)}/` (drafts and state)"]
+    proposal_root = _active_poller_proposal_root(auth_context)
+    if proposal_root is not None:
+        roots.append(
+            f"`{proposal_root.relative_to(home_root)}/` "
+            "(open proposal worktree; edit only its `state/wiki/`)"
+        )
+    return "Write only under " + " or ".join(roots) + ". Never write to live `state/wiki/`."
+
+
 def _target_matches_poller_proposal(
     target: str, destination: str, *, auth_context: AuthContext | None = None,
 ) -> bool:
@@ -6695,6 +6726,14 @@ class SinkGate:
                     resolved_sink_target=resolved_target,
                     refusal_detail=(
                         repo_review_state_refusal
+                        or (
+                            _poller_write_roots_refusal_detail(
+                                service, service_policy, auth_context,
+                            )
+                            if sink_category is SinkCategory.FILE
+                            and adapter is _target_within_trigger_service_write_roots
+                            else None
+                        )
                         or _service_shell_refusal_detail(
                             target, service_policy, review_state,
                         )
