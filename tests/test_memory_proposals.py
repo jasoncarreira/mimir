@@ -331,6 +331,36 @@ def test_outbox_protection_before_creation_and_worktree_exclusion(proposal_turn)
     assert not is_protected_model_path(home / "scratch/proposals/state/social-outbox/feed/new.yaml")
 
 
+@pytest.mark.parametrize("relative,protected", [
+    ("memory/channels/channel-b/loop/summary.md", False),
+    (".mimir/memory-proposals.jsonl", True),
+    ("state/social-outbox/feed/loop/post.yaml", True),
+])
+def test_unresolvable_paths_keep_protected_classification(
+    proposal_turn, monkeypatch, relative, protected,
+):
+    import errno
+    from mimir.memory_proposals import is_protected_model_path
+
+    candidate = proposal_turn.home / relative
+    original_resolve = Path.resolve
+
+    def python313_resolve(path, strict=False):
+        if path == candidate:
+            if strict:
+                raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+            # Python 3.13's non-strict resolution can retain a symlink loop.
+            return path
+        return original_resolve(path, strict=strict)
+
+    def failed_identity(*args):
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(Path, "resolve", python313_resolve)
+    monkeypatch.setattr("mimir.memory_proposals.same_model_target", failed_identity)
+    assert is_protected_model_path(candidate) is protected
+
+
 def test_protected_path_before_store_creation(proposal_turn):
     from mimir.memory_proposals import is_protected_proposal_path
 

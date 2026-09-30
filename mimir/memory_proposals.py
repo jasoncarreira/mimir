@@ -67,7 +67,14 @@ def is_protected_model_path(candidate: Path) -> bool:
     if not home:
         return False
     try:
-        resolved = candidate.resolve()
+        # Python 3.13 leaves symlink loops unresolved with strict=False.
+        # Detect those errors before identity checks so unrelated bad paths
+        # retain their backend/service denial rather than a store denial.
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Future creates still need lexical and case-identity protection.
+            resolved = candidate.resolve()
     except (OSError, RuntimeError, ValueError):
         # Keep unresolved protected spellings closed; unrelated resolution
         # failures retain the existing backend/service denial and its reason.
