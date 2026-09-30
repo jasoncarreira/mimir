@@ -16,7 +16,10 @@ def _wrapper(tmp_path: Path) -> tuple[Path, Path]:
     fake = tmp_path / "social-cli-upstream"
     fake.write_text("#!/bin/sh\n[ \"$1\" != count ] || exit 99\nprintf '%s\\n' \"$@\"\n")
     fake.chmod(0o755)
-    wrapper = tmp_path / "run-social-cli.sh"
+    scripts = tmp_path / "skill/scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "count.py").write_text((SKILL / "scripts/count.py").read_text())
+    wrapper = scripts / "run-social-cli.sh"
     wrapper.write_text(
         (SKILL / "scripts/run-social-cli.sh").read_text().replace(
             "/usr/local/bin/social-cli", str(fake)
@@ -29,8 +32,7 @@ def _run(wrapper: Path, home: Path, *args: str) -> subprocess.CompletedProcess[s
     return subprocess.run(
         ["bash", str(wrapper), "social-cli-notifications", *args],
         capture_output=True, text=True,
-        env={**os.environ, "MIMIR_HOME": str(home),
-             "SOCIAL_CLI_COUNT_HELPER": str(SKILL / "scripts/count.py")},
+        env={**os.environ, "MIMIR_HOME": str(home)},
     )
 
 
@@ -58,6 +60,38 @@ def test_dispatch_execs_upstream_with_original_vetting(tmp_path):
         assert denied.stdout == ""
 
 
+def test_count_ignores_environment_helper_override(tmp_path, monkeypatch):
+    wrapper, _ = _wrapper(tmp_path)
+    (tmp_path / "state/pollers/social-cli-notifications").mkdir(parents=True)
+    alternate = tmp_path / "alternate-count.py"
+    alternate.write_text("print(99)\n")
+    monkeypatch.setenv("SOCIAL_CLI_COUNT_HELPER", str(alternate))
+    result = _run(wrapper, tmp_path, "count", "--platform", "bsky")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0\n"
+
+
+def test_count_helper_is_only_beside_resolved_wrapper(tmp_path, monkeypatch):
+    wrapper, _ = _wrapper(tmp_path)
+    (tmp_path / "state/pollers/social-cli-notifications").mkdir(parents=True)
+    alternate = tmp_path / "alternate-count.py"
+    alternate.write_text("print(99)\n")
+    monkeypatch.setenv("SOCIAL_CLI_COUNT_HELPER", str(alternate))
+    link = tmp_path / "wrapper-link.sh"
+    link.symlink_to(wrapper)
+    result = _run(link, tmp_path, "count", "--platform", "bsky")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0\n"
+    (wrapper.parent / "count.py").unlink()
+    result = _run(wrapper, tmp_path, "count", "--platform", "bsky")
+    assert result.returncode == 127
+    assert result.stdout == ""
+    source = (SKILL / "scripts/run-social-cli.sh").read_text()
+    assert "SOCIAL_CLI_COUNT_HELPER" not in source
+    assert "/workspace/mimir" not in source
+    assert ".mimir_builtin_skills" not in source
+
+
 def test_credentials_and_debugging_are_operator_only():
     text = (SKILL / "SKILL.md").read_text()
     heading = ""
@@ -81,4 +115,8 @@ def test_credentials_and_debugging_are_operator_only():
 def test_service_read_tools_are_admitted_for_both_pollers():
     pollers = json.loads((SKILL / "pollers.json").read_text())["pollers"]
     for poller in pollers:
-        assert {"read_file", "grep", "glob"} <= set(poller["authority"]["capabilities"])
+        capabilities = set(poller["authority"]["capabilities"])
+        assert {"read_file", "grep", "glob"} <= capabilities
+        assert not {"memory_store", "saga_feedback", "saga_mark_contributions"} & capabilities
+        assert all("--dry-run" not in cmd.get("options", [])
+                   for cmd in poller["authority"]["shell_commands"])

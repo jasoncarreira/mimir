@@ -418,7 +418,7 @@ def test_action_hint_names_the_platform_suffixed_outbox(
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert "<STATE_DIR>/outbox-bsky.yaml" in prompt
+    assert f"{tmp_path}/outbox-bsky.yaml" in prompt
     assert "run-social-cli.sh social-cli-notifications dispatch --platform bsky" in prompt
     assert "`social-cli dispatch" not in prompt
     assert "Check count before posts/replies (cap 5 per UTC day)" in prompt
@@ -440,9 +440,22 @@ def test_action_hint_suffix_tracks_the_platform(
     fresh_poller.main()
     prompt = _capture_emits(capsys)[0]["prompt"]
 
-    assert "<STATE_DIR>/outbox-x.yaml" in prompt
+    assert f"{tmp_path}/outbox-x.yaml" in prompt
     assert "run-social-cli.sh social-cli-notifications dispatch --platform x" in prompt
     assert "outbox-bsky.yaml" not in prompt
+
+
+def test_hint_uses_custom_poller_and_home_relative_state(fresh_poller, monkeypatch, tmp_path):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(fresh_poller, "POLLER_NAME", "custom-notifications")
+    monkeypatch.setattr(fresh_poller, "STATE_DIR", tmp_path / "state/pollers/custom-notifications")
+    prompt = fresh_poller._format_event(_notif("n1"))["prompt"]
+    assert "state/pollers/custom-notifications/outbox-bsky.yaml" in prompt
+    assert str(tmp_path) not in prompt
+    assert "run-social-cli.sh custom-notifications dispatch --platform bsky" in prompt
+    assert "read_file + edit_file if present; write_file only creates" in prompt
+    assert "<STATE_DIR>" not in prompt and "append to" not in prompt
+    assert len(prompt.split("\n\n→", 1)[1]) <= 600
 
 
 def test_seeds_state_gitignore(fresh_poller, tmp_path):

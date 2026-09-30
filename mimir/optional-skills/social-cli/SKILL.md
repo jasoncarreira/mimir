@@ -198,7 +198,12 @@ The poller surfaces notifications. The agent responds:
    counts once per published post, using `thread.posts` from its matching
    archived outbox. If that outbox cannot be resolved, count exits 3 with
    `CAP UNKNOWN` and no number: treat a failed or empty count as the daily
-   cap reached; do not post or reply. It excludes `like`, `repost`,
+   cap reached; do not post or reply. An existing unreadable, empty,
+   malformed, or unrecognized sent ledger also raises `LedgerUnreadableError`
+   (exit 3, `CAP UNKNOWN`, empty stdout). Every record list must contain only
+   mappings, every recognized list key must hold a list, and post-creating
+   records require a parseable timestamp. Missing ledgers and `[]` are zeros.
+   It excludes `like`, `repost`,
    `ignore`, and entries with `dryRun: true`.
 
    With `--since today` and no `--until`, the window is bounded to the

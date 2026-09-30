@@ -13,7 +13,7 @@ import os
 import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 POST_CREATING_ACTIONS = {"post", "reply", "thread"}
 EXIT_CAP_UNKNOWN = 3
@@ -21,6 +21,10 @@ EXIT_CAP_UNKNOWN = 3
 
 class UnresolvedThreadError(Exception):
     """A published thread has no unambiguous, readable archived outbox."""
+
+
+class LedgerUnreadableError(Exception):
+    """An existing ledger cannot safely establish the published post count."""
 
 
 def _eprint(*args: object) -> None:
@@ -78,21 +82,53 @@ def _load_yaml(path: Path) -> Any:
         return None
 
 
-def _records(data: Any) -> Iterable[dict[str, Any]]:
+LEDGER_LIST_KEYS = ("entries", "ledger", "sent", "items", "results", "dispatch")
+
+
+def _load_ledger(path: Path) -> list[dict[str, Any]]:
+    import yaml
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as exc:
+        raise LedgerUnreadableError(f"{path}: unreadable ledger") from exc
+    if not text.strip():
+        raise LedgerUnreadableError(f"{path}: empty ledger")
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise LedgerUnreadableError(f"{path}: invalid YAML") from exc
+
+    lists: list[list[Any]] = []
     if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                yield item
-        return
-    if not isinstance(data, dict):
-        return
-    if "action" in data and "timestamp" in data:
-        yield data
-        return
-    for key in ("entries", "ledger", "sent", "items", "results", "dispatch"):
-        value = data.get(key)
-        if isinstance(value, list):
-            yield from _records(value)
+        lists.append(data)
+    elif isinstance(data, dict):
+        # Validate every present list key, even when another key is empty
+        # or a single-record mapping is also present.
+        for key in LEDGER_LIST_KEYS:
+            if key in data:
+                if not isinstance(data[key], list):
+                    raise LedgerUnreadableError(f"{path}: {key} is not a list")
+                lists.append(data[key])
+        if "action" in data:
+            lists.append([data])
+        elif not lists:
+            raise LedgerUnreadableError(f"{path}: unrecognized ledger shape")
+    else:
+        raise LedgerUnreadableError(f"{path}: unrecognized ledger shape")
+
+    records: list[dict[str, Any]] = []
+    for entries in lists:
+        for record in entries:
+            if not isinstance(record, dict):
+                raise LedgerUnreadableError(f"{path}: non-mapping ledger entry")
+            if (record.get("action") in POST_CREATING_ACTIONS
+                    and _parse_dt(record.get("timestamp")) is None):
+                raise LedgerUnreadableError(f"{path}: post entry has no parseable timestamp")
+            records.append(record)
+    return records
 
 
 def _is_true(value: Any) -> bool:
@@ -199,7 +235,7 @@ def count_ledgers(
     count = 0
     seen: set[str] = set()
     for path in _ledger_files(platform, state_root, state_dirs):
-        for record in _records(_load_yaml(path)):
+        for record in _load_ledger(path):
             record_action = str(record.get("action") or "")
             if not _action_matches(record_action, action):
                 continue
@@ -287,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
             state_root=state_root,
             state_dirs=state_dirs,
         )
+    except LedgerUnreadableError as exc:
+        _eprint(f"CAP UNKNOWN: {exc}; treat the daily cap as reached")
+        return EXIT_CAP_UNKNOWN
     except UnresolvedThreadError as exc:
         _eprint(f"CAP UNKNOWN: thread {exc} has no readable matching archived outbox; treat the daily cap as reached")
         return EXIT_CAP_UNKNOWN

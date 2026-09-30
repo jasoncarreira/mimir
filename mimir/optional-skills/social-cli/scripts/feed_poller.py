@@ -180,16 +180,19 @@ def _format_event(post: dict) -> dict | None:
     #
     # The platform suffix is mandatory — see the longer note on the
     # matching hint in ``poller.py``.
+    home = Path(os.environ.get("MIMIR_HOME", "/mimir-home"))
+    outbox = STATE_DIR / f"outbox-{platform}.yaml"
+    if outbox.is_relative_to(home):
+        outbox = outbox.relative_to(home)
     action_hint = (
-        "\n\n→ To engage with this post (reply / like / repost): append to "
-        f"<STATE_DIR>/outbox-{platform}.yaml + run"
-        f" `bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-feed dispatch --platform {platform}`.\n"
-        "  Check count before posts/replies (cap 5 per UTC day).\n"
-        "    dispatch:\n"
-        f"      - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
-        f"      - like:  {{ platform: {platform}, id: \"{pid}\" }}\n"
-        '  Bare outbox.yaml yields "No outbox file found".\n'
-        f"  send_message is chat, NOT {platform}. Use outbox."
+        f"\n\n→ Add entries to {outbox}: read_file + edit_file if present; write_file only creates.\n"
+        f"`bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh {POLLER_NAME} dispatch --platform {platform}`\n"
+        "Check count before posts/replies (cap 5 per UTC day).\n"
+        "dispatch:\n"
+        f"  - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
+        f"  - like: {{ platform: {platform}, id: \"{pid}\" }}\n"
+        'Bare outbox.yaml: "No outbox file found".\n'
+        f"send_message is chat, NOT {platform}."
     )
     prompt = (
         f"[{platform}] feed post from {author}"

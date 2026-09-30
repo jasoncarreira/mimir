@@ -167,6 +167,75 @@ def test_nested_ledger_and_created_id_dedup(tmp_path, capsys, duplicate, expecte
     assert capsys.readouterr().out.strip() == str(expected)
 
 
+@pytest.mark.parametrize("body", [
+    "", " \n", "[", "null", "42", "{}", "unknown: []",
+    "[not-a-mapping]", "entries: [not-a-mapping]",
+    'entries: [{action: post, platform: bsky, timestamp: "2026-06-28T01:00:00Z"}, 42]',
+    "sent: []\nentries: not-a-list",
+    "entries: [{action: post, platform: bsky}]",
+    "action: reply\nplatform: bsky\ntimestamp: not-a-date",
+])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_untrusted_existing_ledger_fails_closed(tmp_path, capsys, body, json_output):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir()
+    path = poller / "sent_ledger-bsky.yaml"
+    path.write_text(body)
+    with pytest.raises(mod.LedgerUnreadableError):
+        mod._load_ledger(path)
+    args = ["--platform", "bsky", "--since", "2026-06-28", "--state-root", str(tmp_path)]
+    if json_output:
+        args.append("--json")
+    assert mod.main(args) == 3
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "CAP UNKNOWN" in output.err
+
+
+def test_unreadable_ledger_fails_closed(tmp_path, monkeypatch, capsys):
+    mod = fresh_count()
+    path = tmp_path / "social-cli-notifications/sent_ledger-bsky.yaml"
+    _write_ledger(path, [])
+    original = Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError("fixture: unreadable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(mod.LedgerUnreadableError):
+        mod._load_ledger(path)
+    assert mod.main(["--platform", "bsky", "--state-root", str(tmp_path)]) == 3
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "CAP UNKNOWN" in output.err
+
+
+@pytest.mark.parametrize("key", ["entries", "ledger", "sent", "items", "results", "dispatch"])
+def test_all_ledger_list_keys_validate_every_item(tmp_path, key):
+    mod = fresh_count()
+    path = tmp_path / "ledger.yaml"
+    path.write_text(f"{key}: [42]")
+    with pytest.raises(mod.LedgerUnreadableError, match="non-mapping"):
+        mod._load_ledger(path)
+    path.write_text(f"{key}: not-a-list\nsent: []" if key != "sent" else "sent: not-a-list\nentries: []")
+    with pytest.raises(mod.LedgerUnreadableError, match="not a list"):
+        mod._load_ledger(path)
+
+
+def test_canonical_entries_mapping_counts_posts(tmp_path, capsys):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    poller.mkdir()
+    (poller / "sent_ledger-bsky.yaml").write_text(
+        'entries: [{action: post, platform: bsky, timestamp: "2026-06-28T01:00:00Z"}]'
+    )
+    assert mod.main(["--platform", "bsky", "--since", "2026-06-28", "--state-root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == "1\n"
+
+
 def test_excludes_mixed_dates_and_dry_runs(tmp_path):
     mod = fresh_count()
     poller = tmp_path / "social-cli-notifications"
@@ -211,10 +280,11 @@ def test_aggregates_across_multiple_poller_ledgers(tmp_path):
     assert total == 2
 
 
-def test_missing_and_empty_ledgers_return_zero(tmp_path):
+def test_missing_and_empty_list_ledgers_return_zero(tmp_path):
     mod = fresh_count()
     (tmp_path / "social-cli-feed").mkdir()
-    (tmp_path / "social-cli-feed" / "sent_ledger-bsky.yaml").write_text("", encoding="utf-8")
+    assert mod._load_ledger(tmp_path / "missing.yaml") == []
+    (tmp_path / "social-cli-feed" / "sent_ledger-bsky.yaml").write_text("[]", encoding="utf-8")
 
     total = mod.count_ledgers(
         platform="bsky",
