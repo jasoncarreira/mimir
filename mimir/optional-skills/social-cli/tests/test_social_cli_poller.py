@@ -419,7 +419,9 @@ def test_action_hint_names_the_platform_suffixed_outbox(
     prompt = _capture_emits(capsys)[0]["prompt"]
 
     assert "<STATE_DIR>/outbox-bsky.yaml" in prompt
-    assert "social-cli dispatch --platform bsky" in prompt
+    assert "run-social-cli.sh social-cli-notifications dispatch --platform bsky" in prompt
+    assert "`social-cli dispatch" not in prompt
+    assert "Check count before posts/replies (cap 5 per UTC day)" in prompt
     # the unsuffixed path must not be offered as the thing to write
     assert "<STATE_DIR>/outbox.yaml" not in prompt
     assert "append to <STATE_DIR>/outbox.yaml" not in prompt
@@ -439,7 +441,7 @@ def test_action_hint_suffix_tracks_the_platform(
     prompt = _capture_emits(capsys)[0]["prompt"]
 
     assert "<STATE_DIR>/outbox-x.yaml" in prompt
-    assert "social-cli dispatch --platform x" in prompt
+    assert "run-social-cli.sh social-cli-notifications dispatch --platform x" in prompt
     assert "outbox-bsky.yaml" not in prompt
 
 

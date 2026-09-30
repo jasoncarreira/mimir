@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def fresh_count():
     sys.modules.pop("count", None)
@@ -18,6 +20,17 @@ def _write_ledger(path: Path, entries: list[dict]) -> None:
     path.write_text(yaml.safe_dump(entries), encoding="utf-8")
 
 
+def _archive(poller: Path, posts: list[str], stamp: str = "2026-06-28T02-29-59-000Z") -> None:
+    import yaml
+
+    folder = poller / "outbox_archive"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{stamp}_outbox-bsky.yaml").write_text(
+        yaml.safe_dump({"dispatch": [{"thread": {"platform": "bsky", "posts": posts}}]}),
+        encoding="utf-8",
+    )
+
+
 def test_counts_post_creating_actions_and_excludes_non_posts(tmp_path):
     mod = fresh_count()
     poller = tmp_path / "social-cli-notifications"
@@ -29,6 +42,33 @@ def test_counts_post_creating_actions_and_excludes_non_posts(tmp_path):
         {"action": "repost", "platform": "bsky", "timestamp": "2026-06-28T04:00:00Z"},
         {"action": "ignore", "platform": "bsky", "timestamp": "2026-06-28T05:00:00Z"},
     ])
+    _archive(poller, ["first", "second", "third"])
+
+    total = mod.count_ledgers(
+        platform="bsky",
+        action="post",
+        since=mod._parse_dt("2026-06-28"),
+        until=mod._parse_dt("2026-06-29"),
+        state_root=tmp_path,
+        state_dirs=[],
+    )
+
+    assert total == 5
+
+
+def test_counts_thread_per_published_post(tmp_path):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {
+            "action": "thread",
+            "platform": "bsky",
+            "timestamp": "2026-06-28T12:00:00Z",
+            "dispatchTimestamp": "2026-06-28T12:00:02Z",
+            "textHash": "hash-of-whole-thread",
+        },
+    ])
+    _archive(poller, ["one", "two", "three"], "2026-06-28T11-59-59-000Z")
 
     total = mod.count_ledgers(
         platform="bsky",
@@ -42,28 +82,89 @@ def test_counts_post_creating_actions_and_excludes_non_posts(tmp_path):
     assert total == 3
 
 
-def test_counts_thread_as_one_post_creating_ledger_entry(tmp_path):
+def test_nested_thread_ledger_resolves_poller_outbox_archive(tmp_path):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / ".social-cli/state/sent_ledger-bsky.yaml", [
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T02:30:00Z",
+         "createdId": "thread-nested"},
+    ])
+    _archive(poller, ["one", "two", "three"])
+    assert mod.count_ledgers(platform="bsky", action="post", since=mod._parse_dt("2026-06-28"),
+                             until=mod._parse_dt("2026-06-29"), state_root=tmp_path, state_dirs=[]) == 3
+
+
+def test_unrelated_state_parent_cannot_supply_thread_archive(tmp_path):
+    mod = fresh_count()
+    custom = tmp_path / "other/state"
+    _write_ledger(custom / "sent_ledger-bsky.yaml", [
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T02:30:00Z",
+         "createdId": "thread-custom"},
+    ])
+    _archive(tmp_path, ["one", "two", "three"])
+    with pytest.raises(mod.UnresolvedThreadError, match="thread-custom"):
+        mod.count_ledgers(platform="bsky", action="post", since=mod._parse_dt("2026-06-28"),
+                          until=mod._parse_dt("2026-06-29"), state_root=tmp_path,
+                          state_dirs=[custom])
+
+
+def test_unresolved_thread_fails_closed_in_library_and_cli(tmp_path, capsys):
     mod = fresh_count()
     poller = tmp_path / "social-cli-notifications"
     _write_ledger(poller / "sent_ledger-bsky.yaml", [
-        {
-            "action": "thread",
-            "platform": "bsky",
-            "timestamp": "2026-06-28T12:00:00Z",
-            "textHash": "hash-of-whole-thread",
-        },
+        {"action": "reply", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"},
+        {"action": "reply", "platform": "bsky", "timestamp": "2026-06-28T01:30:00Z"},
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T02:30:00Z", "createdId": "thread-abc"},
     ])
+    args = dict(platform="bsky", action="post", since=mod._parse_dt("2026-06-28"),
+                until=mod._parse_dt("2026-06-29"), state_root=tmp_path, state_dirs=[])
+    with pytest.raises(mod.UnresolvedThreadError, match="thread-abc"):
+        mod.count_ledgers(**args)
+    rc = mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                   "--until", "2026-06-29", "--state-root", str(tmp_path)])
+    output = capsys.readouterr()
+    assert rc == mod.EXIT_CAP_UNKNOWN == 3
+    assert output.out == ""
+    assert "CAP UNKNOWN" in output.err and "thread-abc" in output.err
 
-    total = mod.count_ledgers(
-        platform="bsky",
-        action="post",
-        since=mod._parse_dt("2026-06-28"),
-        until=mod._parse_dt("2026-06-29"),
-        state_root=tmp_path,
-        state_dirs=[],
-    )
 
-    assert total == 1
+@pytest.mark.parametrize("stamp, archive_platform", [
+    ("2026-06-28T02-20-00-000Z", "bsky"),
+    ("2026-06-28T02-29-59-000Z", "x"),
+])
+def test_unrelated_archive_does_not_resolve_thread(tmp_path, stamp, archive_platform):
+    import yaml
+
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T02:30:00Z",
+         "createdId": "unresolved-thread"},
+    ])
+    _archive(poller, ["one", "two", "three"], stamp)
+    archive = next((poller / "outbox_archive").iterdir())
+    if archive_platform == "x":
+        archive.write_text(yaml.safe_dump({"dispatch": [
+            {"thread": {"platform": "x", "posts": ["one", "two", "three"]}},
+        ]}))
+    with pytest.raises(mod.UnresolvedThreadError, match="unresolved-thread"):
+        mod.count_ledgers(platform="bsky", action="post", since=mod._parse_dt("2026-06-28"),
+                          until=mod._parse_dt("2026-06-29"), state_root=tmp_path, state_dirs=[])
+
+
+@pytest.mark.parametrize("duplicate, expected", [(False, 2), (True, 1)])
+def test_nested_ledger_and_created_id_dedup(tmp_path, capsys, duplicate, expected):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    first = {"action": "reply", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z", "createdId": "post-1"}
+    second = {**first, "createdId": "post-1" if duplicate else "post-2",
+              "timestamp": "2026-06-28T02:00:00Z"}
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [first])
+    _write_ledger(poller / ".social-cli/state/sent_ledger-bsky.yaml", [second])
+    rc = mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                   "--until", "2026-06-29", "--state-root", str(tmp_path)])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == str(expected)
 
 
 def test_excludes_mixed_dates_and_dry_runs(tmp_path):

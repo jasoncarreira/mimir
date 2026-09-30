@@ -337,15 +337,13 @@ def _format_event(notif: dict) -> dict | None:
     target_id = post_id or nid
     action_hint = (
         f"\n\n→ To reply or react: append to <STATE_DIR>/outbox-{platform}.yaml"
-        f" + run `social-cli dispatch --platform {platform}`.\n"
-        "  Minimal shape:\n"
+        f" + run `bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-notifications dispatch --platform {platform}`.\n"
+        "  Check count before posts/replies (cap 5 per UTC day).\n"
         "    dispatch:\n"
         f"      - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
         f"      - like:  {{ platform: {platform}, id: \"{target_id}\" }}\n"
-        f"      - ignore: {{ id: \"{nid}\", reason: \"...\" }}   # skip without action\n"
-        f"  The -{platform} suffix is required: dispatch reads outbox-{platform}.yaml\n"
-        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
-        f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
+        '  Bare outbox.yaml yields "No outbox file found".\n'
+        f"  send_message is chat, NOT {platform}. Use outbox."
     )
     prompt = (
         f"[{platform}] {ntype} from {author}"

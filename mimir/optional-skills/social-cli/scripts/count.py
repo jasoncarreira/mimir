@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Count social-cli post-creating dispatches from sent ledgers.
+"""Count published social-cli posts from sent ledgers and thread archives.
 
-This is intentionally ledger-derived only. It does not read or update any
-secondary counter file, so likes/reposts/ignores and missed manual increments
-cannot drift the daily post count.
+Ledgers identify successful dispatches; archived outboxes supply the post
+length for threads. No secondary counter file can drift the daily count.
 """
 
 from __future__ import annotations
@@ -17,6 +16,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 POST_CREATING_ACTIONS = {"post", "reply", "thread"}
+EXIT_CAP_UNKNOWN = 3
+
+
+class UnresolvedThreadError(Exception):
+    """A published thread has no unambiguous, readable archived outbox."""
 
 
 def _eprint(*args: object) -> None:
@@ -141,10 +145,46 @@ def _ledger_files(
             dirs = [Path.cwd()]
     files: list[Path] = []
     for directory in dirs:
-        for path in sorted(directory.glob("sent_ledger-*.yaml")):
-            if path.name == f"sent_ledger-{platform}.yaml" or path.is_file():
-                files.append(path)
+        for ledger_dir in (directory, directory / ".social-cli" / "state"):
+            files.extend(sorted(ledger_dir.glob("sent_ledger*.yaml")))
     return files
+
+
+def _thread_posts(path: Path, record: dict[str, Any], platform: str) -> int:
+    name = str(record.get("createdId") or record.get("key") or record.get("textHash") or record.get("timestamp"))
+    dispatch_time = _parse_dt(record.get("dispatchTimestamp") or record.get("timestamp"))
+    if dispatch_time is None:
+        raise UnresolvedThreadError(name)
+    matches: list[int] = []
+    archive_dirs = [path.parent / "outbox_archive"]
+    if path.parent.name == "state" and path.parent.parent.name == ".social-cli":
+        archive_dirs.append(path.parent.parent.parent / "outbox_archive")
+    for archive in (p for directory in archive_dirs
+                    for p in directory.glob(f"*_outbox-{platform}.yaml")):
+        stamp = archive.name.split("_outbox-", 1)[0]
+        try:
+            archived_at = datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%S-%fZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        delta = (dispatch_time - archived_at).total_seconds()
+        if not -5 <= delta <= 300:
+            continue
+        data = _load_yaml(archive)
+        actions = data.get("dispatch") if isinstance(data, dict) else data
+        if not isinstance(actions, list):
+            continue
+        threads = [item["thread"] for item in actions
+                   if isinstance(item, dict) and isinstance(item.get("thread"), dict)
+                   and _platform_matches(item["thread"], platform)]
+        # A ledger has no per-post IDs or reliable index into a multi-thread
+        # outbox. Never infer a size from an ambiguous archive.
+        if len(threads) == 1:
+            posts = threads[0].get("posts")
+            if isinstance(posts, list) and posts:
+                matches.append(len(posts))
+    if len(matches) != 1:
+        raise UnresolvedThreadError(name)
+    return matches[0]
 
 
 def count_ledgers(
@@ -157,6 +197,7 @@ def count_ledgers(
     state_dirs: list[Path],
 ) -> int:
     count = 0
+    seen: set[str] = set()
     for path in _ledger_files(platform, state_root, state_dirs):
         for record in _records(_load_yaml(path)):
             record_action = str(record.get("action") or "")
@@ -171,13 +212,21 @@ def count_ledgers(
                 continue
             if until is not None and ts >= until:
                 continue
-            count += 1
+            identity = str(record.get("createdId") or "")
+            key = f"id:{identity}" if identity else (
+                f"fallback:{record.get('key', '')}|{record.get('textHash', '')}|{record.get('timestamp', '')}"
+            )
+            if key in seen:
+                continue
+            posts = _thread_posts(path, record, platform) if record_action == "thread" else 1
+            seen.add(key)
+            count += posts
     return count
 
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Count social-cli sent ledger entries for a platform.",
+        description="Count published social-cli posts for a platform.",
     )
     p.add_argument("--platform", "-p", required=True)
     p.add_argument(
@@ -229,14 +278,18 @@ def main(argv: list[str] | None = None) -> int:
 
     state_root = (args.state_root or _default_state_root()).expanduser()
     state_dirs = [p.expanduser() for p in args.state_dir]
-    total = count_ledgers(
-        platform=args.platform,
-        action=args.action,
-        since=since,
-        until=until,
-        state_root=state_root,
-        state_dirs=state_dirs,
-    )
+    try:
+        total = count_ledgers(
+            platform=args.platform,
+            action=args.action,
+            since=since,
+            until=until,
+            state_root=state_root,
+            state_dirs=state_dirs,
+        )
+    except UnresolvedThreadError as exc:
+        _eprint(f"CAP UNKNOWN: thread {exc} has no readable matching archived outbox; treat the daily cap as reached")
+        return EXIT_CAP_UNKNOWN
     if args.json:
         print(json.dumps({
             "count": total,

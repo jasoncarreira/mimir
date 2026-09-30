@@ -183,14 +183,13 @@ def _format_event(post: dict) -> dict | None:
     action_hint = (
         "\n\n→ To engage with this post (reply / like / repost): append to "
         f"<STATE_DIR>/outbox-{platform}.yaml + run"
-        f" `social-cli dispatch --platform {platform}`.\n"
-        "  Minimal shape:\n"
+        f" `bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh social-cli-feed dispatch --platform {platform}`.\n"
+        "  Check count before posts/replies (cap 5 per UTC day).\n"
         "    dispatch:\n"
         f"      - reply: {{ platform: {platform}, id: \"{pid}\", text: \"...\" }}\n"
         f"      - like:  {{ platform: {platform}, id: \"{pid}\" }}\n"
-        f"  The -{platform} suffix is required: dispatch reads outbox-{platform}.yaml\n"
-        '  and exits 0 with "No outbox file found" on a bare outbox.yaml.\n'
-        f"  send_message routes to Discord/Slack — NOT to {platform}. Use outbox."
+        '  Bare outbox.yaml yields "No outbox file found".\n'
+        f"  send_message is chat, NOT {platform}. Use outbox."
     )
     prompt = (
         f"[{platform}] feed post from {author}"
