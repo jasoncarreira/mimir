@@ -5895,6 +5895,8 @@ def _ifc_blocking_source(
     ifc_labels: Any,
     auth_context: Any,
     sink_category: SinkCategory,
+    *,
+    forge_scope: Any = None,
 ) -> tuple[Any | None, str]:
     """Classify one source for an IFC refusal and the certainty of the match."""
     from .models import InformationFlowLabels
@@ -5910,6 +5912,16 @@ def _ifc_blocking_source(
         raise TypeError("IFC source classifier received invalid labels")
     if not current.sources:
         return None, "no_sources"
+
+    if sink_category is SinkCategory.FORGE and forge_scope is not None:
+        lineage = getattr(getattr(auth_context, "ifc_state", None), "own_push_lineage", None)
+        own_push_lineage = lineage() if callable(lineage) else None
+        for source in current.sources:
+            if _forge_repository_scope_mismatch(
+                InformationFlowLabels(sources=(source,)), forge_scope,
+                own_push_lineage=own_push_lineage,
+            ) is not None:
+                return source, "causing_source"
 
     if sink_category is SinkCategory.SAME_CHANNEL:
         resolved_triggering = ChannelResourceAdapter._resolve_channel(
@@ -5968,6 +5980,7 @@ def _forge_repository_scope_mismatch(
     scope: Any,
     *,
     audit_fields: dict[str, Any] | None = None,
+    own_push_lineage: dict[tuple[str, int], frozenset[str]] | None = None,
 ) -> tuple[str, str, str] | None:
     """Return the first repository result that is outside a forge sink scope."""
     expected_repo = getattr(scope, "canonical_repo", None)
@@ -6041,6 +6054,9 @@ def _forge_repository_scope_mismatch(
             return mismatch(source_repo, str(source_pr), "pr_number")
         if not isinstance(expected_head, str) or (
             source_head.casefold() != expected_head.casefold()
+            and source_head.casefold() not in (
+                own_push_lineage or {}
+            ).get((expected_repo.casefold(), expected_pr), frozenset())
         ):
             return mismatch(source_repo, str(source_pr), "observed_head_sha")
     return None
@@ -6145,6 +6161,9 @@ class SinkGate:
                     )
                     and _forge_repository_scope_mismatch(
                         ifc_labels, repo_pr_action_scope,
+                        own_push_lineage=(
+                            state.own_push_lineage() if state is not None else None
+                        ),
                     ) is None,
                     None,
                 )
@@ -6729,6 +6748,10 @@ class SinkGate:
                 else _forge_repository_scope_mismatch(
                     ifc_labels, repo_pr_action_scope,
                     audit_fields=forge_scope_mismatch,
+                    own_push_lineage=(
+                        auth_context.ifc_state.own_push_lineage()
+                        if getattr(auth_context, "ifc_state", None) is not None else None
+                    ),
                 )
             )
             if mismatch is not None:
@@ -6745,6 +6768,7 @@ class SinkGate:
                     allowed=not enforce,
                     reason="ifc_label_blocked:forge",
                     forge_scope_mismatch=forge_scope_mismatch,
+                    repo_pr_action_scope=repo_pr_action_scope,
                     service_principal=service,
                     required_tier=AccessTier.ADMIN,
                     enforcement_enabled=enforce,
@@ -7016,6 +7040,10 @@ class SinkGate:
                 or _forge_repository_scope_mismatch(
                     ifc_labels,
                     repo_pr_action_scope,
+                    own_push_lineage=(
+                        auth_context.ifc_state.own_push_lineage()
+                        if getattr(auth_context, "ifc_state", None) is not None else None
+                    ),
                 ) is None
             )
         ):
@@ -8653,6 +8681,10 @@ class ToolRegistry:
                         ifc_labels,
                         auth_context,
                         sink_category,
+                        forge_scope=(
+                            auth.repo_pr_action_scope
+                            if auth.forge_scope_mismatch is not None else None
+                        ),
                     )
                     fields["ifc_source_scope"] = scope
                     if source is not None:

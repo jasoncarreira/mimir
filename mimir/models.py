@@ -586,6 +586,9 @@ class InformationFlowState:
     pr_checkout_author_trust: dict[str, bool | None] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
+    _own_push_lineage: dict[tuple[str, int], frozenset[str]] = field(
+        default_factory=dict, repr=False, compare=False, init=False,
+    )
     labels: InformationFlowLabels | None = None
     _declassification: "DeclassificationCapability | None" = field(
         default=None, repr=False, compare=False,
@@ -609,6 +612,18 @@ class InformationFlowState:
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
         with self._lock:
             return self.labels if self.labels is not None else fallback
+
+    def record_own_push(self, repository: str, pull_request: int, previous_head: str) -> None:
+        """Remember a superseded head only after an exact verified publication."""
+        key = (repository.casefold(), pull_request)
+        with self._lock:
+            self._own_push_lineage[key] = self._own_push_lineage.get(key, frozenset()) | {
+                previous_head.casefold(),
+            }
+
+    def own_push_lineage(self) -> dict[tuple[str, int], frozenset[str]]:
+        with self._lock:
+            return dict(self._own_push_lineage)
 
     def record_author_attestation_unavailable(self) -> None:
         """Diagnostic history only; never clears taint or changes authority."""
