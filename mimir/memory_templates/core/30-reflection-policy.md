@@ -9,7 +9,12 @@ trust builds. Conservative defaults:
 
 - SAGA atom decay calls
 - SAGA triples linking (additive)
-- Promote / drop entries in memory/learnings-pending.md
+- Synthesis creates candidate files only at
+  `memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md`; no buffer/archive edits
+- Reflection reviews `memory/learnings-inbox/*.md` alongside
+  `memory/learnings-pending.md`, archives reviewed candidates, and drains source
+  content to reviewed receipts; keep/drop pending entries, propose promotions
+  (physical file deletion remains propose-only)
 - Wiki orphan tagging (writes to state/wiki/index.md — flag, don't delete)
 
 ## Propose-only (operator reviews before it takes effect)

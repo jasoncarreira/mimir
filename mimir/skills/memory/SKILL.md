@@ -110,19 +110,26 @@ Organize however helps you. Common shapes:
   as a hash-lookup against a future symptom. **Filing question:** "is
   this an operational issue I might hit and want flagged in the
   every-turn INDEX?" Yes → here.
-- `memory/learnings-pending.md` — the live append-only buffer for
-  candidate learned behaviors. Captured by `saga_session_end` synthesis
-  turns; reflection's §B.4 reviews them and *proposes* promoting durable
-  ones into `memory/core/40-learned-behaviors.md`. **You can never write
-  `40-learned-behaviors.md` (or any `memory/core/` file) directly — core
-  is read-only at runtime; promotions land via the change-proposal PR flow
-  (`open_proposal`) the operator merges.** Lifecycle:
-  - Synthesis turns **prepend** (newest-first) to the live file.
-  - Reflection's B.4 pass keeps / drops entries and proposes promotions.
-  - When the live file grows past ~1000 lines / 25k tokens, reflection
-    rotates it: rename to `memory/learnings-pending/<YYYY-WNN>.md`
-    (ISO week), create a fresh live file with just the header. Archives
-    are preserved indefinitely and reviewed during the rotation week.
+- `memory/learnings-inbox/` — synthesis creates candidate learned behaviors
+  with `write_file` at `<YYYY-MM-DD>-<turn_id>-<n>.md` (UTC date, synthesis
+  turn id, per-turn sequence). No appending or editing the shared buffer.
+  Reflection's §B.4 reads these top-level `*.md` files alongside the buffer,
+  keeps / drops / proposes each, copies still-pending candidates into the
+  buffer using the inbox source path as a deduplication key, then archives
+  the original at `memory/learnings-inbox/archive/<original-name>.md`.
+  After verifying the archive and any pending copy, reflection drains the
+  source with `edit_file` to a receipt starting
+  `<!-- learnings-inbox: reviewed -->`; later cycles skip receipts and archives.
+  Physical deletion is propose-only. If transfer fails, preserve the source.
+- `memory/learnings-pending.md` — the legacy live buffer and reflection's
+  carry-forward queue. Reflection proposes durable entries into
+  `memory/core/40-learned-behaviors.md`. **Core is read-only at runtime;
+  promotions land via the change-proposal PR flow (`open_proposal`) the
+  operator merges.** When the buffer grows past ~1000 lines / 25k tokens,
+  reflection copies it to `memory/learnings-pending/<YYYY-WNN>.md` (ISO week)
+  and resets the live header. Those weekly archives are history, never a
+  synthesis capture destination. Pending promotions remain in the buffer
+  until merged; retained entries are deduplicated by their inbox source path.
 
 For people, recurring topics, concepts, and anything else that benefits
 from cross-references (a graph of who-relates-to-whom, which-concept-

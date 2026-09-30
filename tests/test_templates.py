@@ -396,7 +396,8 @@ class TestRenderSagaSessionEnd:
             ))
             assert tools <= TRIGGER_AUTHORITY_PROFILES["session-boundary"]
             assert "create new files" in prompt
-            assert "learnings-pending/" in prompt
+            assert "memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md" in prompt
+            assert "learnings-pending/" not in prompt
             assert "learnings-pending.md" not in prompt
             assert not re.search(r"\b(?:edit|append|overwrite) (?:files?|it|to)\b", prompt)
 

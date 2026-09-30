@@ -45,13 +45,17 @@ useful context for future sessions — create new files with `write_file` under:
   memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
   state/wiki/concepts/            # cross-channel patterns / frameworks
   state/wiki/topics/              # cross-channel long-form synthesis
-  memory/learnings-pending/       # candidate learned behaviors (see below)
+  memory/learnings-inbox/       # candidate learned behaviors (see below)
 
 If the session surfaced something that *might* be a durable behavior
 worth remembering across all future turns — a heuristic that worked, a
 failure mode worth avoiding, an approach that beat the default — create a
-new file under `memory/learnings-pending/` in the canonical 4-field shape
-(`What I noticed / What works / Trigger / Source:`) for later review.
+new file at `memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md`, using
+the UTC date, this synthesis turn's id, and a per-turn sequence number.
+Use the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`). Reflection reviews this
+inbox alongside its pending buffer and archives reviewed files; the weekly
+archive directory is not an inbox.
 Durable rules belong in `memory/core/40-learned-behaviors.md` only after
 operator review (core memory is read-only at runtime). **Do NOT write directly to
 `memory/core/40-learned-behaviors.md`** — it's blocked at runtime, and
@@ -185,13 +189,17 @@ useful context for future sessions — create new files with `write_file` under:
   memory/issues/                  # operational gotchas (every-turn-INDEX surfacing)
   state/wiki/concepts/            # cross-channel patterns / frameworks
   state/wiki/topics/              # cross-channel long-form synthesis
-  memory/learnings-pending/       # candidate learned behaviors (see below)
+  memory/learnings-inbox/       # candidate learned behaviors (see below)
 
 If the session surfaced something that *might* be a durable behavior
 worth remembering across all future turns — a heuristic that worked, a
 failure mode worth avoiding, an approach that beat the default — create a
-new file under `memory/learnings-pending/` in the canonical 4-field shape
-(`What I noticed / What works / Trigger / Source:`) for later review.
+new file at `memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md`, using
+the UTC date, this synthesis turn's id, and a per-turn sequence number.
+Use the canonical 4-field shape
+(`What I noticed / What works / Trigger / Source:`). Reflection reviews this
+inbox alongside its pending buffer and archives reviewed files; the weekly
+archive directory is not an inbox.
 Durable rules belong in `memory/core/40-learned-behaviors.md` only after
 operator review (core memory is read-only at runtime). **Do NOT write directly to
 `memory/core/40-learned-behaviors.md`** — it's blocked at runtime, and

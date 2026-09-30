@@ -4893,16 +4893,31 @@ def _synthesis_target_matches_session(target: str, channel_id: str | None) -> bo
     candidate = Path(target)
     if not candidate.is_absolute():
         candidate = Path(home).resolve() / candidate
+    home_root = Path(home).resolve()
     try:
-        candidate.resolve().relative_to(
-            (Path(home).resolve() / "memory" / "channels").resolve()
-        )
-    except (OSError, RuntimeError):
+        lexical = candidate.relative_to(home_root)
+        resolved = candidate.resolve().relative_to(home_root)
+    except (OSError, RuntimeError, ValueError):
         return False
-    except ValueError:
-        # The prompt also authorizes shared non-channel memory and state paths.
-        return True
-    return _synthesis_channel_target_matches_session(target, channel_id)
+    if lexical.is_relative_to(Path("memory/channels")):
+        return _synthesis_channel_target_matches_session(target, channel_id)
+    # Create-only synthesis capture roots. In particular, the legacy buffer
+    # and its weekly archive directory are not destinations for new learnings.
+    inbox = Path("memory/learnings-inbox")
+    if lexical.is_relative_to(inbox) or resolved.is_relative_to(inbox):
+        return (
+            lexical.parent == inbox and resolved.parent == inbox
+            and lexical.suffix == ".md" and resolved.suffix == ".md"
+        )
+    roots = (
+        Path("memory/issues"),
+        Path("state/wiki/concepts"), Path("state/wiki/topics"),
+    )
+    return any(
+        lexical != root and lexical.is_relative_to(root)
+        and resolved != root and resolved.is_relative_to(root)
+        for root in roots
+    )
 
 
 def resolve_trigger_service_write_target(

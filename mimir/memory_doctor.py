@@ -99,6 +99,7 @@ def run_doctor(home: Path) -> DoctorReport:
         _check_channels(home, findings),
         _check_issue_notes(home, findings),
         _check_learnings_pending(home, findings),
+        _check_learnings_inbox(home, findings),
         _check_memory_index(home, findings),
         _check_saga_substrate(home, findings),
         _check_state(home, findings),
@@ -300,6 +301,28 @@ def _check_learnings_pending(home: Path, findings: list[DoctorFinding]) -> Docto
         "overgrown": overgrown,
         "max_bytes": LEARNINGS_PENDING_MAX_BYTES,
         "max_lines": LEARNINGS_PENDING_MAX_LINES,
+    })
+
+
+def _check_learnings_inbox(home: Path, findings: list[DoctorFinding]) -> DoctorSection:
+    """Report live synthesis candidates, excluding archives and drained receipts."""
+    inbox = home / "memory" / "learnings-inbox"
+    files = _md_files(inbox, recursive=False)
+    pending = [
+        (path, text) for path in files
+        if not (text := _read_text(path)).startswith("<!-- learnings-inbox: reviewed -->")
+    ]
+    nbytes = sum(len(text.encode("utf-8")) for _, text in pending)
+    lines = sum(len(text.splitlines()) for _, text in pending)
+    if pending:
+        findings.append(_finding(
+            "learnings-inbox", "pending", "info", _rel(home, inbox),
+            f"{len(pending)} synthesis learning candidates await reflection ({nbytes} bytes).",
+            "Review memory/learnings-inbox/*.md alongside learnings-pending.md in reflection B.4; archive reviewed candidates and drain their source files.",
+        ))
+    return DoctorSection("learnings-inbox", {
+        "files": len(pending), "bytes": nbytes, "lines": lines,
+        "reviewed_receipts": len(files) - len(pending),
     })
 
 

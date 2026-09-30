@@ -2142,6 +2142,8 @@ def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
     for target in (
         "memory/channels/channel-a/summary.md",
         "memory/issues/gotcha.md",
+        "memory/learnings-inbox/2026-09-30-turn-1-1.md",
+        str(home / "memory" / "learnings-inbox" / "2026-09-30-turn-1-2.md"),
         "state/wiki/concepts/pattern.md",
         str(home / "memory" / "issues" / "absolute.md"),
     ):
@@ -2169,6 +2171,27 @@ def test_synthesis_dynamic_scope_matches_prompt_and_preserves_channel_isolation(
         if tool_name == "write_file"
         else "session_boundary_capability_denied"
     )
+
+
+@pytest.mark.parametrize("target", [
+    "memory/learnings-pending.md",
+    "memory/learnings-pending/2026-W40.md",
+    "memory/learnings-inbox-other/candidate.md",
+    "memory/learnings-inbox/archive/candidate.md",
+    "memory/learnings-inbox/../learnings-pending/2026-W40.md",
+    "memory/core/candidate.md",
+    "memory/channels/channel-b/candidate.md",
+])
+def test_synthesis_inbox_does_not_admit_neighbor_or_archive_writes(
+    target: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    principal = access_control.builtin_trigger_service_principal("session-boundary", tmp_path)
+    auth = replace(_service_auth(principal, InformationFlowLabels()), channel_id="channel-a")
+    decision = ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=True, target_channel=target,
+    )
+    assert not decision.allowed
 
 
 def test_synthesis_unresolvable_other_channel_target_fails_closed(
