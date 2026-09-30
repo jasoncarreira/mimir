@@ -68,7 +68,7 @@ def test_counts_thread_per_published_post(tmp_path):
             "textHash": "hash-of-whole-thread",
         },
     ])
-    _archive(poller, ["one", "two", "three"], "2026-06-28T11-59-59-000Z")
+    _archive(poller, ["one", "two", "three"], "2026-06-28T12-00-10-000Z")
 
     total = mod.count_ledgers(
         platform="bsky",
@@ -80,6 +80,42 @@ def test_counts_thread_per_published_post(tmp_path):
     )
 
     assert total == 3
+
+
+@pytest.mark.parametrize("earlier_archive", [False, True], ids=["only-plus-10s", "earlier-archive-cannot-undercount"])
+def test_thread_archive_after_dispatch_counts_real_posts(tmp_path, capsys, earlier_archive):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    _write_ledger(poller / "sent_ledger-bsky.yaml", [
+        {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T12:00:00Z",
+         "dispatchTimestamp": "2026-06-28T12:00:00Z", "createdId": "real-thread"},
+    ])
+    _archive(poller, ["one", "two", "three", "four"], "2026-06-28T12-00-10-000Z")
+    if earlier_archive:
+        _archive(poller, ["previous-one", "previous-two"], "2026-06-28T11-58-20-000Z")
+    assert mod.count_ledgers(platform="bsky", action="post", since=mod._parse_dt("2026-06-28"),
+                             until=mod._parse_dt("2026-06-29"), state_root=tmp_path, state_dirs=[]) == 4
+    assert mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                     "--state-root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == "4\n"
+
+
+@pytest.mark.parametrize("offset, resolves", [(-6, False), (-5, True), (0, True), (300, True), (301, False)])
+def test_thread_archive_window_boundaries(tmp_path, offset, resolves):
+    from datetime import timedelta
+
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    ledger = poller / "sent_ledger-bsky.yaml"
+    record = {"action": "thread", "platform": "bsky", "timestamp": "2026-06-28T12:00:00Z"}
+    _write_ledger(ledger, [record])
+    stamp = (mod._parse_dt(record["timestamp"]) + timedelta(seconds=offset)).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+    _archive(poller, ["one", "two"], stamp)
+    if resolves:
+        assert mod._thread_posts(ledger, record, "bsky") == 2
+    else:
+        with pytest.raises(mod.UnresolvedThreadError):
+            mod._thread_posts(ledger, record, "bsky")
 
 
 def test_nested_thread_ledger_resolves_poller_outbox_archive(tmp_path):
@@ -234,6 +270,30 @@ def test_canonical_entries_mapping_counts_posts(tmp_path, capsys):
     )
     assert mod.main(["--platform", "bsky", "--since", "2026-06-28", "--state-root", str(tmp_path)]) == 0
     assert capsys.readouterr().out == "1\n"
+
+
+@pytest.mark.parametrize("dry_run", [True, "true", "yes", 1])
+@pytest.mark.parametrize("action", ["post", "reply", "thread"])
+def test_dry_run_without_timestamp_is_filtered_before_validation(tmp_path, capsys, dry_run, action):
+    mod = fresh_count()
+    poller = tmp_path / "social-cli-notifications"
+    path = poller / "sent_ledger-bsky.yaml"
+    published = {"action": "post", "platform": "bsky", "timestamp": "2026-06-28T01:00:00Z"}
+    _write_ledger(path, [{"action": action, "platform": "bsky", "dryRun": dry_run}, published])
+    assert mod._load_ledger(path) == [published]
+    assert mod.main(["--platform", "bsky", "--since", "2026-06-28",
+                     "--state-root", str(tmp_path)]) == 0
+    output = capsys.readouterr()
+    assert output.out == "1\n"
+    assert output.err == ""
+
+
+def test_free_action_without_timestamp_does_not_block_count(tmp_path):
+    mod = fresh_count()
+    path = tmp_path / "ledger.yaml"
+    free = {"action": "ignore", "platform": "bsky"}
+    _write_ledger(path, [free])
+    assert mod._load_ledger(path) == [free]
 
 
 def test_excludes_mixed_dates_and_dry_runs(tmp_path):

@@ -124,6 +124,10 @@ def _load_ledger(path: Path) -> list[dict[str, Any]]:
         for record in entries:
             if not isinstance(record, dict):
                 raise LedgerUnreadableError(f"{path}: non-mapping ledger entry")
+            # Dry runs cannot consume the cap, even without a timestamp.
+            # Validate list shapes and mapping entries before filtering them.
+            if _is_true(record.get("dryRun", False)):
+                continue
             if (record.get("action") in POST_CREATING_ACTIONS
                     and _parse_dt(record.get("timestamp")) is None):
                 raise LedgerUnreadableError(f"{path}: post entry has no parseable timestamp")
@@ -202,7 +206,8 @@ def _thread_posts(path: Path, record: dict[str, Any], platform: str) -> int:
             archived_at = datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%S-%fZ").replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-        delta = (dispatch_time - archived_at).total_seconds()
+        # Dispatch writes the ledger before archiving the outbox.
+        delta = (archived_at - dispatch_time).total_seconds()
         if not -5 <= delta <= 300:
             continue
         data = _load_yaml(archive)

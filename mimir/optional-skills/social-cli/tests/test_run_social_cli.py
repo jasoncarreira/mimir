@@ -92,6 +92,15 @@ def test_count_helper_is_only_beside_resolved_wrapper(tmp_path, monkeypatch):
     assert ".mimir_builtin_skills" not in source
 
 
+def test_image_installs_upstream_without_count_interception():
+    fragment = (SKILL / "dockerfile.fragment").read_text()
+    assert "SOCIAL_CLI_COUNT_HELPER" not in fragment
+    assert 'if [ "$1" = "count" ]' not in fragment
+    assert "exec python3" not in fragment
+    assert "printf" not in fragment
+    assert "ln -sf /opt/social-cli/dist/cli.js /usr/local/bin/social-cli\n" in fragment
+
+
 def test_credentials_and_debugging_are_operator_only():
     text = (SKILL / "SKILL.md").read_text()
     heading = ""

@@ -340,12 +340,13 @@ def _format_event(notif: dict) -> dict | None:
     if outbox.is_relative_to(home):
         outbox = outbox.relative_to(home)
     action_hint = (
-        f"\n\n→ Add entries to {outbox}: read_file + edit_file if present; write_file only creates.\n"
+        f"\n\n→ Add to {outbox}: read_file + edit_file if present; write_file only creates.\n"
         f"`bash /mimir-home/skills/social-cli/scripts/run-social-cli.sh {POLLER_NAME} dispatch --platform {platform}`\n"
-        "Check count before posts/replies (cap 5 per UTC day).\n"
+        "Count first: posts/replies cap 5/UTC day.\n"
         "dispatch:\n"
         f"  - reply: {{ platform: {platform}, id: \"{target_id}\", text: \"...\" }}\n"
         f"  - like: {{ platform: {platform}, id: \"{target_id}\" }}\n"
+        f"  - ignore: {{ id: \"{nid}\", reason: \"...\" }}\n"
         'Bare outbox.yaml: "No outbox file found".\n'
         f"send_message is chat, NOT {platform}."
     )
