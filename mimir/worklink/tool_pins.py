@@ -65,7 +65,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="feature-factory",
         category="coding-cli",
-        pin="0.10.8",
+        pin="0.10.10",
         smoke="test -f \"$MIMIR_FACTORY_ENTRYPOINT\"",
         source="npm",
         package="feature-factory",
@@ -75,7 +75,7 @@ DEFAULT_TOOL_PINS: tuple[ToolPin, ...] = (
     ToolPin(
         name="opencode-feature-factory",
         category="coding-plugin",
-        pin="0.10.8",
+        pin="0.10.10",
         smoke="opencode --version",
         source="npm",
         package="opencode-feature-factory",
