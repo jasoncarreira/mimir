@@ -6,7 +6,121 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.10. Integrated-stage
+## [0.9.2] — 2026-10-01
+
+Tainted turns can now propose memories and posts for operator approval instead
+of being refused outright, and reading mimir's own PRs no longer taints forge
+actions after its own push. Outbound text is privacy-scanned, Codex quota state
+follows the server's verdict, and feature-factory moves to 0.10.10.
+
+**Operator actions:**
+
+- Rebuild the image of a source deployment that runs the canonical image. The
+  feature-factory and adapter pins moved to 0.10.10.
+- Social-cli no longer dispatches posts from the agent turn. Posts go out only
+  after an operator merges the rolling social-outbox PR, so set
+  `MIMIR_SOCIAL_OUTBOX_APPROVERS` to the GitHub logins allowed to approve. While
+  it is unset or empty, every dispatch is withheld (`no_approvers_configured`).
+  The social-cli pollers' `pass_env` now forwards `GITHUB_TOKEN`,
+  `MIMIR_SOURCE_DIR` and `MIMIR_SOCIAL_OUTBOX_APPROVERS`, so make sure those are
+  present in the container environment.
+- Installed `github-poller` and `chainlink-orchestrator` manifests must pick up
+  their new `hooks` fields through the startup auto-update or
+  `mimir skills update`. See the entry below.
+- The unversioned `/api/web/bootstrap` and `/api/events` routes are removed.
+  Nothing in mimir consumed them; any external consumer must move to the
+  versioned API.
+
+**Memory and post proposals**
+
+- `memory_propose` queues a memory from a tainted turn in a server-owned store
+  (`<home>/.mimir/memory-proposals.jsonl`) that file tools cannot read or write
+  (#2194).
+- An authenticated operator reply resolves a proposal. `approve mp-xxxx` stores
+  the queued text in SAGA, and `approve mp-xxxx: <edit>` stores the operator's
+  edited text instead, both with `operator_approved_proposal` provenance.
+  `decline mp-xxxx` marks the proposal declined and stores nothing. No model
+  turn runs or sees the command, including when it arrives mid-turn (#2197).
+- A server-posted digest lists pending proposals on the operator alert channel.
+  `mimir memory proposals list` shows them; the CLI has no approve or decline
+  (#2198).
+- Operator approval requests carry typed IDs (`op-xxxx`, `mp-xxxx`). A reply
+  resolves only the request it names, or the one a Discord reply references,
+  and a bare `approve` is accepted only when exactly one request is pending
+  (#2191).
+- Proposal pollers get per-poller surfaces, including a protected social-outbox
+  surface with one rolling PR. One identity-based guard protects the proposal
+  store and live outbox paths for every turn kind, admin included (#2195).
+- Social-cli proposes posts through the rolling outbox PR and pings the operator
+  when it adds to it. The poller dispatches only content an approver merged,
+  verified against the forge, once each (#2196).
+- `social-cli count` works without the image shim and fails closed
+  (`CAP UNKNOWN`, exit 3) on an unreadable, empty or malformed ledger or an
+  unresolved thread. Each thread post counts against the cap (#2190).
+- Proposal pollers write drafts under `state/pollers/<name>/`, and the new
+  proposal-poller guide documents the pattern (#2187). Prompts state that
+  tainted turns cannot write durable memory (#2188).
+
+**Taint and authorization**
+
+- After its own verified push, mimir keeps acting on its own PR through
+  turn-local head lineage, and mismatch diagnostics name the real cause (#2185).
+- A replayed poller event is re-attested at recovery instead of defaulting to
+  untrusted (#2193). `pass_env` redaction no longer masks mimir's own login, so
+  own-PR remediation scope is granted again (#2158).
+- On a tainted turn, `fetch_url` may reach a URL that appeared verbatim in the
+  turn's untrusted ingest (#2157).
+- Authorization uses one per-tool descriptor (#2170). The no-op
+  `audit_declassification` is removed (#2167).
+
+**Outbound privacy**
+
+- External-sink writes are scanned. Credentials are always refused; private
+  terms from `<home>/private-terms.txt` are shadow-logged unless
+  `MIMIR_OUTBOUND_PRIVACY_ENFORCE` is set (#2175). Social-cli outbox posts are
+  scanned at write and at dispatch (#2177).
+- An opt-in Jev PII detector (`MIMIR_OUTBOUND_PII_JEV` with `JEV_KEY`) runs in
+  shadow and fails open (#2179). The operator alert channel is exempt, and
+  GitHub text is scanned (#2180).
+
+**Gmail triage**
+
+- The gmail-poller can run per-account Jev triage that drops confident skips
+  before they cost an agent turn. Rules come from the account prompt, with a
+  shadow mode (#2174, #2176) and an optional `mode: decide` where the Jev notify
+  score decides both ways (#2189).
+
+**Models, quota and synthesis**
+
+- Codex quota records the server's `limit_reached` verdict, smooths noisy usage
+  readings, and re-checks a quota pause with a canary instead of trusting its
+  `resets_at` (#2183, `MIMIR_QUOTA_RECHECK_SECONDS`).
+- Codex-Plus accepts `max` and `ultra` effort and omits reasoning when unset
+  (#2182). Non-interactive turns buffer the model step so mid-response stream
+  drops can be retried (#2178, `MIMIR_CODEX_PLUS_BUFFER_NONINTERACTIVE`).
+- Worklink OpenCode leaf builds pass the agent's reasoning effort as
+  `--variant`, overridable with `MIMIR_WORKLINK_REASONING_EFFORT` (#2184).
+- Requires `langchain-codex-plus` 0.0.11 (Codex client 0.159.1, which admits
+  gpt-6.1-sol) (#2181).
+- Synthesis turns can read back their own evicted tool results (#2186). The SAGA
+  embedding-dimension check ignores tombstoned atoms (#2156).
+
+**Internals**
+
+- The per-turn prompt-block loaders and the SAGA query run concurrently
+  (#2166).
+- budget_gate shares one core between its sync and async paths (#2162) and
+  detects tool failure from a typed signal (#2171).
+- One typed provider-error classifier serves retry and quota pause (#2163), and
+  one event emitter is shared (#2172).
+- Write authorization no longer runs the full `Config.from_env()` per call
+  (#2161).
+- `tool_pins.py` holds pin data only (#2165).
+- Dead code is removed (#2160).
+
+**Feature factory and pollers**
+
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.10 (#2199). Integrated-stage
   findings can open reviewed remediation slices via `factory remediate` (at most 2
   per run), so epic runs may take longer when a remediation opens. Test and
   repository-verify output now has run-local logs with redacted tails. A source
