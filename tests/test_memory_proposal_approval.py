@@ -268,6 +268,65 @@ async def test_boot_reregisters_only_live_requests_and_supports_bare_digest_repl
     assert expired not in [entry.approval_id for entry in approval_requests.pending("discord-1")]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_single_digest_records_reply_anchor_and_resolves_by_reference(setup, chunked):
+    env = setup
+    first = env.queue("digest fact")
+
+    async def send(channel, text, *, final):
+        assert channel == "discord-1"
+        return SimpleNamespace(sent=True, message_id="last" if chunked else "first",
+                               first_message_id="first" if chunked else None)
+
+    assert await memory_proposals.post_review_digest(env.home, "discord-1", send)
+    second = env.queue("later fact")
+    entries = {e.approval_id: e for e in approval_requests.pending("discord-1")}
+    assert entries[first].prompt_message_id == "first"
+    assert entries[second].prompt_message_id is None
+    result = await env.agent.run_turn(env.event("approve", extra={"reply_to_message_id": "first"}))
+    assert result.kind == "memory_proposal_approval"
+    assert env.atoms()[0][1] == "digest fact"
+    assert [e.approval_id for e in approval_requests.pending("discord-1")] == [second]
+
+
+@pytest.mark.asyncio
+async def test_multi_digest_records_no_anchor_and_ambiguity_content_is_inert(setup):
+    env = setup
+    first = env.queue("@everyone <@123> https://example.org")
+    second = env.queue("another fact")
+
+    async def send(channel, text, *, final):
+        return SimpleNamespace(sent=True, message_id="digest", first_message_id="header")
+
+    assert await memory_proposals.post_review_digest(env.home, "discord-1", send)
+    assert all(e.prompt_message_id is None for e in approval_requests.pending("discord-1"))
+    resolution = approval_requests.resolve(
+        env.event("approve", extra={"reply_to_message_id": "header"}), env.resolver,
+    )
+    assert resolution.status == "ambiguous"
+    assert first in resolution.message and second in resolution.message
+    assert "Pending approvals:" in resolution.message
+    assert "@everyone" not in resolution.message and "<@123>" not in resolution.message
+    assert "https://example.org" not in resolution.message
+    assert "@\u200beveryone" in resolution.message and "https:\u200b//" in resolution.message
+    assert env.atoms() == []
+    assert len(approval_requests.pending("discord-1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_digest_records_no_reply_anchor(setup):
+    env = setup
+    env.queue()
+
+    async def send(channel, text, *, final):
+        return SimpleNamespace(sent=False, message_id="partial", first_message_id="header")
+
+    assert not await memory_proposals.post_review_digest(env.home, "discord-1", send)
+    entry, = approval_requests.pending("discord-1")
+    assert entry.prompt_message_id is None
+
+
 def test_mint_skips_durable_and_registry_reserved_ids(setup, monkeypatch):
     env = setup
     monkeypatch.setattr(approval_requests.secrets, "choice", lambda alphabet: "a")

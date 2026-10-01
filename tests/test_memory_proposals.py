@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -60,6 +60,244 @@ def proposal_turn(tmp_path, monkeypatch):
 def _records(home):
     path = proposal_path(home)
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.asyncio
+async def test_server_digest_batches_escapes_redacts_and_reminds_once(proposal_turn):
+    from mimir.memory_proposals import post_review_digest
+
+    env = proposal_turn
+    first = await asyncio.to_thread(env.call, content="@everyone https://example.org ghp_" + "a" * 36)
+    # The proposal tool refuses credentials; queue a normal adversarial string
+    # and inject a token-shaped value in rationale to verify outbound redaction.
+    assert "credential" in first
+    first = await asyncio.to_thread(env.call, content="@everyone https://example.org", rationale="ghp_" + "a" * 36)
+    second = await asyncio.to_thread(env.call, content="another fact")
+    ids = [r["id"] for r in _records(env.home)]
+    assert all(proposal_id in first + second for proposal_id in ids)
+    messages = []
+
+    async def send(channel, text, *, final):
+        messages.append((channel, text))
+        return SimpleNamespace(sent=True)
+
+    now = datetime.now(timezone.utc)
+    assert await post_review_digest(env.home, "operator", send, now=now)
+    assert len(messages) == 1
+    text = messages[0][1]
+    assert all(proposal_id in text for proposal_id in ids)
+    assert "derived from untrusted external content — approve only if true and worth keeping" in text
+    assert "@everyone" not in text and "https://example.org" not in text
+    assert "@\u200beveryone" in text and "https:\u200b//" in text
+    assert "ghp_" + "a" * 36 not in text
+    assert "\\[REDACTED\\]" in text
+    assert "approve " + ids[0] in text and "decline " + ids[0] in text
+    await asyncio.to_thread(env.call, content="third fact")
+    third = _records(env.home)[-1]["id"]
+    assert not await post_review_digest(env.home, "operator", send, now=now + timedelta(minutes=29))
+    assert await post_review_digest(env.home, "operator", send, now=now + timedelta(minutes=31))
+    assert third in messages[1][1] and all(i not in messages[1][1] for i in ids)
+    assert await post_review_digest(env.home, "operator", send, now=now + timedelta(hours=24, minutes=32))
+    assert len(messages) == 3 and all(proposal_id in messages[2][1] for proposal_id in (*ids, third))
+    assert not await post_review_digest(env.home, "operator", send, now=now + timedelta(hours=26))
+    assert len(messages) == 3
+
+
+@pytest.mark.asyncio
+async def test_digest_caps_entries_and_carries_unsent_backlog(proposal_turn):
+    from mimir.memory_proposals import _digest_state, post_review_digest
+
+    env = proposal_turn
+    for index in range(12):
+        await asyncio.to_thread(env.call, content=f"backlog fact {index}")
+    ids = [r["id"] for r in _records(env.home)]
+    messages = []
+
+    async def send(channel, text, *, final):
+        messages.append(text)
+        return SimpleNamespace(sent=True)
+
+    now = datetime.now(timezone.utc)
+    assert await post_review_digest(env.home, "operator", send, now=now)
+    assert all(i in messages[0] for i in ids[:10])
+    assert all(i not in messages[0] for i in ids[10:])
+    assert "2 more pending (`mimir memory proposals list`)" in messages[0]
+    assert set(_digest_state(env.home)["sent"]) == set(ids[:10])
+    assert await post_review_digest(env.home, "operator", send, now=now + timedelta(minutes=31))
+    assert all(i in messages[1] for i in ids[10:])
+    assert all(i not in messages[1] for i in ids[:10])
+    assert set(_digest_state(env.home)["sent"]) == set(ids)
+
+
+@pytest.mark.asyncio
+async def test_digest_does_not_mark_failed_delivery(proposal_turn):
+    from mimir.memory_proposals import post_review_digest
+
+    env = proposal_turn
+    await asyncio.to_thread(env.call)
+    sent = []
+
+    async def send(channel, text, *, final):
+        sent.append(text)
+        return SimpleNamespace(sent=len(sent) > 1)
+
+    assert not await post_review_digest(env.home, "operator", send)
+    assert await post_review_digest(env.home, "operator", send)
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_corrupt_digest_state_refuses_delivery(proposal_turn):
+    from mimir.memory_proposals import ProposalRefusal, _digest_path, post_review_digest
+
+    await asyncio.to_thread(proposal_turn.call)
+    _digest_path(proposal_turn.home).write_text('{"sent": "not a ledger", "last_sent": null}')
+
+    async def send(*args, **kwargs):
+        pytest.fail("corrupt delivery ledger must not result in a duplicate post")
+
+    with pytest.raises(ProposalRefusal, match="digest state"):
+        await post_review_digest(proposal_turn.home, "operator", send)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["declined", "approved", "expired"])
+async def test_digest_never_reminds_a_decided_proposal(proposal_turn, status):
+    from mimir.memory_proposals import _update, post_review_digest
+
+    env = proposal_turn
+    await asyncio.to_thread(env.call)
+    proposal_id = _records(env.home)[0]["id"]
+    messages = []
+
+    async def send(channel, text, *, final):
+        messages.append(text)
+        return SimpleNamespace(sent=True)
+
+    now = datetime.now(timezone.utc)
+    assert await post_review_digest(env.home, "operator", send, now=now)
+    _update(env.home, proposal_id, status)
+    assert not await post_review_digest(env.home, "operator", send,
+                                        now=now + timedelta(hours=25))
+    assert len(messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_excludes_expired_pending_proposals(proposal_turn):
+    from mimir.memory_proposals import post_review_digest
+
+    env = proposal_turn
+    await asyncio.to_thread(env.call)
+    record, = _records(env.home)
+    record["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    proposal_path(env.home).write_text(json.dumps(record) + "\n")
+
+    async def send(*args, **kwargs):
+        pytest.fail("expired pending proposal must not be delivered")
+
+    assert not await post_review_digest(env.home, "operator", send)
+
+
+def test_operator_cli_list_is_read_only_and_escapes_content(proposal_turn, capsys):
+    from mimir.cli import main
+    from mimir.memory_proposals import _update
+
+    env = proposal_turn
+    main(["memory", "proposals", "list"])
+    assert "(no proposals)" in capsys.readouterr().out
+    env.call(content="@everyone <@123> https://example.org", rationale="reason")
+    env.call(content="second fact")
+    ids = [r["id"] for r in _records(env.home)]
+    before = proposal_path(env.home).read_bytes()
+    main(["memory", "proposals", "list"])
+    output = capsys.readouterr().out
+    assert all(i in output for i in ids)
+    assert "@everyone" not in output and "<@123>" not in output
+    assert "https://example.org" not in output
+    assert "@\u200beveryone" in output and "https:\u200b//" in output
+    assert proposal_path(env.home).read_bytes() == before
+    _update(env.home, ids[1], "declined")
+    main(["memory", "proposals", "list"])
+    output = capsys.readouterr().out
+    assert ids[0] in output and ids[1] not in output
+    main(["memory", "proposals", "list", "--status", "all"])
+    output = capsys.readouterr().out
+    assert all(i in output for i in ids)
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+def test_memory_proposal_cli_rejects_decisions(proposal_turn, capsys, decision):
+    from mimir.cli import main
+
+    proposal_turn.call()
+    record, = _records(proposal_turn.home)
+    before = proposal_path(proposal_turn.home).read_bytes()
+    with pytest.raises(SystemExit) as exit_info:
+        main(["memory", "proposals", decision, record["id"]])
+    assert exit_info.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+    assert proposal_path(proposal_turn.home).read_bytes() == before
+
+
+def test_commands_have_no_memory_proposal_decision_path():
+    import ast
+    import mimir.commands
+
+    root = Path(mimir.commands.__file__).parent
+    forbidden = {"decide_proposal", "complete_reply", "_complete_reply"}
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert not any(alias.name in forbidden for alias in node.names), path
+            if isinstance(node, ast.Call):
+                name = (node.func.id if isinstance(node.func, ast.Name) else
+                        node.func.attr if isinstance(node.func, ast.Attribute) else None)
+                assert name not in forbidden, path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_decide_proposal_rejects_malformed_id_before_store_read(tmp_path, monkeypatch, decision):
+    from mimir import memory_proposals
+
+    def unexpected_read(*args):
+        pytest.fail("malformed IDs must be rejected before looking up records")
+
+    monkeypatch.setattr(memory_proposals, "_records", unexpected_read)
+    assert await memory_proposals.decide_proposal(
+        tmp_path, "mp-invalid", decision, approved_by="operator",
+        approval_event_id="message", saga_store=None,
+    ) == "no pending request mp-invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["tampered", "expired", "decided", "blank_edit"])
+async def test_decision_cannot_bypass_b3b_checks(proposal_turn, case):
+    from mimir.memory_proposals import _update, decide_proposal
+
+    home = proposal_turn.home
+    await asyncio.to_thread(proposal_turn.call)
+    record, = _records(home)
+    if case == "tampered":
+        record["content"] = "altered after queue"
+    elif case == "expired":
+        record["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    elif case == "decided":
+        _update(home, record["id"], "declined")
+    if case in {"tampered", "expired"}:
+        proposal_path(home).write_text(json.dumps(record) + "\n")
+
+    class Store:
+        async def store(self, *args, **kwargs):
+            pytest.fail("invalid decision must not reach storage")
+
+    notice = await decide_proposal(
+        home, record["id"], "approve", edit="  " if case == "blank_edit" else None,
+        approved_by="operator", approval_event_id="message", saga_store=Store(),
+    )
+    assert {"tampered": "hash mismatch", "expired": "expired", "decided": "already decided",
+            "blank_edit": "empty edit"}[case] in notice
 
 
 def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_turn, monkeypatch):

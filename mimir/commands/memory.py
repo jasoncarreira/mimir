@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -80,6 +81,29 @@ def _run_doctor(args: argparse.Namespace) -> int:
     return 1 if report.status == "error" else 0
 
 
+def _run_memory_proposals(args: argparse.Namespace) -> int:
+    """Read-only listing; decisions require authenticated operator bridge replies.
+
+    CLI and model shells share a uid, so a TTY cannot attest human approval.
+    """
+    from ..memory_proposals import ProposalRefusal, _safe_digest_field, list_proposals
+
+    home = Path(os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
+    try:
+        records = list_proposals(home, status=args.status)
+        if not records:
+            print("(no proposals)")
+        for record in records:
+            print(f"{_safe_digest_field(record['id'])} "
+                  f"{_safe_digest_field(record['status'])} "
+                  f"{_safe_digest_field(record['stream'])}: "
+                  f"{_safe_digest_field(record['content'])}")
+        return 0
+    except (ProposalRefusal, OSError, ValueError, RuntimeError) as exc:
+        print(f"error: {_safe_digest_field(exc)}", file=sys.stderr)
+    return 1
+
+
 def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     """Register the ``mimir memory`` subcommand tree."""
     mem_p = sub.add_parser(
@@ -121,6 +145,11 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
         help="Emit the stable JSON report model instead of text.",
     )
 
+    proposals = mem_sub.add_parser("proposals", help="Review queued memory proposals.")
+    proposal_sub = proposals.add_subparsers(dest="proposal_action", required=True)
+    listing = proposal_sub.add_parser("list", help="List pending or all proposals.")
+    listing.add_argument("--status", choices=("pending", "all"), default="pending")
+
     return mem_p
 
 
@@ -137,5 +166,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return _run_status(args)
     if action == "doctor":
         return _run_doctor(args)
+    if action == "proposals":
+        return _run_memory_proposals(args)
     parser.print_help()
     return 1

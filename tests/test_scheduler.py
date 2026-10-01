@@ -6561,3 +6561,63 @@ async def test_poller_cadence_is_cached_per_cron(tmp_path):
 
 async def _noop_coro():
     return None
+
+
+@pytest.mark.asyncio
+async def test_memory_digest_registered_as_server_callable_not_model_tick(tmp_path):
+    from mimir.memory_proposals import queue_proposal
+
+    enqueued = []
+
+    async def enqueue(event):
+        enqueued.append(event)
+        return True
+
+    delivered = []
+
+    async def send(channel, text, *, final):
+        delivered.append(text)
+        return SimpleNamespace(sent=True)
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    assert scheduler.add_memory_proposal_digest_job(tmp_path, "operator", send)
+    assert "memory-proposal-digest" in scheduler.registered_callables()
+    fire = scheduler._callables["memory-proposal-digest"].fn
+    await fire()
+    assert delivered == [] and enqueued == []
+    proposal_id = queue_proposal(
+        tmp_path, content="from a feed", stream="semantic", rationale="review",
+        proposed_by="poller:feed", turn_id="turn", origin_trigger="poller",
+        origin_ref="feed:1", sources=(SimpleNamespace(
+            source_kind="channel", integrity="untrusted", integrity_effect="active_ingest",
+            resource_id="feed:1",
+        ),),
+    )
+    await fire()
+    await fire()
+    assert len(delivered) == 1 and proposal_id in delivered[0] and enqueued == []
+
+
+@pytest.mark.asyncio
+async def test_memory_digest_unset_channel_warns_once_per_scheduler_run(tmp_path, monkeypatch):
+    from mimir import scheduler as scheduler_module
+
+    events = []
+
+    async def log(kind, **fields):
+        events.append(kind)
+
+    async def send(*args, **kwargs):
+        pytest.fail("unset channel must not send")
+
+    monkeypatch.setattr(scheduler_module, "log_event", log)
+
+    async def enqueue(event):
+        pytest.fail("digest must never enqueue a model turn")
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    scheduler.add_memory_proposal_digest_job(tmp_path, "", send)
+    fire = scheduler._callables["memory-proposal-digest"].fn
+    await fire()
+    await fire()
+    assert events == ["memory_proposal_digest_channel_unset"]
