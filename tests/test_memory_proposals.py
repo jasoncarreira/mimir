@@ -104,6 +104,32 @@ async def test_server_digest_batches_escapes_redacts_and_reminds_once(proposal_t
 
 
 @pytest.mark.asyncio
+async def test_digest_caps_entries_and_carries_unsent_backlog(proposal_turn):
+    from mimir.memory_proposals import _digest_state, post_review_digest
+
+    env = proposal_turn
+    for index in range(12):
+        await asyncio.to_thread(env.call, content=f"backlog fact {index}")
+    ids = [r["id"] for r in _records(env.home)]
+    messages = []
+
+    async def send(channel, text, *, final):
+        messages.append(text)
+        return SimpleNamespace(sent=True)
+
+    now = datetime.now(timezone.utc)
+    assert await post_review_digest(env.home, "operator", send, now=now)
+    assert all(i in messages[0] for i in ids[:10])
+    assert all(i not in messages[0] for i in ids[10:])
+    assert "2 more pending (`mimir memory proposals list`)" in messages[0]
+    assert set(_digest_state(env.home)["sent"]) == set(ids[:10])
+    assert await post_review_digest(env.home, "operator", send, now=now + timedelta(minutes=31))
+    assert all(i in messages[1] for i in ids[10:])
+    assert all(i not in messages[1] for i in ids[:10])
+    assert set(_digest_state(env.home)["sent"]) == set(ids)
+
+
+@pytest.mark.asyncio
 async def test_digest_does_not_mark_failed_delivery(proposal_turn):
     from mimir.memory_proposals import post_review_digest
 
@@ -172,54 +198,86 @@ async def test_digest_excludes_expired_pending_proposals(proposal_turn):
     assert not await post_review_digest(env.home, "operator", send)
 
 
-def test_operator_cli_list_approve_edit_decline_uses_checked_store(proposal_turn, monkeypatch, capsys):
-    import struct
-    from mimir.cli import main
-    from mimir.runtime import resolve_saga_db_path
-    from mimir.saga.client import SagaStore
-
-    env = proposal_turn
-    monkeypatch.setattr("mimir.saga.client._embed_text_sync",
-                        lambda text: (struct.pack("4f", 1, 0, 0, 0), "stub", "stub", 4))
-    saga = SagaStore(db_path=resolve_saga_db_path(env.home), embedding_dim=4)
-    saga._ensure_conn()
-    first = env.call(content="fact one")
-    second = env.call(content="fact two")
-    ids = [r["id"] for r in _records(env.home)]
-    assert all(i in first + second for i in ids)
-    monkeypatch.setattr("mimir.commands.memory.getpass.getuser", lambda: "operator")
-
-    def cli(*args):
-        main(["memory", "proposals", *args])
-        return 0
-
-    assert cli("list") == 0
-    output = capsys.readouterr().out
-    assert all(i in output for i in ids)
-    assert cli("approve", ids[0], "--text", "edited fact") == 0
-    assert cli("decline", ids[1]) == 0
-    assert cli("list") == 0
-    assert "(no proposals)" in capsys.readouterr().out
-    assert cli("list", "--status", "all") == 0
-    output = capsys.readouterr().out
-    assert all(i in output for i in ids)
-    atom = saga._ensure_conn().execute("SELECT content, source_type, provenance FROM atoms").fetchone()
-    assert atom[0] == "edited fact" and atom[1] == "operator_approved_proposal"
-    assert json.loads(atom[2])["approved_by"] == "cli:operator"
-    assert [r["status"] for r in _records(env.home)] == ["approved", "declined"]
-
-
-@pytest.mark.parametrize("case", ["tampered", "expired", "decided", "blank_edit"])
-def test_cli_approval_cannot_bypass_b3b_checks(proposal_turn, monkeypatch, capsys, case):
+def test_operator_cli_list_is_read_only_and_escapes_content(proposal_turn, capsys):
     from mimir.cli import main
     from mimir.memory_proposals import _update
-    from mimir.saga.client import SagaStore
-    from mimir.runtime import resolve_saga_db_path
+
+    env = proposal_turn
+    main(["memory", "proposals", "list"])
+    assert "(no proposals)" in capsys.readouterr().out
+    env.call(content="@everyone <@123> https://example.org", rationale="reason")
+    env.call(content="second fact")
+    ids = [r["id"] for r in _records(env.home)]
+    before = proposal_path(env.home).read_bytes()
+    main(["memory", "proposals", "list"])
+    output = capsys.readouterr().out
+    assert all(i in output for i in ids)
+    assert "@everyone" not in output and "<@123>" not in output
+    assert "https://example.org" not in output
+    assert "@\u200beveryone" in output and "https:\u200b//" in output
+    assert proposal_path(env.home).read_bytes() == before
+    _update(env.home, ids[1], "declined")
+    main(["memory", "proposals", "list"])
+    output = capsys.readouterr().out
+    assert ids[0] in output and ids[1] not in output
+    main(["memory", "proposals", "list", "--status", "all"])
+    output = capsys.readouterr().out
+    assert all(i in output for i in ids)
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+def test_memory_proposal_cli_rejects_decisions(proposal_turn, capsys, decision):
+    from mimir.cli import main
+
+    proposal_turn.call()
+    record, = _records(proposal_turn.home)
+    before = proposal_path(proposal_turn.home).read_bytes()
+    with pytest.raises(SystemExit) as exit_info:
+        main(["memory", "proposals", decision, record["id"]])
+    assert exit_info.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+    assert proposal_path(proposal_turn.home).read_bytes() == before
+
+
+def test_commands_have_no_memory_proposal_decision_path():
+    import ast
+    import mimir.commands
+
+    root = Path(mimir.commands.__file__).parent
+    forbidden = {"decide_proposal", "complete_reply", "_complete_reply"}
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert not any(alias.name in forbidden for alias in node.names), path
+            if isinstance(node, ast.Call):
+                name = (node.func.id if isinstance(node.func, ast.Name) else
+                        node.func.attr if isinstance(node.func, ast.Attribute) else None)
+                assert name not in forbidden, path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_decide_proposal_rejects_malformed_id_before_store_read(tmp_path, monkeypatch, decision):
+    from mimir import memory_proposals
+
+    def unexpected_read(*args):
+        pytest.fail("malformed IDs must be rejected before looking up records")
+
+    monkeypatch.setattr(memory_proposals, "_records", unexpected_read)
+    assert await memory_proposals.decide_proposal(
+        tmp_path, "mp-invalid", decision, approved_by="operator",
+        approval_event_id="message", saga_store=None,
+    ) == "no pending request mp-invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["tampered", "expired", "decided", "blank_edit"])
+async def test_decision_cannot_bypass_b3b_checks(proposal_turn, case):
+    from mimir.memory_proposals import _update, decide_proposal
 
     home = proposal_turn.home
-    saga = SagaStore(db_path=resolve_saga_db_path(home), embedding_dim=4)
-    saga._ensure_conn()
-    proposal_turn.call()
+    await asyncio.to_thread(proposal_turn.call)
     record, = _records(home)
     if case == "tampered":
         record["content"] = "altered after queue"
@@ -229,13 +287,17 @@ def test_cli_approval_cannot_bypass_b3b_checks(proposal_turn, monkeypatch, capsy
         _update(home, record["id"], "declined")
     if case in {"tampered", "expired"}:
         proposal_path(home).write_text(json.dumps(record) + "\n")
-    with pytest.raises(SystemExit) as exit_info:
-        main(["memory", "proposals", "approve", record["id"],
-              *(["--text", "  "] if case == "blank_edit" else [])])
-    assert exit_info.value.code == 1
+
+    class Store:
+        async def store(self, *args, **kwargs):
+            pytest.fail("invalid decision must not reach storage")
+
+    notice = await decide_proposal(
+        home, record["id"], "approve", edit="  " if case == "blank_edit" else None,
+        approved_by="operator", approval_event_id="message", saga_store=Store(),
+    )
     assert {"tampered": "hash mismatch", "expired": "expired", "decided": "already decided",
-            "blank_edit": "empty edit"}[case] in capsys.readouterr().out
-    assert saga._ensure_conn().execute("SELECT COUNT(*) FROM atoms").fetchone()[0] == 0
+            "blank_edit": "empty edit"}[case] in notice
 
 
 def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_turn, monkeypatch):

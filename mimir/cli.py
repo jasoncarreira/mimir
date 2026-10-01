@@ -460,14 +460,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "memory":
-        if (args.memory_action == "proposals" and
-                args.proposal_action == "approve"):
-            from .config import _load_home_dotenv
-
-            home = Path(os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
-            _load_home_dotenv(home)
-            if (home / "saga.toml").is_file() and not os.environ.get("SAGA_CONFIG"):
-                os.environ["SAGA_CONFIG"] = str(home / "saga.toml")
         code = _memory_cmd.dispatch(args, mem_p)
         if code:
             sys.exit(code)

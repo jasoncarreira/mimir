@@ -342,6 +342,8 @@ async def post_review_digest(
             eligible.append(record)
     if not eligible:
         return False
+    remaining = len(eligible) - 10
+    eligible = eligible[:10]
     lines = ["Pending memory proposals — derived from untrusted external content — approve only if true and worth keeping"]
     for record in eligible:
         proposal_id = record["id"]
@@ -352,9 +354,16 @@ async def post_review_digest(
             f"Rationale: {_safe_digest_field(record['rationale'])}",
             f"approve {proposal_id} / decline {proposal_id} / approve {proposal_id}: <edited text>",
         ))
+    if remaining > 0:
+        lines.append(f"\n{remaining} more pending (`mimir memory proposals list`)")
     result = await send(channel, "\n".join(lines), final=True)
     if not getattr(result, "sent", False):
         return False
+    if len(eligible) == 1:
+        approval_requests.set_prompt_message_id(
+            eligible[0]["id"],
+            getattr(result, "first_message_id", None) or getattr(result, "message_id", None),
+        )
     with _store_lock(home, exclusive=True):
         state = _digest_state(home)
         state["last_sent"] = now.isoformat()
@@ -414,7 +423,7 @@ def sync_pending(home: Path) -> None:
         try:
             approval_requests.register(
                 kind="mp", approval_id=record["id"], channel_id=channel,
-                description=record.get("content", "memory proposal")[:160],
+                description=_safe_digest_field(record.get("content", "memory proposal"))[:160],
                 expires_at=time.monotonic() + remaining, resolver=resolve,
                 supports_edits=True, inject_into_turn=False,
             )
@@ -485,7 +494,10 @@ async def decide_proposal(
     home: Path, proposal_id: str, decision: str, *, edit: str | None = None,
     approved_by: str, approval_event_id: str | None, saga_store: Any,
 ) -> str:
-    """Shared operator decision and B3b validation/storage path."""
+    """Server-side decision path after authenticated bridge reply resolution.
+
+    Never expose this as a CLI decision or model tool: neither attests an operator.
+    """
     if decision not in {"approve", "decline"} or not _NAMED_MP.fullmatch(f"{decision} {proposal_id}"):
         return f"no pending request {proposal_id}"
     record = next((r for r in _records(home) if r.get("id") == proposal_id), None)

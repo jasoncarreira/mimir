@@ -451,6 +451,62 @@ async def test_chunked_approval_alert_retains_first_chunk_reply_anchor(
 
 
 @pytest.mark.asyncio
+async def test_long_single_memory_digest_anchors_first_chunk(
+    bridge_with_fake_client, tmp_path, monkeypatch,
+):
+    import time
+    from mimir import approval_requests, memory_proposals
+
+    monkeypatch.setattr(approval_requests, "_PENDING", {})
+    monkeypatch.setattr(approval_requests, "_RECENT", {})
+    monkeypatch.setattr(approval_requests, "_EXPIRED", set())
+    monkeypatch.setattr(memory_proposals, "_APPROVAL_BACKENDS", {})
+    memory_proposals.configure_approvals(tmp_path, "discord-1", SimpleNamespace())
+    first = memory_proposals.queue_proposal(
+        tmp_path, content="digest fact", stream="semantic", rationale="long rationale " * 400,
+        proposed_by="poller:feed", turn_id="turn", origin_trigger="poller",
+        origin_ref="feed:1", sources=(SimpleNamespace(
+            source_kind="channel", integrity="untrusted", integrity_effect="active_ingest",
+            resource_id="feed:1",
+        ),),
+    )
+    bridge, _, sent = bridge_with_fake_client
+    results = []
+
+    async def send(channel, text, *, final):
+        result = await bridge.send(channel, text, final=final)
+        results.append(result)
+        return result
+
+    assert await memory_proposals.post_review_digest(tmp_path, "discord-1", send)
+    assert len(sent) > 1
+    assert "Pending memory proposals" in sent[0]["content"]
+    assert any(first in chunk["content"] for chunk in sent)
+    entry, = approval_requests.pending("discord-1")
+    assert entry.prompt_message_id == "1001" == results[0].first_message_id
+    assert entry.prompt_message_id != results[0].message_id
+    approval_requests.register(
+        kind="op", channel_id="discord-1", description="another request",
+        expires_at=time.monotonic() + 60, resolver=lambda *args: "declined",
+    )
+    from mimir.identities import IdentityResolver
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: operator\n    aliases: [discord-99]\n"
+        "    access: {roles: [admin]}\n",
+    )
+    identity = IdentityResolver(tmp_path)
+    identity.reload()
+    event = AgentEvent(
+        trigger="user_message", channel_id="discord-1", author="discord-99",
+        source="discord", content="decline", extra={"reply_to_message_id": "1001"},
+    )
+    assert approval_requests.resolve(event, identity).entry.approval_id == first
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_whitespace_only_message(bridge_with_fake_client):
     bridge, _, sent = bridge_with_fake_client
 

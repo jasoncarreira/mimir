@@ -14,8 +14,6 @@ tests. A proposal can change both memory/core and prompts in one PR:
 from __future__ import annotations
 
 import argparse
-import asyncio
-import getpass
 import json
 import os
 import sys
@@ -84,36 +82,25 @@ def _run_doctor(args: argparse.Namespace) -> int:
 
 
 def _run_memory_proposals(args: argparse.Namespace) -> int:
-    from ..memory_proposals import ProposalRefusal, decide_proposal, list_proposals
-    from ..redaction import redact_text
+    """Read-only listing; decisions require authenticated operator bridge replies.
+
+    CLI and model shells share a uid, so a TTY cannot attest human approval.
+    """
+    from ..memory_proposals import ProposalRefusal, _safe_digest_field, list_proposals
 
     home = Path(os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
     try:
-        if args.proposal_action == "list":
-            records = list_proposals(home, status=args.status)
-            if not records:
-                print("(no proposals)")
-            for record in records:
-                print(f"{record['id']} {record['status']} {record['stream']}: "
-                      f"{redact_text(record['content'])}")
-            return 0
-        if args.proposal_action in {"approve", "decline"}:
-            # Resolve the same SAGA configuration as the running server.
-            from ..runtime import resolve_saga_db_path
-            from ..saga_client import make_saga_client
-
-            saga = (make_saga_client(db_path=resolve_saga_db_path(home),
-                                     require_existing=True, record_calls=False)
-                    if args.proposal_action == "approve" else None)
-            notice = asyncio.run(decide_proposal(
-                home, args.id, args.proposal_action,
-                edit=getattr(args, "text", None), approved_by=f"cli:{getpass.getuser()}",
-                approval_event_id=None, saga_store=saga,
-            ))
-            print(redact_text(notice))
-            return 0 if notice.startswith(("Stored ", "Already in memory ", "Declined ")) else 1
+        records = list_proposals(home, status=args.status)
+        if not records:
+            print("(no proposals)")
+        for record in records:
+            print(f"{_safe_digest_field(record['id'])} "
+                  f"{_safe_digest_field(record['status'])} "
+                  f"{_safe_digest_field(record['stream'])}: "
+                  f"{_safe_digest_field(record['content'])}")
+        return 0
     except (ProposalRefusal, OSError, ValueError, RuntimeError) as exc:
-        print(f"error: {redact_text(str(exc))}", file=sys.stderr)
+        print(f"error: {_safe_digest_field(exc)}", file=sys.stderr)
     return 1
 
 
@@ -162,11 +149,6 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     proposal_sub = proposals.add_subparsers(dest="proposal_action", required=True)
     listing = proposal_sub.add_parser("list", help="List pending or all proposals.")
     listing.add_argument("--status", choices=("pending", "all"), default="pending")
-    approve = proposal_sub.add_parser("approve", help="Approve a proposal into SAGA memory.")
-    approve.add_argument("id")
-    approve.add_argument("--text", help="Edited text to store instead.")
-    decline = proposal_sub.add_parser("decline", help="Decline a proposal.")
-    decline.add_argument("id")
 
     return mem_p
 
