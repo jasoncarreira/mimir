@@ -36,10 +36,11 @@ follows the server's verdict, and feature-factory moves to 0.10.10.
 - `memory_propose` queues a memory from a tainted turn in a server-owned store
   (`<home>/.mimir/memory-proposals.jsonl`) that file tools cannot read or write
   (#2194).
-- An authenticated operator reply `approve mp-xxxx`, `approve mp-xxxx: <edit>`
-  or `decline mp-xxxx` stores the exact queued text in SAGA with
-  `operator_approved_proposal` provenance. No model turn runs or sees the
-  command, including when it arrives mid-turn (#2197).
+- An authenticated operator reply resolves a proposal. `approve mp-xxxx` stores
+  the queued text in SAGA, and `approve mp-xxxx: <edit>` stores the operator's
+  edited text instead, both with `operator_approved_proposal` provenance.
+  `decline mp-xxxx` marks the proposal declined and stores nothing. No model
+  turn runs or sees the command, including when it arrives mid-turn (#2197).
 - A server-posted digest lists pending proposals on the operator alert channel.
   `mimir memory proposals list` shows them; the CLI has no approve or decline
   (#2198).
