@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.10. Integrated-stage
+  findings can open reviewed remediation slices via `factory remediate` (at most 2
+  per run), so epic runs may take longer when a remediation opens. Test and
+  repository-verify output now has run-local logs with redacted tails. A source
+  deployment must rebuild its image to install the new package and adapter pins.
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.8. Repository
   `verify` now runs on each slice, bootstrap runs before every verify, and an
   identical tree reuses its green verify. Epic runs therefore take longer per

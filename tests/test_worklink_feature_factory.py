@@ -95,7 +95,7 @@ def package_entrypoint(tmp_path: Path) -> Path:
 
 
 def structured_status_payload() -> dict[str, Any]:
-    # 0.10.8 release shape, including Gate 3's commit binding, not a live probe.
+    # 0.10.10 release shape, including Gate 3's commit binding, not a live probe.
     return status_payload(
         steps=[{"agent": "spec-writer", "status": "blocked", "attempts": 2}],
         slices=[{
@@ -132,6 +132,27 @@ def test_status_accepts_0102_slice_fields_and_top_level_retry_extensions() -> No
         "id": "be-x", "status": "merged", "attempts": 5,
         "extra_attempts": 2, "retry_limit": 7,
     },)
+
+
+def test_status_accepts_pending_remediation_slice_on_existing_schema() -> None:
+    remediation = {
+        "id": "remediation-1", "status": "pending", "attempts": 0,
+        "extra_attempts": 0, "retry_limit": 5,
+    }
+    next_action = {"kind": "dispatch-slice", "subject": "remediation-1"}
+    payload = status_payload(
+        slices=[structured_status_payload()["slices"][0], remediation],
+        next_action=next_action,
+    )
+
+    status = parse_factory_status(payload)
+
+    assert status.slices is not None
+    assert status.slices[1] == remediation
+    assert status.next_action == next_action
+    assert status.to_json()["slices"][1] == remediation
+    assert status.to_json()["next_action"] == next_action
+    assert parse_factory_status(status.to_json()) == status
 
 
 _STRUCTURED_ROWS = {
@@ -587,7 +608,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.10.8"
+    assert FACTORY_VERSION == "0.10.10"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
