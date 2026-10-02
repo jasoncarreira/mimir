@@ -361,6 +361,37 @@ async def test_llm_tick_registers_with_generous_misfire_grace(tmp_path: Path):
     assert fast.misfire_grace_time == 90
 
 
+@pytest.mark.asyncio
+async def test_scheduler_health_check_passes_actual_scheduler_start(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from mimir import ntfy
+
+    check = AsyncMock()
+    monkeypatch.setattr(ntfy, "fire_scheduler_wedge_alarm_if_warranted", check)
+    events_file = tmp_path / "events.jsonl"
+    scheduler_yaml = tmp_path / "scheduler.yaml"
+    sched = Scheduler(
+        scheduler_yaml=scheduler_yaml,
+        enqueue=lambda event: asyncio.sleep(0, result=True),
+    )
+    assert sched.add_scheduler_health_check_job(events_file, scheduler_yaml)
+    monkeypatch.setattr(sched, "_start_poller_trigger_listener", lambda: None)
+    monkeypatch.setattr(sched, "_start_loop_lag_monitor", lambda: None)
+    monkeypatch.setattr(sched, "rearm_quota_recovery_on_start", lambda: None)
+    before = datetime.now(timezone.utc)
+    try:
+        sched.start()
+        after = datetime.now(timezone.utc)
+        await sched._callables["scheduler-health-check"].fn()
+    finally:
+        await sched.stop()
+
+    check.assert_awaited_once()
+    assert check.call_args.args == (events_file,)
+    assert check.call_args.kwargs["scheduler_yaml_path"] == scheduler_yaml
+    assert before <= check.call_args.kwargs["scheduler_started_at"] <= after
+
+
 def test_misfire_grace_time_yaml_round_trip_and_validation(tmp_path: Path, caplog):
     import logging
 

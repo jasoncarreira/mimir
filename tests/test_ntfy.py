@@ -1277,6 +1277,102 @@ assert a.monitoring_since.isoformat() == sys.argv[4]
     assert json.loads(state_file.read_text())["monitoring_since"] == now.isoformat()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uptime_minutes,alarms", [(8, 0), (121, 1)])
+async def test_wedge_restart_floors_persisted_tick_without_rewriting_state(
+    tmp_path, monkeypatch, captured_events, uptime_minutes, alarms,
+):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(minutes=uptime_minutes)
+    tick = now - timedelta(minutes=510)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [_heartbeat_event(tick.isoformat())])
+    ntfy._assess_scheduler_wedge(
+        events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+        channel_id="scheduler:heartbeat", now=tick,
+    )
+    state_file, = tmp_path.glob(".scheduler-wedge-*.json")
+    original_state = state_file.read_bytes()
+    assert json.loads(original_state)["last_tick"] == tick.isoformat()
+    # The old tick is no longer in the bounded scan; only durable state sees it.
+    recent_events = [
+        {"timestamp": (now - timedelta(minutes=140)).isoformat(), "type": "other"},
+    ]
+    if not alarms:
+        recent_events.append(_suppress_event((now - timedelta(minutes=5)).isoformat()))
+    recent_events.append({"timestamp": now.isoformat(), "type": "other"})
+    _write_events(events_file, recent_events)
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+
+    assert alarm.await_count == alarms
+    assert not [event for event, _ in captured_events
+                if event == "scheduler_suppressed_window_observed"]
+    assert state_file.read_bytes() == original_state
+    if alarms:
+        assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+        assert alarm.call_args.kwargs["priority"] == 5
+        assert alarm.call_args.kwargs["dedupe_key"] == "scheduler-wedge:heartbeat"
+        assert f"since the scheduler started at {started.isoformat()}" in alarm.call_args.kwargs["body"]
+
+
+@pytest.mark.asyncio
+async def test_wedge_restart_does_not_delay_tick_newer_than_start(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(hours=10)
+    tick = now - timedelta(hours=3)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [_heartbeat_event(tick.isoformat())])
+    ntfy._assess_scheduler_wedge(
+        events_file, scheduler_yaml_path=scheduler, safety_factor=2,
+        channel_id="scheduler:heartbeat", now=tick,
+    )
+    _write_events(events_file, [
+        {"timestamp": (now - timedelta(minutes=140)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+    alarm.assert_awaited_once()
+    assert "hasn't fired in 180 min" in alarm.call_args.kwargs["body"]
+    assert "since the scheduler started" not in alarm.call_args.kwargs["body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("uptime_minutes,alarms", [(30, 0), (130, 1)])
+async def test_wedge_restart_uses_start_with_no_persisted_baseline(
+    tmp_path, monkeypatch, uptime_minutes, alarms,
+):
+    now = datetime(2026, 10, 2, 13, 50, tzinfo=timezone.utc)
+    started = now - timedelta(minutes=uptime_minutes)
+    events_file = tmp_path / "events.jsonl"
+    scheduler = _write_scheduler_yaml(tmp_path, "0 * * * *")
+    _write_events(events_file, [
+        {"timestamp": (now - timedelta(days=1)).isoformat(), "type": "other"},
+        {"timestamp": now.isoformat(), "type": "other"},
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler, now=now,
+        scheduler_started_at=started,
+    )
+    assert alarm.await_count == alarms
+    if alarms:
+        assert f"since the scheduler started at {started.isoformat()}" in alarm.call_args.kwargs["body"]
+
+
 def test_retained_tick_alarms_beyond_bound_and_recent_tick_recovers(tmp_path):
     now = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
     events_file = tmp_path / "events.jsonl"
