@@ -888,6 +888,7 @@ class Scheduler:
         self._arbiter = arbiter
         self._mutate_lock = asyncio.Lock()
         self._started = False
+        self._started_at: datetime | None = None
         self._loop_lag_task: asyncio.Task[Any] | None = None
         # chainlink #587: watchdog that captures the loop's stack DURING a stall.
         self._loop_watchdog: LoopStallWatchdog | None = None
@@ -3760,6 +3761,7 @@ class Scheduler:
                     events_log,
                     scheduler_yaml_path=scheduler_yaml,
                     safety_factor=safety_factor,
+                    scheduler_started_at=self._started_at,
                 )
             except Exception as exc:  # noqa: BLE001
                 await log_event(
@@ -3851,6 +3853,7 @@ class Scheduler:
 
     def start(self) -> None:
         if not self._started:
+            self._started_at = datetime.now(timezone.utc)
             self._scheduler.start()
             self._started = True
             self._start_poller_trigger_listener()
@@ -3997,6 +4000,7 @@ class Scheduler:
         if self._started or self._scheduler.running:
             self._scheduler.shutdown(wait=False)
             self._started = False
+            self._started_at = None
         errors = await cancel_background_tasks(
             self._background_tasks,
             label="scheduler",

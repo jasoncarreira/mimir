@@ -514,6 +514,7 @@ class _SchedulerWedgeAssessment:
     elapsed_minutes: float | None = None
     classification: str | None = None
     suppress_reason: str | None = None
+    silence_since_start: datetime | None = None
 
 
 def _assess_scheduler_wedge(
@@ -523,6 +524,7 @@ def _assess_scheduler_wedge(
     safety_factor: float,
     channel_id: str,
     now: datetime,
+    scheduler_started_at: datetime | None = None,
 ) -> _SchedulerWedgeAssessment:
     """Read scheduler/events state and classify heartbeat silence.
 
@@ -568,7 +570,10 @@ def _assess_scheduler_wedge(
             last_tick = None
         if last_tick is None:
             if monitoring_since is None or monitoring_since > now:
-                monitoring_since = now
+                # With no prior observation, the current scheduler's start is
+                # the earliest known point of monitoring. Keep older persisted
+                # observations intact across restarts.
+                monitoring_since = scheduler_started_at or now
         else:
             monitoring_since = None
     updated = {
@@ -588,6 +593,12 @@ def _assess_scheduler_wedge(
             _log.warning("Unable to persist scheduler wedge baseline", exc_info=True)
 
     baseline = last_tick if last_tick is not None else monitoring_since
+    silence_since_start = None
+    if scheduler_started_at is not None and (
+        baseline is None or scheduler_started_at >= baseline
+    ):
+        baseline = scheduler_started_at
+        silence_since_start = scheduler_started_at
     if baseline is None:
         return _SchedulerWedgeAssessment(
             heartbeat_cron=heartbeat_cron,
@@ -602,6 +613,7 @@ def _assess_scheduler_wedge(
             last_tick=last_tick,
             monitoring_since=monitoring_since,
             elapsed_minutes=elapsed_minutes,
+            silence_since_start=silence_since_start,
         )
 
     classification, suppress_reason = _classify_silence(
@@ -618,6 +630,7 @@ def _assess_scheduler_wedge(
         elapsed_minutes=elapsed_minutes,
         classification=classification,
         suppress_reason=suppress_reason,
+        silence_since_start=silence_since_start,
     )
 
 
@@ -628,6 +641,7 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     safety_factor: float = NTFY_SCHEDULER_WEDGE_SAFETY_FACTOR,
     channel_id: str = _HEARTBEAT_CHANNEL_ID,
     now: datetime | None = None,
+    scheduler_started_at: datetime | None = None,
 ) -> None:
     """Send a phone-push alarm if the heartbeat scheduler hasn't fired recently.
 
@@ -666,6 +680,9 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     now:
         Injected current time (UTC-aware).  Defaults to
         ``datetime.now(timezone.utc)``.  Exposed for deterministic tests.
+    scheduler_started_at:
+        UTC-aware start time of this scheduler run. Floors the silence baseline
+        and suppression window without changing persisted heartbeat state.
 
     Always returns ``None``.  Never raises.
     """
@@ -680,6 +697,7 @@ async def fire_scheduler_wedge_alarm_if_warranted(
             safety_factor=safety_factor,
             channel_id=channel_id,
             now=now,
+            scheduler_started_at=scheduler_started_at,
         )
     except Exception:  # noqa: BLE001 - health probing must not crash the caller
         _log.warning("Unable to assess scheduler wedge", exc_info=True)
@@ -698,11 +716,15 @@ async def fire_scheduler_wedge_alarm_if_warranted(
     heartbeat_cron = assessment.heartbeat_cron
     threshold_minutes = assessment.threshold_minutes
     elapsed_minutes = assessment.elapsed_minutes
-    silence = (
-        f"{channel_id} hasn't fired in {elapsed_minutes:.0f} min "
-        if assessment.last_tick is not None
-        else f"No {channel_id} tick observed during {elapsed_minutes:.0f} min of monitoring "
-    )
+    if assessment.silence_since_start is not None:
+        silence = (
+            f"{channel_id} hasn't fired in {elapsed_minutes:.0f} min since the "
+            f"scheduler started at {assessment.silence_since_start.isoformat()} "
+        )
+    elif assessment.last_tick is not None:
+        silence = f"{channel_id} hasn't fired in {elapsed_minutes:.0f} min "
+    else:
+        silence = f"No {channel_id} tick observed during {elapsed_minutes:.0f} min of monitoring "
 
     # chainlink #221: distinguish genuine wedge from intentional
     # suppression. The legacy alarm fired identically when APScheduler
