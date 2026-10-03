@@ -14,6 +14,7 @@ def test_successful_social_cli_documents(name):
 
 
 @pytest.mark.parametrize("item,problem", [
+    ("action: like", "old action: shape"),
     ("action: like, uri: 'at://post', cid: abc", "not action: type"),
     ("reply: {platform: bsky, text: hi}", "missing id"),
     ("post: {platform: bsky, platforms: [x], text: hi}", "exactly one"),

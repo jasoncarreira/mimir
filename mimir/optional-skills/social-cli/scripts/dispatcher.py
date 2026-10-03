@@ -244,8 +244,8 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                     log.flush()
                     os.fsync(log.fileno())
                     seen.add(digest)
-                    for platform, units in posts.items():
-                        reserved[platform] = reserved.get(platform, 0) + units
+                    for reserved_platform, units in posts.items():
+                        reserved[reserved_platform] = reserved.get(reserved_platform, 0) + units
                     result = _run([bin_path, "dispatch", str(snapshot)], state_dir)
                     if result.returncode != 0:
                         _withheld(poller, "dispatch_failed", rel, result.stderr)
