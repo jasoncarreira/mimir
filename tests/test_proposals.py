@@ -186,7 +186,7 @@ def _social_submit(home: Path, turn: str, text: str):
     scope = _social_scope(turn)
     opened = open_proposal(home, lane="poller", poller=scope)
     assert opened.ok, opened
-    target = opened.worktree / scope.surface_root / f"{turn}.yaml"
+    target = opened.worktree / scope.surface_root / f"outbox-{turn}.yaml"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text)
     return scope, opened, finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
@@ -197,7 +197,7 @@ def test_social_rolling_pr_and_terminal_branches(home, rolling_forge):
     _, first, result = _social_submit(home, "one", valid)
     assert result.ok and rolling_forge["creates"] == 1
     assert result.branch == "poller/feed/social-outbox"
-    assert not (home / "state/social-outbox/feed/one.yaml").exists()
+    assert not (home / "state/social-outbox/feed/outbox-one.yaml").exists()
     first_tip = _git("rev-parse", f"origin/{result.branch}", cwd=home).stdout.strip()
     _, second, result = _social_submit(home, "two", valid)
     assert result.ok and result.reused_pr
@@ -213,7 +213,102 @@ def test_social_rolling_pr_and_terminal_branches(home, rolling_forge):
     rolling_forge["prs"][-1]["state"] = "CLOSED"
     _, fourth, result = _social_submit(home, "four", valid)
     assert result.ok and rolling_forge["creates"] == 3
-    assert _git("show", f"origin/{result.branch}:state/social-outbox/feed/three.yaml", cwd=home, check=False).returncode != 0
+    assert _git("show", f"origin/{result.branch}:state/social-outbox/feed/outbox-three.yaml", cwd=home, check=False).returncode != 0
+
+
+def test_social_pr_title_body_and_submission_commit(home, rolling_forge):
+    scope = PollerProposalScope("poller:social-cli-feed", "turn-1", "at://did:plc:public/post",
+                                "feed:item:1", "social-outbox")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    target = opened.worktree / scope.surface_root / "outbox-2026-10-03-x.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    calls = []
+    result = finalize_proposal(home, lane="poller", poller=scope, title="Agent summary",
+                               rationale="Review this", open_pr=_opener(calls))
+    assert result.ok
+    assert calls[0]["title"] == "[social outbox:social-cli-feed] rolling outbox"
+    assert "at://did:plc:public/post" in calls[0]["body"]
+    assert "Submission title: Agent summary" in calls[0]["body"]
+    commit_message = _git("log", "-1", "--format=%B", f"origin/{result.branch}", cwd=home).stdout
+    assert "Agent summary" in commit_message
+
+
+@pytest.mark.parametrize("name", ["outbox-x.md", "notes.yaml", "outbox-x.yml",
+                                       "sub/outbox-x.yaml", "outbox-.yaml"])
+def test_social_rejects_unrecognized_staged_names_before_commit_push(home, rolling_forge, name):
+    scope = _social_scope("one")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    target = opened.worktree / scope.surface_root / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
+    result = finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
+    assert result.reason == "name" and not result.pushed
+    assert name in result.detail and "state/social-outbox/feed/outbox-*.yaml" in result.detail
+    assert target.exists() and opened.worktree.exists()
+    assert _git("rev-parse", "HEAD", cwd=opened.worktree).stdout == before
+    assert not _git("ls-remote", "origin", f"refs/heads/{result.branch}", cwd=home).stdout
+    assert rolling_forge["creates"] == 0
+
+
+def test_social_deletes_legacy_name_without_name_rejection(home, rolling_forge):
+    old = home / "state/social-outbox/feed/outbox-legacy.md"
+    old.parent.mkdir(parents=True)
+    old.write_text("legacy")
+    _git("add", str(old.relative_to(home)), cwd=home)
+    _git("commit", "-qm", "seed legacy file", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    scope = _social_scope("one")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    (opened.worktree / old.relative_to(home)).unlink()
+    result = finalize_proposal(home, lane="poller", poller=scope, title="Clean up", rationale="Review")
+    assert result.ok and result.pushed
+    assert _git("show", f"origin/{result.branch}:{old.relative_to(home)}", cwd=home,
+                check=False).returncode != 0
+
+
+def test_social_rejects_modified_legacy_name(home, rolling_forge):
+    old = home / "state/social-outbox/feed/outbox-legacy.md"
+    old.parent.mkdir(parents=True)
+    old.write_text("legacy")
+    _git("add", str(old.relative_to(home)), cwd=home)
+    _git("commit", "-qm", "seed legacy file", cwd=home)
+    _git("push", "origin", "main", cwd=home)
+    scope = _social_scope("one")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    (opened.worktree / old.relative_to(home)).write_text("dispatch:\n  - action: post\n    text: public\n")
+    result = finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
+    assert result.reason == "name" and not result.pushed
+    assert opened.worktree.exists() and rolling_forge["creates"] == 0
+
+
+def test_social_name_check_git_error_refuses_before_commit(home, rolling_forge, monkeypatch):
+    import mimir.proposals as proposals
+
+    scope = _social_scope("one")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    target = opened.worktree / scope.surface_root / "outbox-one.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("dispatch:\n  - action: post\n    text: public\n")
+    original_git = proposals._git
+
+    def broken_name_diff(args, cwd):
+        if args[:4] == ["diff", "--cached", "--no-renames", "--diff-filter=ACMT"]:
+            return subprocess.CompletedProcess(args, 1, "", "failure")
+        return original_git(args, cwd)
+
+    monkeypatch.setattr(proposals, "_git", broken_name_diff)
+    before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
+    result = finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
+    assert result.reason == "error" and not result.pushed
+    assert _git("rev-parse", "HEAD", cwd=opened.worktree).stdout == before
+    assert target.exists() and rolling_forge["creates"] == 0
 
 
 @pytest.mark.parametrize("bad,reason", [
@@ -250,16 +345,16 @@ def test_social_base_drift_conflict_does_not_push(home, rolling_forge):
     _, _, first = _social_submit(home, "one", valid)
     assert first.ok
     # Move main independently, changing the same file on the rolling branch.
-    target = home / "state/social-outbox/feed/one.yaml"
+    target = home / "state/social-outbox/feed/outbox-one.yaml"
     target.parent.mkdir(parents=True)
     target.write_text(valid.replace("old", "base"))
-    _git("add", "state/social-outbox/feed/one.yaml", cwd=home)
+    _git("add", "state/social-outbox/feed/outbox-one.yaml", cwd=home)
     _git("commit", "-m", "base moved", cwd=home)
     _git("push", "origin", "main", cwd=home)
     scope = _social_scope("two")
     opened = open_proposal(home, lane="poller", poller=scope)
     assert opened.ok
-    path = opened.worktree / "state/social-outbox/feed/two.yaml"
+    path = opened.worktree / "state/social-outbox/feed/outbox-two.yaml"
     path.write_text(valid)
     tip = _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout
     result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
@@ -287,7 +382,7 @@ def test_social_private_term_follows_enforcement(home, rolling_forge, monkeypatc
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
     _, opened, denied = _social_submit(home, "one", text)
     assert denied.reason == "privacy" and not denied.pushed
-    (opened.worktree / "state/social-outbox/feed/one.yaml").write_text(text)
+    (opened.worktree / "state/social-outbox/feed/outbox-one.yaml").write_text(text)
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "0")
     allowed = finalize_proposal(home, lane="poller", poller=_social_scope("one"), title="t", rationale="r")
     assert allowed.ok
@@ -340,7 +435,7 @@ def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling
 
     scope = _social_scope("one")
     opened = open_proposal(home, lane="poller", poller=scope)
-    path = opened.worktree / scope.surface_root / "one.yaml"
+    path = opened.worktree / scope.surface_root / "outbox-one.yaml"
     path.parent.mkdir(parents=True)
     path.write_text("dispatch:\n  - action: post\n    text: Public update\n")
     before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
@@ -355,10 +450,10 @@ def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling
 def test_social_rebase_scans_content_imported_from_base(home, rolling_forge):
     valid = "dispatch:\n  - action: post\n    text: Public update\n"
     _, _, first = _social_submit(home, "one", valid)
-    imported = home / "state/social-outbox/feed/base.yaml"
+    imported = home / "state/social-outbox/feed/outbox-base.yaml"
     imported.parent.mkdir(parents=True)
     imported.write_text("dispatch:\n  - action: post\n    text: public\nunknown: value\n")
-    _git("add", "state/social-outbox/feed/base.yaml", cwd=home)
+    _git("add", "state/social-outbox/feed/outbox-base.yaml", cwd=home)
     _git("commit", "-m", "base outbox changed", cwd=home)
     _git("push", "origin", "main", cwd=home)
     tip = _git("ls-remote", "origin", f"refs/heads/{first.branch}", cwd=home).stdout
@@ -1348,7 +1443,7 @@ def test_poller_submit_attribution_and_live_wiki_untouched(wiki_home: Path, poll
     calls = []
     result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="findings", rationale="model claim", open_pr=_opener(calls))
     assert result.ok and result.pushed
-    assert calls[0]["title"].startswith("[research poller:research_feed-v2] https://paper.test/42")
+    assert calls[0]["title"] == "[research poller:research_feed-v2] https://paper.test/42 [REDACTED]: findings"
     body = calls[0]["body"]
     assert "Untrusted-ingest source (not verified):" in body
     assert "Trusted origin_ref: feed:item:9" in body

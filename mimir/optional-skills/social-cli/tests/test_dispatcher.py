@@ -110,6 +110,31 @@ def test_merged_clean_once_and_before_sync(setup):
     assert hashlib.sha256(POST.encode()).hexdigest() in records[0]["ledger"]
 
 
+def test_stray_outbox_name_is_flagged_once_per_content_and_never_dispatched(setup, capsys):
+    home, state, root, calls, module = setup
+    stray = root / "outbox-2026-10-02-ship-hack-engineering.md"
+    commit_file(home, stray)
+    original = stray.read_bytes()
+    for expected in (1, 0):
+        assert module.main() == 0
+        signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert signals == ([{"poller": module.POLLER_NAME,
+                             "signal": "social_outbox_dispatch_withheld",
+                             "reason": "unrecognized_outbox_name",
+                             "path": stray.relative_to(home).as_posix()}] if expected else [])
+        assert not dispatches(calls)
+        assert stray.read_bytes() == original
+    stray.write_text(POST.replace("public", "changed"))
+    assert module.main() == 0
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(signals) == 1 and signals[0]["reason"] == "unrecognized_outbox_name"
+    assert not dispatches(calls)
+    assert stray.read_text() == POST.replace("public", "changed")
+    records = [json.loads(line) for line in (state / "unrecognized-outbox-ledger.jsonl").read_text().splitlines()]
+    assert [r["path"] for r in records] == [stray.relative_to(home).as_posix()] * 2
+    assert records[0]["sha256"] != records[1]["sha256"]
+
+
 @pytest.mark.parametrize("case", ["untracked", "dirty", "staged"])
 def test_unmerged_files_never_dispatch(setup, case, capsys):
     home, _, root, calls, module = setup
