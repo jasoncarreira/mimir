@@ -480,7 +480,8 @@ def test_notifications_hint_fits_existing_main_budget(fresh_poller, monkeypatch,
     prompt = fresh_poller._format_event(_notif(nid))["prompt"]
     hint = "\n\n→" + prompt.split("\n\n→", 1)[1]
     assert len(hint) <= 650
-    assert f'uri: "{nid}"' in hint
+    assert f'- reply: {{platform: bsky, id: "{nid}", text: "..."}}' in hint
+    assert "action:" not in hint
 
 
 def test_seeds_state_gitignore(fresh_poller, tmp_path):

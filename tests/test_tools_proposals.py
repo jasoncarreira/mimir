@@ -732,7 +732,7 @@ def test_poller_proposal_middleware_defaults_and_backend_reads(
     assert "Abandoned" in invoke(tp.abandon_proposal)
 
 
-@pytest.mark.parametrize("outcome", ["success", "updated", "mentions", "failed", "unset"])
+@pytest.mark.parametrize("outcome", ["success", "updated", "mentions", "platforms", "failed", "unset"])
 def test_social_submit_server_pings_once_with_added_entries(
     monkeypatch, proposal_home, poller_runtime, caplog, outcome,
 ):
@@ -749,12 +749,18 @@ def test_social_submit_server_pings_once_with_added_entries(
     state.worktree = poller_worktree_path(proposal_home, scope)
     target = state.worktree / scope.surface_root / "outbox-one.yaml"
     target.parent.mkdir(parents=True)
-    target.write_text("dispatch:\n  - action: post\n    text: " + "A" * 90 + "\n"
-                      "  - action: like\n    uri: at://public\n    cid: public\n"
-                      "  - action: thread\n    posts:\n      - " + "B" * 90 +
-                      "\n      - text: " + "C" * 90 + "\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: " + "A" * 90 + "}\n"
+                      "  - like: {platform: bsky, id: 'at://public'}\n"
+                      "  - thread:\n      platform: bsky\n      posts:\n        - " + "B" * 90 +
+                      "\n        - " + "C" * 90 + "\n")
     if outcome == "mentions":
-        target.write_text('dispatch:\n  - action: post\n    text: "@everyone @here <@123> <@!123> <@&123>"\n')
+        target.write_text('dispatch:\n  - post: {platform: bsky, text: "@everyone @here <@123> <@!123> <@&123>"}\n')
+    if outcome == "platforms":
+        target.write_text("dispatch:\n"
+                          "  - post: {platforms: {bsky: 'Bluesky update'}}\n"
+                          "  - like: {platform: bsky, id: 'at://" + "L" * 90 + "'}\n"
+                          "  - reply: {platform: bsky, id: '123', text: 'A reply'}\n"
+                          "  - annotate: {platform: bsky, id: 'https://example.org', text: 'A note'}\n")
     state.active = True
     sent = []
 
@@ -786,17 +792,23 @@ def test_social_submit_server_pings_once_with_added_entries(
         reply = _inv(tp.submit_proposal, runtime=poller_runtime, title="T", rationale="R")
         assert ("Updated the rolling outbox PR" if outcome == "updated" else
                 "Opened a change-proposal PR") in reply
-    if outcome in {"success", "updated", "mentions"}:
+    if outcome in {"success", "updated", "mentions", "platforms"}:
         assert len(sent) == 1
         channel, text, final = sent[0]
         assert channel == "operator-channel" and final
         if outcome == "mentions":
             assert "@everyone" not in text and "@here" not in text and "<@" not in text
             assert "＠everyone" in text
+        elif outcome == "platforms":
+            assert "papers: 4 entries added" in text
+            assert "post: bsky: Bluesky update" in text
+            assert "like: id: at://" + "L" * 75 in text and "L" * 76 not in text
+            assert "reply: id: 123 | A reply" in text
+            assert "annotate: id: https://example.org | A note" in text
         else:
             assert "papers: 3 entries added" in text
             assert "post: " + "A" * 80 in text and "A" * 81 not in text
-            assert "like:" in text and "thread: " + "B" * 80 in text
+            assert "like: id: at://public" in text and "thread: " + "B" * 80 in text
             assert " | " + "C" * 80 in text and "https://example.org/pr/42" in text
     else:
         assert sent == []

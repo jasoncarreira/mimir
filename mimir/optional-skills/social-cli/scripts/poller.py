@@ -334,8 +334,7 @@ def _format_event(notif: dict) -> dict | None:
         f"Add a new outbox-*.yaml under state/social-outbox/{POLLER_NAME}/ in that worktree.\n"
         "The server pings the operator automatically after submission.\n"
         "dispatch:\n"
-        f"  - action: reply\n    parent: {{ uri: \"{target_id}\", cid: \"<cid>\" }}\n"
-        "    text: \"...\""
+        f"  - reply: {{platform: {platform}, id: \"{target_id}\", text: \"...\"}}"
     )
     prompt = (
         f"[{platform}] {ntype} from {author}"

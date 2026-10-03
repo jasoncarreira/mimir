@@ -48,6 +48,7 @@ from typing import Callable, Literal, Mapping
 from .event_logger import log_event_sync
 from .git_bootstrap import _redact, _run
 from .outbound_privacy import findings_require_refusal, scan_outbound
+from .social_outbox import load_outbox, validate_outbox
 
 #: Protected surfaces a proposal can change, relative to the home / repo root.
 #: Both are git-tracked and blocked from live agent writes (memory/core via the
@@ -532,66 +533,12 @@ def _check_poller_surface(worktree: Path, surface: Path = Path("state/wiki")) ->
     return None
 
 
-class _OutboxLoader(yaml.SafeLoader):
-    pass
-
-
-def _outbox_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict:
-    result: dict = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node)
-        if not isinstance(key, str) or key in result:
-            raise ValueError("duplicate or non-string outbox key")
-        result[key] = loader.construct_object(value_node)
-    return result
-
-
-_OutboxLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _outbox_mapping)
-
-
 def _valid_outbox(text: str) -> bool:
     try:
-        doc = yaml.load(text, Loader=_OutboxLoader)
+        doc = load_outbox(text)
     except (yaml.YAMLError, ValueError, TypeError):
         return False
-    if not isinstance(doc, dict) or set(doc) != {"dispatch"}:
-        return False
-    items = doc["dispatch"]
-    if not isinstance(items, list) or not items:
-        return False
-    fields = {
-        "post": ({"text"}, {"text"}),
-        "reply": ({"text", "uri", "cid", "parent"}, {"text"}),
-        "like": ({"uri", "cid"}, {"uri", "cid"}),
-        "repost": ({"uri", "cid"}, {"uri", "cid"}),
-        "thread": ({"posts"}, {"posts"}),
-    }
-    for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("action"), str):
-            return False
-        rule = fields.get(item["action"])
-        if rule is None or not rule[1].issubset(item) or not set(item).issubset({"action"} | rule[0]):
-            return False
-        if item["action"] == "reply" and "parent" not in item and not {"uri", "cid"}.issubset(item):
-            return False
-        for key, value in item.items():
-            if key == "action":
-                continue
-            if key == "parent" and isinstance(value, dict):
-                if set(value) != {"uri", "cid"} or not all(isinstance(v, str) and v.strip() for v in value.values()):
-                    return False
-                continue
-            if key == "posts":
-                if not isinstance(value, list) or not value or not all(
-                    isinstance(post, str) and post.strip() or
-                    isinstance(post, dict) and set(post) == {"text"} and
-                    isinstance(post["text"], str) and post["text"].strip()
-                    for post in value
-                ):
-                    return False
-            elif not isinstance(value, str) or not value.strip():
-                return False
-    return True
+    return not validate_outbox(doc)
 
 
 def _check_outbox_files(worktree: Path, surface: Path | None = None) -> str | None:

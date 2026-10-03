@@ -143,7 +143,7 @@ def test_dispatch_requires_exact_forge_merge_and_blob(home, monkeypatch, squash)
     _git("checkout", "-b", branch, cwd=home)
     target = home / path
     target.parent.mkdir(parents=True)
-    target.write_text("dispatch:\n  - action: post\n    text: approved\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: approved}\n")
     _git("add", path, cwd=home)
     _git("commit", "-qm", "proposal", cwd=home)
     _git("checkout", "main", cwd=home)
@@ -193,7 +193,7 @@ def _social_submit(home: Path, turn: str, text: str):
 
 
 def test_social_rolling_pr_and_terminal_branches(home, rolling_forge):
-    valid = "dispatch:\n  - action: post\n    text: A public update\n"
+    valid = "dispatch:\n  - post: {platform: bsky, text: A public update}\n"
     _, first, result = _social_submit(home, "one", valid)
     assert result.ok and rolling_forge["creates"] == 1
     assert result.branch == "poller/feed/social-outbox"
@@ -223,7 +223,7 @@ def test_social_pr_title_body_and_submission_commit(home, rolling_forge):
     assert opened.ok
     target = opened.worktree / scope.surface_root / "outbox-2026-10-03-x.yaml"
     target.parent.mkdir(parents=True)
-    target.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: Public update}\n")
     calls = []
     result = finalize_proposal(home, lane="poller", poller=scope, title="Agent summary",
                                rationale="Review this", open_pr=_opener(calls))
@@ -243,7 +243,7 @@ def test_social_rejects_unrecognized_staged_names_before_commit_push(home, rolli
     assert opened.ok
     target = opened.worktree / scope.surface_root / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: Public update}\n")
     before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
     result = finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
     assert result.reason == "name" and not result.pushed
@@ -281,7 +281,7 @@ def test_social_rejects_modified_legacy_name(home, rolling_forge):
     scope = _social_scope("one")
     opened = open_proposal(home, lane="poller", poller=scope)
     assert opened.ok
-    (opened.worktree / old.relative_to(home)).write_text("dispatch:\n  - action: post\n    text: public\n")
+    (opened.worktree / old.relative_to(home)).write_text("dispatch:\n  - post: {platform: bsky, text: public}\n")
     result = finalize_proposal(home, lane="poller", poller=scope, title="Post", rationale="Review")
     assert result.reason == "name" and not result.pushed
     assert opened.worktree.exists() and rolling_forge["creates"] == 0
@@ -295,7 +295,7 @@ def test_social_name_check_git_error_refuses_before_commit(home, rolling_forge, 
     assert opened.ok
     target = opened.worktree / scope.surface_root / "outbox-one.yaml"
     target.parent.mkdir(parents=True)
-    target.write_text("dispatch:\n  - action: post\n    text: public\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: public}\n")
     original_git = proposals._git
 
     def broken_name_diff(args, cwd):
@@ -312,16 +312,32 @@ def test_social_name_check_git_error_refuses_before_commit(home, rolling_forge, 
 
 
 @pytest.mark.parametrize("bad,reason", [
-    ("dispatch:\n  - action: post\n    text: ghp_" + "A" * 36 + "\n", "privacy"),
-    ("dispatch:\n  - action: post\n    text: Hello\nhook: run\n", "schema"),
-    ("dispatch:\n  - action: execute\n    text: hello\n", "schema"),
-    ("dispatch:\n  - action: post\n    text: hi\n    config: go\n", "schema"),
-    ("dispatch:\n  - action: reply\n    text: hi\n    parent:\n      uri: at://public\n      hook: run\n", "schema"),
-    ("dispatch:\n  - action: thread\n    posts:\n      - text: hi\n        config: run\n", "schema"),
+    ("dispatch:\n  - post: {platform: bsky, text: ghp_" + "A" * 36 + "}\n", "privacy"),
+    ("dispatch:\n  - post: {platform: bsky, text: Hello}\nhook: run\n", "schema"),
+    ("dispatch:\n  - execute: {text: hello}\n", "schema"),
+    ("dispatch:\n  - post: {platform: bsky, text: hi, media: [local-image.png]}\n", "schema"),
+    ("dispatch:\n  - follow: {platform: bsky, handle: example.bsky.social, media: []}\n", "schema"),
+    ("dispatch:\n  - post: {platform: bsky, text: hi, config: go}\n", "schema"),
+    ("dispatch:\n  - reply: {platform: bsky, text: hi, parent: bad}\n", "schema"),
+    ("dispatch:\n  - thread: {platform: bsky, posts: [{text: hi}]}\n", "schema"),
+    ("dispatch:\n  - action: like\n    uri: at://public\n    cid: public\n", "schema"),
 ])
 def test_social_submission_fails_closed(home, rolling_forge, bad, reason):
     _, opened, result = _social_submit(home, "one", bad)
     assert result.reason == reason and not result.pushed
+    assert opened.worktree.exists() and rolling_forge["creates"] == 0
+
+
+@pytest.mark.parametrize("text", [
+    "dispatch:\n  - post: {text: hi, platforms: [bsky, x]}\n",
+    "dispatch:\n  - post: {platforms: {bsky: hi, x: hello}}\n",
+    "dispatch:\n  - reply: {platform: bsky, id: post, text: hi}\n  - like: {platform: x, id: '123'}\n",
+    "dispatch:\n  - follow: {platform: bsky, handle: example}\n  - bookmark: {platform: x, id: '123'}\n",
+    "dispatch:\n  - post: {platform: bsky, text: hi, quoteId: q, replyTo: r}\n",
+])
+def test_social_mixed_platform_or_post_targets_refused_at_submit(home, rolling_forge, text):
+    _, opened, result = _social_submit(home, "one", text)
+    assert result.reason == "schema" and not result.pushed
     assert opened.worktree.exists() and rolling_forge["creates"] == 0
 
 
@@ -341,7 +357,7 @@ def test_social_surface_is_exclusive(home, rolling_forge):
 
 
 def test_social_base_drift_conflict_does_not_push(home, rolling_forge):
-    valid = "dispatch:\n  - action: post\n    text: old\n"
+    valid = "dispatch:\n  - post: {platform: bsky, text: old}\n"
     _, _, first = _social_submit(home, "one", valid)
     assert first.ok
     # Move main independently, changing the same file on the rolling branch.
@@ -363,7 +379,7 @@ def test_social_base_drift_conflict_does_not_push(home, rolling_forge):
 
 
 def test_social_base_drift_rebases_before_push(home, rolling_forge):
-    valid = "dispatch:\n  - action: post\n    text: A public update\n"
+    valid = "dispatch:\n  - post: {platform: bsky, text: A public update}\n"
     _, _, first = _social_submit(home, "one", valid)
     assert first.ok
     (home / "skills/x.md").write_text("base updated")
@@ -378,7 +394,7 @@ def test_social_base_drift_rebases_before_push(home, rolling_forge):
 def test_social_private_term_follows_enforcement(home, rolling_forge, monkeypatch):
     monkeypatch.setenv("MIMIR_HOME", str(home))
     (home / "private-terms.txt").write_text("unpublished phrase\n")
-    text = "dispatch:\n  - action: post\n    text: unpublished phrase\n"
+    text = "dispatch:\n  - post: {platform: bsky, text: unpublished phrase}\n"
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1")
     _, opened, denied = _social_submit(home, "one", text)
     assert denied.reason == "privacy" and not denied.pushed
@@ -437,7 +453,7 @@ def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling
     opened = open_proposal(home, lane="poller", poller=scope)
     path = opened.worktree / scope.surface_root / "outbox-one.yaml"
     path.parent.mkdir(parents=True)
-    path.write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    path.write_text("dispatch:\n  - post: {platform: bsky, text: Public update}\n")
     before = _git("rev-parse", "HEAD", cwd=opened.worktree).stdout
     monkeypatch.setattr(proposals, "_rolling_pr", lambda *a: (None, None))
     result = finalize_proposal(home, lane="poller", poller=scope, title="t", rationale="r")
@@ -448,11 +464,11 @@ def test_social_submit_unknown_forge_state_never_commits_or_pushes(home, rolling
 
 
 def test_social_rebase_scans_content_imported_from_base(home, rolling_forge):
-    valid = "dispatch:\n  - action: post\n    text: Public update\n"
+    valid = "dispatch:\n  - post: {platform: bsky, text: Public update}\n"
     _, _, first = _social_submit(home, "one", valid)
     imported = home / "state/social-outbox/feed/outbox-base.yaml"
     imported.parent.mkdir(parents=True)
-    imported.write_text("dispatch:\n  - action: post\n    text: public\nunknown: value\n")
+    imported.write_text("dispatch:\n  - post: {platform: bsky, text: public}\nunknown: value\n")
     _git("add", "state/social-outbox/feed/outbox-base.yaml", cwd=home)
     _git("commit", "-m", "base outbox changed", cwd=home)
     _git("push", "origin", "main", cwd=home)
@@ -466,7 +482,7 @@ def test_social_rebase_scans_content_imported_from_base(home, rolling_forge):
 def test_social_rolling_push_has_exact_lease_and_preserves_concurrent_push(home, rolling_forge, monkeypatch):
     import mimir.proposals as proposals
 
-    valid = "dispatch:\n  - action: post\n    text: Public update\n"
+    valid = "dispatch:\n  - post: {platform: bsky, text: Public update}\n"
     _, _, first = _social_submit(home, "one", valid)
     rolling_forge["prs"][-1]["state"] = "CLOSED"
     original = proposals._git
@@ -514,7 +530,7 @@ def test_outbox_shared_privacy_rule(tmp_path, monkeypatch, detector, enforced, b
     from mimir.outbound_privacy import OutboundFinding, findings_require_refusal
 
     monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", enforced)
-    (tmp_path / "x.yaml").write_text("dispatch:\n  - action: post\n    text: Public update\n")
+    (tmp_path / "x.yaml").write_text("dispatch:\n  - post: {platform: bsky, text: Public update}\n")
     monkeypatch.setattr(proposals, "_git", lambda *a, **k: subprocess.CompletedProcess([], 0, "x.yaml\0", ""))
     findings = [OutboundFinding(detector, "test", 1, None)]
     monkeypatch.setattr(proposals, "scan_outbound", lambda *a, **k: findings)
@@ -523,12 +539,16 @@ def test_outbox_shared_privacy_rule(tmp_path, monkeypatch, detector, enforced, b
 
 
 def test_social_reply_and_thread_known_fields(home, rolling_forge):
-    text = ("dispatch:\n  - action: reply\n    text: A public answer\n"
-            "    parent:\n      uri: at://public/post\n      cid: public-cid\n"
-            "  - action: thread\n    posts:\n      - text: First public post\n"
-            "      - text: Second public post\n")
+    text = ("dispatch:\n  - reply: {platform: bsky, id: 'at://public/post', text: A public answer}\n"
+            "  - thread: {platform: bsky, posts: [First public post, Second public post]}\n")
     _, _, result = _social_submit(home, "one", text)
     assert result.ok and rolling_forge["creates"] == 1
+
+
+def test_social_invalid_yaml_refused_at_submit(home, rolling_forge):
+    _, opened, result = _social_submit(home, "one", "dispatch: [unclosed\n")
+    assert result.reason == "schema" and not result.pushed
+    assert opened.worktree.exists() and rolling_forge["creates"] == 0
 
 
 # ─── open ────────────────────────────────────────────────────────────

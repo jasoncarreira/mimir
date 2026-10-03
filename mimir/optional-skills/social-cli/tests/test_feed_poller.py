@@ -284,6 +284,8 @@ def test_action_hint_names_the_platform_suffixed_outbox(
     assert "Today bsky posts/replies: 0 / 5 per UTC day" in prompt
     assert all(tool in prompt for tool in ("open_proposal", "edit_file", "write_file", "submit_proposal"))
     assert "dispatch --" not in prompt and "run-social-cli.sh" not in prompt
+    assert '- reply: {platform: bsky, id: "p1", text: "..."}' in prompt
+    assert "action:" not in prompt
 
 
 def test_hint_uses_custom_poller_and_home_relative_state(fresh_feed_poller, monkeypatch, tmp_path):

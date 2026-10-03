@@ -190,8 +190,7 @@ def _format_event(post: dict) -> dict | None:
         f"Add a new outbox-*.yaml under state/social-outbox/{POLLER_NAME}/ in that worktree.\n"
         "The server pings the operator automatically after submission.\n"
         "dispatch:\n"
-        f"  - action: reply\n    parent: {{ uri: \"{pid}\", cid: \"<cid>\" }}\n"
-        "    text: \"...\""
+        f"  - reply: {{platform: {platform}, id: \"{pid}\", text: \"...\"}}"
     )
     prompt = (
         f"[{platform}] feed post from {author}"

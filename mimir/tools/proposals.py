@@ -65,12 +65,22 @@ def _social_additions(worktree: Path, scope: PollerProposalScope) -> list[tuple[
             if previous[key]:
                 previous[key] -= 1
                 continue
-            action = entry["action"]
-            posts = entry.get("posts", []) if action == "thread" else [entry.get("text", "")]
-            preview = " | ".join(
-                " ".join((post.get("text", "") if isinstance(post, dict) else post).split())[:80]
-                for post in posts
-            )
+            action, payload = next(iter(entry.items()))
+            def compact(text: str) -> str:
+                return " ".join(text.split())[:80]
+
+            if action == "post" and isinstance(payload.get("platforms"), dict):
+                parts = [f"{platform}: {compact(text)}"
+                         for platform, text in payload["platforms"].items()]
+            elif action == "thread":
+                parts = [compact(post) for post in payload["posts"]]
+            else:
+                parts = [compact(payload["text"])] if "text" in payload else []
+            if action in {"reply", "like", "annotate", "bookmark", "highlight", "ignore"}:
+                parts.insert(0, "id: " + compact(payload["id"]))
+            elif action == "follow":
+                parts.insert(0, "handle: " + compact(payload["handle"]))
+            preview = " | ".join(parts)
             additions.append((action, preview))
     return additions
 

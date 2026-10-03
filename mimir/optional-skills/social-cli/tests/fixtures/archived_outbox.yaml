@@ -1,0 +1,13 @@
+dispatch:
+  - like:
+      platform: bsky
+      id: at://did:plc:pd3z4q6m77efhx7hv53mujsf/app.bsky.feed.post/3mmomrpclok26
+  - reply:
+      platform: bsky
+      id: at://did:plc:pd3z4q6m77efhx7hv53mujsf/app.bsky.feed.post/3mmnwr3ycnk26
+      text: "three IFS stacked, nonlinear variations, 100M points by chance. chaos game: you're not approximating the attractor. you ARE the attractor, point by point."
+  - thread:
+      platform: bsky
+      posts:
+        - "partly. ashby says the regulator needs as much variety as the system. but the move here is meta — the defense produces the calibration data."
+        - "closer to: the regulator's response is itself a signal the system can read."

@@ -14,7 +14,7 @@ import pytest
 
 
 POLLERS = ("social-cli-notifications", "social-cli-feed")
-POST = "dispatch:\n  - action: post\n    text: A public update\n"
+POST = "dispatch:\n  - post: {platform: bsky, text: A public update}\n"
 
 
 def git(home: Path, *args: str) -> None:
@@ -43,9 +43,11 @@ def setup(tmp_path: Path, monkeypatch, request):
                       "import json, os, sys\n"
                       "from pathlib import Path\n"
                       "with open(os.environ['CALLS'], 'a') as f:\n"
-                      "    snapshot = Path(sys.argv[3]) if sys.argv[1] == 'dispatch' else None\n"
+                      "    snapshot = Path(sys.argv[-1]) if sys.argv[1] == 'dispatch' else None\n"
                       "    f.write(json.dumps({'argv': sys.argv[1:], 'text': snapshot.read_text() if snapshot else None, 'mode': snapshot.stat().st_mode & 0o777 if snapshot else None, 'parent_mode': snapshot.parent.stat().st_mode & 0o777 if snapshot else None, 'ledger': Path(os.environ['LEDGER']).read_text() if Path(os.environ['LEDGER']).exists() else ''}) + '\\n')\n"
-                      "if os.environ.get('CRASH') and sys.argv[1] == 'dispatch': os._exit(7)\n")
+                      "if os.environ.get('DRY_FAIL') and '--dry-run' in sys.argv: print('invalid outbox', file=sys.stderr); sys.exit(7)\n"
+                      "if os.environ.get('DRY_OUTPUT_FAIL') and '--dry-run' in sys.argv: print('Action 0: No recognized action type'); sys.exit(0)\n"
+                      "if os.environ.get('CRASH') and sys.argv[1] == 'dispatch' and '--dry-run' not in sys.argv: print('real failure', file=sys.stderr); sys.exit(7)\n")
     binary.chmod(0o755)
     calls = tmp_path / "calls.jsonl"
     monkeypatch.setenv("CALLS", str(calls))
@@ -89,7 +91,7 @@ def commit_file(home: Path, path: Path, text: str = POST) -> None:
 
 def dispatches(calls: Path) -> list[dict]:
     return [record for line in calls.read_text().splitlines()
-            if (record := json.loads(line))["argv"][0] == "dispatch"] if calls.exists() else []
+            if (record := json.loads(line))["argv"][0] == "dispatch" and "--dry-run" not in record["argv"]] if calls.exists() else []
 
 
 def test_merged_clean_once_and_before_sync(setup):
@@ -100,14 +102,133 @@ def test_merged_clean_once_and_before_sync(setup):
     assert module.main() == 0
     records = [json.loads(line) for line in calls.read_text().splitlines()]
     assert len(dispatches(calls)) == 1
-    assert records[0]["argv"][:2] == ["dispatch", "--file"]
-    assert records[0]["argv"][2] != str(path)
+    assert records[0]["argv"] == ["dispatch", "--dry-run", records[0]["argv"][-1]]
+    assert records[1]["argv"] == ["dispatch", records[0]["argv"][-1]]
+    assert "--file" not in records[0]["argv"] + records[1]["argv"]
+    assert records[0]["argv"][-1] != str(path)
     assert records[0]["text"] == POST
     assert records[0]["mode"] == 0o600
     assert records[0]["parent_mode"] == 0o700
-    assert not Path(records[0]["argv"][2]).exists()
+    assert not Path(records[0]["argv"][-1]).exists()
     assert len(state.joinpath("dispatched-ledger.jsonl").read_text().splitlines()) == 1
-    assert hashlib.sha256(POST.encode()).hexdigest() in records[0]["ledger"]
+    assert records[0]["ledger"] == ""
+    assert hashlib.sha256(POST.encode()).hexdigest() in records[1]["ledger"]
+
+
+@pytest.mark.parametrize("platform", ["bsky", "x"])
+@pytest.mark.parametrize("form", ["platform", "list", "mapping", "follow", "ignore"])
+def test_snapshot_basename_matches_action_platform(setup, monkeypatch, platform, form):
+    import yaml
+
+    home, state, root, calls, module = setup
+    # Named actions, including zero-cap follow, must override the legacy default.
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", platform if form == "ignore" else "bsky")
+    payload = {"platform": platform, "text": "Hi"}
+    if form == "list":
+        payload = {"platforms": [platform], "text": "Hi"}
+    elif form == "mapping":
+        payload = {"platforms": {platform: "Hi"}}
+    entry = {"post": payload}
+    if form == "follow":
+        entry = {"follow": {"platform": platform, "handle": "example"}}
+    elif form == "ignore":
+        entry = {"ignore": {"id": "notif"}}
+    commit_file(home, root / "outbox-arbitrary-name.yaml", yaml.safe_dump({"dispatch": [entry]}))
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()
+               if json.loads(line)["argv"][0] == "dispatch"]
+    assert len(records) == 2
+    snapshot = records[0]["argv"][-1]
+    assert Path(snapshot).name == f"outbox-{platform}.yaml"
+    assert records[0]["argv"] == ["dispatch", "--dry-run", snapshot]
+    assert records[1]["argv"] == ["dispatch", snapshot]
+    assert records[0]["ledger"] == "" and records[1]["ledger"]
+
+
+@pytest.mark.parametrize("text", [
+    "dispatch:\n  - post: {text: hi, platforms: [bsky, x]}\n",
+    "dispatch:\n  - post: {platforms: {bsky: hi, x: hello}}\n",
+    "dispatch:\n  - reply: {platform: bsky, id: post, text: hi}\n  - like: {platform: x, id: '123'}\n",
+    "dispatch:\n  - follow: {platform: bsky, handle: example}\n  - bookmark: {platform: x, id: '123'}\n",
+    "dispatch:\n  - post: {platform: bsky, text: hi, quoteId: q, replyTo: r}\n",
+])
+def test_invalid_platform_or_post_targets_withheld_before_dry_run_and_ledger(setup, capsys, text):
+    home, state, root, calls, module = setup
+    commit_file(home, root / "outbox-invalid.yaml", text)
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(record["argv"][0] == "dispatch" for record in records)
+    assert (state / "dispatched-ledger.jsonl").read_text() == ""
+    assert any(json.loads(line)["reason"] == "cap_check_refused"
+               for line in capsys.readouterr().out.splitlines())
+
+
+@pytest.mark.parametrize("failure", ["DRY_FAIL", "DRY_OUTPUT_FAIL"])
+def test_failed_dry_run_does_not_consume_ledger_or_cap(setup, monkeypatch, capsys, failure):
+    home, state, root, calls, module = setup
+    commit_file(home, root / "outbox-one.yaml")
+    monkeypatch.setenv(failure, "1")
+    module.main()
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert len([r for r in records if r["argv"][0] == "dispatch"]) == 1
+    assert records[0]["argv"][1] == "--dry-run" and records[0]["ledger"] == ""
+    assert (state / "dispatched-ledger.jsonl").read_text() == ""
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert signals[0]["reason"] == "dry_run_failed" and "stderr" in signals[0]
+    monkeypatch.delenv(failure)
+    module.main()
+    assert len(dispatches(calls)) == 1
+    assert json.loads((state / "dispatched-ledger.jsonl").read_text())["posts"] == {"bsky": 1}
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("dispatch:\n  - post: {text: hi, platforms: [x]}\n", {"x": 1}),
+    ("dispatch:\n  - post: {platforms: {bsky: hi}}\n", {"bsky": 1}),
+    ("dispatch:\n  - thread: {platform: bsky, posts: [one, two, three]}\n", {"bsky": 3}),
+    ("dispatch:\n  - like: {platform: bsky, id: 'at://post'}\n"
+     "  - ignore: {id: notif_003}\n"
+     "  - annotate: {platform: bsky, id: 'https://example.org', text: hi}\n"
+     "  - follow: {platform: bsky, handle: example.bsky.social}\n"
+     "  - bookmark: {platform: bsky, id: '123'}\n"
+     "  - highlight: {platform: bsky, id: 'at://post', quote: Excerpt}\n", {}),
+    ("processed: [notif_003]\ndispatch:\n"
+     "  - reply: {platform: bsky, id: 'at://post', text: hi, notificationId: notif_003, idempotencyKey: r1}\n"
+     "  - post: {text: hi, platforms: [bsky], quoteId: 'at://quote', idempotencyKey: p1}\n"
+     "  - thread: {platform: bsky, posts: [one, two], replyTo: '123', idempotencyKey: t1}\n",
+     {"bsky": 4}),
+])
+def test_cap_units_from_validated_schema(setup, text, expected):
+    import dispatcher
+
+    _, state, _, _, _ = setup
+    assert dispatcher._cap_allows(text, state, {}) == expected
+
+
+@pytest.mark.parametrize("action,payload", [
+    ("post", {"platform": "bsky", "text": "hi"}),
+    ("follow", {"platform": "bsky", "handle": "example.bsky.social"}),
+])
+def test_media_refused_before_dry_run_and_ledger(setup, capsys, action, payload):
+    import yaml
+
+    home, state, root, calls, module = setup
+    text = yaml.safe_dump({"dispatch": [{action: {**payload, "media": ["local-image.png"]}}]})
+    commit_file(home, root / "outbox-media.yaml", text)
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(record["argv"][0] == "dispatch" for record in records)
+    assert (state / "dispatched-ledger.jsonl").read_text() == ""
+    assert any(json.loads(line)["reason"] == "cap_check_refused"
+               for line in capsys.readouterr().out.splitlines())
+
+
+def test_dispatch_revalidates_shared_schema(setup, monkeypatch):
+    import mimir.social_outbox as schema
+    import dispatcher
+
+    _, state, _, _, _ = setup
+    monkeypatch.setattr(schema, "validate_outbox", lambda doc: ["forced rejection"])
+    assert dispatcher._cap_allows(POST, state, {}) is None
 
 
 def test_stray_outbox_name_is_flagged_once_per_content_and_never_dispatched(setup, capsys):
