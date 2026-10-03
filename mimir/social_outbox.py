@@ -27,11 +27,16 @@ def load_outbox(text: str) -> object:
     return yaml.load(text, Loader=OutboxLoader)
 
 
+# social-cli OutboxAction fields (PR #2203's amended contract). Media is
+# deliberately excluded: local file contents are not part of the reviewed PR.
 _FIELDS = {
-    "reply": ({"platform", "id", "text"}, set()),
-    "post": (set(), {"text", "platform", "platforms"}),
-    "thread": ({"platform", "posts"}, set()),
+    "reply": ({"platform", "id", "text"}, {"notificationId", "idempotencyKey"}),
+    "post": (set(), {"text", "platform", "platforms", "quoteId", "replyTo", "idempotencyKey"}),
+    "thread": ({"platform", "posts"}, {"replyTo", "idempotencyKey"}),
     "like": ({"platform", "id"}, set()),
+    "follow": ({"platform", "handle"}, set()),
+    "bookmark": ({"platform", "id"}, {"text"}),
+    "highlight": ({"platform", "id", "quote"}, {"text"}),
     "annotate": ({"platform", "id", "text"}, {"motivation", "quote"}),
     "ignore": ({"id"}, {"reason"}),
 }
@@ -39,13 +44,18 @@ _PLATFORMS = {"bsky", "x"}
 
 
 def validate_outbox(doc: object) -> list[str]:
-    """Return indexed schema errors for social-cli's documented dispatch actions."""
-    if not isinstance(doc, dict) or set(doc) != {"dispatch"}:
-        return ["outbox must contain only dispatch"]
+    """Validate the reviewed action schema, explicitly refusing local media."""
+    if not isinstance(doc, dict) or "dispatch" not in doc or set(doc) - {"dispatch", "processed"}:
+        return ["outbox must contain dispatch and optionally processed only"]
+    errors: list[str] = []
+    if "processed" in doc and (
+        not isinstance(doc["processed"], list)
+        or any(not isinstance(value, str) for value in doc["processed"])
+    ):
+        errors.append("processed must be a list of strings")
     items = doc["dispatch"]
     if not isinstance(items, list) or not items:
-        return ["dispatch must be a non-empty list"]
-    errors: list[str] = []
+        return errors + ["dispatch must be a non-empty list"]
     for index, item in enumerate(items):
         label = f"item {index}"
         if not isinstance(item, dict) or len(item) != 1:
@@ -63,7 +73,9 @@ def validate_outbox(doc: object) -> list[str]:
             continue
         required, optional = _FIELDS[action]
         missing = required - fields.keys()
-        unknown = fields.keys() - required - optional
+        unknown = fields.keys() - required - optional - {"media"}
+        if "media" in fields:
+            errors.append(f"{label}: {action} media is forbidden: local file contents are not part of the reviewed outbox PR")
         if missing:
             errors.append(f"{label}: {action} missing {', '.join(sorted(missing))}")
         if unknown:

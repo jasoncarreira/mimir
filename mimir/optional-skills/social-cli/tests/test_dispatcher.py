@@ -139,13 +139,39 @@ def test_failed_dry_run_does_not_consume_ledger_or_cap(setup, monkeypatch, capsy
     ("dispatch:\n  - thread: {platform: bsky, posts: [one, two, three]}\n", {"bsky": 3}),
     ("dispatch:\n  - like: {platform: bsky, id: 'at://post'}\n"
      "  - ignore: {id: notif_003}\n"
-     "  - annotate: {platform: bsky, id: 'https://example.org', text: hi}\n", {}),
+     "  - annotate: {platform: bsky, id: 'https://example.org', text: hi}\n"
+     "  - follow: {platform: bsky, handle: example.bsky.social}\n"
+     "  - bookmark: {platform: x, id: '123'}\n"
+     "  - highlight: {platform: bsky, id: 'at://post', quote: Excerpt}\n", {}),
+    ("processed: [notif_003]\ndispatch:\n"
+     "  - reply: {platform: bsky, id: 'at://post', text: hi, notificationId: notif_003, idempotencyKey: r1}\n"
+     "  - post: {text: hi, platforms: [bsky, x], quoteId: 'at://quote', replyTo: 'at://parent', idempotencyKey: p1}\n"
+     "  - thread: {platform: x, posts: [one, two], replyTo: '123', idempotencyKey: t1}\n",
+     {"bsky": 2, "x": 3}),
 ])
 def test_cap_units_from_validated_schema(setup, text, expected):
     import dispatcher
 
     _, state, _, _, _ = setup
     assert dispatcher._cap_allows(text, state, {}) == expected
+
+
+@pytest.mark.parametrize("action,payload", [
+    ("post", {"platform": "bsky", "text": "hi"}),
+    ("follow", {"platform": "bsky", "handle": "example.bsky.social"}),
+])
+def test_media_refused_before_dry_run_and_ledger(setup, capsys, action, payload):
+    import yaml
+
+    home, state, root, calls, module = setup
+    text = yaml.safe_dump({"dispatch": [{action: {**payload, "media": ["local-image.png"]}}]})
+    commit_file(home, root / "outbox-media.yaml", text)
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(record["argv"][0] == "dispatch" for record in records)
+    assert (state / "dispatched-ledger.jsonl").read_text() == ""
+    assert any(json.loads(line)["reason"] == "cap_check_refused"
+               for line in capsys.readouterr().out.splitlines())
 
 
 def test_dispatch_revalidates_shared_schema(setup, monkeypatch):
