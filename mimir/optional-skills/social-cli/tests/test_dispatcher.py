@@ -115,6 +115,54 @@ def test_merged_clean_once_and_before_sync(setup):
     assert hashlib.sha256(POST.encode()).hexdigest() in records[1]["ledger"]
 
 
+@pytest.mark.parametrize("platform", ["bsky", "x"])
+@pytest.mark.parametrize("form", ["platform", "list", "mapping", "follow", "ignore"])
+def test_snapshot_basename_matches_action_platform(setup, monkeypatch, platform, form):
+    import yaml
+
+    home, state, root, calls, module = setup
+    # Named actions, including zero-cap follow, must override the legacy default.
+    monkeypatch.setenv("MIMIR_SOCIAL_PLATFORMS", platform if form == "ignore" else "bsky")
+    payload = {"platform": platform, "text": "Hi"}
+    if form == "list":
+        payload = {"platforms": [platform], "text": "Hi"}
+    elif form == "mapping":
+        payload = {"platforms": {platform: "Hi"}}
+    entry = {"post": payload}
+    if form == "follow":
+        entry = {"follow": {"platform": platform, "handle": "example"}}
+    elif form == "ignore":
+        entry = {"ignore": {"id": "notif"}}
+    commit_file(home, root / "outbox-arbitrary-name.yaml", yaml.safe_dump({"dispatch": [entry]}))
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()
+               if json.loads(line)["argv"][0] == "dispatch"]
+    assert len(records) == 2
+    snapshot = records[0]["argv"][-1]
+    assert Path(snapshot).name == f"outbox-{platform}.yaml"
+    assert records[0]["argv"] == ["dispatch", "--dry-run", snapshot]
+    assert records[1]["argv"] == ["dispatch", snapshot]
+    assert records[0]["ledger"] == "" and records[1]["ledger"]
+
+
+@pytest.mark.parametrize("text", [
+    "dispatch:\n  - post: {text: hi, platforms: [bsky, x]}\n",
+    "dispatch:\n  - post: {platforms: {bsky: hi, x: hello}}\n",
+    "dispatch:\n  - reply: {platform: bsky, id: post, text: hi}\n  - like: {platform: x, id: '123'}\n",
+    "dispatch:\n  - follow: {platform: bsky, handle: example}\n  - bookmark: {platform: x, id: '123'}\n",
+    "dispatch:\n  - post: {platform: bsky, text: hi, quoteId: q, replyTo: r}\n",
+])
+def test_invalid_platform_or_post_targets_withheld_before_dry_run_and_ledger(setup, capsys, text):
+    home, state, root, calls, module = setup
+    commit_file(home, root / "outbox-invalid.yaml", text)
+    assert module.main() == 0
+    records = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(record["argv"][0] == "dispatch" for record in records)
+    assert (state / "dispatched-ledger.jsonl").read_text() == ""
+    assert any(json.loads(line)["reason"] == "cap_check_refused"
+               for line in capsys.readouterr().out.splitlines())
+
+
 @pytest.mark.parametrize("failure", ["DRY_FAIL", "DRY_OUTPUT_FAIL"])
 def test_failed_dry_run_does_not_consume_ledger_or_cap(setup, monkeypatch, capsys, failure):
     home, state, root, calls, module = setup
@@ -134,20 +182,20 @@ def test_failed_dry_run_does_not_consume_ledger_or_cap(setup, monkeypatch, capsy
 
 
 @pytest.mark.parametrize("text,expected", [
-    ("dispatch:\n  - post: {text: hi, platforms: [bsky, x]}\n", {"bsky": 1, "x": 1}),
-    ("dispatch:\n  - post: {platforms: {bsky: hi, x: hello}}\n", {"bsky": 1, "x": 1}),
+    ("dispatch:\n  - post: {text: hi, platforms: [x]}\n", {"x": 1}),
+    ("dispatch:\n  - post: {platforms: {bsky: hi}}\n", {"bsky": 1}),
     ("dispatch:\n  - thread: {platform: bsky, posts: [one, two, three]}\n", {"bsky": 3}),
     ("dispatch:\n  - like: {platform: bsky, id: 'at://post'}\n"
      "  - ignore: {id: notif_003}\n"
      "  - annotate: {platform: bsky, id: 'https://example.org', text: hi}\n"
      "  - follow: {platform: bsky, handle: example.bsky.social}\n"
-     "  - bookmark: {platform: x, id: '123'}\n"
+     "  - bookmark: {platform: bsky, id: '123'}\n"
      "  - highlight: {platform: bsky, id: 'at://post', quote: Excerpt}\n", {}),
     ("processed: [notif_003]\ndispatch:\n"
      "  - reply: {platform: bsky, id: 'at://post', text: hi, notificationId: notif_003, idempotencyKey: r1}\n"
-     "  - post: {text: hi, platforms: [bsky, x], quoteId: 'at://quote', replyTo: 'at://parent', idempotencyKey: p1}\n"
-     "  - thread: {platform: x, posts: [one, two], replyTo: '123', idempotencyKey: t1}\n",
-     {"bsky": 2, "x": 3}),
+     "  - post: {text: hi, platforms: [bsky], quoteId: 'at://quote', idempotencyKey: p1}\n"
+     "  - thread: {platform: bsky, posts: [one, two], replyTo: '123', idempotencyKey: t1}\n",
+     {"bsky": 4}),
 ])
 def test_cap_units_from_validated_schema(setup, text, expected):
     import dispatcher

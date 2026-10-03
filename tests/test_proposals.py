@@ -328,6 +328,19 @@ def test_social_submission_fails_closed(home, rolling_forge, bad, reason):
     assert opened.worktree.exists() and rolling_forge["creates"] == 0
 
 
+@pytest.mark.parametrize("text", [
+    "dispatch:\n  - post: {text: hi, platforms: [bsky, x]}\n",
+    "dispatch:\n  - post: {platforms: {bsky: hi, x: hello}}\n",
+    "dispatch:\n  - reply: {platform: bsky, id: post, text: hi}\n  - like: {platform: x, id: '123'}\n",
+    "dispatch:\n  - follow: {platform: bsky, handle: example}\n  - bookmark: {platform: x, id: '123'}\n",
+    "dispatch:\n  - post: {platform: bsky, text: hi, quoteId: q, replyTo: r}\n",
+])
+def test_social_mixed_platform_or_post_targets_refused_at_submit(home, rolling_forge, text):
+    _, opened, result = _social_submit(home, "one", text)
+    assert result.reason == "schema" and not result.pushed
+    assert opened.worktree.exists() and rolling_forge["creates"] == 0
+
+
 def test_social_surface_is_exclusive(home, rolling_forge):
     for scope, stray in (
         (PollerProposalScope("poller:feed", "wiki", "source", "ref"), "state/social-outbox/feed/x.yaml"),

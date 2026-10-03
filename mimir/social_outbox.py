@@ -43,6 +43,26 @@ _FIELDS = {
 _PLATFORMS = {"bsky", "x"}
 
 
+def _action_platforms(action: str, fields: dict) -> set[str]:
+    """Collect declared, recognized platforms without inferring ignored targets."""
+    if action == "ignore":
+        return set()
+    targets = fields.get("platforms", [fields.get("platform")]) if action == "post" else [fields.get("platform")]
+    if not isinstance(targets, (list, dict)):
+        return set()
+    return {target for target in targets if isinstance(target, str) and target in _PLATFORMS}
+
+
+def outbox_platform(doc: object) -> str | None:
+    """Return a validated file's sole platform; ignore-only files have none."""
+    errors = validate_outbox(doc)
+    if errors:
+        raise ValueError("; ".join(errors))
+    platforms = set().union(*(_action_platforms(action, fields)
+                             for item in doc["dispatch"] for action, fields in item.items()))
+    return next(iter(platforms), None)
+
+
 def validate_outbox(doc: object) -> list[str]:
     """Validate the reviewed action schema, explicitly refusing local media."""
     if not isinstance(doc, dict) or "dispatch" not in doc or set(doc) - {"dispatch", "processed"}:
@@ -56,6 +76,7 @@ def validate_outbox(doc: object) -> list[str]:
     items = doc["dispatch"]
     if not isinstance(items, list) or not items:
         return errors + ["dispatch must be a non-empty list"]
+    platforms: set[str] = set()
     for index, item in enumerate(items):
         label = f"item {index}"
         if not isinstance(item, dict) or len(item) != 1:
@@ -80,7 +101,10 @@ def validate_outbox(doc: object) -> list[str]:
             errors.append(f"{label}: {action} missing {', '.join(sorted(missing))}")
         if unknown:
             errors.append(f"{label}: {action} unknown field {', '.join(sorted(unknown))}")
+        platforms.update(_action_platforms(action, fields))
         if action == "post":
+            if "quoteId" in fields and "replyTo" in fields:
+                errors.append(f"{label}: post cannot have both 'quoteId' and 'replyTo'")
             targets = {"platform", "platforms"} & fields.keys()
             if len(targets) != 1:
                 errors.append(f"{label}: post needs exactly one of platform or platforms")
@@ -107,4 +131,6 @@ def validate_outbox(doc: object) -> list[str]:
                     errors.append(f"{label}: {key} must be a non-empty string")
                 elif key == "platform" and value not in _PLATFORMS:
                     errors.append(f"{label}: unknown platform {value!r}")
+    if len(platforms) > 1:
+        errors.append("outbox actions span multiple platforms; split the file per platform")
     return errors

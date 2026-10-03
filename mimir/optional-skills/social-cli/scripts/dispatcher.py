@@ -138,6 +138,7 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
         import yaml
         from mimir.outbound_privacy import findings_require_refusal, scan_outbound
         from mimir.proposals import merged_social_outbox_commit
+        from mimir.social_outbox import load_outbox, outbox_platform
     except ImportError:
         _withheld(poller, "mimir_import_failure")
         print("social-cli: mimir import failed; withholding dispatch only", file=sys.stderr)
@@ -208,6 +209,12 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                     _withheld(poller, "cap_check_refused", rel)
                     print(f"social-cli: cap check refused {rel}", file=sys.stderr)
                     continue
+                platform = outbox_platform(load_outbox(text))
+                if platform is None:
+                    # Ignore-only files retain the configured legacy inbox default.
+                    platform = os.environ.get("MIMIR_SOCIAL_PLATFORMS", "bsky").split(",")[0].strip() or "bsky"
+                    if platform not in {"bsky", "x"}:
+                        raise ValueError("unknown default platform for ignore-only outbox")
             except (OSError, ValueError, yaml.YAMLError, subprocess.TimeoutExpired) as exc:
                 _withheld(poller, "scan_or_cap_failed", rel)
                 print(f"social-cli: scan or cap failed for {rel}: {exc}", file=sys.stderr)
@@ -216,7 +223,7 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                 # The verified snapshot, not a second read of the live path.
                 # Private directory (0700) and file (0600); retain through child exit.
                 with tempfile.TemporaryDirectory(prefix="social-dispatch-") as private:
-                    snapshot = Path(private) / "outbox.yaml"
+                    snapshot = Path(private) / f"outbox-{platform}.yaml"
                     with snapshot.open("x", encoding="utf-8", newline="") as output:
                         snapshot.chmod(0o600)
                         output.write(text)

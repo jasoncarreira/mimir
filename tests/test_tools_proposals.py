@@ -757,9 +757,9 @@ def test_social_submit_server_pings_once_with_added_entries(
         target.write_text('dispatch:\n  - post: {platform: bsky, text: "@everyone @here <@123> <@!123> <@&123>"}\n')
     if outcome == "platforms":
         target.write_text("dispatch:\n"
-                          "  - post: {platforms: {bsky: 'Bluesky update', x: 'X update'}}\n"
+                          "  - post: {platforms: {bsky: 'Bluesky update'}}\n"
                           "  - like: {platform: bsky, id: 'at://" + "L" * 90 + "'}\n"
-                          "  - reply: {platform: x, id: '123', text: 'A reply'}\n"
+                          "  - reply: {platform: bsky, id: '123', text: 'A reply'}\n"
                           "  - annotate: {platform: bsky, id: 'https://example.org', text: 'A note'}\n")
     state.active = True
     sent = []
@@ -801,7 +801,7 @@ def test_social_submit_server_pings_once_with_added_entries(
             assert "＠everyone" in text
         elif outcome == "platforms":
             assert "papers: 4 entries added" in text
-            assert "post: bsky: Bluesky update | x: X update" in text
+            assert "post: bsky: Bluesky update" in text
             assert "like: id: at://" + "L" * 75 in text and "L" * 76 not in text
             assert "reply: id: 123 | A reply" in text
             assert "annotate: id: https://example.org | A note" in text
