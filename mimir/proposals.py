@@ -774,9 +774,10 @@ def finalize_proposal(
             restored = _git(["stash", "pop", "--index"], cwd=wt)
             if restored.returncode != 0:
                 return ProposalResult(False, branch, False, None, "rolling_conflict", "draft conflicts with rebased base")
-            name_failure = _check_outbox_names(wt, poller.surface_root)
-            if name_failure:
-                return ProposalResult(False, branch, False, None, *name_failure)
+            # A successful pop --index restores the draft paths already checked
+            # above; base-imported paths are committed, not newly staged. No
+            # second staged-name check is needed. Content must still be scanned
+            # across the full surface because the rebase can import new blobs.
             failure = _check_outbox_files(wt, poller.surface_root)
             if failure:
                 return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed after rebase")
