@@ -65,8 +65,8 @@ def _social_additions(worktree: Path, scope: PollerProposalScope) -> list[tuple[
             if previous[key]:
                 previous[key] -= 1
                 continue
-            action = entry["action"]
-            posts = entry.get("posts", []) if action == "thread" else [entry.get("text", "")]
+            action, payload = next(iter(entry.items()))
+            posts = payload.get("posts", []) if action == "thread" else [payload.get("text", "")]
             preview = " | ".join(
                 " ".join((post.get("text", "") if isinstance(post, dict) else post).split())[:80]
                 for post in posts

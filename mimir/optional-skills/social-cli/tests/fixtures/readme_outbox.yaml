@@ -1,0 +1,8 @@
+dispatch:
+  - reply: {platform: bsky, id: "at://did:plc:example/app.bsky.feed.post/abc", text: "Thanks"}
+  - post: {text: "Update", platforms: [bsky, x]}
+  - post: {platforms: {bsky: "Bluesky update", x: "X update"}}
+  - thread: {platform: bsky, posts: ["1/ First", "2/ Second"]}
+  - like: {platform: bsky, id: "at://did:plc:example/app.bsky.feed.post/abc"}
+  - annotate: {platform: bsky, id: "https://example.org", text: "Note", motivation: commenting, quote: "Excerpt"}
+  - ignore: {id: "notif_003", reason: "spam"}

@@ -34,10 +34,14 @@ def _ensure_mimir_import_path() -> None:
             return
 
 
-def _withheld(poller: str, reason: str, path: str | None = None) -> None:
+def _withheld(poller: str, reason: str, path: str | None = None,
+              stderr: str | None = None) -> None:
     """Signal the parent event logger without enqueueing an agent turn."""
-    print(json.dumps({"poller": poller, "signal": "social_outbox_dispatch_withheld",
-                      "reason": reason, "path": path}), flush=True)
+    event = {"poller": poller, "signal": "social_outbox_dispatch_withheld",
+             "reason": reason, "path": path}
+    if stderr is not None:
+        event["stderr"] = stderr[:500]
+    print(json.dumps(event), flush=True)
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -64,24 +68,20 @@ def _count(platform: str, state_dir: Path) -> int | None:
 
 
 def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int]) -> dict[str, int] | None:
-    import yaml
+    from mimir.social_outbox import load_outbox, validate_outbox
 
-    doc = yaml.safe_load(text)
-    if not isinstance(doc, dict) or not isinstance(doc.get("dispatch"), list):
+    doc = load_outbox(text)
+    if validate_outbox(doc):
         return None
     proposed: dict[str, int] = {}
     for entry in doc["dispatch"]:
-        if not isinstance(entry, dict) or entry.get("action") not in {"post", "reply", "like", "repost", "thread"}:
-            return None
-        action = entry["action"]
+        action, payload = next(iter(entry.items()))
         if action not in {"post", "reply", "thread"}:
             continue
-        platforms = entry.get("platforms", [entry.get("platform", "bsky")])
-        if not isinstance(platforms, list) or not platforms or any(p not in {"bsky", "x"} for p in platforms):
-            return None
-        units = len(entry.get("posts", [])) if action == "thread" else 1
-        if not units:
-            return None
+        platforms = payload.get("platforms", [payload.get("platform")])
+        if isinstance(platforms, dict):
+            platforms = platforms.keys()
+        units = len(payload["posts"]) if action == "thread" else 1
         for platform in platforms:
             proposed[platform] = proposed.get(platform, 0) + units
 
@@ -212,13 +212,6 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                 _withheld(poller, "scan_or_cap_failed", rel)
                 print(f"social-cli: scan or cap failed for {rel}: {exc}", file=sys.stderr)
                 continue
-            log.seek(0, os.SEEK_END)
-            log.write(json.dumps({"sha256": digest, "path": rel, "day": today, "posts": posts}) + "\n")
-            log.flush()
-            os.fsync(log.fileno())
-            seen.add(digest)
-            for platform, units in posts.items():
-                reserved[platform] = reserved.get(platform, 0) + units
             try:
                 # The verified snapshot, not a second read of the live path.
                 # Private directory (0700) and file (0600); retain through child exit.
@@ -227,8 +220,29 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
                     with snapshot.open("x", encoding="utf-8", newline="") as output:
                         snapshot.chmod(0o600)
                         output.write(text)
-                    result = _run([bin_path, "dispatch", "--file", str(snapshot)], state_dir)
+                    try:
+                        dry = _run([bin_path, "dispatch", "--dry-run", str(snapshot)], state_dir)
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        _withheld(poller, "dry_run_failed", rel, str(exc))
+                        continue
+                    if dry.returncode != 0 or re.search(
+                        r"(?:validation\s+(?:failed|failure|error)|"
+                        r"action\s+\d+:.*(?:error|invalid|failed|no recognized))",
+                        dry.stdout + "\n" + dry.stderr, re.IGNORECASE,
+                    ):
+                        _withheld(poller, "dry_run_failed", rel, dry.stderr)
+                        continue
+                    log.seek(0, os.SEEK_END)
+                    log.write(json.dumps({"sha256": digest, "path": rel, "day": today, "posts": posts}) + "\n")
+                    log.flush()
+                    os.fsync(log.fileno())
+                    seen.add(digest)
+                    for platform, units in posts.items():
+                        reserved[platform] = reserved.get(platform, 0) + units
+                    result = _run([bin_path, "dispatch", str(snapshot)], state_dir)
                     if result.returncode != 0:
+                        _withheld(poller, "dispatch_failed", rel, result.stderr)
                         print(f"social-cli: dispatch failed for {rel}: {result.stderr[:200]}", file=sys.stderr)
             except (OSError, subprocess.TimeoutExpired) as exc:
+                _withheld(poller, "dispatch_failed", rel, str(exc))
                 print(f"social-cli: dispatch failed for {rel}: {exc}", file=sys.stderr)

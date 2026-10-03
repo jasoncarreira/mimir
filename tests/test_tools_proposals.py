@@ -749,12 +749,12 @@ def test_social_submit_server_pings_once_with_added_entries(
     state.worktree = poller_worktree_path(proposal_home, scope)
     target = state.worktree / scope.surface_root / "outbox-one.yaml"
     target.parent.mkdir(parents=True)
-    target.write_text("dispatch:\n  - action: post\n    text: " + "A" * 90 + "\n"
-                      "  - action: like\n    uri: at://public\n    cid: public\n"
-                      "  - action: thread\n    posts:\n      - " + "B" * 90 +
-                      "\n      - text: " + "C" * 90 + "\n")
+    target.write_text("dispatch:\n  - post: {platform: bsky, text: " + "A" * 90 + "}\n"
+                      "  - like: {platform: bsky, id: 'at://public'}\n"
+                      "  - thread:\n      platform: bsky\n      posts:\n        - " + "B" * 90 +
+                      "\n        - " + "C" * 90 + "\n")
     if outcome == "mentions":
-        target.write_text('dispatch:\n  - action: post\n    text: "@everyone @here <@123> <@!123> <@&123>"\n')
+        target.write_text('dispatch:\n  - post: {platform: bsky, text: "@everyone @here <@123> <@!123> <@&123>"}\n')
     state.active = True
     sent = []
 
