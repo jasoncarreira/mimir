@@ -42,6 +42,7 @@ def _withheld(poller: str, reason: str, path: str | None = None) -> None:
 
 SCRIPTS = Path(__file__).resolve().parent
 CAP = 5
+OUTBOX_NAME = re.compile(r"outbox-.+\.yaml\Z")
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -97,6 +98,36 @@ def _cap_allows(text: str, state_dir: Path, reserved: dict[str, int]) -> dict[st
     return proposed
 
 
+def _flag_unrecognized(home: Path, root: Path, state_dir: Path, poller: str) -> None:
+    """Flag inert regular files once per path and content, across poller fires."""
+    ledger = state_dir / "unrecognized-outbox-ledger.jsonl"
+    try:
+        with ledger.open("a+", encoding="utf-8") as log:
+            fcntl.flock(log, fcntl.LOCK_EX)
+            log.seek(0)
+            seen = {(entry["path"], entry["sha256"])
+                    for line in log if line.strip() for entry in (json.loads(line),)}
+            for path in sorted(root.iterdir()):
+                if path.is_symlink() or not path.is_file() or OUTBOX_NAME.fullmatch(path.name):
+                    continue
+                rel = path.relative_to(home).as_posix()
+                try:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    _withheld(poller, "outbox_read_failed", rel)
+                    continue
+                if (rel, digest) in seen:
+                    continue
+                log.seek(0, os.SEEK_END)
+                log.write(json.dumps({"path": rel, "sha256": digest}) + "\n")
+                log.flush()
+                os.fsync(log.fileno())
+                seen.add((rel, digest))
+                _withheld(poller, "unrecognized_outbox_name", rel)
+    except (OSError, ValueError, KeyError, TypeError):
+        _withheld(poller, "invalid_unrecognized_outbox_ledger")
+
+
 def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> None:
     """Consume each merged file at most once, including on dispatch failure."""
     root = home / "state" / "social-outbox" / poller
@@ -113,6 +144,7 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
         return
     ledger = state_dir / "dispatched-ledger.jsonl"
     state_dir.mkdir(parents=True, exist_ok=True)
+    _flag_unrecognized(home, root, state_dir, poller)
     with ledger.open("a+", encoding="utf-8") as log:
         fcntl.flock(log, fcntl.LOCK_EX)
         log.seek(0)
@@ -137,6 +169,8 @@ def dispatch_merged(home: Path, state_dir: Path, poller: str, bin_path: str) -> 
             print("social-cli: invalid dispatched ledger; refusing dispatch", file=sys.stderr)
             return
         for path in sorted(root.glob("outbox-*.yaml")):
+            if not OUTBOX_NAME.fullmatch(path.name):
+                continue
             if not path.is_file() or path.is_symlink():
                 _withheld(poller, "nonregular_or_symlink_outbox", path.relative_to(home).as_posix())
                 continue

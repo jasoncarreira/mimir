@@ -110,6 +110,93 @@ def test_merged_clean_once_and_before_sync(setup):
     assert hashlib.sha256(POST.encode()).hexdigest() in records[0]["ledger"]
 
 
+def test_stray_outbox_name_is_flagged_once_per_content_and_never_dispatched(setup, capsys):
+    home, state, root, calls, module = setup
+    stray = root / "outbox-2026-10-02-ship-hack-engineering.md"
+    commit_file(home, stray)
+    original = stray.read_bytes()
+    for expected in (1, 0):
+        assert module.main() == 0
+        signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert signals == ([{"poller": module.POLLER_NAME,
+                             "signal": "social_outbox_dispatch_withheld",
+                             "reason": "unrecognized_outbox_name",
+                             "path": stray.relative_to(home).as_posix()}] if expected else [])
+        assert not dispatches(calls)
+        assert stray.read_bytes() == original
+    stray.write_text(POST.replace("public", "changed"))
+    assert module.main() == 0
+    signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(signals) == 1 and signals[0]["reason"] == "unrecognized_outbox_name"
+    assert not dispatches(calls)
+    assert stray.read_text() == POST.replace("public", "changed")
+    records = [json.loads(line) for line in (state / "unrecognized-outbox-ledger.jsonl").read_text().splitlines()]
+    assert [r["path"] for r in records] == [stray.relative_to(home).as_posix()] * 2
+    assert records[0]["sha256"] != records[1]["sha256"]
+
+
+def test_approver_merged_stray_is_excluded_before_dispatch_candidates(setup, monkeypatch, capsys):
+    import dispatcher
+    from mimir.proposals import merged_social_outbox_commit
+
+    home, state, root, calls, module = setup
+    stray = root / "outbox-2026-10-02-ship-hack-engineering.md"
+    commit_file(home, stray)
+    original = stray.read_bytes()
+    rel = stray.relative_to(home).as_posix()
+    merge_oid = subprocess.run(["git", "rev-parse", "HEAD"], cwd=home,
+                               check=True, capture_output=True, text=True).stdout.strip()
+    # commit_file's "merge outbox" subject is translated by setup's fake forge
+    # into a MERGED rolling PR whose merger is the configured approver. Prove
+    # the real provenance gate passes, rather than relying on its refusal.
+    withheld = []
+    assert merged_social_outbox_commit(
+        home, module.POLLER_NAME, rel, verified_text=POST,
+        on_withheld=withheld.append,
+    ) == merge_oid
+    assert withheld == []
+
+    valid = root / "outbox-approved.yaml"
+    valid_text = POST.replace("public", "approved YAML")
+    commit_file(home, valid, valid_text)
+    assert merged_social_outbox_commit(
+        home, module.POLLER_NAME, rel, verified_text=POST,
+    ) == merge_oid
+
+    # The regex guard is deliberately redundant with the narrow glob. Pin
+    # candidate enumeration independently so widening only the glob fails,
+    # even though the second guard would still prevent an actual dispatch.
+    original_glob = Path.glob
+    candidates = []
+
+    def observe_glob(path, pattern, *args, **kwargs):
+        for candidate in original_glob(path, pattern, *args, **kwargs):
+            if path == root:
+                candidates.append(candidate)
+            yield candidate
+
+    monkeypatch.setattr(dispatcher.Path, "glob", observe_glob)
+    for expected_signals in (1, 0):
+        assert module.main() == 0
+        signals = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert signals == ([{"poller": module.POLLER_NAME,
+                             "signal": "social_outbox_dispatch_withheld",
+                             "reason": "unrecognized_outbox_name", "path": rel}]
+                           if expected_signals else [])
+        assert candidates == [valid]
+        candidates.clear()
+        dispatched = dispatches(calls)
+        assert len(dispatched) == 1
+        assert dispatched[0]["text"] == valid_text
+        assert stray.read_bytes() == original
+    flags = [json.loads(line) for line in
+             (state / "unrecognized-outbox-ledger.jsonl").read_text().splitlines()]
+    assert flags == [{"path": rel, "sha256": hashlib.sha256(original).hexdigest()}]
+    sent = [json.loads(line) for line in
+            (state / "dispatched-ledger.jsonl").read_text().splitlines()]
+    assert [entry["path"] for entry in sent] == [valid.relative_to(home).as_posix()]
+
+
 @pytest.mark.parametrize("case", ["untracked", "dirty", "staged"])
 def test_unmerged_files_never_dispatch(setup, case, capsys):
     home, _, root, calls, module = setup

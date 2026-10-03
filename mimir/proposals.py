@@ -182,7 +182,7 @@ class ProposalResult:
     pushed: bool
     pr_url: str | None
     #: None on full success; else "no_open" | "no_changes" | "secret" |
-    #: "conflict_marker" | "pr_open" | "error".
+    #: "conflict_marker" | "name" | "pr_open" | "error".
     reason: str | None
     detail: str | None = None
     reused_pr: bool = False
@@ -620,6 +620,20 @@ def _check_outbox_files(worktree: Path, surface: Path | None = None) -> str | No
     return None
 
 
+def _check_outbox_names(worktree: Path, surface: Path) -> tuple[str, str] | None:
+    """Validate staged additions/modifications; deletions can clean up legacy names."""
+    res = _git(["diff", "--cached", "--no-renames", "--diff-filter=ACMT",
+                "--name-only", "-z"], cwd=worktree)
+    if res.returncode != 0:
+        return "error", "outbox name check failed"
+    pattern = f"{surface.as_posix()}/outbox-*.yaml"
+    for rel in filter(None, (res.stdout or "").split("\0")):
+        path = Path(rel)
+        if path.parent != surface or not re.fullmatch(r"outbox-.+\.yaml", path.name):
+            return "name", f"{rel} must match {pattern} (outbox- + one or more chars + .yaml)"
+    return None
+
+
 def finalize_proposal(
     home: Path,
     *,
@@ -687,6 +701,9 @@ def finalize_proposal(
         )
 
     if poller and poller.surface == "social-outbox":
+        name_failure = _check_outbox_names(wt, poller.surface_root)
+        if name_failure:
+            return ProposalResult(False, branch, False, None, *name_failure)
         failure = _check_outbox_files(wt)
         if failure:
             return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed")
@@ -722,9 +739,13 @@ def finalize_proposal(
     attribution = ""
     if poller:
         source = " ".join(poller.source.split())
-        title = f"[research {poller.owner}] {source}: {title}"
+        if poller.surface == "social-outbox":
+            attribution = f"\n\nSubmission title: {title}"
+            title = f"[social outbox:{poller.owner.removeprefix('poller:')}] rolling outbox"
+        else:
+            title = f"[research {poller.owner}] {source}: {title}"
         attribution = (
-            f"\n\nUntrusted-ingest source (not verified): {source}\n"
+            f"{attribution}\n\nUntrusted-ingest source (not verified): {source}\n"
             f"Trusted origin_ref: {poller.origin_ref}\nTurn: {poller.turn_id}"
         )
     safe_title = _redact(title)
@@ -753,6 +774,10 @@ def finalize_proposal(
             restored = _git(["stash", "pop", "--index"], cwd=wt)
             if restored.returncode != 0:
                 return ProposalResult(False, branch, False, None, "rolling_conflict", "draft conflicts with rebased base")
+            # A successful pop --index restores the draft paths already checked
+            # above; base-imported paths are committed, not newly staged. No
+            # second staged-name check is needed. Content must still be scanned
+            # across the full surface because the rebase can import new blobs.
             failure = _check_outbox_files(wt, poller.surface_root)
             if failure:
                 return ProposalResult(False, branch, False, None, failure, f"outbox {failure} check failed after rebase")
