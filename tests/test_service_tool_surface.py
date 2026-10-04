@@ -408,6 +408,26 @@ def test_synthesis_surface_matches_session_boundary_gate(tmp_path, monkeypatch, 
     assert [t.name for t in filtered.tools] == expected
     availability = filtered.system_message.text.split("Available tools: ", 1)[1]
     assert availability.split(".\n", 1)[0] == ", ".join(expected)
+
+    stripped_service = replace(service, readable_domains=(), sink_destinations=())
+    stripped_request = request.override(runtime=Runtime(context=auth(
+        stripped_service, enforcement_enabled=enforce,
+    )))
+    stripped = ServiceToolSurfaceMiddleware()._filter_request(stripped_request)
+    # Mutation guard: dropping the catalog/resource intersection must fail this
+    # exact assertion, even though all of these tools retain profile capabilities.
+    assert [t.name for t in stripped.tools] == ["read_file", "memory_get"]
+    assert "Available tools: read_file, memory_get." in stripped.system_message.text
+
+    # Catalog OPEN still applies to profile tools, but not to tools outside it.
+    open_granted_service = replace(
+        stripped_service, capabilities=(*stripped_service.capabilities, "explicit_open"),
+    )
+    opened = ServiceToolSurfaceMiddleware()._filter_request(request.override(
+        runtime=Runtime(context=auth(open_granted_service, enforcement_enabled=enforce)),
+    ))
+    assert [t.name for t in opened.tools] == ["read_file", "memory_get", "explicit_open"]
+
     # The read_file exception remains visible for the turn's own evicted artifacts.
     for name in ("memory_query", "file_search", "commitment_list", "write_todos", "explicit_open"):
         decision = ToolRegistry().authorize_tool(

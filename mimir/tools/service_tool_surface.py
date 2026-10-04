@@ -72,8 +72,16 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
         tools = [
             tool for tool in request.tools
             if service is not None and _tool_name(tool) and (
-                (service.has_capability(_tool_name(tool)) or _tool_name(tool) == "read_file")
-                if service.authority_profile == "session-boundary" else (
+                (
+                    _tool_name(tool) == "read_file"
+                    or (
+                        service.has_capability(_tool_name(tool))
+                        and (
+                            catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
+                            or service_can_invoke_operation(service, _tool_name(tool))
+                        )
+                    )
+                ) if service.authority_profile == "session-boundary" else (
                     catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
                     or service_can_invoke_operation(service, _tool_name(tool))
                 )
