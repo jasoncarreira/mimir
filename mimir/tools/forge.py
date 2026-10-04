@@ -19,7 +19,7 @@ from langchain_core.tools import StructuredTool, ToolException, tool
 from langchain_core.tools.base import create_schema_from_function
 from pydantic import StrictInt
 
-from ..forge import ForgeClient, ForgeError, IssueTarget, ReviewVerdict
+from ..forge import ForgeClient, ForgeError, IssueTarget, PullRequestProjection, ReviewVerdict
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
@@ -724,6 +724,7 @@ def _publish_author_attestation(
     runtime: ToolRuntime[AuthContext] | None,
     scope: RepoPRActionScope,
     authors: tuple[str, ...],
+    head_sha: str | None = None,
 ) -> None:
     """Publish provenance only for authors obtained from native forge projections.
 
@@ -768,9 +769,10 @@ def _publish_author_attestation(
     principal = context.canonical_principal
     if context.is_service and principal:
         principal = f"service:{principal}"
+    resource_id = f"{scope.canonical_repo}#pull/{scope.pr_number}@{head_sha or scope.observed_head_sha}"
     publish_protected_result((SourceLabel(
         principal=principal, domain="repository",
-        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        resource_id=resource_id,
         bridge_instance="forge", sensitivity="internal",
         authorized_principals=frozenset({principal}) if principal else frozenset(),
         source_kind="protected_tool", integrity="trusted" if trusted else "untrusted",
@@ -787,7 +789,7 @@ def _publish_author_attestation(
                 session_id=context.channel_id,
                 turn_id=turn.turn_id if turn is not None else None,
                 repository=scope.canonical_repo,
-                resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+                resource_id=resource_id,
                 integrity="untrusted", integrity_effect="active_ingest",
                 failed_authors=failed_authors,
                 unavailable_authors=unavailable_authors,
@@ -797,14 +799,35 @@ def _publish_author_attestation(
             pass
 
 
-def _pr_content_authors(client: ForgeClient, scope: RepoPRActionScope) -> tuple[str, ...]:
-    """Bind PR-owned diff/file text to API authorship at the scoped head."""
-    metadata = client.get_pull_request(scope)
+def _pr_attestation(
+    metadata: PullRequestProjection,
+    scope: RepoPRActionScope,
+    runtime: ToolRuntime[AuthContext] | None,
+) -> tuple[tuple[str, ...], str]:
+    """Bind PR-owned text to the observed head or an exact verified own push."""
     if metadata.number != scope.pr_number:
-        return ("",)
+        return ("",), scope.observed_head_sha
     if metadata.head_sha != scope.observed_head_sha:
-        return ("<head-mismatch>",)
-    return (metadata.author,)
+        from ..repo_tools import was_verified_push
+
+        if not was_verified_push(
+            scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
+        ):
+            return ("<head-mismatch>",), scope.observed_head_sha
+        context = getattr(runtime, "context", None)
+        if context is not None and context.ifc_state is not None:
+            context.ifc_state.record_own_push(
+                scope.canonical_repo, scope.pr_number, scope.observed_head_sha,
+            )
+    return (metadata.author,), metadata.head_sha
+
+
+def _pr_content_authors(
+    client: ForgeClient, scope: RepoPRActionScope,
+    runtime: ToolRuntime[AuthContext] | None = None,
+) -> tuple[tuple[str, ...], str]:
+    """Bind PR-owned diff/file text to API authorship at its verified head."""
+    return _pr_attestation(client.get_pull_request(scope), scope, runtime)
 
 
 @tool
@@ -816,9 +839,8 @@ def pr_metadata(
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
     metadata = _call(lambda: _client(scope).get_pull_request(scope))
-    authors = ((metadata.author,) if metadata.head_sha == scope.observed_head_sha
-               else ("<head-mismatch>",)) if metadata.number == scope.pr_number else ("",)
-    _publish_author_attestation(runtime, scope, authors)
+    authors, head_sha = _pr_attestation(metadata, scope, runtime)
+    _publish_author_attestation(runtime, scope, authors, head_sha)
     return asdict(metadata)
 
 
@@ -833,7 +855,8 @@ def pr_files(
     client = _client(scope)
     items = _call(lambda: client.list_files(scope))
     if callable(getattr(client, "author_is_trusted", None)):
-        _publish_author_attestation(runtime, scope, _call(lambda: _pr_content_authors(client, scope)))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        _publish_author_attestation(runtime, scope, authors, head_sha)
     return [asdict(item) for item in items]
 
 
@@ -848,7 +871,8 @@ def pr_diff(
     client = _client(scope)
     diff = _call(lambda: client.get_diff(scope))
     if callable(getattr(client, "author_is_trusted", None)):
-        _publish_author_attestation(runtime, scope, _call(lambda: _pr_content_authors(client, scope)))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        _publish_author_attestation(runtime, scope, authors, head_sha)
     return diff
 
 

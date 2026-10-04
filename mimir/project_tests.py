@@ -178,9 +178,22 @@ def _configured_command(
         else:
             matches = [default] if default is not None else []
         if len(matches) != 1:
+            message = "select exactly one declared test suite: " + ", ".join(s.name for s in suites)
+            if not matches and selectors and not legacy and suite is None:
+                unmatched = [
+                    path for path in selectors
+                    if not any(
+                        path.partition("::")[0].startswith(s.selector_prefixes)
+                        or path.partition("::")[0].endswith(s.selector_suffixes)
+                        for s in suites
+                    )
+                ]
+                if unmatched:
+                    options = " (or ".join(f'suite="{s.name}"' for s in suites)
+                    message += f"; unmatched selectors: {unmatched!r}; pass {options}" + ")" * (len(suites) - 1)
             raise ProjectTestRefusal(
                 "test_suite_selection_refused",
-                "select exactly one declared test suite: " + ", ".join(s.name for s in suites),
+                message,
                 execution_started=False,
             )
         chosen = matches[0]

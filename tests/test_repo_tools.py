@@ -1901,6 +1901,39 @@ async def test_project_suite_selection_refuses_without_execution(
     assert "python, frontend" in str(error.value)
 
 
+@pytest.mark.asyncio
+async def test_unmatched_directory_selector_refusal_names_explicit_suite(
+    repo_tools, tmp_path, monkeypatch,
+):
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    selector = "mimir/optional-skills/social-cli/tests/"
+    (state.checkout_lease.path / selector).mkdir(parents=True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("suite refusal must precede snapshot creation")
+
+    with pytest.raises(ProjectTestRefusal) as error:
+        await RepoProjectTests(state, checkout_factory=forbidden).execute((selector,))
+    assert error.value.code == "test_suite_selection_refused"
+    assert selector in str(error.value)
+    assert 'pass suite="python" (or suite="frontend")' in str(error.value)
+
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append(argv)
+        return CollectedExecutionResult(0, b"", b"", False, False, 0, 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute((selector,), suite="python")
+    assert result.ok and result.suite == "python"
+    assert calls == [("/usr/bin/true", "-q", selector.rstrip("/"))]
+
+
 @pytest.mark.parametrize("selector,code", [
     ("frontend/example.tsx::case", "test_selector_invalid"),
     ("tracked.txt", "test_selector_invalid"),

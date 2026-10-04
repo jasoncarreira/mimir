@@ -245,6 +245,67 @@ def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
     assert recorded[0][1]["failed_authors"] == ["<head-mismatch>"]
 
 
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff])
+@pytest.mark.parametrize("publication", ["verified", "foreign", "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr"])
+def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, publication):
+    import uuid
+
+    import mimir.event_logger as events
+    from mimir.repo_tools import _record_verified_push
+
+    observed = uuid.uuid4().hex + "0" * 8
+    pushed = uuid.uuid4().hex + "0" * 8
+    scope = _scope(RepoPRAction.INSPECT, head_sha=observed)
+    runtime = _runtime(scope)
+    client = FakeForge()
+    monkeypatch.setattr(client, "get_pull_request", lambda _: PullRequestProjection(
+        17, "Title", "open", "author", False, "main", "change",
+        pushed, True, "created", "updated",
+    ))
+    attested = []
+    monkeypatch.setattr(client, "author_is_trusted", lambda repo, author: (
+        attested.append((repo, author)) or True
+    ), raising=False)
+    recorded = []
+    monkeypatch.setattr(events, "log_event_sync", lambda event, **fields: recorded.append((event, fields)))
+    if publication != "foreign":
+        recorded_scope = replace(
+            scope,
+            canonical_repo="other/repo" if publication == "wrong_repo" else scope.canonical_repo,
+            pr_number=18 if publication == "wrong_pr" else scope.pr_number,
+        )
+        _record_verified_push(
+            recorded_scope,
+            uuid.uuid4().hex + "0" * 8 if publication == "wrong_previous" else observed,
+            uuid.uuid4().hex + "0" * 8 if publication == "wrong_new" else pushed,
+        )
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            read_tool.func("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        label = provenance.sources[0]
+        if publication == "verified":
+            assert label.integrity == "trusted"
+            assert label.resource_id == f"owner/repo#pull/17@{pushed}"
+            assert recorded == []
+            assert attested == [("owner/repo", "author")]
+            assert runtime.context.ifc_state.own_push_lineage() == {
+                ("owner/repo", 17): frozenset({observed}),
+            }
+        else:
+            assert label.integrity == "untrusted"
+            assert label.resource_id == f"owner/repo#pull/17@{observed}"
+            assert recorded[0][0] == "forge_author_attestation_downgraded"
+            assert recorded[0][1]["failed_authors"] == ["<head-mismatch>"]
+            assert attested == []
+            assert runtime.context.ifc_state.own_push_lineage() == {}
+    finally:
+        set_forge_client(None)
+
+
 @pytest.mark.parametrize("own_push", [
     False, True, "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr",
 ])
