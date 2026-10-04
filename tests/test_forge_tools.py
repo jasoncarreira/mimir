@@ -152,7 +152,9 @@ async def test_mixed_comment_authorship_and_retry(monkeypatch, other_verdict):
 @pytest.mark.parametrize("verdict", [True, False, None])
 @pytest.mark.parametrize("logger_fails", [False, True])
 @pytest.mark.parametrize("author", ["other", "https://user:secret@github.com/body"])
-def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger_fails, author):
+def test_author_attestation_downgrade_explains_turn(
+    monkeypatch, caplog, verdict, logger_fails, author,
+):
     from mimir.tools.forge import _publish_author_attestation
     import mimir.event_logger as events
 
@@ -174,7 +176,7 @@ def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger
     try:
         capture = access_control.begin_protected_result_capture()
         try:
-            _publish_author_attestation(runtime, scope, ("collaborator", author, author))
+            _publish_author_attestation(runtime, scope, ("collaborator", author, author), "pr_comments")
         finally:
             provenance = access_control.end_protected_result_capture(capture)
         assert (provenance.sources[0].integrity == "trusted") is (verdict is True)
@@ -186,11 +188,24 @@ def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger
             assert event == "forge_author_attestation_downgraded"
             assert fields["repository"] == "owner/repo"
             assert fields["resource_id"] == provenance.sources[0].resource_id
+            assert fields["tool"] == "pr_comments"
             diagnostic_author = "other" if author == "other" else "<invalid-author>"
             assert fields["failed_authors"] == [diagnostic_author]
             assert fields["unavailable_authors"] == ([diagnostic_author] if verdict is None else [])
             assert "secret" not in json.dumps(fields)
             assert fields["integrity"] == "untrusted"
+            if logger_fails:
+                warning = [record for record in caplog.records if record.name == "mimir.tools.forge"]
+                assert len(warning) == 1
+                assert warning[0].levelname == "WARNING"
+                message = warning[0].getMessage()
+                for field in (
+                    "repository=owner/repo", f"resource_id={provenance.sources[0].resource_id}",
+                    "tool=pr_comments", f"failed_authors=['{diagnostic_author}']",
+                    f"unavailable_authors={fields['unavailable_authors']}",
+                ):
+                    assert field in message
+                assert "secret" not in message
         monkeypatch.setattr(budget_gate, "_emit_event_sync", lambda *a, **kw: None)
         refusal = budget_gate._deny_admin_tool(
             "shell_exec", "ifc_label_blocked:shell_process",
@@ -205,6 +220,28 @@ def test_author_attestation_downgrade_explains_turn(monkeypatch, verdict, logger
         assert "attestation" not in unrelated
     finally:
         set_forge_client(None)
+
+
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_reviews, pr_comments])
+def test_author_attestation_downgrade_identifies_read_tool(monkeypatch, read_tool):
+    import mimir.event_logger as events
+
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: False, raising=False)
+    recorded = []
+    monkeypatch.setattr(events, "log_event_sync", lambda event, **fields: recorded.append((event, fields)))
+    scope = _scope(RepoPRAction.INSPECT)
+    set_forge_client(client)
+    capture = access_control.begin_protected_result_capture()
+    try:
+        read_tool.func("owner/repo", 17, runtime=_runtime(scope))
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+        set_forge_client(None)
+    assert provenance.sources[0].integrity == "untrusted"
+    assert len(recorded) == 1
+    assert recorded[0][0] == "forge_author_attestation_downgraded"
+    assert recorded[0][1]["tool"] == read_tool.name
 
 
 def test_author_attestation_denial_without_ifc_state(monkeypatch):

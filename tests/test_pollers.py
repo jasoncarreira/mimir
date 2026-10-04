@@ -2583,6 +2583,73 @@ def test_pr_synchronize_actor_is_resolved_from_server_compare(
     assert calls == [f"repos/acme/widget/compare/{'a' * 40}...{'b' * 40}"]
 
 
+@pytest.mark.parametrize(("committer", "author", "expected"), [
+    pytest.param({"login": "collab"}, {"login": "outsider"}, "collab", id="committer-first"),
+    pytest.param({"login": "web-flow"}, {"login": "collab"}, "collab", id="web-flow-fallback"),
+    pytest.param(None, {"login": "collab"}, "collab", id="missing-committer"),
+    pytest.param({"login": ""}, {"login": "collab"}, "collab", id="empty-committer"),
+    pytest.param({"login": "web-flow"}, None, None, id="web-flow-alone"),
+    pytest.param(None, None, None, id="missing-both"),
+])
+def test_pr_synchronize_selects_one_real_commit_identity(monkeypatch, committer, author, expected):
+    commits = [{"committer": {"login": "earlier"}}, {"committer": committer, "author": author}]
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", lambda *_: (200, {"commits": commits}))
+
+    assert _github_content_author("acme/widget", {
+        "event_type": "pr_synchronize", "url": "https://github.com/acme/widget/pull/11",
+        "previous_head": "a" * 40, "new_head": "b" * 40,
+    }, "token") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("committer", "author", "expected", "attested"), [
+    pytest.param("collab", "outsider", "trusted", "collab", id="collaborator-committer"),
+    pytest.param("outsider", "collab", "untrusted", "outsider", id="outsider-committer"),
+    pytest.param("web-flow", "collab", "trusted", "collab", id="web-flow-author"),
+    pytest.param(None, None, "untrusted", None, id="missing-identity"),
+])
+async def test_pr_synchronize_attests_only_selected_identity(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+    committer: str | None, author: str | None, expected: str, attested: str | None,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", """
+import json
+print(json.dumps({"poller": "x", "prompt": "synchronize", "event_type": "pr_synchronize", "repo": "acme/widget", "url": "https://github.com/acme/widget/pull/11", "author": "payload-impostor", "previous_head": "aaaaaaaa", "new_head": "bbbbbbbb"}))
+""")
+    calls: list[str] = []
+
+    def fake_api(endpoint: str, token: str):
+        assert token == "server-token"
+        calls.append(endpoint)
+        if "/compare/" in endpoint:
+            return 200, {"commits": [{
+                "committer": {"login": committer} if committer else None,
+                "author": {"login": author} if author else None,
+            }]}
+        if endpoint == f"repos/acme/widget/collaborators/{attested}":
+            return (204, None) if attested == "collab" else (404, None)
+        if endpoint == f"orgs/acme/memberships/{attested}":
+            return 404, None
+        pytest.fail(f"unexpected attestation: {endpoint}")
+
+    monkeypatch.setattr("mimir.pollers._github_api_attestation", fake_api)
+    cfg = PollerConfig(
+        name="x", command=f"{sys.executable} poller.py", cron="* * * * *",
+        env={"GITHUB_TOKEN": "server-token"}, skill_dir=skill_dir, trust_source="github",
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+
+    assert len(enq.events) == 1
+    source = next(iter(enq.events[0].ifc_labels.sources))
+    assert (source.integrity, source.integrity_effect) == (expected, "active_ingest")
+    assert enq.events[0].extra["items"][0]["actor"] == attested
+    assert calls == ["repos/acme/widget/compare/aaaaaaaa...bbbbbbbb"] + (
+        [f"repos/acme/widget/collaborators/{attested}"] if attested else []
+    ) + ([f"orgs/acme/memberships/{attested}"] if attested == "outsider" else [])
+
+
 def test_github_activity_integrity_classification_is_total() -> None:
     poller_source = (
         Path(__file__).parents[1]
