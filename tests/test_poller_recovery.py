@@ -743,6 +743,60 @@ async def test_reconcile_completed_hard_refusal_without_charging_attempt(
     ]
 
 
+@pytest.mark.parametrize("outcome_type", ["turn_completed", "turn_failed"])
+@pytest.mark.parametrize("recover_failed_turns", [False, True])
+async def test_reconcile_exempt_refusal_clears_non_live_state_poller(
+    tmp_path: Path, outcome_type: str, recover_failed_turns: bool,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    event = _make_event("sid-gmail", channel_id="poller:gmail-inbox")
+    await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(10))
+    outcome_at = _ts(5)
+    _write_outcome(
+        events, type_=outcome_type, channel_id=event.channel_id,
+        source_id=event.source_id, ts=outcome_at,
+        attempt_disposition="exempt_hard_refusal",
+        attempt_reason="service_scope_denied",
+        hard_refusals=[{"reason": "service_scope_denied"}],
+    )
+    enqueue = _FakeEnqueue()
+
+    summary = await poller_recovery.reconcile_failed_turns(
+        poller_name="gmail-inbox", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=events, enqueue=enqueue,
+        recover_failed_turns=recover_failed_turns,
+    )
+
+    state = poller_recovery._load_state(tmp_path)
+    assert state["inflight"] == {}
+    assert state["last_reconciled"] == outcome_at
+    assert summary["completed"] == (outcome_type == "turn_completed")
+    assert summary["reenqueued"] == 0
+    assert enqueue.calls == []
+
+
+@pytest.mark.parametrize("outcome_type", ["turn_completed", "turn_failed"])
+async def test_reconcile_exempt_refusal_clears_live_state_with_recovery_enabled(
+    tmp_path: Path, outcome_type: str,
+) -> None:
+    events = tmp_path / "events.jsonl"
+    event = _make_event("sid-github", channel_id="poller:github-activity")
+    await poller_recovery.stash_enqueued_event(tmp_path, event, enqueued_at=_ts(10))
+    _write_outcome(
+        events, type_=outcome_type, channel_id=event.channel_id,
+        source_id=event.source_id, ts=_ts(5),
+        attempt_disposition="exempt_hard_refusal",
+    )
+
+    await poller_recovery.reconcile_failed_turns(
+        poller_name="github-activity", channel_id=event.channel_id,
+        persist_dir=tmp_path, events_path=events, enqueue=_FakeEnqueue(),
+        recover_failed_turns=True,
+    )
+
+    assert poller_recovery._load_state(tmp_path)["inflight"] == {}
+
+
 async def test_reconcile_drops_tool_budget_exhaustion_without_retry(tmp_path: Path):
     """Budget exhaustion is a failed turn for telemetry, but replaying the
     same poller item under the unchanged budget would deterministically fail
