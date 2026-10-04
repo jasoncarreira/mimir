@@ -49,6 +49,47 @@ def _gog(**over):
     return entry
 
 
+@pytest.mark.parametrize("missing_kind", ["final", "intermediate", "dangling_link"])
+def test_missing_executable_component_preserves_raw_diagnostic(
+    tmp_path: Path, missing_kind: str,
+) -> None:
+    missing = tmp_path / "missing"
+    if missing_kind == "dangling_link":
+        link = tmp_path / "entry"
+        link.symlink_to(missing)
+        spelling = link.name
+    elif missing_kind == "intermediate":
+        spelling = "missing/tool"
+    else:
+        spelling = "missing"
+    # Path normalizes duplicate separators; diagnostics must retain the input.
+    raw_path = f"{tmp_path}//{spelling}"
+    with pytest.raises(access_control.DeclaredShellCommandError) as caught:
+        parse_declared_shell_commands([_gog(path=raw_path)], writable_roots=())
+    assert str(caught.value).endswith(f"path does not exist: {raw_path}")
+    assert caught.value.environment_dependent is True
+
+
+def test_unresolvable_executable_component_has_distinct_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = tmp_path / "blocked"
+    original_lstat = Path.lstat
+
+    def denied_lstat(path, *args, **kwargs):
+        if path == blocked:
+            raise PermissionError("permission denied")
+        return original_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", denied_lstat)
+    raw_path = f"{tmp_path}//blocked/tool"
+    with pytest.raises(access_control.DeclaredShellCommandError) as caught:
+        parse_declared_shell_commands([_gog(path=raw_path)], writable_roots=())
+    assert str(caught.value).endswith(f"path cannot be resolved: {raw_path}")
+    assert caught.value.environment_dependent is True
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
 def test_declared_read_subcommands_are_admitted(home: Path) -> None:
     declared = parse_declared_shell_commands([_gog()], writable_roots=())
     for command in (

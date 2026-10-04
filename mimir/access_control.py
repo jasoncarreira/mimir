@@ -2024,7 +2024,7 @@ def _agent_writable_root_for_path(
 
 
 def _resolve_declared_executable(
-    path: Path, name: str, writable_roots: tuple[Path, ...],
+    path: Path, name: str, writable_roots: tuple[Path, ...], *, raw_path: str,
 ) -> Path:
     """Walk in kernel order and reject every agent-writable traversal component.
 
@@ -2040,15 +2040,8 @@ def _resolve_declared_executable(
             current = current.parent
             continue
         link = current / component
-        # The resolved prefix contains no links. Check the link's location
-        # before examining its target, including non-link directory entries.
-        writable_root = _agent_writable_root_for_path(
-            current, writable_roots, admin_operator_turn=False,
-        )
-        if writable_root is not None:
-            raise _declaration_error(
-                name, f"path component {link} is inside the agent-writable root {writable_root}",
-            )
+        # The resolved prefix contains no links; its directories were already
+        # checked below. Check each new link location or non-link component.
         try:
             mode = link.lstat().st_mode
             if stat.S_ISLNK(mode):
@@ -2062,9 +2055,14 @@ def _resolve_declared_executable(
                 else:
                     pending = list(target.parts) + pending
                 continue
+        except FileNotFoundError as exc:
+            raise _declaration_error(
+                name, f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            ) from exc
         except OSError as exc:
             raise _declaration_error(
-                name, f"path does not exist or cannot be resolved: {path}",
+                name, f"path cannot be resolved: {raw_path}",
                 environment_dependent=True,
             ) from exc
         writable_root = _agent_writable_root_for_path(
@@ -2149,7 +2147,9 @@ def parse_declared_shell_commands(
         path = Path(raw_path)
         if not path.is_absolute():
             raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
-        resolved_path = _resolve_declared_executable(path, name, resolved_writable)
+        resolved_path = _resolve_declared_executable(
+            path, name, resolved_writable, raw_path=raw_path,
+        )
         if not resolved_path.exists():
             raise _declaration_error(
                 name,
