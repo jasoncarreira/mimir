@@ -96,6 +96,11 @@ MAX_PENDING_ENQUEUE = 1000
 _TURN_OUTCOME_TYPES = ("turn_completed", "turn_failed")
 _UNCLEAN_RESTART_TYPE = "liveness_unclean_restart"
 
+
+def _is_live_state_poller(poller_name: str) -> bool:
+    return poller_name == "github-activity"
+
+
 # chainlink #316: writers stamp the event timestamp BEFORE acquiring the
 # append lock, so a record can land slightly out of append order relative to
 # its timestamp. The disorder is bounded by the lock-hold window (sub-ms in
@@ -756,12 +761,12 @@ async def reconcile_failed_turns(
                     )
                     entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
-                    if recover_failed_turns:
+                    if recover_failed_turns or not _is_live_state_poller(poller_name):
                         del inflight[source_id]
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)
                     continue
-                if not recover_failed_turns and poller_name == "github-activity":
+                if not recover_failed_turns and _is_live_state_poller(poller_name):
                     # Live-state pollers decide success from the next external
                     # snapshot. If the requested state transition did not occur,
                     # a normal model completion is still a spent wedge attempt.
@@ -785,7 +790,7 @@ async def reconcile_failed_turns(
                     )
                     entry["attempt_reasons"] = [entry["outcome_reason"]]
                     entry["hard_refusals"] = rec.get("hard_refusals", [])
-                    if recover_failed_turns:
+                    if recover_failed_turns or not _is_live_state_poller(poller_name):
                         del inflight[source_id]
                     if isinstance(ts, str):
                         watermark = max(watermark, ts)

@@ -194,6 +194,20 @@ def _all_bundled_skill_mds() -> list[Path]:
     return out
 
 
+def test_bundled_skill_descriptions_fit_agent_skills_limit() -> None:
+    checked_roots: set[Path] = set()
+    for root in (SKILLS_ROOT, _OPTIONAL_SKILLS_ROOT):
+        skill_mds = list(root.rglob("SKILL.md"))
+        assert skill_mds, f"no bundled skills found under {root}"
+        for skill_md in skill_mds:
+            description = _parse_frontmatter(skill_md.read_text())["description"]
+            assert len(description) <= 1024, (
+                f"{skill_md}: description is {len(description)} characters (limit 1024)"
+            )
+        checked_roots.add(root)
+    assert checked_roots == {SKILLS_ROOT, _OPTIONAL_SKILLS_ROOT}
+
+
 @pytest.fixture
 def registered_tool_names(monkeypatch: pytest.MonkeyPatch) -> set[str]:
     """Enumerate the registry without provider, CLI, or ambient MCP gating."""

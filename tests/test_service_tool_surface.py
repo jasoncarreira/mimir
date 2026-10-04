@@ -386,39 +386,58 @@ def test_untrusted_service_fails_closed(context):
 
 
 @pytest.mark.parametrize("enforce", [False, True])
-def test_synthesis_uses_catalog_and_exact_resource_requirements(tmp_path, monkeypatch, enforce):
+def test_synthesis_surface_matches_session_boundary_gate(tmp_path, monkeypatch, enforce):
     service = builtin_trigger_service_principal("session-boundary", tmp_path)
     catalog = OperationCatalog()
     catalog.register_operation("explicit_open", OperationDecision.OPEN)
     monkeypatch.setattr("mimir.tools.service_tool_surface.get_operation_catalog", lambda: catalog)
-    candidates = [*INVENTORY, "mimir_get_turn", "explicit_open", "explicit_grant"]
-    service = replace(service, capabilities=(*service.capabilities, "explicit_grant"))
-
-    def surface(principal):
-        request = ModelRequest(
-            model=RecordingModel(), messages=[], tools=tools(*candidates),
-            runtime=Runtime(context=auth(principal, enforcement_enabled=enforce)),
-        )
-        return [t.name for t in ServiceToolSurfaceMiddleware()._filter_request(request).tools]
-
-    visible = surface(service)
-    assert visible == [
-        *OPEN, "write_file", "saga_feedback",
-        "saga_end_session", "mimir_get_turn", "explicit_open", "explicit_grant",
+    candidates = (
+        "memory_query", "file_search", "read_file", "commitment_list",
+        "write_todos", "memory_get", "saga_feedback", "saga_end_session",
+        "write_file", "mimir_get_turn", "explicit_open",
+    )
+    request = ModelRequest(
+        model=RecordingModel(), messages=[], tools=tools(*candidates),
+        runtime=Runtime(context=auth(service, enforcement_enabled=enforce)),
+    )
+    filtered = ServiceToolSurfaceMiddleware()._filter_request(request)
+    expected = [
+        "read_file", "memory_get", "saga_feedback", "saga_end_session",
+        "write_file", "mimir_get_turn",
     ]
-    # Visibility is not authority: OPEN tools still reach the registry,
-    # which hard-denies synthesis calls outside its capabilities even in shadow.
-    for name in ("web_search", "fetch_url", "memory_query", "write_todos", "explicit_open"):
+    assert [t.name for t in filtered.tools] == expected
+    availability = filtered.system_message.text.split("Available tools: ", 1)[1]
+    assert availability.split(".\n", 1)[0] == ", ".join(expected)
+    # The read_file exception remains visible for the turn's own evicted artifacts.
+    for name in ("memory_query", "file_search", "commitment_list", "write_todos", "explicit_open"):
         decision = ToolRegistry().authorize_tool(
             name, auth(service, enforcement_enabled=enforce), enforce=enforce,
         )
         assert decision.allowed is False
         assert decision.reason == "session_boundary_capability_denied"
-    stripped = surface(replace(service, readable_domains=(), sink_destinations=()))
-    assert stripped == [*OPEN, "explicit_open", "explicit_grant"]
-    # OPEN memory reads do not require an explicit service grant. Non-open
-    # resource operations require both the grant and declared domain/sink.
-    granted = replace(service, capabilities=("send_message",), sink_destinations=("message",))
+
+
+def test_non_synthesis_surface_keeps_open_and_resource_checks(monkeypatch):
+    catalog = OperationCatalog()
+    catalog.register_operation("explicit_open", OperationDecision.OPEN)
+    monkeypatch.setattr("mimir.tools.service_tool_surface.get_operation_catalog", lambda: catalog)
+    service = service_context("research").service_authority
+    candidates = ("memory_query", "file_search", "read_file", "memory_store",
+                  "send_message", "explicit_open")
+
+    def surface(principal):
+        request = ModelRequest(
+            model=RecordingModel(), messages=[], tools=tools(*candidates),
+            runtime=Runtime(context=auth(principal)),
+        )
+        return [t.name for t in ServiceToolSurfaceMiddleware()._filter_request(request).tools]
+
+    assert surface(service) == ["memory_query", "read_file", "memory_store", "explicit_open"]
+    assert surface(replace(service, readable_domains=())) == [
+        "memory_query", "memory_store", "explicit_open",
+    ]
+    granted = replace(service, capabilities=(*service.capabilities, "send_message"),
+                      sink_destinations=("message",))
     assert "send_message" in surface(granted)
     assert "send_message" not in surface(replace(granted, sink_destinations=()))
 
