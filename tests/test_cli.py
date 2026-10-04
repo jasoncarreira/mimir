@@ -185,6 +185,26 @@ def test_setup_writes_saga_toml(tmp_path: Path):
 # ── --embedding preset tests (PR #144 review nit #4) ─────────────────
 
 
+
+def test_setup_saga_toml_retrieval_keys_are_all_read_by_saga(tmp_path: Path):
+    """Every [retrieval] key setup writes must be one SAGA's config knows.
+
+    `enable_missing_ref_pivot` was written from v0.5 (P30) on but never read
+    by anything, so it silently did nothing. Guard the class with SAGA's own
+    definition of a known key (the same set `_warn_unknown_keys` uses).
+    """
+    import tomllib
+
+    from mimir.saga._config_io import _DEFAULTS, _KNOWN_EXTRA_KEYS
+
+    home = tmp_path / "agent"
+    setup_home(home)
+    written = tomllib.loads((home / "saga.toml").read_text())
+    known = set(_DEFAULTS["retrieval"]) | _KNOWN_EXTRA_KEYS.get("retrieval", set())
+    unknown = sorted(set(written.get("retrieval", {})) - known)
+    assert unknown == [], f"setup writes [retrieval] keys SAGA never reads: {unknown}"
+    assert "enable_missing_ref_pivot" not in written.get("retrieval", {})
+
 def test_setup_embedding_default_is_voyage(tmp_path: Path):
     """Per the Phase 3 LongMemEval cross-bench result, voyage is the
     new canonical default. Status dict records the chosen preset."""
