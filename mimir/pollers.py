@@ -719,7 +719,13 @@ def _github_content_author(
         commit = commits[-1] if isinstance(commits, list) and commits else None
         if not isinstance(commit, dict):
             return None
-        user = commit.get("author") or commit.get("committer")
+        # GitHub's web-flow committer represents a UI action, not an actor.
+        # Attest exactly one mapped identity, preferring the real committer.
+        for user in (commit.get("committer"), commit.get("author")):
+            login = user.get("login") if isinstance(user, dict) else None
+            if isinstance(login, str) and login and login != "web-flow":
+                return login
+        return None
     elif event_type == "pr_review_requested":
         requested_reviewer = extras.get("requested_reviewer")
         if not isinstance(payload, list) or not isinstance(requested_reviewer, str):

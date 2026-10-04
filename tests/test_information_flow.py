@@ -6091,7 +6091,10 @@ def test_shell_gate_after_real_source_labelling(
         ))
         token = access_control.begin_protected_result_capture()
         try:
-            forge._publish_author_attestation(SimpleNamespace(context=auth), scope, ("author",))
+            forge._publish_author_attestation(
+                SimpleNamespace(context=auth), scope, ("author",),
+                "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata",
+            )
         finally:
             provenance = access_control.end_protected_result_capture(token)
         forge_tool = "pr_diff" if source == "noncollaborator_pr_diff" else "pr_metadata"

@@ -1192,10 +1192,12 @@ def _emit_pr_synchronize(
         commits = compare.get("commits") or []
         total_commits = compare.get("ahead_by") or len(commits)
     head_commit = commits[-1] if commits else {}
-    push_author = (
-        (head_commit.get("author") or {}).get("login")
-        or (head_commit.get("committer") or {}).get("login")
-    )
+    push_author = None
+    for user in (head_commit.get("committer"), head_commit.get("author")):
+        login = user.get("login") if isinstance(user, dict) else None
+        if isinstance(login, str) and login and login != "web-flow":
+            push_author = login
+            break
     if total_commits and commits:
         subjects = [
             (commit.get("commit") or {}).get("message", "").split("\n")[0][:72]
