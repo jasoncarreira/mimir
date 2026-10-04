@@ -402,6 +402,65 @@ class TestWriteGuardBackend:
         assert labels is not None
         assert labels.has_untrusted_active_ingest is (integrity == "untrusted")
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["ls", "als"])
+    @pytest.mark.parametrize("target_kind", ["file", "directory"])
+    @pytest.mark.parametrize("untrusted", [True, False], ids=["untrusted", "trusted"])
+    async def test_ls_labels_resolved_symlink_children(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+        target_kind: str, untrusted: bool,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        directory = home / "state" / "notes"
+        directory.mkdir(parents=True)
+        target_root = home / "state" / ("pollers/x" if untrusted else "other")
+        target_root.mkdir(parents=True)
+        target = target_root / "target"
+        if target_kind == "directory":
+            target.mkdir()
+        else:
+            target.write_text("benign fixture\n", encoding="utf-8")
+        (directory / "reference").symlink_to(
+            target, target_is_directory=(target_kind == "directory"),
+        )
+        ordinary = directory / "ordinary.md"
+        ordinary.write_text("ordinary fixture\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = begin_protected_result_capture()
+        try:
+            result = getattr(backend, method)(str(directory))
+            if method == "als":
+                result = await result
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        entry_paths = {
+            str(backend._fs._resolve_path(entry["path"]).resolve())
+            for entry in result.entries or ()
+        }
+        assert str(target.resolve()) in entry_paths
+        assert str(ordinary.resolve()) in entry_paths
+        assert provenance is not None
+        assert len(provenance.sources) == 2
+        sources = {source.resource_id: source for source in provenance.sources}
+        assert set(sources) == {str(directory.resolve()), str(target.resolve())}
+        assert sources[str(directory.resolve())].integrity == "trusted"
+        assert sources[str(target.resolve())].integrity == (
+            "untrusted" if untrusted else "trusted"
+        )
+        labels = classify_protected_result(
+            method, {"path": str(directory)}, None,
+            ToolAuthorization(
+                tool_name=method, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+            ),
+            result=result, provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is untrusted
+
     @pytest.mark.parametrize("method", ["ls", "als"])
     @pytest.mark.parametrize("error_kind", ["outside", "not-directory"])
     @pytest.mark.asyncio

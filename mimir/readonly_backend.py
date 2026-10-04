@@ -1575,7 +1575,24 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         except ValueError as e:
             return LsResult(error=self._path_value_error_msg(path, e))
         if result.error is None:
-            self._publish_read_paths([path])
+            # Ordinary names belong to the listed directory. Resolved symlink
+            # targets can disclose names from elsewhere and need their own source.
+            read_paths = [path]
+            try:
+                listed_directory = self._resolve_path(path).resolve(strict=True)
+                for entry in result.entries or ():
+                    entry_path = entry.get("path")
+                    if not entry_path:
+                        continue
+                    resolved_entry = self._resolve_path(str(entry_path)).resolve(strict=True)
+                    if resolved_entry.parent != listed_directory:
+                        read_paths.append(str(entry_path))
+            except (OSError, RuntimeError, ValueError):
+                from .access_control import invalidate_protected_result_capture
+
+                invalidate_protected_result_capture()
+            else:
+                self._publish_read_paths(read_paths)
         return result
 
     async def als(self, path: str) -> LsResult:
