@@ -124,19 +124,49 @@ def test_expected_blob_len_is_4_bytes_per_dim():
     assert _expected_blob_len(1536) == 6144
 
 
+def test_dispatch_installs_home_config_before_reindex(tmp_path, monkeypatch):
+    import os
+    import mimir.reindex as module
+    from mimir.saga import _config_io
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    _config_io.install_saga_config(None)
+    (tmp_path / "saga.toml").write_text(
+        '[embedding]\nprovider = "openai"\nmodel = "home-model"\n',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def reindex(db_path, **kwargs):
+        cfg = _config_io.get_config()
+        assert cfg("embedding", "provider") == "openai"
+        assert cfg("embedding", "model") == "home-model"
+        calls.append((db_path, kwargs))
+        return ReindexReport(
+            target="atoms", db_path=db_path, total_rows=0, already_current=0,
+            needs_reindex=0, reindexed=0, failed=0, estimated_input_chars=0,
+            elapsed_seconds=0, provider="openai", dimension=1536,
+        )
+
+    monkeypatch.setattr(module, "reindex_saga_atoms", reindex)
+    args = argparse.Namespace(home=tmp_path, target="atoms", apply=False, batch_size=7)
+    assert dispatch(args) == 0
+    assert calls == [(tmp_path / ".mimir/saga.db", {"dry_run": True, "batch_size": 7})]
+    assert "SAGA_CONFIG" not in os.environ
+
+
 @pytest.mark.parametrize("configured", [None, "nested/custom #?%.db", "absolute"])
 def test_dispatch_reembeds_resolved_store(tmp_path, monkeypatch, patch_provider, configured):
-    import mimir.saga._config_io as config_io
-
     patch_provider(dim=4)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("SAGA_CONFIG", raising=False)
     if configured == "absolute":
         configured = str(tmp_path / "external.db")
-    config = {"embedding": {"provider": "openai"}}
-    if configured is not None:
-        config["storage"] = {"db_path": configured}
-    monkeypatch.setattr(config_io, "_config", config)
+    (tmp_path / "saga.toml").write_text(
+        '[embedding]\nprovider = "openai"\n'
+        + (f'[storage]\ndb_path = "{configured}"\n' if configured else "")
+    )
     db = Path(configured or "saga.db")
     if not db.is_absolute():
         db = tmp_path / ".mimir" / db

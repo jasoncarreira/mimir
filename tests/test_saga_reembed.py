@@ -200,12 +200,41 @@ def test_cli_home_config_and_options(tmp_path, monkeypatch, home_source, absolut
         monkeypatch.chdir(home)
     main(argv)
     assert os.environ["MIMIR_HOME"] == str(home)
-    assert os.environ["SAGA_CONFIG"] == str(home / "saga.toml")
+    assert os.environ["SAGA_CONFIG"] == ""
     config._load_home_dotenv.assert_called_once_with(home)
     assert run.call_args.args == (Path(configured) if absolute_db else home / ".mimir/custom.db",)
     assert run.call_args.kwargs["dry_run"] is True
     assert run.call_args.kwargs["batch_size"] == 7
     assert run.call_args.kwargs["batch_delay"] == 0.25
+
+
+def test_cli_installs_home_config_before_reembed(tmp_path, monkeypatch):
+    from mimir.cli import main
+    from mimir import config
+    from mimir.saga import _config_io
+    from mimir.saga import reembed as module
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(config, "_load_home_dotenv", Mock())
+    _config_io.install_saga_config(None)
+    (tmp_path / "saga.toml").write_text(
+        '[embedding]\nprovider = "openai"\nmodel = "home-model"\n',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(db_path, **kwargs):
+        cfg = _config_io.get_config()
+        assert cfg("embedding", "provider") == "openai"
+        assert cfg("embedding", "model") == "home-model"
+        calls.append((db_path, kwargs["dry_run"]))
+        return {}
+
+    monkeypatch.setattr(module, "reembed", run)
+    main(["saga-reembed", "--home", str(tmp_path), "--dry-run"])
+    assert calls == [(tmp_path / ".mimir/saga.db", True)]
+    assert "SAGA_CONFIG" not in os.environ
 
 
 def test_cli_interrupt(tmp_path, monkeypatch, capsys):
@@ -236,6 +265,9 @@ def test_unrepaired_sessions_reported_and_cli_fails(db, provider, monkeypatch, c
     provider.batch_embed.assert_not_called()
     assert snapshot(db) == before
     monkeypatch.setenv("MIMIR_HOME", str(db.parent))
+    (db.parent / "saga.toml").write_text(
+        f'[storage]\ndb_path = "{db}"\n', encoding="utf-8",
+    )
     monkeypatch.setattr(_config_io, "get_config", lambda: lambda section, *args:
                         str(db) if section == "storage" else 2000)
     main(["saga-reembed", "--dry-run"])

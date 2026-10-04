@@ -6,6 +6,14 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- `mimir run` now loads `<home>/saga.toml` into SAGA (or the exported
+  `SAGA_CONFIG` override). Previously the home file was ignored: upgrading
+  activates its configured SAGA LLM provider/model, embedding provider, and
+  retrieval flags, potentially changing LLM spend and retrieval behaviour.
+  An unreadable or malformed selected file now stops startup rather than
+  silently using defaults. `saga-reembed` and `reindex` use the same config
+  selection without writing `SAGA_CONFIG` to the process environment.
+
 ## [0.9.2] — 2026-10-01
 
 Tainted turns can now propose memories and posts for operator approval instead

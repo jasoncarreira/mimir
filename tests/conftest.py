@@ -27,6 +27,19 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_installed_saga_config():
+    """An entrypoint's explicit installation must not affect the next test."""
+    from mimir.saga import _config_io
+
+    generation = _config_io._install_generation
+    try:
+        yield
+    finally:
+        if _config_io._install_generation != generation:
+            _config_io.install_saga_config(None)
+
+
+@pytest.fixture(autouse=True)
 def _event_log_read_barrier(monkeypatch, request):
     """Drain accepted sync telemetry before test-side reads of owned logs.
 

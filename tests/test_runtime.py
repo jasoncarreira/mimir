@@ -625,7 +625,7 @@ def test_resolve_saga_db_path_does_not_use_or_change_cached_config(
     assert runtime.resolve_saga_db_path(tmp_path) == tmp_path / ".mimir/home.db"
     assert _config_io.get_config()("storage", "db_path") == "cached.db"
     assert runtime.resolve_saga_db_path(tmp_path / "no-config") == (
-        tmp_path / "no-config/.mimir/cached.db"
+        tmp_path / "no-config/.mimir/saga.db"
     )
 
 

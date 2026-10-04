@@ -423,10 +423,10 @@ def dispatch(args: argparse.Namespace) -> int:
     home = home.resolve()
     os.environ["MIMIR_HOME"] = str(home)
 
-    # Wire SAGA_CONFIG so saga reads the same per-home toml mimir does.
-    saga_toml = home / "saga.toml"
-    if saga_toml.is_file() and "SAGA_CONFIG" not in os.environ:
-        os.environ["SAGA_CONFIG"] = str(saga_toml)
+    from .runtime import resolve_saga_config
+    from .saga._config_io import install_saga_config
+
+    install_saga_config(resolve_saga_config(home)[0])
 
     dry_run = not args.apply
 

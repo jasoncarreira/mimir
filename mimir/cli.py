@@ -682,12 +682,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         home = Path(args.home or os.environ.get("MIMIR_HOME") or Path.cwd()).resolve()
         os.environ["MIMIR_HOME"] = str(home)
         _load_home_dotenv(home)
-        if (home / "saga.toml").is_file() and not os.environ.get("SAGA_CONFIG"):
-            os.environ["SAGA_CONFIG"] = str(home / "saga.toml")
-
-        from .runtime import resolve_saga_db_path
+        from .runtime import resolve_saga_config, resolve_saga_db_path
+        from .saga._config_io import install_saga_config
         from .saga.reembed import reembed
 
+        install_saga_config(resolve_saga_config(home)[0])
         db_path = resolve_saga_db_path(home)
         if not args.dry_run:
             print("OFFLINE ONLY: stop mimir and all Saga writers before running.", flush=True)
