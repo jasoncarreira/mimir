@@ -139,8 +139,9 @@ def test_no_triage_preserves_event_and_makes_no_request(
                 "[gmail] new message from Deals <deals@shop-example.com>: "
                 "'48-hour flash sale'\n  > Don't miss out.\n"
                 "  URL: https://mail.google.com/mail/u/0/#inbox/thread-1\n"
-                "  message_id: m1\n\nAccount rules"
+                "  message_id: m1"
             ),
+            "batch_context": "Account rules",
             "source_platform": "gmail",
             "message_id": "m1",
             "thread_id": "thread-1",

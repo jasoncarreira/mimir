@@ -10,16 +10,17 @@ Each line of stdout must be a self-contained JSON object. The scheduler reads st
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `prompt` | string | The text delivered to the agent. This is the only field the scheduler reads. |
+| `prompt` | string | Per-item text delivered to the agent. |
 
 ### Optional Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `poller` | string | Poller name. The scheduler ignores this (it uses the registered name from pollers.json), but it's useful in local event logs for filtering with jq. |
+| `batch_context` | string | Shared per-source instructions rendered once before a batch; only items with identical context batch together. Excluded from extras and redacted like `prompt`. |
 | `source_platform` | string | The platform this notification originated from (e.g., `"bluesky"`, `"github"`). Lets the agent know where to reply — without it, the agent may respond on the wrong platform (e.g., replying on Discord to a Bluesky mention). |
 
-**On where extras land in `AgentEvent.extra`** (mimir-side, not relevant to skill-author shape): the framework wraps each emitted JSONL line into an `AgentEvent`. Per-item metadata (`source_platform`, URLs, IDs, anything that's not `prompt` or `poller`) lives at `event.extra.items[i]` — a list of dicts, one per item in the batch. Top-level `event.extra` carries `{poller_name, batch_index, batch_count}`. This shape is uniform across `batch_size=1` (single-item batches still have `items=[{...}]`) and `batch_size>1`. If you're scripting against events.jsonl or the dashboard, read item-level fields from `extra.items[i].source_platform` rather than `extra.source_platform`.
+**On where extras land in `AgentEvent.extra`**: per-item metadata (`source_platform`, URLs, IDs, anything except `prompt`, `batch_context`, `poller` and integrity keys) lives at `event.extra.items[i]`. Top-level `event.extra` carries `{poller_name, batch_index, batch_count}`. This shape is uniform across `batch_size=1` and `batch_size>1`.
 
 ### Example Output
 

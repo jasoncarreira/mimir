@@ -87,7 +87,7 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    |---|---|---|
    | `name` | yes | Friendly label — surfaces in the emitted event as `account_name` for downstream routing. |
    | `email` | yes | Gmail address `gog` should query (`gog --account <email>`). Must already be authed via `gog auth add`. |
-    | `prompt-file` | no | Filename under `<home>/prompts/` to load as the per-message prompt. Path traversal (`..`, absolute paths) is rejected. |
+     | `prompt-file` | no | Filename under `<home>/prompts/` to load as shared account instructions. Path traversal (`..`, absolute paths) is rejected. |
     | `prompt` | no | Inline prompt body. Used when `prompt-file` is absent or its target is missing. |
     | `triage` | no | Opt in to TypeSafe Jev pre-turn triage for this account. See "Optional Jev triage" below. |
 
@@ -210,7 +210,8 @@ One JSONL line per never-before-seen message ID:
 ```json
 {
   "poller": "gmail-inbox",
-  "prompt": "<account-specific prompt body resolved from prompt-file / prompt / default>",
+  "prompt": "[gmail] new message from Alice <alice@example.com> ...",
+  "batch_context": "<account instructions from prompt-file or inline prompt, if configured>",
   "source_platform": "gmail",
   "message_id": "19483abc...",
   "thread_id": "19483abc...",
@@ -225,6 +226,11 @@ One JSONL line per never-before-seen message ID:
 
 `account` and `account_name` reflect the matched entry from `config.json`
 (or `legacy@x.com` / `"default"` in single-account mode).
+When no account instructions are configured, `batch_context` is omitted.
+The per-message `prompt` contains the sender, subject, snippet, URL and ID,
+followed by Jev triage answers and the NOTIFY line when applicable. Shared
+account instructions render once before the numbered items in a batch; emails
+from accounts with different instructions are batched separately.
 
 The framework wraps the JSONL into an `AgentEvent` per item (or per
 `batch_size` items if you bump that in `pollers.json` — default here
