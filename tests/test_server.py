@@ -324,8 +324,8 @@ def test_production_global_writers_are_confined() -> None:
         for path in (root / "mimir").rglob("*.py")
         if 'os.environ["SAGA_CONFIG"] =' in path.read_text(encoding="utf-8")
     }
-    # Standalone offline maintenance commands select their home before loading Saga.
-    assert saga_config_writers == {"mimir/reindex.py", "mimir/cli.py"}
+    # Every single-home entrypoint uses the installer instead of writing the env.
+    assert saga_config_writers == set()
 
     server_source = (root / "mimir" / "server.py").read_text(encoding="utf-8")
     assert 'os.environ["MIMIR_WORKLINK_AGENT_ID"] = worklink_agent_id' in server_source
@@ -951,6 +951,10 @@ def _controlled_server_app(
         return await mimir.background_tasks.cancel_background_tasks(tasks, label=label)
 
     monkeypatch.setattr("mimir.server.init_logger", lambda *args, **kwargs: control.hit("logger"))
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda kind, **fields: control.event_payloads.append((kind, fields)),
+    )
     monkeypatch.setattr("mimir.server.seed_subagent_defs", lambda home: {})
     monkeypatch.setattr("mimir.server.migrate_legacy_skills_dir", lambda home: None)
     monkeypatch.setattr("mimir.server.refresh_builtin_skills", lambda home: {})
@@ -1054,6 +1058,57 @@ def _controlled_server_app(
 
     pairing_notifier.aclose = close_pairing
     return app, control
+
+
+def test_server_boot_installs_home_saga_config(tmp_path, monkeypatch):
+    from mimir.saga._config_io import get_config, resolve_llm_config, was_set_in_toml
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text(
+        '[llm]\nprovider = "codex_plus"\nmodel = "gpt-6-luna"\n'
+        '[embedding]\nprovider = "voyage"\n'
+        '[retrieval]\nenable_contextual_rewrite = true\n',
+        encoding="utf-8",
+    )
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    for subsystem in ("consolidation", "reflection", "retrieval_v2"):
+        resolved = resolve_llm_config(subsystem)
+        assert (resolved["provider"], resolved["model"]) == ("codex_plus", "gpt-6-luna")
+    assert get_config()("retrieval", "enable_contextual_rewrite") is True
+    assert was_set_in_toml("embedding", "provider") is True
+    assert ("saga_config_loaded", {
+        "path": str(tmp_path / "saga.toml"), "source": "home",
+    }) in control.event_payloads
+    assert control.events.index("logger") < control.events.index("core")
+
+
+def test_server_boot_defaults_emit_config_event(tmp_path, monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="saga.config")
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert ("saga_config_loaded", {"path": None, "source": "defaults"}) in control.event_payloads
+    assert "has no saga.toml" in caplog.text
+
+
+def test_server_boot_exported_saga_config_wins(tmp_path, monkeypatch):
+    from mimir.saga._config_io import resolve_llm_config
+
+    (tmp_path / "saga.toml").write_text('[llm]\nprovider = "codex_plus"\n')
+    operator = tmp_path / "operator.toml"
+    operator.write_text('[llm]\nprovider = "minimax"\n')
+    monkeypatch.setenv("SAGA_CONFIG", str(operator))
+    _, control = _controlled_server_app(tmp_path, monkeypatch)
+    assert resolve_llm_config("reflection")["provider"] == "minimax"
+    assert ("saga_config_loaded", {"path": str(operator), "source": "env"}) in control.event_payloads
+
+
+def test_server_boot_rejects_invalid_saga_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text("[llm\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="saga.toml"):
+        _controlled_server_app(tmp_path, monkeypatch)
 
 
 async def _run_startup(app: web.Application) -> None:

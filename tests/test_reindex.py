@@ -126,17 +126,15 @@ def test_expected_blob_len_is_4_bytes_per_dim():
 
 @pytest.mark.parametrize("configured", [None, "nested/custom #?%.db", "absolute"])
 def test_dispatch_reembeds_resolved_store(tmp_path, monkeypatch, patch_provider, configured):
-    import mimir.saga._config_io as config_io
-
     patch_provider(dim=4)
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("SAGA_CONFIG", raising=False)
     if configured == "absolute":
         configured = str(tmp_path / "external.db")
-    config = {"embedding": {"provider": "openai"}}
-    if configured is not None:
-        config["storage"] = {"db_path": configured}
-    monkeypatch.setattr(config_io, "_config", config)
+    (tmp_path / "saga.toml").write_text(
+        '[embedding]\nprovider = "openai"\n'
+        + (f'[storage]\ndb_path = "{configured}"\n' if configured else "")
+    )
     db = Path(configured or "saga.db")
     if not db.is_absolute():
         db = tmp_path / ".mimir" / db

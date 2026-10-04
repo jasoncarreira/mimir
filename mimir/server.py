@@ -1269,7 +1269,21 @@ def build_app(config: Config) -> web.Application:
     # Best-effort and gated on the binary, so plain pip installs are unaffected.
     ensure_chainlink_initialized(config.home)
 
-    from .runtime import create_core_services
+    from .runtime import create_core_services, resolve_saga_config
+    from .saga._config_io import install_saga_config
+
+    saga_config_path, saga_config_source = resolve_saga_config(config.home)
+    install_saga_config(saga_config_path)
+    if saga_config_source == "defaults":
+        logging.getLogger("saga.config").info(
+            "home %s has no saga.toml; using defaults", config.home,
+        )
+    from .event_logger import log_event_sync
+    log_event_sync(
+        "saga_config_loaded",
+        path=str(saga_config_path) if saga_config_path is not None else None,
+        source=saga_config_source,
+    )
 
     core = create_core_services(config)
     identity_resolver = core.identity_resolver

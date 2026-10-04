@@ -200,7 +200,7 @@ def test_cli_home_config_and_options(tmp_path, monkeypatch, home_source, absolut
         monkeypatch.chdir(home)
     main(argv)
     assert os.environ["MIMIR_HOME"] == str(home)
-    assert os.environ["SAGA_CONFIG"] == str(home / "saga.toml")
+    assert os.environ["SAGA_CONFIG"] == ""
     config._load_home_dotenv.assert_called_once_with(home)
     assert run.call_args.args == (Path(configured) if absolute_db else home / ".mimir/custom.db",)
     assert run.call_args.kwargs["dry_run"] is True
@@ -236,6 +236,9 @@ def test_unrepaired_sessions_reported_and_cli_fails(db, provider, monkeypatch, c
     provider.batch_embed.assert_not_called()
     assert snapshot(db) == before
     monkeypatch.setenv("MIMIR_HOME", str(db.parent))
+    (db.parent / "saga.toml").write_text(
+        f'[storage]\ndb_path = "{db}"\n', encoding="utf-8",
+    )
     monkeypatch.setattr(_config_io, "get_config", lambda: lambda section, *args:
                         str(db) if section == "storage" else 2000)
     main(["saga-reembed", "--dry-run"])

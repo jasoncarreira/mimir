@@ -387,6 +387,14 @@ _provider_instance = None
 _provider_lock = threading.Lock()
 
 
+def reset_provider_cache() -> None:
+    """Discard a provider constructed against the previous SAGA config."""
+    global _provider_instance
+    with _provider_lock:
+        _provider_instance = None
+        cached_embed_query.cache_clear()
+
+
 def get_provider() -> EmbeddingProvider:
     """Get the configured embedding provider (singleton).
 

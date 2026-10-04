@@ -446,9 +446,12 @@ _config_loaded = False
 # "explicitly set" from "inherited from _DEFAULTS" is otherwise
 # impossible at the _cfg layer because _deep_merge collapses the two.
 _explicit_keys: dict[str, set[str]] = {}
+_install_generation = 0
 
 
-def _record_explicit_keys(data: dict, *, prefix: str) -> None:
+def _record_explicit_keys(
+    data: dict, *, prefix: str, explicit_keys: dict[str, set[str]] | None = None,
+) -> None:
     """Walk a parsed toml dict and populate ``_explicit_keys`` with
     dotted-path section names. Handles arbitrarily nested tables —
     e.g. ``[llm.consolidation]`` registers as section
@@ -462,11 +465,13 @@ def _record_explicit_keys(data: dict, *, prefix: str) -> None:
     its sub-section names recorded against the dotted-path section
     key. Sub-sections also recurse so deeper nesting works.
     """
+    if explicit_keys is None:
+        explicit_keys = _explicit_keys
     leaf_keys: set[str] = set()
     for key, value in data.items():
         if isinstance(value, dict):
             nested_prefix = f"{prefix}.{key}" if prefix else key
-            _record_explicit_keys(value, prefix=nested_prefix)
+            _record_explicit_keys(value, prefix=nested_prefix, explicit_keys=explicit_keys)
             # Also note the sub-section's existence under this prefix,
             # so ``was_set_in_toml("llm", "consolidation")`` keeps
             # returning True (the prior one-level behavior) for
@@ -475,7 +480,7 @@ def _record_explicit_keys(data: dict, *, prefix: str) -> None:
         else:
             leaf_keys.add(key)
     if leaf_keys:
-        _explicit_keys.setdefault(prefix, set()).update(leaf_keys)
+        explicit_keys.setdefault(prefix, set()).update(leaf_keys)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -540,6 +545,47 @@ def _find_toml() -> Optional[Path]:
     return None
 
 
+def _read_toml(path: Path) -> tuple[dict, dict[str, set[str]]]:
+    """Parse once for both the lazy loader and the explicit installer."""
+    if tomllib is None:
+        raise RuntimeError(f"Cannot load {path}: tomllib unavailable")
+    with path.open("rb") as stream:
+        data = tomllib.load(stream)
+    explicit: dict[str, set[str]] = {}
+    _record_explicit_keys(data, prefix="", explicit_keys=explicit)
+    _warn_unknown_keys(data)
+    return _deep_merge(_DEFAULTS, data), explicit
+
+
+def install_saga_config(path: Path | None) -> Path | None:
+    """Install exactly this file (or defaults) for a single-home process.
+
+    Parse before publishing any state: a broken operator file must stop boot,
+    never leave a partial config or silently inherit another home's values.
+    """
+    global _config, _config_loaded, _explicit_keys, _install_generation
+    if path is None:
+        config, explicit = dict(_DEFAULTS), {}
+    else:
+        try:
+            config, explicit = _read_toml(path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise type(exc)(f"Failed to load {path}: {exc}") from exc
+
+    from .embeddings import reset_provider_cache
+
+    reset_provider_cache()
+    _config = config
+    _explicit_keys = explicit
+    _config_loaded = True
+    _install_generation += 1
+
+    import logging
+    if path is not None:
+        logging.getLogger("saga.config").info("loaded %s", path)
+    return path
+
+
 def _load_config() -> dict:
     """Load configuration from saga.toml, falling back to defaults."""
     global _config, _config_loaded
@@ -561,10 +607,8 @@ def _load_config() -> dict:
 
     if toml_path is not None and tomllib is not None:
         try:
-            with open(toml_path, "rb") as f:
-                toml_data = tomllib.load(f)
-            _record_explicit_keys(toml_data, prefix="")
-            config = _deep_merge(config, toml_data)
+            config, explicit = _read_toml(toml_path)
+            _explicit_keys.update(explicit)
         except Exception as e:
             import logging
             logging.getLogger("saga.config").warning(
@@ -579,17 +623,6 @@ def _load_config() -> dict:
 
     _config = config
     _config_loaded = True
-
-    # Surface user-config typos: keys in known sections that don't match
-    # any known key. Catches things like Mimir's `cluster_similarity_threshold`
-    # (real key: `similarity_threshold`) silently falling through to defaults.
-    if toml_path is not None and tomllib is not None:
-        try:
-            with open(toml_path, "rb") as f:
-                user_data = tomllib.load(f)
-            _warn_unknown_keys(user_data)
-        except Exception:
-            pass
 
     return _config
 
@@ -641,9 +674,7 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     "annotation": {
         "use_llm", "llm_url", "llm_model", "api_key_env", "reasoning_effort",
     },
-    "llm": {
-        # All keys are in _DEFAULTS, but listed here for clarity.
-    },
+    "llm": set(),  # All keys are in _DEFAULTS.
     "compression": {
         "api_key_env", "llm_url", "llm_model", "timeout_seconds",
         "reasoning_effort",
