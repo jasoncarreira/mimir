@@ -1575,11 +1575,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         except ValueError as e:
             return LsResult(error=self._path_value_error_msg(path, e))
         if result.error is None:
-            self._publish_read_paths([
-                str(entry.get("path"))
-                for entry in result.entries or ()
-                if entry.get("path")
-            ])
+            self._publish_read_paths([path])
         return result
 
     async def als(self, path: str) -> LsResult:
