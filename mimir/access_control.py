@@ -1918,6 +1918,9 @@ class DeclaredShellCommand:
     pass_env: tuple[str, ...] = ()
     external_send: bool = False
     payload_args: tuple[str, ...] = ()
+    # Parsed declarations keep both: exec must use path (not the realpath), while
+    # classification and immutability checks use the resolved executable.
+    resolved_path: Path | None = None
 
 
 class DeclaredShellCommandError(ValueError):
@@ -2019,6 +2022,40 @@ def _agent_writable_root_for_path(
     return max((root for root, _relative in matching), key=lambda root: len(root.parts))
 
 
+def _resolve_declared_executable(
+    path: Path, name: str, writable_roots: tuple[Path, ...],
+) -> Path:
+    """Resolve every component, checking each link's location before following it."""
+    pending = list(path.parts[1:])
+    current = Path("/")
+    hops = 0
+    while pending:
+        link = current / pending.pop(0)
+        if not link.is_symlink():
+            current = link
+            continue
+        if hops >= 40:
+            raise _declaration_error(name, "path has a symlink loop or exceeds 40 hops")
+        hops += 1
+        # Checking only link.resolve() would miss a writable link pointing at
+        # an operator-owned binary. The parent is the place that can replace it.
+        writable_root = _agent_writable_root_for_path(
+            link.parent, writable_roots, admin_operator_turn=False,
+        )
+        if writable_root is not None:
+            raise _declaration_error(
+                name, f"path link {link} is inside the agent-writable root {writable_root}",
+            )
+        target = os.readlink(link)
+        next_path = Path(os.path.normpath(str(
+            (Path(target) if os.path.isabs(target) else link.parent / target)
+            .joinpath(*pending)
+        )))
+        pending = list(next_path.parts[1:])
+        current = Path("/")
+    return current
+
+
 def parse_declared_shell_commands(
     raw: object, *, writable_roots: tuple[Path, ...] = (),
 ) -> tuple[DeclaredShellCommand, ...]:
@@ -2028,8 +2065,8 @@ def parse_declared_shell_commands(
     tools (``Config.writable_dirs``). A declared script must lie outside all of
     them: the danger of an interpreter is *arbitrary* code, not code, so a script
     the running agent cannot modify is equivalent to a binary the operator
-    installed. Resolution follows symlinks before the check, or a link inside a
-    writable root would launder the path.
+    installed. Executables retain their declared spelling for exec (including
+    virtualenv links); each link location and the final target must be safe.
     """
     if raw is None:
         return ()
@@ -2080,10 +2117,11 @@ def parse_declared_shell_commands(
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             raise _declaration_error(name, "path is required")
-        path = Path(raw_path)
+        path = Path(os.path.normpath(raw_path))
         if not path.is_absolute():
             raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
-        if not path.exists():
+        resolved_path = _resolve_declared_executable(path, name, resolved_writable)
+        if not resolved_path.exists():
             raise _declaration_error(
                 name,
                 f"path does not exist: {raw_path}",
@@ -2093,23 +2131,24 @@ def parse_declared_shell_commands(
         # this, declaring a CLI under an agent-writable location lets the agent
         # replace the binary and run anything through an admitted command shape,
         # which would make every other check here decorative.
-        path = path.resolve()
-        if not path.is_file():
+        if not resolved_path.is_file():
             raise _declaration_error(
                 name,
                 f"path is not a regular file: {raw_path}",
                 environment_dependent=True,
             )
-        if not os.access(path, os.X_OK):
+        if not os.access(resolved_path, os.X_OK):
             raise _declaration_error(
                 name,
                 f"path is not executable: {raw_path}",
                 environment_dependent=True,
             )
-        writable_root = _agent_writable_root_for_path(
-            path, resolved_writable, admin_operator_turn=False,
-        )
-        if writable_root is not None:
+        for candidate in (path.parent, resolved_path):
+            writable_root = _agent_writable_root_for_path(
+                candidate, resolved_writable, admin_operator_turn=False,
+            )
+            if writable_root is None:
+                continue
             raise _declaration_error(
                 name,
                 f"path {raw_path} is inside the agent-writable root {writable_root}; "
@@ -2145,8 +2184,8 @@ def parse_declared_shell_commands(
         # rule entirely. Either name being an interpreter is enough.
         is_interpreter = (
             name in _INTERPRETER_EXECUTABLES
-            or path.name in _INTERPRETER_EXECUTABLES
-            or path.name.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+            or resolved_path.name in _INTERPRETER_EXECUTABLES
+            or resolved_path.name.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
         )
         if raw_script is not None:
             if not isinstance(raw_script, str) or not raw_script:
@@ -2184,6 +2223,7 @@ def parse_declared_shell_commands(
             pass_env=tuple(dict.fromkeys(pass_env)),
             external_send=external_send,
             payload_args=tuple(dict.fromkeys(payload_args)),
+            resolved_path=resolved_path,
         ))
     return tuple(out)
 

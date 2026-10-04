@@ -119,6 +119,6 @@ def test_seeded_script_is_declarable_outside_agent_writable_roots(tmp_path: Path
     )
     command = f"python3 {script}"
     assert parse_service_shell_argv(command, "maintenance", declared=declaration) == [
-        str(Path(sys.executable).resolve()),
+        sys.executable,
         str(script),
     ]

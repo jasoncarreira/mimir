@@ -8,7 +8,10 @@ security content of the feature.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+import venv
 from pathlib import Path
 
 import pytest
@@ -150,7 +153,7 @@ class TestInterpreterRule:
             "maintenance",
             declared=declared,
         ) == [
-            str(Path(sys.executable).resolve()),
+            os.path.normpath(sys.executable),
             str(script.resolve()),
             "--experimental-strip-types",
         ]
@@ -173,10 +176,10 @@ class TestInterpreterRule:
 
         assert parse_service_shell_argv(
             f"python3 {todo}", "maintenance", declared=declared,
-        ) == [str(Path("/usr/bin/python3").resolve()), str(todo.resolve())]
+        ) == ["/usr/bin/python3", str(todo.resolve())]
         assert parse_service_shell_argv(
             f"python3 {weather}", "maintenance", declared=declared,
-        ) == [str(Path("/usr/bin/python3").resolve()), str(weather.resolve())]
+        ) == ["/usr/bin/python3", str(weather.resolve())]
 
     def test_script_inside_an_agent_writable_root_is_refused(self, home: Path) -> None:
         with pytest.raises(ValueError, match="agent-writable root"):
@@ -289,20 +292,27 @@ class TestDeclarationShape:
             )
 
     def test_the_pinned_path_is_what_executes(self) -> None:
-        """A declaration is a pin: PATH never selects the binary.
-
-        Compared against the RESOLVED path, because the declaration resolves
-        symlinks before pinning — the writable-root check would otherwise be
-        defeated by a link. On Linux ``/bin`` is a symlink to ``/usr/bin``, so a
-        hardcoded ``/bin/echo`` passes on macOS and fails in CI.
-        """
+        """A declaration is a pin: PATH never selects the binary."""
         declared = parse_declared_shell_commands([_gog()], writable_roots=())
         argv = parse_service_shell_argv(
             "gog gmail search x", "maintenance", declared=declared,
         )
         assert argv is not None
-        assert argv[0] == str(Path("/bin/echo").resolve())
+        assert argv[0] == "/bin/echo"
+        assert declared[0].resolved_path == Path("/bin/echo").resolve()
         assert Path(argv[0]).is_absolute()
+
+    def test_non_symlink_path_and_lexical_normalization(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        declaration = _gog(path=str(tmp_path / "subdir" / ".." / "gog"))
+        parsed = parse_declared_shell_commands([declaration], writable_roots=())
+        assert parsed[0].path == executable
+        assert parsed[0].resolved_path == executable
+        assert access_control._declared_command_execution_argv(
+            ["gog", "gmail", "search"], parsed,
+        ) == [str(executable), "gmail", "search"]
 
     def test_absent_declaration_is_a_no_op(self) -> None:
         assert parse_declared_shell_commands(None, writable_roots=()) == ()
@@ -461,6 +471,66 @@ class TestReviewFindings:
             parse_declared_shell_commands(
                 [{"exec": "gog", "path": str(link), "subcommands": [["gmail", "search"]]}],
                 writable_roots=agent_writable_roots(home),
+            )
+
+    def test_venv_interpreter_executes_through_declared_link(self, home: Path) -> None:
+        venv_dir = home / "venv"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(venv_dir)
+        interpreter = venv_dir / "bin" / "python3"
+        assert interpreter.is_symlink()
+        script = home / "scripts" / "todo.py"
+        script.write_text("import sys; print(sys.prefix)\n")
+        parsed = parse_declared_shell_commands([{
+            "exec": "python3", "path": str(interpreter), "script": str(script),
+        }], writable_roots=agent_writable_roots(home))
+        argv = access_control._declared_command_execution_argv(
+            ["python3", str(script)], parsed,
+        )
+        assert argv == [str(interpreter), str(script)]
+        assert parsed[0].resolved_path == interpreter.resolve()
+        result = subprocess.run(argv, capture_output=True, text=True, check=True)
+        assert result.stdout.strip() == str(venv_dir)
+
+    def test_link_in_writable_root_cannot_point_outside(self, home: Path) -> None:
+        link = home / "scratch" / "gog"
+        link.symlink_to("/bin/echo")
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(link))],
+                                          writable_roots=agent_writable_roots(home))
+
+    def test_middle_link_in_writable_root_cannot_launder_path(self, home: Path) -> None:
+        middle = home / "scratch" / "middle"
+        middle.symlink_to("/bin/echo")
+        first = home / "scripts" / "gog"
+        first.symlink_to(middle)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(first))],
+                                          writable_roots=agent_writable_roots(home))
+
+    def test_declared_parent_inside_writable_root_cannot_launder_path(self, home: Path) -> None:
+        # The declared executable is not a symlink; its parent leads through one.
+        directory = home / "scratch" / "safe"
+        directory.symlink_to(home / "scripts", target_is_directory=True)
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands([_gog(path=str(directory / "gog"))],
+                                          writable_roots=agent_writable_roots(home))
+
+    def test_symlink_loop_and_over_40_hops_are_refused(self, home: Path) -> None:
+        link = home / "scripts" / "loop"
+        link.symlink_to(link)
+        with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
+            parse_declared_shell_commands([_gog(path=str(link))], writable_roots=())
+
+        for i in range(41):
+            (home / "scripts" / f"hop{i}").symlink_to(
+                home / "scripts" / f"hop{i + 1}" if i < 40 else Path("/bin/echo").resolve()
+            )
+        with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
+            parse_declared_shell_commands(
+                [_gog(path=str(home / "scripts" / "hop0"))], writable_roots=(),
             )
 
     def test_path_must_be_a_regular_executable_file(self, home: Path) -> None:
