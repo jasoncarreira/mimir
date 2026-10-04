@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import threading
@@ -1919,6 +1920,9 @@ class DeclaredShellCommand:
     pass_env: tuple[str, ...] = ()
     external_send: bool = False
     payload_args: tuple[str, ...] = ()
+    # Parsed declarations keep both: exec must use path (not the realpath), while
+    # classification and immutability checks use the resolved executable.
+    resolved_path: Path | None = None
 
 
 class DeclaredShellCommandError(ValueError):
@@ -2020,6 +2024,64 @@ def _agent_writable_root_for_path(
     return max((root for root, _relative in matching), key=lambda root: len(root.parts))
 
 
+def _resolve_declared_executable(
+    path: Path, name: str, writable_roots: tuple[Path, ...], *, raw_path: str,
+) -> Path:
+    """Walk in kernel order and reject every agent-writable traversal component.
+
+    Exec re-walks the declared spelling, so even a directory later left via
+    ``..`` must be immutable. Never collapse ``..`` before following a link.
+    """
+    pending = list(path.parts[1:])
+    current = Path("/")
+    hops = 0
+    while pending:
+        component = pending.pop(0)
+        if component == "..":
+            current = current.parent
+            continue
+        link = current / component
+        # The resolved prefix contains no links; its directories were already
+        # checked below. Check each new link location or non-link component.
+        try:
+            mode = link.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                if hops >= 40:
+                    raise _declaration_error(name, "path has a symlink loop or exceeds 40 hops")
+                hops += 1
+                target = Path(os.readlink(link))
+                if target.is_absolute():
+                    current = Path("/")
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+                continue
+        except FileNotFoundError as exc:
+            raise _declaration_error(
+                name, f"path does not exist: {raw_path}",
+                environment_dependent=True,
+            ) from exc
+        except OSError as exc:
+            raise _declaration_error(
+                name, f"path cannot be resolved: {raw_path}",
+                environment_dependent=True,
+            ) from exc
+        writable_root = _agent_writable_root_for_path(
+            link, writable_roots, admin_operator_turn=False,
+        )
+        if writable_root is not None:
+            raise _declaration_error(
+                name, f"path component {link} is inside the agent-writable root {writable_root}",
+            )
+        if pending and not stat.S_ISDIR(mode):
+            raise _declaration_error(
+                name, f"path component is not a directory: {link}",
+                environment_dependent=True,
+            )
+        current = link
+    return current
+
+
 def parse_declared_shell_commands(
     raw: object, *, writable_roots: tuple[Path, ...] = (),
 ) -> tuple[DeclaredShellCommand, ...]:
@@ -2029,8 +2091,9 @@ def parse_declared_shell_commands(
     tools (``Config.writable_dirs``). A declared script must lie outside all of
     them: the danger of an interpreter is *arbitrary* code, not code, so a script
     the running agent cannot modify is equivalent to a binary the operator
-    installed. Resolution follows symlinks before the check, or a link inside a
-    writable root would launder the path.
+    installed. Executables retain their declared spelling for exec (including
+    virtualenv links); every traversed directory, link location, and final
+    target must be outside the agent-writable surface.
     """
     if raw is None:
         return ()
@@ -2081,10 +2144,14 @@ def parse_declared_shell_commands(
         raw_path = entry.get("path")
         if not isinstance(raw_path, str) or not raw_path:
             raise _declaration_error(name, "path is required")
+        # Preserve parent components: their meaning depends on preceding links.
         path = Path(raw_path)
         if not path.is_absolute():
             raise _declaration_error(name, f"path must be absolute, got {raw_path!r}")
-        if not path.exists():
+        resolved_path = _resolve_declared_executable(
+            path, name, resolved_writable, raw_path=raw_path,
+        )
+        if not resolved_path.exists():
             raise _declaration_error(
                 name,
                 f"path does not exist: {raw_path}",
@@ -2094,28 +2161,20 @@ def parse_declared_shell_commands(
         # this, declaring a CLI under an agent-writable location lets the agent
         # replace the binary and run anything through an admitted command shape,
         # which would make every other check here decorative.
-        path = path.resolve()
-        if not path.is_file():
+        if not resolved_path.is_file():
             raise _declaration_error(
                 name,
                 f"path is not a regular file: {raw_path}",
                 environment_dependent=True,
             )
-        if not os.access(path, os.X_OK):
+        if not os.access(resolved_path, os.X_OK):
             raise _declaration_error(
                 name,
                 f"path is not executable: {raw_path}",
                 environment_dependent=True,
             )
-        writable_root = _agent_writable_root_for_path(
-            path, resolved_writable, admin_operator_turn=False,
-        )
-        if writable_root is not None:
-            raise _declaration_error(
-                name,
-                f"path {raw_path} is inside the agent-writable root {writable_root}; "
-                "an executable the agent can replace is arbitrary code execution",
-            )
+        # Every traversal component and the final target were checked by
+        # _resolve_declared_executable; no lexical parent check is needed.
 
         options_raw = entry.get("options") or []
         if not isinstance(options_raw, list) or not all(isinstance(o, str) for o in options_raw):
@@ -2140,14 +2199,12 @@ def parse_declared_shell_commands(
 
         raw_script = entry.get("script")
         script: Path | None = None
-        # Classified on the RESOLVED binary as well as the declared name: the
-        # two need not match, so ``exec: gog`` with ``path: /usr/bin/python3``
-        # would otherwise present as a non-interpreter and skip the pinned-script
-        # rule entirely. Either name being an interpreter is enough.
-        is_interpreter = (
-            name in _INTERPRETER_EXECUTABLES
-            or path.name in _INTERPRETER_EXECUTABLES
-            or path.name.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+        # Check the label, declared argv[0] basename (multi-call dispatch),
+        # and resolved binary name. Any interpreter spelling requires a script.
+        is_interpreter = any(
+            candidate in _INTERPRETER_EXECUTABLES
+            or candidate.rstrip("0123456789.") in _INTERPRETER_EXECUTABLES
+            for candidate in (name, path.name, resolved_path.name)
         )
         if raw_script is not None:
             if not isinstance(raw_script, str) or not raw_script:
@@ -2185,6 +2242,7 @@ def parse_declared_shell_commands(
             pass_env=tuple(dict.fromkeys(pass_env)),
             external_send=external_send,
             payload_args=tuple(dict.fromkeys(payload_args)),
+            resolved_path=resolved_path,
         ))
     return tuple(out)
 

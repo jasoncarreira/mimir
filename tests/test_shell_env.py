@@ -126,7 +126,7 @@ def test_declared_environment_is_bound_to_exact_argv(tmp_path, monkeypatch, over
         "exec": "python3", "path": sys.executable, "script": str(script),
         "pass_env": ["WEATHER_KEY", "ABSENT_KEY"],
     }])
-    argv = [str(Path(sys.executable).resolve()), str(script)]
+    argv = [sys.executable, str(script)]
     events = []
     from mimir.event_logger import EventLogger
 
@@ -215,7 +215,7 @@ def test_missing_declared_environment_surfaces_child_error(tmp_path, monkeypatch
     }])
     command = f"python3 {script}"
     token = _shell_env.bind_direct_exec_argv(
-        [str(Path(sys.executable).resolve()), str(script)], command=command, declared=declared,
+        [sys.executable, str(script)], command=command, declared=declared,
     )
     try:
         result = shell_exec.invoke({"command": command})
