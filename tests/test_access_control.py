@@ -1547,6 +1547,12 @@ def test_synthesis_builtin_has_exact_session_boundary_capabilities(tmp_path: Pat
     assert principal.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
 
 
+def test_research_memory_propose_profile_grant_keeps_tier_and_github_boundary() -> None:
+    assert "memory_propose" in access_control.TRIGGER_AUTHORITY_PROFILES["research"]
+    assert access_control.TRIGGER_CAPABILITY_TIERS["memory_propose"] is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert "memory_propose" not in access_control.TRIGGER_AUTHORITY_PROFILES["github"]
+
+
 @pytest.mark.parametrize("profile", ["github", "custom"])
 @pytest.mark.parametrize("grant", [False, True])
 @pytest.mark.parametrize("tier", [CapabilityTier.SCOPE_CONTAINED, CapabilityTier.SCOPED_WITH_PROVENANCE])

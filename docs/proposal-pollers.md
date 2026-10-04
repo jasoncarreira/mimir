@@ -30,7 +30,7 @@ papers from arxiv (the script fetches the feed independently):
       "scoped_roots": ["state"],
       "approved_urls": ["https://arxiv.org/"],
       "capabilities": [
-        "read_file", "write_file", "edit_file",
+        "read_file", "write_file", "edit_file", "memory_propose",
         "open_proposal", "submit_proposal", "abandon_proposal"
       ]
     }
@@ -71,7 +71,9 @@ print(json.dumps({
         f"Then open_proposal(source='https://arxiv.org/abs/{paper_id}'), "
         "edit only state/wiki/ in the returned worktree, and "
         "submit_proposal(title, rationale) for operator review; "
-        "abandon_proposal() if you discard it. Never edit live state/wiki/."
+        "abandon_proposal() if you discard it. For durable facts, use "
+        "memory_propose(content, stream, rationale) for operator review, "
+        "never memory_store. Never edit live state/wiki/."
     ),
 }))
 ```
@@ -95,7 +97,13 @@ do not invent a `state/research/` location.
    The operator reviews and **merges the PR to approve** the change; opening
    the PR does not publish the edit.
 
-The tainted poller turn has no `memory_store` or `saga_*` writes or
+For durable facts rather than wiki knowledge, declare `memory_propose` in the
+research manifest and call `memory_propose(content, stream, rationale)` on the
+tainted turn. It queues a pending memory candidate with the poller's provenance
+for operator approval; it does not store a memory atom. Never write memory
+directly with `memory_store` on a tainted poller turn.
+
+The tainted poller turn has no direct `memory_store` or `saga_*` writes or
 commitments, no file writes outside its persist directory and active proposal
 worktree, and no shell. File write refusals name the permitted home-relative
 roots; the proposal worktree grant ends when the worktree is removed.

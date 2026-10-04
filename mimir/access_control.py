@@ -496,6 +496,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     "research": frozenset({
         "write_file", "edit_file", "read_file", "aread", "ls", "als",
         "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
+        "memory_propose",
         "saga_feedback", "saga_mark_contributions", "send_message",
         "saga_record_skill_learning", "operator_alert", "shell_exec",
         "bash_jobs_list", "bash_job_output", "fetch_url",

@@ -110,19 +110,23 @@ async work; guarantee a successful emit (poller bugs surface as `poller_stderr` 
 
 ## Creating a Poller
 
-### Research Notes and Wiki Proposals
+### Research Notes, Memory Candidates, and Wiki Proposals
 
-Poller turns are tainted from their trigger and cannot use durable-memory tools.
-Write drafts and notes under your own persist directory (`state/pollers/<name>/`)
-— the poller's `STATE_DIR` — then
-`open_proposal(source="<paper ID or URL>")` to publish wiki changes; never write
-to `state/wiki` directly. Edit only `state/wiki/` inside the returned worktree,
-then call `submit_proposal(title, rationale)`, or `abandon_proposal()` to discard
+Poller turns are tainted from their trigger and cannot use durable-memory tools
+to write directly. For durable facts, use
+`memory_propose(content, stream, rationale)` to queue a candidate carrying the
+poller's provenance for operator approval; never write memory directly with
+`memory_store` on a tainted turn. For knowledge, write drafts and notes under
+your own persist directory (`state/pollers/<name>/`) — the poller's `STATE_DIR`
+— then `open_proposal(source="<paper ID or URL>")` to propose wiki changes;
+never write to `state/wiki` directly. Edit only `state/wiki/` inside the returned
+worktree, then call `submit_proposal(title, rationale)`, or `abandon_proposal()` to discard
 it. Omit `lane`; research pollers are automatically confined to the poller lane.
 Finish the proposal in the same turn. Merge is approval, not opening the PR.
 
-The operator must declare `open_proposal`, `submit_proposal`, and
-`abandon_proposal` in the research poller's `authority.capabilities`, with tier
+The operator must declare `memory_propose` for memory candidates and
+`open_proposal`, `submit_proposal`, and `abandon_proposal` for wiki proposals in
+the research poller's `authority.capabilities`, with tier
 `scoped-with-provenance` or higher and `scoped_roots: ["state"]`. Keep the file
 read/write capabilities needed to draft and edit. Proposal-enabled research
 pollers cannot declare live `wiki:<slug>` roots or write to unrelated scratch
@@ -230,7 +234,7 @@ if __name__ == "__main__":
       "authority": {
         "profile": "research",
         "tier": "scoped-with-provenance",
-        "capabilities": ["write_file", "send_message", "open_proposal", "submit_proposal", "abandon_proposal"],
+        "capabilities": ["write_file", "send_message", "memory_propose", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"]
       },
       "env": {
@@ -263,7 +267,7 @@ Research pollers may opt into `fetch_url` with an `authority.approved_urls` list
 {
   "profile": "research",
   "tier": "scoped-with-provenance",
-  "capabilities": ["write_file", "open_proposal", "submit_proposal", "abandon_proposal"],
+  "capabilities": ["write_file", "memory_propose", "open_proposal", "submit_proposal", "abandon_proposal"],
   "scoped_roots": ["state"],
   "approved_urls": [
     "https://arxiv.org/",

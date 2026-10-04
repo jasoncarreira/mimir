@@ -369,6 +369,37 @@ def _authority(**updates: object) -> dict:
     return value
 
 
+def test_research_memory_propose_manifest_registers(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    _write_pollers_json(skills / "papers", [{
+        "name": "papers", "command": "true", "cron": "* * * * *",
+        "authority": _authority(capabilities=["memory_store", "memory_propose"]),
+    }])
+
+    [poller] = discover_pollers(skills, state_root=tmp_path / "state" / "pollers")
+    assert poller.authority.canonical == "poller:papers"
+    assert poller.authority.authority_profile == "research"
+    assert poller.authority.capability_tier is CapabilityTier.SCOPED_WITH_PROVENANCE
+    assert poller.authority.has_capability("memory_propose")
+
+
+def test_github_memory_propose_manifest_is_rejected(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    manifest = skills / "github-memory" / "pollers.json"
+    _write_pollers_json(manifest.parent, [{
+        "name": "github-memory", "command": "true", "cron": "* * * * *",
+        "authority": _authority(profile="github", capabilities=["memory_propose"]),
+    }])
+    invalid_entries = []
+
+    assert discover_pollers(
+        skills, state_root=tmp_path / "state" / "pollers", invalid_entries=invalid_entries,
+    ) == []
+    assert invalid_entries == [(
+        manifest, "github-memory", "capabilities outside 'github' profile: memory_propose",
+    )]
+
+
 @pytest.mark.parametrize("operation", ["open_proposal", "submit_proposal", "abandon_proposal"])
 def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, operation: str) -> None:
     persist = tmp_path / "state/pollers/research"

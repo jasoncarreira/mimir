@@ -28,7 +28,7 @@ def proposal_turn(tmp_path, monkeypatch):
     service = build_trigger_service_principal(
         canonical="poller:papers", trigger="poller", profile="research",
         tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-        capabilities=("memory_propose", "read_file", "write_file", "edit_file", "ls"),
+        capabilities=("memory_propose", "memory_store", "read_file", "write_file", "edit_file", "ls"),
         roots=(tmp_path / "state" / "pollers" / "papers",), creation_path="test",
     )
     source = SourceLabel.from_record(dict(
@@ -350,6 +350,29 @@ def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_tur
     assert conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == before_tables
 
 
+def test_research_poller_memory_store_refusal_offers_proposal_on_tainted_turn(proposal_turn):
+    env = proposal_turn
+    registry = get_tool_registry()
+    proposal = registry.authorize_tool(
+        "memory_propose", env.auth, enforce=True, ifc_labels=env.labels,
+    )
+    assert proposal.allowed
+    store = registry.authorize_tool(
+        "memory_store", env.auth, enforce=True, ifc_labels=env.labels,
+    )
+    assert not store.allowed and store.reason == "saga_mutation_blocked_by_tainted_turn"
+    assert store.refusal_detail == (
+        SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
+    )
+    assert "queued" in env.call(content="Research poller fact")
+    record, = _records(env.home)
+    assert record["proposed_by"] == "poller:papers"
+    assert record["origin_trigger"] == "poller"
+    assert record["origin_ref"] == env.auth.origin_ref
+    assert record["ifc_sources"][0]["resource_id"] == "feed:item:42"
+    assert record["status"] == "pending"
+
+
 def test_clean_turn_refuses_directs_to_memory_store(proposal_turn):
     env = proposal_turn
     clean_labels = InformationFlowLabels(sources=(
@@ -428,10 +451,12 @@ def test_duplicate_pending_proposal_is_refused(proposal_turn):
 
 def test_21st_pending_per_principal_is_refused(proposal_turn):
     env = proposal_turn
+    assert env.auth.canonical_principal == "poller:papers"
     for index in range(20):
         assert "queued" in env.call(content=f"Fact {index}")
     assert "20 pending proposals" in env.call(content="Fact 20")
     assert len(_records(env.home)) == 20
+    assert {record["proposed_by"] for record in _records(env.home)} == {"poller:papers"}
 
 
 def test_file_tools_cannot_access_proposal_path(proposal_turn):
