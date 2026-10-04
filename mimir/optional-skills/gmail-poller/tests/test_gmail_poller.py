@@ -256,8 +256,7 @@ def test_config_json_multi_account_each_uses_own_prompt(
     fresh_poller, tmp_path, monkeypatch, capsys,
 ):
     """Two accounts, two different ``prompt-file`` entries. Each
-    account's messages must carry that account's prompt body + the
-    account email/name fields in extras."""
+    account's messages carry their own shared context and detail."""
     mimir_home = tmp_path / "mimir-home"
     monkeypatch.setenv("MIMIR_HOME", str(mimir_home))
     _write_prompt(mimir_home, "home.md", "HOME ACCOUNT PROMPT")
@@ -285,12 +284,14 @@ def test_config_json_multi_account_each_uses_own_prompt(
 
     # Each account's prompt body is present as instructions, alongside that
     # message's per-item detail (from/subject) — not a replacement for it.
-    assert "HOME ACCOUNT PROMPT" in by_id["home-msg-1"]["prompt"]
+    assert by_id["home-msg-1"]["batch_context"] == "HOME ACCOUNT PROMPT"
+    assert "HOME ACCOUNT PROMPT" not in by_id["home-msg-1"]["prompt"]
     assert "alice@example.com" in by_id["home-msg-1"]["prompt"]
     assert by_id["home-msg-1"]["account"] == "me@gmail.com"
     assert by_id["home-msg-1"]["account_name"] == "home"
 
-    assert "WORK ACCOUNT PROMPT" in by_id["work-msg-1"]["prompt"]
+    assert by_id["work-msg-1"]["batch_context"] == "WORK ACCOUNT PROMPT"
+    assert "WORK ACCOUNT PROMPT" not in by_id["work-msg-1"]["prompt"]
     assert "bob@employer.com" in by_id["work-msg-1"]["prompt"]
     assert by_id["work-msg-1"]["account"] == "me@employer.com"
     assert by_id["work-msg-1"]["account_name"] == "work"
@@ -311,8 +312,7 @@ def test_config_json_inline_prompt(fresh_poller, tmp_path, monkeypatch, capsys):
     rc = fresh_poller.main()
     assert rc == 0
     events = _capture_emits(capsys)
-    # Inline prompt is included as instructions, after the per-message detail.
-    assert "Triage agent-account email." in events[0]["prompt"]
+    assert events[0]["batch_context"] == "Triage agent-account email."
     assert events[0]["prompt"].startswith("[gmail] new message")
 
 
@@ -339,8 +339,8 @@ def test_config_json_prompt_file_wins_over_inline(
     # Capture stdout + stderr in one readout — both share the buffer.
     captured = capsys.readouterr()
     events = [json.loads(l) for l in captured.out.splitlines() if l.strip()]
-    assert "FILE WINS" in events[0]["prompt"]
-    assert "this should be overridden" not in events[0]["prompt"]
+    assert events[0]["batch_context"] == "FILE WINS"
+    assert "this should be overridden" not in events[0]["batch_context"]
     assert "both prompt-file and prompt" in captured.err
 
 
@@ -363,7 +363,7 @@ def test_config_json_missing_prompt_file_falls_back_to_inline(
     rc = fresh_poller.main()
     assert rc == 0
     events = _capture_emits(capsys)
-    assert "inline fallback" in events[0]["prompt"]
+    assert events[0]["batch_context"] == "inline fallback"
 
 
 def test_config_json_no_prompt_fields_uses_default_template(
@@ -385,6 +385,7 @@ def test_config_json_no_prompt_fields_uses_default_template(
     events = _capture_emits(capsys)
     # Default template includes the "[gmail] new message from" prefix.
     assert events[0]["prompt"].startswith("[gmail] new message from alice@example.com")
+    assert "batch_context" not in events[0]
 
 
 def test_config_json_custom_prompt_still_includes_per_message_detail(
@@ -410,11 +411,43 @@ def test_config_json_custom_prompt_still_includes_per_message_detail(
     )
     rc = fresh_poller.main()
     assert rc == 0
-    prompt = _capture_emits(capsys)[0]["prompt"]
-    # Both the per-message detail AND the instructions — detail first.
+    event = _capture_emits(capsys)[0]
+    prompt = event["prompt"]
     assert "alice@example.com" in prompt and "Invoice" in prompt
-    assert "TRIAGE INSTRUCTIONS" in prompt
-    assert prompt.index("alice@example.com") < prompt.index("TRIAGE INSTRUCTIONS")
+    assert event["batch_context"] == "TRIAGE INSTRUCTIONS"
+    assert "TRIAGE INSTRUCTIONS" not in prompt
+
+
+def test_five_decide_messages_emit_shared_context_and_full_triage_tail(
+    fresh_poller, tmp_path, monkeypatch, capsys,
+):
+    rules = "## Notify For\n- Direct messages\n" + "Account rule.\n" * 220
+    rules = rules[:2845].ljust(2845, ".") + "."
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    _write_prompt(tmp_path / "home", "personal.md", rules)
+    _write_config(tmp_path, [{
+        "name": "personal", "email": "me@example.com", "prompt-file": "personal.md",
+        "triage": {"mode": "decide", "questions": {"notify": {
+            "type": "noul", "instructions_from": "prompt",
+        }}},
+    }])
+    monkeypatch.setattr(fresh_poller, "_gog_search", lambda *_args: [
+        _msg(f"m{i}", subject=f"Request {i}") for i in range(5)
+    ])
+    monkeypatch.setattr(fresh_poller, "_triage_message", lambda *_args: {
+        "model": "jev-1.13.0", "answers": {"notify": {"type": "noul", "noul": 0.9}},
+    })
+    assert fresh_poller.main() == 0
+    events = _capture_emits(capsys)
+    assert len(events) == 5
+    for i, event in enumerate(events):
+        assert event["batch_context"] == rules
+        assert rules not in event["prompt"]
+        assert f"Request {i}" in event["prompt"]
+        assert event["prompt"].endswith(
+            "\nJev triage: NOTIFY — send the operator alert for this email; do not skip it."
+        )
+        assert 'Jev triage answers: {"model":"jev-1.13.0"' in event["prompt"]
 
 
 def test_config_json_prompt_file_path_traversal_rejected(

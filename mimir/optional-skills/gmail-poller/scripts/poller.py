@@ -556,11 +556,9 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     Returns None if the message lacks an ``id`` (we have nothing to
     cursor on — safer to skip than emit an un-deduplicable event).
 
-    The emitted ``prompt`` always begins with the per-message detail
-    block (from / subject / snippet / URL / message_id). When the account
-    supplies a custom prompt body (per-account file or inline), it is
-    appended after the detail as triage instructions — it augments the
-    detail, it does not replace it.
+    The emitted ``prompt`` holds per-message detail (from / subject /
+    snippet / URL / message_id). Custom account instructions go in
+    ``batch_context`` so the framework renders them once per batch.
     """
     msg_id = msg.get("id") or msg.get("messageId") or msg.get("message_id")
     if not msg_id:
@@ -594,10 +592,9 @@ def _format_event(msg: dict, account: Account) -> dict | None:
     # so a batch showed N copies of the account instructions with no idea
     # which emails arrived.)
     detail = _default_prompt(sender, subject, snippet, web_url, msg_id)
-    prompt = f"{detail}\n\n{account.prompt_body}" if account.prompt_body else detail
-    return {
+    event = {
         "poller": POLLER_NAME,
-        "prompt": prompt,
+        "prompt": detail,
         "source_platform": "gmail",
         "message_id": msg_id,
         "thread_id": thread_id,
@@ -608,6 +605,9 @@ def _format_event(msg: dict, account: Account) -> dict | None:
         "account": account.email,
         "account_name": account.name,
     }
+    if account.prompt_body:
+        event["batch_context"] = account.prompt_body
+    return event
 
 
 def _always_emit(sender: str, configured: tuple[str, ...]) -> bool:

@@ -149,7 +149,7 @@ Plus any literal env vars from the `env` field, plus any pass-throughs declared 
 **Output contract:**
 - **stdout:** JSONL (one JSON object per line). Two record shapes:
 
-  *Event records* — `{"poller": "<name>", "prompt": "<text>", ...extras}`. Each becomes one `AgentEvent` (= one turn the agent runs). Other keys flow into `AgentEvent.extra` so platform metadata (URLs, IDs, `source_platform`) carries through to your prompt rendering.
+  *Event records* — `{"poller": "<name>", "prompt": "<text>", "batch_context": "<shared instructions>", ...extras}`. `batch_context` is optional; it is rendered once before the batch header (or before the prompt for a single item). Items batch only with others whose context is exactly equal; missing context forms its own group. Both text fields are redacted for poller env secrets before capping; context is capped at half the 16 KB budget and excluded from `AgentEvent.extra`. Other keys flow into `AgentEvent.extra` as platform metadata (URLs, IDs, `source_platform`).
 
   *Signal records* — `{"poller": "<name>", "signal": "<event_type>", ...payload}`. These do NOT spawn an `AgentEvent`. The framework writes them to `events.jsonl` via `log_event(event_type, poller=<name>, **payload)` — recognized signal event types (below) surface in the next turn's **algedonic block** as negative signals (pain). Use for external-state health that the agent should see but that shouldn't each fire a turn of their own: OAuth token expiry, upstream 5xx outage, rate-limit cliffs.
 
@@ -338,7 +338,7 @@ using a built-in profile is validated only as a narrowing subset and cannot add
 capabilities or destinations. Resolution is deterministic: built-in profile,
 then optional narrowing; skill pollers resolve only from their manifest.
 
-**On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework collects all items, then emits `ceil(N/batch_size)` AgentEvents, each carrying a rendered prompt summarizing up to `batch_size` items + per-item metadata in `extra.items`. Single-item batches (default) render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts.
+**On `batch_size`**: the poller script always emits per-item JSONL lines (clean contract). The framework groups items by exact `batch_context` in first-arrival group order, preserving each group's item order, then emits batches of up to `batch_size` items with per-item metadata in `extra.items`. Without a context, single-item batches render the prompt verbatim — no header. Multi-item batches render with a header (`<poller-name> reported N items` plus a `(batch X of Y)` suffix on multi-batch fires) and a numbered list of per-item prompts. The per-item cap applies only to `prompt`; truncated items keep their last 600 characters with a middle marker, including when the assembled batch exceeds its cap.
 
 ### 3. Register the pollers
 

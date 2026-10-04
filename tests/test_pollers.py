@@ -6464,6 +6464,153 @@ async def test_run_poller_silent_run_reports_zero_metadata(
 # ─── per-item starvation cap (PR #93 review nit) ─────────────────────
 
 
+async def _fire_context_items(tmp_path: Path, records: list[dict], *, batch_size: int = 5):
+    skill_dir = tmp_path / "context-skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+for item in {records!r}:
+    print(json.dumps(item))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir, batch_size=batch_size,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    return enq.events
+
+
+@pytest.mark.asyncio
+async def test_batch_context_five_decide_items_once_without_truncation(
+    tmp_path: Path, home: Path,
+) -> None:
+    rules = "## Skip List\n- Routine updates\n## Notify For\n- Direct requests\n"
+    rules += "Account-specific rule.\n" * 124
+    rules = rules[:2846].ljust(2846, ".")
+    assert len(rules) == 2846
+    notify = "Jev triage: NOTIFY — send the operator alert for this email; do not skip it."
+    answers = 'Jev triage answers: {"model":"jev-1.13.0","answers":{"notify":{"type":"noul","noul":0.9}}}'
+    items = [{"prompt": f"[gmail] message {i}\n" + "detail " * 50 + f"\n{answers}\n{notify}",
+              "batch_context": rules, "message_id": f"m{i}"} for i in range(5)]
+    [event] = await _fire_context_items(tmp_path, items)
+    assert event.content.startswith(rules + "\n\ngmail-inbox reported 5 items:")
+    assert event.content.count(rules) == 1
+    assert event.content.count(answers) == 5
+    assert event.content.count(notify) == 5
+    assert all("batch_context" not in item for item in event.extra["items"])
+    assert not [e for e in _read_events(home) if e["type"] == "poller_prompt_truncated"]
+
+
+@pytest.mark.asyncio
+async def test_batch_context_groups_by_exact_source_in_arrival_order(
+    tmp_path: Path, home: Path,
+) -> None:
+    items = [{"prompt": f"item {i}", "batch_context": context}
+             for i, context in [(1, "HOME RULES"), (2, "WORK RULES"),
+                                (3, "HOME RULES"), (4, "WORK RULES")]]
+    events = await _fire_context_items(tmp_path, items)
+    assert len(events) == 2
+    assert events[0].content == "HOME RULES\n\ngmail-inbox reported 2 items (batch 1 of 2):\n1. item 1\n2. item 3"
+    assert events[1].content == "WORK RULES\n\ngmail-inbox reported 2 items (batch 2 of 2):\n1. item 2\n2. item 4"
+
+
+@pytest.mark.asyncio
+async def test_batch_context_single_item_and_absent_context(
+    tmp_path: Path, home: Path,
+) -> None:
+    events = await _fire_context_items(tmp_path, [
+        {"prompt": "plain", "message_id": "a"},
+        {"prompt": "detail", "batch_context": "RULES"},
+    ])
+    assert [e.content for e in events] == ["plain", "RULES\n\ndetail"]
+    assert events[0].extra["items"] == [{"message_id": "a"}]
+
+
+@pytest.mark.asyncio
+async def test_batch_context_cap_does_not_cut_items(tmp_path: Path, home: Path) -> None:
+    events = await _fire_context_items(tmp_path, [
+        {"prompt": "message tail NOTIFY", "batch_context": "R" * 10000},
+    ])
+    assert events[0].content.endswith("\n\nmessage tail NOTIFY")
+    assert len(events[0].content.split("\n\nmessage")[0]) <= 8000
+    assert [(e["scope"]) for e in _read_events(home)
+            if e["type"] == "poller_prompt_truncated"] == ["batch_context"]
+
+
+@pytest.mark.asyncio
+async def test_batch_context_redacts_secret_before_cap_and_excludes_extras(
+    tmp_path: Path, home: Path,
+) -> None:
+    secret = "context-secret-abcdef123456"
+    skill_dir = tmp_path / "context-skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+print(json.dumps({"prompt": "item", "batch_context": "Rules " + os.environ["POLLER_SECRET"]}))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={"POLLER_SECRET": secret},
+        skill_dir=skill_dir, batch_size=5,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert secret not in enq.events[0].content
+    assert "[REDACTED]" in enq.events[0].content
+    assert "batch_context" not in str(enq.events[0].extra)
+
+
+@pytest.mark.asyncio
+async def test_batch_context_different_secrets_do_not_merge_after_redaction(
+    tmp_path: Path, home: Path,
+) -> None:
+    skill_dir = tmp_path / "context-skill"
+    _install_script(skill_dir, "poller.py", """
+import json, os
+for name in ("FIRST_SECRET", "SECOND_SECRET"):
+    print(json.dumps({"prompt": name, "batch_context": os.environ[name]}))
+""")
+    cfg = PollerConfig(
+        name="gmail-inbox", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={"FIRST_SECRET": "first-secret-abcdef123456",
+                                     "SECOND_SECRET": "second-secret-abcdef123456"},
+        skill_dir=skill_dir, batch_size=5,
+    )
+    enq = _CapturingEnqueue()
+    await run_poller(cfg, enqueue=enq)
+    assert len(enq.events) == 2
+    assert [e.content for e in enq.events] == [
+        "[REDACTED]\n\nFIRST_SECRET", "[REDACTED]\n\nSECOND_SECRET",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_item_middle_cut_preserves_notify_tail(tmp_path: Path, home: Path) -> None:
+    notify = "Jev triage: NOTIFY — send the operator alert for this email; do not skip it."
+    tail = "T" * (600 - len(notify)) + notify
+    [event] = await _fire_context_items(tmp_path, [
+        {"prompt": "start " + "X" * 20000 + tail}, {"prompt": "other item"},
+    ])
+    assert "[…truncated by poller framework…]" in event.content
+    assert tail in event.content
+    assert event.content.index("start") < event.content.index("[…truncated")
+    assert "other item" in event.content
+    assert "per_item" in [e.get("scope") for e in _read_events(home)
+                          if e["type"] == "poller_prompt_truncated"]
+
+
+@pytest.mark.asyncio
+async def test_batch_level_cut_preserves_each_item_tail(tmp_path: Path, home: Path) -> None:
+    # A context plus five near-cap items exceeds the assembled budget.
+    tails = ["t" * 590 + f"NOTIFY {i}" for i in range(5)]
+    items = [{"prompt": f"mail {i} " + "x" * 2400 + tails[i],
+              "batch_context": "RULE " * 1400} for i in range(5)]
+    [event] = await _fire_context_items(tmp_path, items)
+    assert len(event.content) <= 16000
+    assert all(tail in event.content for tail in tails)
+    assert "batch" in [e.get("scope") for e in _read_events(home)
+                       if e["type"] == "poller_prompt_truncated"]
+
+
 @pytest.mark.asyncio
 async def test_run_poller_batch_size_above_one_caps_per_item(
     tmp_path: Path, home: Path,

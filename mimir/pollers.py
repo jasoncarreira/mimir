@@ -172,6 +172,8 @@ POLLER_INVALID_LINE_CHARS = 500
 # JSON line would otherwise blow the prompt-build cache and burn
 # budget on the next turn (Mimir's PR #88 review nit 4).
 POLLER_PROMPT_CHARS = 16_000
+_TRUNCATION_MARKER = "\n[…truncated by poller framework…]\n"
+_ITEM_TAIL_CHARS = 600
 # Hard byte ceilings on a poller subprocess's stdout/stderr (chainlink
 # #258). The POLLER_PROMPT_CHARS cap above only applies AFTER the bytes
 # are read — ``communicate()`` buffers the ENTIRE stream first, so a
@@ -2853,8 +2855,8 @@ async def run_poller(
     stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
 
     # Phase 1: parse + clean every JSONL line into a list of items.
-    # Each item is ``{"prompt": str, "extras": dict[str, Any]}`` —
-    # extras are the original parsed keys minus ``prompt``/``poller``.
+    # Each item keeps its prompt and optional shared context separately;
+    # neither context nor framework keys are included in extras.
     # When ``batch_size > 1`` a per-item soft cap also fires here so
     # one chatty item can't starve others by consuming the whole
     # batch-level prompt budget. Single-item batches (default) skip
@@ -2981,6 +2983,19 @@ async def run_poller(
 
         # Mask before either prompt cap can leave a partial secret behind.
         prompt = _redact_poller_env_values(prompt, env, explicit_env_redact_keys)
+        raw_context = parsed.get("batch_context")
+        context = None
+        if isinstance(raw_context, str):
+            context = _redact_poller_env_values(raw_context, env, explicit_env_redact_keys)
+            context_cap = POLLER_PROMPT_CHARS // 2
+            if len(context) > context_cap:
+                await log_event(
+                    "poller_prompt_truncated",
+                    poller=poller.name,
+                    original_chars=len(context),
+                    scope="batch_context",
+                )
+                context = context[:context_cap - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
         # Per-item cap: only when batch_size > 1. Prevents one runaway
         # item from starving others in a batched render. Marks the
@@ -2993,10 +3008,7 @@ async def run_poller(
                 original_chars=len(prompt),
                 scope="per_item",
             )
-            prompt = (
-                prompt[:per_item_cap]
-                + "\n\n[…truncated by poller framework]"
-            )
+            prompt = _keep_item_tail(prompt, per_item_cap)
 
         # Strip the framework-required keys before stuffing the rest
         # into AgentEvent.extra so downstream prompt rendering can
@@ -3004,20 +3016,27 @@ async def run_poller(
         # etc.) without colliding with the AgentEvent dataclass shape.
         extras = {
             k: v for k, v in parsed.items()
-            if k not in ("prompt", "poller", "integrity", "integrity_effect")
+            if k not in ("prompt", "batch_context", "poller", "integrity", "integrity_effect")
         }
-        items.append({"prompt": prompt, "extras": extras})
+        items.append({"prompt": prompt, "extras": extras,
+                      "context_key": raw_context if isinstance(raw_context, str) else None,
+                      "batch_context": context})
 
-    # Phase 2: batch items into groups of up to ``poller.batch_size``.
-    # batch_size=1 preserves the per-item-per-turn shape; >1 coalesces
-    # to ``ceil(len(items) / batch_size)`` AgentEvents.
+    # Phase 2: first-arrival-ordered context groups, each chunked into
+    # batches of up to ``poller.batch_size``. The original context is the
+    # key: distinct instructions must not merge just because redaction or
+    # truncation happened to produce the same rendered text.
     # ``max(1, ...)`` is defense-in-depth: ``discover_pollers``
     # already filters non-positive values, but tests construct
     # ``PollerConfig`` directly bypassing that path.
     batch_size = max(1, poller.batch_size)
+    groups: dict[str | None, list[dict[str, Any]]] = {}
+    for item in items:
+        groups.setdefault(item["context_key"], []).append(item)
     batches: list[list[dict[str, Any]]] = [
-        items[i:i + batch_size]
-        for i in range(0, len(items), batch_size)
+        group[i:i + batch_size]
+        for group in groups.values()
+        for i in range(0, len(group), batch_size)
     ]
     # Per-fire timestamp scoped to source_id — disambiguates events
     # across overlapping fires (manual fire racing a scheduled fire,
@@ -3065,10 +3084,9 @@ async def run_poller(
                 batch_index=batch_idx,
                 scope="batch",
             )
-            content = (
-                content[:POLLER_PROMPT_CHARS]
-                + "\n\n[…truncated by poller framework]"
-            )
+            # Re-render after cutting *items*, not the assembled string: a
+            # head-first cut can erase every later item's decisive last line.
+            content = _fit_batch(poller.name, batch, batch_idx, len(batches))
 
         # Per-batch extra. ``items`` carries per-item metadata so the
         # agent can react to specific items without re-parsing the
@@ -3247,6 +3265,46 @@ async def run_poller(
     return event_count
 
 
+def _keep_item_tail(prompt: str, limit: int) -> str:
+    """Cut the middle of an item while preserving its decisive suffix."""
+    if len(prompt) <= limit:
+        return prompt
+    available = max(0, limit - len(_TRUNCATION_MARKER))
+    tail_len = min(_ITEM_TAIL_CHARS, available)
+    return prompt[:available - tail_len] + _TRUNCATION_MARKER + prompt[-tail_len:]
+
+
+def _fit_batch(
+    poller_name: str, batch: list[dict[str, Any]], index: int, count: int,
+) -> str:
+    """Fit the rendered batch by shrinking items, retaining their tails."""
+    working = [dict(item) for item in batch]
+    content = _render_batch(poller_name, working, index, count)
+    # Rendering inserts indentation on continuation lines, so measure the
+    # actual result after each cut rather than estimating prompt lengths.
+    while len(content) > POLLER_PROMPT_CHARS:
+        excess = len(content) - POLLER_PROMPT_CHARS
+        candidates = [item for item in working
+                      if len(item["prompt"]) > _ITEM_TAIL_CHARS + len(_TRUNCATION_MARKER)]
+        if not candidates:
+            # Pathological batch_size values may leave insufficient room for
+            # 600 chars per item. Preserve as much of each suffix as fits.
+            candidates = [item for item in working
+                          if len(item["prompt"]) > len(_TRUNCATION_MARKER) + 1]
+        if not candidates:
+            break
+        item = max(candidates, key=lambda entry: len(entry["prompt"]))
+        minimum = (_ITEM_TAIL_CHARS if len(item["prompt"]) > _ITEM_TAIL_CHARS + len(_TRUNCATION_MARKER)
+                   else 1) + len(_TRUNCATION_MARKER)
+        item["prompt"] = _keep_item_tail(
+            item["prompt"], max(minimum, len(item["prompt"]) - excess),
+        )
+        content = _render_batch(poller_name, working, index, count)
+    # If the header/markers alone exceed the budget (e.g. hundreds of
+    # one-character items), no representation can preserve every item.
+    return content[:POLLER_PROMPT_CHARS] if len(content) > POLLER_PROMPT_CHARS else content
+
+
 def _render_batch(
     poller_name: str,
     batch: list[dict[str, Any]],
@@ -3266,8 +3324,9 @@ def _render_batch(
     items are coming on subsequent turns and decide whether to wait
     or act on each batch independently.
     """
+    context = batch[0].get("batch_context")
     if len(batch) == 1:
-        return batch[0]["prompt"]
+        return (context + "\n\n" if context is not None else "") + batch[0]["prompt"]
     header = f"{poller_name} reported {len(batch)} items"
     if batch_count > 1:
         header += f" (batch {batch_index + 1} of {batch_count})"
@@ -3285,7 +3344,8 @@ def _render_batch(
         body_lines.append(f"{i:>{width}}. {item_lines[0]}")
         for tail in item_lines[1:]:
             body_lines.append(f"{cont_indent}{tail}")
-    return "\n".join(body_lines)
+    rendered = "\n".join(body_lines)
+    return context + "\n\n" + rendered if context is not None else rendered
 
 
 __all__ = (
