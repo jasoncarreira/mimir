@@ -316,7 +316,7 @@ def repo_checkout(
     client = _client(scope)
     attest = getattr(client, "author_is_trusted", None)
     if callable(attest):
-        authors = _call(lambda: _pr_content_authors(client, scope))
+        authors, _ = _call(lambda: _pr_content_authors(client, scope))
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
             verdict = context.ifc_state.repository_author_trust.resolve(
                 scope.canonical_repo, scope.pull_request_author,
@@ -387,8 +387,10 @@ async def repo_test(
 ) -> dict[str, Any]:
     """Run configured tests in a contained repository snapshot.
 
-    Pass suite='frontend' for Vitest, or omit suite to infer it from selectors
-    (no selectors: default). On a retained Worklink remediation turn,
+    Omit ``suite`` to infer it only when every selector matches one declared
+    suite's prefixes or suffixes (no selectors: default). Otherwise pass
+    ``suite`` explicitly, e.g. ``suite="python"`` or ``suite="frontend"``.
+    On a retained Worklink remediation turn,
     ``repository`` is the retained run's repository and ``pull_request`` is the
     incident's Chainlink issue id.
     """
