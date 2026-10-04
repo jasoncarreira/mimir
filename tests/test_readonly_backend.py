@@ -355,7 +355,246 @@ class TestWriteGuardBackend:
             provenance = end_protected_result_capture(token)
 
         assert result.error is None
-        assert self._provenance_paths(provenance) == (str(target.resolve()),)
+        expected = docs if method == "als" else target
+        assert self._provenance_paths(provenance) == (str(expected.resolve()),)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["ls", "als"])
+    @pytest.mark.parametrize(
+        ("relative", "integrity"),
+        [("state", "trusted"), ("state/pollers/x", "untrusted"), ("", "untrusted")],
+        ids=["trusted-parent", "untrusted-subtree", "home-root"],
+    )
+    async def test_ls_labels_listed_directory_once(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+        relative: str, integrity: str,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        poller = home / "state" / "pollers" / "x"
+        poller.mkdir(parents=True)
+        (poller / "notes.md").write_text("poller needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        directory = home / relative
+
+        token = begin_protected_result_capture()
+        try:
+            result = getattr(backend, method)(str(directory))
+            if method == "als":
+                result = await result
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert provenance is not None
+        assert len(provenance.sources) == 1
+        source = provenance.sources[0]
+        assert source.resource_id == str(directory.resolve())
+        assert source.domain == "filesystem"
+        assert source.integrity == integrity
+        labels = classify_protected_result(
+            method, {"path": str(directory)}, None,
+            ToolAuthorization(
+                tool_name=method, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+            ),
+            result=result, provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is (integrity == "untrusted")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["ls", "als"])
+    @pytest.mark.parametrize("target_kind", ["file", "directory"])
+    @pytest.mark.parametrize("untrusted", [True, False], ids=["untrusted", "trusted"])
+    async def test_ls_labels_resolved_symlink_children(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+        target_kind: str, untrusted: bool,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        directory = home / "state" / "notes"
+        directory.mkdir(parents=True)
+        target_root = home / "state" / ("pollers/x" if untrusted else "other")
+        target_root.mkdir(parents=True)
+        target = target_root / "target"
+        if target_kind == "directory":
+            target.mkdir()
+        else:
+            target.write_text("benign fixture\n", encoding="utf-8")
+        (directory / "reference").symlink_to(
+            target, target_is_directory=(target_kind == "directory"),
+        )
+        ordinary = directory / "ordinary.md"
+        ordinary.write_text("ordinary fixture\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = begin_protected_result_capture()
+        try:
+            result = getattr(backend, method)(str(directory))
+            if method == "als":
+                result = await result
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        entry_paths = {
+            str(backend._fs._resolve_path(entry["path"]).resolve())
+            for entry in result.entries or ()
+        }
+        assert str(target.resolve()) in entry_paths
+        assert str(ordinary.resolve()) in entry_paths
+        assert provenance is not None
+        assert len(provenance.sources) == 2
+        sources = {source.resource_id: source for source in provenance.sources}
+        assert set(sources) == {str(directory.resolve()), str(target.resolve())}
+        assert sources[str(directory.resolve())].integrity == "trusted"
+        assert sources[str(target.resolve())].integrity == (
+            "untrusted" if untrusted else "trusted"
+        )
+        labels = classify_protected_result(
+            method, {"path": str(directory)}, None,
+            ToolAuthorization(
+                tool_name=method, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+            ),
+            result=result, provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is untrusted
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["ls", "als"])
+    @pytest.mark.parametrize("resolution_error", [OSError, RuntimeError, ValueError])
+    async def test_ls_symlink_resolution_failure_invalidates_capture(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+        resolution_error: type[Exception],
+    ) -> None:
+        from mimir.readonly_backend import _BoundedFilesystemBackend
+
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        directory = home / "state" / "notes"
+        directory.mkdir(parents=True)
+        target_root = home / "state" / "pollers" / "x"
+        target_root.mkdir(parents=True)
+        target = target_root / "target.md"
+        target.write_text("benign fixture\n", encoding="utf-8")
+        (directory / "reference.md").symlink_to(target)
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+        real_ls = _BoundedFilesystemBackend.ls
+        real_resolve = Path.resolve
+        failed_resolutions = []
+        listed_entries = []
+
+        def fail_target_resolution(candidate: Path, strict: bool = False) -> Path:
+            if strict and candidate == target:
+                failed_resolutions.append(candidate)
+                raise resolution_error("simulated post-listing resolution failure")
+            return real_resolve(candidate, strict=strict)
+
+        def list_before_resolution_failure(instance, path):
+            result = real_ls(instance, path)
+            listed_entries.extend(result.entries or ())
+            # Leave real listing/filtering intact; fail only the subsequent
+            # strict provenance resolution of the disclosed symlink target.
+            monkeypatch.setattr(Path, "resolve", fail_target_resolution)
+            return result
+
+        monkeypatch.setattr(
+            _BoundedFilesystemBackend, "ls", list_before_resolution_failure,
+        )
+        token = begin_protected_result_capture()
+        try:
+            # Invalidation must also discard an already published source, not
+            # merely avoid adding more sources to an otherwise empty capture.
+            backend._fs._publish_read_paths([str(directory)])
+            result = getattr(backend, method)(str(directory))
+            if method == "als":
+                result = await result
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert any(
+            backend._fs._resolve_path(entry["path"]) == target
+            for entry in listed_entries
+        )
+        assert failed_resolutions == [target]
+        assert provenance is None
+
+    @pytest.mark.parametrize("method", ["ls", "als"])
+    @pytest.mark.parametrize("error_kind", ["outside", "not-directory"])
+    @pytest.mark.asyncio
+    async def test_erroring_ls_publishes_no_source(
+        self, tmp_path: Path, method: str, error_kind: str,
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        file = home / "notes.md"
+        file.write_text("needle\n", encoding="utf-8")
+        target = outside if error_kind == "outside" else file
+        backend = WriteGuardBackend(
+            root_dir=home, writable_dirs=["state"], guard_outside_root=True,
+        )
+        token = begin_protected_result_capture()
+        try:
+            result = getattr(backend, method)(str(target))
+            if method == "als":
+                result = await result
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is not None
+        if error_kind == "outside":
+            assert "outside_file_tool_roots" in result.error
+        assert provenance is None
+
+    @pytest.mark.parametrize("method", ["glob", "grep"])
+    def test_collection_reads_keep_per_match_taint(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, method: str,
+    ) -> None:
+        monkeypatch.setenv("MIMIR_HOME", str(home))
+        state = home / "state"
+        poller = state / "pollers" / "x"
+        poller.mkdir(parents=True)
+        trusted = state / "trusted.md"
+        untrusted = poller / "notes.md"
+        for path in (trusted, untrusted):
+            path.write_text("shared needle\n", encoding="utf-8")
+        backend = WriteGuardBackend(root_dir=home, writable_dirs=["state"])
+
+        token = begin_protected_result_capture()
+        try:
+            result = (
+                backend.glob("**/*", str(state)) if method == "glob"
+                else backend.grep("shared needle", str(state))
+            )
+        finally:
+            provenance = end_protected_result_capture(token)
+
+        assert result.error is None
+        assert provenance is not None
+        paths = {source.resource_id for source in provenance.sources}
+        assert paths == {
+            str(backend._fs._resolve_path(match["path"]).resolve())
+            for match in result.matches or ()
+        }
+        assert {str(trusted), str(untrusted)} <= paths
+        poller_source = next(
+            source for source in provenance.sources
+            if source.resource_id == str(untrusted)
+        )
+        assert poller_source.integrity == "untrusted"
+        labels = classify_protected_result(
+            method, {"path": str(state)}, None,
+            ToolAuthorization(
+                tool_name=method, decision=OperationDecision.RESOURCE_SCOPED,
+                allowed=True, flow_direction=ToolFlowDirection.SOURCE,
+            ),
+            result=result, provenance=provenance,
+        )
+        assert labels is not None
+        assert labels.has_untrusted_active_ingest is True
 
     @pytest.mark.parametrize("is_service", [False, True], ids=["non-admin", "service"])
     def test_skill_roots_are_readable_but_protected_names_and_writes_are_refused(
