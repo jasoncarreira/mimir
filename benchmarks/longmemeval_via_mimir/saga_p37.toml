@@ -45,7 +45,6 @@ timeout_seconds = 120
 [retrieval]
 enable_contextual_rewrite = true
 two_tier_enabled = true
-enable_missing_ref_pivot = true
 enable_confidence_gating = true
 default_min_confidence_tier = "low"
 enable_triple_augment_v2 = false

@@ -401,8 +401,6 @@ def _default_saga_toml(
         enable_contextual_rewrite = true
         # Two-tier {{observations, raws}} is saga's canonical-best mode.
         two_tier_enabled = true
-        # P30: retrieve atoms for the missing-reference pivot.
-        enable_missing_ref_pivot = true
         # Confidence gating with low floor (drops sub-0.15 noise).
         enable_confidence_gating = true
         default_min_confidence_tier = "low"

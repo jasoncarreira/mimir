@@ -185,7 +185,6 @@ timeout_seconds = 120
 # anyone reading the bench config; explicit-off documents the intent.
 enable_contextual_rewrite = false
 two_tier_enabled = true
-enable_missing_ref_pivot = true
 enable_confidence_gating = true
 default_min_confidence_tier = "low"
 
