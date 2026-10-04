@@ -1188,6 +1188,30 @@ def test_push_is_attributed_to_head_commit_author(monkeypatch, captured_emits):
     assert "by @outside-contributor" in event["prompt"]
 
 
+@pytest.mark.parametrize(("committer", "author", "expected"), [
+    pytest.param("collab", "outsider", "collab", id="committer-first"),
+    pytest.param("web-flow", "collab", "collab", id="web-flow-fallback"),
+    pytest.param(None, "collab", "collab", id="missing-committer"),
+    pytest.param("web-flow", None, "unknown", id="web-flow-alone"),
+])
+def test_synchronize_prompt_names_attested_commit_identity(
+    monkeypatch, captured_emits, committer, author, expected,
+):
+    head = _make_commit("Head commit", author=author)
+    if committer is not None:
+        head["committer"] = {"login": committer}
+    _patch_api(monkeypatch, [_pr(113, "new_sha")], compare_response={
+        "commits": [_make_commit("Earlier", author="earlier"), head],
+    })
+
+    poller._check_pr_pushes("o/r", token="t", me="", pr_heads={"113": "old_sha"})
+
+    event = captured_emits[0]
+    assert f"(by @{expected})" in event["prompt"]
+    assert "@web-flow" not in event["prompt"]
+    assert event["author"] == (None if expected == "unknown" else expected)
+
+
 def test_commit_subjects_truncated_at_three(monkeypatch, captured_emits):
     """Only the first 3 commit subjects are shown inline; remainder shown
     as '… (N more)' so the prompt doesn't balloon on large force-pushes."""

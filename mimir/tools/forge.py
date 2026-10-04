@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -26,6 +27,8 @@ from ..models import (
     ServerDiscoveredPRScopeStore, ServerDiscoveredPRStates,
 )
 from .refusals import ToolPolicyRefusal
+
+log = logging.getLogger(__name__)
 
 _BODY_MAX_BYTES = 65_536
 _PATH_MAX_BYTES = 4_096
@@ -724,6 +727,7 @@ def _publish_author_attestation(
     runtime: ToolRuntime[AuthContext] | None,
     scope: RepoPRActionScope,
     authors: tuple[str, ...],
+    tool: str,
     head_sha: str | None = None,
 ) -> None:
     """Publish provenance only for authors obtained from native forge projections.
@@ -790,13 +794,21 @@ def _publish_author_attestation(
                 turn_id=turn.turn_id if turn is not None else None,
                 repository=scope.canonical_repo,
                 resource_id=resource_id,
+                tool=tool,
                 integrity="untrusted", integrity_effect="active_ingest",
                 failed_authors=failed_authors,
                 unavailable_authors=unavailable_authors,
             )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — telemetry must not alter the read
             # Observability must not turn a successful read into a tool failure.
-            pass
+            log.warning(
+                "forge_author_attestation_downgraded: repository=%s resource_id=%s "
+                "tool=%s failed_authors=%s unavailable_authors=%s "
+                "(event logging failed: %s)",
+                scope.canonical_repo,
+                resource_id,
+                tool, failed_authors, unavailable_authors, exc,
+            )
 
 
 def _pr_attestation(
@@ -844,7 +856,7 @@ def pr_metadata(
     scope = _scope(runtime, repository, pull_request)
     metadata = _call(lambda: _client(scope).get_pull_request(scope))
     authors, head_sha = _pr_attestation(metadata, scope, runtime)
-    _publish_author_attestation(runtime, scope, authors, head_sha)
+    _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
 
 
@@ -860,7 +872,7 @@ def pr_files(
     items = _call(lambda: client.list_files(scope))
     if callable(getattr(client, "author_is_trusted", None)):
         authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
-        _publish_author_attestation(runtime, scope, authors, head_sha)
+        _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
     return [asdict(item) for item in items]
 
 
@@ -876,7 +888,7 @@ def pr_diff(
     diff = _call(lambda: client.get_diff(scope))
     if callable(getattr(client, "author_is_trusted", None)):
         authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
-        _publish_author_attestation(runtime, scope, authors, head_sha)
+        _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
     return diff
 
 
@@ -939,7 +951,7 @@ def pr_reviews(
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_reviews(scope))
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items))
+    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_reviews")
     return [asdict(item) for item in items]
 
 
@@ -952,7 +964,7 @@ def pr_comments(
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_comments(scope))
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items))
+    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_comments")
     return [asdict(item) for item in items]
 
 
