@@ -1901,6 +1901,35 @@ async def test_project_suite_selection_refuses_without_execution(
     assert "python, frontend" in str(error.value)
 
 
+def test_selector_helper_drives_inference_and_refusal_message(
+    repo_tools, tmp_path, monkeypatch,
+):
+    import mimir.project_tests as project_tests
+
+    state = repo_tools[-2]
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    # Neither selector matches the declared prefixes/suffixes. Change only the
+    # shared helper: it must control both inference and unmatched diagnostics.
+    matched = "custom-directory/"
+    unmatched = "other-directory/"
+    monkeypatch.setattr(
+        project_tests, "_selector_matches",
+        lambda path, suite: path == matched and suite.name == "python",
+    )
+    assert project_tests._configured_command(
+        state.action_scope.canonical_repo, (matched,),
+    )[3] == "python"
+    with pytest.raises(ProjectTestRefusal) as error:
+        project_tests._configured_command(
+            state.action_scope.canonical_repo, (matched, unmatched),
+        )
+    assert error.value.code == "test_suite_selection_refused"
+    assert f"unmatched selectors: {[unmatched]!r}" in str(error.value)
+    assert matched not in str(error.value)
+
+
 @pytest.mark.asyncio
 async def test_unmatched_directory_selector_refusal_names_explicit_suite(
     repo_tools, tmp_path, monkeypatch,

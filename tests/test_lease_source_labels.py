@@ -408,8 +408,8 @@ def test_non_author_content_repository_results_remain_untrusted(
 @pytest.mark.parametrize(
     ("verdict", "mismatch"),
     [(True, None), (False, None), (None, None),
-     (True, "number"), (True, "head_sha"), (True, "author"),
-     (True, "missing_author"), (True, "no_attestation")],
+     (True, "number"), (True, "head_sha"), (True, "verified_own_push"),
+     (True, "author"), (True, "missing_author"), (True, "no_attestation")],
 )
 def test_checkout_records_native_author_trust_for_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -422,6 +422,10 @@ def test_checkout_records_native_author_trust_for_file_reads(
 
     author = "" if mismatch == "missing_author" else "collaborator"
     scope = _scope(author=author)
+    if mismatch == "verified_own_push":
+        import uuid
+
+        scope = replace(scope, observed_head_sha=uuid.uuid4().hex + "0" * 8)
     auth = _auth(scope=scope, recorded_verdict=mismatch is not None)
     runtime = SimpleNamespace(context=auth)
     lease_root = tmp_path / "leases"
@@ -444,6 +448,13 @@ def test_checkout_records_native_author_trust_for_file_reads(
         })
         auth.ifc_state.repository_author_trust.resolve(
             "owner/repo", "collaborator", lambda: True,
+        )
+    if mismatch == "verified_own_push":
+        from mimir.repo_tools import _record_verified_push, was_verified_push
+
+        _record_verified_push(scope, scope.observed_head_sha, metadata.head_sha)
+        assert was_verified_push(
+            scope.canonical_repo, scope.pr_number, scope.observed_head_sha, metadata.head_sha,
         )
     calls = []
 
