@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.11. The
+  factory can amend owned paths in-band on a running run, with exclusive path
+  ownership between active slices and activation deferred for overlapping
+  slices. Fewer epics park in `needs-human`, though some waves serialize.
+  Source deployments must rebuild their image to pick up the new pins.
+
 - `mimir run` now loads `<home>/saga.toml` into SAGA (or the exported
   `SAGA_CONFIG` override). Previously the home file was ignored: upgrading
   activates its configured SAGA LLM provider/model, embedding provider, and
