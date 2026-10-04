@@ -6,19 +6,98 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-10-04
+
+SAGA now actually loads each home's `saga.toml`, which had been silently ignored
+since 2026-09-12. Social-outbox dispatch works against the real social-cli, and gmail
+batches no longer cut off the Jev triage line. Declared shell commands can use
+virtualenv interpreters, and several taint and attestation false positives are
+fixed. feature-factory moves to 0.10.11.
+
+**Operator actions:**
+
+- Rebuild the image of a source deployment that runs the canonical image. The
+  feature-factory and adapter pins moved to 0.10.11.
+- `mimir run` now loads `<home>/saga.toml` (#2204). Its configured SAGA LLM
+  provider/model, embedding provider and retrieval flags take effect on upgrade,
+  which can change LLM spend and retrieval behaviour. A present but unreadable or
+  malformed file now stops startup instead of silently using defaults. Homes
+  created by older `mimir setup` runs log an unknown-key warning for
+  `[retrieval] enable_missing_ref_pivot`; that key was never read, so delete the
+  line (#2206).
+- Gmail account rules now render once per batch (#2207). If you lowered a gmail
+  poller's `batch_size` to stop the triage/NOTIFY line being truncated, you can
+  restore it.
+- Declared shell commands now execute at their declared path (#2208), so a
+  virtualenv interpreter such as `/home/mimir/venv/bin/python3` can be declared
+  directly. A declaration whose symlink chain passes through an agent-writable
+  directory is now refused when the job loads.
+- Research pollers may now request `memory_propose` (#2209). Add it to a research
+  poller's capabilities to let it queue memories for operator approval.
+- Social-outbox files must be named `outbox-*.yaml` and use social-cli's own
+  outbox schema (`- like: {platform, id}`, `- reply: {platform, id, text}`, and
+  so on); the older `action:` shape is refused, as is `media`. Each file is
+  dry-run before it is recorded as dispatched (#2202, #2203).
+
+**Changes**
+
 - Upgrade `feature-factory` and `opencode-feature-factory` to 0.10.11. The
   factory can amend owned paths in-band on a running run, with exclusive path
   ownership between active slices and activation deferred for overlapping
-  slices. Fewer epics park in `needs-human`, though some waves serialize.
-  Source deployments must rebuild their image to pick up the new pins.
-
+  slices. Fewer epics park in `needs-human`, though some waves serialize
+  (#2213).
 - `mimir run` now loads `<home>/saga.toml` into SAGA (or the exported
   `SAGA_CONFIG` override). Previously the home file was ignored: upgrading
   activates its configured SAGA LLM provider/model, embedding provider, and
   retrieval flags, potentially changing LLM spend and retrieval behaviour.
   An unreadable or malformed selected file now stops startup rather than
   silently using defaults. `saga-reembed` and `reindex` use the same config
-  selection without writing `SAGA_CONFIG` to the process environment.
+  selection without writing `SAGA_CONFIG` to the process environment (#2204).
+- `mimir setup` no longer writes the dead `[retrieval] enable_missing_ref_pivot`
+  key, which nothing read. It is also removed from the LongMemEval bench runner
+  and the eight bench presets, and a test checks that every `[retrieval]` key
+  setup writes is one SAGA knows (#2206).
+- Pollers can supply a shared `batch_context` that renders once per batch; items
+  keep their tail when truncated. The gmail poller moves account rules into it,
+  so the Jev triage/NOTIFY line is never cut off (#2207).
+- Declared shell commands execute at the declared path while every symlink hop
+  is checked against agent-writable roots, and interpreter rules also consider
+  the declared executable name (#2208).
+
+**Social outbox**
+
+- Social-outbox PRs get their own title, `[social outbox:<poller>] rolling
+  outbox`. Submitting a file not named `outbox-*.yaml` is refused, and the
+  dispatcher flags such files once instead of silently ignoring them (#2202).
+- Dispatch runs `social-cli dispatch <file>` with the file positional, validates
+  against social-cli's own schema (including `follow`, `bookmark` and
+  `highlight`), refuses `media`, dry-runs each file before its ledger entry is
+  consumed, and names its snapshot `outbox-<platform>.yaml` so the right sent
+  ledger is used (#2203).
+
+**Authorization and taint**
+
+- `ls` labels a listing by the directory listed, not by each child name, so
+  listing a trusted directory no longer taints a turn through untrusted child
+  names. Untrusted directories, and symlink children that resolve elsewhere,
+  still carry their own labels (#2210).
+- Forge attestation uses the commit's committer login first (skipping
+  `web-flow`), falling back to the author. Every attestation downgrade is now
+  logged, with a warning if the event cannot be written (#2212).
+- After a verified own push, forge reads are attested at the new head, reusing
+  the head lineage from the write path (#2211).
+- Research pollers may request `memory_propose` (#2209).
+
+**Fixes**
+
+- The scheduler-wedge alarm measures staleness from the later of the last
+  heartbeat and the scheduler's start, so a restart after an outage no longer
+  sends a false "heartbeat stale" page (#2201).
+- Completed gmail turns no longer linger as in flight; session-boundary
+  (synthesis) turns are shown only the tools their profile admits; and the
+  built-in `pollers` skill description fits the 1,024-character limit (#2205).
+- The `repo_test` suite refusal names the suite argument and the selector rules
+  (#2211).
 
 ## [0.9.2] — 2026-10-01
 
