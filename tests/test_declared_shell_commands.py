@@ -302,17 +302,39 @@ class TestDeclarationShape:
         assert declared[0].resolved_path == Path("/bin/echo").resolve()
         assert Path(argv[0]).is_absolute()
 
-    def test_non_symlink_path_and_lexical_normalization(self, tmp_path: Path) -> None:
+    def test_non_symlink_path_preserves_parent_components(self, tmp_path: Path) -> None:
         executable = tmp_path / "gog"
         executable.write_text("#!/bin/sh\nexit 0\n")
         executable.chmod(0o755)
-        declaration = _gog(path=str(tmp_path / "subdir" / ".." / "gog"))
-        parsed = parse_declared_shell_commands([declaration], writable_roots=())
-        assert parsed[0].path == executable
-        assert parsed[0].resolved_path == executable
+        (tmp_path / "subdir").mkdir()
+        declared_path = tmp_path / "subdir" / ".." / "gog"
+        parsed = parse_declared_shell_commands(
+            [_gog(path=str(declared_path))], writable_roots=(),
+        )
+        assert parsed[0].path == declared_path
+        assert parsed[0].resolved_path == executable.resolve()
         assert access_control._declared_command_execution_argv(
             ["gog", "gmail", "search"], parsed,
-        ) == [str(executable), "gmail", "search"]
+        ) == [str(declared_path), "gmail", "search"]
+
+    def test_missing_parent_component_is_not_lexically_skipped(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="does not exist"):
+            parse_declared_shell_commands(
+                [_gog(path=str(tmp_path / "missing" / ".." / "gog"))],
+                writable_roots=(),
+            )
+
+    def test_parent_component_requires_a_directory(self, tmp_path: Path) -> None:
+        executable = tmp_path / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        with pytest.raises(ValueError, match="not a directory"):
+            parse_declared_shell_commands(
+                [_gog(path=str(executable / ".." / "gog"))], writable_roots=(),
+            )
 
     def test_absent_declaration_is_a_no_op(self) -> None:
         assert parse_declared_shell_commands(None, writable_roots=()) == ()
@@ -518,16 +540,103 @@ class TestReviewFindings:
             parse_declared_shell_commands([_gog(path=str(directory / "gog"))],
                                           writable_roots=agent_writable_roots(home))
 
-    def test_symlink_loop_and_over_40_hops_are_refused(self, home: Path) -> None:
+    @pytest.mark.parametrize("declared_link", [False, True])
+    def test_writable_directory_traversal_is_refused_even_when_left(
+        self, home: Path, declared_link: bool,
+    ) -> None:
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        traversal = home / "scratch" / ".." / "scripts" / "gog"
+        if declared_link:
+            link = home / "scripts" / "entry"
+            link.symlink_to(traversal)
+            traversal = link
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [_gog(path=str(traversal))],
+                writable_roots=agent_writable_roots(home),
+            )
+
+    def test_missing_writable_component_is_not_normalized_away(self, home: Path) -> None:
+        executable = home / "scripts" / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        link = home / "scripts" / "entry"
+        link.symlink_to(home / "scratch" / "missing" / ".." / ".." / "scripts" / "gog")
+        # Refuse at the writable directory itself, regardless of whether later
+        # components exist. No execution or subsequent mutation is needed.
+        with pytest.raises(ValueError, match="agent-writable root"):
+            parse_declared_shell_commands(
+                [_gog(path=str(link))], writable_roots=agent_writable_roots(home),
+            )
+
+    @pytest.mark.parametrize("declared_link", [False, True])
+    def test_parent_components_follow_resolved_directory_prefix(
+        self, home: Path, declared_link: bool,
+    ) -> None:
+        safe = home / "scripts"
+        (safe / "nested").mkdir()
+        executable = safe / "gog"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        directory = home / "directory"
+        directory.symlink_to(safe / "nested", target_is_directory=True)
+        traversal = directory / ".." / "gog"
+        if declared_link:
+            link = home / "entry"
+            link.symlink_to(traversal)
+            traversal = link
+        parsed = parse_declared_shell_commands(
+            [_gog(path=str(traversal))], writable_roots=(),
+        )
+        assert parsed[0].path == traversal
+        assert parsed[0].resolved_path == executable.resolve()
+        assert parsed[0].resolved_path == traversal.resolve()
+
+    @pytest.mark.parametrize("basename", ["sh", "python3.12"])
+    def test_declared_interpreter_basename_requires_script(
+        self, home: Path, basename: str,
+    ) -> None:
+        binary = home / "scripts" / "tool"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        link = home / "scripts" / basename
+        link.symlink_to(binary)
+        with pytest.raises(ValueError, match="only be declared with a pinned"):
+            parse_declared_shell_commands(
+                [_gog(exec="tool", path=str(link))], writable_roots=(),
+            )
+
+    def test_symlink_loop_and_over_40_hops_are_refused(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Detect a missing bound promptly, rather than waiting for pytest's
+        # global timeout to interrupt an infinite resolver loop.
+        readlink = os.readlink
+        calls = 0
+
+        def bounded_readlink(path):
+            nonlocal calls
+            # macOS may also resolve the host /tmp -> /private/tmp prefix.
+            if Path(path).name == "loop" or Path(path).name.startswith("hop"):
+                calls += 1
+                assert calls <= 40, "resolver exceeded its symlink hop budget"
+            return readlink(path)
+
+        monkeypatch.setattr(access_control.os, "readlink", bounded_readlink)
         link = home / "scripts" / "loop"
         link.symlink_to(link)
         with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
             parse_declared_shell_commands([_gog(path=str(link))], writable_roots=())
 
+        calls = 0
+        target = Path("/bin/echo").resolve()
         for i in range(41):
             (home / "scripts" / f"hop{i}").symlink_to(
-                home / "scripts" / f"hop{i + 1}" if i < 40 else Path("/bin/echo").resolve()
+                home / "scripts" / f"hop{i + 1}" if i < 40 else target
             )
+        calls = 0
         with pytest.raises(ValueError, match="symlink loop or exceeds 40 hops"):
             parse_declared_shell_commands(
                 [_gog(path=str(home / "scripts" / "hop0"))], writable_roots=(),

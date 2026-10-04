@@ -5481,12 +5481,18 @@ def test_declaration_and_write_gate_share_skill_script_writability(
     script.parent.mkdir(parents=True)
     script.write_text("console.log('ok')\n", encoding="utf-8")
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    # This is a declaration/write-policy test, not an interpreter execution
+    # test. Own the executable location instead of depending on the host venv.
+    interpreter = home / "scripts" / "python3"
+    interpreter.parent.mkdir()
+    interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    interpreter.chmod(0o755)
     roots = access_control.agent_writable_roots(home)
 
     declared = access_control.parse_declared_shell_commands(
         [{
             "exec": "python3",
-            "path": sys.executable,
+            "path": str(interpreter),
             "script": str(script),
             "options": ["--experimental-strip-types"],
         }],
