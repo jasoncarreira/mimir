@@ -208,6 +208,35 @@ def test_cli_home_config_and_options(tmp_path, monkeypatch, home_source, absolut
     assert run.call_args.kwargs["batch_delay"] == 0.25
 
 
+def test_cli_installs_home_config_before_reembed(tmp_path, monkeypatch):
+    from mimir.cli import main
+    from mimir import config
+    from mimir.saga import _config_io
+    from mimir.saga import reembed as module
+
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setattr(config, "_load_home_dotenv", Mock())
+    _config_io.install_saga_config(None)
+    (tmp_path / "saga.toml").write_text(
+        '[embedding]\nprovider = "openai"\nmodel = "home-model"\n',
+        encoding="utf-8",
+    )
+    calls = []
+
+    def run(db_path, **kwargs):
+        cfg = _config_io.get_config()
+        assert cfg("embedding", "provider") == "openai"
+        assert cfg("embedding", "model") == "home-model"
+        calls.append((db_path, kwargs["dry_run"]))
+        return {}
+
+    monkeypatch.setattr(module, "reembed", run)
+    main(["saga-reembed", "--home", str(tmp_path), "--dry-run"])
+    assert calls == [(tmp_path / ".mimir/saga.db", True)]
+    assert "SAGA_CONFIG" not in os.environ
+
+
 def test_cli_interrupt(tmp_path, monkeypatch, capsys):
     from mimir.cli import main
     from mimir.saga import _config_io

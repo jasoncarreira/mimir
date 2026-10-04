@@ -674,7 +674,7 @@ _KNOWN_EXTRA_KEYS: dict[str, set[str]] = {
     "annotation": {
         "use_llm", "llm_url", "llm_model", "api_key_env", "reasoning_effort",
     },
-    "llm": set(),  # All keys are in _DEFAULTS.
+    "llm": {"provider"},  # resolve_llm_config supplies its runtime default.
     "compression": {
         "api_key_env", "llm_url", "llm_model", "timeout_seconds",
         "reasoning_effort",
