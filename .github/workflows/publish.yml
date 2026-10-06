@@ -37,7 +37,7 @@ jobs:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       # The React app (mimir/react_app/dist/) is gitignored and force-included
       # via [tool.hatch.build] artifacts — but it must EXIST before uv build
       # packages it, so build it here first. (0.6.0 shipped without it because
@@ -119,7 +119,7 @@ jobs:
     permissions:
       contents: write  # the only job that needs write; build/publish stay read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Create the GitHub Release from the tag + CHANGELOG
         env:
           GH_TOKEN: ${{ github.token }}
