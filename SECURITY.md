@@ -9,10 +9,12 @@ security fixes. Older versions should be upgraded.
 
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
-Use GitHub's private vulnerability reporting:
+Use GitHub's private vulnerability reporting when enabled:
 <https://github.com/jasoncarreira/mimir/security/advisories/new>
 
-Or email the maintainer privately. Include:
+Until that feature is enabled, email the maintainer privately at
+`<OPERATOR_SECURITY_CONTACT_EMAIL>` (operator: replace with a working contact).
+Include:
 
 - A description of the issue and its impact
 - Steps to reproduce (or a proof-of-concept if appropriate)
@@ -58,12 +60,13 @@ might initially suggest:
   command string, not a sandbox. A determined caller wraps the command in
   a script file and gets past it. Treat it as best-effort surface-area
   reduction, not a security boundary.
-- DNS-rebinding mitigation for the web-fetch tool is documented in code
-  but not currently enforced. Don't point the agent at an untrusted URL
-  on a network where it shouldn't be able to reach internal IPs.
+- Web fetch validates public DNS results and pins each HTTP/HTTPS connection
+  (including redirect hops) to a validated IP while verifying TLS against
+  the requested hostname.
 - Bash output redaction (`mimir/git_bootstrap.py` `_redact`) covers
-  common token patterns but is not exhaustive. Avoid `env` / printenv-
-  style commands in production agent homes that auto-commit `turns.jsonl`.
+  common token patterns but is not exhaustive. Never write secrets into
+  the committed home surface (`memory/`, `prompts/`, `skills/`, `state/`).
+  `logs/` and `*.jsonl` are not committed.
 
 ## Out of scope
 

@@ -648,11 +648,11 @@ A session **cannot reopen** after it ends. The next inbound event for the same c
 
 The in-process `SagaStore` (mimir/saga rewrite, PR #161) replaced the original HTTP `/v1/sessions/end` design — `saga_end_session` now calls `SagaStore.end_session()` directly, which writes the boundary atom, topics, decisions, unfinished, mood, and `closed_since` corrections inline. No external endpoint required.
 
-The `saga_feedback` and `saga_mark_contributions` MCP tools (§7, SAGA sub-group) operate through the same in-process path. The weekly consolidation job calls `SagaStore.consolidate()` directly (not `/v1/consolidate`).
+The `saga_feedback` and `saga_mark_contributions` MCP tools (§7, SAGA sub-group) operate through the same in-process path. The daily consolidation job (default `MIMIR_SAGA_CONSOLIDATE_CRON=0 4 * * *`) calls `saga_client.consolidate(...)` from the scheduler.
 
-#### Weekly consolidation
+#### Daily consolidation (default `MIMIR_SAGA_CONSOLIDATE_CRON=0 4 * * *`)
 
-`mimir/scheduler.py` runs a hard-coded periodic SAGA consolidation job — `MIMIR_SAGA_CONSOLIDATE_CRON` (default `"0 4 * * *"`, daily at 04:00 UTC) POSTs `/v1/consolidate` directly, bypassing the LLM. This is *not* a `scheduler.yaml` entry — those are LLM ticks, this is an out-of-band SAGA control call. Set `MIMIR_SAGA_CONSOLIDATE_CRON=""` to disable. Errors log to events.jsonl as `saga_consolidate_error`. Decay (`/v1/decay`) and forgetting (`/v1/forget`) are deferred to a later spec revision — SAGA's internal defaults are good enough for v1.
+`mimir/scheduler.py` runs a hard-coded periodic SAGA consolidation job — `MIMIR_SAGA_CONSOLIDATE_CRON` (default `"0 4 * * *"`, daily at 04:00 UTC) calls `saga_client.consolidate(...)`, bypassing the agent turn. This is *not* a `scheduler.yaml` entry — those are LLM ticks, this is an out-of-band SAGA control call. Set `MIMIR_SAGA_CONSOLIDATE_CRON=""` to disable. Errors log to events.jsonl as `saga_consolidate_error`. Decay (`/v1/decay`) and forgetting (`/v1/forget`) are deferred to a later spec revision — SAGA's internal defaults are good enough for v1.
 
 **Two-pass consolidation.** Since the in-process `SagaStore` (mimir/saga rewrite) replaced the HTTP `/v1/consolidate` call, the consolidate job runs two passes per fire:
 
@@ -1107,7 +1107,7 @@ SAGA's scorer decides which atoms in the passed set actually contributed based o
 
 **Subagents do not inherit the parent's `saga_atom_ids`.** Each subagent has its own `TurnContext`. If a subagent calls `memory_query` and wants retrievals credited, it calls `saga_mark_contributions` from inside the subagent. The parent neither tracks nor credits subagent-internal SAGA activity.
 
-`ctx.saga_atom_ids` is per-turn (cleared between turns). SAGA session boundaries are §5.6. Weekly consolidation is a separate scheduled job (§5.6).
+`ctx.saga_atom_ids` is per-turn (cleared between turns). SAGA session boundaries are §5.6. Daily consolidation (default `MIMIR_SAGA_CONSOLIDATE_CRON=0 4 * * *`) is a separate scheduled job (§5.6).
 
 ---
 
@@ -1158,7 +1158,7 @@ Event types ported from open-strix (`open-strix-base/docs/events.md`):
 | `bridge_connecting` / `bridge_ready` / `bridge_error` | `bridge, source, error?` — bridge lifecycle |
 | `bridge_stub_called` | `bridge, channel_id, method` — stubbed bridges (§15 Phase 6.3) log instead of sending |
 | `saga_session_started` / `saga_session_ended` | `channel_id, saga_session_id, duration_s?, turn_count?, synthesis_ok?, feedback_count?, memory_writes?` — per-channel session lifecycle (§5.6) |
-| `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?, result.dedup{candidates_scanned, clusters_formed, canonicals_kept, duplicates_tombstoned, threshold}` — weekly cron, two-pass dedup + thematic (§5.6) |
+| `saga_consolidate_ok` / `saga_consolidate_error` | `dry_run, max_clusters?, error?, result.dedup{candidates_scanned, clusters_formed, canonicals_kept, duplicates_tombstoned, threshold}` — daily cron, two-pass dedup + thematic (§5.6) |
 | `poller_stderr` / `poller_nonzero_exit` | `poller, exit_code, stderr` — pollers (§7.2.2) |
 | `send_message_loop_warning` / `send_message_loop_hard_stop` / `send_message_loop_detected` | `tool, channel_id, streak, similarity_ratio, reacted?` — circuit breaker (§7.2.4) |
 | `shadow_tool_decision` | `tool, decision, allowed, reason, required_tier, enforcement_enabled, is_shadow_decision, would_block, target, requested_target, trigger, service_principal, scope_provenance, scope_id, granted_actions, refusal_reason` — counterfactual enforcement result; `target` is server-resolved while bounded, scrubbed `requested_target` is unvalidated caller evidence, and repo/PR fields identify immutable authority without accepting a model-selected target; the action proceeds in compatibility mode |
@@ -1415,7 +1415,7 @@ Caveats: `--dataset-path` must be explicit (default resolves incorrectly — see
 | `MIMIR_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `MIMIR_INDEX_DB` | `$MIMIR_HOME/.mimir/index.db` | SQLite path |
 | `MIMIR_SAGA_SESSION_IDLE_MINUTES` | `10` | Per-channel SAGA session idle timeout (§5.6); session-end fires after this much silence on a channel |
-| `MIMIR_SAGA_CONSOLIDATE_CRON` | `0 4 * * *` | Cron expression for periodic `POST /v1/consolidate`; empty string disables (§5.6) |
+| `MIMIR_SAGA_CONSOLIDATE_CRON` | `0 4 * * *` | Cron expression for periodic `saga_client.consolidate(...)`; empty string disables (§5.6) |
 | `MIMIR_PROMPTS_DIR` | (unset) | Operator override dir for prompt templates; mimir falls back to the bundled defaults in `templates.py` / `prompt_templates/` when unset or a file isn't found (§5.6) |
 | `MIMIR_TURNS_ARCHIVE_DIR` | (unset) | If set, `reset()` archives turns.jsonl + events.jsonl here before truncate |
 | `MIMIR_MAX_TURNS` | `5000` | Retention cap for turns.jsonl (hard ceiling 50000) |
@@ -1499,7 +1499,7 @@ Slack and Discord bridge config is live (both implemented). Bluesky is handled b
 - **Per-channel SAGA session manager (§5.6)** — `mimir/session_manager.py` with `touch(channel_id)`, idle timer. Hook into the dispatcher (§4.5) so every inbound event touches the session before enqueueing.
 - **Session-end synthesis turn** — on idle, dispatcher enqueues a turn with `trigger="saga_session_end"`, the channel's turn window from turns.jsonl in the prompt, and `mimir/templates.py` (the `SAGA_SESSION_END_DEFAULT` constant) as the template. Pre/post SAGA hooks skip on this trigger.
 - `saga_end_session` tool that POSTs `/v1/sessions/end` (`store_session_boundary` server-side).
-- Weekly consolidation cron (`MIMIR_SAGA_CONSOLIDATE_CRON`) wired into `mimir/scheduler.py` as a non-LLM job — direct POST `/v1/consolidate`.
+- Daily consolidation cron (`MIMIR_SAGA_CONSOLIDATE_CRON`, default `0 4 * * *`) wired into `mimir/scheduler.py` as a non-agent-turn job — `saga_client.consolidate(...)`.
 - Turn logger writes `saga_session_id` and `saga_atom_ids` to every TurnRecord (§10.2) so the synthesis turn can filter the window exactly.
 - Tests: session start/touch/idle-end lifecycle; timer reset on rapid messages; synthesis turn reads only turns with the matching `saga_session_id` (verifies tagging); agent calls `saga_end_session` with at least `session_id` + `summary`; agent emits at least one `saga_feedback` call when atoms are present in the window; consolidation cron fires and logs; session manager tolerates `/v1/sessions/end` 404 (drops in-memory session, `synthesis_ok=False`).
 - File SAGA-side feature requests: `POST /v1/sessions/end` endpoint with `{session_id, summary, topics_discussed?, decisions_made?, unfinished?, emotional_state?}` body + `session_id` field on `/v1/feedback` and `/v1/query` (§5.6 dependencies).
@@ -1556,7 +1556,7 @@ Slack and Discord bridge config is live (both implemented). Bluesky is handled b
 - Resume detection (task-result JSON).
 - Error path coverage (MiniMax tool-arg drops, SDK timeouts).
 
-Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0.5 day for the per-channel SAGA session manager + weekly consolidation).
+Total: ~15.5 working days for a first benchmarkable build (Phase 4 expanded by 0.5 day for the per-channel SAGA session manager + daily consolidation).
 
 ---
 

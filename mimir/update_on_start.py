@@ -11,8 +11,8 @@ ssh dance). This module adds a flag-file checkpoint instead:
 2. The agent surfaces the update + the approval phrasing to the
    operator in chat.
 3. The operator approves ("yes, do the update on next restart").
-4. The agent calls the ``request_mimir_update`` tool, which writes
-   ``<home>/.mimir/pending-update.flag`` with the target version.
+4. The agent requests an authenticated operator approval. Only the approval
+   resolver writes ``<home>/.mimir/pending-update.flag``.
 5. The operator restarts the container.
 6. ``apply_pending_update`` runs as the FIRST thing in ``server.main``
    — before asyncio setup, logging config, anything. If the flag is
@@ -56,14 +56,9 @@ the diagnostic, the operator investigates, and re-approves once
 they've identified the issue (network, dep conflict, broken
 upstream release).
 
-**The flag is the approval.** Per ``persona-spec-framework`` (the
-tri-zone boundary model), "update mimir" is an escalate-first
-action. The flag file's existence IS the operator-approved signal —
-the agent should not write it without explicit operator authorization
-in the same conversation. This matches the existing pattern for
-``memory/core/`` edits: the agent CAN write to the file (autonomous
-authority on the filesystem) but the action category is
-escalate-first per ``06-action-boundaries.md``.
+**The flag is the approval.** The tool registers a typed request; an
+authenticated operator reply writes the flag. Operators can also create a
+bare flag themselves as a manual override.
 """
 
 from __future__ import annotations
@@ -77,6 +72,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+from packaging.version import InvalidVersion, Version
 
 # One PyPI distribution name for both the daily check and update-on-start.
 from .version_check import _pypi_package_name
@@ -571,10 +567,10 @@ def write_flag(
     *,
     target_version: str = "",
     include_prereleases: bool = False,
+    approval_id: str | None = None,
+    approved_by: str | None = None,
 ) -> Path:
-    """Create (or overwrite) the pending-update flag. Called by the
-    ``request_mimir_update`` tool when the operator has approved an
-    update in chat. Returns the path written.
+    """Create (or overwrite) the pending-update flag after operator approval.
 
     Empty ``target_version`` means "use whatever pip resolves as
     latest at install time" — the operator approved an open-ended
@@ -587,8 +583,19 @@ def write_flag(
         "include_prereleases": include_prereleases,
         "approved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if approval_id is not None:
+        payload["approval_id"] = approval_id
+    if approved_by is not None:
+        payload["approved_by"] = approved_by
     path.write_text(json.dumps(payload, indent=2) + "\n")
     return path
+
+
+def parse_target_version(target: str) -> Version | None:
+    """Parse a pinned PEP 440 release; empty means the latest release."""
+    if not target:
+        return None
+    return Version(target)
 
 
 def _read_flag(path: Path) -> PendingUpdate:
@@ -860,6 +867,15 @@ def apply_pending_update(
     _truncate_startup_events(home)
 
     parsed = _read_flag(path)
+    try:
+        parse_target_version(parsed.target_version)
+    except InvalidVersion:
+        emit("mimir_update_failed", reason="invalid_target_version")
+        try:
+            path.unlink()
+        except OSError as exc:
+            log.warning("pending-update flag unlink failed: %s", exc)
+        return True
     pkg = _pypi_package_name()
     spec = _install_spec(pkg, parsed)
     prior_version = _current_version()

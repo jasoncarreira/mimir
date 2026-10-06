@@ -55,7 +55,7 @@ streamed for cross-turn surfacing — see §2.1).
 
 ### 1.3 send_message LoopDetector — runaway-loop circuit breaker
 
-**S2 (coordination).** `mimir/channeltools.py` wraps the
+**S2 (coordination).** `mimir/loop_detector.py` implements the
 `send_message` tool with a `LoopDetector` per turn. The detector
 tracks (channel_id, message-content-hash) pairs and refuses
 duplicate-or-near-duplicate sends past a soft threshold, hard-stops
@@ -87,7 +87,7 @@ abandon).
 
 ### 2.1 Algedonic surfacing — recent feedback signals in turn prompt
 
-**Algedonic channel.** `mimir/feedback.py` tail-streams
+**Algedonic channel.** `mimir/feedback/` tail-streams
 `events.jsonl` and `turns.jsonl` for the last N minutes / M turns,
 extracts pain signals (errors, tool denials, loop-detector hits,
 explicit `saga_feedback` with `feedback="negative"`) and pleasure
@@ -105,11 +105,11 @@ before acting again.
 **Frequency:** every turn (block re-rendered).
 **Latency:** seconds (tail-read of jsonl files).
 **Closes the loop:** next turn (or any turn within the window).
-**Call sites:** `mimir/feedback.py`, `mimir/prompts.py:256`,
+**Call sites:** `mimir/feedback/`, `mimir/prompts.py:256`,
 `mimir/agent.py:543` (FeedbackLog init).
 
 **Surfaced event types** (each maps to a polarity + render rule
-in `mimir/feedback.py:_EVENT_RULES`):
+in `mimir/feedback/rules.py:_EVENT_RULES`):
 
 - **Core:** `error`, `tool_call_denied`
 - **Budget:** `tool_call_budget_denied`, `tool_call_budget_soft_warning`
@@ -229,7 +229,7 @@ prompt assembly.
 **Frequency:** on-demand (reflection skill invocation).
 **Closes the loop:** weekly+ via reflection's HITL gate.
 **Call sites:** `mimir/saga_client.py:most_retrieved_atoms`,
-`mimir/skills/reflection/most_retrieved.py`.
+`mimir/reflection/most_retrieved.py`.
 
 ---
 
@@ -306,7 +306,7 @@ historical applied-proposals audit records.
 **Closes the loop:** human-in-the-loop. Skill produces text;
 operator decides; mimir reads the merged result on next turn.
 **Call sites:** `mimir/skills/reflection/SKILL.md`,
-`mimir/skills/reflection/most_retrieved.py`,
+`mimir/reflection/most_retrieved.py`,
 `memory/core/30-reflection-policy.md`,
 proposal PRs / Chainlink follow-ups.
 
@@ -393,7 +393,7 @@ on-demand via CLI.
 operator via the report file under `state/reports/` and via
 the reflection skill's write-up. With `--emit-algedonic`, the
 heartbeat-health subsection also emits an event (loop §4.8).
-**Call sites:** `mimir/skills/reflection/introspection_report.py`,
+**Call sites:** `mimir/reflection/introspection_report.py`,
 `mimir reflection introspection-report` CLI.
 
 ### 4.8 Heartbeat-pipeline health monitor
@@ -419,8 +419,8 @@ sits in events.jsonl and surfaces on the next turn after
 emission (until 24h window expires).
 **Closes the loop:** algedonic event → next-turn prompt →
 agent investigates / alerts.
-**Call sites:** `mimir/skills/reflection/introspection_report.py:
-maybe_emit_health_event`, `mimir/feedback.py:_EVENT_RULES`
+**Call sites:** `mimir/reflection/introspection_report.py:
+maybe_emit_health_event`, `mimir/feedback/rules.py:_EVENT_RULES`
 (`heartbeat_health_degraded`).
 
 ### 4.6 World model — currently-valid facts (v0.5 §3 P37)
@@ -469,7 +469,7 @@ gates the reaction signal; older reactions don't appear.
 **Call sites:** `mimir/reactions.py`,
 `mimir/bridges/discord.py:_on_reaction`,
 `mimir/bridges/slack.py:_on_reaction`,
-`mimir/feedback.py` (per-event polarity override).
+`mimir/feedback/rules.py` (per-event polarity override).
 
 ---
 

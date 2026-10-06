@@ -14,8 +14,16 @@ from mimir.turn_event_bus import TurnEventBus
 from mimir.identities import IdentityResolver
 from mimir.identities_populator import issue_web_key
 from mimir import web_ui
-from mimir.server import _is_admin_required, _make_auth_middleware
+from mimir.server import (_is_admin_required, _make_auth_middleware,
+                          _web_session_post, _web_session_get, _web_session_delete)
 from mimir.web_ui import _whoami_payload, web_gate_active
+
+
+def test_legacy_dashboard_auth_exchanges_and_deletes_stored_key():
+    script = (Path(__file__).resolve().parents[1] / "mimir/web_auth.js").read_text()
+    assert 'window.localStorage.removeItem(API_KEY_LS)' in script
+    assert '"/api/v1/web/session"' in script
+    assert 'window.localStorage.setItem(API_KEY_LS' not in script
 
 
 async def _echo(request: web.Request) -> web.Response:
@@ -25,6 +33,31 @@ async def _echo(request: web.Request) -> web.Response:
         "is_master": bool(request.get("auth_is_master")),
         "is_admin": bool(request.get("auth_is_admin")),
     })
+
+
+async def test_cookie_session_requires_valid_header_and_keeps_csrf_gate(tmp_path: Path) -> None:
+    app = _app(tmp_path, "master-secret")
+    app["api_key"] = "master-secret"
+    app.router.add_post("/api/v1/web/session", _web_session_post)
+    app.router.add_get("/api/v1/web/session", _web_session_get)
+    app.router.add_delete("/api/v1/web/session", _web_session_delete)
+    app.router.add_post("/api/v1/turns", _echo)
+    async with TestClient(TestServer(app)) as c:
+        bad = await c.post("/api/v1/web/session", headers={"X-API-Key": "wrong"})
+        assert bad.status == 401 and "Set-Cookie" not in bad.headers
+        good = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret"})
+        assert good.status == 200
+        cookie = good.cookies["mimir_session"]
+        assert cookie["httponly"] and cookie["samesite"] == "Strict"
+        assert not cookie["secure"]  # loopback Host
+        only_cookie = {"Cookie": "mimir_session=master-secret"}
+        assert (await c.get("/api/v1/turns", headers=only_cookie)).status == 200
+        assert (await c.post("/api/v1/turns", headers={**only_cookie, "Sec-Fetch-Site": "cross-site"})).status == 403
+        assert (await c.post("/api/v1/turns", headers={"X-API-Key": "master-secret"})).status == 200
+        cleared = await c.delete("/api/v1/web/session", headers=only_cookie)
+        assert cleared.cookies["mimir_session"]["max-age"] == "0"
+        public = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret", "Host": "example.org"})
+        assert public.cookies["mimir_session"]["secure"]
 
 
 def _resolver(home: Path) -> IdentityResolver:

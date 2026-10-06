@@ -2720,26 +2720,21 @@ async def request_mimir_update(
     target_version: Optional[str] = None,
     include_prereleases: bool = False,
 ) -> str:
-    """Approve a mimir package update — writes the pending-update flag.
+    """Request an authenticated operator approval for a mimir update.
 
-    **Escalate-first action** (per memory/core/06-action-boundaries.md):
-    invoke ONLY after the operator has explicitly approved the update
-    in the current conversation. Writing this flag without operator
-    consent is a self-modification of the running binary — the same
-    kind of compounding-cost / silent-drift concern that gates
-    ``memory/core/`` edits. The flag IS the operator's consent
-    signal; do not fabricate it.
+    The tool registers a turn-bound request. Only an authenticated operator
+    ``approve upd-xxxx`` reply on the operator alert channel writes the flag.
 
-    Trigger conditions (all must hold):
+    Suggested conversation before requesting approval:
       1. A ``mimir_update_available`` event has fired (visible in the
          per-turn feedback block).
       2. You raised the available update with the operator in this
          conversation.
-      3. The operator replied with explicit approval ("yes", "do the
-         update", "approve", etc.) — NOT a non-committal acknowledgment.
+      3. Ask the operator to reply with the typed request ID; informal
+         acknowledgments do not approve or create a flag.
 
     What happens after this tool succeeds:
-      - A flag file is written to ``<MIMIR_HOME>/.mimir/pending-update.flag``.
+      - After approval, a flag is written to ``<MIMIR_HOME>/.mimir/pending-update.flag``.
       - On the NEXT process restart (operator runs ``docker compose
         restart`` or the equivalent), the startup pre-flight in
         ``server.main`` runs ``pip install --upgrade``, deletes the
@@ -2759,11 +2754,11 @@ async def request_mimir_update(
         include_prereleases: True → pip ``--pre`` flag passed at
             install time (alpha / beta / rc accepted). Default False.
 
-    Returns: a confirmation string with the path written and what
-    will happen on next restart, plus the operator-facing reminder.
+    Returns: the request ID and instructions for the operator.
     """
-    from pathlib import Path
-    from ..update_on_start import write_flag
+    from packaging.version import InvalidVersion, Version
+    from .. import __version__, approval_requests
+    from ..update_on_start import parse_target_version, write_flag
 
     home_env = os.environ.get("MIMIR_HOME")
     if not home_env:
@@ -2772,21 +2767,44 @@ async def request_mimir_update(
             "can't resolve the flag location. (This shouldn't happen "
             "in a normal deployment; surface to the operator.)"
         )
-    home = Path(home_env)
-
     cleaned_target = (target_version or "").strip()
-    path = write_flag(
-        home,
-        target_version=cleaned_target,
-        include_prereleases=bool(include_prereleases),
+    try:
+        target = parse_target_version(cleaned_target)
+    except InvalidVersion:
+        return f"request_mimir_update refused: invalid PEP 440 target version {cleaned_target!r}"
+    if target is not None and target < Version(__version__):
+        return f"request_mimir_update refused: {cleaned_target} is older than running version {__version__}"
+    dispatcher = _STATE.get("dispatcher")
+    channel = (getattr(getattr(dispatcher, "_config", None), "operator_alert_channel", "") or "").strip()
+    if not channel:
+        return "request_mimir_update refused: no operator alert channel configured"
+
+    def resolve(decision, edit, event, identity_resolver, now, approval_event, reply_source):
+        if decision == "decline":
+            return "declined"
+        canonical = identity_resolver.resolve(event.author) if identity_resolver else None
+        if not canonical:
+            return "unauthenticated_operator"
+        write_flag(
+            Path(home_env), target_version=cleaned_target,
+            include_prereleases=bool(include_prereleases),
+            approval_id=entry.approval_id, approved_by=canonical,
+        )
+        return "granted"
+
+    entry = approval_requests.register(
+        kind="upd", channel_id=channel,
+        description=f"mimir update to {cleaned_target or 'latest'}",
+        expires_at=time.monotonic() + 3600, resolver=resolve,
     )
 
     pin_desc = f"pinned to {cleaned_target}" if cleaned_target else "latest at install time"
     pre_desc = " (pre-releases allowed)" if include_prereleases else ""
     return (
-        f"Pending-update flag written to {path}.\n"
+        f"Update approval requested: {entry.approval_id}. No flag written.\n"
         f"Target: {pin_desc}{pre_desc}.\n"
-        f"On next restart, mimir will run pip install --upgrade and "
+        f"Operator: reply `approve {entry.approval_id}` (or `decline {entry.approval_id}`) "
+        f"on {channel} within one hour. After approval and next restart, mimir will run pip install --upgrade and "
         f"re-exec onto the new code. The running process keeps the "
         f"OLD version until the operator restarts.\n"
         f"Operator: run `docker compose restart` (or the equivalent "

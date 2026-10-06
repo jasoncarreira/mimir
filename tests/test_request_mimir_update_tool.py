@@ -1,119 +1,99 @@
-"""Tests for the ``request_mimir_update`` tool — the operator-approval
-side of the pending-update flag flow."""
+"""Update requests are version-checked and fulfilled only by operator replies."""
 
 from __future__ import annotations
 
+import asyncio
 import json
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from mimir.tools.registry import request_mimir_update
-from mimir.update_on_start import _read_flag, flag_path
+from mimir import __version__, approval_requests
+from mimir.identities import IdentityResolver
+from mimir.models import AgentEvent
+from mimir.tools import registry
+from mimir.update_on_start import flag_path
+from packaging.version import Version
 
 
-@pytest.mark.asyncio
-async def test_writes_flag_at_default_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Default args → bare flag (no pin, no --pre). Verifies the path
-    + the parsed contents from the startup side's perspective."""
+@pytest.fixture
+def setup_update(tmp_path, monkeypatch):
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    result = await request_mimir_update.ainvoke({})
-    assert "Pending-update flag written" in result
-    assert str(flag_path(tmp_path)) in result
+    monkeypatch.setitem(registry._STATE, "dispatcher", SimpleNamespace(
+        _config=SimpleNamespace(operator_alert_channel="discord-1")))
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "identities.yaml").write_text("""people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    return tmp_path, resolver
 
-    parsed = _read_flag(flag_path(tmp_path))
-    assert parsed.target_version == ""
-    assert parsed.include_prereleases is False
-    assert parsed.approved_at is not None
 
-
-@pytest.mark.asyncio
-async def test_pinned_version_carried_through(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Operator approved a specific release → the pin survives to
-    startup-side parsing."""
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    result = await request_mimir_update.ainvoke({"target_version": "0.2.0"})
-    assert "pinned to 0.2.0" in result
-
-    parsed = _read_flag(flag_path(tmp_path))
-    assert parsed.target_version == "0.2.0"
+def reply(approval_id, *, decision="approve", source="discord", trigger="user_message", author="discord-99"):
+    return AgentEvent(trigger=trigger, channel_id="discord-1",
+                      content=f"{decision} {approval_id}", author=author, source=source)
 
 
 @pytest.mark.asyncio
-async def test_include_prereleases_flag_carried_through(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """--pre is opt-in. The tool's parameter routes through to the
-    flag's metadata so startup-side install passes ``--pre`` to pip."""
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    result = await request_mimir_update.ainvoke({
-        "target_version": "0.2.0rc1",
-        "include_prereleases": True,
-    })
-    assert "pre-releases allowed" in result
-
-    parsed = _read_flag(flag_path(tmp_path))
-    assert parsed.target_version == "0.2.0rc1"
-    assert parsed.include_prereleases is True
+@pytest.mark.parametrize("version", ["not a version", "0.0.1"])
+async def test_update_request_requires_valid_non_downgrade_version(setup_update, version):
+    home, _ = setup_update
+    result = await registry.request_mimir_update.ainvoke({"target_version": version})
+    assert "refused" in result
+    assert not flag_path(home).exists()
 
 
 @pytest.mark.asyncio
-async def test_strips_whitespace_in_target_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Operator pasted ``" 0.2.0 "`` from somewhere — strip it."""
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    await request_mimir_update.ainvoke({"target_version": "  0.2.0  "})
-    parsed = _read_flag(flag_path(tmp_path))
-    assert parsed.target_version == "0.2.0"
+async def test_newer_update_registers_without_flag(setup_update):
+    home, _ = setup_update
+    newer = f"{Version(__version__).major + 1}.0.0"
+    result = await registry.request_mimir_update.ainvoke({"target_version": newer})
+    assert "upd-" in result and newer in result
+    assert not flag_path(home).exists()
 
 
 @pytest.mark.asyncio
-async def test_missing_mimir_home_returns_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No ``MIMIR_HOME`` env → the tool returns an error string and
-    doesn't write anywhere. Shouldn't happen in normal deployments
-    but defensive."""
+async def test_approved_update_only_writes_after_authenticated_reply(setup_update):
+    home, identity = setup_update
+    target = f"{Version(__version__).major + 1}.0.0rc1"
+    result = await registry.request_mimir_update.ainvoke({"target_version": f"  {target}  ", "include_prereleases": True})
+    approval_id = result.split("Update approval requested: ")[1].split(".")[0]
+    assert not flag_path(home).exists()
+    for untrusted in (reply(approval_id, source="web"), reply(approval_id, trigger="scheduled_tick"),
+                      reply(approval_id, author="unknown")):
+        assert approval_requests.resolve(untrusted, identity).status == "unauthenticated_operator"
+        assert not flag_path(home).exists()
+    assert approval_requests.resolve(reply(approval_id), identity).status == "granted"
+    data = json.loads(flag_path(home).read_text())
+    assert data["target_version"] == target
+    assert data["include_prereleases"] is True
+    assert data["approval_id"] == approval_id
+    assert data["approved_by"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_decline_and_latest_never_write_without_approval(setup_update):
+    home, identity = setup_update
+    result = await registry.request_mimir_update.ainvoke({})
+    approval_id = result.split("Update approval requested: ")[1].split(".")[0]
+    assert not flag_path(home).exists()
+    assert approval_requests.resolve(reply(approval_id, decision="decline"), identity).status == "declined"
+    assert not flag_path(home).exists()
+
+
+@pytest.mark.asyncio
+async def test_missing_home_and_operator_channel_refuse(tmp_path, monkeypatch):
     monkeypatch.delenv("MIMIR_HOME", raising=False)
-    result = await request_mimir_update.ainvoke({})
-    assert "request_mimir_update failed" in result
-    assert "MIMIR_HOME" in result
-
-
-@pytest.mark.asyncio
-async def test_overwrites_existing_flag(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Operator changed their mind — second invocation overrides the
-    first. Common case: approved a pin, then changed to ""latest""."""
+    assert "MIMIR_HOME" in await registry.request_mimir_update.ainvoke({})
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    await request_mimir_update.ainvoke({"target_version": "0.2.0"})
-    await request_mimir_update.ainvoke({})  # second call: empty target
-
-    parsed = _read_flag(flag_path(tmp_path))
-    assert parsed.target_version == ""
+    monkeypatch.setitem(registry._STATE, "dispatcher", None)
+    assert "refused" in await registry.request_mimir_update.ainvoke({})
+    assert not flag_path(tmp_path).exists()
 
 
-@pytest.mark.asyncio
-async def test_tool_is_coroutine() -> None:
-    """Sanity — async-only tool shape (no sync
-    fallback). Deepagents routes async tools via ``coroutine``."""
-    import asyncio
-    assert request_mimir_update.coroutine is not None
-    assert asyncio.iscoroutinefunction(request_mimir_update.coroutine)
-    assert request_mimir_update.func is None
-
-
-@pytest.mark.asyncio
-async def test_tool_in_all_mimir_tools() -> None:
-    """The tool is wired into ``all_mimir_tools`` so deepagents
-    discovers it at agent construction."""
-    from mimir.tools.registry import all_mimir_tools
-    tools = all_mimir_tools()
-    names = {t.name for t in tools}
-    assert "request_mimir_update" in names
+def test_tool_shape():
+    assert asyncio.iscoroutinefunction(registry.request_mimir_update.coroutine)
+    assert "request_mimir_update" in {t.name for t in registry.all_mimir_tools()}
