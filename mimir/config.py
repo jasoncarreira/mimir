@@ -880,11 +880,11 @@ class Config:
     # without removing state/identities.yaml.
     cross_platform_pull: bool
 
-    # Access-control policy enforcement. Defaults false for backwards
-    # compatibility: the central policy can classify allow/deny outcomes, but
-    # callers should only reject unknown/non-allowlisted authors when this is
-    # explicitly enabled.
+    # IFC, tool and sink policy enforcement; independent of bridge intake.
     access_control_enforced: bool
+    # Explicitly admit unauthorised bridge authors in shadow mode. Ignored when
+    # access control is enforced; intake is closed by default.
+    open_bridge: bool
 
     # Operator alert channel (v0.4 §6) — channel_id the agent uses for
     # high-priority signals to the operator that don't fit the current
@@ -1316,6 +1316,7 @@ class Config:
                 model_spec=model_spec,
                 coding_enabled=coding_enabled_value,
             ),
+            open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
             unauthorized_user_behavior=_env(

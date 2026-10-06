@@ -357,7 +357,7 @@ class Dispatcher:
         decision = authorize_inbound(
             event,
             self._identity_resolver,
-            enforce=self._config.access_control_enforced,
+            enforce=self._config.access_control_enforced or not self._config.open_bridge,
         )
         if decision.allowed:
             await log_event(
@@ -370,7 +370,7 @@ class Dispatcher:
                 canonical_author=decision.canonical_author,
                 status=decision.status.value,
                 trigger=event.trigger,
-                enforcement_enabled=decision.enforcement_enabled,
+                enforcement_enabled=self._config.access_control_enforced,
             )
             return True
 
@@ -385,7 +385,8 @@ class Dispatcher:
             reason=decision.denial_reason,
             status=decision.status.value,
             trigger=event.trigger,
-            enforcement_enabled=decision.enforcement_enabled,
+            enforcement_enabled=self._config.access_control_enforced,
+            intake_gate=True,
         )
         is_dm = self._is_dm_channel(event.channel_id)
         if is_dm:

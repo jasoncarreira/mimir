@@ -3591,12 +3591,36 @@ async def test_inbound_audit_events_are_structured_and_redacted(
         "status": expected_status,
         "trigger": "user_message",
         "enforcement_enabled": True,
+        **({"intake_gate": True} if expected_reason is not None else {}),
         **({"reason": expected_reason} if expected_reason is not None else {}),
     }
     rendered = repr(captured)
     assert "secret-message-body" not in rendered
     assert "secret-api-key" not in rendered
     assert "api_key" not in rendered
+
+
+def test_intake_gate_keeps_ifc_sink_and_tool_decisions_in_shadow(tmp_path: Path) -> None:
+    """Closing bridge intake must not turn on IFC for admitted turns."""
+    cfg = _dispatcher_config(tmp_path, enforce=False)
+    assert cfg.open_bridge is False
+    auth = replace(_trusted_operator_write_auth(), enforcement_enabled=cfg.access_control_enforced)
+    labels = auth.ifc_labels
+    sink = SinkGate.check_sink_flow(
+        "post_message", "public", labels, auth,
+        enforce=cfg.access_control_enforced, sink_category=SinkCategory.PUBLIC,
+    )
+    assert sink.allowed is True
+    assert sink.would_block is True
+    assert sink.reason == "ifc_label_blocked:public"
+
+    tool = ToolRegistry().authorize_tool(
+        "send_message", auth, enforce=cfg.access_control_enforced,
+        target_channel="public", ifc_labels=labels,
+    )
+    assert tool.allowed is True
+    assert tool.would_block is True
+    assert tool.is_shadow_decision is True
 
 
 @pytest.mark.asyncio
