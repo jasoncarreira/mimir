@@ -153,9 +153,11 @@ def _minimal_direct_exec_env() -> dict[str, str]:
 
 
 def disable_process_dumpability() -> None:
-    """Keep same-uid children from reading the Linux server's proc secrets.
+    """Keep same-uid shells from reading this Linux process's proc secrets.
 
-    This does not protect other same-uid processes or root/CAP_SYS_PTRACE.
+    Call at every CLI entry and reapply after any exec. This disables core
+    dumps and same-uid procfs inspection, not root/CAP_SYS_PTRACE access.
+    It does not protect non-mimir same-uid processes with inherited secrets.
     Fail startup on Linux if the kernel cannot enforce the requested control.
     """
     if sys.platform != "linux":
@@ -207,8 +209,8 @@ def refuse_protected_shell_operands(command: str, cwd: Path | None, tool: str) -
     """Best-effort literal screen, not a shell sandbox.
 
     Globs, braces, variable indirection and interpreter code can bypass this
-    screen. The child environment scrub and non-dumpable Linux server parent
-    are the controls preventing recovery of the server's ambient credentials.
+    screen. The child environment scrub and non-dumpable Linux mimir CLI
+    processes are the controls preventing recovery of their ambient credentials.
     """
     from ..read_policy import _has_protected_read_name
     from .refusals import ToolPolicyRefusal

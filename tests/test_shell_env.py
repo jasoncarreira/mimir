@@ -101,6 +101,62 @@ assert "PermissionError" in result.stderr
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux procfs dumpability control")
+@pytest.mark.parametrize("subcommand", ["watchdog", "worklink"])
+def test_real_cli_non_run_sibling_environment_unreadable(subcommand):
+    if os.geteuid() == 0:
+        pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    # Drive the real CLI entry in an isolated sibling process, keeping it alive
+    # after --help exits. Prove readability before CLI startup to avoid a
+    # vacuous pass on hosts which already restrict same-uid procfs reads.
+    script = '''
+import contextlib, ctypes, io, sys
+from mimir.cli import main
+libc = ctypes.CDLL(None)
+assert libc.prctl(4, 1, 0, 0, 0) == 0
+print("before", flush=True)
+sys.stdin.readline()
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        main([sys.argv[1], "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+print("after", flush=True)
+sys.stdin.read()
+'''
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", script, subcommand], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert sibling.stdout.readline().strip() == "before"
+        probe = f"open('/proc/{sibling.pid}/environ', 'rb').close()"
+        argv = ["bash", "-lc", _shell_env.login_shell_command(
+            "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe),
+        )]
+        env = _shell_env.interactive_shell_env()
+        before = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+        assert before.returncode == 0, before.stderr
+        sibling.stdin.write("start cli\n")
+        sibling.stdin.flush()
+        assert sibling.stdout.readline().strip() == "after"
+        after = subprocess.run(
+            argv, env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert after.returncode != 0
+        assert "PermissionError" in after.stderr
+        sibling.stdin.close()
+        assert sibling.wait(timeout=10) == 0
+    finally:
+        if sibling.poll() is None:
+            sibling.kill()
+        sibling.wait(timeout=10)
+        sibling.stdout.close()
+        sibling.stderr.close()
+        if not sibling.stdin.closed:
+            sibling.stdin.close()
+
+
 def test_interactive_passthrough_logs_names_only(monkeypatch):
     events = []
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: events.append((a, kw)))
