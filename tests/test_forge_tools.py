@@ -792,19 +792,25 @@ class FakeForge:
         self.calls.append(("rerequest", scope, reviewer))
 
 
-def _ci_watch_context(*, poller="github-ci-watch", items=None):
+def _ci_watch_context(
+    *, poller="github-ci-watch", items=None, principal=None,
+    capabilities=("ci_run_jobs",), extra=None, event_ingress=None,
+):
     authority = access_control.build_trigger_service_principal(
-        canonical=f"poller:{poller}", trigger="poller", profile="github",
+        canonical=principal or f"poller:{poller}", trigger="poller", profile="github",
         tier=access_control.CapabilityTier.CODE_EXECUTION,
         capabilities=("ci_run_jobs",), creation_path="mimir.pollers.run_poller",
     )
+    # Vary the capability alone: keep the repository-readable domain and every
+    # other authority property intact so another guard cannot hide its removal.
+    authority = replace(authority, capabilities=capabilities)
     return access_control.create_auth_context(AgentEvent(
         trigger="poller", channel_id=f"poller:{poller}", source="poller",
         service_principal=authority.canonical, service_authority=authority,
         extra={"poller_name": poller, "items": items if items is not None else [
             {"repo": "owner/repo", "run_id": 42, "event_type": "ci_failure"},
-        ]},
-    ), enforce=True, ifc_labels=InformationFlowLabels())
+        ], **(extra or {})},
+    ), enforce=True, event_ingress=event_ingress, ifc_labels=InformationFlowLabels())
 
 
 def _ci_runtime(context):
@@ -847,6 +853,75 @@ async def test_ci_run_jobs_requires_poller_record_not_model_selector(monkeypatch
     ):
         with pytest.raises(ToolException):
             await ci_run_jobs.coroutine("owner/repo", 42, runtime=_ci_runtime(context))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("context_kwargs", [
+    pytest.param(
+        {"extra": {"poller_name": "github-activity"}},
+        id="wrong-poller-name-only",
+    ),
+    pytest.param(
+        {"principal": "poller:github-activity"}, id="wrong-service-principal-only",
+    ),
+    pytest.param({"capabilities": ()}, id="missing-ingress-capability-only"),
+    pytest.param(
+        {"extra": {access_control.HTTP_EVENT_INGRESS_EXTRA_KEY: "http"}},
+        id="http-ingress-extra-only",
+    ),
+    pytest.param({"event_ingress": "http"}, id="explicit-http-ingress-only"),
+    pytest.param({"items": [
+        {"repo": "owner/repo", "run_id": 42, "event_type": "pr_opened"},
+    ]}, id="non-ci-event-type-only"),
+])
+@pytest.mark.asyncio
+async def test_ci_run_jobs_ingress_guards_are_independent(monkeypatch, context_kwargs):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    assert _ci_watch_context().ci_run_targets == frozenset({("owner/repo", 42)})
+    context = _ci_watch_context(**context_kwargs)
+    assert context.ci_run_targets == frozenset()
+    with pytest.raises(ToolException, match="outside this turn's poller scope"):
+        await ci_run_jobs.coroutine("owner/repo", 42, runtime=_ci_runtime(context))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("missing_authority", ["capability", "principal"])
+def test_ci_run_jobs_authz_capability_independent_of_carried_selector(
+    monkeypatch, missing_authority,
+):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    args = {"repository": "owner/repo", "run_id": 42}
+    assert registry.authorize_tool(
+        "ci_run_jobs", context, enforce=True, arguments=args,
+    ).allowed
+    if missing_authority == "capability":
+        context = replace(context, service_authority=replace(
+            context.service_authority, capabilities=(),
+        ))
+        service = access_control.get_trusted_service_from_auth_context(context)
+        assert service is not None
+        assert "repository" in service.readable_domains
+        assert not service.has_capability("ci_run_jobs")
+    else:
+        context = replace(context, is_service=False, service_authority=None)
+        assert access_control.get_trusted_service_from_auth_context(context) is None
+    # Preserve the valid run selector to isolate the authorization-time guard
+    # from the independently tested ingress capability check.
+    assert context.ci_run_targets == frozenset({("owner/repo", 42)})
+    authorization = registry.authorize_tool(
+        "ci_run_jobs", context, enforce=True, arguments=args,
+    )
+    assert not authorization.allowed
+    assert authorization.reason == "ci_run_scope_denied"
+    assert authorization.would_block
     assert client.calls == []
 
 
