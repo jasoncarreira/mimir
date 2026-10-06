@@ -322,12 +322,6 @@ class GitHubForgeClient:
         if len(raw) > max_bytes:
             if not truncate_text or response.status_code >= 400:
                 raise ForgeResponseTooLarge("forge response exceeded size limit")
-            if "application/json" in response.headers.get("Content-Type", ""):
-                try:
-                    if isinstance(response.json(), list):
-                        raise ForgeError("file content refused: directory response")
-                except ValueError as exc:
-                    raise ForgeError("forge returned invalid JSON") from exc
             try:
                 raw.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -349,12 +343,7 @@ class GitHubForgeClient:
             )
         if not raw:
             return "" if accept == "application/vnd.github.raw" else None
-        if accept == "application/vnd.github.raw" and "application/json" in response.headers.get("Content-Type", ""):
-            try:
-                if isinstance(response.json(), list):
-                    return response.json()  # directories are never file content
-            except ValueError as exc:
-                raise ForgeError("forge returned invalid JSON") from exc
+        if accept == "application/vnd.github.raw":
             try:
                 return raw.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -516,7 +505,7 @@ class GitHubForgeClient:
 
     def get_file_content(self, scope: RepoPRActionScope, path: str) -> str:
         repository, _number = self._target(scope)
-        # Validate before even the metadata request; quote each segment, never the separators.
+        # Validate before requesting the pinned commit or walking its tree.
         parts = path.split("/") if isinstance(path, str) else []
         if (
             not parts or not path or path.startswith("/")
@@ -526,20 +515,8 @@ class GitHubForgeClient:
             or len(path.encode("utf-8")) > 4_096
         ):
             raise ForgeError("invalid repository path")
-        endpoint = (
-            f"/repos/{repository}/contents/{'/'.join(quote(part, safe='') for part in parts)}"
-            f"?ref={scope.observed_head_sha}"
-        )
-        metadata = self._request(
-            "GET", endpoint, accept="application/vnd.github.object+json",
-            not_found="file not found at scoped head",
-        )
-        if not isinstance(metadata, Mapping) or metadata.get("type") != "file" or (
-            metadata.get("target") is not None or metadata.get("submodule_git_url") is not None
-        ):
-            raise ForgeError("file content refused: path is not a regular file (directory, symlink or submodule)")
-        # Contents dereferences symlinks pointing to files. The pinned commit's
-        # Git tree supplies the actual mode at each path component instead.
+        # The pinned commit's Git tree proves every component's actual mode;
+        # unlike Contents, it never dereferences a symlink to a regular file.
         commit = self._request(
             "GET", f"/repos/{repository}/git/commits/{scope.observed_head_sha}",
         )
@@ -564,7 +541,6 @@ class GitHubForgeClient:
             if final:
                 if (
                     entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}
-                    or entry.get("sha") != metadata.get("sha")
                 ):
                     raise ForgeError("file content refused: path is not a regular file at scoped head")
             elif entry.get("type") != "tree" or entry.get("mode") != "040000":
@@ -572,8 +548,11 @@ class GitHubForgeClient:
             tree_sha = entry.get("sha")
             if not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None:
                 raise ForgeError("file content refused: invalid scoped tree entry")
+        # Fetch the verified blob once: no base64 Contents metadata response
+        # can exceed the smaller JSON cap before this bounded raw read.
         data = self._request(
-            "GET", endpoint, accept="application/vnd.github.raw",
+            "GET", f"/repos/{repository}/git/blobs/{tree_sha}",
+            accept="application/vnd.github.raw",
             max_bytes=_MAX_DIFF_FETCH_BYTES, not_found="file not found at scoped head",
             truncate_text=True,
         )

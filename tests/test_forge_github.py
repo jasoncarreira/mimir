@@ -67,7 +67,6 @@ class Session:
 def _file_responses(path: str, head: str = "a" * 40) -> list[Response]:
     parts = path.split("/")
     responses = [
-        Response({"type": "file", "sha": "d" * 40}),
         Response({"sha": head, "tree": {"sha": "c" * 40}}),
     ]
     for index, part in enumerate(parts):
@@ -112,22 +111,19 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
-def test_file_content_is_quoted_and_pinned_to_observed_head() -> None:
+def test_file_content_reads_verified_blob_from_observed_head() -> None:
     session = Session([*_file_responses("src/a #1.py", "b" * 40),
                        Response("text at observed head", content_type="text/plain")])
     client = GitHubForgeClient(session=session)
     scope = replace(_scope(), observed_head_sha="b" * 40)
     assert client.get_file_content(scope, "src/a #1.py") == "text at observed head"
-    endpoint = f"https://api.github.com/repos/owner/repo/contents/src/a%20%231.py?ref={'b' * 40}"
     assert [call[1] for call in session.calls] == [
-        endpoint,
         f"https://api.github.com/repos/owner/repo/git/commits/{'b' * 40}",
         f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
         f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
-        endpoint,
+        f"https://api.github.com/repos/owner/repo/git/blobs/{'d' * 40}",
     ]
     assert session.calls[-1][2]["headers"]["Accept"] == "application/vnd.github.raw"
-    assert session.calls[0][2]["headers"]["Accept"] == "application/vnd.github.object+json"
 
 
 @pytest.mark.parametrize("path", ["../x", "a/../../x", "/etc/passwd", "a\\b", "a\x00b", "", "a" * 4_097])
@@ -138,29 +134,65 @@ def test_file_content_invalid_path_does_not_request(path: str) -> None:
     assert session.calls == []
 
 
-@pytest.mark.parametrize("metadata", [
-    [{"type": "file"}],
-    {"type": "dir"},
-    {"type": "symlink", "target": "secrets.txt"},
-    {"type": "submodule", "submodule_git_url": "https://example.com/repo"},
-    {"type": "file", "target": "secrets.txt"},
-    {"type": "file", "submodule_git_url": "https://example.com/repo"},
+@pytest.mark.parametrize("entry", [
+    {"path": "link", "type": "tree", "mode": "040000", "sha": "d" * 40},
+    {"path": "link", "type": "blob", "mode": "120000", "sha": "d" * 40},
+    {"path": "link", "type": "commit", "mode": "160000", "sha": "d" * 40},
 ])
-def test_file_content_refuses_non_regular_file_without_raw_fetch(metadata) -> None:
-    session = Session([Response(metadata)])
+def test_file_content_refuses_non_regular_file_without_raw_fetch(entry) -> None:
+    responses = _file_responses("link")
+    responses[-1] = Response({"tree": [entry]})
+    session = Session(responses)
     with pytest.raises(ForgeError, match="not a regular file"):
-        GitHubForgeClient(session=session).get_file_content(_scope(), "src/link")
-    assert len(session.calls) == 1
+        GitHubForgeClient(session=session).get_file_content(_scope(), "link")
+    assert len(session.calls) == 2
 
 
-def test_file_content_refuses_binary_and_directory_raw_response() -> None:
-    for raw_response in (
+def test_file_content_refuses_binary_raw_response() -> None:
+    session = Session([
+        *_file_responses("src/app.py"),
         Response(b"\xffbad", content_type="application/octet-stream"),
-        Response([{"type": "file"}]),
-    ):
-        session = Session([*_file_responses("src/app.py"), raw_response])
-        with pytest.raises(ForgeError, match="invalid text|directory"):
-            GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+    ])
+    with pytest.raises(ForgeError, match="invalid text"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+
+
+def test_file_content_near_one_mb_does_not_fetch_base64_metadata() -> None:
+    import base64
+    import json
+
+    content = "a" * 900_000
+    metadata = {"type": "file", "sha": "d" * 40,
+                "content": base64.encodebytes(content.encode()).decode()}
+    assert len(json.dumps(metadata).encode()) > github_module._MAX_RESPONSE_BYTES
+
+    class MetadataOverflowSession(Session):
+        def request(self, method, url, **kwargs):
+            if "/contents/" in url:
+                # Reintroducing the Contents read fails at its default 1 MiB cap.
+                self.calls.append((method, url, kwargs))
+                return Response(metadata)
+            return super().request(method, url, **kwargs)
+
+    session = MetadataOverflowSession([
+        *_file_responses("uv.lock"),
+        Response(content, content_type="application/vnd.github.raw; charset=utf-8"),
+    ])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "uv.lock") == content
+    assert all("/contents/" not in call[1] for call in session.calls)
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'d' * 40}")
+
+
+def test_file_content_refuses_over_cap_binary_instead_of_truncating() -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    # Put the invalid byte beyond the retained prefix: validating only that
+    # prefix (or deleting the strict decode) must not silently accept binary.
+    session = Session([
+        *_file_responses("large.bin"),
+        Response(b"a" * cap + b"\xff", content_type="application/octet-stream"),
+    ])
+    with pytest.raises(ForgeError, match="binary file refused"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "large.bin")
 
 
 def test_file_content_allows_empty_regular_file() -> None:
@@ -175,11 +207,11 @@ def test_file_content_preserves_json_file_bytes_as_text() -> None:
 
 def test_file_content_refuses_unverified_commit_tree() -> None:
     responses = _file_responses("src/app.py")
-    responses[1] = Response({"sha": "f" * 40, "tree": {"sha": "c" * 40}})
+    responses[0] = Response({"sha": "f" * 40, "tree": {"sha": "c" * 40}})
     session = Session(responses)
     with pytest.raises(ForgeError, match="scoped commit tree is unavailable"):
         GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
-    assert len(session.calls) == 2
+    assert len(session.calls) == 1
 
 
 def test_file_content_truncates_over_diff_fetch_cap_and_passes_max_bytes(monkeypatch) -> None:
@@ -204,30 +236,37 @@ def test_file_content_truncates_over_diff_fetch_cap_and_passes_max_bytes(monkeyp
     assert calls[-1]["max_bytes"] == cap
 
 
-@pytest.mark.parametrize("entry", [
-    {"path": "link", "type": "blob", "mode": "120000", "sha": "d" * 40},
-    {"path": "link", "type": "commit", "mode": "160000", "sha": "e" * 40},
-    {"path": "link", "type": "blob", "mode": "100644", "sha": "e" * 40},
-])
-def test_file_content_refuses_dereferenced_symlink_and_nonmatching_blob(entry) -> None:
-    # Contents may claim this path is a file after dereferencing a symlink.
+@pytest.mark.parametrize("sha", [None, "", "not-a-sha", "e" * 39])
+def test_file_content_refuses_invalid_blob_sha(sha) -> None:
     responses = _file_responses("link")
-    responses[-1] = Response({"tree": [entry]})
+    responses[-1] = Response({"tree": [{
+        "path": "link", "type": "blob", "mode": "100644", "sha": sha,
+    }]})
     session = Session(responses)
-    with pytest.raises(ForgeError, match="not a regular file at scoped head"):
+    with pytest.raises(ForgeError, match="invalid scoped tree entry"):
         GitHubForgeClient(session=session).get_file_content(_scope(), "link")
-    assert len(session.calls) == 3  # no raw request
+    assert len(session.calls) == 2  # no raw request
+
+
+def test_file_content_fetches_blob_sha_from_tree_not_an_assumed_value() -> None:
+    responses = _file_responses("file.py")
+    responses[-1] = Response({"tree": [{
+        "path": "file.py", "type": "blob", "mode": "100755", "sha": "e" * 40,
+    }]})
+    session = Session([*responses, Response("executable", content_type="text/plain")])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "file.py") == "executable"
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'e' * 40}")
 
 
 def test_file_content_refuses_symlinked_parent() -> None:
     responses = _file_responses("alias/file.py")
-    responses[2] = Response({"tree": [{
+    responses[1] = Response({"tree": [{
         "path": "alias", "type": "blob", "mode": "120000", "sha": "e" * 40,
     }]})
     session = Session(responses)
     with pytest.raises(ForgeError, match="crosses a symlink"):
         GitHubForgeClient(session=session).get_file_content(_scope(), "alias/file.py")
-    assert len(session.calls) == 3
+    assert len(session.calls) == 2
 
 
 def _job_metadata():
