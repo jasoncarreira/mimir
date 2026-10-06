@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
 
 // Regression for github #563 / PR #774: saving an API key must refetch whoami so
@@ -11,6 +11,24 @@ import type { ReactNode } from "react";
 // login screen instead of a dashboard full of 401 error panels.
 
 const STORAGE_KEY = "mimir.api_key";
+let sessionKey = "";
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async (path: string, options?: RequestInit) => {
+    if (path !== "/api/v1/web/session") throw new Error(`unexpected session URL: ${path}`);
+    const headers = new Headers(options?.headers);
+    if (options?.method === "POST") {
+      const key = headers.get("X-API-Key") || "";
+      if (key === "revoked-key" || !key) return new Response('{"error":"unauthorized"}', { status: 401, headers: { "content-type": "application/json" } });
+      sessionKey = key;
+    } else if (options?.method === "DELETE") {
+      sessionKey = "";
+    } else if (!sessionKey) {
+      return new Response('{"error":"unauthorized"}', { status: 401, headers: { "content-type": "application/json" } });
+    }
+    return new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } });
+  }));
+});
 
 const { routeFailures, whoami, wikiRouteLoads, liveEventsState } = vi.hoisted(() => ({
   routeFailures: { chat: false },
@@ -22,7 +40,7 @@ const { routeFailures, whoami, wikiRouteLoads, liveEventsState } = vi.hoisted(()
 // whoami reflects the *current* stored key, exactly as the real client would:
 // admin when a key is present, anonymous (non-admin) when not.
 whoami.getWhoami = vi.fn(async () => {
-  const key = window.localStorage.getItem(STORAGE_KEY);
+  const key = sessionKey;
   return {
     ok: true,
     version: "v1",
@@ -129,9 +147,7 @@ const { useChatStore } = await import("./chatStore");
 const { useUiState } = await import("./uiState");
 
 function renderApp(initialEntries = ["/"]) {
-  // The store seeds apiKeyPresent from localStorage at import (when it's empty);
-  // mirror a fresh page load by syncing it to the current key before each render.
-  useUiState.setState({ apiKeyPresent: Boolean(window.localStorage.getItem(STORAGE_KEY)) });
+  useUiState.setState({ apiKeyPresent: false });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
@@ -145,6 +161,8 @@ function renderApp(initialEntries = ["/"]) {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  sessionKey = "";
+  vi.unstubAllGlobals();
   window.history.replaceState(null, "", "/");
   bootstrapOverride = null;
   skinLayout = "top-nav";
@@ -384,7 +402,8 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
 
     // Key gone -> bootstrap is invalidated so the prior user's UI data cannot
     // survive sign-out. The loading state is transient, then login returns.
-    expect(screen.getByText("Loading server auth policy…")).toBeTruthy();
+    // Cookie deletion is asynchronous; the login screen appears only after
+    // the server acknowledges that the browser credential was cleared.
     await waitFor(() =>
       expect(screen.queryByRole("link", { name: /Users/ })).toBeNull()
     );
@@ -403,8 +422,9 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
-    expect(window.localStorage.getItem(STORAGE_KEY)).toBe("replacement-key");
     expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull();
+    expect(sessionKey).toBe("replacement-key");
   });
 
   it("redirects the legacy /admin/users path to the Admin Users sub-tab (#1169)", async () => {

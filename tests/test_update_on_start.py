@@ -130,6 +130,26 @@ def test_apply_no_flag_returns_false(tmp_path: Path) -> None:
 # ─── apply_pending_update — happy path ──────────────────────────────
 
 
+def test_invalid_flag_version_never_reaches_pip(tmp_path, monkeypatch):
+    write_flag(tmp_path, target_version="not a version")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: pytest.fail("pip called"))
+    events = []
+    assert apply_pending_update(tmp_path, lambda kind, **fields: events.append((kind, fields))) is True
+    assert ("mimir_update_failed", {"reason": "invalid_target_version"}) in events
+    assert not flag_path(tmp_path).exists()
+
+
+def test_operator_touch_still_installs_latest(tmp_path, monkeypatch):
+    flag = flag_path(tmp_path)
+    flag.parent.mkdir(parents=True)
+    flag.touch()
+    specs = []
+    monkeypatch.setattr("mimir.update_on_start._run_pip_install",
+                        lambda spec, pre, emit: specs.append(spec) or 1)
+    assert apply_pending_update(tmp_path, lambda *a, **kw: None) is True
+    assert specs == ["mimir-agent"]
+
+
 def test_apply_happy_path_runs_pip_then_execs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

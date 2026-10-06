@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import http.client
 import ipaddress
 import json
 import logging
@@ -37,6 +38,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import (
     HTTPRedirectHandler,
+    HTTPHandler,
+    HTTPSHandler,
+    ProxyHandler,
     Request,
     build_opener,
 )
@@ -322,7 +326,7 @@ class SSRFBlocked(ValueError):
     """
 
 
-def _validate_public_host(hostname: str) -> None:
+def _validate_public_host(hostname: str) -> tuple[str, ...]:
     """Reject SSRF-shaped targets before any network call.
 
     Resolves ``hostname`` via ``getaddrinfo`` and asserts every returned
@@ -332,14 +336,9 @@ def _validate_public_host(hostname: str) -> None:
     string all reject. Defends against prompt-controlled URLs pivoting
     the agent into the operator's internal network.
 
-    Note on DNS rebinding: this call resolves the host once. The
-    subsequent ``urlopen`` re-resolves at connect time, so a TTL-0
-    record returning ``1.2.3.4`` here and ``127.0.0.1`` at connect
-    is a residual gap — fully closing it requires connecting to the
-    IP literal with a ``Host:`` header override, which breaks HTTPS
-    cert validation without significant urllib3 plumbing. The
-    redirect handler below re-validates each hop, so the practical
-    attack window is narrow. Documented; defer to a follow-up.
+    The returned addresses are the only permitted dial targets. The
+    connection handlers pin every hop while retaining the original Host
+    header and TLS server name.
     """
     if not hostname or hostname.lower() in ("localhost", "localhost.localdomain"):
         raise SSRFBlocked(f"fetch target host {hostname!r} is not allowed")
@@ -348,6 +347,7 @@ def _validate_public_host(hostname: str) -> None:
         infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
         raise SSRFBlocked(f"DNS resolution failed for {hostname!r}: {exc}") from exc
+    addresses = []
     for info in infos:
         sockaddr = info[4]
         ip_str = sockaddr[0]
@@ -371,16 +371,66 @@ def _validate_public_host(hostname: str) -> None:
             raise SSRFBlocked(
                 f"fetch target {hostname!r} resolves to non-public address {ip_str}"
             )
+        addresses.append(ip_str)
+    if not addresses:
+        raise SSRFBlocked(f"no addresses resolved for {hostname!r}")
+    return tuple(addresses)
 
 
-def _validate_fetch_url(url: str) -> None:
+def _validate_fetch_url(url: str) -> tuple[str, ...]:
     """Run SSRF + scheme checks on a candidate URL."""
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise SSRFBlocked(f"only http/https URLs are allowed (got {parsed.scheme!r})")
     if not parsed.hostname:
         raise SSRFBlocked("fetch target has no hostname")
-    _validate_public_host(parsed.hostname)
+    if parsed.username is not None or parsed.password is not None:
+        raise SSRFBlocked("credentials in fetch URL are not allowed")
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise SSRFBlocked("invalid fetch port") from exc
+    return _validate_public_host(parsed.hostname)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, *, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        # Never fall back to resolving the hostname, including on connection
+        # failure: trying another vetted address is safe, falling back is not.
+        self.sock = socket.create_connection((self._addresses[0], self.port), self.timeout,
+                                             self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, *, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        self.sock = socket.create_connection((self._addresses[0], self.port), self.timeout,
+                                             self.source_address)
+        # Preserve both SNI and certificate hostname verification; never use
+        # the dialed IP as the TLS identity.
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(HTTPHandler):
+    def http_open(self, req):
+        addresses = _validate_fetch_url(req.full_url)
+        return self.do_open(lambda host, **kw: _PinnedHTTPConnection(host, addresses=addresses, **kw), req)
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        addresses = _validate_fetch_url(req.full_url)
+        return self.do_open(lambda host, **kw: _PinnedHTTPSConnection(
+            host, addresses=addresses, context=self._context, **kw), req)
 
 
 class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
@@ -409,7 +459,10 @@ class _SSRFCheckingRedirectHandler(HTTPRedirectHandler):
 
 def _open_url(request: Request, timeout: int):
     """Open a URL with the SSRF-checking redirect handler installed."""
-    opener = build_opener(_SSRFCheckingRedirectHandler())
+    # Ignore environment proxies: a proxy would resolve the original hostname
+    # outside our pinned transport, bypassing the SSRF boundary.
+    opener = build_opener(ProxyHandler({}), _PinnedHTTPHandler(), _PinnedHTTPSHandler(),
+                          _SSRFCheckingRedirectHandler())
     return opener.open(request, timeout=timeout)  # noqa: S310
 
 

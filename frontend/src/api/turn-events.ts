@@ -1,4 +1,4 @@
-import { buildQuery, getStoredApiKey } from "./http";
+import { buildQuery } from "./http";
 import type { TurnStreamEvent } from "./generated/contracts";
 import { runReconnectingSse, SseResponseError } from "./sse-reconnect";
 
@@ -83,8 +83,7 @@ export function createTurnEventStream(
     onError,
     connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
-      const key = apiKey ?? getStoredApiKey();
-      if (key) headers.set("X-API-Key", key);
+      if (apiKey) headers.set("X-API-Key", apiKey);
       const response = await fetchImpl(
         `${baseUrl}/api/v1/turn-events${buildQuery({ channel })}`,
         { headers, signal: controller.signal }

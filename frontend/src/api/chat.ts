@@ -1,4 +1,4 @@
-import { apiFetchEnvelope, getStoredApiKey, type ApiClientOptions } from "./http";
+import { apiFetchEnvelope, type ApiClientOptions } from "./http";
 import type {
   ApiSuccessEnvelope,
   ChatAcceptedData,
@@ -162,8 +162,7 @@ export function createChatStream(
     onError,
     connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
-      const key = apiKey ?? getStoredApiKey();
-      if (key) headers.set("X-API-Key", key);
+      if (apiKey) headers.set("X-API-Key", apiKey);
       const response = await fetchImpl(`${baseUrl}/chat/stream`, {
         headers,
         signal: controller.signal

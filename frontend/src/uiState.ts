@@ -1,13 +1,4 @@
 import { create } from "zustand";
-import { MIMIR_API_KEY_STORAGE_KEY } from "./api";
-
-function hasStoredKey(): boolean {
-  try {
-    return Boolean(window.localStorage.getItem(MIMIR_API_KEY_STORAGE_KEY));
-  } catch {
-    return false;
-  }
-}
 
 interface UiState {
   detailsPanelOpen: boolean;
@@ -42,7 +33,7 @@ export const useUiState = create<UiState>((set) => ({
   selectedChatMessageId: "",
   collapsedRegions: {},
   composerActive: false,
-  apiKeyPresent: hasStoredKey(),
+  apiKeyPresent: false,
   apiKeyRejected: false,
   apiKeyEpoch: 0,
   setComposerActive: (composerActive) => set({ composerActive }),

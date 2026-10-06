@@ -1117,6 +1117,153 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+@pytest.mark.parametrize("reply_style,request_count", [("named", 1), ("bare", 1), ("bare", 2)])
+async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+    reply_style: str, request_count: int, request: pytest.FixtureRequest,
+):
+    """Named/sole bare replies resolve; ambiguous bare replies list IDs pre-turn."""
+    from mimir import __version__, approval_requests, mid_turn_injection
+    from mimir.tools import registry as tool_registry
+    from mimir.update_on_start import flag_path
+    from packaging.version import Version
+
+    target = f"{Version(__version__).major + 1}.0.0rc1"
+    channel = f"discord-update-e2e-{tmp_path.name}"
+    approval_ids = []
+
+    def cancel_requests():
+        for approval_id in approval_ids:
+            approval_requests.cancel(approval_id)
+
+    request.addfinalizer(cancel_requests)
+
+    class RequestingModel(_FakeAgent):
+        approval_id = None
+        calls = 0
+
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            self.calls += 1
+            assert self.calls == 1, "approval reply must not invoke the model"
+            for _ in range(request_count):
+                result = await tool_registry.request_mimir_update.ainvoke({
+                    "target_version": target, "include_prereleases": True,
+                })
+                self.approval_id = result.split("Update approval requested: ")[1].split(".")[0]
+                approval_ids.append(self.approval_id)
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = RequestingModel([AIMessage(content="approval requested")])
+    # Snapshot the real original before _make_config writes os.environ directly;
+    # otherwise monkeypatch teardown restores the test home into later tests.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    agent._config.operator_alert_channel = channel
+    identity = _resolver(home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    agent._identity_resolver = identity
+    notices = []
+
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+
+    dispatcher = SimpleNamespace(_config=agent._config, _send_approval_notice=send_notice)
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", dispatcher)
+    first = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content="request an update",
+    ))
+    assert first.error is None
+    assert model.calls == 1 and model.approval_id is not None
+    assert not flag_path(home).exists()
+    assert channel not in mid_turn_injection._REGISTRY
+    entry = next(e for e in approval_requests.pending(channel) if e.approval_id == model.approval_id)
+    assert entry.inject_into_turn is False
+
+    # No ordinary turn setup, model, or message injection may see this reply.
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("approval reply entered ordinary turn setup")
+    monkeypatch.setattr("mimir.agent._initialize_ifc_labels", unexpected_setup)
+    agent._dispatcher = dispatcher
+    result = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=(
+            f"{decision} {model.approval_id}" if reply_style == "named" else decision
+        ),
+    ))
+    assert result.kind == "operator_approval"
+    assert model.calls == 1
+    assert channel not in mid_turn_injection._REGISTRY
+    if request_count > 1:
+        entries = approval_requests.pending(channel)
+        assert {entry.approval_id for entry in entries} == set(approval_ids)
+        expected_notice = "Pending approvals:\n" + "\n".join(
+            f"{entry.approval_id}: {entry.description}" for entry in entries
+        )
+        assert result.output == expected_notice
+        assert notices == [(channel, expected_notice)]
+        assert not flag_path(home).exists()
+        return
+    assert approval_requests.pending(channel) == ()
+    assert notices == [(channel, f"{'granted' if decision == 'approve' else 'declined'} {model.approval_id}")]
+    assert flag_path(home).exists() == (decision == "approve")
+    if decision == "approve":
+        data = json.loads(flag_path(home).read_text())
+        assert data["target_version"] == target
+        assert data["include_prereleases"] is True
+        assert data["approved_by"] == "operator"
+        assert data["approval_id"] == model.approval_id
+    again = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"approve {model.approval_id}",
+    ))
+    assert again.output == f"already resolved {model.approval_id}"
+    assert model.calls == 1
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+):
+    from mimir import approval_requests
+
+    channel = f"discord-op-e2e-{tmp_path.name}"
+    model = _FakeAgent([AIMessage(content="live-turn path")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    agent._identity_resolver = _resolver(agent._config.home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+
+    def unexpected_resolution(*args):
+        pytest.fail("turn-bound request resolved by standalone pre-turn path")
+
+    entry = approval_requests.register(
+        kind="op", channel_id=channel, description="live-turn request",
+        expires_at=time.monotonic() + 3600, resolver=unexpected_resolution,
+        inject_into_turn=True,
+    )
+    try:
+        result = await agent.run_turn(AgentEvent(
+            trigger="user_message", channel_id=channel, source="discord",
+            author="discord-99", content=decision,
+        ))
+        assert result.error is None
+        assert len(model.invocations) == 1
+        assert approval_requests.pending(channel) == (entry,)
+    finally:
+        approval_requests.cancel(entry.approval_id)
+
+
 def test_agent_audience_provider_reuses_message_buffer_identity_resolver(
     tmp_path: Path,
 ) -> None:

@@ -138,6 +138,21 @@ def pending(channel_id: str, *, now: float | None = None) -> tuple[ApprovalEntry
         return tuple(entry for entry in _PENDING.values() if entry.channel_id == channel_id)
 
 
+def is_non_turn_bound_reply(event: AgentEvent) -> bool:
+    """Route named standalone requests (and stale/unknown IDs) before the model.
+
+    Turn-bound requests must remain on the live-turn approval path. Unknown
+    IDs are consumed with a registry refusal, never interpreted by the model.
+    Authentication and channel binding are still enforced by ``resolve``.
+    """
+    match = _REPLY.fullmatch((event.content or "").strip())
+    if match is None or match.group(2) is None:
+        return False
+    with _LOCK:
+        entry = _PENDING.get(match.group(2).lower())
+        return entry is None or not entry.inject_into_turn
+
+
 def resolve(
     event: AgentEvent, identity_resolver: IdentityResolver | None, *,
     now: float | None = None, approval_event: AgentEvent | None = None,

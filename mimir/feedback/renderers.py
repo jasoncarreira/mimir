@@ -769,7 +769,7 @@ def _render_event_line(rule_kind: str, ev: dict) -> str:
         latest = ev.get("latest") or "?"
         return (
             f"mimir update available: {current} → {latest} "
-            f"(operator approves → I call request_mimir_update → "
+            f"(I call request_mimir_update → operator approves the typed request → "
             f"`docker compose restart` installs on boot)"
         )
     if rule_kind == "mimir_update_check_error":

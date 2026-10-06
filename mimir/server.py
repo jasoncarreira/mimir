@@ -581,6 +581,7 @@ _AUTH_EXEMPT: frozenset[tuple[str, str]] = frozenset({
     ("GET", "/app"),
     ("GET", "/app/auth.js"),
     ("GET", "/api/v1/web/bootstrap"),
+    ("DELETE", "/api/v1/web/session"),
     ("GET", "/turns"),
     ("GET", "/ops"),
     ("GET", "/saga"),
@@ -639,6 +640,38 @@ def _is_admin_required(path: str) -> bool:
 
 
 _STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_WEB_SESSION_COOKIE = "mimir_session"
+
+
+def _resolve_web_credential(request: web.Request, provided: str, expected_key: str):
+    resolver = request.app.get("identity_resolver")
+    is_master = bool(expected_key and provided and _safe_str_eq(provided, expected_key))
+    identity = None
+    if not is_master and resolver is not None and provided:
+        identity = resolver.resolve_web_key(provided)
+    return is_master, identity
+
+
+async def _web_session_post(request: web.Request) -> web.Response:
+    key = request.headers.get("X-API-Key", "")
+    master, identity = _resolve_web_credential(request, key, request.app.get("api_key") or "")
+    if not key or not (master or (identity is not None and identity.access.is_authorized)):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    response = web.json_response({"ok": True})
+    authority = _request_authority(request)
+    response.set_cookie(_WEB_SESSION_COOKIE, key, httponly=True, samesite="Strict",
+                        secure=authority is None or authority[0] not in _LOOPBACK_HOSTS, path="/")
+    return response
+
+
+async def _web_session_get(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+async def _web_session_delete(request: web.Request) -> web.Response:
+    response = web.json_response({"ok": True})
+    response.del_cookie(_WEB_SESSION_COOKIE, path="/")
+    return response
 
 _KEYLESS_ACCESS_WARNING = (
     "MIMIR_API_KEY is not set. With no per-user web keys configured or "
@@ -743,13 +776,8 @@ def _make_auth_middleware(expected_key: str, web_host: str | None = None):
         # after this middleware; populated by request time). github #726.
         resolver = request.app.get("identity_resolver")
 
-        provided = request.headers.get("X-API-Key", "")
-        identity = None
-        is_master = False
-        if expected_key and provided and _safe_str_eq(provided, expected_key):
-            is_master = True
-        elif resolver is not None and provided:
-            identity = resolver.resolve_web_key(provided)
+        provided = request.headers.get("X-API-Key") or request.cookies.get(_WEB_SESSION_COOKIE, "")
+        is_master, identity = _resolve_web_credential(request, provided, expected_key)
         authorized = is_master or (
             identity is not None and identity.access.is_authorized
         )
@@ -1433,6 +1461,9 @@ def build_app(config: Config) -> web.Application:
     app.router.add_get("/", _handle_root)
     app.router.add_post("/event", _handle_event)
     app.router.add_get("/health", _handle_health)
+    app.router.add_post("/api/v1/web/session", _web_session_post)
+    app.router.add_get("/api/v1/web/session", _web_session_get)
+    app.router.add_delete("/api/v1/web/session", _web_session_delete)
     app.router.add_post("/api/memory/consolidate", _handle_consolidate)
     # Turn viewer + log API (SPEC §11).
     from .usage_history import active_provider_for_spec

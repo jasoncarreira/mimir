@@ -193,6 +193,22 @@ def test_recent_ids_are_reusable_only_after_retention_expires(registry):
     assert replacement.channel_id == "discord-2"
 
 
+@pytest.mark.parametrize("kind", ["mp", "upd", "custom"])
+@pytest.mark.parametrize("inject_into_turn", [False, True])
+def test_preturn_routing_uses_entry_policy_not_kind(registry, kind, inject_into_turn):
+    entry = requests.register(
+        kind=kind, channel_id="discord-1", description="request", now=100,
+        expires_at=400, resolver=lambda *args: "granted", inject_into_turn=inject_into_turn,
+    )
+    assert requests.is_non_turn_bound_reply(reply(f"approve {entry.approval_id}")) is (not inject_into_turn)
+    assert requests.is_non_turn_bound_reply(reply(f"DECLINE {entry.approval_id.upper()}")) is (not inject_into_turn)
+    assert requests.is_non_turn_bound_reply(reply("approve")) is False
+    assert requests.is_non_turn_bound_reply(reply("approve upd-aaaa extra text")) is False
+    assert requests.is_non_turn_bound_reply(reply("approve unknown-aaaa")) is True
+    requests.cancel(entry.approval_id)
+    assert requests.is_non_turn_bound_reply(reply(f"approve {entry.approval_id}")) is True
+
+
 def test_pending_id_cannot_be_registered_twice(registry):
     _, _, add = registry
     op = add("op")

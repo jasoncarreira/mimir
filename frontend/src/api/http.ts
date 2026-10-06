@@ -22,11 +22,28 @@ export class ApiError extends Error {
   }
 }
 
-export function getStoredApiKey(): string {
+export async function createWebSession(key: string): Promise<void> {
+  await apiFetchJson("/api/v1/web/session", { method: "POST", apiKey: key });
+}
+
+export async function deleteWebSession(): Promise<void> {
+  await apiFetchJson("/api/v1/web/session", { method: "DELETE" });
+}
+
+export async function restoreWebSession(): Promise<boolean> {
+  let legacy = "";
   try {
-    return globalThis.localStorage?.getItem(MIMIR_API_KEY_STORAGE_KEY) ?? "";
+    legacy = globalThis.localStorage?.getItem(MIMIR_API_KEY_STORAGE_KEY) ?? "";
+    globalThis.localStorage?.removeItem(MIMIR_API_KEY_STORAGE_KEY);
   } catch {
-    return "";
+    // Storage may be disabled; the cookie can still be checked.
+  }
+  try {
+    if (legacy) await createWebSession(legacy);
+    else await apiFetchJson("/api/v1/web/session");
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -52,8 +69,7 @@ export async function apiFetchJson<T>(
     ...request
   } = options;
   const mergedHeaders = new Headers(headers);
-  const key = apiKey ?? getStoredApiKey();
-  if (key) mergedHeaders.set("X-API-Key", key);
+  if (apiKey) mergedHeaders.set("X-API-Key", apiKey);
 
   const response = await fetchImpl(`${baseUrl}${path}`, {
     ...request,

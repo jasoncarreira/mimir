@@ -1107,3 +1107,135 @@ def test_all_mimir_tools_includes_fetch_only_without_tavily(
     names = {t.name for t in all_mimir_tools()}
     assert "web_search" not in names
     assert "fetch_url" in names
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_pinned_connections_dial_vetted_address_for_http_https_and_post(monkeypatch, scheme):
+    """A rebinding resolver may never make the transport dial its second answer."""
+    import io
+    import socket
+    import ssl
+    from urllib.request import Request
+
+    lookups, dials, tls_names = [], [], []
+
+    def resolve(host, *args, **kwargs):
+        lookups.append(host)
+        address = "8.8.8.8" if len(lookups) == 1 else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0))]
+
+    class Socket:
+        def sendall(self, data):
+            pass
+
+        def makefile(self, *args, **kwargs):
+            return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+
+        def close(self):
+            pass
+
+    def dial(address, *args):
+        dials.append(address)
+        assert address[0] == "8.8.8.8"
+        return Socket()
+
+    monkeypatch.setattr(web_tools_mod.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(web_tools_mod.socket, "create_connection", dial)
+    if scheme == "https":
+        class TLS:
+            check_hostname = True
+            verify_mode = ssl.CERT_REQUIRED
+
+            def wrap_socket(self, sock, *, server_hostname):
+                tls_names.append(server_hostname)
+                if server_hostname != "example.com":
+                    raise ssl.SSLCertVerificationError("hostname mismatch")
+                return sock
+
+        original_init = web_tools_mod._PinnedHTTPSHandler.__init__
+        def init_tls(self):
+            original_init(self)
+            self._context = TLS()
+        monkeypatch.setattr(web_tools_mod._PinnedHTTPSHandler, "__init__", init_tls)
+    with web_tools_mod._open_url(Request(f"{scheme}://example.com/"), 2) as response:
+        assert response.read() == b"OK"
+    assert dials == [("8.8.8.8", 443 if scheme == "https" else 80)]
+    assert lookups == ["example.com"]
+    if scheme == "https":
+        assert tls_names == ["example.com"]
+
+
+def test_https_pinned_connection_rejects_mismatched_certificate(monkeypatch):
+    import socket
+    import ssl
+
+    class RejectingTLS:
+        check_hostname = True
+        verify_mode = ssl.CERT_REQUIRED
+
+        def wrap_socket(self, sock, *, server_hostname):
+            assert server_hostname == "example.com"
+            raise ssl.SSLCertVerificationError("certificate is for other.example")
+
+    monkeypatch.setattr(web_tools_mod.socket, "create_connection", lambda *a: object())
+    connection = web_tools_mod._PinnedHTTPSConnection(
+        "example.com", addresses=("8.8.8.8",), context=RejectingTLS())
+    with pytest.raises(ssl.SSLCertVerificationError, match="other.example"):
+        connection.connect()
+
+
+def test_webhook_post_uses_pinned_transport(monkeypatch):
+    import io
+    import socket
+
+    dials = []
+    monkeypatch.setattr(web_tools_mod.socket, "getaddrinfo", lambda *a, **kw:
+                        [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 0))])
+
+    class Socket:
+        def sendall(self, data):
+            pass
+
+        def makefile(self, *a, **kw):
+            return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{"ok":true}')
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web_tools_mod.socket, "create_connection",
+                        lambda address, *a: dials.append(address) or Socket())
+    response = web_tools_mod._post_json(url="http://example.com/hook", payload={"test": True},
+                                        headers={}, timeout_seconds=2)
+    assert response["json"] == {"ok": True}
+    assert dials == [("8.8.8.8", 80)]
+
+
+def test_redirect_hop_revalidates_and_pins(monkeypatch):
+    import io
+    import socket
+    from urllib.request import Request
+
+    dialed = []
+    def resolve(host, *a, **kw):
+        address = {"first.example": "8.8.8.8", "next.example": "1.1.1.1"}[host]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0))]
+
+    class Socket:
+        def __init__(self, address):
+            self.address = address
+
+        def sendall(self, data):
+            pass
+
+        def makefile(self, *args, **kwargs):
+            if self.address == "8.8.8.8":
+                return io.BytesIO(b"HTTP/1.1 302 Found\r\nLocation: http://next.example/\r\nContent-Length: 0\r\n\r\n")
+            return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(web_tools_mod.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(web_tools_mod.socket, "create_connection",
+                        lambda address, *a: dialed.append(address) or Socket(address[0]))
+    with web_tools_mod._open_url(Request("http://first.example/"), 2) as response:
+        assert response.read() == b"OK"
+    assert dialed == [("8.8.8.8", 80), ("1.1.1.1", 80)]

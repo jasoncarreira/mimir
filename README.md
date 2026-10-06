@@ -131,7 +131,7 @@ uv run mimir run --home ~/mimir-home
 ```
 
 `mimir setup` activates four recurring tasks out of the box: hourly
-heartbeat, weekly reflection, weekly saga consolidation, weekly
+heartbeat, weekly reflection, daily saga consolidation (default `MIMIR_SAGA_CONSOLIDATE_CRON=0 4 * * *`), weekly
 behavioral introspection report. All gated by the homeostat so a
 saturated plan window doesn't blow through your quota.
 
@@ -307,7 +307,7 @@ claude setup-token
 ```bash
 # Tests — minimal toolchain
 uv pip install -e ".[dev]"
-uv run pytest                                       # 600+ tests
+uv run pytest                                       # the full suite
 uv run pytest --ignore=tests/test_bench_via_mimir.py  # skip the slow integration test
 
 # Tests — full toolchain, including the Claude Code adapter import smoke

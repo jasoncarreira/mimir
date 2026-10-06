@@ -13,7 +13,7 @@ import {
   useSearchParams
 } from "react-router-dom";
 import { AgentCharacter, characterStateFromLiveEvent, withComposerListening } from "./agent-character";
-import { MIMIR_API_KEY_STORAGE_KEY } from "./api";
+import { createWebSession, deleteWebSession, restoreWebSession } from "./api";
 import { useBootstrap } from "./api/bootstrap";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
@@ -99,15 +99,6 @@ function appBasename() {
   return base === "" ? "/" : base;
 }
 
-function readStoredKey() {
-  try {
-    return window.localStorage.getItem(MIMIR_API_KEY_STORAGE_KEY) || "";
-  } catch {
-    return "";
-  }
-}
-
-
 function useWhoami(enabled: boolean) {
   return useQuery({
     queryKey: ["whoami"],
@@ -147,7 +138,7 @@ export function resetBrowserSessionStateForApiKeyChange(
   navigate?.("/chat", { replace: true });
 }
 
-// Writes/clears the API key + flips the shared store flag (so AppFrame's login
+// Exchanges/clears the API key cookie + flips the shared store flag (so AppFrame's login
 // gate + the header status react) + drops browser-scoped user data before the
 // dashboard reconnects with the new identity (#563, #594).
 function useSetApiKey() {
@@ -155,14 +146,10 @@ function useSetApiKey() {
   const navigate = useNavigate();
   const setApiKeyPresent = useUiState((state) => state.setApiKeyPresent);
   return React.useCallback(
-    (value: string) => {
+    async (value: string) => {
       const trimmed = value.trim();
-      try {
-        if (trimmed) window.localStorage.setItem(MIMIR_API_KEY_STORAGE_KEY, trimmed);
-        else window.localStorage.removeItem(MIMIR_API_KEY_STORAGE_KEY);
-      } catch {
-        // Storage can be blocked by browser policy; the in-memory flag still updates.
-      }
+      if (trimmed) await createWebSession(trimmed);
+      else await deleteWebSession();
       resetBrowserSessionStateForApiKeyChange(client, navigate);
       setApiKeyPresent(Boolean(trimmed));
       if (trimmed) void client.invalidateQueries({ queryKey: ["whoami"] });
@@ -178,6 +165,7 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
   isLoading: boolean;
 }) {
   const [entry, setEntry] = React.useState("");
+  const [sessionError, setSessionError] = React.useState("");
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
   const setApiKey = useSetApiKey();
   const requiresKey = bootstrap?.auth.required ?? false;
@@ -232,25 +220,26 @@ function AuthPanel({ bootstrap, error, isError, isLoading }: {
               className="auth-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                setApiKey(entry);
-                setEntry("");
+                 void setApiKey(entry).then(() => { setEntry(""); setSessionError(""); })
+                   .catch(() => setSessionError("Invalid API key"));
               }}
             >
               <TextInput
                 aria-label="MIMIR_API_KEY"
                 autoComplete="off"
-                placeholder={apiKeyPresent ? "Key stored in this browser" : "MIMIR_API_KEY"}
+                 placeholder={apiKeyPresent ? "Session active" : "MIMIR_API_KEY"}
                 type="password"
                 value={entry}
                 onChange={(event) => setEntry(event.target.value)}
               />
               <Button type="submit" variant="primary">Save</Button>
-              <Button type="button" onClick={() => setApiKey("")}>Clear</Button>
+               <Button type="button" onClick={() => void setApiKey("")}>Clear</Button>
+               {sessionError ? <span role="alert">{sessionError}</span> : null}
             </form>
           ) : null}
           {!isLoading && !isError ? (
             <dl className="facts-grid facts-grid--compact">
-              <div><dt>Browser key</dt><dd>{apiKeyPresent ? "stored" : "not stored"}</dd></div>
+               <div><dt>Browser session</dt><dd>{apiKeyPresent ? "active" : "inactive"}</dd></div>
               <div><dt>Bind</dt><dd>{bootstrap?.server?.public_bind ? "public" : "localhost"}</dd></div>
               <div><dt>Streams</dt><dd>{bootstrap?.stream_auth?.shape || "loading"}</dd></div>
             </dl>
@@ -547,6 +536,7 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
   reauthenticate?: boolean;
 }) {
   const [entry, setEntry] = React.useState("");
+  const [sessionError, setSessionError] = React.useState("");
   const setApiKey = useSetApiKey();
   const host = bootstrap?.server?.web_host || "this server";
 
@@ -571,8 +561,8 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
               className="login-screen__form"
               onSubmit={(event) => {
                 event.preventDefault();
-                setApiKey(entry);
-                setEntry("");
+                 void setApiKey(entry).then(() => { setEntry(""); setSessionError(""); })
+                   .catch(() => setSessionError("Invalid API key"));
               }}
             >
               <TextInput
@@ -585,7 +575,8 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
               />
               <Button disabled={!entry.trim()} type="submit" variant="primary">Sign in</Button>
             </form>
-            <p className="login-screen__hint">Your key is stored only in this browser.</p>
+            {sessionError ? <p role="alert">{sessionError}</p> : null}
+            <p className="login-screen__hint">Your session uses an HttpOnly browser cookie.</p>
           </>
         )}
       </div>
@@ -757,6 +748,16 @@ function AppFrameContent() {
   const { data: bootstrap, error, isError, isLoading } = useBootstrap();
   const apiKeyPresent = useUiState((state) => state.apiKeyPresent);
   const apiKeyRejected = useUiState((state) => state.apiKeyRejected);
+  React.useEffect(() => {
+    let active = true;
+    const epoch = useUiState.getState().apiKeyEpoch;
+    void restoreWebSession().then((present) => {
+      if (active && present && useUiState.getState().apiKeyEpoch === epoch) {
+        useUiState.getState().setApiKeyPresent(true);
+      }
+    });
+    return () => { active = false; };
+  }, []);
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);
   // Gate identity on sign-in so a protected server doesn't fetch whoami pre-login.
   const identity = useWhoami(signedIn);
@@ -847,10 +848,7 @@ function RoutedLiveEventsProvider({ children }: { children: React.ReactNode }) {
   // recompute the key off the epoch too — otherwise the live-events stream keeps
   // the previous identity's key until the next drop/reconnect.
   const apiKeyEpoch = useUiState((state) => state.apiKeyEpoch);
-  const apiKey = React.useMemo(
-    () => (apiKeyPresent ? readStoredKey() || undefined : undefined),
-    [apiKeyPresent, apiKeyEpoch]
-  );
+  const apiKey = undefined;
   // Shares AppFrame's bootstrap query; after login it carries authenticated UI data.
   const { data: bootstrap } = useBootstrap();
   const signedIn = isSignedIn(bootstrap, apiKeyPresent);

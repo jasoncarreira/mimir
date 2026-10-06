@@ -1,4 +1,4 @@
-import { buildQuery, getStoredApiKey } from "./http";
+import { buildQuery } from "./http";
 import type { LiveEventStreamItem } from "./generated/contracts";
 import { runReconnectingSse, SseResponseError } from "./sse-reconnect";
 
@@ -159,8 +159,7 @@ export function createLiveEventStream(
     onError,
     connect: async (markConnected) => {
       const headers = new Headers({ Accept: "text/event-stream" });
-      const key = apiKey ?? getStoredApiKey();
-      if (key) headers.set("X-API-Key", key);
+      if (apiKey) headers.set("X-API-Key", apiKey);
       const response = await fetchImpl(
         `${baseUrl}/api/v1/live-events${buildQuery({ since: cursor, limit: backfillLimit })}`,
         { headers, signal: controller.signal }
