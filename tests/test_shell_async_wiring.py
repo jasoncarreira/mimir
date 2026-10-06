@@ -111,6 +111,17 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["cat .env", "head < .env", "echo hi >> .env", "cat ~/.codex/auth.json"])
+async def test_bash_async_protected_operands_never_spawn(fake_registry, command, monkeypatch):
+    events = []
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *a, **kw: events.append((a, kw)))
+    result = await shell_async.bash_async.coroutine(command=command)
+    assert "protected_name_match" in result
+    assert fake_registry._spawned_log == []
+    assert events[-1][1]["reason"] == "protected_name_match"
+
+
+@pytest.mark.asyncio
 async def test_bash_async_accepts_explicit_cwd(
     fake_registry: ShellJobRegistry, tmp_path: Path,
 ) -> None:
@@ -1065,7 +1076,7 @@ async def test_bash_async_allows_different_channel(
 
     def _fake_spawn(
         command: str, *, argv: list[str], channel_id: str | None,
-        on_complete=None, auth_context=None,
+        on_complete=None, auth_context=None, env_overlay=None,
     ) -> _FakeJob:
         return _FakeJob(command=command, channel_id=channel_id)
 

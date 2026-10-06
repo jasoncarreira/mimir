@@ -71,6 +71,36 @@ def test_shell_exec_runs_arbitrary_command_in_default_state():
     assert "chainlink-226" in result
 
 
+@pytest.mark.parametrize("command", [
+    "cat .env", "cat ~/.codex/auth.json", "grep -r KEY .env",
+    "less compose.env", "head < .env", "cat ~/.config/gh/hosts.yml",
+    "cat .git/credentials", "cat ~/.config/gogcli/config.json",
+    "cat $GOG_HOME/auth.json", "cat $MIMIR_CLAUDE_OAUTH_CREDENTIALS",
+    "cat < .env", "cat <<< .env", "echo hi > .env", "echo hi >> .env",
+])
+def test_protected_shell_operands_refuse_without_spawning(command, monkeypatch, tmp_path):
+    monkeypatch.setenv("GOG_HOME", str(tmp_path / "gog"))
+    monkeypatch.setenv("MIMIR_CLAUDE_OAUTH_CREDENTIALS", str(tmp_path / "oauth.json"))
+    # The OAuth path is checked in its literal form too.
+    if "$MIMIR_CLAUDE_OAUTH_CREDENTIALS" in command:
+        command = f"cat {tmp_path / 'oauth.json'}"
+    calls = []
+    monkeypatch.setattr(extra.subprocess, "run", lambda *a, **kw: calls.append(a))
+    events = []
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *a, **kw: events.append((a, kw)))
+    result = shell_exec.invoke({"command": command})
+    assert "protected_name_match" in result
+    assert calls == []
+    assert events[-1][0] == ("hard_boundary_denied",)
+    assert events[-1][1]["reason"] == "protected_name_match"
+
+
+@pytest.mark.parametrize("command", ["cat README.md", "ls -la"])
+def test_safe_shell_operands_execute(command, tmp_path):
+    (tmp_path / "README.md").write_text("safe\n")
+    assert "exit=0" in shell_exec.invoke({"command": command, "cwd": str(tmp_path)})
+
+
 def test_shell_exec_does_not_emit_rejection_message_for_unfamiliar_command():
     """The previous allowlist gate would return a 'rejected: ... does not
     match any allowlist prefix' string. After chainlink #226, no gate

@@ -18,6 +18,62 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
+@pytest.mark.asyncio
+async def test_interactive_sync_and_async_children_receive_same_scrubbed_env(
+    tmp_path, monkeypatch,
+):
+    from mimir.shell_jobs import ShellJobRegistry
+    from mimir.tools.extra import shell_exec
+    from mimir.tools import shell_async
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_API_KEY", "x")
+    monkeypatch.setenv("KEEP_ME", "y")
+    monkeypatch.setenv("GITHUB_TOKEN", "ungranted")
+    monkeypatch.setenv("GH_TOKEN", "ungranted")
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "KEEP_ME")
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
+    sync = shell_exec.invoke({"command": "env"})
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    done = threading.Event()
+    completed = []
+    def on_complete(job):
+        completed.append(job)
+        done.set()
+
+    shell_async.set_shell_job_registry(registry, on_complete=on_complete)
+    try:
+        result = await shell_async.bash_async.coroutine(command="env", cwd=str(tmp_path))
+        assert "Spawned job" in result
+        assert await asyncio.to_thread(done.wait, 10)
+        [job] = completed
+        async_text = job.stdout_path.read_text()
+    finally:
+        shell_async.set_shell_job_registry(None)
+
+    sync_text = sync.split("stdout:\n", 1)[1]
+    sync_env = dict(line.split("=", 1) for line in sync_text.splitlines() if "=" in line)
+    async_env = dict(line.split("=", 1) for line in async_text.splitlines() if "=" in line)
+    for child in (sync_env, async_env):
+        assert child["KEEP_ME"] == "y"
+        assert child["MIMIR_HOME"] == str(tmp_path)
+        assert not {"FAKE_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"} & child.keys()
+    assert sync_env == async_env
+
+
+def test_interactive_passthrough_logs_names_only(monkeypatch):
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: events.append((a, kw)))
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "KEEP_ME, ABSENT, KEEP_ME, OTHER*, PATH")
+    monkeypatch.setenv("KEEP_ME", "private-value")
+    monkeypatch.delenv("ABSENT", raising=False)
+    env = _shell_env.interactive_shell_env()
+    assert env["KEEP_ME"] == "private-value"
+    assert env["PATH"] == _shell_env._TRUSTED_PATH
+    assert events == [(("interactive_shell_env_passthrough",), {"pass_env": ["KEEP_ME"]})]
+    assert "private-value" not in repr(events)
+
+
 @pytest.mark.parametrize("executable", ["gh", "git", "echo"])
 def test_output_mask_includes_only_granted_child_values(monkeypatch, executable):
     monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: (

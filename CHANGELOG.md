@@ -6,6 +6,13 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+**Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
+inherit the agent's environment. Add any variable a shell workflow genuinely
+needs to `MIMIR_SHELL_PASS_ENV` (exact comma-separated names). Ad hoc `gh`,
+`acli`, `gog`, and `social-cli` shell calls may need explicit passthrough or a
+declared command/forge tool; service-shell and forge authentication are unchanged
+(#1873).
+
 **Operator action:** Before upgrading, add Discord and Slack participants who
 should be able to start turns to `<MIMIR_HOME>/state/identities.yaml` with the
 `user` role (or `admin`). Unknown, missing and non-allowlisted bridge authors
