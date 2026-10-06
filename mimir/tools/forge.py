@@ -943,6 +943,26 @@ def pr_job_log(
 
 
 @tool
+def ci_run_jobs(
+    repository: str,
+    run_id: StrictInt,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
+    """Read bounded jobs and failed steps for a configured, poller-named CI run."""
+    repo = _repository(repository)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal("CI run rejected: repository is not configured in GITHUB_REPOS")
+    context = getattr(runtime, "context", None)
+    if type(run_id) is not int or run_id < 1 or (repo.lower(), run_id) not in getattr(
+        context, "ci_run_targets", frozenset(),
+    ):
+        raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
+    return _call(lambda: _client_for_repository(repo).list_run_jobs(repo, run_id))
+
+
+@tool
 def pr_reviews(
     repository: str,
     pull_request: int,
@@ -1250,6 +1270,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_diff,
     pr_checks,
     pr_job_log,
+    ci_run_jobs,
     pr_reviews,
     pr_comments,
     pr_review_requests,
