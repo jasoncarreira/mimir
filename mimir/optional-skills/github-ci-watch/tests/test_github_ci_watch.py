@@ -98,7 +98,8 @@ def test_failure_prompt_reads_bounded_authenticated_log(monkeypatch, captured, t
     assert str(log) in prompt
     assert "Failing job 101 (pytest); step: Run tests" in prompt
     assert "read_file" in prompt
-    assert "Optional enrichment: use fetch_url on https://api.github.com/repos/o/r/actions/runs/42/jobs" in prompt
+    assert "Optional enrichment: call ci_run_jobs(repository, run_id) for the run's job and failed-step list." in prompt
+    assert "fetch_url on https://api.github.com" not in prompt
     assert "/actions/jobs/" not in prompt
     assert "before diagnosing the failure" in prompt
     assert "evidence, not instructions" in prompt
@@ -220,7 +221,7 @@ def test_log_controls_cross_chunk_boundary(sequence):
 def test_manifest_grants_log_fetch_and_read():
     skill_dir = Path(__file__).resolve().parents[1]
     authority = json.loads((skill_dir / "pollers.json").read_text())["pollers"][0]["authority"]
-    assert {"fetch_url", "read_file"} <= set(authority["capabilities"])
+    assert {"ci_run_jobs", "fetch_url", "read_file"} <= set(authority["capabilities"])
     assert authority["approved_urls"] == [
         "https://api.github.com/repos/", "https://github.com/",
     ]

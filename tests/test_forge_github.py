@@ -63,6 +63,46 @@ class Session:
         return self.responses.pop(0)
 
 
+def test_list_run_jobs_projects_only_bounded_job_metadata():
+    job = {
+        "id": 1, "name": "J" * 250, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "html_url": "secret-url", "logs_url": "secret-log-url",
+        "runner_name": "runner-secret", "runner_group_name": "runner-group-secret",
+        "log": "secret log text",
+        "steps": [
+            {"number": 3, "name": "S" * 250, "conclusion": "failure", "html_url": "secret-step"},
+            {"number": 4, "name": "ok", "conclusion": "success"},
+        ],
+    }
+    session = Session([Response({"jobs": [job] * 50}), Response({"jobs": [job] * 50})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert len(result) == 100
+    assert result[0] == {
+        "id": 1, "name": "J" * 200, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "failed_steps": [{"number": 3, "name": "S" * 200, "conclusion": "failure"}],
+    }
+    assert all(value not in str(result) for value in (
+        "secret-url", "secret-log-url", "runner-secret", "runner-group-secret",
+        "secret log text", "secret-step",
+    ))
+    assert len(session.calls) == 2
+    assert [call[1] for call in session.calls] == [
+        f"https://api.github.com/repos/owner/repo/actions/runs/42/jobs?per_page=50&page={page}"
+        for page in (1, 2)
+    ]
+
+
+def test_list_run_jobs_caps_more_than_100_jobs_without_fetching_third_page():
+    session = Session([Response({"jobs": [{"id": i} for i in range(50)]}),
+                       Response({"jobs": [{"id": i} for i in range(50, 100)]}),
+                       Response({"jobs": [{"id": i} for i in range(100, 120)]})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert [job["id"] for job in result] == list(range(100))
+    assert len(session.calls) == 2
+
+
 @pytest.fixture(autouse=True)
 def reset_verified_identity(monkeypatch) -> None:
     from mimir.tools import forge as forge_tools
