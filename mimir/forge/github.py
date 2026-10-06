@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -32,9 +32,11 @@ from .client import (
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_SHA = re.compile(r"[a-fA-F0-9]{40}")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_DIFF_BYTES = 524_288
 _MAX_DIFF_FETCH_BYTES = 8_388_608
+_FILE_TRUNCATION_MARKER = "\n[pr_file_content truncated: file exceeded size limit]\n"
 _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
@@ -299,6 +301,7 @@ class GitHubForgeClient:
         accept: str = "application/vnd.github+json",
         max_bytes: int = _MAX_RESPONSE_BYTES,
         not_found: str = "pull request not found",
+        truncate_text: bool = False,
     ) -> Any:
         url = f"https://api.github.com{endpoint}"
         if body is not None and len(
@@ -319,7 +322,14 @@ class GitHubForgeClient:
             ) from exc
         raw = response.content
         if len(raw) > max_bytes:
-            raise ForgeResponseTooLarge("forge response exceeded size limit")
+            if not truncate_text or response.status_code >= 400:
+                raise ForgeResponseTooLarge("forge response exceeded size limit")
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
+            prefix = raw[:max_bytes - len(_FILE_TRUNCATION_MARKER.encode("utf-8"))]
+            return prefix.decode("utf-8", errors="ignore") + _FILE_TRUNCATION_MARKER
         if response.status_code >= 400:
             reasons = {
                 401: "authentication failed",
@@ -334,7 +344,12 @@ class GitHubForgeClient:
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
         if not raw:
-            return None
+            return "" if accept == "application/vnd.github.raw" else None
+        if accept == "application/vnd.github.raw":
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
         if "application/json" not in response.headers.get("Content-Type", ""):
             try:
                 return raw.decode("utf-8")
@@ -572,6 +587,63 @@ class GitHubForgeClient:
         if not isinstance(data, str):
             raise ForgeError("forge returned an invalid diff")
         return bound_diff(data)
+
+    def get_file_content(self, scope: RepoPRActionScope, path: str) -> str:
+        repository, _number = self._target(scope)
+        # Validate before requesting the pinned commit or walking its tree.
+        parts = path.split("/") if isinstance(path, str) else []
+        if (
+            not parts or not path or path.startswith("/")
+            or any(part in {".", ".."} for part in parts)
+            or any(not part for part in parts[1:]) or "\\" in path
+            or any(ord(character) < 32 for character in path)
+            or len(path.encode("utf-8")) > 4_096
+        ):
+            raise ForgeError("invalid repository path")
+        # The pinned commit's Git tree proves every component's actual mode;
+        # unlike Contents, it never dereferences a symlink to a regular file.
+        commit = self._request(
+            "GET", f"/repos/{repository}/git/commits/{scope.observed_head_sha}",
+        )
+        tree = commit.get("tree") if isinstance(commit, Mapping) else None
+        tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
+        if (
+            not isinstance(commit, Mapping)
+            or commit.get("sha") != scope.observed_head_sha
+            or not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None
+        ):
+            raise ForgeError("file content refused: scoped commit tree is unavailable")
+        for index, part in enumerate(parts):
+            listing = self._request("GET", f"/repos/{repository}/git/trees/{tree_sha}")
+            entries = listing.get("tree") if isinstance(listing, Mapping) else None
+            if not isinstance(entries, list):
+                raise ForgeError("file content refused: scoped tree is unavailable")
+            matches = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("path") == part]
+            if len(matches) != 1:
+                raise ForgeError("file content refused: path is not a regular file at scoped head")
+            entry = matches[0]
+            final = index == len(parts) - 1
+            if final:
+                if (
+                    entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}
+                ):
+                    raise ForgeError("file content refused: path is not a regular file at scoped head")
+            elif entry.get("type") != "tree" or entry.get("mode") != "040000":
+                raise ForgeError("file content refused: path crosses a symlink or submodule")
+            tree_sha = entry.get("sha")
+            if not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None:
+                raise ForgeError("file content refused: invalid scoped tree entry")
+        # Fetch the verified blob once: no base64 Contents metadata response
+        # can exceed the smaller JSON cap before this bounded raw read.
+        data = self._request(
+            "GET", f"/repos/{repository}/git/blobs/{tree_sha}",
+            accept="application/vnd.github.raw",
+            max_bytes=_MAX_DIFF_FETCH_BYTES, not_found="file not found at scoped head",
+            truncate_text=True,
+        )
+        if not isinstance(data, str):
+            raise ForgeError("file content refused: directory, symlink or submodule response")
+        return data
 
     def list_checks(self, scope: RepoPRActionScope) -> tuple[CheckProjection, ...]:
         repository, _number = self._target(scope)

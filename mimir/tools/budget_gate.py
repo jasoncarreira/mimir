@@ -120,7 +120,7 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 log = logging.getLogger(__name__)
 
 _STANDING_REVIEW_TOOLS = frozenset({
-    "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "pr_submit_review",
     "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review",
     "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
