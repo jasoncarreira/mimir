@@ -1158,10 +1158,12 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
                 yield chunk
 
     model = RequestingModel([AIMessage(content="approval requested")])
+    # Snapshot the real original before _make_config writes os.environ directly;
+    # otherwise monkeypatch teardown restores the test home into later tests.
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
     agent = _build_agent(tmp_path, fake_agent=model)
     home = agent._config.home
     agent._config.operator_alert_channel = channel
-    monkeypatch.setenv("MIMIR_HOME", str(home))
     identity = _resolver(home, """people:
   - canonical: operator
     aliases: [discord-99]

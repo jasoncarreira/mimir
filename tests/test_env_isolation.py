@@ -82,6 +82,33 @@ def test_dotenv_keys_do_not_survive_into_the_next_test():
     )
 
 
+def test_update_approval_teardown_does_not_leak_home_to_shell_tests(tmp_path: Path):
+    """Run the approval cases first on one worker, then their leak consumers.
+
+    xdist can otherwise put the producer and consumers on different workers,
+    hiding the build-agent-before-setenv teardown regression.
+    """
+    from tests.nested_pytest import pytest_command
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        pytest_command(
+            tmp_path, "-q", "-n", "0", "-p", "no:randomly",
+            "tests/test_agent.py::test_update_reply_after_requesting_turn_ends_never_invokes_model",
+            "tests/test_github_review_guard.py",
+            "tests/test_budget_gate_and_alias.py",
+            "tests/test_operator_alert.py",
+            "tests/test_outbound_privacy.py",
+        ),
+        cwd=root, capture_output=True, text=True, check=False, timeout=120,
+    )
+    assert result.returncode == 0, (
+        "approval teardown leaked MIMIR_HOME or an affected regression failed:\n"
+        + result.stdout + result.stderr
+    )
+    assert "passed" in result.stdout, "child pytest did not report executed tests"
+
+
 # ── 2. no enforcement-keyed skips ────────────────────────────────────
 
 

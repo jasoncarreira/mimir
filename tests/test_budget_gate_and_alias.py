@@ -5063,7 +5063,6 @@ async def test_profile_matching_text_without_binding_never_executes_after_ingest
 async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
     middleware_path: str,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     from types import SimpleNamespace
 
@@ -5095,10 +5094,6 @@ async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
 
     monkeypatch.setattr(budget_gate, "parse_service_shell_argv_with_diagnostics", parser)
     monkeypatch.setattr(extra.subprocess, "run", run)
-    # Pin startup cwd and exclude remembered session cwd: this test exercises
-    # the pre-ingest shell execution path, not ambient runtime configuration.
-    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
-    monkeypatch.setattr(extra, "_shell_session_id", lambda: None)
     command = "printf pre-ingest-soft"
     request = _make_request(
         "shell_exec", f"soft-bash-{middleware_path}", auth, {"command": command},
@@ -5110,9 +5105,7 @@ async def test_pre_ingest_soft_operator_uses_actual_bash_lc_path(
 
     assert result.status != "error"
     assert parser_calls == 1
-    assert executed == [
-        (["bash", "-lc", login_shell_command(command)], tmp_path.resolve()),
-    ]
+    assert executed == [(["bash", "-lc", login_shell_command(command)], None)]
     assert bound_direct_exec_argv() is None
 
 
