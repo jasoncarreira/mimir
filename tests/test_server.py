@@ -730,6 +730,9 @@ def _controlled_server_app(
             control.events.append(f"enqueue:{self._run_turn is not None}")
             return self._run_turn is not None
 
+        def intake_admits(self, event: Any) -> bool:
+            return True
+
         async def drain(self, *, timeout: float) -> None:
             control.hit("dispatcher:drain")
 
@@ -1235,6 +1238,9 @@ def test_optional_feedback_bridges_receive_core_identity_resolver(
         resolver,
         resolver,
     ]
+    for bridge in optional_bridges:
+        assert bridge.kwargs["enqueue"] == app["dispatcher"].enqueue
+        assert bridge.kwargs["admit"] == app["dispatcher"].intake_admits
 
 
 def test_route_and_hook_parity_with_runtime_proxies(

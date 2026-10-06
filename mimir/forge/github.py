@@ -358,15 +358,22 @@ class GitHubForgeClient:
         except ValueError as exc:
             raise ForgeError("forge returned invalid JSON") from exc
 
-    def _paginate(self, endpoint: str) -> list[Mapping[str, Any]]:
+    def _paginate(
+        self, endpoint: str, *, collection_key: str | None = None,
+        limit: int | None = None,
+    ) -> list[Mapping[str, Any]]:
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
         for page in range(1, _MAX_PAGES + 1):
             payload = self._request("GET", f"{endpoint}{separator}per_page=50&page={page}")
+            if collection_key is not None:
+                payload = payload.get(collection_key) if isinstance(payload, Mapping) else None
             if not isinstance(payload, list):
                 raise ForgeError("forge returned an invalid collection")
             page_items = [item for item in payload if isinstance(item, Mapping)]
             items.extend(page_items)
+            if limit is not None and len(items) >= limit:
+                return items[:limit]
             if len(items) > _MAX_ITEMS:
                 raise ForgeResponseTooLarge("forge collection exceeded item limit")
             if len(payload) < 50:
@@ -640,6 +647,35 @@ class GitHubForgeClient:
         if error:
             raise ForgeError(error)
         return text.decode("utf-8")
+
+    def list_run_jobs(self, repository: str, run_id: int) -> list[dict[str, Any]]:
+        """Return only bounded job and failed-step metadata for a named run."""
+        if _REPOSITORY.fullmatch(repository) is None or type(run_id) is not int or run_id < 1:
+            raise ForgeError("invalid workflow run selector")
+        jobs = self._paginate(
+            f"/repos/{repository}/actions/runs/{run_id}/jobs",
+            collection_key="jobs", limit=100,
+        )
+        return [
+            {
+                "id": job.get("id") if type(job.get("id")) is int else None,
+                "name": self._text(job.get("name"), 200),
+                "status": self._text(job.get("status"), 32),
+                "conclusion": self._text(job.get("conclusion"), 32) or None,
+                "started_at": self._text(job.get("started_at"), 64) or None,
+                "completed_at": self._text(job.get("completed_at"), 64) or None,
+                "failed_steps": [
+                    {
+                        "number": step.get("number") if type(step.get("number")) is int else None,
+                        "name": self._text(step.get("name"), 200),
+                        "conclusion": self._text(step.get("conclusion"), 32),
+                    }
+                    for step in (job.get("steps") if isinstance(job.get("steps"), list) else [])[:100]
+                    if isinstance(step, Mapping) and step.get("conclusion") == "failure"
+                ],
+            }
+            for job in jobs
+        ]
 
     def list_reviews(self, scope: RepoPRActionScope) -> tuple[ReviewProjection, ...]:
         repository, number = self._target(scope)
