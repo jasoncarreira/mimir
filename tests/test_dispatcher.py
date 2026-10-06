@@ -16,6 +16,7 @@ from mimir.event_logger import init_logger
 from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 from mimir.server import _PairingNotifier
+from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 
 def _make_config(home: Path, **overrides) -> Config:
@@ -849,11 +850,11 @@ class TestSchedulerTickSerialization:
 
         disp = Dispatcher(cfg, runner)
         await disp.enqueue(AgentEvent(
-            trigger="user_message", channel_id="discord-1", content=""
+            trigger="user_message", channel_id="discord-1", content="", source="api",
         ))
         await asyncio.wait_for(first_started.wait(), timeout=1.0)
         await disp.enqueue(AgentEvent(
-            trigger="user_message", channel_id="discord-2", content=""
+            trigger="user_message", channel_id="discord-2", content="", source="api",
         ))
         # Second user_message proceeds in parallel — no scheduler-tick
         # mutex constrains it.
@@ -906,6 +907,7 @@ def _inj_config(home: Path, channels: tuple[str, ...]) -> Config:
         worker_idle_timeout_s=1,
         midturn_injection_channels=channels,
         access_control_enforced=False,
+        open_bridge=True,  # These routing tests intentionally use anonymous events.
     )
 
 
@@ -1022,7 +1024,7 @@ async def test_allowlisted_slack_user_message_enqueues_normally(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_default_compat_allows_non_allowlisted_discord_user(tmp_path: Path):
-    cfg = _make_config(tmp_path, access_control_enforced=False)
+    cfg = replace(_make_config(tmp_path, access_control_enforced=False), open_bridge=True)
     resolver = _resolver(
         tmp_path,
         """
@@ -1050,6 +1052,138 @@ async def test_default_compat_allows_non_allowlisted_discord_user(tmp_path: Path
     assert accepted is True
     await disp.drain()
     assert ran == ["legacy"]
+
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    allowed = [row for row in rows if row.get("type") == "inbound_event_allowed"]
+    assert len(allowed) == 1
+    assert allowed[0]["status"] == "legacy_allowed"
+    assert allowed[0]["enforcement_enabled"] is False
+
+
+def test_open_bridge_env_is_opt_in(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIMIR_OPEN_BRIDGE", raising=False)
+    assert Config.from_env().open_bridge is False
+    monkeypatch.setenv("MIMIR_OPEN_BRIDGE", "true")
+    assert Config.from_env().open_bridge is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("author", "roles", "reason"),
+    [
+        ("discord-2", "[user]", "unknown_author"),
+        ("discord-1", "[]", "user_not_allowlisted"),
+        (None, "[user]", "missing_author"),
+    ],
+)
+async def test_default_intake_refuses_discord_author_before_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    author: str | None, roles: str, reason: str,
+):
+    monkeypatch.delenv("MIMIR_ACCESS_CONTROL_ENFORCED", raising=False)
+    monkeypatch.delenv("MIMIR_OPEN_BRIDGE", raising=False)
+    cfg = _make_config(tmp_path)
+    assert cfg.open_bridge is False
+    resolver = _resolver(tmp_path, f"""
+        people:
+          - canonical: alice
+            aliases: [discord-1]
+            access: {{roles: {roles}}}
+    """)
+    ran: list[AgentEvent] = []
+    observed: list[AgentEvent] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event)
+
+    async def observer(event: AgentEvent) -> None:
+        observed.append(event)
+
+    disp = Dispatcher(cfg, runner, resolver=resolver)
+    disp.set_on_event(observer)
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hi",
+        author=author, source="discord", author_id="2" if author else None,
+    )) is False
+    await disp.drain()
+    assert ran == observed == []
+    assert "discord-C1" not in disp._queues
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+    assert len(denied) == 1
+    assert denied[0]["reason"] == reason
+    assert denied[0]["intake_gate"] is True
+    assert denied[0]["enforcement_enabled"] is False
+    assert not any(row.get("type") in {"event_queued", "inbound_event_allowed"} for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_admits_allowlisted_bridge_author(tmp_path: Path):
+    resolver = _resolver(tmp_path, """
+        people:
+          - canonical: alice
+            aliases: [discord-1]
+            access: {roles: [user]}
+    """)
+    ran: list[str] = []
+
+    async def runner(event: AgentEvent) -> None:
+        ran.append(event.content)
+
+    disp = Dispatcher(_make_config(tmp_path), runner, resolver=resolver)
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hi",
+        author="discord-1", source="discord",
+    )) is True
+    await disp.drain()
+    assert ran == ["hi"]
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert any(row.get("type") == "inbound_event_allowed" and
+               row.get("enforcement_enabled") is False for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_open_bridge_cannot_override_enforcement(tmp_path: Path):
+    disp = Dispatcher(replace(_make_config(tmp_path, access_control_enforced=True), open_bridge=True),
+                      resolver=_resolver(tmp_path, "people: []\n"))
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hi",
+        author="discord-unknown", source="discord",
+    )) is False
+    assert "discord-C1" not in disp._queues
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", sorted(TRUSTED_INTERNAL_SOURCES))
+async def test_shadow_intake_keeps_internal_sources_trusted(tmp_path: Path, source: str):
+    disp = Dispatcher(_make_config(tmp_path), resolver=_resolver(tmp_path, "people: []\n"))
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="internal-C1", content="hi",
+        author="unknown", source=source,
+    )) is True
+    await disp.drain()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["poller", "scheduled_tick", "synthesis"])
+async def test_shadow_intake_keeps_non_user_triggers(tmp_path: Path, trigger: str):
+    disp = Dispatcher(_make_config(tmp_path), resolver=_resolver(tmp_path, "people: []\n"))
+    assert await disp.enqueue(AgentEvent(
+        trigger=trigger, channel_id="discord-C1", content="hi",
+        author="unknown", source="discord",
+    )) is True
+    await disp.drain()
+
+
+@pytest.mark.asyncio
+async def test_shadow_intake_gates_generic_http_even_with_internal_source(tmp_path: Path):
+    disp = Dispatcher(_make_config(tmp_path), resolver=_resolver(tmp_path, "people: []\n"))
+    assert await disp.enqueue(AgentEvent(
+        trigger="synthesis", channel_id="api-C1", content="hi",
+        author="unknown", source="api",
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
+    )) is False
+    assert "api-C1" not in disp._queues
 
 
 @pytest.mark.asyncio
@@ -1179,7 +1313,7 @@ async def test_missing_source_user_message_is_gated_fail_closed(tmp_path: Path):
 async def test_unknown_dm_sender_gets_pairing_hook_without_normal_dispatch(
     tmp_path: Path,
 ):
-    cfg = _make_config(tmp_path, access_control_enforced=True)
+    cfg = _make_config(tmp_path, access_control_enforced=False)
     resolver = _resolver(tmp_path, "people: []\n")
     ran: list[str] = []
     pairing: list[tuple[AgentEvent, str | None]] = []
@@ -1222,6 +1356,8 @@ async def test_unknown_dm_sender_gets_pairing_hook_without_normal_dispatch(
         if line.strip()
     ]
     assert any(row.get("type") == "inbound_pairing_required" for row in rows)
+    assert any(row.get("type") == "inbound_event_denied" and
+               row.get("intake_gate") is True for row in rows)
     assert not any(row.get("type") == "event_queued" for row in rows)
 
 
@@ -1230,7 +1366,7 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
     tmp_path: Path,
 ):
     cfg = replace(
-        _make_config(tmp_path, access_control_enforced=True),
+        _make_config(tmp_path, access_control_enforced=False),
         unauthorized_user_behavior="prompt-to-pair",
     )
     resolver = _resolver(tmp_path, "people: []\n")
@@ -1267,7 +1403,7 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
 async def test_public_unknown_sender_gets_pairing_hook_without_public_send(
     tmp_path: Path,
 ):
-    cfg = _make_config(tmp_path, access_control_enforced=True)
+    cfg = _make_config(tmp_path, access_control_enforced=False)
     resolver = _resolver(tmp_path, "people: []\n")
     pairing: list[tuple[AgentEvent, str | None]] = []
 

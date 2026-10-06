@@ -6,6 +6,13 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+**Operator action:** Before upgrading, add Discord and Slack participants who
+should be able to start turns to `<MIMIR_HOME>/state/identities.yaml` with the
+`user` role (or `admin`). Unknown, missing and non-allowlisted bridge authors
+are now refused at intake even in IFC shadow mode. To retain open bridge intake
+while IFC enforcement is off, explicitly set `MIMIR_OPEN_BRIDGE=true`; it cannot
+override `MIMIR_ACCESS_CONTROL_ENFORCED=true` (#1871).
+
 ## [0.9.3] — 2026-10-04
 
 SAGA now actually loads each home's `saga.toml`, which had been silently ignored
