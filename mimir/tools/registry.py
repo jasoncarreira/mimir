@@ -2722,7 +2722,8 @@ async def request_mimir_update(
 ) -> str:
     """Request an authenticated operator approval for a mimir update.
 
-    The tool registers a turn-bound request. Only an authenticated operator
+    The tool registers a standalone request that survives the requesting turn.
+    Only an authenticated operator
     ``approve upd-xxxx`` reply on the operator alert channel writes the flag.
 
     Suggested conversation before requesting approval:
@@ -2782,9 +2783,8 @@ async def request_mimir_update(
     def resolve(decision, edit, event, identity_resolver, now, approval_event, reply_source):
         if decision == "decline":
             return "declined"
-        canonical = identity_resolver.resolve(event.author) if identity_resolver else None
-        if not canonical:
-            return "unauthenticated_operator"
+        # The registry authenticates the operator before calling this resolver.
+        canonical = identity_resolver.resolve(event.author)
         write_flag(
             Path(home_env), target_version=cleaned_target,
             include_prereleases=bool(include_prereleases),
@@ -2795,7 +2795,7 @@ async def request_mimir_update(
     entry = approval_requests.register(
         kind="upd", channel_id=channel,
         description=f"mimir update to {cleaned_target or 'latest'}",
-        expires_at=time.monotonic() + 3600, resolver=resolve,
+        expires_at=time.monotonic() + 3600, resolver=resolve, inject_into_turn=False,
     )
 
     pin_desc = f"pinned to {cleaned_target}" if cleaned_target else "latest at install time"

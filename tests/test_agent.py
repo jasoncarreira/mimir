@@ -1117,6 +1117,92 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+@pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+):
+    """Exercise request -> completed run_turn -> a new bridge reply event."""
+    from mimir import __version__, approval_requests, mid_turn_injection
+    from mimir.tools import registry as tool_registry
+    from mimir.update_on_start import flag_path
+    from packaging.version import Version
+
+    target = f"{Version(__version__).major + 1}.0.0rc1"
+    channel = "discord-update-e2e"
+
+    class RequestingModel(_FakeAgent):
+        approval_id = None
+        calls = 0
+
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            self.calls += 1
+            assert self.calls == 1, "approval reply must not invoke the model"
+            result = await tool_registry.request_mimir_update.ainvoke({
+                "target_version": target, "include_prereleases": True,
+            })
+            self.approval_id = result.split("Update approval requested: ")[1].split(".")[0]
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = RequestingModel([AIMessage(content="approval requested")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    agent._config.operator_alert_channel = channel
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    identity = _resolver(home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    agent._identity_resolver = identity
+    notices = []
+
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+
+    dispatcher = SimpleNamespace(_config=agent._config, _send_approval_notice=send_notice)
+    monkeypatch.setitem(tool_registry._STATE, "dispatcher", dispatcher)
+    first = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content="request an update",
+    ))
+    assert first.error is None
+    assert model.calls == 1 and model.approval_id is not None
+    assert not flag_path(home).exists()
+    assert channel not in mid_turn_injection._REGISTRY
+    entry = next(e for e in approval_requests.pending(channel) if e.approval_id == model.approval_id)
+    assert entry.inject_into_turn is False
+
+    # No ordinary turn setup, model, or message injection may see this reply.
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("approval reply entered ordinary turn setup")
+    monkeypatch.setattr("mimir.agent._initialize_ifc_labels", unexpected_setup)
+    agent._dispatcher = dispatcher
+    result = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"{decision} {model.approval_id}",
+    ))
+    assert result.kind == "operator_approval"
+    assert model.calls == 1
+    assert channel not in mid_turn_injection._REGISTRY
+    assert notices == [(channel, f"{'granted' if decision == 'approve' else 'declined'} {model.approval_id}")]
+    assert flag_path(home).exists() == (decision == "approve")
+    if decision == "approve":
+        data = json.loads(flag_path(home).read_text())
+        assert data["target_version"] == target
+        assert data["include_prereleases"] is True
+        assert data["approved_by"] == "operator"
+        assert data["approval_id"] == model.approval_id
+    again = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"approve {model.approval_id}",
+    ))
+    assert again.output == f"already resolved {model.approval_id}"
+    assert model.calls == 1
+
+
 def test_agent_audience_provider_reuses_message_buffer_identity_resolver(
     tmp_path: Path,
 ) -> None:

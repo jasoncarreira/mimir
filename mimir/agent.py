@@ -1927,21 +1927,33 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         from .operator_approval import _is_authenticated_operator
         from .memory_proposals import complete_reply, is_mp_reply, sync_pending
-        from .approval_requests import pending as pending_approvals, resolve as resolve_approval
+        from .approval_requests import (
+            is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
+        )
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
-        if _is_authenticated_operator(event, self._identity_resolver) and (is_mp_reply(event) or bare_reply):
+        named_reply = is_non_turn_bound_reply(event)
+        if _is_authenticated_operator(event, self._identity_resolver) and (named_reply or bare_reply):
             sync_pending(self._config.home)
-            if is_mp_reply(event) or any(
-                entry.kind == "mp" for entry in pending_approvals(event.channel_id)
+            pending_entries = pending_approvals(event.channel_id)
+            memory_reply = is_mp_reply(event) or (bare_reply and bool(pending_entries) and all(
+                entry.kind == "mp" for entry in pending_entries
+            ))
+            if named_reply or any(
+                entry.kind == "mp" for entry in pending_entries
             ):
                 resolution = resolve_approval(event, self._identity_resolver)
             else:
                 resolution = None
             if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
-                    or (resolution.entry is None and (is_mp_reply(event) or bare_reply))):
-                notice = await complete_reply(
-                    self._config.home, event, resolution, self._identity_resolver,
-                )
+                    or (resolution.entry is None and (named_reply or bare_reply))):
+                if memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
+                    notice = await complete_reply(
+                        self._config.home, event, resolution, self._identity_resolver,
+                    )
+                else:
+                    notice = resolution.message or (
+                        f"{resolution.status} {resolution.entry.approval_id}" if resolution.entry else None
+                    )
                 if notice and self._dispatcher is not None:
                     await self._dispatcher._send_approval_notice(event.channel_id, notice)
                 elif notice and self._channels is not None:
@@ -1951,7 +1963,11 @@ class Agent:
                     session_id=session_id or event.channel_id or "default",
                     saga_session_id=saga_session_id, trigger=event.trigger,
                     channel_id=event.channel_id, input=event.content or "",
-                    output=notice or "", kind="memory_proposal_approval",
+                    output=notice or "", kind=(
+                        "memory_proposal_approval" if memory_reply or (
+                            resolution.entry is not None and resolution.entry.kind == "mp"
+                        ) else "operator_approval"
+                    ),
                 )
         turn_id = turn_id or make_turn_id()
         explicit_session_binding = session_id is not None and saga_session_id is not None
