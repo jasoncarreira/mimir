@@ -1939,7 +1939,7 @@ class Agent:
                 entry.kind == "mp" for entry in pending_entries
             ))
             if named_reply or any(
-                entry.kind == "mp" for entry in pending_entries
+                not entry.inject_into_turn for entry in pending_entries
             ):
                 resolution = resolve_approval(event, self._identity_resolver)
             else:
