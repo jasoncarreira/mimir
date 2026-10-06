@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,9 @@ from mimir.bridges.discord import (
     _chunk_message,
 )
 from mimir.event_logger import init_logger
+from mimir.config import Config
+from mimir.dispatcher import Dispatcher
+from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 
 
@@ -1204,6 +1208,84 @@ async def test_on_message_downloads_inbound_attachments(
     assert saved.parent.parent.name == "discord"
     # Original URL preserved on extra for fallback.
     assert ev.extra.get("inbound_attachment_urls") == ["https://cdn.example/a.png"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("author_id", "text", "open_bridge", "wire_admit", "downloads"),
+    [
+        (22, "", False, True, False),  # attachment-only, unknown author
+        (11, "see attached", False, True, True),
+        (22, "see attached", True, True, True),
+        (22, "see attached", False, False, True),  # standalone bridge compatibility
+    ],
+)
+async def test_attachment_download_respects_intake_admission(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    author_id: int, text: str, open_bridge: bool, wire_admit: bool, downloads: bool,
+):
+    from mimir.bridges import _attachments
+
+    bridge, _, _ = bridge_with_fake_client
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [discord-11]\n"
+        "    access: {roles: [user]}\n", encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    disp = Dispatcher(replace(Config.from_env(), home=tmp_path,
+                              access_control_enforced=False, open_bridge=open_bridge),
+                      resolver=resolver)
+    observed: list[AgentEvent] = []
+
+    async def enqueue(event: AgentEvent) -> bool:
+        observed.append(event)
+        return await disp.enqueue(event)
+
+    bridge.enqueue = enqueue
+    if wire_admit:
+        bridge.admit = disp.intake_admits
+    bridge.attachments_dir = tmp_path / "attachments"
+    calls: list[str] = []
+
+    async def fake_download(url, target, **kwargs):
+        calls.append(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"attachment")
+        return True
+
+    monkeypatch.setattr(_attachments, "download_to_path", fake_download)
+    msg = SimpleNamespace(
+        id=900 + author_id, author=SimpleNamespace(id=author_id, bot=False,
+                                                   display_name="User"),
+        channel=_fake_channel(id=1), content=text,
+        attachments=[SimpleNamespace(url="https://cdn.example/a.png",
+                                     filename="a.png", size=10)],
+    )
+    try:
+        await bridge._on_message(msg)
+        assert len(observed) == 1
+        incoming = observed[0]
+        assert incoming.author == f"discord-{author_id}"
+        assert calls == (["https://cdn.example/a.png"] if downloads else [])
+        assert bool(incoming.attachment_names) is downloads
+        assert incoming.extra.get("inbound_attachment_urls") == (
+            ["https://cdn.example/a.png"] if downloads else None
+        )
+        if downloads:
+            assert len(list(bridge.attachments_dir.rglob("*.png"))) == 1
+        else:
+            assert not bridge.attachments_dir.exists()
+        rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+        denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+        assert len(denied) == (0 if author_id == 11 or open_bridge else 1)
+        if denied:
+            assert denied[0]["reason"] == "unknown_author"
+            assert denied[0]["intake_gate"] is True
+    finally:
+        await disp.drain()
 
 
 @pytest.mark.asyncio

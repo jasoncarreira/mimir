@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,9 @@ from mimir.bridges.slack import (
     _slack_channel_to_id,
 )
 from mimir.event_logger import init_logger
+from mimir.config import Config
+from mimir.dispatcher import Dispatcher
+from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 
 
@@ -765,6 +769,82 @@ async def test_on_message_allows_file_share_subtype(bridge_with_fake_app):
         }
     )
     assert len(enqueued) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "text", "open_bridge", "wire_admit", "downloads"),
+    [
+        ("UUNKNOWN", "", False, True, False),
+        ("U05ALICE", "see attached", False, True, True),
+        ("UUNKNOWN", "see attached", True, True, True),
+        ("UUNKNOWN", "see attached", False, False, True),
+    ],
+)
+async def test_file_share_download_respects_intake_admission(
+    bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    user: str, text: str, open_bridge: bool, wire_admit: bool, downloads: bool,
+):
+    from mimir.bridges import slack as slack_module
+
+    bridge, _, _ = bridge_with_fake_app
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [slack-U05ALICE]\n"
+        "    access: {roles: [user]}\n", encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    disp = Dispatcher(replace(Config.from_env(), home=tmp_path,
+                              access_control_enforced=False, open_bridge=open_bridge),
+                      resolver=resolver)
+    observed: list[AgentEvent] = []
+
+    async def enqueue(agent_event: AgentEvent) -> bool:
+        observed.append(agent_event)
+        return await disp.enqueue(agent_event)
+
+    bridge.enqueue = enqueue
+    if wire_admit:
+        bridge.admit = disp.intake_admits
+    bridge.attachments_dir = tmp_path / "attachments"
+    calls: list[str] = []
+
+    async def fake_download(url, target, **kwargs):
+        calls.append(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"attachment")
+        return True
+
+    monkeypatch.setattr(slack_module, "download_to_path", fake_download)
+    try:
+        await bridge._on_message({
+            "user": user, "channel": "C01ENG", "text": text,
+            "ts": "900.001", "subtype": "file_share",
+            "files": [{"url_private": "https://files.slack.com/a.png",
+                       "name": "a.png", "size": 10}],
+        })
+        assert len(observed) == 1
+        incoming = observed[0]
+        assert incoming.author == f"slack-{user}"
+        assert calls == (["https://files.slack.com/a.png"] if downloads else [])
+        assert bool(incoming.attachment_names) is downloads
+        assert incoming.extra.get("inbound_attachment_urls") == (
+            ["https://files.slack.com/a.png"] if downloads else None
+        )
+        if downloads:
+            assert len(list(bridge.attachments_dir.rglob("*.png"))) == 1
+        else:
+            assert not bridge.attachments_dir.exists()
+        rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+        denied = [row for row in rows if row.get("type") == "inbound_event_denied"]
+        assert len(denied) == (0 if user == "U05ALICE" or open_bridge else 1)
+        if denied:
+            assert denied[0]["reason"] == "unknown_author"
+            assert denied[0]["intake_gate"] is True
+    finally:
+        await disp.drain()
 
 
 @pytest.mark.asyncio
