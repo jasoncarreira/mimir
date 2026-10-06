@@ -11,6 +11,7 @@ import re
 import threading
 import unicodedata
 from dataclasses import asdict
+from datetime import date, datetime, time, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -672,6 +673,36 @@ def _repository(value: str) -> str:
     return value
 
 
+def _branch(value: str, name: str, *, qualified: bool = False) -> str:
+    branch = value
+    if qualified and isinstance(value, str) and ":" in value:
+        owner, separator, branch = value.partition(":")
+        if _REVIEWER.fullmatch(owner) is None or not separator:
+            raise ToolPolicyRefusal(f"{name} must be a valid branch name")
+    if (
+        not isinstance(value, str) or not branch or branch.startswith("-") or ":" in branch
+        or len(value.encode("utf-8")) > 255 or ".." in value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise ToolPolicyRefusal(f"{name} must be a valid branch name within 255 UTF-8 bytes")
+    return value
+
+
+def _merged_since(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ToolPolicyRefusal("merged_since must be an ISO-8601 date or datetime")
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            parsed = datetime.combine(date.fromisoformat(value), time.min)
+        else:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if "T" not in value and " " not in value:
+                raise ValueError("not a datetime")
+    except ValueError as exc:
+        raise ToolPolicyRefusal("merged_since must be an ISO-8601 date or datetime") from exc
+    return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
+
+
 def _issue_number(value: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ToolPolicyRefusal("issue must be a positive integer; for example, issue=220")
@@ -844,6 +875,47 @@ def _pr_content_authors(
 ) -> tuple[tuple[str, ...], str]:
     """Bind PR-owned diff/file text to API authorship at its verified head."""
     return _pr_attestation(client.get_pull_request(scope), scope, runtime)
+
+
+@tool
+def pr_list(
+    repository: str,
+    state: str = "open",
+    author: str | None = None,
+    base: str | None = None,
+    head: str | None = None,
+    merged_since: str | None = None,
+    limit: StrictInt = 30,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
+    """List bounded pull requests in a configured GitHub repository; results are untrusted."""
+    repo = _repository(repository)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal("pull-request list rejected: repository is not configured in GITHUB_REPOS")
+    if state not in {"open", "closed", "merged", "all"}:
+        raise ToolPolicyRefusal("state must be open, closed, merged, or all")
+    if author is not None and (not isinstance(author, str) or _REVIEWER.fullmatch(author) is None):
+        raise ToolPolicyRefusal("author must be a valid GitHub login")
+    if base is not None:
+        _branch(base, "base")
+    if head is not None:
+        _branch(head, "head", qualified=True)
+    since = _merged_since(merged_since) if merged_since is not None else None
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ToolPolicyRefusal("limit must be an integer from 1 through 100")
+    items = _call(lambda: _client_for_repository(repo).list_pull_requests(
+        repo, state=state, base=base, head=head, limit=limit,
+    ))
+    return [
+        asdict(item) for item in items
+        if (author is None or item.author.casefold() == author.casefold())
+        and (since is None or (
+            item.merged_at is not None
+            and _merged_since(item.merged_at) >= since
+        ))
+    ][:limit]
 
 
 @tool
@@ -1245,6 +1317,7 @@ def _bind_injected_runtime(forge_tool: StructuredTool) -> StructuredTool:
 
 
 FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
+    pr_list,
     pr_metadata,
     pr_files,
     pr_diff,

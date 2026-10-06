@@ -10,6 +10,7 @@ import threading
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
 
@@ -22,6 +23,7 @@ from .client import (
     ForgeResponseTooLarge,
     IssueTarget,
     PullRequestProjection,
+    PullRequestSummary,
     ReviewProjection,
     ReviewRequestProjection,
     ReviewVerdict,
@@ -342,19 +344,28 @@ class GitHubForgeClient:
         except ValueError as exc:
             raise ForgeError("forge returned invalid JSON") from exc
 
-    def _paginate(self, endpoint: str) -> list[Mapping[str, Any]]:
+    def _paginate(
+        self, endpoint: str, *, limit: int | None = None, merged_only: bool = False,
+    ) -> list[Mapping[str, Any]]:
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
         for page in range(1, _MAX_PAGES + 1):
             payload = self._request("GET", f"{endpoint}{separator}per_page=50&page={page}")
             if not isinstance(payload, list):
                 raise ForgeError("forge returned an invalid collection")
-            page_items = [item for item in payload if isinstance(item, Mapping)]
+            page_items = [
+                item for item in payload
+                if isinstance(item, Mapping) and (not merged_only or item.get("merged_at") is not None)
+            ]
             items.extend(page_items)
             if len(items) > _MAX_ITEMS:
                 raise ForgeResponseTooLarge("forge collection exceeded item limit")
+            if limit is not None and len(items) >= limit:
+                return items[:limit]
             if len(payload) < 50:
                 return items
+        if limit is not None:
+            return items
         raise ForgeResponseTooLarge("forge collection exceeded page limit")
 
     @staticmethod
@@ -459,6 +470,45 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+        )
+
+    def list_pull_requests(
+        self, repository: str, *, state: str, base: str | None = None,
+        head: str | None = None, limit: int = 30,
+    ) -> tuple[PullRequestSummary, ...]:
+        """List bounded, updated-descending PR summaries from the fixed GitHub host."""
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ForgeError("invalid repository selector")
+        if state not in {"open", "closed", "merged", "all"} or type(limit) is not int or not 1 <= limit <= 100:
+            raise ForgeError("invalid pull-request list selector")
+        query = {"state": "closed" if state == "merged" else state,
+                 "sort": "updated", "direction": "desc"}
+        if base is not None:
+            query["base"] = base
+        if head is not None:
+            query["head"] = head
+        rows = self._paginate(
+            f"/repos/{repository}/pulls?{urlencode(query)}",
+            limit=limit, merged_only=state == "merged",
+        )
+        return tuple(
+            PullRequestSummary(
+                number=int(item.get("number", 0)),
+                title=self._text(item.get("title"), 1_024),
+                state="merged" if item.get("merged_at") is not None else self._text(item.get("state"), 32),
+                author=self._text(self._user(item), 256),
+                head_ref=self._text(head_data.get("ref"), 255),
+                base_ref=self._text(base_data.get("ref"), 255),
+                head_sha=self._text(head_data.get("sha"), 64),
+                updated_at=self._text(item.get("updated_at"), 64),
+                merged_at=self._text(item.get("merged_at"), 64) or None,
+                url=self._text(item.get("html_url"), 4_096),
+            )
+            for item in rows
+            for head_data, base_data in [(
+                item.get("head") if isinstance(item.get("head"), Mapping) else {},
+                item.get("base") if isinstance(item.get("base"), Mapping) else {},
+            )]
         )
 
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]:

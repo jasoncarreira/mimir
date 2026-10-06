@@ -95,6 +95,45 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+def _pr_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",
+        "user": {"login": "author"}, "head": {"ref": "topic", "sha": "a" * 40},
+        "base": {"ref": "main"}, "updated_at": "2026-10-03T00:00:00Z",
+        "merged_at": "2026-10-02T00:00:00Z" if merged else None,
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+    }
+
+
+def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
+    session = Session([Response([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", base="main", head="fork:topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert result[0].state == "merged"
+    assert len(result[0].title) == 1024
+    assert session.calls[0][0:2] == (
+        "GET", "https://api.github.com/repos/owner/repo/pulls?"
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
+    )
+
+
+def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
+    session = Session([Response([_pr_row(page * 50 + n, merged=True) for n in range(50)])
+                       for page in range(20)])
+    client = GitHubForgeClient(session=session)
+    assert len(client.list_pull_requests("owner/repo", state="all", limit=51)) == 51
+    assert len(session.calls) == 2
+    session = Session([Response([_pr_row(page * 50 + n) for n in range(50)])
+                       for page in range(20)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=100,
+    )
+    assert result == ()
+    assert len(session.calls) == 10
+
+
 def _job_metadata():
     return {
         "id": 456, "run_id": 123, "head_sha": "a" * 40,

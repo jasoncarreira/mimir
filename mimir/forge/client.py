@@ -39,6 +39,20 @@ class PullRequestProjection:
 
 
 @dataclass(frozen=True)
+class PullRequestSummary:
+    number: int
+    title: str
+    state: str
+    author: str
+    head_ref: str
+    base_ref: str
+    head_sha: str
+    updated_at: str
+    merged_at: str | None
+    url: str
+
+
+@dataclass(frozen=True)
 class FileProjection:
     path: str
     status: str
@@ -103,6 +117,11 @@ class ForgeClient(Protocol):
     ) -> NormalizedPullRequestSnapshot: ...
 
     def get_pull_request(self, scope: RepoPRActionScope) -> PullRequestProjection: ...
+
+    def list_pull_requests(
+        self, repository: str, *, state: str, base: str | None,
+        head: str | None, limit: int,
+    ) -> tuple[PullRequestSummary, ...]: ...
 
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]: ...
 

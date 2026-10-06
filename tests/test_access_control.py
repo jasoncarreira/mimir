@@ -17104,6 +17104,11 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     decisions[OperationDecision.RESOURCE_SCOPED].add("pr_job_log")
     readable["pr_job_log"] = "repository"
     protected["pr_job_log"] = "repository"
+    flows[access_control.ToolFlowDirection.SOURCE].add("pr_list")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("pr_list")
+    admin_catalog.add("pr_list")
+    readable["pr_list"] = "repository"
+    protected["pr_list"] = "repository"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}
