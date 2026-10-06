@@ -378,11 +378,17 @@ async def bash_async(
             bound_direct_exec_argv,
             direct_exec_env_overlay,
             direct_exec_redact_names,
+            interactive_shell_env_overlay,
             login_shell_command,
+            refuse_protected_shell_operands,
         )
         direct_argv = bound_direct_exec_argv()
         if direct_argv is None:
             direct_argv = mimir_direct_argv
+        if direct_argv is None:
+            refuse_protected_shell_operands(
+                command, Path(cwd).expanduser() if cwd else None, "bash_async",
+            )
         argv = (
             direct_argv
             if direct_argv is not None
@@ -404,6 +410,8 @@ async def bash_async(
                 spawn_kwargs["redact_values"] = tuple(
                     value for name in redact_names if (value := overlay.get(name))
                 )
+        else:
+            spawn_kwargs["env_overlay"] = interactive_shell_env_overlay()
         job = _REGISTRY.spawn(
             command,  # original (clean) command recorded for display
             **spawn_kwargs,
@@ -415,6 +423,10 @@ async def bash_async(
             else getattr(ctx, "ifc_labels", None)
         )
     except Exception as exc:  # noqa: BLE001
+        from .refusals import ToolPolicyRefusal
+
+        if isinstance(exc, ToolPolicyRefusal):
+            return str(exc)
         if redact_names:
             return f"bash_async failed: {type(exc).__name__}"
         return f"bash_async failed: {exc}"

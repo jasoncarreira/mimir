@@ -64,6 +64,13 @@ from .commands.identities import (  # noqa: E402
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    # Every CLI process may inherit credentials, including watchdog/worklink
+    # siblings. Protect them before parsing or dispatching any subcommand.
+    # server.main reapplies this after the pending-update exec path, since exec
+    # resets dumpability.
+    from .tools._shell_env import disable_process_dumpability
+
+    disable_process_dumpability()
     parser = argparse.ArgumentParser(
         prog="mimir",
         description="Memory-centric agent harness on the Claude Agent SDK.",
