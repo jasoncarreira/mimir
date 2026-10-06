@@ -108,7 +108,7 @@ _OLD_NON_INGESTING = {
     "repo_cleanup", "repo_stage", "write_todos", "write_file", "edit_file", "task",
 }
 _OLD_REPOSITORY_RESULTS = {
-    "pr_job_log", "ci_run_jobs", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+    "pr_job_log", "ci_run_jobs", "pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
     "pr_comments", "pr_review_requests", "repo_checkout", "repo_fetch",
     "repo_status", "repo_test", "repo_diff", "repo_unmerged", "pr_submit_review",
     "pr_inline_review_comment", "pr_comment", "pr_edit_body", "repo_commit",
@@ -116,7 +116,7 @@ _OLD_REPOSITORY_RESULTS = {
     "repo_revert", "repo_revert_abort", "repo_push",
 }
 _OLD_EXTERNAL_RESULTS = {
-    "web_search", "pr_job_log", "ci_run_jobs", "pr_metadata", "pr_files", "pr_diff", "pr_checks",
+    "web_search", "pr_job_log", "ci_run_jobs", "pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks",
     "pr_reviews", "pr_comments", "pr_review_requests",
 }
 _OLD_GIT_RESULTS = {

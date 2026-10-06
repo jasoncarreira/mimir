@@ -893,6 +893,23 @@ def pr_diff(
 
 
 @tool
+def pr_file_content(
+    repository: str,
+    pull_request: int,
+    path: str,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Read one regular file at the pull request's verified head."""
+    scope = _scope(runtime, repository, pull_request)
+    client = _client(scope)
+    content = _call(lambda: client.get_file_content(scope, path))
+    if callable(getattr(client, "author_is_trusted", None)):
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
+    return content
+
+
+@tool
 def pr_checks(
     repository: str,
     pull_request: int,
@@ -1268,6 +1285,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_metadata,
     pr_files,
     pr_diff,
+    pr_file_content,
     pr_checks,
     pr_job_log,
     ci_run_jobs,

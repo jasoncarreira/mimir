@@ -50,6 +50,7 @@ from mimir.tools.forge import (
     pr_comment,
     pr_comments,
     pr_diff,
+    pr_file_content,
     pr_edit_body,
     pr_files,
     pr_inline_review_comment,
@@ -67,7 +68,7 @@ from mimir.tools.budget_gate import BudgetGateMiddleware
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_comments, pr_reviews])
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content, pr_comments, pr_reviews])
 @pytest.mark.parametrize("verdict", [True, False, None])
 async def test_author_attested_forge_results(tmp_path, monkeypatch, read_tool, verdict):
     import threading
@@ -93,7 +94,10 @@ async def test_author_attested_forge_results(tmp_path, monkeypatch, read_tool, v
         for _ in range(2):
             token = access_control.begin_protected_result_capture()
             try:
-                result = await read_tool.coroutine("owner/repo", 17, runtime=runtime)
+                result = await read_tool.coroutine(
+                    "owner/repo", 17, **({"path": "src/app.py"} if read_tool is pr_file_content else {}),
+                    runtime=runtime,
+                )
             finally:
                 provenance = access_control.end_protected_result_capture(token)
             labels = access_control.classify_protected_result(
@@ -229,7 +233,7 @@ def test_author_attestation_downgrade_explains_turn(
         set_forge_client(None)
 
 
-@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_reviews, pr_comments])
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content, pr_reviews, pr_comments])
 def test_author_attestation_downgrade_identifies_read_tool(monkeypatch, read_tool):
     import mimir.event_logger as events
 
@@ -241,7 +245,8 @@ def test_author_attestation_downgrade_identifies_read_tool(monkeypatch, read_too
     set_forge_client(client)
     capture = access_control.begin_protected_result_capture()
     try:
-        read_tool.func("owner/repo", 17, runtime=_runtime(scope))
+        read_tool.func("owner/repo", 17, **({"path": "src/app.py"} if read_tool is pr_file_content else {}),
+                       runtime=_runtime(scope))
     finally:
         provenance = access_control.end_protected_result_capture(capture)
         set_forge_client(None)
@@ -266,7 +271,7 @@ def test_author_attestation_denial_without_ifc_state(monkeypatch):
     assert "attestation" not in refusal
 
 
-@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff])
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content])
 def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
     import mimir.event_logger as events
 
@@ -281,7 +286,8 @@ def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
     set_forge_client(client)
     token = access_control.begin_protected_result_capture()
     try:
-        read_tool.func("owner/repo", 17, runtime=runtime)
+        read_tool.func("owner/repo", 17, **({"path": "src/app.py"} if read_tool is pr_file_content else {}),
+                       runtime=runtime)
     finally:
         provenance = access_control.end_protected_result_capture(token)
     assert provenance.sources[0].integrity == "untrusted"
@@ -289,7 +295,7 @@ def test_stale_head_authorship_reports_head_mismatch(monkeypatch, read_tool):
     assert recorded[0][1]["failed_authors"] == ["<head-mismatch>"]
 
 
-@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff])
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content])
 @pytest.mark.parametrize("publication", ["verified", "foreign", "wrong_previous", "wrong_new", "wrong_repo", "wrong_pr"])
 def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, publication):
     import uuid
@@ -327,7 +333,8 @@ def test_pr_read_attests_only_exact_verified_push(monkeypatch, read_tool, public
     try:
         token = access_control.begin_protected_result_capture()
         try:
-            read_tool.func("owner/repo", 17, runtime=runtime)
+            read_tool.func("owner/repo", 17, **({"path": "src/app.py"} if read_tool is pr_file_content else {}),
+                           runtime=runtime)
         finally:
             provenance = access_control.end_protected_result_capture(token)
         label = provenance.sources[0]
@@ -745,6 +752,10 @@ class FakeForge:
         self.calls.append(("diff", scope))
         return self.diff
 
+    def get_file_content(self, scope, path):
+        self.calls.append(("file_content", scope, path))
+        return "file at scoped head"
+
     def list_checks(self, scope):
         self.calls.append(("checks", scope))
         return (CheckProjection("test", "completed", "success", "now", "now"),)
@@ -1015,6 +1026,75 @@ def test_tool_surface_requires_exact_repository_and_resource_selectors() -> None
         assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
+
+
+@pytest.mark.parametrize("repository,number", [("other/repo", 17), ("owner/repo", 18)])
+def test_file_content_outside_scope_never_calls_client(monkeypatch, repository, number):
+    monkeypatch.setattr(access_control, "is_configured_github_repo", lambda _: True)
+    client = FakeForge()
+    set_forge_client(client)
+    with pytest.raises(ToolException, match="outside this turn's scope"):
+        pr_file_content.func(repository, number, "src/app.py", runtime=_runtime(_scope(RepoPRAction.INSPECT)))
+    assert client.calls == []
+
+
+def test_file_content_dispatches_scoped_head_even_when_live_head_differs():
+    client = FakeForge()
+    client.snapshot_heads = ["f" * 40]
+    scope = _scope(RepoPRAction.INSPECT)
+    set_forge_client(client)
+    result = pr_file_content.func("owner/repo", 17, "src/app.py", runtime=_runtime(scope))
+    assert result == "file at scoped head"
+    assert client.calls == [("file_content", scope, "src/app.py")]
+    assert scope.observed_head_sha != client.snapshot_heads[0]
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_file_content_publishes_author_and_head_attestation(monkeypatch, trusted):
+    import mimir.event_logger as events
+
+    client = FakeForge()
+    attestations = []
+    monkeypatch.setattr(client, "author_is_trusted", lambda repo, author: (
+        attestations.append((repo, author)) or trusted
+    ), raising=False)
+    recorded = []
+    monkeypatch.setattr(events, "log_event_sync", lambda event, **fields: recorded.append((event, fields)))
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    token = access_control.begin_protected_result_capture()
+    try:
+        assert pr_file_content.func("owner/repo", 17, "src/app.py", runtime=runtime) == "file at scoped head"
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+    assert attestations == [("owner/repo", "author")]
+    assert provenance.sources[0].resource_id == f"owner/repo#pull/17@{scope.observed_head_sha}"
+    assert provenance.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    if not trusted:
+        assert recorded[0][1]["tool"] == "pr_file_content"
+
+
+@pytest.mark.parametrize("skill", ["github-poller", "github-ci-watch"])
+def test_file_content_granted_in_shipped_poller_manifests(skill):
+    manifest = Path(__file__).parents[1] / "mimir" / "optional-skills" / skill / "pollers.json"
+    capabilities = json.loads(manifest.read_text())["pollers"][0]["authority"]["capabilities"]
+    assert capabilities.count("pr_file_content") == 1
+
+
+def test_file_content_inventory_and_review_skill():
+    from mimir.tool_descriptors import ResultOriginKind, TOOL_DESCRIPTORS
+
+    assert access_control._TOOL_FLOW_MAP["pr_file_content"] == access_control.ToolFlowDirection.SOURCE
+    assert access_control._PROTECTED_RESULT_DOMAINS["pr_file_content"] == "repository"
+    assert "pr_file_content" in access_control._READ_BACKEND_RESULT_TOOLS
+    assert "pr_file_content" in budget_gate._STANDING_REVIEW_TOOLS
+    assert TOOL_DESCRIPTORS["pr_file_content"].result_origin == (
+        ResultOriginKind.EXTERNAL | ResultOriginKind.REPOSITORY
+    )
+    skill = Path(__file__).parents[1] / "mimir/skills/review/SKILL.md"
+    assert "pr_file_content" in skill.read_text()
+    assert "raw.githubusercontent.com" not in skill.read_text()
 
 
 def test_job_log_tool_dispatches_exact_scoped_target(monkeypatch):

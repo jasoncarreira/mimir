@@ -328,6 +328,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "pr_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "pr_comments": _D(result_origin=_E | _R),
     "pr_diff": _D(result_origin=_E | _R),
+    "pr_file_content": _D(result_origin=_E | _R),
     "pr_edit_body": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),
     "pr_files": _D(result_origin=_E | _R),
     "pr_inline_review_comment": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_R, sink_payload_extractor=_argument_payload("body")),

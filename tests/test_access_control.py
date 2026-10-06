@@ -17100,7 +17100,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     }
     destinations["memory_propose"] = "memory_proposals"
 
-    for name in ("pr_job_log", "ci_run_jobs"):
+    for name in ("pr_job_log", "ci_run_jobs", "pr_file_content"):
         flows[access_control.ToolFlowDirection.SOURCE].add(name)
         decisions[OperationDecision.RESOURCE_SCOPED].add(name)
         readable[name] = "repository"
