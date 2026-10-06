@@ -351,7 +351,8 @@ class Dispatcher:
 
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
         """Gate external user messages before any admission side effect."""
-        admitted = self.intake_admits(event)
+        decision = self._intake_decision(event)
+        admitted = decision is None or decision.allowed
         source = (event.source or "").strip().lower()
         is_http_ingress = self._is_http_ingress(event)
         if event.trigger != "user_message" and not is_http_ingress:
@@ -370,10 +371,8 @@ class Dispatcher:
             )
             return admitted
 
-        # Re-evaluate only for the audit/pairing metadata; the admission rule
-        # itself lives exclusively in _intake_decision.
-        decision = self._intake_decision(event)
-        assert decision is not None
+        if decision is None:
+            return admitted
         if admitted:
             await log_event(
                 "inbound_event_allowed",

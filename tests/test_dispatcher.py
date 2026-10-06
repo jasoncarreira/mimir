@@ -1243,17 +1243,39 @@ async def test_intake_admits_matches_authorization_without_side_effects(
 
 
 @pytest.mark.asyncio
-async def test_authorization_uses_shared_intake_decision(tmp_path: Path, monkeypatch):
-    """Both callers must consume the same decision, not reimplement the gate."""
+@pytest.mark.parametrize("admitted", [True, False])
+async def test_authorization_uses_shared_intake_decision(tmp_path: Path, monkeypatch, admitted):
+    """Admission and audit metadata consume one decision even if the rule changes."""
     from mimir.access_control import authorize_inbound
 
     disp = Dispatcher(_make_config(tmp_path), resolver=_resolver(tmp_path, "people: []\n"))
     event = AgentEvent(trigger="user_message", channel_id="discord-C1", content="hi",
                        author="discord-2", source="discord")
-    allowed = authorize_inbound(event, disp._identity_resolver, enforce=False)
-    monkeypatch.setattr(disp, "_intake_decision", lambda _: allowed)
-    assert disp.intake_admits(event) is True
-    assert await disp._authorize_bridge_event(event) is True
+    decision = authorize_inbound(event, disp._identity_resolver, enforce=not admitted)
+    opposite = authorize_inbound(event, disp._identity_resolver, enforce=admitted)
+    calls: list[AgentEvent] = []
+    logs: list[tuple[str, dict]] = []
+
+    def changing_decision(incoming: AgentEvent):
+        calls.append(incoming)
+        return decision if len(calls) == 1 else opposite
+
+    async def record_log(kind: str, **fields) -> None:
+        logs.append((kind, fields))
+
+    monkeypatch.setattr(disp, "_intake_decision", changing_decision)
+    monkeypatch.setattr("mimir.dispatcher.log_event", record_log)
+    assert disp.intake_admits(event) is admitted
+    assert calls == [event]
+    assert logs == []
+    calls.clear()
+    assert await disp._authorize_bridge_event(event) is admitted
+    assert calls == [event]
+    kind, fields = logs[0]
+    assert kind == ("inbound_event_allowed" if admitted else "inbound_event_denied")
+    assert fields["status"] == decision.status.value
+    if not admitted:
+        assert fields["reason"] == decision.denial_reason
 
 
 @pytest.mark.asyncio

@@ -1211,6 +1211,54 @@ async def test_on_message_downloads_inbound_attachments(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_raising_intake_admit_prevents_download_and_releases_claim(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    error_type,
+):
+    from mimir.bridges import _attachments
+
+    bridge, enqueued, _ = bridge_with_fake_client
+    bridge.attachments_dir = tmp_path / "attachments"
+    download = AsyncMock(return_value=True)
+    monkeypatch.setattr(_attachments, "download_to_path", download)
+    failure = error_type("intake unavailable")
+
+    def raising_admit(event: AgentEvent) -> bool:
+        raise failure
+
+    bridge.admit = raising_admit
+    message = SimpleNamespace(
+        id=990, author=SimpleNamespace(id=11, bot=False, display_name="Alice"),
+        channel=_fake_channel(id=1), content="",
+        attachments=[SimpleNamespace(url="https://cdn.example/a.png",
+                                     filename="a.png", size=10)],
+    )
+    with pytest.raises(error_type) as caught:
+        await bridge._on_message(message)
+    assert caught.value is failure
+    assert enqueued == []
+    download.assert_not_called()
+    assert not bridge.attachments_dir.exists()
+
+    async def successful_download(url, target, **kwargs):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"attachment")
+        return True
+
+    download.side_effect = successful_download
+    bridge.admit = lambda event: True
+    await bridge._on_message(message)
+    download.assert_awaited_once()
+    assert len(enqueued) == 1
+    assert Path(enqueued[0].attachment_names[0]).read_bytes() == b"attachment"
+    # Successful redelivery commits the claim; a third delivery is deduped.
+    await bridge._on_message(message)
+    assert len(enqueued) == 1
+    download.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("author_id", "text", "open_bridge", "wire_admit", "downloads"),
     [
