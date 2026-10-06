@@ -218,6 +218,7 @@ async def test_interactive_shell_credential_command_refused_before_execution(too
     assert any(fields["reason"] == "outbound_credential" for kind, fields in events
                if kind == "hard_boundary_denied")
     assert command not in repr(events)
+    assert ("ghp_" + "a" * 36) not in repr(events)
 
 
 async def _run_async(

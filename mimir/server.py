@@ -2572,6 +2572,12 @@ def main() -> None:
     _home_for_flag = Path(os.environ.get("MIMIR_HOME") or os.getcwd())
     apply_pending_update(_home_for_flag)
 
+    # Apply after any update exec (exec resets dumpability), before spawning
+    # any runtime children. Same-uid interactive shells must not recover the
+    # server's original environment through /proc/$PPID/environ.
+    from .tools._shell_env import disable_process_dumpability
+
+    disable_process_dumpability()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     config = Config.from_env()
     _validate_bind_security(config.web_host, config.api_key)

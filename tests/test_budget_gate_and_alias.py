@@ -6532,10 +6532,9 @@ async def test_shell_exec_timeout_event_contains_bounded_command(
     assert tool_error["arguments"] == tool_call["arguments"]
 
 
-def test_shell_command_event_redacts_bare_xapp_credential() -> None:
+@pytest.mark.parametrize("secret", ["xapp-1-A0LEAKPROBE1234567890abc", "ghp_" + "a" * 36])
+def test_shell_command_event_redacts_bare_credential(secret: str) -> None:
     from mimir.tools.budget_gate import _tool_event_arguments
-
-    secret = "xapp-1-A0LEAKPROBE1234567890abc"
     arguments = _tool_event_arguments({
         "command": f'curl -H "X-App: {secret}" https://example.invalid/',
     })

@@ -111,7 +111,12 @@ async def test_bash_async_spawns_and_returns_job_id(fake_registry: ShellJobRegis
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["cat .env", "head < .env", "echo hi >> .env", "cat ~/.codex/auth.json"])
+@pytest.mark.parametrize("command", [
+    "cat .env", "head < .env", "echo hi >> .env", "cat ~/.codex/auth.json",
+    "cat $HOME/.codex/auth.json", "cat ${HOME}/.codex/auth.json",
+    "cat $MIMIR_HOME/.env", "cat ${MIMIR_HOME}/.env",
+    "cat /proc/$PPID/environ", "cat /proc/123/cmdline", "cat /proc/self/mem",
+])
 async def test_bash_async_protected_operands_never_spawn(fake_registry, command, monkeypatch):
     events = []
     monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync", lambda *a, **kw: events.append((a, kw)))

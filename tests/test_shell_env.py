@@ -61,6 +61,46 @@ async def test_interactive_sync_and_async_children_receive_same_scrubbed_env(
     assert sync_env == async_env
 
 
+def test_server_disables_dumpability_after_update_before_runtime_children():
+    import ast
+
+    source = Path(__file__).resolve().parents[1] / "mimir" / "server.py"
+    tree = ast.parse(source.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = {
+        node.func.id: node.lineno for node in ast.walk(main)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert calls["apply_pending_update"] < calls["disable_process_dumpability"] < calls["build_app"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux procfs dumpability control")
+def test_non_dumpable_parent_environment_unreadable_to_interactive_child():
+    if os.geteuid() == 0:
+        pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    # Isolate PR_SET_DUMPABLE from pytest's shared process. Probe before and
+    # after so a pre-existing procfs restriction cannot make this test vacuous.
+    script = '''
+import ctypes, subprocess, sys, shlex
+from mimir.tools._shell_env import (
+    disable_process_dumpability, interactive_shell_env, login_shell_command,
+)
+probe = "import os; open('/proc/' + str(os.getppid()) + '/environ', 'rb').close()"
+argv = ["bash", "-lc", login_shell_command("exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe))]
+env = interactive_shell_env()
+assert subprocess.run(argv, env=env, capture_output=True).returncode == 0
+disable_process_dumpability()
+assert ctypes.CDLL(None).prctl(3, 0, 0, 0, 0) == 0
+result = subprocess.run(argv, env=env, capture_output=True, text=True)
+assert result.returncode != 0
+assert "PermissionError" in result.stderr
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_interactive_passthrough_logs_names_only(monkeypatch):
     events = []
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: events.append((a, kw)))

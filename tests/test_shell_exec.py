@@ -77,6 +77,11 @@ def test_shell_exec_runs_arbitrary_command_in_default_state():
     "cat .git/credentials", "cat ~/.config/gogcli/config.json",
     "cat $GOG_HOME/auth.json", "cat $MIMIR_CLAUDE_OAUTH_CREDENTIALS",
     "cat < .env", "cat <<< .env", "echo hi > .env", "echo hi >> .env",
+    "cat $HOME/.codex/auth.json", "cat ${HOME}/.codex/auth.json",
+    "cat $MIMIR_HOME/.env", "cat ${MIMIR_HOME}/.env",
+    "cat ${GOG_HOME}/auth.json",
+    "cat /proc/$PPID/environ", "cat /proc/${PPID}/environ",
+    "cat /proc/123/cmdline", "cat /proc/self/mem", "cat /proc/*/environ",
 ])
 def test_protected_shell_operands_refuse_without_spawning(command, monkeypatch, tmp_path):
     monkeypatch.setenv("GOG_HOME", str(tmp_path / "gog"))

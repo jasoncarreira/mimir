@@ -152,6 +152,25 @@ def _minimal_direct_exec_env() -> dict[str, str]:
     return env
 
 
+def disable_process_dumpability() -> None:
+    """Keep same-uid children from reading the Linux server's proc secrets.
+
+    This does not protect other same-uid processes or root/CAP_SYS_PTRACE.
+    Fail startup on Linux if the kernel cannot enforce the requested control.
+    """
+    if sys.platform != "linux":
+        return
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 4
+        error = ctypes.get_errno()
+        raise OSError(error, "cannot disable server process dumpability")
+
+
 def interactive_shell_env() -> dict[str, str]:
     """Select interactive child settings and exact operator-granted names."""
     env = {
@@ -185,7 +204,12 @@ def interactive_shell_env_overlay() -> dict[str, str | None]:
 
 
 def refuse_protected_shell_operands(command: str, cwd: Path | None, tool: str) -> None:
-    """Best-effort literal operand screen; shell expansion is not fully parseable."""
+    """Best-effort literal screen, not a shell sandbox.
+
+    Globs, braces, variable indirection and interpreter code can bypass this
+    screen. The child environment scrub and non-dumpable Linux server parent
+    are the controls preventing recovery of the server's ambient credentials.
+    """
     from ..read_policy import _has_protected_read_name
     from .refusals import ToolPolicyRefusal
 
@@ -211,14 +235,27 @@ def refuse_protected_shell_operands(command: str, cwd: Path | None, tool: str) -
         if not word or all(char in "<>|;&()" for char in word):
             continue
         raw = word
-        if gog_home and (raw == "$GOG_HOME" or raw.startswith("$GOG_HOME/")):
-            raw = gog_home + raw[len("$GOG_HOME"):]
+        for name, value in (
+            ("HOME", str(home)),
+            ("MIMIR_HOME", os.environ.get("MIMIR_HOME", "")),
+            ("GOG_HOME", gog_home),
+        ):
+            if not value:
+                continue
+            for prefix in (f"${name}", "${" + name + "}"):
+                if raw == prefix or raw.startswith(prefix + "/"):
+                    raw = value + raw[len(prefix):]
+                    break
         candidate = Path(raw).expanduser()
         if not candidate.is_absolute():
             candidate = base / candidate
         resolved = candidate.resolve()
         if (
-            _has_protected_read_name(candidate)
+            (candidate.parts[:2] == ("/", "proc")
+             and candidate.name in {"environ", "cmdline", "mem"})
+            or (resolved.parts[:2] == ("/", "proc")
+                and resolved.name in {"environ", "cmdline", "mem"})
+            or _has_protected_read_name(candidate)
             or _has_protected_read_name(resolved)
             or any(resolved == root or resolved.is_relative_to(root) for root in roots)
             or oauth_path is not None and resolved == oauth_path
