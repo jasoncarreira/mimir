@@ -3996,6 +3996,12 @@ def test_declared_shell_authorization_and_execution_gates_agree(
         assert authorization_admitted is (authorization_argv is not None)
         assert gate_admitted is authorization_admitted
         assert authorization_admitted is expected_admitted
+        if expected_admitted:
+            shadow = SinkGate.check_sink_flow(
+                tool_name, command, auth.ifc_labels, auth, enforce=False,
+                repo_review_state=review_state,
+            )
+            assert shadow.allowed is True
 
 
 @pytest.mark.parametrize("subcommand", ["diff", "log", "show"])
@@ -5283,6 +5289,120 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
     return replace(auth, ifc_labels=auth.ifc_labels.with_source(untrusted))
 
 
+@pytest.mark.parametrize(("tool_name", "target", "category", "reason"), [
+    ("shell_exec", "printf tainted", SinkCategory.SHELL_PROCESS, "ifc_label_blocked:shell_process"),
+    ("bash_async", "printf tainted", SinkCategory.SHELL_PROCESS, "ifc_label_blocked:shell_process"),
+    ("fetch_url", "https://outside.example/secret", SinkCategory.NETWORK, "egress_destination_not_approved"),
+    ("webhook", "https://outside.example/hook", SinkCategory.HTTP_WEBHOOK, "ifc_label_blocked:http_webhook"),
+    ("http_request", "https://outside.example/hook", SinkCategory.HTTP_WEBHOOK, "ifc_label_blocked:http_webhook"),
+    ("send_message", "slack-C2", SinkCategory.CROSS_CHANNEL, "ifc_label_blocked:cross_channel"),
+    ("send_message", "slack-D2", SinkCategory.DIRECT_MESSAGE, "ifc_label_blocked:direct_message"),
+    ("send_message", "slack-C2", SinkCategory.SAME_CHANNEL, "ifc_label_blocked:same_channel"),
+])
+def test_always_on_ifc_veto_refuses_tainted_turn_in_shadow_mode(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, target: str,
+    category: SinkCategory, reason: str,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    auth = _tainted_admin_operator_write_auth()
+    decision = SinkGate.check_sink_flow(
+        tool_name, target, auth.ifc_labels, auth, enforce=False,
+        sink_category=category,
+    )
+    assert (decision.allowed, decision.reason, decision.would_block) == (False, reason, True)
+    assert decision.enforcement_enabled is True
+    assert decision.is_shadow_decision is False
+    assert "untrusted active ingest" in decision.refusal_detail
+    assert "channel source" in decision.refusal_detail
+    assert "operator" in decision.refusal_detail
+
+
+@pytest.mark.parametrize(("tool_name", "target", "category"), [
+    ("shell_exec", "pwd", SinkCategory.SHELL_PROCESS),
+    ("bash_async", "pwd", SinkCategory.SHELL_PROCESS),
+    ("fetch_url", "https://outside.example/secret", SinkCategory.NETWORK),
+    ("webhook", "https://outside.example/hook", SinkCategory.HTTP_WEBHOOK),
+    ("http_request", "https://outside.example/hook", SinkCategory.HTTP_WEBHOOK),
+    ("send_message", "slack-C2", SinkCategory.CROSS_CHANNEL),
+    ("send_message", "slack-D2", SinkCategory.DIRECT_MESSAGE),
+    ("send_message", "slack-C2", SinkCategory.SAME_CHANNEL),
+])
+def test_clean_operator_keeps_shadow_sink_decisions(
+    monkeypatch: pytest.MonkeyPatch, tool_name: str, target: str,
+    category: SinkCategory,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    auth = _trusted_operator_write_auth(admin=True)
+    decision = SinkGate.check_sink_flow(
+        tool_name, target, auth.ifc_labels, auth, enforce=False,
+        sink_category=category,
+    )
+    assert decision.allowed is True, (decision.reason, decision.refusal_detail)
+    assert decision.enforcement_enabled is False
+    assert decision.is_shadow_decision is decision.would_block
+
+
+@pytest.mark.parametrize(("tool_name", "target", "category"), [
+    ("write_file", "/tmp/ifc-shadow.txt", SinkCategory.FILE),
+    ("operator_alert", "slack-C2", SinkCategory.NOTIFICATION),
+    ("spawn_open_code", "/tmp/ifc-shadow", SinkCategory.SPAWN),
+    ("pr_comment", "owner/repo", SinkCategory.FORGE),
+])
+def test_other_tainted_sink_vetoes_remain_shadow_only(
+    tool_name: str, target: str, category: SinkCategory,
+) -> None:
+    auth = _tainted_admin_operator_write_auth()
+    decision = SinkGate.check_sink_flow(
+        tool_name, target, auth.ifc_labels, auth, enforce=False,
+        sink_category=category,
+    )
+    assert decision.allowed is True
+    assert decision.would_block is True
+    assert decision.is_shadow_decision is True
+    assert decision.enforcement_enabled is False
+
+
+def test_incompatible_origin_channel_reply_stays_shadow_only() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    foreign = replace(auth.ifc_labels.sources[-1], resource_id="slack-C2")
+    labels = InformationFlowLabels(sources=(foreign,))
+    decision = SinkGate.check_sink_flow(
+        "send_message", "slack-C1", labels, replace(auth, ifc_labels=labels),
+        enforce=False,
+    )
+    assert (decision.allowed, decision.would_block, decision.is_shadow_decision) == (True, True, True)
+
+
+def test_same_channel_reply_after_untrusted_ingest_is_allowed() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    decision = SinkGate.check_sink_flow(
+        "send_message", "slack-C1", auth.ifc_labels, auth, enforce=False,
+    )
+    assert decision.allowed is True
+    assert decision.would_block is False
+
+
+def test_public_cross_channel_taint_remains_shadow_only() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    public = replace(auth.ifc_labels.sources[-1], sensitivity="public")
+    labels = InformationFlowLabels(sources=(public,))
+    decision = SinkGate.check_sink_flow(
+        "send_message", "slack-C2", labels, replace(auth, ifc_labels=labels),
+        enforce=False, sink_category=SinkCategory.CROSS_CHANNEL,
+    )
+    assert (decision.allowed, decision.would_block, decision.is_shadow_decision) == (True, True, True)
+
+
+def test_shadow_veto_never_changes_enforced_decision() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    decision = SinkGate.check_sink_flow(
+        "shell_exec", "pwd", auth.ifc_labels, auth, enforce=True,
+    )
+    assert (decision.allowed, decision.enforcement_enabled, decision.is_shadow_decision) == (False, True, False)
+    assert decision.reason == "ifc_label_blocked:shell_process"
+    assert decision.refusal_detail is None
+
+
 @pytest.mark.parametrize(
     ("case", "auth_factory", "allowed"),
     [
@@ -5719,6 +5839,108 @@ def _service_auth(
         ifc_labels=labels,
         repo_review_state=repo_review_state,
     )
+
+
+def test_approved_research_fetch_and_verbatim_url_survive_shadow_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("fetch_url",),
+        approved_urls=("https://arxiv.org/", "https://papers.example/exact"),
+        creation_path="test",
+    )
+    labels = InformationFlowLabels().with_channel("poller:test").with_source(SourceLabel(
+        principal="research", domain="web", resource_id="https://arxiv.org/",
+        bridge_instance="poller", sensitivity="private",
+        authorized_principals=frozenset({"research"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = _service_auth(service, labels)
+    exact = "https://papers.example/exact"
+    assert exact in access_control.approved_fetch_urls(auth)
+    assert not access_control._egress_target_requires_taint_gate("fetch_url", exact, auth)
+    decision = SinkGate.check_sink_flow("fetch_url", exact, labels, auth, enforce=False)
+    assert decision.allowed is True, (decision.reason, decision.refusal_detail)
+    assert decision.would_block is False
+
+    # A URL that is within the manifest's scope but absent from the ingest is
+    # still refused; the verbatim grant admits only the exact encountered URL.
+    scoped = "https://arxiv.org/abs/42"
+    blocked = SinkGate.check_sink_flow("fetch_url", scoped, labels, auth, enforce=False)
+    assert blocked.allowed is False
+    access_control.record_ingested_urls(auth, f"Read {scoped}", labels)
+    admitted = SinkGate.check_sink_flow("fetch_url", scoped, labels, auth, enforce=False)
+    assert (admitted.allowed, admitted.reason) == (True, "taint_gate_exempt:verbatim_ingest_url")
+
+
+def test_verbatim_url_without_destination_grant_remains_shadow_only() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    target = "https://outside.example/mentioned"
+    access_control.record_ingested_urls(auth, target, auth.ifc_labels)
+    decision = SinkGate.check_sink_flow(
+        "fetch_url", target, auth.ifc_labels, auth, enforce=False,
+    )
+    assert decision.reason == "egress_destination_not_approved"
+    assert (decision.allowed, decision.would_block, decision.is_shadow_decision) == (True, True, True)
+
+
+def test_approved_fetch_denied_for_another_reason_remains_shadow_only() -> None:
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("fetch_url",), approved_urls=("https://outside.example/approved",),
+        creation_path="test",
+    )
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="research", domain="web", resource_id="https://outside.example/",
+        bridge_instance="poller", sensitivity="private",
+        authorized_principals=frozenset({"research"}), source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = _service_auth(service, labels)
+    target = "https://outside.example/approved"
+    decision = SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=False)
+    assert decision.reason == "ifc_label_blocked:network"
+    assert (decision.allowed, decision.would_block, decision.is_shadow_decision) == (True, True, True)
+
+
+def test_approved_webhook_sink_approval_survives_shadow_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", "https://outside.example/hook")
+    auth = _tainted_admin_operator_write_auth()
+    target = "https://outside.example/hook"
+    state = InformationFlowState(labels=auth.ifc_labels)
+    auth = replace(auth, ifc_state=state)
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="http_webhook", destination=target,
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    decision = SinkGate.check_sink_flow(
+        "webhook", target, auth.ifc_labels, auth, enforce=False,
+    )
+    assert (decision.allowed, decision.reason) == (True, "ifc_declassification_approved")
+
+
+def test_operator_approval_admits_private_cross_channel_send_in_shadow_mode() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    target = "slack-C2"
+    state = InformationFlowState(labels=auth.ifc_labels)
+    auth = replace(auth, ifc_state=state)
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="cross_channel", destination=target,
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    decision = SinkGate.check_sink_flow(
+        "send_message", target, auth.ifc_labels, auth, enforce=False,
+        sink_category=SinkCategory.CROSS_CHANNEL,
+    )
+    assert (decision.allowed, decision.reason) == (True, "ifc_declassification_approved")
 
 
 @pytest.mark.parametrize("trigger", ["poller", "scheduled_tick"])
@@ -7414,18 +7636,19 @@ async def test_admin_required_shadow_denial_marks_targetless_request_explicitly(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "target", "reason"),
+    ("tool_name", "target", "reason", "always_on"),
     [
-        ("shell_exec", "printf test", "ifc_label_blocked:shell_process"),
-        ("write_file", "/tmp/result.txt", "ifc_label_blocked:file"),
-        ("send_message", "slack-C2", "ifc_label_blocked:same_channel"),
-        ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn"),
+        ("shell_exec", "printf test", "ifc_label_blocked:shell_process", True),
+        ("write_file", "/tmp/result.txt", "ifc_label_blocked:file", False),
+        ("send_message", "slack-C2", "ifc_label_blocked:same_channel", True),
+        ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn", False),
     ],
 )
 async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     tool_name: str,
     target: str,
     reason: str,
+    always_on: bool,
 ) -> None:
     compatible = SourceLabel(
         principal="alice", domain="channel", resource_id="slack-C1",
@@ -7465,6 +7688,12 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
         await asyncio.sleep(0)
 
     events = [event for event in captured if event["reason"] == reason]
+    if always_on:
+        assert events == []
+        assert shadow.allowed is False
+        assert shadow.enforcement_enabled is True
+        assert shadow.is_shadow_decision is False
+        return
     assert len(events) == 1
     event = events[0]
     assert event["ifc_source_scope"] == "causing_source"
@@ -7521,7 +7750,7 @@ async def test_same_channel_event_selects_incompatible_source_not_first_source()
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
         registry.authorize_tool(
-            "send_message", auth, enforce=False, target_channel="slack-C2",
+            "send_message", auth, enforce=False, target_channel="slack-C1",
             ifc_labels=labels,
         )
         await asyncio.sleep(0)
@@ -7636,12 +7865,10 @@ async def test_ifc_source_recording_failure_cannot_change_live_decision(
     )
     await asyncio.sleep(0)
 
-    assert shadow.allowed is True
-    assert shadow.reason == "cross_channel_scope"
-    assert len(captured) == 1
-    assert captured[0]["reason"] == enforced.reason == "ifc_label_blocked:same_channel"
-    assert captured[0]["ifc_source_scope"] == "classification_failed"
-    assert "ifc_source" not in captured[0]
+    assert shadow.allowed is False
+    assert shadow.reason == enforced.reason == "ifc_label_blocked:same_channel"
+    assert shadow.enforcement_enabled is True
+    assert captured == []
     assert enforced.allowed is False
 
 
@@ -12686,6 +12913,24 @@ def test_operator_binding_genuine_match_and_sink_is_shell_only(
     assert file.reason == "ifc_label_blocked:file"
 
 
+def test_request_bound_operator_shell_survives_shadow_veto(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    request = object()
+    auth = _tainted_admin_operator_write_auth()
+    command = "pwd"
+    binding = _operator_chainlink_binding(command, request=request, auth=auth, root=root)
+    decision = SinkGate.check_sink_flow(
+        "shell_exec", command, auth.ifc_labels, auth, enforce=False,
+        requested_cwd=str(root), operator_shell_binding=binding,
+        operator_shell_request_identity=request, tool_call_id="call-arm2",
+    )
+    assert (decision.allowed, decision.reason) == (True, "ifc_allowed")
+
+
 @pytest.mark.parametrize(
     ("command", "allowed", "reason"),
     [
@@ -13982,6 +14227,7 @@ def test_shell_gate_fails_closed_for_indeterminate_live_ifc(tool_name, case, rol
     )
 
 
+@pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize(("profile", "authority_profile"), _CHAINLINK_SERVICE_PROFILES)
 @pytest.mark.parametrize("command", _CHAINLINK_QUERIES)
 def test_tainted_service_profiles_keep_chainlink_queries(
@@ -13989,6 +14235,7 @@ def test_tainted_service_profiles_keep_chainlink_queries(
     authority_profile: str,
     command: str,
     maintenance_pinned_executables: dict[str, Path],
+    enforce: bool,
 ) -> None:
     labels = _chainlink_ifc_labels(tainted=True)
     service = _chainlink_service(profile, authority_profile)
@@ -13998,7 +14245,7 @@ def test_tainted_service_profiles_keep_chainlink_queries(
     )
 
     decision = ToolRegistry().authorize_tool(
-        "shell_exec", auth, enforce=True, target_channel=command,
+        "shell_exec", auth, enforce=enforce, target_channel=command,
     )
 
     assert decision.allowed is True, (profile, command, decision.reason)

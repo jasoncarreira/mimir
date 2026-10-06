@@ -6234,6 +6234,57 @@ def _sink_category_capability_turn_id(auth_context: Any) -> str | None:
     return turn_id
 
 
+def _always_on_ifc_veto(
+    reason: str, tool_name: str, sink_category: SinkCategory,
+) -> bool:
+    """Select only the tainted-turn sink refusals promoted out of shadow mode.
+
+    Callers must first establish live untrusted active ingest (and, for channel
+    sends, a private source and an incompatible destination). This predicate
+    does not promote other denials with the same sink category.
+    """
+    if tool_name in {"shell_exec", "bash_async"} and sink_category is SinkCategory.SHELL_PROCESS:
+        return reason in {
+            "ifc_label_blocked:shell_process",
+            "chainlink_mutation_blocked_by_untrusted_ingest",
+        }
+    if tool_name == "fetch_url" and sink_category is SinkCategory.NETWORK:
+        return reason in {"ifc_label_blocked:network", "egress_destination_not_approved"}
+    if tool_name in {"webhook", "http_request"} and sink_category is SinkCategory.HTTP_WEBHOOK:
+        return reason in {"ifc_label_blocked:http_webhook", "egress_destination_not_approved"}
+    return (
+        tool_name == "send_message"
+        and sink_category in {
+            SinkCategory.SAME_CHANNEL, SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE,
+        }
+        and reason == f"ifc_label_blocked:{sink_category.value}"
+    )
+
+
+def _always_on_ifc_refusal(ifc_labels: Any, auth_context: Any) -> str:
+    """Name the source class without reflecting attacker-controlled resource IDs."""
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next(
+        (s for s in getattr(labels, "sources", ()) if s.has_untrusted_active_ingest),
+        None,
+    )
+    kind = (
+        source.source_kind
+        if source is not None and source.source_kind in SourceKind._value2member_map_
+        else "external"
+    )
+    return (
+        f"This turn carries untrusted active ingest from a {kind} source. "
+        "Propose the action for review, reply in the origin channel, or ask "
+        "the operator for approval."
+    )
+
+
 class SinkGate:
     """Information flow control sink gate (chainlink #871).
 
@@ -6567,14 +6618,17 @@ class SinkGate:
             and operator_shell_binding is not None
             and operator_shell_binding.chainlink_mutation
         ):
+            always_on = _always_on_ifc_veto(
+                "chainlink_mutation_blocked_by_untrusted_ingest", tool_name, sink_category,
+            )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
+                allowed=not (enforce or always_on),
                 reason="chainlink_mutation_blocked_by_untrusted_ingest",
                 required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
-                is_shadow_decision=not enforce,
+                enforcement_enabled=enforce or always_on,
+                is_shadow_decision=not (enforce or always_on),
                 would_block=True,
                 resolved_sink_target=resolved_target,
                 refusal_detail=_CHAINLINK_TAINT_REFUSAL,
@@ -6594,21 +6648,27 @@ class SinkGate:
                 and cls._is_trusted_operator_turn(ifc_labels, auth_context)
             )
             if mutation or (chainlink_argv is None and not bounded_execution):
+                reason = (
+                    "chainlink_mutation_blocked_by_untrusted_ingest"
+                    if mutation else "ifc_label_blocked:shell_process"
+                )
+                always_on = _always_on_ifc_veto(reason, tool_name, sink_category)
                 return ToolAuthorization(
                     tool_name=tool_name,
                     decision=OperationDecision.ADMIN_REQUIRED,
-                    allowed=not enforce,
-                    reason=(
-                        "chainlink_mutation_blocked_by_untrusted_ingest"
-                        if mutation else "ifc_label_blocked:shell_process"
-                    ),
+                    allowed=not (enforce or always_on),
+                    reason=reason,
                     service_principal=service,
                     required_tier=AccessTier.ADMIN,
-                    enforcement_enabled=enforce,
-                    is_shadow_decision=not enforce,
+                    enforcement_enabled=enforce or always_on,
+                    is_shadow_decision=not (enforce or always_on),
                     would_block=True,
                     resolved_sink_target=resolved_target,
-                    refusal_detail=_CHAINLINK_TAINT_REFUSAL if mutation else None,
+                    refusal_detail=(
+                        _CHAINLINK_TAINT_REFUSAL if mutation else
+                        _always_on_ifc_refusal(ifc_labels, auth_context)
+                        if always_on and not enforce else None
+                    ),
                 )
         if (
             is_application_egress
@@ -6639,17 +6699,23 @@ class SinkGate:
                     enforcement_enabled=enforce,
                     resolved_sink_target=resolved_target,
                 )
+            reason = f"ifc_label_blocked:{sink_category.value}"
+            always_on = _always_on_ifc_veto(reason, tool_name, sink_category)
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
-                reason=f"ifc_label_blocked:{sink_category.value}",
+                allowed=not (enforce or always_on),
+                reason=reason,
                 service_principal=service,
                 required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
-                is_shadow_decision=not enforce,
+                enforcement_enabled=enforce or always_on,
+                is_shadow_decision=not (enforce or always_on),
                 would_block=True,
                 resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    _always_on_ifc_refusal(ifc_labels, auth_context)
+                    if always_on and not enforce else None
+                ),
             )
         if tool_name == "web_search":
             fixed_web_search_url = _fixed_web_search_url()
@@ -6670,33 +6736,51 @@ class SinkGate:
             normalized_target is None
             or not fetch_url_is_approved(target, auth_context)
         ):
+            always_on = (
+                has_untrusted_active_ingest
+                and not verbatim_ingest_taint_exempt
+                and _always_on_ifc_veto(
+                    "egress_destination_not_approved", tool_name, sink_category,
+                )
+            )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
+                allowed=not (enforce or always_on),
                 reason="egress_destination_not_approved",
                 service_principal=service,
                 required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
-                is_shadow_decision=not enforce,
+                enforcement_enabled=enforce or always_on,
+                is_shadow_decision=not (enforce or always_on),
                 would_block=True,
                 resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    _always_on_ifc_refusal(ifc_labels, auth_context)
+                    if always_on and not enforce else None
+                ),
             )
         if tool_name in {"webhook", "http_request"} and (
             normalized_target is None
             or not _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS")
         ):
+            always_on = has_untrusted_active_ingest and _always_on_ifc_veto(
+                "egress_destination_not_approved", tool_name, sink_category,
+            )
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
+                allowed=not (enforce or always_on),
                 reason="egress_destination_not_approved",
                 service_principal=service,
                 required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
-                is_shadow_decision=not enforce,
+                enforcement_enabled=enforce or always_on,
+                is_shadow_decision=not (enforce or always_on),
                 would_block=True,
                 resolved_sink_target=resolved_target,
+                refusal_detail=(
+                    _always_on_ifc_refusal(ifc_labels, auth_context)
+                    if always_on and not enforce else None
+                ),
             )
         service_policy: ServiceSinkPolicy | None = None
         if service is not None and sink_category is SinkCategory.SAME_CHANNEL:
@@ -7001,15 +7085,31 @@ class SinkGate:
                     resolved_sink_target=resolved_target,
                 )
             reason = f"ifc_label_blocked:{sink_category.value}"
-            is_shadow = not enforce
+            always_on = (
+                has_untrusted_active_ingest
+                and auth_context is not None
+                and tool_name == "send_message"
+                and (
+                    sink_category in {SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}
+                    or (
+                        sink_category is SinkCategory.SAME_CHANNEL
+                        and effective_target != ChannelResourceAdapter._resolve_channel(
+                            getattr(auth_context, "channel_id", None),
+                        )
+                    )
+                )
+                and any(source.sensitivity == "private" for source in ifc_labels.sources)
+                and _always_on_ifc_veto(reason, tool_name, sink_category)
+            )
+            is_shadow = not (enforce or always_on)
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=not enforce,
+                allowed=is_shadow,
                 reason=reason,
                 service_principal=service,
                 required_tier=AccessTier.ADMIN,
-                enforcement_enabled=enforce,
+                enforcement_enabled=enforce or always_on,
                 is_shadow_decision=is_shadow,
                 would_block=True,
                 resolved_sink_target=resolved_target,
@@ -7017,7 +7117,8 @@ class SinkGate:
                     operator_shell_refusal
                     if sink_category is SinkCategory.SHELL_PROCESS
                     and isinstance(operator_shell_refusal, str)
-                    else None
+                    else _always_on_ifc_refusal(ifc_labels, auth_context)
+                    if always_on and not enforce else None
                 ),
             )
 
@@ -9283,7 +9384,10 @@ class ToolRegistry:
                 request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
-            if not sink_check.allowed and enforce and not preliminary_admin_denied:
+            if not sink_check.allowed and (
+                (enforce and not preliminary_admin_denied)
+                or (not enforce and sink_check.enforcement_enabled)
+            ):
                 return finish(sink_check)
             if sink_check.is_shadow_decision and sink_check.would_block:
                 if preliminary_admin_denied:

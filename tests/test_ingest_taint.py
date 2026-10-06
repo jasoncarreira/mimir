@@ -337,12 +337,15 @@ def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypat
     ) for _ in range(2)]
     for index, (observed, actual) in enumerate(zip(shadow, enforced)):
         approved = case == "matching" and index == 0
-        assert observed.allowed
+        assert observed.allowed is (approved or tool == "write_file")
         assert actual.allowed is approved
         assert observed.would_block is (not approved)
         assert observed.decision == actual.decision
         assert observed.reason == actual.reason
         assert (observed.reason == "ifc_declassification_approved") is approved
+        if not approved and tool == "http_request":
+            assert observed.enforcement_enabled is True
+            assert observed.is_shadow_decision is False
     assert auth.ifc_state.current() is auth.ifc_labels
 
 
@@ -383,17 +386,23 @@ async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypa
         )
         shadow.append(result)
         await asyncio.sleep(0)
-        assert result.allowed
+        assert result.allowed is (attempt == 0 or tool == "write_file")
         if attempt == 0:
             assert not result.would_block
-        assert len(captured) == attempt
+        assert len(captured) == (attempt if tool == "write_file" else 0)
         assert auth.ifc_state._declassification is grant
 
-    kind, fields = captured[0]
-    assert kind == "shadow_tool_decision"
-    assert fields["tool"] == tool
-    assert fields["would_block"] is True
-    assert fields["reason"] == f"ifc_label_blocked:{access_control.get_sink_category(tool).value}"
+    reason = f"ifc_label_blocked:{access_control.get_sink_category(tool).value}"
+    if tool == "write_file":
+        kind, fields = captured[0]
+        assert kind == "shadow_tool_decision"
+        assert fields["tool"] == tool
+        assert fields["would_block"] is True
+        assert fields["reason"] == reason
+    else:
+        assert shadow[1].reason == reason
+        assert shadow[1].enforcement_enabled is True
+        assert shadow[1].is_shadow_decision is False
     for attempt in range(2):
         enforced = registry.authorize_tool(
             tool, auth, enforce=True, target_channel=target,
@@ -405,10 +414,13 @@ async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypa
             assert enforced.reason == shadow[0].reason
             assert enforced.decision == shadow[0].decision
         else:
-            assert enforced.reason == fields["reason"]
-            assert enforced.decision.value == fields["decision"]
+            assert enforced.reason == reason
+            if tool == "write_file":
+                assert enforced.decision.value == fields["decision"]
+            else:
+                assert enforced.decision == shadow[1].decision
     await asyncio.sleep(0)
-    assert len(captured) == 1
+    assert len(captured) == (1 if tool == "write_file" else 0)
 
 
 @pytest.mark.parametrize(("tool", "target"), [

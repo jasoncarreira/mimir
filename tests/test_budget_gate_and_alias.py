@@ -235,6 +235,44 @@ def test_live_middleware_denies_tainted_shell_and_network_egress(
     assert handler_calls == 0
 
 
+@pytest.mark.parametrize(("tool_name", "args", "reason"), [
+    ("shell_exec", {"command": "printf tainted"}, "ifc_label_blocked:shell_process"),
+    ("bash_async", {"command": "printf tainted"}, "ifc_label_blocked:shell_process"),
+    ("fetch_url", {"url": "https://outside.example/secret"}, "egress_destination_not_approved"),
+    ("webhook", {"url": "https://outside.example/hook"}, "ifc_label_blocked:http_webhook"),
+    ("http_request", {"url": "https://outside.example/hook"}, "ifc_label_blocked:http_webhook"),
+    ("send_message", {"channel_id": "ch-2", "text": "private"}, "ifc_label_blocked:same_channel"),
+])
+def test_shadow_middleware_hard_refuses_only_tainted_ifc_sinks(
+    tool_name: str, args: dict[str, str], reason: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    auth = replace(_ifc_auth(), enforcement_enabled=False)
+    auth.ifc_state.merge(auth.ifc_labels)
+    calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="sent", tool_call_id=request.tool_call["id"])
+
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=False, arguments=args,
+        target_channel=args.get("command") or args.get("url") or args.get("channel_id"),
+    )
+    result = BudgetGateMiddleware().wrap_tool_call(
+        _make_request(tool_name, auth_context=auth, args=args), handler,
+    )
+    assert decision.allowed is False
+    assert decision.reason == reason
+    assert decision.enforcement_enabled is True
+    assert decision.is_shadow_decision is False
+    assert result.status == "error"
+    assert "untrusted active ingest" in str(result.content)
+    assert calls == 0
+
+
 @pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
 def test_synthesis_write_executes_resolved_authorized_path_but_edit_is_denied(
     tool_name: str,
@@ -7539,10 +7577,9 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
     assert repeated.content == (
         f"Repeat of an identical command refused in this turn. {result.content}"
     )
-    # #1725 now vetoes tainted unbounded shell before declassification. Shadow
-    # mode can report allowed, but the middleware still refuses execution. Keep
-    # the externally observable refusal assertions below unchanged.
-    assert decisions[0].allowed is (exact_grant and not enforcement_enabled)
+    # The tainted unbounded shell veto now refuses even in shadow mode, before
+    # either a sink grant or the middleware's independent operator shell policy.
+    assert decisions[0].allowed is False
     assert decisions[0].reason == "ifc_label_blocked:shell_process"
     assert ("GitHub author attestation was unavailable" in result.content) is attestation_unavailable
     assert ("GitHub author attestation was unavailable" in repeated.content) is attestation_unavailable
@@ -7568,5 +7605,5 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
         "preparation_outcome": "soft_unbound",
         "command_family": "profile_miss",
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
-    }] * (1 if enforcement_enabled else 2)
+    }]
     assert command not in json.dumps(captured)

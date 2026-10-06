@@ -6,6 +6,13 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+**Operator action:** IFC shadow mode now hard-refuses shell execution, unapproved
+`fetch_url` destinations, outbound webhooks, and private cross-channel sends
+after untrusted active ingest (#1872). Verbatim-ingest URLs, approved fetch URLs,
+bounded/request-bound shell commands, and operator sink approvals still work.
+Review pollers that shell out after ingest or send to another channel before
+upgrading.
+
 **Operator action:** Before upgrading, add Discord and Slack participants who
 should be able to start turns to `<MIMIR_HOME>/state/identities.yaml` with the
 `user` role (or `admin`). Unknown, missing and non-allowlisted bridge authors

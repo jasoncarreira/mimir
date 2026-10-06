@@ -2940,9 +2940,10 @@ def test_fetch_url_scope_is_taint_gated_but_exact_url_is_not(
         assert refused.reason == "ifc_label_blocked:network"
         assert refused.would_block is True
     assert clean_decision.allowed is True
-    assert shadow_decision.allowed is True
+    assert shadow_decision.allowed is False
+    assert shadow_decision.enforcement_enabled is True
+    assert shadow_decision.is_shadow_decision is False
     assert shadow_decision.would_block is True
-    assert shadow_decision.is_shadow_decision is True
 
 
 def test_heartbeat_fetches_multiple_approved_exact_urls_after_untrusted_ingest(

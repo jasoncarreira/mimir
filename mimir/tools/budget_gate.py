@@ -2503,7 +2503,7 @@ def _authorize_tool_call(
         tool_name,
         auth.reason or "admin_required",
         ctx=ctx,
-        enforcement_enabled=enforce,
+        enforcement_enabled=auth.enforcement_enabled,
         detail=auth.refusal_detail,
         target=target_channel or (arguments or {}).get("file_path") or (arguments or {}).get("path"),
     )
