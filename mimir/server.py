@@ -1368,6 +1368,7 @@ def build_app(config: Config) -> web.Application:
                 DiscordBridge(
                     token=config.discord_token,
                     enqueue=dispatcher.enqueue,
+                    admit=dispatcher.intake_admits,
                     attachments_dir=attachments_inbound,
                     attachments_max_bytes=config.attachments_max_bytes,
                     identity_resolver=core.identity_resolver,
@@ -1392,6 +1393,7 @@ def build_app(config: Config) -> web.Application:
                     bot_token=config.slack_bot_token,
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
+                    admit=dispatcher.intake_admits,
                     attachments_dir=attachments_inbound,
                     attachments_max_bytes=config.attachments_max_bytes,
                     identity_resolver=core.identity_resolver,

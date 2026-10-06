@@ -153,6 +153,7 @@ class SlackBridge(Bridge):
         bot_token: ``xoxb-`` bot user OAuth token (env: ``SLACK_BOT_TOKEN``).
         app_token: ``xapp-`` app-level token for Socket Mode (env: ``SLACK_APP_TOKEN``).
         enqueue: dispatcher's enqueue coroutine.
+        admit: optional side-effect-free dispatcher intake author gate.
         respond_to_bots: if True, on_message accepts other bots' messages.
             Default False — humans only. Self-messages are always skipped
             via the bot's own user id or bot id.
@@ -168,6 +169,7 @@ class SlackBridge(Bridge):
     identity_resolver: IdentityResolver | None = field(
         default=None, repr=False, kw_only=True
     )
+    admit: Callable[[AgentEvent], bool] | None = field(default=None, repr=False, kw_only=True)
     _app: Any | None = field(default=None, init=False, repr=False)
     _handler: Any | None = field(default=None, init=False, repr=False)
     _runner: asyncio.Task | None = field(default=None, init=False, repr=False)
@@ -862,56 +864,6 @@ class SlackBridge(Bridge):
             )
             slack_email = info.get("email")
 
-        # Inbound file_share attachments — Slack's ``files`` array on
-        # the event has url_private (Bot-token-auth) which we can stream
-        # to disk. Skipped when attachments_dir isn't configured.
-        attachment_paths: list[str] = []
-        attachment_urls: list[str] = []
-        for f in (event.get("files") or []):
-            if not isinstance(f, dict):
-                continue
-            url = f.get("url_private") or f.get("url_private_download")
-            name = f.get("name") or f.get("id") or "attachment"
-            size = f.get("size")
-            if url:
-                attachment_urls.append(str(url))
-            if not (self.attachments_dir and url):
-                continue
-            if (
-                self.attachments_max_bytes is not None
-                and isinstance(size, int)
-                and size > self.attachments_max_bytes
-            ):
-                log.warning(
-                    "SlackBridge: attachment %s (%d bytes) exceeds "
-                    "max_bytes=%s; skipping download",
-                    name, size, self.attachments_max_bytes,
-                )
-                continue
-            target = build_inbound_path(
-                self.attachments_dir,
-                channel="slack",
-                chat_id=str(slack_channel or ""),
-                filename=str(name),
-            )
-            # Slack's url_private requires the bot token in the
-            # Authorization header. Use the shared download_to_path
-            # helper so the streaming-size cap is enforced (no unbounded
-            # disk write if the endpoint streams more than advertised).
-            try:
-                ok = await download_to_path(
-                    str(url),
-                    target,
-                    max_bytes=self.attachments_max_bytes,
-                    headers={"Authorization": f"Bearer {self.bot_token}"},
-                    allowed_host_suffixes=_SLACK_CDN_HOSTS,
-                )
-            except BaseException:
-                self._release_inbound_claim(source_id)
-                raise
-            if ok:
-                attachment_paths.append(str(target))
-
         agent_event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -921,7 +873,6 @@ class SlackBridge(Bridge):
             author_id=user_id,
             source_id=event.get("ts"),
             source="slack",
-            attachment_names=attachment_paths,
             extra={
                 "bridge_instance": self.bridge_instance or (
                     "slack:" + hashlib.sha256(self.bot_token.encode()).hexdigest()[:16]
@@ -930,12 +881,59 @@ class SlackBridge(Bridge):
                 "channel_visibility": "private" if is_dm else "public",
                 "thread_ts": event.get("thread_ts"),
                 "slack_email": slack_email,
-                **(
-                    {"inbound_attachment_urls": attachment_urls}
-                    if attachment_urls else {}
-                ),
             },
         )
+        try:
+            admitted = self.admit is None or self.admit(agent_event)
+        except BaseException:
+            self._release_inbound_claim(source_id)
+            raise
+        if admitted:
+            # file_share URLs require bot-token auth; only inspect/fetch them
+            # after the dispatcher admits the author.
+            attachment_urls: list[str] = []
+            for f in (event.get("files") or []):
+                if not isinstance(f, dict):
+                    continue
+                url = f.get("url_private") or f.get("url_private_download")
+                name = f.get("name") or f.get("id") or "attachment"
+                size = f.get("size")
+                if url:
+                    attachment_urls.append(str(url))
+                if not (self.attachments_dir and url):
+                    continue
+                if (
+                    self.attachments_max_bytes is not None
+                    and isinstance(size, int)
+                    and size > self.attachments_max_bytes
+                ):
+                    log.warning(
+                        "SlackBridge: attachment %s (%d bytes) exceeds "
+                        "max_bytes=%s; skipping download",
+                        name, size, self.attachments_max_bytes,
+                    )
+                    continue
+                target = build_inbound_path(
+                    self.attachments_dir,
+                    channel="slack",
+                    chat_id=str(slack_channel or ""),
+                    filename=str(name),
+                )
+                try:
+                    ok = await download_to_path(
+                        str(url),
+                        target,
+                        max_bytes=self.attachments_max_bytes,
+                        headers={"Authorization": f"Bearer {self.bot_token}"},
+                        allowed_host_suffixes=_SLACK_CDN_HOSTS,
+                    )
+                except BaseException:
+                    self._release_inbound_claim(source_id)
+                    raise
+                if ok:
+                    agent_event.attachment_names.append(str(target))
+            if attachment_urls:
+                agent_event.extra["inbound_attachment_urls"] = attachment_urls
         try:
             accepted = await self.enqueue(agent_event)
         except BaseException:
