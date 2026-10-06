@@ -10,6 +10,7 @@ import threading
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
+from urllib.parse import quote
 
 import requests
 
@@ -29,9 +30,11 @@ from .client import (
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_SHA = re.compile(r"[a-fA-F0-9]{40}")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_DIFF_BYTES = 524_288
 _MAX_DIFF_FETCH_BYTES = 8_388_608
+_FILE_TRUNCATION_MARKER = "\n[pr_file_content truncated: file exceeded size limit]\n"
 _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
@@ -296,6 +299,7 @@ class GitHubForgeClient:
         accept: str = "application/vnd.github+json",
         max_bytes: int = _MAX_RESPONSE_BYTES,
         not_found: str = "pull request not found",
+        truncate_text: bool = False,
     ) -> Any:
         url = f"https://api.github.com{endpoint}"
         if body is not None and len(
@@ -316,7 +320,20 @@ class GitHubForgeClient:
             ) from exc
         raw = response.content
         if len(raw) > max_bytes:
-            raise ForgeResponseTooLarge("forge response exceeded size limit")
+            if not truncate_text or response.status_code >= 400:
+                raise ForgeResponseTooLarge("forge response exceeded size limit")
+            if "application/json" in response.headers.get("Content-Type", ""):
+                try:
+                    if isinstance(response.json(), list):
+                        raise ForgeError("file content refused: directory response")
+                except ValueError as exc:
+                    raise ForgeError("forge returned invalid JSON") from exc
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
+            prefix = raw[:max_bytes - len(_FILE_TRUNCATION_MARKER.encode("utf-8"))]
+            return prefix.decode("utf-8", errors="ignore") + _FILE_TRUNCATION_MARKER
         if response.status_code >= 400:
             reasons = {
                 401: "authentication failed",
@@ -331,7 +348,17 @@ class GitHubForgeClient:
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
         if not raw:
-            return None
+            return "" if accept == "application/vnd.github.raw" else None
+        if accept == "application/vnd.github.raw" and "application/json" in response.headers.get("Content-Type", ""):
+            try:
+                if isinstance(response.json(), list):
+                    return response.json()  # directories are never file content
+            except ValueError as exc:
+                raise ForgeError("forge returned invalid JSON") from exc
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
         if "application/json" not in response.headers.get("Content-Type", ""):
             try:
                 return raw.decode("utf-8")
@@ -486,6 +513,73 @@ class GitHubForgeClient:
         if not isinstance(data, str):
             raise ForgeError("forge returned an invalid diff")
         return bound_diff(data)
+
+    def get_file_content(self, scope: RepoPRActionScope, path: str) -> str:
+        repository, _number = self._target(scope)
+        # Validate before even the metadata request; quote each segment, never the separators.
+        parts = path.split("/") if isinstance(path, str) else []
+        if (
+            not parts or not path or path.startswith("/")
+            or any(part in {".", ".."} for part in parts)
+            or any(not part for part in parts[1:]) or "\\" in path
+            or any(ord(character) < 32 for character in path)
+            or len(path.encode("utf-8")) > 4_096
+        ):
+            raise ForgeError("invalid repository path")
+        endpoint = (
+            f"/repos/{repository}/contents/{'/'.join(quote(part, safe='') for part in parts)}"
+            f"?ref={scope.observed_head_sha}"
+        )
+        metadata = self._request(
+            "GET", endpoint, accept="application/vnd.github.object+json",
+            not_found="file not found at scoped head",
+        )
+        if not isinstance(metadata, Mapping) or metadata.get("type") != "file" or (
+            metadata.get("target") is not None or metadata.get("submodule_git_url") is not None
+        ):
+            raise ForgeError("file content refused: path is not a regular file (directory, symlink or submodule)")
+        # Contents dereferences symlinks pointing to files. The pinned commit's
+        # Git tree supplies the actual mode at each path component instead.
+        commit = self._request(
+            "GET", f"/repos/{repository}/git/commits/{scope.observed_head_sha}",
+        )
+        tree = commit.get("tree") if isinstance(commit, Mapping) else None
+        tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
+        if (
+            not isinstance(commit, Mapping)
+            or commit.get("sha") != scope.observed_head_sha
+            or not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None
+        ):
+            raise ForgeError("file content refused: scoped commit tree is unavailable")
+        for index, part in enumerate(parts):
+            listing = self._request("GET", f"/repos/{repository}/git/trees/{tree_sha}")
+            entries = listing.get("tree") if isinstance(listing, Mapping) else None
+            if not isinstance(entries, list):
+                raise ForgeError("file content refused: scoped tree is unavailable")
+            matches = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("path") == part]
+            if len(matches) != 1:
+                raise ForgeError("file content refused: path is not a regular file at scoped head")
+            entry = matches[0]
+            final = index == len(parts) - 1
+            if final:
+                if (
+                    entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}
+                    or entry.get("sha") != metadata.get("sha")
+                ):
+                    raise ForgeError("file content refused: path is not a regular file at scoped head")
+            elif entry.get("type") != "tree" or entry.get("mode") != "040000":
+                raise ForgeError("file content refused: path crosses a symlink or submodule")
+            tree_sha = entry.get("sha")
+            if not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None:
+                raise ForgeError("file content refused: invalid scoped tree entry")
+        data = self._request(
+            "GET", endpoint, accept="application/vnd.github.raw",
+            max_bytes=_MAX_DIFF_FETCH_BYTES, not_found="file not found at scoped head",
+            truncate_text=True,
+        )
+        if not isinstance(data, str):
+            raise ForgeError("file content refused: directory, symlink or submodule response")
+        return data
 
     def list_checks(self, scope: RepoPRActionScope) -> tuple[CheckProjection, ...]:
         repository, _number = self._target(scope)
