@@ -1055,6 +1055,29 @@ class DiscordBridge(Bridge):
         ):
             return
 
+        author_id = str(getattr(payload, "user_id", "") or "")
+        if re.fullmatch(r"[0-9]+", author_id) is None:
+            return
+        author = f"discord-{author_id}"
+        raw_channel_id = str(getattr(payload, "channel_id", "") or "")
+        channel_id = (
+            f"dm-discord-{raw_channel_id}"
+            if getattr(payload, "guild_id", "unknown") is None
+            else f"discord-{raw_channel_id}"
+        )
+        if self.admit is not None and not self.admit(AgentEvent(
+            trigger="user_message", source="discord", author=author,
+            channel_id=channel_id,
+        )):
+            try:
+                await log_event(
+                    "reaction_ignored", reason="author_not_admitted",
+                    bridge=self.name, author=author, channel_id=channel_id,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         # Only count reactions on the BOT'S messages — that's what
         # makes them feedback. A user reacting to another user's
         # message isn't a signal about the agent's behavior.
@@ -1092,10 +1115,6 @@ class DiscordBridge(Bridge):
         except Exception:  # noqa: BLE001
             pass
 
-        author_id = str(getattr(payload, "user_id", "") or "")
-        if re.fullmatch(r"[0-9]+", author_id) is None:
-            return
-        author = f"discord-{author_id}"
         owner_principal: str | None = None
         if self.identity_resolver is not None:
             try:

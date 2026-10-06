@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -387,6 +388,76 @@ async def test_on_reaction_rejects_unvalidated_platform_user_id(
     events_path = tmp_path / "logs" / "events.jsonl"
     assert not events_path.exists()
     resolver.identity.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_id", "open_bridge", "enforced", "admitted"),
+    [
+        (22, False, False, False),
+        (11, False, True, True),
+        (22, True, False, True),
+        (22, True, True, False),
+    ],
+)
+async def test_reaction_uses_dispatcher_intake_before_discord_fetch(
+    bridge_with_fake_client, tmp_path: Path,
+    user_id: int, open_bridge: bool, enforced: bool, admitted: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_client
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [discord-11]\n"
+        "    access: {roles: [user]}\n", encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    dispatcher = Dispatcher(replace(
+        Config.from_env(), home=tmp_path,
+        access_control_enforced=enforced, open_bridge=open_bridge,
+    ), resolver=resolver)
+    bridge.admit = dispatcher.intake_admits
+    bridge.identity_resolver = resolver
+    channel = bridge._client._channels.pop(1)  # force cache miss on admitted path
+    channel.fetch_message = AsyncMock(return_value=SimpleNamespace(
+        author=bridge._client.user, created_at=datetime.now(timezone.utc),
+    ))
+    bridge._client.get_channel = MagicMock(return_value=None)
+    bridge._client.fetch_channel = AsyncMock(return_value=channel)
+
+    await bridge._on_reaction(SimpleNamespace(
+        user_id=user_id, channel_id=1, message_id=123, emoji="👍",
+    ))
+
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    if admitted:
+        bridge._client.get_channel.assert_called_once_with(1)
+        bridge._client.fetch_channel.assert_awaited_once_with(1)
+        channel.fetch_message.assert_awaited_once_with(123)
+        assert {key: row[key] for key in (
+            "type", "event_version", "bridge", "channel_id", "emoji", "polarity",
+            "action", "author", "owner_principal", "target_message_id",
+        )} == {
+            "type": "react_received", "event_version": "v1", "bridge": "discord",
+            "channel_id": "discord-1", "emoji": "👍", "polarity": "positive",
+            "action": "add", "author": f"discord-{user_id}",
+            "owner_principal": "alice" if user_id == 11 else None,
+            "target_message_id": "123",
+        }
+        assert isinstance(row["target_age_minutes"], float)
+    else:
+        bridge._client.get_channel.assert_not_called()
+        bridge._client.fetch_channel.assert_not_awaited()
+        channel.fetch_message.assert_not_awaited()
+        assert {key: row[key] for key in ("type", "reason", "bridge", "author", "channel_id")} == {
+            "type": "reaction_ignored", "reason": "author_not_admitted",
+            "bridge": "discord", "author": "discord-22", "channel_id": "discord-1",
+        }
+        assert not ({"emoji", "polarity", "target_message_id", "target_age_minutes", "action"} & row.keys())
 
 
 @pytest.mark.asyncio
