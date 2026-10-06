@@ -1626,6 +1626,8 @@ class AuthContext(_AuthContextAuthoritySlot):
     repo_pr_action_scope: RepoPRActionScope | None = field(
         default=None, repr=False, compare=False,
     )
+    # Exact CI selectors from the server-delivered github-ci-watch record.
+    ci_run_targets: frozenset[tuple[str, int]] = frozenset()
     # Standing review authority is resolved lazily from a live server fetch.
     # This cache is per turn and stores only immutable server-issued scopes.
     server_discovered_pr_states: ServerDiscoveredPRStates = field(

@@ -509,7 +509,10 @@ def shell_exec(
     """
     if not command or not command.strip():
         raise ToolException("shell_exec failed: command is required")
-    from ._shell_env import bound_direct_exec_argv, direct_exec_env, login_shell_command
+    from ._shell_env import (
+        bound_direct_exec_argv, direct_exec_env, interactive_shell_env,
+        login_shell_command, refuse_protected_shell_operands,
+    )
     direct_argv = bound_direct_exec_argv()
     if direct_argv is None:
         direct_argv = mimir_direct_argv
@@ -518,12 +521,14 @@ def shell_exec(
     effective_cwd = _effective_shell_cwd(
         cwd, allow_session_state=direct_argv is None,
     )
+    if direct_argv is None:
+        refuse_protected_shell_operands(command, effective_cwd, "shell_exec")
     argv = (
         direct_argv
         if direct_argv is not None
         else ["bash", "-lc", login_shell_command(command)]
     )
-    direct_env = direct_exec_env(argv) if direct_argv is not None else None
+    child_env = direct_exec_env(argv) if direct_argv is not None else interactive_shell_env()
     from ..access_control import configured_project_test_cwd
 
     is_project_test = (
@@ -536,7 +541,7 @@ def shell_exec(
                 argv,
                 cwd=effective_cwd,
                 timeout=_SHELL_STATE["timeout_s"],
-                env=direct_env or {},
+                env=child_env,
             )
         else:
             proc = subprocess.run(  # noqa: S603 — argv is either the trusted shell wrapper or server-authorized direct argv
@@ -545,7 +550,7 @@ def shell_exec(
                 capture_output=True,
                 timeout=_SHELL_STATE["timeout_s"],
                 cwd=effective_cwd,
-                env=direct_env,
+                env=child_env,
             )
     except subprocess.TimeoutExpired:
         if is_project_test:
@@ -576,12 +581,12 @@ def shell_exec(
     parts = [f"exit={proc.returncode}"]
     stdout = (proc.stdout or b"").decode("utf-8", errors="replace")
     stderr = (proc.stderr or b"").decode("utf-8", errors="replace")
-    if direct_env is not None:
+    if direct_argv is not None:
         from ._shell_env import direct_exec_redact_names, redact_direct_exec_output
 
         names = direct_exec_redact_names(argv)
-        stdout = redact_direct_exec_output(stdout, direct_env, names)
-        stderr = redact_direct_exec_output(stderr, direct_env, names)
+        stdout = redact_direct_exec_output(stdout, child_env, names)
+        stderr = redact_direct_exec_output(stderr, child_env, names)
     if proc.returncode == 0:
         target = _cd_target(command, effective_cwd)
         session_id = _shell_session_id() if direct_argv is None else None

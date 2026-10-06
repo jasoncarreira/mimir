@@ -83,6 +83,7 @@ from .saga_ops import (
 from .forge import (
     pr_checks,
     pr_job_log,
+    ci_run_jobs,
     pr_comment,
     pr_comments,
     pr_diff,
@@ -161,6 +162,7 @@ __all__ = [
     "pr_diff",
     "pr_checks",
     "pr_job_log",
+    "ci_run_jobs",
     "pr_reviews",
     "pr_comments",
     "pr_review_requests",

@@ -1,13 +1,14 @@
 """Shared helpers for shell subprocess argv and environment handling.
 
-Interactive/admin shell calls preserve the full ``bash -lc`` surface. Trusted
-service calls are different: their access-control profile validates one parsed
-argv, so execution must use that exact argv with no shell expansion layer.
+Interactive/admin shell calls preserve the full ``bash -lc`` surface but receive
+only an explicitly selected environment. Trusted service calls validate one
+parsed argv and execute it with no shell expansion layer.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -32,6 +33,10 @@ _GH_CONFIG_DIR = tempfile.mkdtemp(prefix="mimir-gh-config-")
 Path(_GH_CONFIG_DIR).chmod(0o500)
 _MODEL_SELECTION_ENV = "MIMIR_MODEL_SPEC"
 _MINIMAL_ENV_NAMES = frozenset({"HOME", "LANG", "TZ"})
+_INTERACTIVE_ENV_NAMES = _MINIMAL_ENV_NAMES | frozenset({
+    "TERM", "TMPDIR", "USER", "LOGNAME", "MIMIR_HOME",
+})
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CREDENTIAL_ENV_BY_EXECUTABLE = {
     "gh": frozenset({"GITHUB_TOKEN"}),
 }
@@ -147,6 +152,125 @@ def _minimal_direct_exec_env() -> dict[str, str]:
     return env
 
 
+def disable_process_dumpability() -> None:
+    """Keep same-uid shells from reading this Linux process's proc secrets.
+
+    Call at every CLI entry and reapply after any exec. This disables core
+    dumps and same-uid procfs inspection, not root/CAP_SYS_PTRACE access.
+    It does not protect non-mimir same-uid processes with inherited secrets.
+    Fail startup on Linux if the kernel cannot enforce the requested control.
+    """
+    if sys.platform != "linux":
+        return
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 4
+        error = ctypes.get_errno()
+        raise OSError(error, "cannot disable server process dumpability")
+
+
+def interactive_shell_env() -> dict[str, str]:
+    """Select interactive child settings and exact operator-granted names."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if key in _INTERACTIVE_ENV_NAMES or key.startswith("LC_")
+    }
+    # login_shell_command pins PATH after bash login startup. Do not feed the
+    # parent's PATH to the login startup files in the first place.
+    env["PATH"] = _TRUSTED_PATH
+    names = dict.fromkeys(
+        name.strip() for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(",")
+    )
+    passed = [name for name in names if name != "PATH" and _ENV_NAME.fullmatch(name)
+              and name in os.environ]
+    for name in passed:
+        env[name] = os.environ[name]
+    if passed:
+        from ..event_logger import log_event_sync
+
+        log_event_sync("interactive_shell_env_passthrough", pass_env=passed)
+    return env
+
+
+def interactive_shell_env_overlay() -> dict[str, str | None]:
+    """Remove inherited registry settings outside the interactive child env."""
+    overlay: dict[str, str | None] = interactive_shell_env()
+    for key in (*os.environ, "PYTHONUNBUFFERED"):
+        if key not in overlay:
+            overlay[key] = None
+    return overlay
+
+
+def refuse_protected_shell_operands(command: str, cwd: Path | None, tool: str) -> None:
+    """Best-effort literal screen, not a shell sandbox.
+
+    Globs, braces, variable indirection and interpreter code can bypass this
+    screen. The child environment scrub and non-dumpable Linux mimir CLI
+    processes are the controls preventing recovery of their ambient credentials.
+    """
+    from ..read_policy import _has_protected_read_name
+    from .refusals import ToolPolicyRefusal
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="<>|;&()")
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return  # Bash still handles malformed quoting as it did before.
+
+    base = (cwd or Path.cwd()).expanduser().resolve()
+    home = Path.home().resolve()
+    roots = [home / ".codex", home / ".config/gh", home / ".config/gogcli"]
+    gog_home = os.environ.get("GOG_HOME", "").strip()
+    if gog_home:
+        roots.append(Path(gog_home).expanduser().resolve())
+    oauth = os.environ.get("MIMIR_CLAUDE_OAUTH_CREDENTIALS", "").strip()
+    oauth_path = Path(oauth).expanduser().resolve() if oauth else None
+
+    for word in words:
+        # Ignore shell operators; all other literal words may be operands,
+        # including redirect targets and bare protected filenames like .env.
+        if not word or all(char in "<>|;&()" for char in word):
+            continue
+        raw = word
+        for name, value in (
+            ("HOME", str(home)),
+            ("MIMIR_HOME", os.environ.get("MIMIR_HOME", "")),
+            ("GOG_HOME", gog_home),
+        ):
+            if not value:
+                continue
+            for prefix in (f"${name}", "${" + name + "}"):
+                if raw == prefix or raw.startswith(prefix + "/"):
+                    raw = value + raw[len(prefix):]
+                    break
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        resolved = candidate.resolve()
+        if (
+            (candidate.parts[:2] == ("/", "proc")
+             and candidate.name in {"environ", "cmdline", "mem"})
+            or (resolved.parts[:2] == ("/", "proc")
+                and resolved.name in {"environ", "cmdline", "mem"})
+            or _has_protected_read_name(candidate)
+            or _has_protected_read_name(resolved)
+            or any(resolved == root or resolved.is_relative_to(root) for root in roots)
+            or oauth_path is not None and resolved == oauth_path
+        ):
+            from .budget_gate import _emit_hard_boundary_denied
+
+            _emit_hard_boundary_denied(
+                tool=tool, boundary="protected_read_policy",
+                reason="protected_name_match", target=None,
+            )
+            raise ToolPolicyRefusal(f"{tool} refused: protected_name_match")
+
+
 def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     """Return a child environment safe for the server-authorized direct argv.
 
@@ -211,7 +335,10 @@ __all__ = [
     "bound_direct_exec_argv",
     "direct_exec_env",
     "direct_exec_env_overlay",
+    "interactive_shell_env",
+    "interactive_shell_env_overlay",
     "login_shell_command",
+    "refuse_protected_shell_operands",
     "reset_direct_exec_argv",
     "scrub_model_selection_env",
 ]

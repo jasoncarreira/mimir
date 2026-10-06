@@ -331,35 +331,49 @@ class Dispatcher:
         ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
         return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
 
-    async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
-        """Gate external user messages before any admission side effect."""
-        source = (event.source or "").strip().lower()
+    def _intake_decision(self, event: AgentEvent) -> AccessDecision | None:
+        """Return the external author decision, or None for a trusted/bypassed event."""
         is_http_ingress = self._is_http_ingress(event)
         if event.trigger != "user_message" and not is_http_ingress:
-            return True
-
-        if source in TRUSTED_INTERNAL_SOURCES:
-            if is_http_ingress:
-                pass
-            else:
-                await log_event(
-                    "inbound_event_allowed",
-                    source=source or "unknown",
-                    channel_id=event.channel_id,
-                    author=event.author,
-                    raw_author_handle=event.author,
-                    author_id=event.author_id,
-                    reason="trusted_internal_source",
-                    trigger=event.trigger,
-                )
-                return True
-
-        decision = authorize_inbound(
+            return None
+        if (event.source or "").strip().lower() in TRUSTED_INTERNAL_SOURCES and not is_http_ingress:
+            return None
+        return authorize_inbound(
             event,
             self._identity_resolver,
             enforce=self._config.access_control_enforced or not self._config.open_bridge,
         )
-        if decision.allowed:
+
+    def intake_admits(self, event: AgentEvent) -> bool:
+        """Side-effect-free author gate for pre-download bridge intake."""
+        decision = self._intake_decision(event)
+        return decision is None or decision.allowed
+
+    async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
+        """Gate external user messages before any admission side effect."""
+        decision = self._intake_decision(event)
+        admitted = decision is None or decision.allowed
+        source = (event.source or "").strip().lower()
+        is_http_ingress = self._is_http_ingress(event)
+        if event.trigger != "user_message" and not is_http_ingress:
+            return admitted
+
+        if source in TRUSTED_INTERNAL_SOURCES and not is_http_ingress:
+            await log_event(
+                "inbound_event_allowed",
+                source=source or "unknown",
+                channel_id=event.channel_id,
+                author=event.author,
+                raw_author_handle=event.author,
+                author_id=event.author_id,
+                reason="trusted_internal_source",
+                trigger=event.trigger,
+            )
+            return admitted
+
+        if decision is None:
+            return admitted
+        if admitted:
             await log_event(
                 "inbound_event_allowed",
                 source=source or "unknown",

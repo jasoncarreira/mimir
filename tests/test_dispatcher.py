@@ -1187,6 +1187,98 @@ async def test_shadow_intake_gates_generic_http_even_with_internal_source(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("author", "source", "trigger", "http", "enforced", "open_bridge", "expected"),
+    [
+        ("discord-1", "discord", "user_message", False, False, False, True),
+        ("discord-2", "discord", "user_message", False, False, False, False),
+        (None, "discord", "user_message", False, False, False, False),
+        ("discord-1", "discord", "user_message", False, True, False, True),
+        ("discord-2", "discord", "user_message", False, True, True, False),
+        ("discord-2", "discord", "user_message", False, False, True, True),
+        ("unknown", "discord", "poller", False, False, False, True),
+        ("unknown", "api", "user_message", False, False, False, True),
+        ("unknown", "api", "synthesis", True, False, False, False),
+        ("unknown", "discord", "user_message", False, False, False, False),
+        *[("unknown", source, "user_message", False, False, False, True)
+          for source in sorted(TRUSTED_INTERNAL_SOURCES)],
+    ],
+)
+async def test_intake_admits_matches_authorization_without_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    author: str | None, source: str, trigger: str, http: bool,
+    enforced: bool, open_bridge: bool, expected: bool,
+):
+    cfg = replace(_make_config(tmp_path, access_control_enforced=enforced), open_bridge=open_bridge)
+    resolver = _resolver(tmp_path, """
+        people:
+          - canonical: alice
+            aliases: [discord-1]
+            access: {roles: [user]}
+    """)
+    disp = Dispatcher(cfg, resolver=resolver)
+    logs: list[str] = []
+    pairing: list[AgentEvent] = []
+
+    async def record_log(kind: str, **fields) -> None:
+        logs.append(kind)
+
+    async def record_pairing(event: AgentEvent, decision) -> None:
+        pairing.append(event)
+
+    monkeypatch.setattr("mimir.dispatcher.log_event", record_log)
+    disp.set_on_pairing_required(record_pairing)
+    event = AgentEvent(
+        trigger=trigger, channel_id="discord-C1", content="hi", author=author,
+        source=source,
+        extra={HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE} if http else {},
+    )
+    assert disp.intake_admits(event) is expected
+    assert logs == pairing == []
+    assert disp._queues == {}
+    assert await disp._authorize_bridge_event(event) is expected
+    if not expected:
+        assert logs == ["inbound_event_denied"]
+        assert pairing == [event]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [True, False])
+async def test_authorization_uses_shared_intake_decision(tmp_path: Path, monkeypatch, admitted):
+    """Admission and audit metadata consume one decision even if the rule changes."""
+    from mimir.access_control import authorize_inbound
+
+    disp = Dispatcher(_make_config(tmp_path), resolver=_resolver(tmp_path, "people: []\n"))
+    event = AgentEvent(trigger="user_message", channel_id="discord-C1", content="hi",
+                       author="discord-2", source="discord")
+    decision = authorize_inbound(event, disp._identity_resolver, enforce=not admitted)
+    opposite = authorize_inbound(event, disp._identity_resolver, enforce=admitted)
+    calls: list[AgentEvent] = []
+    logs: list[tuple[str, dict]] = []
+
+    def changing_decision(incoming: AgentEvent):
+        calls.append(incoming)
+        return decision if len(calls) == 1 else opposite
+
+    async def record_log(kind: str, **fields) -> None:
+        logs.append((kind, fields))
+
+    monkeypatch.setattr(disp, "_intake_decision", changing_decision)
+    monkeypatch.setattr("mimir.dispatcher.log_event", record_log)
+    assert disp.intake_admits(event) is admitted
+    assert calls == [event]
+    assert logs == []
+    calls.clear()
+    assert await disp._authorize_bridge_event(event) is admitted
+    assert calls == [event]
+    kind, fields = logs[0]
+    assert kind == ("inbound_event_allowed" if admitted else "inbound_event_denied")
+    assert fields["status"] == decision.status.value
+    if not admitted:
+        assert fields["reason"] == decision.denial_reason
+
+
+@pytest.mark.asyncio
 async def test_access_gate_allows_non_user_messages_and_trusted_internal_sources(
     tmp_path: Path,
 ):

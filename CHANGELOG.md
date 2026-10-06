@@ -6,6 +6,21 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+**Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
+inherit the agent's environment. Add any variable a shell workflow genuinely
+needs to `MIMIR_SHELL_PASS_ENV` (exact comma-separated names). Ad hoc `gh`,
+`acli`, `gog`, and `social-cli` shell calls may need explicit passthrough or a
+declared command/forge tool; service-shell and forge authentication are unchanged
+(#1873). On Linux, every `mimir` CLI subcommand now disables process dumpability,
+including the server (`mimir run`), watchdog and Worklink processes. This prevents
+same-uid shells from reading their original environments through procfs. The
+server reapplies the control after a pending-update exec. Restart these processes
+to activate it; same-uid procfs inspection and core dumps are disabled. Non-mimir
+same-uid processes launched with the container's full environment (for example
+`codex-auth-sync` and dev `vite`/`esbuild` watchers) remain readable: deploy them
+with minimal environments or separate identities, and do not grant children
+root/CAP_SYS_PTRACE. The literal operand screen is best effort, not a sandbox.
+
 **Operator action:** Before upgrading, add Discord and Slack participants who
 should be able to start turns to `<MIMIR_HOME>/state/identities.yaml` with the
 `user` role (or `admin`). Unknown, missing and non-allowlisted bridge authors

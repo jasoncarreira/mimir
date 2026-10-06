@@ -907,15 +907,9 @@ def pr_list(
         raise ToolPolicyRefusal("limit must be an integer from 1 through 100")
     items = _call(lambda: _client_for_repository(repo).list_pull_requests(
         repo, state=state, base=base, head=head, limit=limit,
+        author=author, merged_since=since,
     ))
-    return [
-        asdict(item) for item in items
-        if (author is None or item.author.casefold() == author.casefold())
-        and (since is None or (
-            item.merged_at is not None
-            and _merged_since(item.merged_at) >= since
-        ))
-    ][:limit]
+    return [asdict(item) for item in items]
 
 
 @tool
@@ -1012,6 +1006,26 @@ def pr_job_log(
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
+
+
+@tool
+def ci_run_jobs(
+    repository: str,
+    run_id: StrictInt,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
+    """Read bounded jobs and failed steps for a configured, poller-named CI run."""
+    repo = _repository(repository)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal("CI run rejected: repository is not configured in GITHUB_REPOS")
+    context = getattr(runtime, "context", None)
+    if type(run_id) is not int or run_id < 1 or (repo.lower(), run_id) not in getattr(
+        context, "ci_run_targets", frozenset(),
+    ):
+        raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
+    return _call(lambda: _client_for_repository(repo).list_run_jobs(repo, run_id))
 
 
 @tool
@@ -1323,6 +1337,7 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_diff,
     pr_checks,
     pr_job_log,
+    ci_run_jobs,
     pr_reviews,
     pr_comments,
     pr_review_requests,

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..models import NormalizedPullRequestSnapshot, RepoPRActionScope
 
@@ -121,6 +122,7 @@ class ForgeClient(Protocol):
     def list_pull_requests(
         self, repository: str, *, state: str, base: str | None,
         head: str | None, limit: int,
+        author: str | None = None, merged_since: datetime | None = None,
     ) -> tuple[PullRequestSummary, ...]: ...
 
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]: ...
@@ -132,6 +134,8 @@ class ForgeClient(Protocol):
     def get_job_log(
         self, scope: RepoPRActionScope, job_id: int, run_id: int | None = None,
     ) -> str: ...
+
+    def list_run_jobs(self, repository: str, run_id: int) -> list[dict[str, Any]]: ...
 
     def list_reviews(self, scope: RepoPRActionScope) -> tuple[ReviewProjection, ...]: ...
 

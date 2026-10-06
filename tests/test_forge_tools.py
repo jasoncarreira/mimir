@@ -44,6 +44,7 @@ from mimir.models import (
 from mimir.identities import IdentityResolver
 from mimir.tools.forge import (
     FORGE_TOOLS,
+    ci_run_jobs,
     issue_comment,
     pr_checks,
     pr_job_log,
@@ -720,8 +721,9 @@ class FakeForge:
             "a" * 40, True, "created", "updated",
         )
 
-    def list_pull_requests(self, repository, *, state, base, head, limit):
-        self.calls.append(("pr_list", repository, state, base, head, limit))
+    def list_pull_requests(self, repository, *, state, base, head, limit,
+                           author=None, merged_since=None):
+        self.calls.append(("pr_list", repository, state, base, head, limit, author, merged_since))
         return (PullRequestSummary(
             17, "Title", "open", "author", "change", "main", "a" * 40,
             "2026-10-01T00:00:00Z", None, "https://github.com/owner/repo/pull/17",
@@ -756,6 +758,10 @@ class FakeForge:
     def list_checks(self, scope):
         self.calls.append(("checks", scope))
         return (CheckProjection("test", "completed", "success", "now", "now"),)
+
+    def list_run_jobs(self, repository, run_id):
+        self.calls.append(("run_jobs", repository, run_id))
+        return [{"id": 1, "name": "test", "failed_steps": []}]
 
     def list_reviews(self, scope):
         self.calls.append(("reviews", scope))
@@ -796,6 +802,210 @@ class FakeForge:
         self.calls.append(("rerequest", scope, reviewer))
 
 
+def _ci_watch_context(
+    *, poller="github-ci-watch", items=None, principal=None,
+    capabilities=("ci_run_jobs",), extra=None, event_ingress=None,
+):
+    authority = access_control.build_trigger_service_principal(
+        canonical=principal or f"poller:{poller}", trigger="poller", profile="github",
+        tier=access_control.CapabilityTier.CODE_EXECUTION,
+        capabilities=("ci_run_jobs",), creation_path="mimir.pollers.run_poller",
+    )
+    # Vary the capability alone: keep the repository-readable domain and every
+    # other authority property intact so another guard cannot hide its removal.
+    authority = replace(authority, capabilities=capabilities)
+    return access_control.create_auth_context(AgentEvent(
+        trigger="poller", channel_id=f"poller:{poller}", source="poller",
+        service_principal=authority.canonical, service_authority=authority,
+        extra={"poller_name": poller, "items": items if items is not None else [
+            {"repo": "owner/repo", "run_id": 42, "event_type": "ci_failure"},
+        ], **(extra or {})},
+    ), enforce=True, event_ingress=event_ingress, ifc_labels=InformationFlowLabels())
+
+
+def _ci_runtime(context):
+    return ToolRuntime(
+        state={}, context=context, config={}, stream_writer=lambda _: None,
+        tool_call_id="ci-run-jobs-test", store=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ci_run_jobs_binds_named_run_and_configured_repo(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    runtime = _ci_runtime(_ci_watch_context())
+    assert await ci_run_jobs.coroutine("owner/repo", 42, runtime=runtime) == [
+        {"id": 1, "name": "test", "failed_steps": []},
+    ]
+    assert client.calls == [("run_jobs", "owner/repo", 42)]
+    for repo, run in [("owner/repo", 43), ("other/repo", 42), ("owner/repo", 0)]:
+        with pytest.raises(ToolException):
+            await ci_run_jobs.coroutine(repo, run, runtime=runtime)
+    assert client.calls == [("run_jobs", "owner/repo", 42)]
+
+
+@pytest.mark.asyncio
+async def test_ci_run_jobs_requires_poller_record_not_model_selector(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    for context in (
+        _ci_watch_context(items=[]),
+        _ci_watch_context(poller="github-activity"),
+        _ci_watch_context(items=[{"repo": "owner/repo", "run_id": 43, "event_type": "ci_failure"}]),
+        access_control.create_local_operator_auth_context(
+            principal="operator", trigger="user_message", channel_id="operator",
+        ),
+    ):
+        with pytest.raises(ToolException):
+            await ci_run_jobs.coroutine("owner/repo", 42, runtime=_ci_runtime(context))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("context_kwargs", [
+    pytest.param(
+        {"extra": {"poller_name": "github-activity"}},
+        id="wrong-poller-name-only",
+    ),
+    pytest.param(
+        {"principal": "poller:github-activity"}, id="wrong-service-principal-only",
+    ),
+    pytest.param({"capabilities": ()}, id="missing-ingress-capability-only"),
+    pytest.param(
+        {"extra": {access_control.HTTP_EVENT_INGRESS_EXTRA_KEY: "http"}},
+        id="http-ingress-extra-only",
+    ),
+    pytest.param({"event_ingress": "http"}, id="explicit-http-ingress-only"),
+    pytest.param({"items": [
+        {"repo": "owner/repo", "run_id": 42, "event_type": "pr_opened"},
+    ]}, id="non-ci-event-type-only"),
+])
+@pytest.mark.asyncio
+async def test_ci_run_jobs_ingress_guards_are_independent(monkeypatch, context_kwargs):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    assert _ci_watch_context().ci_run_targets == frozenset({("owner/repo", 42)})
+    context = _ci_watch_context(**context_kwargs)
+    assert context.ci_run_targets == frozenset()
+    with pytest.raises(ToolException, match="outside this turn's poller scope"):
+        await ci_run_jobs.coroutine("owner/repo", 42, runtime=_ci_runtime(context))
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("missing_authority", ["capability", "principal"])
+def test_ci_run_jobs_authz_capability_independent_of_carried_selector(
+    monkeypatch, missing_authority,
+):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    args = {"repository": "owner/repo", "run_id": 42}
+    assert registry.authorize_tool(
+        "ci_run_jobs", context, enforce=True, arguments=args,
+    ).allowed
+    if missing_authority == "capability":
+        context = replace(context, service_authority=replace(
+            context.service_authority, capabilities=(),
+        ))
+        service = access_control.get_trusted_service_from_auth_context(context)
+        assert service is not None
+        assert "repository" in service.readable_domains
+        assert not service.has_capability("ci_run_jobs")
+    else:
+        context = replace(context, is_service=False, service_authority=None)
+        assert access_control.get_trusted_service_from_auth_context(context) is None
+    # Preserve the valid run selector to isolate the authorization-time guard
+    # from the independently tested ingress capability check.
+    assert context.ci_run_targets == frozenset({("owner/repo", 42)})
+    authorization = registry.authorize_tool(
+        "ci_run_jobs", context, enforce=True, arguments=args,
+    )
+    assert not authorization.allowed
+    assert authorization.reason == "ci_run_scope_denied"
+    assert authorization.would_block
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ci_run_jobs_configured_guard_independent_of_carried_selector(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    # Even a malformed server carrier must not widen the configured-repo boundary.
+    context = replace(_ci_watch_context(), ci_run_targets=frozenset({("other/repo", 42)}))
+    with pytest.raises(ToolException, match="repository is not configured"):
+        await ci_run_jobs.coroutine("other/repo", 42, runtime=_ci_runtime(context))
+    assert client.calls == []
+
+
+def test_ci_run_jobs_ingress_discards_unconfigured_record(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    assert not _ci_watch_context(items=[
+        {"repo": "other/repo", "run_id": 42, "event_type": "ci_failure"},
+    ]).ci_run_targets
+
+
+@pytest.mark.asyncio
+async def test_ci_run_jobs_result_taints_clean_turn_but_trusted_read_does_not(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    set_forge_client(FakeForge())
+    runtime = _ci_runtime(_ci_watch_context())
+    authorization = access_control.ToolAuthorization(
+        tool_name="ci_run_jobs", decision="resource_scoped", allowed=True,
+    )
+    assert not runtime.context.ifc_labels.has_untrusted_active_ingest
+    clean = access_control.classify_protected_result(
+        "write_todos", {}, runtime.context, authorization, result="ok",
+    )
+    assert clean is None or not clean.has_untrusted_active_ingest
+    result = await ci_run_jobs.coroutine("owner/repo", 42, runtime=runtime)
+    labels = access_control.classify_protected_result(
+        "ci_run_jobs", {"repository": "owner/repo", "run_id": 42},
+        runtime.context, authorization, result=result,
+    )
+    assert labels.has_untrusted_active_ingest
+    assert [(source.integrity, source.resource_id) for source in labels.sources] == [
+        ("untrusted", "owner/repo#actions/run/42/jobs"),
+    ]
+    assert runtime.context.ifc_state.merge(labels, fallback=runtime.context.ifc_labels).has_untrusted_active_ingest
+
+
+def test_ci_run_jobs_authorization_requires_exact_poller_selector(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    for repo, run_id, allowed in [
+        ("owner/repo", 42, True), ("owner/repo", 43, False),
+        ("other/repo", 42, False),
+    ]:
+        auth = registry.authorize_tool(
+            "ci_run_jobs", context, enforce=True,
+            arguments={"repository": repo, "run_id": run_id},
+        )
+        assert auth.allowed is allowed
+    assert not registry.authorize_tool(
+        "ci_run_jobs", _ci_watch_context(poller="github-activity"), enforce=True,
+        arguments={"repository": "owner/repo", "run_id": 42},
+    ).allowed
+    assert not registry.authorize_tool(
+        "ci_run_jobs", replace(context, ci_run_targets=frozenset({("other/repo", 42)})),
+        enforce=True, arguments={"repository": "other/repo", "run_id": 42},
+    ).allowed
+
+
 @pytest.fixture(autouse=True)
 def _reset_client() -> None:
     set_forge_client(None)
@@ -808,6 +1018,8 @@ def test_tool_surface_requires_exact_repository_and_resource_selectors() -> None
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
         selectors = {"pull_request", "issue"} & set(properties)
+        if forge_tool.name == "ci_run_jobs":
+            selectors = {"run_id"} & set(properties)
         assert "repository" in properties
         assert len(selectors) == (0 if forge_tool.name == "pr_list" else 1), forge_tool.name
         assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))
@@ -3506,15 +3718,11 @@ def test_pr_list_refuses_invalid_selectors_before_client_call(monkeypatch, field
     assert client.calls == []
 
 
-def test_pr_list_filters_author_and_merged_since_and_passes_selectors(monkeypatch):
+def test_pr_list_passes_author_and_normalized_merged_since_to_pagination(monkeypatch):
     client = FakeForge()
-    client.list_pull_requests = lambda repo, *, state, base, head, limit: (
-        client.calls.append((repo, state, base, head, limit)) or (
+    client.list_pull_requests = lambda repo, *, state, base, head, limit, author, merged_since: (
+        client.calls.append((repo, state, base, head, limit, author, merged_since)) or (
             PullRequestSummary(1, "match", "merged", "Bot", "topic", "main", "a" * 40,
-                               "2026-10-03T00:00:00Z", "2026-10-02T12:00:00Z", "url"),
-            PullRequestSummary(2, "old", "merged", "Bot", "topic", "main", "a" * 40,
-                               "2026-09-03T00:00:00Z", "2026-09-02T12:00:00Z", "url"),
-            PullRequestSummary(3, "other", "merged", "Other", "topic", "main", "a" * 40,
                                "2026-10-03T00:00:00Z", "2026-10-02T12:00:00Z", "url"),
         )
     )
@@ -3523,7 +3731,10 @@ def test_pr_list_filters_author_and_merged_since_and_passes_selectors(monkeypatc
     result = pr_list.func(repository="owner/repo", state="merged", author="bot",
                           merged_since="2026-10-01", base="main", head="fork:topic", limit=10)
     assert [item["number"] for item in result] == [1]
-    assert client.calls == [("owner/repo", "merged", "main", "fork:topic", 10)]
+    from datetime import datetime, timezone
+
+    assert client.calls == [("owner/repo", "merged", "main", "fork:topic", 10,
+                             "bot", datetime(2026, 10, 1, tzinfo=timezone.utc))]
 
 
 def test_pr_list_repository_shape_is_independent_of_configuration_check(monkeypatch):

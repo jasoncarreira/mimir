@@ -18,6 +18,158 @@ from mimir.tools import _shell_env
 from mimir.tools._shell_env import direct_exec_env, direct_exec_env_overlay
 
 
+@pytest.mark.asyncio
+async def test_interactive_sync_and_async_children_receive_same_scrubbed_env(
+    tmp_path, monkeypatch,
+):
+    from mimir.shell_jobs import ShellJobRegistry
+    from mimir.tools.extra import shell_exec
+    from mimir.tools import shell_async
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("FAKE_API_KEY", "x")
+    monkeypatch.setenv("KEEP_ME", "y")
+    monkeypatch.setenv("GITHUB_TOKEN", "ungranted")
+    monkeypatch.setenv("GH_TOKEN", "ungranted")
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "KEEP_ME")
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
+    sync = shell_exec.invoke({"command": "env"})
+    registry = ShellJobRegistry(jobs_dir=tmp_path / "jobs")
+    done = threading.Event()
+    completed = []
+    def on_complete(job):
+        completed.append(job)
+        done.set()
+
+    shell_async.set_shell_job_registry(registry, on_complete=on_complete)
+    try:
+        result = await shell_async.bash_async.coroutine(command="env", cwd=str(tmp_path))
+        assert "Spawned job" in result
+        assert await asyncio.to_thread(done.wait, 10)
+        [job] = completed
+        async_text = job.stdout_path.read_text()
+    finally:
+        shell_async.set_shell_job_registry(None)
+
+    sync_text = sync.split("stdout:\n", 1)[1]
+    sync_env = dict(line.split("=", 1) for line in sync_text.splitlines() if "=" in line)
+    async_env = dict(line.split("=", 1) for line in async_text.splitlines() if "=" in line)
+    for child in (sync_env, async_env):
+        assert child["KEEP_ME"] == "y"
+        assert child["MIMIR_HOME"] == str(tmp_path)
+        assert not {"FAKE_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"} & child.keys()
+    assert sync_env == async_env
+
+
+def test_server_disables_dumpability_after_update_before_runtime_children():
+    import ast
+
+    source = Path(__file__).resolve().parents[1] / "mimir" / "server.py"
+    tree = ast.parse(source.read_text())
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = {
+        node.func.id: node.lineno for node in ast.walk(main)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert calls["apply_pending_update"] < calls["disable_process_dumpability"] < calls["build_app"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux procfs dumpability control")
+def test_non_dumpable_parent_environment_unreadable_to_interactive_child():
+    if os.geteuid() == 0:
+        pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    # Isolate PR_SET_DUMPABLE from pytest's shared process. Probe before and
+    # after so a pre-existing procfs restriction cannot make this test vacuous.
+    script = '''
+import ctypes, subprocess, sys, shlex
+from mimir.tools._shell_env import (
+    disable_process_dumpability, interactive_shell_env, login_shell_command,
+)
+probe = "import os; open('/proc/' + str(os.getppid()) + '/environ', 'rb').close()"
+argv = ["bash", "-lc", login_shell_command("exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe))]
+env = interactive_shell_env()
+assert subprocess.run(argv, env=env, capture_output=True).returncode == 0
+disable_process_dumpability()
+assert ctypes.CDLL(None).prctl(3, 0, 0, 0, 0) == 0
+result = subprocess.run(argv, env=env, capture_output=True, text=True)
+assert result.returncode != 0
+assert "PermissionError" in result.stderr
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux procfs dumpability control")
+@pytest.mark.parametrize("subcommand", ["watchdog", "worklink"])
+def test_real_cli_non_run_sibling_environment_unreadable(subcommand):
+    if os.geteuid() == 0:
+        pytest.skip("root may bypass procfs access controls; exercise as worker uid")
+    # Drive the real CLI entry in an isolated sibling process, keeping it alive
+    # after --help exits. Prove readability before CLI startup to avoid a
+    # vacuous pass on hosts which already restrict same-uid procfs reads.
+    script = '''
+import contextlib, ctypes, io, sys
+from mimir.cli import main
+libc = ctypes.CDLL(None)
+assert libc.prctl(4, 1, 0, 0, 0) == 0
+print("before", flush=True)
+sys.stdin.readline()
+with contextlib.redirect_stdout(io.StringIO()):
+    try:
+        main([sys.argv[1], "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+print("after", flush=True)
+sys.stdin.read()
+'''
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", script, subcommand], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert sibling.stdout.readline().strip() == "before"
+        probe = f"open('/proc/{sibling.pid}/environ', 'rb').close()"
+        argv = ["bash", "-lc", _shell_env.login_shell_command(
+            "exec " + shlex.quote(sys.executable) + " -c " + shlex.quote(probe),
+        )]
+        env = _shell_env.interactive_shell_env()
+        before = subprocess.run(argv, env=env, capture_output=True, timeout=10)
+        assert before.returncode == 0, before.stderr
+        sibling.stdin.write("start cli\n")
+        sibling.stdin.flush()
+        assert sibling.stdout.readline().strip() == "after"
+        after = subprocess.run(
+            argv, env=env, capture_output=True, text=True, timeout=10,
+        )
+        assert after.returncode != 0
+        assert "PermissionError" in after.stderr
+        sibling.stdin.close()
+        assert sibling.wait(timeout=10) == 0
+    finally:
+        if sibling.poll() is None:
+            sibling.kill()
+        sibling.wait(timeout=10)
+        sibling.stdout.close()
+        sibling.stderr.close()
+        if not sibling.stdin.closed:
+            sibling.stdin.close()
+
+
+def test_interactive_passthrough_logs_names_only(monkeypatch):
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: events.append((a, kw)))
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "KEEP_ME, ABSENT, KEEP_ME, OTHER*, PATH")
+    monkeypatch.setenv("KEEP_ME", "private-value")
+    monkeypatch.delenv("ABSENT", raising=False)
+    env = _shell_env.interactive_shell_env()
+    assert env["KEEP_ME"] == "private-value"
+    assert env["PATH"] == _shell_env._TRUSTED_PATH
+    assert events == [(("interactive_shell_env_passthrough",), {"pass_env": ["KEEP_ME"]})]
+    assert "private-value" not in repr(events)
+
+
 @pytest.mark.parametrize("executable", ["gh", "git", "echo"])
 def test_output_mask_includes_only_granted_child_values(monkeypatch, executable):
     monkeypatch.setattr(_shell_env, "direct_exec_pass_env", lambda argv: (

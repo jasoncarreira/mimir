@@ -263,6 +263,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_diff": ToolFlowDirection.SOURCE,
     "pr_checks": ToolFlowDirection.SOURCE,
     "pr_job_log": ToolFlowDirection.SOURCE,
+    "ci_run_jobs": ToolFlowDirection.SOURCE,
     "pr_reviews": ToolFlowDirection.SOURCE,
     "pr_comments": ToolFlowDirection.SOURCE,
     "pr_review_requests": ToolFlowDirection.SOURCE,
@@ -433,6 +434,7 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_diff": CapabilityTier.SCOPE_CONTAINED,
     "pr_checks": CapabilityTier.SCOPE_CONTAINED,
     "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
+    "ci_run_jobs": CapabilityTier.SCOPE_CONTAINED,
     "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
     "pr_comments": CapabilityTier.SCOPE_CONTAINED,
     "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
@@ -515,7 +517,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_list", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body", "pr_review_others", "pr_job_log",
+        "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -7961,7 +7963,7 @@ class OperationCatalog:
         READ_RESOURCE_OPERATIONS
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
-        | frozenset({"hands_read"})
+        | frozenset({"hands_read", "ci_run_jobs"})
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -9389,6 +9391,30 @@ class ToolRegistry:
                     sink_target = resource
                     requested_target = (arguments or {}).get("path")
                 return finish(hands_auth)
+            if tool_name == "ci_run_jobs":
+                args = arguments or {}
+                repo, run_id = args.get("repository"), args.get("run_id")
+                in_scope = (
+                    isinstance(repo, str)
+                    and type(run_id) is int and run_id > 0
+                    and is_configured_github_repo(repo)
+                    and (repo.lower(), run_id) in getattr(
+                        auth_context, "ci_run_targets", frozenset(),
+                    )
+                    and service_principal is not None
+                    and service_principal.has_capability("ci_run_jobs")
+                )
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision.RESOURCE_SCOPED,
+                    allowed=in_scope or not enforce,
+                    reason=None if in_scope else "ci_run_scope_denied",
+                    required_tier=AccessTier.USER,
+                    enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce and not in_scope,
+                    would_block=not in_scope,
+                    flow_direction=flow_direction,
+                ))
             if tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
                 forge_auth = authorize_repo_pr_tool(
                     tool_name,
@@ -9605,6 +9631,7 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "pr_diff": "repository",
     "pr_checks": "repository",
     "pr_job_log": "repository",
+    "ci_run_jobs": "repository",
     "pr_reviews": "repository",
     "pr_comments": "repository",
     "pr_review_requests": "repository",
@@ -9648,6 +9675,7 @@ _ACP_HANDS_RESULT_TOOLS = frozenset({
 # MCPResourceAdapter.authorize_call.
 _READ_BACKEND_RESULT_TOOLS = frozenset({
     "pr_job_log",
+    "ci_run_jobs",
     "Read",
     "Glob",
     "Grep",
@@ -10294,6 +10322,28 @@ def classify_protected_result(
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     descriptor = get_tool_descriptor(tool_name)
+    if tool_name == "ci_run_jobs":
+        repo, run_id = args.get("repository"), args.get("run_id")
+        if (
+            not isinstance(repo, str)
+            or type(run_id) is not int
+            or (repo.lower(), run_id) not in getattr(auth_context, "ci_run_targets", frozenset())
+        ):
+            return _incomplete_protected_result(
+                "repository", args, tool_name=tool_name, auth_context=auth_context,
+            )
+        principal = getattr(auth_context, "canonical_principal", None)
+        if getattr(auth_context, "is_service", False) and principal:
+            principal = f"service:{principal}"
+        labels = InformationFlowLabels().with_source(protected_result_source(
+            auth_context,
+            principal=principal,
+            domain="repository",
+            resource_id=f"{repo.lower()}#actions/run/{run_id}/jobs",
+            bridge_instance="forge",
+        ))
+        channel = getattr(auth_context, "channel_id", None)
+        return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
         scope = authorization.repo_pr_action_scope
         if scope is None:
@@ -10779,6 +10829,7 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "mimir_get_turn": "turn_history",
     "memory_query": "saga",
     "memory_get": "saga",
+    "ci_run_jobs": "repository",
     "hands_read": "client_provider",
     "hands_python": "client_provider",
     **{
@@ -11592,6 +11643,30 @@ def create_auth_context(
         event, registered_service if is_service else None,
     )
 
+    ci_run_targets: frozenset[tuple[str, int]] = frozenset()
+    if (
+        event.trigger == "poller"
+        and event.source == "poller"
+        and event_ingress is None
+        and extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) is None
+        and extra.get("poller_name") == "github-ci-watch"
+        and registered_service is not None
+        and event.service_principal == registered_service.canonical == "poller:github-ci-watch"
+        and registered_service.has_capability("ci_run_jobs")
+    ):
+        items = extra.get("items")
+        if isinstance(items, list):
+            ci_run_targets = frozenset(
+                (item["repo"].lower(), item["run_id"])
+                for item in items
+                if isinstance(item, dict)
+                and item.get("event_type") in {"ci_failure", "ci_attention"}
+                and isinstance(item.get("repo"), str)
+                and is_configured_github_repo(item["repo"])
+                and type(item.get("run_id")) is int
+                and item["run_id"] > 0
+            )
+
     return AuthContext(
         principal=author,
         canonical_principal=canonical,
@@ -11606,6 +11681,7 @@ def create_auth_context(
         repo_pr_scope_registry=repo_pr_scope_registry,
         repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
+        ci_run_targets=ci_run_targets,
         retained_factory_scope=retained_resolution.scope,
         retained_factory_scope_refusal=retained_resolution.refusal_reason,
         enforcement_enabled=enforce,

@@ -63,6 +63,46 @@ class Session:
         return self.responses.pop(0)
 
 
+def test_list_run_jobs_projects_only_bounded_job_metadata():
+    job = {
+        "id": 1, "name": "J" * 250, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "html_url": "secret-url", "logs_url": "secret-log-url",
+        "runner_name": "runner-secret", "runner_group_name": "runner-group-secret",
+        "log": "secret log text",
+        "steps": [
+            {"number": 3, "name": "S" * 250, "conclusion": "failure", "html_url": "secret-step"},
+            {"number": 4, "name": "ok", "conclusion": "success"},
+        ],
+    }
+    session = Session([Response({"jobs": [job] * 50}), Response({"jobs": [job] * 50})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert len(result) == 100
+    assert result[0] == {
+        "id": 1, "name": "J" * 200, "status": "completed", "conclusion": "failure",
+        "started_at": "start", "completed_at": "end",
+        "failed_steps": [{"number": 3, "name": "S" * 200, "conclusion": "failure"}],
+    }
+    assert all(value not in str(result) for value in (
+        "secret-url", "secret-log-url", "runner-secret", "runner-group-secret",
+        "secret log text", "secret-step",
+    ))
+    assert len(session.calls) == 2
+    assert [call[1] for call in session.calls] == [
+        f"https://api.github.com/repos/owner/repo/actions/runs/42/jobs?per_page=50&page={page}"
+        for page in (1, 2)
+    ]
+
+
+def test_list_run_jobs_caps_more_than_100_jobs_without_fetching_third_page():
+    session = Session([Response({"jobs": [{"id": i} for i in range(50)]}),
+                       Response({"jobs": [{"id": i} for i in range(50, 100)]}),
+                       Response({"jobs": [{"id": i} for i in range(100, 120)]})])
+    result = GitHubForgeClient(token="secret", session=session).list_run_jobs("owner/repo", 42)
+    assert [job["id"] for job in result] == list(range(100))
+    assert len(session.calls) == 2
+
+
 @pytest.fixture(autouse=True)
 def reset_verified_identity(monkeypatch) -> None:
     from mimir.tools import forge as forge_tools
@@ -103,6 +143,49 @@ def _pr_row(number, *, merged=False):
         "merged_at": "2026-10-02T00:00:00Z" if merged else None,
         "html_url": f"https://github.com/owner/repo/pull/{number}",
     }
+
+
+def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
+    wrong = _pr_row(1)
+    wrong["head"]["ref"] = "unrelated"
+    session = Session([Response([wrong, _pr_row(2)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", head="topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert "head=owner%3Atopic" in session.calls[0][1]
+
+
+@pytest.mark.parametrize("selector", ["author", "merged_since", "both"])
+def test_pr_list_applies_filters_before_limit_across_pages(selector):
+    from datetime import datetime, timezone
+
+    excluded = [_pr_row(n, merged=True) for n in range(50)]
+    for item in excluded:
+        item["user"]["login"] = "other"
+        item["merged_at"] = "2026-09-01T00:00:00Z"
+    # Matching rows must be discovered after a full page of rejected rows,
+    # not merely beyond limit within an already-fetched page.
+    session = Session([Response(excluded), Response([_pr_row(51, merged=True), _pr_row(52, merged=True)])])
+    kwargs = {}
+    if selector in {"author", "both"}:
+        kwargs["author"] = "AUTHOR"
+    if selector in {"merged_since", "both"}:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1, **kwargs,
+    )
+    assert [item.number for item in result] == [51]
+    assert len(session.calls) == 2
+
+
+def test_paginate_limited_collection_returns_partial_at_page_cap():
+    session = Session([Response({"jobs": [{"id": n}] * 50}) for n in range(10)])
+    result = GitHubForgeClient(session=session)._paginate(
+        "/repos/owner/repo/actions/runs/42/jobs", collection_key="jobs", limit=501,
+    )
+    assert len(result) == 500
+    assert len(session.calls) == 10
 
 
 def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
