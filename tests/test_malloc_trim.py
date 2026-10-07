@@ -61,8 +61,9 @@ def test_missing_symbol_skips_trim(linux_glibc) -> None:
     assert malloc_trim.trim_heap(libc=object(), rss_reader=lambda: pytest.fail("RSS read")) is None
 
 
-def test_jemalloc_preload_skips_trim(linux_glibc, monkeypatch) -> None:
-    monkeypatch.setenv("LD_PRELOAD", "/usr/lib/libjemalloc.so")
+@pytest.mark.parametrize("preload", ["/usr/lib/libjemalloc.so", "/opt/LibJemalloc.so"])
+def test_jemalloc_preload_skips_trim(linux_glibc, monkeypatch, preload: str) -> None:
+    monkeypatch.setenv("LD_PRELOAD", preload)
     libc = FakeLibc()
     assert malloc_trim.trim_heap(libc=libc, rss_reader=lambda: pytest.fail("RSS read")) is None
     assert libc.calls == []
@@ -179,6 +180,44 @@ async def test_trim_runs_off_loop_and_logs_only_large_drops(
         })]
     else:
         assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "env_cron,expected_cron",
+    [(None, "*/5 * * * *"), ("*/10 * * * *", "*/10 * * * *"), ("", "")],
+    ids=["default-on", "env-override", "explicit-disable"],
+)
+async def test_server_passes_malloc_trim_cron(
+    tmp_path, monkeypatch, env_cron: str | None, expected_cron: str,
+) -> None:
+    import mimir.server as server_module
+    from tests.test_server import _controlled_server_app, _run_cleanup, _run_startup
+
+    if env_cron is None:
+        monkeypatch.delenv("MIMIR_MALLOC_TRIM_CRON", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_MALLOC_TRIM_CRON", env_cron)
+    monkeypatch.setattr("mimir.scheduler.trim_supported", lambda: True)
+    real_scheduler = make_scheduler(tmp_path)
+    app, _control = _controlled_server_app(tmp_path, monkeypatch)
+    recorded_crons = []
+
+    def record_trim_job(self, *, cron_expr: str) -> bool:
+        recorded_crons.append(cron_expr)
+        return real_scheduler.add_malloc_trim_job(cron_expr)
+
+    monkeypatch.setattr(
+        server_module.Scheduler, "add_malloc_trim_job", record_trim_job, raising=False,
+    )
+    try:
+        await _run_startup(app)
+        assert recorded_crons == [expected_cron]
+        job = real_scheduler._scheduler.get_job("malloc-trim")
+        assert (job is not None) is bool(expected_cron)
+        assert ("malloc-trim" in real_scheduler.registered_callables()) is bool(expected_cron)
+    finally:
+        await _run_cleanup(app)
 
 
 @pytest.mark.asyncio
