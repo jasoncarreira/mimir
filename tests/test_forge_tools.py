@@ -3863,6 +3863,23 @@ def test_pr_list_search_refuses_each_invalid_input_before_client_call(monkeypatc
     assert client.calls == []
 
 
+@pytest.mark.parametrize("search", [
+    '1445 "', '"1445"', "kernel ) OR (", "kernel(", "kernel)",
+    "linux OR", "linux AND", "linux NOT", "linux or", "linux and", "linux not",
+    "linux oR", "linux aNd", "linux nOt",
+    'label:bu"g', "head:topic(foo)",
+])
+def test_pr_list_search_refuses_advanced_syntax_before_client_call(monkeypatch, search):
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    with pytest.raises(ToolPolicyRefusal, match="quotes, parentheses, or boolean operators"):
+        pr_list.func(repository="owner/repo", search=search)
+    assert client.calls == []
+
+
 def test_pr_list_search_refuses_non_string_before_client_call(monkeypatch):
     from mimir.tools.refusals import ToolPolicyRefusal
 
@@ -3877,6 +3894,7 @@ def test_pr_list_search_refuses_non_string_before_client_call(monkeypatch):
 @pytest.mark.parametrize("search", [
     "head:issue/1879-a1", "in:title 1445", "is:merged author:jasoncarreira",
     "in:body in:comments is:unmerged is:draft base:main label:bug",
+    "ordinary android nothing", "label:OR head:topic/AND base:NOT",
 ])
 def test_pr_list_search_allows_documented_qualifiers(monkeypatch, search):
     client = FakeForge()

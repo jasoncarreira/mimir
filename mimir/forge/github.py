@@ -584,6 +584,12 @@ class GitHubForgeClient:
         if merged_since is not None:
             qualifiers.append(f"merged:>={merged_since.date().isoformat()}")
         search_query = " ".join(qualifiers)
+        # Validate the final query too: direct callers can supply selectors as
+        # well as query text, and advanced search can otherwise escape repo:.
+        if any(char in search_query for char in '\"()') or any(
+            token.casefold() in {"or", "and", "not"} for token in search_query.split()
+        ):
+            raise ForgeError("pull-request search cannot contain quotes, parentheses, or boolean operators")
         # GitHub ORs repeated repo: qualifiers; reject even a duplicate of our repo.
         if search_query.casefold().count("repo:") != 1 or f"repo:{repository}" not in search_query.split():
             raise ForgeError("pull-request search must target exactly the configured repository")

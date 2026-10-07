@@ -712,6 +712,12 @@ def _pr_search(value: str) -> str:
         raise ToolPolicyRefusal("search must be non-empty text within 256 UTF-8 bytes without control characters")
     if any(forbidden in value.casefold() for forbidden in ("repo:", "org:", "user:", "is:issue")):
         raise ToolPolicyRefusal("search cannot contain repo:, org:, user:, or is:issue")
+    # Appending repo: is not confinement if boolean syntax or an open quote
+    # can change how GitHub's advanced search parser binds those qualifiers.
+    if any(char in value for char in '\"()') or any(
+        token.casefold() in {"or", "and", "not"} for token in value.split()
+    ):
+        raise ToolPolicyRefusal("search cannot contain quotes, parentheses, or boolean operators")
     fixed = {
         "in:title", "in:body", "in:comments", "is:open", "is:closed",
         "is:merged", "is:unmerged", "is:draft",

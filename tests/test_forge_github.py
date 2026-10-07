@@ -349,6 +349,32 @@ def test_pr_search_client_rejects_second_repo_qualifier_without_request(query):
     assert session.calls == []
 
 
+@pytest.mark.parametrize("query", [
+    '1445 "', '"1445"', "kernel ) OR (", "kernel(", "kernel)",
+    "linux OR", "linux AND", "linux NOT", "linux or", "linux and", "linux not",
+    "linux oR", "linux aNd", "linux nOt",
+    'label:bu"g', "head:topic(foo)",
+])
+def test_pr_search_client_refuses_advanced_syntax_without_request(query):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query=query, state="all", limit=5,
+        )
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("selector", ["author", "base", "head"])
+@pytest.mark.parametrize("value", ['topic"', "topic(", "topic)", "topic OR"])
+def test_pr_search_client_checks_advanced_syntax_in_final_selectors(selector, value):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query="1445", state="all", **{selector: value},
+        )
+    assert session.calls == []
+
+
 def test_pr_search_page_cap_and_limit():
     session = Session([Response({"items": [_search_row(n) for n in range(50)]}) for _ in range(11)])
     assert len(GitHubForgeClient(session=session).search_pull_requests(
