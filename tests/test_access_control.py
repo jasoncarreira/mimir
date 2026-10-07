@@ -10542,7 +10542,7 @@ def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
     assert escaped.allowed is False
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
 @pytest.mark.parametrize("enforce", [False, True])
 def test_file_writes_resolve_payload_and_server_discovered_leases(
     tool_name: str, enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
