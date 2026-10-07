@@ -755,6 +755,52 @@ class GitHubForgeClient:
             for job in jobs
         ]
 
+    @classmethod
+    def _run_projection(cls, run: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": run.get("id") if type(run.get("id")) is int else None,
+            "name": cls._text(run.get("name"), 200),
+            "display_title": cls._text(run.get("display_title"), 200),
+            "status": cls._text(run.get("status"), 32),
+            "conclusion": cls._text(run.get("conclusion"), 32) or None,
+            "event": cls._text(run.get("event"), 100),
+            "head_branch": cls._text(run.get("head_branch"), 200),
+            "head_sha": cls._text(run.get("head_sha"), 64),
+            "run_attempt": run.get("run_attempt") if type(run.get("run_attempt")) is int else None,
+            "workflow_id": run.get("workflow_id") if type(run.get("workflow_id")) is int else None,
+            "created_at": cls._text(run.get("created_at"), 64) or None,
+            "updated_at": cls._text(run.get("updated_at"), 64) or None,
+            "run_started_at": cls._text(run.get("run_started_at"), 64) or None,
+        }
+
+    def get_run(self, repository: str, run_id: int) -> dict[str, Any]:
+        if _REPOSITORY.fullmatch(repository) is None or type(run_id) is not int or run_id < 1:
+            raise ForgeError("invalid workflow run selector")
+        run = self._request("GET", f"/repos/{repository}/actions/runs/{run_id}")
+        if not isinstance(run, Mapping):
+            raise ForgeError("invalid run metadata")
+        return self._run_projection(run)
+
+    def list_runs(
+        self, repository: str, branch: str, workflow_id: int | None, limit: int,
+    ) -> list[dict[str, Any]]:
+        if (
+            _REPOSITORY.fullmatch(repository) is None
+            or not isinstance(branch, str) or not branch
+            or (workflow_id is not None and (type(workflow_id) is not int or workflow_id < 1))
+            or type(limit) is not int or not 1 <= limit <= 20
+        ):
+            raise ForgeError("invalid workflow runs selector")
+        path = (
+            f"/repos/{repository}/actions/workflows/{workflow_id}/runs"
+            if workflow_id is not None else f"/repos/{repository}/actions/runs"
+        )
+        runs = self._paginate(
+            f"{path}?branch={quote(branch, safe='')}",
+            collection_key="workflow_runs", limit=limit,
+        )
+        return [self._run_projection(run) for run in runs]
+
     def list_reviews(self, scope: RepoPRActionScope) -> tuple[ReviewProjection, ...]:
         repository, number = self._target(scope)
         return tuple(self._review(item) for item in self._paginate(

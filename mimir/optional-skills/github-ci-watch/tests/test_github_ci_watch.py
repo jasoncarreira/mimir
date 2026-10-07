@@ -52,6 +52,20 @@ def test_emits_only_new_completed_failures(monkeypatch, captured):
     assert seen["o/r"]["watermark"] == 3
 
 
+@pytest.mark.parametrize("workflow_id,expected", [
+    (7, 7), (None, None), (0, None), (-1, None), (True, None), ("7", None),
+])
+def test_emitted_workflow_id_only_when_positive_int(monkeypatch, captured, workflow_id, expected):
+    run = _run(42, "failure")
+    run["workflowDatabaseId"] = workflow_id
+    monkeypatch.setattr(poller, "_gh", lambda *a: [run])
+    monkeypatch.setattr(poller, "_failure_logs", lambda *a: "saved log")
+    poller._check_repo("o/r", {"o/r": {"watermark": 0, "alerted": set()}})
+    assert len(captured) == 1
+    assert captured[0].get("workflow_id") == expected
+    assert ("workflow_id" in captured[0]) is (expected is not None)
+
+
 def test_skips_already_seen_failures(monkeypatch, captured):
     monkeypatch.setattr(poller, "_gh", lambda *a: [_run(2, "failure")])
     seen = {"o/r": {"watermark": 2, "alerted": set()}}
@@ -98,7 +112,10 @@ def test_failure_prompt_reads_bounded_authenticated_log(monkeypatch, captured, t
     assert str(log) in prompt
     assert "Failing job 101 (pytest); step: Run tests" in prompt
     assert "read_file" in prompt
-    assert "Optional enrichment: call ci_run_jobs(repository, run_id) for the run's job and failed-step list." in prompt
+    assert ("Optional enrichment: call ci_run(repository, run_id) for run metadata, "
+            "ci_run_jobs(repository, run_id) for jobs and failed steps, and "
+            "ci_recent_runs(repository, branch) to compare recent runs on the branch.") in prompt
+    assert "(for the operator; do not fetch it)" in prompt
     assert "fetch_url on https://api.github.com" not in prompt
     assert "/actions/jobs/" not in prompt
     assert "before diagnosing the failure" in prompt
@@ -221,7 +238,7 @@ def test_log_controls_cross_chunk_boundary(sequence):
 def test_manifest_grants_log_fetch_and_read():
     skill_dir = Path(__file__).resolve().parents[1]
     authority = json.loads((skill_dir / "pollers.json").read_text())["pollers"][0]["authority"]
-    assert {"ci_run_jobs", "fetch_url", "read_file"} <= set(authority["capabilities"])
+    assert {"ci_run_jobs", "ci_run", "ci_recent_runs", "fetch_url", "read_file"} <= set(authority["capabilities"])
     assert authority["approved_urls"] == [
         "https://api.github.com/repos/", "https://github.com/",
     ]

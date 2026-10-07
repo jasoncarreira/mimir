@@ -1046,6 +1046,58 @@ def ci_run_jobs(
 
 
 @tool
+def ci_run(
+    repository: str,
+    run_id: StrictInt,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Read bounded metadata for a configured, poller-named CI run."""
+    repo = _repository(repository)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal("CI run rejected: repository is not configured in GITHUB_REPOS")
+    context = getattr(runtime, "context", None)
+    if type(run_id) is not int or run_id < 1 or (repo.lower(), run_id) not in getattr(
+        context, "ci_run_targets", frozenset(),
+    ):
+        raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
+    return _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+
+
+@tool
+def ci_recent_runs(
+    repository: str,
+    branch: str,
+    workflow_id: StrictInt | None = None,
+    limit: StrictInt = 10,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> list[dict[str, Any]]:
+    """Read bounded recent CI runs on the poller-named branch."""
+    repo = _repository(repository)
+    from ..access_control import is_configured_github_repo
+
+    if not is_configured_github_repo(repo):
+        raise ToolPolicyRefusal("CI runs rejected: repository is not configured in GITHUB_REPOS")
+    context = getattr(runtime, "context", None)
+    targets = getattr(context, "ci_branch_targets", frozenset())
+    if (
+        not isinstance(branch, str) or not branch
+        or (workflow_id is not None and (type(workflow_id) is not int or workflow_id < 1))
+        or not any(
+            target_repo == repo.lower() and target_branch == branch
+            and (workflow_id is None or workflow_id == target_workflow)
+            for target_repo, target_branch, target_workflow in targets
+        )
+    ):
+        raise ToolPolicyRefusal("CI runs rejected: branch or workflow is outside this turn's poller scope")
+    if type(limit) is not int:
+        raise ToolPolicyRefusal("CI runs rejected: limit must be an integer")
+    bounded_limit = max(1, min(20, limit))
+    return _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+
+
+@tool
 def pr_reviews(
     repository: str,
     pull_request: int,
@@ -1356,6 +1408,8 @@ FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_checks,
     pr_job_log,
     ci_run_jobs,
+    ci_run,
+    ci_recent_runs,
     pr_reviews,
     pr_comments,
     pr_review_requests,
