@@ -9,7 +9,7 @@
         "profile": "research",
         "tier": "scoped-with-provenance",
         "saga_full_corpus_read": true,
-        "capabilities": ["write_file", "edit_file", "send_message", "operator_alert", "shell_exec", "bash_jobs_list", "bash_job_output"],
+        "capabilities": ["read_file", "ls", "glob", "grep", "write_file", "edit_file", "send_message", "operator_alert", "shell_exec", "bash_jobs_list", "bash_job_output"],
         "scoped_roots": ["state"],
         "shell_commands": [
           {
@@ -17,9 +17,7 @@
             "path": "/usr/bin/bash",
             "script": "/mimir-home/skills/gmail-poller/scripts/run-gog.sh",
             "options": ["--account", "--max", "--json", "--no-input"]
-          },
-          {"exec": "wc", "path": "/usr/bin/wc", "subcommands": [["-l"]], "options": ["-l"]},
-          {"exec": "ls", "path": "/usr/bin/ls", "subcommands": [["-la"]], "options": ["-la"]}
+          }
         ]
       },
       "pass_env": [

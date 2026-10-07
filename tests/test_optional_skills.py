@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from mimir.access_control import agent_writable_roots, parse_declared_shell_commands
+from mimir.pollers import _parse_poller_authority
 
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +48,35 @@ def test_shipped_poller_manifests_omit_unusable_grants_and_options(
             assert poller["authority"]["proposal_surface"] == "social-outbox"
 
 
+def test_gmail_poller_grants_file_reads_and_only_gog_shell_command() -> None:
+    manifest = json.loads(
+        (_OPTIONAL_SKILLS / "gmail-poller" / "pollers.json").read_text(encoding="utf-8")
+    )
+    assert len(manifest["pollers"]) == 1
+    authority = manifest["pollers"][0]["authority"]
+    assert {"read_file", "ls", "glob", "grep"} <= set(authority["capabilities"])
+    assert authority["scoped_roots"] == ["state"]
+    assert authority["shell_commands"] == [
+        {
+            "exec": "bash",
+            "path": "/usr/bin/bash",
+            "script": "/mimir-home/skills/gmail-poller/scripts/run-gog.sh",
+            "options": ["--account", "--max", "--json", "--no-input"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("skill_name", _WRAPPER_SKILLS)
+def test_shipped_skill_guidance_has_no_backticked_shell_file_reads(
+    skill_name: str,
+) -> None:
+    text = (_OPTIONAL_SKILLS / skill_name / "SKILL.md").read_text(encoding="utf-8")
+    shell_read = re.compile(
+        r"`(?:cat|head|tail|less|wc|ls)\b(?:\s+-[^\s`]+)*\s+[^-\s`][^\s`]*`"
+    )
+    assert shell_read.search(text) is None, skill_name
+
+
 @_REQUIRES_DEPLOYMENT_BASH
 @pytest.mark.parametrize("skill_name", _DECLARING_SKILLS)
 def test_shipped_shell_commands_parse_in_installed_skill(
@@ -56,9 +87,13 @@ def test_shipped_shell_commands_parse_in_installed_skill(
     installed = home / "skills" / skill_name
     shutil.copytree(_OPTIONAL_SKILLS / skill_name, installed)
     monkeypatch.setenv("MIMIR_HOME", str(home))
+    state_root = home / "state" / "pollers"
+    state_root.mkdir(parents=True)
 
     manifest = json.loads((installed / "pollers.json").read_text(encoding="utf-8"))
     for poller in manifest["pollers"]:
+        persist_dir = state_root / poller["name"]
+        persist_dir.mkdir()
         declarations = poller["authority"]["shell_commands"]
         for declaration in declarations:
             script = declaration.get("script")
@@ -71,6 +106,14 @@ def test_shipped_shell_commands_parse_in_installed_skill(
             writable_roots=agent_writable_roots(home),
         )
         assert len(parsed) == len(declarations)
+        principal = _parse_poller_authority(
+            poller["authority"],
+            name=poller["name"],
+            persist_dir=persist_dir,
+            state_root=state_root,
+            manifest_path=installed / "pollers.json",
+        )
+        assert len(principal.declared_shell_commands) == len(declarations)
 
 
 @pytest.mark.parametrize("skill_name", _WRAPPER_SKILLS)
