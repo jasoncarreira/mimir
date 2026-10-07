@@ -107,6 +107,15 @@ def test_ci_recent_runs_paginates_encoded_bound_branch(workflow_id, limit, endpo
     )
 
 
+@pytest.mark.parametrize("limit", [0, 21])
+def test_ci_recent_runs_client_rejects_out_of_bounds_limit(limit):
+    session = Session([Response({"workflow_runs": []})])
+    client = GitHubForgeClient(token="secret", session=session)
+    with pytest.raises(ForgeError, match="invalid workflow runs selector"):
+        client.list_runs("owner/repo", "main", None, limit)
+    assert session.calls == []
+
+
 def _file_responses(path: str, head: str = "a" * 40) -> list[Response]:
     parts = path.split("/")
     responses = [

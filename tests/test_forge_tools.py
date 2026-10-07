@@ -1202,6 +1202,69 @@ def test_ci_read_authorization_and_untrusted_result(monkeypatch, name, args):
     assert context.ifc_state.merge(labels, fallback=context.ifc_labels).has_untrusted_active_ingest
 
 
+def test_ci_recent_runs_authorization_rejects_configured_but_unbound_repo(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    args = {"repository": "owner/repo", "branch": "main"}
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Change only the repository; both are configured, so that guard cannot
+    # mask a missing repository match against the carried branch binding.
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={**args, "repository": "other/repo"},
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
+def test_ci_recent_runs_authorization_rejects_unconfigured_carried_branch(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    # Inject an exact branch binding to isolate the authorization-time
+    # configured-repository check from the ingress binding check.
+    context = replace(
+        _ci_watch_context(),
+        ci_branch_targets=frozenset({("other/repo", "main", 7)}),
+    )
+    args = {"repository": "other/repo", "branch": "main"}
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Change only deployment configuration, keeping the exact binding intact.
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
+def test_ci_recent_runs_authorization_cannot_fall_back_to_bound_run(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    assert context.ci_run_targets == frozenset({("owner/repo", 42)})
+    args = {"repository": "owner/repo", "branch": "main", "run_id": 42}
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Vary only branch. A stray, otherwise bound run_id cannot authorize a
+    # branch-scoped tool, even before tool-schema validation runs.
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={**args, "branch": "dev"},
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
 def test_ci_recent_runs_none_workflow_uses_branch_label(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     monkeypatch.delenv("MIMIR_HOME", raising=False)
