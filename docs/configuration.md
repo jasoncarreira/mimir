@@ -348,6 +348,7 @@ repository files and model-generated values never add permission entries.
 | `PYTEST_ADDOPTS` | pytest arguments | unset | Existing pytest options are preserved by the Worklink gate alongside its fresh JUnit/cache reporting options. Failed-node reruns override selection and use `-n 0`, retaining execution settings such as warning policies. |
 | `MIMIR_WORKLINK_REAPER_CRON` | cron | `""` (off) | Stale-claim TTL reaper cron; empty registers no job (non-Worklink homes). |
 | `MIMIR_SCRATCH_JANITOR_CRON` | cron | `13 4 * * *` (on) | Daily scratch-retention sweep of the home's ephemeral roots; empty disables. |
+| `MIMIR_MALLOC_TRIM_CRON` | cron | `*/5 * * * *` (on) | `mimir run` trims freed glibc heap every five minutes on Linux; empty disables. No job is registered on other platforms or with jemalloc/tcmalloc in `LD_PRELOAD`. Changes require a restart; only RSS drops of at least 16 MB emit `malloc_trim`. |
 | `MIMIR_SCRATCH_TTL_DAYS` | int | `1` | Age (newest contained mtime, days) before a scratch entry is swept; the recency check keeps in-use checkouts. `<= 0` disables the janitor. |
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |

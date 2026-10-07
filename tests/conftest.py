@@ -274,6 +274,7 @@ _HOST_ONLY_ENV = frozenset(
         "MIMIR_CLAUDE_OAUTH_CREDENTIALS",
         "MIMIR_HOME",
         "MIMIR_MODEL_REASONING_EFFORT",
+        "MIMIR_MALLOC_TRIM_CRON",
         "MIMIR_OPEN_BRIDGE",
         "MIMIR_SHELL_PASS_ENV",
         "MIMIR_WORKLINK_REASONING_EFFORT",
@@ -338,6 +339,9 @@ def _clear_host_mimir_environment():
     changes disabled-default assertions and routes Worklink tests through the
     enabled worker path. A Worklink test gate must therefore be invariant to the
     controller's configured coding state.
+
+    ``MIMIR_MALLOC_TRIM_CRON`` must not let a deployment override change the
+    suite's default-registration assertions.
 
     Same shape as the SAGA_CONFIG cleanup proposed in chainlink #129's
     PR #75 precedent. Session-scoped so we don't churn os.environ on
