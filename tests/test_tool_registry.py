@@ -706,7 +706,7 @@ async def test_final_model_bound_tool_surface_is_fully_cataloged(
         if sum(tool.name == "task" for tool in tools) == 1
     )
     main_names = [tool.name for tool in main_tools]
-    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "glob", "grep"}
+    filesystem_names = {"ls", "read_file", "write_file", "edit_file", "replace_file", "glob", "grep"}
     assert set(main_names) & filesystem_names == filesystem_names
     assert main_names.count("task") == 1
     assert main_names.count("write_todos") == 1
@@ -715,7 +715,8 @@ async def test_final_model_bound_tool_surface_is_fully_cataloged(
     write_file = next(tool for tool in main_tools if tool.name == "write_file")
     assert write_file.description == (
         "Creates a new file and writes the supplied content. It never overwrites an "
-        "existing path; when the target exists, use `edit_file` instead. Parent "
+        "existing path; when the target exists, use `edit_file` for a targeted change "
+        "or `replace_file` for its full content. Parent "
         "directories are created as needed."
     )
     assert result["todos"] == [{"content": "Verify inventory", "status": "in_progress"}]

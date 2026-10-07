@@ -2335,6 +2335,7 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
         "read_file",
         "write_file",
         "edit_file",
+        "replace_file",
         "glob",
         "grep",
         "execute",
@@ -16915,7 +16916,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
         SinkCategory.SPAWN: {"spawn_open_code", "worklink_run", "worklink_resume"},
         SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
-        SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
+        SinkCategory.FILE: {"write_file", "edit_file", "replace_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
         SinkCategory.SAGA: {"memory_store", "memory_propose", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
         SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
         SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
@@ -17043,6 +17044,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         access_control.ToolFlowDirection.SINK: {"memory_store", "open_proposal", "submit_proposal", "abandon_proposal", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_forget", "saga_record_skill_learning", "rebuild_index", "send_message", "operator_alert", "react", "defer_injected_message", "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers", "commitment_complete", "commitment_snooze", "commitment_dismiss", "request_mimir_update", "post_message", "webhook", "ntfy_send", "write_file", "edit_file", "Write", "Edit", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_cleanup", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
     }
     flows[access_control.ToolFlowDirection.SINK].add("memory_propose")
+    flows[access_control.ToolFlowDirection.SINK].add("replace_file")
     decisions = {
         OperationDecision.OPEN: {"commitment_list", "memory_query", "memory_get", "web_search", "fetch_url", "write_todos", "defer_injected_message", "request_operator_approval", "commitment_complete", "commitment_snooze", "commitment_dismiss"},
         OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "worklink_resume", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -17066,6 +17068,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     admin_catalog.add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("clear_ingest_taint")
+    decisions[OperationDecision.RESOURCE_SCOPED].add("replace_file")
     protected_builtins = {
         "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
         "Write", "Edit", "Read", "Glob", "Grep", "download_files",
@@ -17099,6 +17102,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         for name in names
     }
     destinations["memory_propose"] = "memory_proposals"
+    destinations["replace_file"] = "filesystem"
 
     for name in ("pr_job_log", "ci_run_jobs", "pr_file_content"):
         flows[access_control.ToolFlowDirection.SOURCE].add(name)

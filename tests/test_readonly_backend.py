@@ -1154,6 +1154,147 @@ class TestWriteGuardBackend:
         assert worker_threads[0] != loop_thread
 
 
+def test_replace_file_existing_missing_and_async(home: Path) -> None:
+    import stat
+
+    backend = WriteGuardBackend(home, ["state"])
+    target = home / "state" / "today.md"
+    target.write_bytes(b"original\x00")
+    target.chmod(0o600)
+    inode = target.stat().st_ino
+    result = backend.replace("/state/today.md", "new\n")
+    assert result.error is None
+    assert target.read_bytes() == b"new\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert target.stat().st_ino != inode
+    missing = home / "state" / "missing.md"
+    assert backend.replace("/state/missing.md", "new").error == (
+        "File '/state/missing.md' does not exist. Use write_file to create new files."
+    )
+    assert not missing.exists()
+
+
+def test_replace_file_refuses_symlink_to_writable_regular_file(home: Path) -> None:
+    target = home / "state" / "real.md"
+    target.write_text("original")
+    (home / "state" / "alias.md").symlink_to(target)
+    backend = WriteGuardBackend(home, ["state"])
+    assert backend.replace("/state/alias.md", "wrong").error
+    assert target.read_text() == "original"
+
+
+def test_replace_file_refuses_symlinked_parent_within_writable_root(home: Path) -> None:
+    directory = home / "state" / "real"
+    directory.mkdir()
+    target = directory / "today.md"
+    target.write_text("original")
+    (home / "state" / "alias").symlink_to(directory, target_is_directory=True)
+    assert WriteGuardBackend(home, ["state"]).replace("/state/alias/today.md", "new").error
+    assert target.read_text() == "original"
+
+
+def test_replace_file_target_probe_requires_nofollow(home: Path, monkeypatch) -> None:
+    target = home / "state" / "today.md"
+    target.write_text("original")
+    real_open = os.open
+    probes = []
+
+    def checked_open(path, flags, *args, **kwargs):
+        if path == "today.md":
+            probes.append(flags)
+            assert flags & os.O_NOFOLLOW
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", checked_open)
+    assert WriteGuardBackend(home, ["state"]).replace("/state/today.md", "new").error is None
+    assert probes
+
+
+def test_replace_file_tool_dispatches_through_guard(home: Path) -> None:
+    backend = WriteGuardBackend(home, ["state"])
+    target = home / "state" / "today.md"
+    target.write_text("original")
+    tool = next(tool for tool in MimirFilesystemMiddleware(backend=backend).tools
+                if tool.name == "replace_file")
+    runtime = SimpleNamespace(tool_call_id="replace-call")
+    result = tool.func(file_path="/state/today.md", content="new", runtime=runtime)
+    assert result.status == "success"
+    assert target.read_text() == "new"
+    denied = tool.func(file_path="/logs/existing.txt", content="bad", runtime=runtime)
+    assert denied.status == "error"
+    assert backend.drain_denials()[0]["op"] == "replace"
+
+
+@pytest.mark.asyncio
+async def test_replace_file_routes_and_refuses_unsafe_targets(home: Path, tmp_path: Path) -> None:
+    route = tmp_path / "mounted"
+    route.mkdir()
+    target = route / "file"
+    target.write_text("old")
+    router = FileToolRouter(
+        default=WriteGuardBackend(home, ["state"]),
+        routes=build_file_tool_routes([(str(route), "rw")]),
+    )
+    assert (await router.areplace(str(target), "new")).path == str(target)
+    assert target.read_text() == "new"
+    outside = home / "logs" / "existing.txt"
+    (home / "state" / "link").symlink_to(outside)
+    (home / "state" / "parent").symlink_to(home / "logs", target_is_directory=True)
+    for path in ("/state/link", "/state", "/state/parent/existing.txt"):
+        assert WriteGuardBackend(home, ["state"]).replace(path, "bad").error
+    assert outside.read_text() == "preexisting log line\n"
+    assert ReadOnlyFilesystemBackend(route).replace("/file", "bad").error
+    assert target.read_text() == "new"
+
+
+def test_replace_file_failure_cleans_temp_and_retains_original(home: Path, monkeypatch) -> None:
+    import mimir.readonly_backend as filesystem
+
+    target = home / "state" / "today.md"
+    target.write_bytes(b"old bytes\x00")
+    original_replace = filesystem.os.replace
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(filesystem.os, "replace", fail_replace)
+    try:
+        result = WriteGuardBackend(home, ["state"]).replace("/state/today.md", "new")
+        assert "injected rename failure" in result.error
+    finally:
+        monkeypatch.setattr(filesystem.os, "replace", original_replace)
+    assert target.read_bytes() == b"old bytes\x00"
+    assert not list(target.parent.glob(".mimir-*.tmp"))
+
+
+def test_replace_file_guard_denials_are_attributed(home: Path) -> None:
+    from mimir.models import TurnContext
+
+    for path in (home / "logs" / "existing.txt", home / "prompts" / "policy.md",
+                 home / "memory" / "core" / "rule.md", home / "state" / "identities.yaml"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("unchanged")
+    backend = WriteGuardBackend(home, ["state", "memory"])
+    token = set_current_turn(TurnContext(
+        turn_id="replace-guard", session_id="session", trigger="user_message",
+        channel_id="test", started_at=0.0,
+    ))
+    try:
+        for path in ("/logs/existing.txt", "/prompts/policy.md", "/memory/core/rule.md",
+                     "/state/identities.yaml"):
+            assert backend.replace(path, "bad").error
+            assert (home / path.lstrip("/")).read_text() == "unchanged"
+    finally:
+        reset_current_turn(token)
+    denials = backend.drain_denials()
+    assert len(denials) == 4
+    assert all(d["op"].startswith("replace") and d["turn_id"] == "replace-guard" for d in denials)
+    assert {d["op"] for d in denials} == {
+        "replace", "replace_prompts_readonly", "replace_core_memory_readonly",
+        "replace_identities_protected",
+    }
+
+
 class TestCreateOnlyWrites:
     def test_middleware_dispatches_only_approved_filesystem_tools(
         self, home: Path,
@@ -1165,14 +1306,18 @@ class TestCreateOnlyWrites:
         )
 
         assert [tool.name for tool in middleware.tools] == [
-            "ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute",
+            "ls", "read_file", "write_file", "edit_file", "replace_file", "glob", "grep", "execute",
         ]
         write_tool = next(tool for tool in middleware.tools if tool.name == "write_file")
         assert write_tool.description == (
             "Creates a new file and writes the supplied content. It never overwrites an "
-            "existing path; when the target exists, use `edit_file` instead. Parent "
+            "existing path; when the target exists, use `edit_file` for a targeted change "
+            "or `replace_file` for its full content. Parent "
             "directories are created as needed."
         )
+        replacement = next(tool for tool in middleware.tools if tool.name == "replace_file")
+        assert "existing regular file" in replacement.description
+
 
     def test_home_collision_uses_canonical_virtual_path_without_audit(
         self, home: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1201,7 +1346,7 @@ class TestCreateOnlyWrites:
             reset_current_turn(token)
 
         assert result.error == (
-            "File '/state/existing.txt' already exists. Use edit_file to modify existing files."
+            "File '/state/existing.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1216,8 +1361,8 @@ class TestCreateOnlyWrites:
         result = await backend.awrite(str(target), "replacement")
 
         assert result.error == (
-            "File '/state/existing-async.txt' already exists. Use edit_file to modify "
-            "existing files."
+            "File '/state/existing-async.txt' already exists. Use edit_file for a targeted change "
+            "or replace_file to replace its full content."
         )
         assert target.read_text(encoding="utf-8") == "original"
         assert backend.drain_denials() == []
@@ -1242,16 +1387,16 @@ class TestCreateOnlyWrites:
         async_result = await router.awrite(async_path, "changed")
 
         assert sync_result.error == (
-            f"File '{sync_path}' already exists. Use edit_file to modify existing files."
+            f"File '{sync_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
         assert async_result.error == (
-            f"File '{async_path}' already exists. Use edit_file to modify existing files."
+            f"File '{async_path}' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
         assert sync_result.error != (
-            "File '/sync.txt' already exists. Use edit_file to modify existing files."
+            "File '/sync.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
         assert async_result.error != (
-            "File '/async.txt' already exists. Use edit_file to modify existing files."
+            "File '/async.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
         assert (route / "sync.txt").read_text(encoding="utf-8") == "sync"
         assert (route / "async.txt").read_text(encoding="utf-8") == "async"
@@ -1504,7 +1649,7 @@ class TestCreateOnlyWrites:
     ) -> None:
         backend = WriteGuardBackend(home, ["state"])
         expected = (
-            "File '/state/race.txt' already exists. Use edit_file to modify existing files."
+            "File '/state/race.txt' already exists. Use edit_file for a targeted change or replace_file to replace its full content."
         )
 
         with ThreadPoolExecutor(max_workers=8) as pool:

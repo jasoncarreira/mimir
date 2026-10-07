@@ -95,14 +95,21 @@ _FILESYSTEM_TOOLS = [
     "read_file",
     "write_file",
     "edit_file",
+    "replace_file",
     "glob",
     "grep",
     "execute",
 ]
 _WRITE_FILE_DESCRIPTION = (
     "Creates a new file and writes the supplied content. It never overwrites an "
-    "existing path; when the target exists, use `edit_file` instead. Parent "
+    "existing path; when the target exists, use `edit_file` for a targeted change "
+    "or `replace_file` for its full content. Parent "
     "directories are created as needed."
+)
+_REPLACE_FILE_DESCRIPTION = (
+    "Atomically replaces the full content of an existing regular file, preserving its "
+    "permissions. Use `write_file` to create a missing file, or `edit_file` for a "
+    "targeted change. Symlinks and directories are refused."
 )
 _UNSUPPORTED_CREATE_ERROR = (
     "Write failed: descriptor-relative file creation is unsupported on this platform."
@@ -320,7 +327,87 @@ def _exclusive_write(
 
 
 def _collision_error(file_path: str) -> str:
-    return f"File '{file_path}' already exists. Use edit_file to modify existing files."
+    return (f"File '{file_path}' already exists. Use edit_file for a targeted change "
+            "or replace_file to replace its full content.")
+
+
+def _missing_replace_error(file_path: str) -> str:
+    return f"File '{file_path}' does not exist. Use write_file to create new files."
+
+
+def _atomic_replace(root: Path, file_path: str, content: str, max_bytes: int) -> WriteResult:
+    """Publish through an anchored parent; never open the destination for writing."""
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or _OS_OPEN not in os.supports_dir_fd or _OS_STAT not in os.supports_dir_fd
+            or os.stat not in os.supports_follow_symlinks
+            or os.rename not in os.supports_dir_fd):
+        return WriteResult(error=_UNSUPPORTED_CREATE_ERROR)
+    root_text = str(root).rstrip("/")
+    key = file_path
+    if key == root_text:
+        key = "/"
+    elif root_text and key.startswith(root_text + "/"):
+        key = "/" + key[len(root_text) + 1:]
+    if key.startswith("~"):
+        return WriteResult(error="Path traversal not allowed")
+    parts = PurePosixPath(key.lstrip("/")).parts
+    if not parts or any(part in {"..", "~"} for part in parts):
+        return WriteResult(error="Path traversal not allowed")
+    opened: list[int] = []
+    temporary: str | None = None
+    try:
+        opened.append(os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        for component in parts[:-1]:
+            opened.append(os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=opened[-1]))
+        parent = opened[-1]
+        try:
+            target_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            return WriteResult(error=_missing_replace_error(file_path))
+        try:
+            metadata = os.fstat(target_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                return WriteResult(error=f"File '{file_path}' is not a regular file.")
+        finally:
+            os.close(target_fd)
+        encoded = content.encode("utf-8")
+        if len(encoded) > max_bytes:
+            return WriteResult(error=f"File '{file_path}' exceeds size limit.")
+        temporary = f".mimir-{os.getpid()}-{os.urandom(8).hex()}.tmp"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     stat.S_IMODE(metadata.st_mode), dir_fd=parent)
+        try:
+            os.fchmod(fd, stat.S_IMODE(metadata.st_mode))
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        current = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(current.st_mode) or current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino):
+            return WriteResult(error=f"File '{file_path}' changed during replacement.")
+        os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
+        temporary = None
+        return WriteResult(path=file_path)
+    except FileNotFoundError:
+        return WriteResult(error=_missing_replace_error(file_path))
+    except (OSError, UnicodeEncodeError) as exc:
+        if isinstance(exc, OSError) and exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            return WriteResult(error=_UNSAFE_COMPONENT_ERROR)
+        return WriteResult(error=_write_failure_error(file_path, str(exc)))
+    finally:
+        if temporary is not None and opened:
+            try:
+                os.unlink(temporary, dir_fd=opened[-1])
+            except FileNotFoundError:
+                pass
+        for descriptor in reversed(opened):
+            os.close(descriptor)
 
 
 def _write_failure_error(file_path: str, detail: str) -> str:
@@ -366,9 +453,47 @@ class MimirFilesystemMiddleware(FilesystemMiddleware):
     def __init__(self, **kwargs: Any) -> None:
         descriptions = dict(kwargs.pop("custom_tool_descriptions", None) or {})
         descriptions["write_file"] = _WRITE_FILE_DESCRIPTION
+        descriptions["replace_file"] = _REPLACE_FILE_DESCRIPTION
         kwargs["custom_tool_descriptions"] = descriptions
-        kwargs["tools"] = list(_FILESYSTEM_TOOLS)
+        kwargs["tools"] = [name for name in _FILESYSTEM_TOOLS if name != "replace_file"]
         super().__init__(**kwargs)
+        self.tools.insert(4, self._create_replace_file_tool())
+
+    def _create_replace_file_tool(self) -> BaseTool:
+        from deepagents.middleware.filesystem import WriteFileSchema, _check_fs_permission, validate_path
+
+        def result(path: str, response: WriteResult, runtime: ToolRuntime) -> ToolMessage:
+            return ToolMessage(
+                content=response.error or f"Updated file {response.path}",
+                name="replace_file", tool_call_id=runtime.tool_call_id,
+                status="error" if response.error else "success",
+            )
+
+        def sync_replace(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+            try:
+                path = validate_path(file_path)
+            except ValueError as exc:
+                return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
+            if _check_fs_permission(self._permissions, "write", path) == "deny":
+                return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
+            return result(path, self.backend.replace(path, content), runtime)
+
+        async def async_replace(file_path: str, content: str, runtime: ToolRuntime) -> ToolMessage:
+            try:
+                path = validate_path(file_path)
+            except ValueError as exc:
+                return result(file_path, WriteResult(error=f"Error: {exc}"), runtime)
+            if _check_fs_permission(self._permissions, "write", path) == "deny":
+                return result(path, WriteResult(error=f"Error: permission denied for write on {path}"), runtime)
+            return result(path, await self.backend.areplace(path, content), runtime)
+
+        for wrapper in (sync_replace, async_replace):
+            wrapper.__annotations__["runtime"] = ToolRuntime
+        return StructuredTool.from_function(
+            name="replace_file", description=_REPLACE_FILE_DESCRIPTION,
+            func=sync_replace, coroutine=async_replace, infer_schema=False,
+            args_schema=WriteFileSchema,
+        )
 
     @staticmethod
     def _record_eviction(message: ToolMessage, evicted: bool) -> None:
@@ -1660,6 +1785,12 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
+    def replace(self, file_path: str, content: str) -> WriteResult:
+        return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes)
+
+    async def areplace(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content)
+
     def edit(
         self,
         file_path: str,
@@ -1835,7 +1966,8 @@ class WriteGuardBackend:
         self._denials.append(denial)
         from .tools.budget_gate import _emit_hard_boundary_denied
 
-        tool = "edit_file" if op.startswith("edit") else "write_file"
+        tool = ("edit_file" if op.startswith("edit") else
+                "replace_file" if op.startswith("replace") else "write_file")
         if op.startswith("upload"):
             tool = "upload_files"
         if "prompts_readonly" in op:
@@ -2066,6 +2198,27 @@ class WriteGuardBackend:
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
+    def replace(self, file_path: str, content: str) -> WriteResult:
+        if not self._is_write_allowed(file_path):
+            if self._is_prompts_path(file_path):
+                self._record_denial("replace_prompts_readonly", file_path)
+                return WriteResult(error=self._PROMPTS_DENY_REASON)
+            self._record_denial("replace", file_path)
+            return WriteResult(error=f"Write blocked. Writable directories: {self._allowed_dirs_label()}")
+        if self._is_core_memory_write_blocked(file_path):
+            self._record_denial("replace_core_memory_readonly", file_path)
+            return WriteResult(error=self._CORE_MEMORY_DENY_REASON)
+        if self._is_identities_write_blocked(file_path):
+            self._record_denial("replace_identities_protected", file_path)
+            return WriteResult(error=self._IDENTITIES_DENY_REASON)
+        canonical_path = self._canonicalize_path(file_path)
+        if not canonical_path.startswith("/"):
+            canonical_path = "/" + canonical_path
+        return self._fs.replace(canonical_path, content)
+
+    async def areplace(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content)
+
     def edit(
         self,
         file_path: str,
@@ -2180,6 +2333,18 @@ class ReadOnlyFilesystemBackend:
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return self.write(file_path=file_path, content=content)
 
+    def replace(self, file_path: str, content: str) -> WriteResult:
+        from .tools.budget_gate import _emit_hard_boundary_denied
+
+        _emit_hard_boundary_denied(
+            tool="replace_file", boundary="readonly_filesystem",
+            reason="write_readonly", target=self._resolved_target(file_path),
+        )
+        return WriteResult(error=f"Write blocked. '{file_path}' is read-only.")
+
+    async def areplace(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content)
+
     def edit(
         self,
         file_path: str,
@@ -2281,6 +2446,18 @@ class RetainedCheckoutFilesystemBackend(ReadOnlyFilesystemBackend):
     async def awrite(self, file_path: str, content: str) -> WriteResult:
         return await asyncio.to_thread(self.write, file_path, content)
 
+    def replace(self, file_path: str, content: str) -> WriteResult:
+        result = self._operate("replace_file", file_path, content=content)
+        if result.get("status") == "ok":
+            return WriteResult(path=file_path)
+        error = str(result.get("error") or "retained factory replace failed")
+        if error == "file does not exist":
+            error = _missing_replace_error(str(self._root / file_path.lstrip("/")))
+        return WriteResult(error=error)
+
+    async def areplace(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content)
+
     def edit(
         self, file_path: str, old_string: str, new_string: str, replace_all: bool = False,
     ) -> EditResult:
@@ -2354,6 +2531,16 @@ class FileToolRouter(CompositeBackend):
         if isinstance(result.error, _WriteFailure):
             return WriteResult(error=_write_failure_error(file_path, result.error))
         return result
+
+    def replace(self, file_path: str, content: str) -> WriteResult:
+        backend, backend_path = self._get_backend_and_key(file_path)
+        result = backend.replace(backend_path, content)
+        if result.path is not None:
+            result.path = file_path
+        return result
+
+    async def areplace(self, file_path: str, content: str) -> WriteResult:
+        return await asyncio.to_thread(self.replace, file_path, content)
 
     def grep(
         self,

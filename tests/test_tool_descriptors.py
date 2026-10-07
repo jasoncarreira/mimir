@@ -31,7 +31,7 @@ _OLD_SINK_CATEGORIES = {
     SinkCategory.SPAWN: {"spawn_open_code", "worklink_run", "worklink_resume"},
     SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
     SinkCategory.FILE: {
-        "write_file", "edit_file", "Write", "Edit", "download_files",
+        "write_file", "edit_file", "replace_file", "Write", "Edit", "download_files",
         "adownload_files", "rebuild_index", "request_mimir_update",
     },
     SinkCategory.SAGA: {
@@ -57,7 +57,7 @@ _OLD_SINK_CATEGORIES = {
 
 _OLD_SINK_DESTINATIONS = {
     "filesystem": {
-        "write_file", "edit_file", "rebuild_index", "request_mimir_update",
+        "write_file", "edit_file", "replace_file", "rebuild_index", "request_mimir_update",
         "download_files", "adownload_files", "Write", "Edit",
     },
     "shell_process": {
@@ -105,7 +105,7 @@ _OLD_NON_INGESTING = {
     "remove_schedule", "set_poller_overrides", "reload_pollers",
     "commitment_complete", "commitment_snooze", "commitment_dismiss",
     "request_mimir_update", "pr_rerequest_review", "unsupported_operation",
-    "repo_cleanup", "repo_stage", "write_todos", "write_file", "edit_file", "task",
+    "repo_cleanup", "repo_stage", "write_todos", "write_file", "edit_file", "replace_file", "task",
 }
 _OLD_REPOSITORY_RESULTS = {
     "pr_job_log", "ci_run_jobs", "pr_metadata", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
@@ -138,6 +138,7 @@ _OLD_SPECIAL_EXTRACTORS = {
     "fetch_channel_history": "_channel_target",
     "write_file": "_file_target",
     "edit_file": "_file_target",
+    "replace_file": "_file_target",
     "shell_exec": "_command_target",
     "bash_async": "_command_target",
     "spawn_open_code": "_spawn_target",

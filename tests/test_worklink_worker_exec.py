@@ -1760,6 +1760,45 @@ def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeyp
         worker_exec._run_factory_file_child({**write, "issue": 42})
 
 
+def test_factory_file_child_replace_requires_regular_existing_target(tmp_path: Path, monkeypatch) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    target = sandbox / "fix.py"
+    target.write_bytes(b"old\x00")
+    target.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+    request = {
+        "op": "replace_file", "issue": 41, "run_id": "chainlink-41",
+        "relative_path": ".factory-sandboxes/chainlink-41/fix.py",
+        "content": "new",
+    }
+    inode = target.stat().st_ino
+    assert worker_exec._run_factory_file_child(request)["status"] == "ok"
+    assert target.read_text() == "new"
+    assert target.stat().st_ino != inode
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    target.unlink()
+    assert worker_exec._run_factory_file_child(request)["error"] == "file does not exist"
+    assert not target.exists()
+    outside = tmp_path / "outside"
+    outside.write_text("untouched")
+    target.symlink_to(outside)
+    with pytest.raises(OSError):
+        worker_exec._run_factory_file_child(request)
+    assert outside.read_text() == "untouched"
+    target.unlink()
+    target.write_text("original")
+    original_replace = worker_exec.os.replace
+    monkeypatch.setattr(worker_exec.os, "replace", Mock(side_effect=OSError("injected rename failure")))
+    try:
+        with pytest.raises(OSError, match="injected rename failure"):
+            worker_exec._run_factory_file_child(request)
+    finally:
+        monkeypatch.setattr(worker_exec.os, "replace", original_replace)
+    assert target.read_text() == "original"
+    assert not list(sandbox.glob(".mimir-*.tmp"))
+
+
 def test_factory_file_child_refuses_symlink_escape(tmp_path: Path, monkeypatch) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()

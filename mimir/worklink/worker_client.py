@@ -270,7 +270,7 @@ class WorkerClient:
             raise ValueError("factory file operation requires a factory checkout")
         relative = PurePosixPath(relative_path)
         if (
-            operation not in {"write_file", "edit_file"}
+            operation not in {"write_file", "edit_file", "replace_file"}
             or relative.is_absolute()
             or not relative.parts
             or any(part in {"", ".", ".."} for part in relative.parts)
@@ -287,7 +287,7 @@ class WorkerClient:
             "run_id": run_id,
             "relative_path": relative.as_posix(),
         }
-        if operation == "write_file":
+        if operation in {"write_file", "replace_file"}:
             if not isinstance(content, str):
                 raise ValueError("factory write content is invalid")
             request["content"] = content

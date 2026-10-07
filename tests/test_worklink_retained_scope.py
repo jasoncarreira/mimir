@@ -422,7 +422,7 @@ def test_session_lock_reconciliation_fails_closed(
         _factory_session_lock_is_fresh(case.record)
 
 
-def test_retained_backend_dispatches_both_effects_under_lease(
+def test_retained_backend_dispatches_file_effects_under_lease(
     retained_incident, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     case = retained_incident
@@ -452,7 +452,8 @@ def test_retained_backend_dispatches_both_effects_under_lease(
     )
     assert backend.write(str(target), "new\n").error is None
     assert backend.edit(str(target), "new", "fixed").error is None
-    assert [call[0] for call in calls] == ["write_file", "edit_file"]
+    assert backend.replace(str(target), "whole new content").error is None
+    assert [call[0] for call in calls] == ["write_file", "edit_file", "replace_file"]
     assert all(call[1] == ".factory-sandboxes/chainlink-1810/fix.py" for call in calls)
 
 

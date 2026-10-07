@@ -230,6 +230,7 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "agrep": ToolFlowDirection.SOURCE,
     "write_file": ToolFlowDirection.SINK,
     "edit_file": ToolFlowDirection.SINK,
+    "replace_file": ToolFlowDirection.SINK,
     "download_files": ToolFlowDirection.BOTH,
     "adownload_files": ToolFlowDirection.BOTH,
     "write_todos": ToolFlowDirection.NEITHER,
@@ -390,6 +391,7 @@ class ServicePrincipal:
 TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "write_file": CapabilityTier.SCOPE_CONTAINED,
     "edit_file": CapabilityTier.SCOPE_CONTAINED,
+    "replace_file": CapabilityTier.SCOPE_CONTAINED,
     "rebuild_index": CapabilityTier.SCOPE_CONTAINED,
     "shell_exec": CapabilityTier.SCOPE_CONTAINED,
     "bash_async": CapabilityTier.SCOPE_CONTAINED,
@@ -499,7 +501,7 @@ _LEGACY_SERVICE_SINK_TIERS: dict[str, CapabilityTier] = {
 
 TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     "research": frozenset({
-        "write_file", "edit_file", "read_file", "aread", "ls", "als",
+        "write_file", "edit_file", "replace_file", "read_file", "aread", "ls", "als",
         "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
         "memory_propose",
         "saga_feedback", "saga_mark_contributions", "send_message",
@@ -508,7 +510,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "open_proposal", "submit_proposal", "abandon_proposal",
     }),
     "github": frozenset({
-        "worklink_run", "worklink_resume", "write_file", "edit_file", "shell_exec",
+        "worklink_run", "worklink_resume", "write_file", "edit_file", "replace_file", "shell_exec",
         "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
         "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
         "file_search", "get_turn", "mimir_get_turn", "send_message",
@@ -529,7 +531,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
     },
     "heartbeat": frozenset({
-        "write_file", "edit_file", "shell_exec", "bash_async",
+        "write_file", "edit_file", "replace_file", "shell_exec", "bash_async",
         "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
         "als", "glob", "aglob", "grep", "agrep", "file_search",
         "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
@@ -677,7 +679,7 @@ def build_trigger_service_principal(
         destination = descriptor.sink_destination if descriptor else None
         if destination:
             sink_destinations.add(destination)
-        if operation in {"write_file", "edit_file"}:
+        if operation in {"write_file", "edit_file", "replace_file"}:
             policies.append(ServiceSinkPolicy(
                 operation,
                 "trigger_service_write_roots",
@@ -7765,7 +7767,7 @@ class ChannelResourceAdapter:
 class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
-    _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file"})
+    _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file", "replace_file"})
     _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
@@ -8950,7 +8952,7 @@ class ToolRegistry:
 
         service = get_trusted_service_from_auth_context(auth_context)
         if tool_name in {
-            "read_file", "aread", "write_file", "edit_file",
+            "read_file", "aread", "write_file", "edit_file", "replace_file",
             "ls", "als", "glob", "aglob", "grep", "agrep",
         }:
             home = os.environ.get("MIMIR_HOME", "").strip()
@@ -9202,7 +9204,7 @@ class ToolRegistry:
                 )
                 if repo_review_state is not None:
                     repo_pr_action_scope = repo_review_state.action_scope
-            elif tool_name in {"write_file", "edit_file"}:
+            elif tool_name in {"write_file", "edit_file", "replace_file"}:
                 repo_review_state, repo_review_state_refusal = (
                     resolve_repository_review_state(
                         auth_context, path=target_channel,
@@ -10671,6 +10673,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "saga_forget",
                 "write_file",
                 "edit_file",
+                "replace_file",
                 "open_proposal",
                 "submit_proposal",
                 "abandon_proposal",
@@ -10715,6 +10718,10 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                     "edit_file", "static_service_write_roots",
                     "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
                 ),
+                ServiceSinkPolicy(
+                    "replace_file", "static_service_write_roots",
+                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
+                ),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
                 ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
                 ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
@@ -10753,6 +10760,7 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 "bash_job_output",
                 "write_file",
                 "edit_file",
+                "replace_file",
                 "open_proposal",
                 "submit_proposal",
                 "abandon_proposal",
@@ -10791,6 +10799,10 @@ _TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
                 ),
                 ServiceSinkPolicy(
                     "edit_file", "upgrade_proposals",
+                    "MIMIR_HOME/scratch/proposals",
+                ),
+                ServiceSinkPolicy(
+                    "replace_file", "upgrade_proposals",
                     "MIMIR_HOME/scratch/proposals",
                 ),
                 ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
