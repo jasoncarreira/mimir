@@ -322,6 +322,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "memory_propose": _D(SinkCategory.SAGA, _fixed_target("memory_proposals"), "memory_proposals", result_origin=_N, sink_payload_extractor=_argument_payload("content", "rationale")),
     "ntfy_send": _D(SinkCategory.NOTIFICATION, _generic_target, "notification", sink_payload_extractor=None),
     "open_proposal": _D(SinkCategory.PROPOSAL, _generic_target, "proposal", result_origin=_N),
+    "proposal_diff": _D(),
     "operator_alert": _D(SinkCategory.NOTIFICATION, _operator_alert_target, "notification", result_origin=_N, sink_payload_extractor=None),
     "post_message": _D(SinkCategory.CROSS_CHANNEL, _generic_target, "message", sink_payload_extractor=None),
     "pr_checks": _D(result_origin=_E | _R),

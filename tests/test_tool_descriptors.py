@@ -197,7 +197,10 @@ def test_descriptors_are_equivalent_to_all_pre_migration_policy_tables() -> None
         {"fetch_channel_history"},
     )
 
-    assert set(TOOL_DESCRIPTORS) == known_names
+    # The frozen inventory predates the server-side proposal diff read.
+    assert set(TOOL_DESCRIPTORS) == known_names | {"proposal_diff"}
+    assert TOOL_DESCRIPTORS["proposal_diff"].sink_category is None
+    assert TOOL_DESCRIPTORS["proposal_diff"].result_origin is ResultOriginKind.NONE
     for name in sorted(known_names):
         descriptor = TOOL_DESCRIPTORS[name]
         expected_origin = ResultOriginKind.NONE

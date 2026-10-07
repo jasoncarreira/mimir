@@ -29,8 +29,11 @@ import yaml
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException, tool
 
+from ..forge.github import _MAX_DIFF_FETCH_BYTES
 from ..models import AuthContext, PollerProposalState
 from ..proposals import (
+    PROPOSAL_SURFACES,
+    PROPOSALS_REL,
     PollerProposalScope,
     OpenResult,
     ProposalResult,
@@ -41,6 +44,7 @@ from ..proposals import (
     list_open_proposals,
     normalize_lane,
     open_proposal as _open_proposal,
+    _git,
 )
 from ..event_logger import log_event
 from .refusals import ToolPolicyRefusal
@@ -129,7 +133,7 @@ def _poller_context(
 def _run_poller(
     context: AuthContext, home: Path, operation: str, *,
     source: str = "", title: str = "", rationale: str = "",
-) -> OpenResult | ProposalResult | bool:
+) -> OpenResult | ProposalResult | bool | tuple[str, Path] | str:
     from .._context import get_current_turn
     from ..access_control import get_trusted_service_from_auth_context
 
@@ -185,6 +189,8 @@ def _run_poller(
                 state.active = True
             return result
         if state.active is not True or scope is None:
+            if operation == "proposal_diff":
+                return "proposal_diff: no `poller` proposal is open."
             raise ProposalSubmissionError(
                 f"{operation}: no `poller` proposal is open (no_open).", reason="no_open", lane="poller",
             )
@@ -192,6 +198,11 @@ def _run_poller(
         if expected.resolve() != expected:
             raise ToolPolicyRefusal("proposal rejected: worktree path changed")
         try:
+            if operation == "proposal_diff":
+                opens = list_open_proposals(home, lane="poller", poller=scope)
+                if not any(wt == expected for _, wt in opens):
+                    return "proposal_diff: no `poller` proposal is open."
+                return _staged_diff(expected, (scope.surface_root,)), expected
             if operation == "submit_proposal":
                 additions = []
                 if scope.surface == "social-outbox":
@@ -207,6 +218,76 @@ def _run_poller(
                 state.deactivate()
     finally:
         state._operation_lock.release()
+
+
+def _staged_diff(worktree: Path, surfaces: tuple[Path, ...]) -> str:
+    """Read only staged proposal surfaces using the timed git subprocess helper."""
+    result = _git(
+        ["-C", str(worktree), "diff", "--cached", "--no-ext-diff",
+         "--no-textconv", "--no-color", "--", *[s.as_posix() + "/" for s in surfaces]],
+        cwd=worktree,
+    )
+    if result.returncode != 0:
+        return "proposal_diff failed: staged diff unavailable."
+    data = (result.stdout or "").encode("utf-8", errors="surrogateescape")
+    if not data:
+        return "proposal_diff: no staged changes."
+    if len(data) <= _MAX_DIFF_FETCH_BYTES:
+        return result.stdout
+    marker = b"\n[proposal_diff truncated]\n"
+    return (data[:_MAX_DIFF_FETCH_BYTES - len(marker)].decode("utf-8", errors="ignore")
+            + marker.decode("ascii"))
+
+
+def _agent_diff(home: Path, lane: str) -> tuple[str, Path | None]:
+    # A fresh home has no proposal namespace; do not start git just to report
+    # the absence of an open proposal.
+    if not (home / PROPOSALS_REL).is_dir():
+        return f"proposal_diff: no `{lane}` proposal is open.", None
+    opens = list_open_proposals(home, lane=lane)
+    if not opens:
+        return f"proposal_diff: no `{lane}` proposal is open.", None
+    worktree = opens[0][1]
+    return _staged_diff(worktree, PROPOSAL_SURFACES), worktree
+
+
+@tool
+async def proposal_diff(
+    lane: str = "agent",
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> str:
+    """Read the bounded staged diff of your open proposal's protected surfaces.
+
+    The worktree is resolved server-side; there is no path argument. An upgrade
+    turn should pass ``lane='upgrade'``. Pollers read only their own active
+    proposal and cannot switch lanes.
+    """
+    context = _poller_context(runtime, lane, "proposal_diff")
+    if context is not None:
+        lane = "poller"
+    try:
+        lane = normalize_lane(lane)
+    except ValueError as exc:
+        return f"proposal_diff failed ({exc})"
+    home = _home()
+    if home is None:
+        return "proposal_diff failed: MIMIR_HOME not set — surface to the operator."
+    if context is not None:
+        response = await asyncio.to_thread(_run_poller, context, home, "proposal_diff")
+        if isinstance(response, str):
+            return response
+        text, worktree = response
+    else:
+        text, worktree = await asyncio.to_thread(_agent_diff, home, lane)
+    if worktree is not None:
+        from ..access_control import protected_result_source, publish_protected_result
+
+        publish_protected_result((protected_result_source(
+            runtime.context if isinstance(runtime, ToolRuntime) else None,
+            principal="filesystem", domain="filesystem",
+            resource_id=str(worktree.resolve()), bridge_instance="filesystem",
+        ),))
+    return text
 
 
 @tool
@@ -430,12 +511,13 @@ async def abandon_proposal(
     return f"abandon_proposal: nothing to abandon (no `{lane}` proposal open)."
 
 
-for _proposal_tool in (open_proposal, submit_proposal, abandon_proposal):
+for _proposal_tool in (open_proposal, proposal_diff, submit_proposal, abandon_proposal):
     _bind_injected_runtime(_proposal_tool)
 
 
 __all__ = (
     "open_proposal",
+    "proposal_diff",
     "submit_proposal",
     "ProposalSubmissionError",
     "abandon_proposal",

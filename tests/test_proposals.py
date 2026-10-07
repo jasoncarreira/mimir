@@ -9,14 +9,23 @@ so the home's per-turn ``git add -A`` never grabs it as an embedded repo, and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from langchain.tools import ToolRuntime
 
 import mimir
+from mimir.access_control import (
+    CapabilityTier, begin_protected_result_capture, end_protected_result_capture,
+    build_trigger_service_principal, create_auth_context,
+)
+from mimir.models import AgentEvent
+from mimir.tools import proposals as proposal_tools
 from mimir.proposals import (
     PollerProposalScope,
     poller_branch_name,
@@ -104,6 +113,168 @@ def _opener(calls: list[dict]):
         return "https://github.com/jasoncarreira/mimirbot/pull/1"
 
     return f
+
+
+def _read_diff(lane: str = "agent", runtime: ToolRuntime | None = None) -> str:
+    return asyncio.run(proposal_tools.proposal_diff.coroutine(lane=lane, runtime=runtime))
+
+
+def test_proposal_diff_staged_surfaces_only(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    opened = open_proposal(home)
+    assert opened.ok
+    wt = opened.worktree
+    (wt / "memory/core/40-learned-behaviors.md").write_text(SEED + "- changed\n")
+    (wt / "prompts/reflect.md").write_text("# new reflect\n")
+    (wt / "skills/x.md").parent.mkdir(exist_ok=True)
+    (wt / "skills/x.md").write_text("out of scope")
+    _git("add", "--sparse", "memory/core", "prompts", "skills/x.md", cwd=wt)
+    expected = _git("diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color",
+                    "--", "memory/core/", "prompts/", cwd=wt).stdout
+    assert expected and "changed" in expected and "new reflect" in expected
+    assert _read_diff() == expected
+    assert "out of scope" not in _read_diff()
+    # No model-controlled worktree path is exposed by the tool schema.
+    assert "path" not in proposal_tools.proposal_diff.args
+    with pytest.raises(TypeError):
+        asyncio.run(proposal_tools.proposal_diff.coroutine(path=str(home), lane="agent"))
+
+
+def test_proposal_diff_missing_and_empty(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mimir.proposals as core
+
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    original = core._git
+    calls: list[list[str]] = []
+
+    def spy(args, cwd):
+        calls.append(args)
+        return original(args, cwd)
+
+    monkeypatch.setattr(core, "_git", spy)
+    assert "no `agent` proposal is open" in _read_diff()
+    assert calls == []
+    opened = open_proposal(home)
+    assert opened.ok
+    assert "no staged changes" in _read_diff()
+
+
+def test_proposal_diff_disables_external_and_textconv(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    opened = open_proposal(home)
+    assert opened.ok
+    wt = opened.worktree
+    external = home.parent / "external-ran"
+    textconv = home.parent / "textconv-ran"
+    _git("config", "diff.external", f"touch {external}", cwd=wt)
+    _git("config", "diff.evil.textconv", f"touch {textconv}", cwd=wt)
+    (wt / ".gitattributes").write_text("memory/core/*.md diff=evil\n")
+    (wt / "memory/core/40-learned-behaviors.md").write_text(SEED + "- reviewed\n")
+    _git("add", "memory/core/40-learned-behaviors.md", cwd=wt)
+    assert "reviewed" in _read_diff()
+    assert not external.exists() and not textconv.exists()
+
+
+def test_proposal_diff_caps_utf8_bytes(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    opened = open_proposal(home)
+    assert opened.ok
+    wt = opened.worktree
+    (wt / "prompts/reflect.md").write_text("é" * 500)
+    _git("add", "prompts/reflect.md", cwd=wt)
+    monkeypatch.setattr(proposal_tools, "_MAX_DIFF_FETCH_BYTES", 256)
+    out = _read_diff()
+    assert out.endswith("[proposal_diff truncated]\n")
+    assert len(out.encode("utf-8")) <= 256
+
+
+def test_proposal_diff_runs_off_loop_with_worktree_provenance(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    opened = open_proposal(home)
+    assert opened.ok
+    (opened.worktree / "prompts/reflect.md").write_text("staged text\n")
+    _git("add", "prompts/reflect.md", cwd=opened.worktree)
+    original = proposal_tools._git
+    seen: list[list[str]] = []
+
+    def off_loop(args, cwd):
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        seen.append(args)
+        return original(args, cwd)
+
+    monkeypatch.setattr(proposal_tools, "_git", off_loop)
+
+    async def read():
+        token = begin_protected_result_capture()
+        try:
+            text = await proposal_tools.proposal_diff.coroutine()
+        finally:
+            provenance = end_protected_result_capture(token)
+        return text, provenance
+
+    text, provenance = asyncio.run(read())
+    assert "staged text" in text
+    assert seen and seen[0][:3] == ["-C", str(opened.worktree), "diff"]
+    assert provenance is not None and len(provenance.sources) == 1
+    source = provenance.sources[0]
+    assert source.domain == "filesystem"
+    assert source.resource_id == str(opened.worktree)
+    assert source.integrity == "untrusted"
+
+
+def test_proposal_diff_poller_is_bound_to_own_scope(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    wiki = home / "state/wiki/paper.md"
+    wiki.parent.mkdir(parents=True)
+    wiki.write_text("original\n")
+    _git("add", "state/wiki/paper.md", cwd=home)
+    _git("commit", "-qm", "seed wiki", cwd=home)
+    _git("push", "-q", "origin", "main", cwd=home)
+    other = open_proposal(home)
+    assert other.ok
+    (other.worktree / "prompts/reflect.md").write_text("other lane secret\n")
+    _git("add", "prompts/reflect.md", cwd=other.worktree)
+    service = build_trigger_service_principal(
+        canonical="poller:papers", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
+        capabilities=("open_proposal", "submit_proposal", "proposal_diff"),
+        roots=(home / "state/pollers/papers",), creation_path="test",
+    )
+    auth = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical, source="poller",
+        source_id="feed:item:42", service_principal=service.canonical,
+        service_authority=service,
+    ), enforce=True)
+    runtime = ToolRuntime(state={}, context=auth, config={}, stream_writer=lambda _: None,
+                          tool_call_id="proposal-diff", store=None)
+    assert "no `poller` proposal is open" in _read_diff(runtime=runtime)
+    scope = PollerProposalScope("poller:papers", "papers-turn", "paper:42", "feed:item:42")
+    opened = open_proposal(home, lane="poller", poller=scope)
+    assert opened.ok
+    state = auth.poller_proposal_state
+    state.scope, state.worktree, state.active = scope, opened.worktree, True
+    (opened.worktree / "state/wiki/paper.md").write_text("own paper\n")
+    _git("add", "state/wiki/paper.md", cwd=opened.worktree)
+    assert "own paper" in _read_diff(runtime=runtime)
+    assert "other lane secret" not in _read_diff(runtime=runtime)
+    state.active = False
+    assert "no `poller` proposal is open" in _read_diff(runtime=runtime)
+    state.active = True
+    with pytest.raises(Exception, match="cannot switch proposal lanes"):
+        _read_diff(lane="upgrade", runtime=runtime)
+    original = proposal_tools.list_open_proposals
+    monkeypatch.setattr(proposal_tools, "list_open_proposals", lambda *args, **kwargs: [
+        (other.branch, other.worktree),
+    ])
+    assert "no `poller` proposal is open" in _read_diff(runtime=runtime)
+    monkeypatch.setattr(proposal_tools, "list_open_proposals", original)
+    state.scope = replace(scope, owner="poller:other")
+    state.worktree = poller_worktree_path(home, state.scope)
+    with pytest.raises(Exception, match="ownership or worktree mismatch"):
+        _read_diff(runtime=runtime)
 
 
 @pytest.fixture

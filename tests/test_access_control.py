@@ -17105,6 +17105,13 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         decisions[OperationDecision.RESOURCE_SCOPED].add(name)
         readable[name] = "repository"
         protected[name] = "repository"
+    # New local proposal read: admin-cataloged like the proposal workflow,
+    # but an IFC source with the worktree's filesystem result provenance.
+    flows[access_control.ToolFlowDirection.SOURCE].add("proposal_diff")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("proposal_diff")
+    admin_catalog.add("proposal_diff")
+    readable["proposal_diff"] = "filesystem"
+    protected["proposal_diff"] = "filesystem"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}

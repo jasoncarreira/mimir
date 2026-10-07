@@ -104,6 +104,7 @@ from .repo import (
     repo_unmerged, repo_stage, repo_commit, repo_merge, repo_merge_abort,
     repo_rebase, repo_rebase_abort, repo_revert, repo_revert_abort, repo_push,
 )
+from .proposals import proposal_diff
 
 __all__ = [
     # Core tools (callable by the agent)
@@ -158,6 +159,7 @@ __all__ = [
     "pr_metadata",
     "pr_files",
     "pr_diff",
+    "proposal_diff",
     "pr_checks",
     "pr_job_log",
     "ci_run_jobs",

@@ -567,16 +567,16 @@ def test_upgrade_template_instructs_operator_notification() -> None:
     assert "channel_id" in text
 
 
-def test_upgrade_template_uses_admitted_single_argv_git_shape() -> None:
-    """Upgrade turns must not rediscover the denied ``cd worktree && git`` form."""
+def test_upgrade_template_uses_proposal_diff() -> None:
+    """Upgrade turns review the server-side staged diff without a shell command."""
     from pathlib import Path as _P
 
     import mimir
 
     tmpl = _P(mimir.__file__).parent / "prompt_templates" / "upgrade.md"
     text = tmpl.read_text(encoding="utf-8")
-    assert "git -C {worktree} diff --cached" in text
-    assert "do not express the working directory" in text.lower()
+    assert "proposal_diff(lane='upgrade')" in text
+    assert "git -C {worktree} diff --cached" not in text
 
 
 @pytest.mark.asyncio
