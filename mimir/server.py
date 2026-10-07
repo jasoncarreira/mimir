@@ -1852,6 +1852,15 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="scratch-janitor")
 
+        # Default-on Linux/glibc heap reclamation; empty cron disables it.
+        # Invalid cron must not prevent the rest of startup.
+        try:
+            scheduler.add_malloc_trim_job(
+                cron_expr=os.environ.get("MIMIR_MALLOC_TRIM_CRON", "*/5 * * * *"),
+            )
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="malloc-trim")
+
         # Resume Worklink runs orphaned by a restart (#561). After the #832
         # substrate cleanup local_subprocess is the only Worklink compute and
         # its runs die with the controller, so no run state is persisted today

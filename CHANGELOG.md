@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- `mimir run` now trims freed glibc heap off the event loop every five minutes
+  on supported Linux deployments. Set `MIMIR_MALLOC_TRIM_CRON=""` to disable or
+  supply another cron; only RSS drops of at least 16 MB emit an event (#1885).
+
 **Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
 inherit the agent's environment. Add any variable a shell workflow genuinely
 needs to `MIMIR_SHELL_PASS_ENV` (exact comma-separated names). Ad hoc `gh`,
