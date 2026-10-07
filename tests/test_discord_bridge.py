@@ -391,6 +391,40 @@ async def test_on_reaction_rejects_unvalidated_platform_user_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["add", "remove"])
+async def test_reaction_admission_exception_propagates_without_side_effects(
+    bridge_with_fake_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    bridge, _, _ = bridge_with_fake_client
+    error = RuntimeError("intake admission unavailable")
+    bridge.admit = MagicMock(side_effect=error)
+    bridge.identity_resolver = SimpleNamespace(identity=MagicMock())
+    channel = bridge._client._channels[1]
+    channel.fetch_message = AsyncMock(return_value=SimpleNamespace(
+        author=bridge._client.user, created_at=datetime.now(timezone.utc),
+    ))
+    bridge._client.get_channel = MagicMock(return_value=channel)
+    bridge._client.fetch_channel = AsyncMock(return_value=channel)
+    log_event = AsyncMock()
+    monkeypatch.setattr("mimir.event_logger.log_event", log_event)
+
+    with pytest.raises(RuntimeError, match="intake admission unavailable") as raised:
+        await bridge._on_reaction(SimpleNamespace(
+            user_id=22, channel_id=1, message_id=123, emoji="thumbsup",
+        ), action=action)
+
+    assert raised.value is error
+    bridge.admit.assert_called_once()
+    bridge._client.get_channel.assert_not_called()
+    bridge._client.fetch_channel.assert_not_awaited()
+    channel.fetch_message.assert_not_awaited()
+    bridge.identity_resolver.identity.assert_not_called()
+    log_event.assert_not_called()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("user_id", "open_bridge", "enforced", "admitted"),
     [

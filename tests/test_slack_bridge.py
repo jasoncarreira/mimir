@@ -577,6 +577,33 @@ async def test_on_reaction_rejects_unvalidated_platform_user_id(
 
 
 @pytest.mark.asyncio
+async def test_reaction_admission_exception_propagates_without_side_effects(
+    bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+    error = RuntimeError("intake admission unavailable")
+    bridge.admit = MagicMock(side_effect=error)
+    bridge.identity_resolver = SimpleNamespace(identity=MagicMock())
+    log_event = AsyncMock()
+    monkeypatch.setattr("mimir.event_logger.log_event", log_event)
+
+    with pytest.raises(RuntimeError, match="intake admission unavailable") as raised:
+        await bridge._on_reaction({
+            "type": "reaction_added", "user": "UOUTSIDER", "reaction": "thumbsup",
+            "item": {"type": "message", "channel": "C01ENG",
+                     "ts": "1714768925.000100", "bot_id": "BSELF123"},
+        })
+
+    assert raised.value is error
+    bridge.admit.assert_called_once()
+    bridge.identity_resolver.identity.assert_not_called()
+    log_event.assert_not_called()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("target_in_item", [False, True])
 async def test_unadmitted_reaction_on_non_bot_message_is_silent(
     bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
