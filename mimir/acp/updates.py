@@ -26,6 +26,7 @@ _TOOL_PRESENTATIONS = {
     "hands_read": ("read", "Read", "path"),
     "memory_get": ("read", "Read", "atom_ids"),
     "edit_file": ("edit", "Edit", "file_path"),
+    "replace_file": ("edit", "Edit", "file_path"),
     "write_file": ("edit", "Edit", "file_path"),
     "hands_edit": ("edit", "Edit", "path"),
     "glob": ("search", "Search", "pattern"),

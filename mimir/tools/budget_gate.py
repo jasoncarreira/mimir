@@ -158,7 +158,7 @@ _TYPED_ERROR_SIGNAL_TOOLS = frozenset({
 })
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review", "write_file", "edit_file", "worklink_resume",
+    "pr_rerequest_review", "write_file", "edit_file", "replace_file", "worklink_resume",
 })
 
 
@@ -532,7 +532,7 @@ class _DispatchScanPlan:
 def _outbox_write_payloads(
     tool_name: str, arguments: Mapping[str, Any],
 ) -> tuple[str, ...]:
-    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
+    if tool_name not in {"write_file", "edit_file", "replace_file", "multi_edit"}:
         return ()
     raw_path = arguments.get("file_path") or arguments.get("path")
     if not isinstance(raw_path, str):
@@ -544,7 +544,7 @@ def _outbox_write_payloads(
 
     if not is_outbox_path(target):
         return ()
-    if tool_name == "write_file":
+    if tool_name in {"write_file", "replace_file"}:
         value = arguments.get("content")
         return (value,) if isinstance(value, str) else ()
     if tool_name == "edit_file":
@@ -564,7 +564,7 @@ def _outbox_write_payloads(
 def _outbox_control_write(
     tool_name: str, arguments: Mapping[str, Any],
 ) -> bool:
-    if tool_name not in {"write_file", "edit_file", "multi_edit"}:
+    if tool_name not in {"write_file", "edit_file", "replace_file", "multi_edit"}:
         return False
     raw_path = arguments.get("file_path") or arguments.get("path")
     if not isinstance(raw_path, str):
@@ -1890,7 +1890,7 @@ def _request_with_resolved_service_write_path(
     auth_context: AuthContext | None,
 ) -> ToolCallRequest:
     """Bind a trigger-service file write to the path checked by authorization."""
-    if tool_name not in {"write_file", "edit_file"}:
+    if tool_name not in {"write_file", "edit_file", "replace_file"}:
         return request
     service = get_trusted_service_from_auth_context(auth_context)
     policy = service.sink_policy_for(tool_name) if service is not None else None

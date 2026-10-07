@@ -1760,6 +1760,114 @@ def test_factory_file_child_write_edit_and_escape_guards(tmp_path: Path, monkeyp
         worker_exec._run_factory_file_child({**write, "issue": 42})
 
 
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize("guard", ["fifo", "nlink", "uid", "size", "inode", "device", "changed_nlink"])
+def test_factory_replace_fail_closed_guards(tmp_path: Path, monkeypatch, guard: str) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    target = sandbox / "fix.py"
+    monkeypatch.chdir(tmp_path)
+    request = {
+        "op": "replace_file", "issue": 41, "run_id": "chainlink-41",
+        "relative_path": ".factory-sandboxes/chainlink-41/fix.py", "content": "new",
+    }
+    if guard == "fifo":
+        os.mkfifo(target)
+        real_open = os.open
+
+        def nonblocking_open(path, flags, *args, **kwargs):
+            if path == "fix.py":
+                assert flags & os.O_NONBLOCK
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", nonblocking_open)
+    else:
+        target.write_text("original")
+    if guard == "nlink":
+        (sandbox / "alias").hardlink_to(target)
+    elif guard == "uid":
+        real_fstat = os.fstat
+
+        def foreign_owner(fd):
+            observed = real_fstat(fd)
+            values = {name: getattr(observed, name) for name in ("st_mode", "st_nlink", "st_uid")}
+            values["st_uid"] = os.geteuid() + 1
+            return SimpleNamespace(**values)
+
+        monkeypatch.setattr(os, "fstat", foreign_owner)
+    elif guard == "size":
+        request["content"] = "é" * (4 * 1024 * 1024 + 1)
+    elif guard in {"inode", "device", "changed_nlink"}:
+        real_stat = os.stat
+
+        def changed_target(path, *args, **kwargs):
+            observed = real_stat(path, *args, **kwargs)
+            if path == "fix.py" and kwargs.get("dir_fd") is not None:
+                values = {name: getattr(observed, name) for name in ("st_mode", "st_ino", "st_dev", "st_nlink")}
+                values[{"inode": "st_ino", "device": "st_dev", "changed_nlink": "st_nlink"}[guard]] += 1
+                return SimpleNamespace(**values)
+            return observed
+
+        monkeypatch.setattr(os, "stat", changed_target)
+    error = ("size limit" if guard == "size" else "changed during operation"
+             if guard in {"inode", "device", "changed_nlink"} else "regular owned file")
+    with pytest.raises(RuntimeError, match=error):
+        worker_exec._run_factory_file_child(request)
+    assert not list(sandbox.glob(".mimir-*.tmp"))
+    if guard == "fifo":
+        assert stat.S_ISFIFO(target.stat().st_mode)
+    else:
+        assert target.read_text() == "original"
+
+
+def test_factory_replace_refuses_untransferred_checkout(factory_request, monkeypatch) -> None:
+    factory_request["op"] = "replace_file"
+    transfer = Mock(side_effect=AssertionError("untransferred replace reached ownership handoff"))
+    monkeypatch.setattr(worker_exec, "_normalize_checkout_fd", transfer)
+    with pytest.raises(RuntimeError, match="already transferred checkout"):
+        worker_exec._open_factory_checkout(factory_request)
+    transfer.assert_not_called()
+
+
+def test_factory_file_child_replace_requires_regular_existing_target(tmp_path: Path, monkeypatch) -> None:
+    sandbox = tmp_path / ".factory-sandboxes" / "chainlink-41"
+    sandbox.mkdir(parents=True)
+    target = sandbox / "fix.py"
+    target.write_bytes(b"old\x00")
+    target.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+    request = {
+        "op": "replace_file", "issue": 41, "run_id": "chainlink-41",
+        "relative_path": ".factory-sandboxes/chainlink-41/fix.py",
+        "content": "new",
+    }
+    inode = target.stat().st_ino
+    assert worker_exec._run_factory_file_child(request)["status"] == "ok"
+    assert target.read_text() == "new"
+    assert target.stat().st_ino != inode
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    target.unlink()
+    assert worker_exec._run_factory_file_child(request)["error"] == "file does not exist"
+    assert not target.exists()
+    outside = tmp_path / "outside"
+    outside.write_text("untouched")
+    target.symlink_to(outside)
+    with pytest.raises(OSError):
+        worker_exec._run_factory_file_child(request)
+    assert outside.read_text() == "untouched"
+    target.unlink()
+    target.write_text("original")
+    original_replace = worker_exec.os.replace
+    monkeypatch.setattr(worker_exec.os, "replace", Mock(side_effect=OSError("injected rename failure")))
+    try:
+        with pytest.raises(OSError, match="injected rename failure"):
+            worker_exec._run_factory_file_child(request)
+    finally:
+        monkeypatch.setattr(worker_exec.os, "replace", original_replace)
+    assert target.read_text() == "original"
+    assert not list(sandbox.glob(".mimir-*.tmp"))
+
+
 def test_factory_file_child_refuses_symlink_escape(tmp_path: Path, monkeypatch) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()

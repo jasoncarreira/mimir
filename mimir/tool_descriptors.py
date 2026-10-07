@@ -307,6 +307,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "defer_injected_message": _D(SinkCategory.SAGA, _injected_message_target, "injected_messages", result_origin=_N),
     "download_files": _D(SinkCategory.FILE, _generic_target, "filesystem"),
     "edit_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
+    "replace_file": _D(SinkCategory.FILE, _file_target, "filesystem", result_origin=_N),
     "execute": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "fetch_channel_history": _D(sink_target_extractor=_channel_target),
     "fetch_url": _D(SinkCategory.NETWORK, _url_target, "network", FetchAuthorizationKind.FETCH_URL, _N, sink_payload_extractor=_argument_payload("url")),

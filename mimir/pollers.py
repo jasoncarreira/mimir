@@ -1298,7 +1298,7 @@ def _parse_poller_authority(
         if not candidate.exists() or not candidate.is_dir():
             raise ValueError(f"scoped root does not exist: {root_name!r}")
         roots.append(candidate)
-    if {"write_file", "edit_file"} & set(capabilities) and not roots:
+    if {"write_file", "edit_file", "replace_file"} & set(capabilities) and not roots:
         raise ValueError("file capabilities require at least one scoped root")
 
     home_root = state_root.parent.parent if state_root is not None else None

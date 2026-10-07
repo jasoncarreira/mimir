@@ -418,7 +418,7 @@ def _open_factory_checkout(
         ):
             raise RuntimeError("factory checkout ownership or mode is invalid")
         if mode == 0o2700 and request.get("op") in {
-            "launch_factory_control", "write_file", "edit_file",
+            "launch_factory_control", "write_file", "edit_file", "replace_file",
         }:
             raise RuntimeError("factory control requires an already transferred checkout")
         # Keep contract guards platform-independent, but refuse unsupported
@@ -559,6 +559,39 @@ def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:
             except FileExistsError:
                 return {"status": "error", "error": "file already exists"}
             return {"status": "ok", "path": relative.as_posix()}
+        if operation == "replace_file":
+            content = request.get("content")
+            if not isinstance(content, str):
+                raise RuntimeError("factory replace content is invalid")
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=opened[-1])
+            except FileNotFoundError:
+                return {"status": "error", "error": "file does not exist"}
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.geteuid():
+                raise RuntimeError("factory replace target is not a regular owned file")
+            encoded = content.encode("utf-8")
+            if len(encoded) > 8 * 1024 * 1024:
+                raise RuntimeError("factory replace result exceeds size limit")
+            os.close(fd)
+            fd = -1
+            replacement_fd = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                stat.S_IMODE(metadata.st_mode), dir_fd=opened[-1],
+            )
+            try:
+                os.fchmod(replacement_fd, stat.S_IMODE(metadata.st_mode))
+                _write_all(replacement_fd, encoded)
+                os.fsync(replacement_fd)
+            finally:
+                os.close(replacement_fd)
+            current = os.stat(name, dir_fd=opened[-1], follow_symlinks=False)
+            if (not stat.S_ISREG(current.st_mode) or current.st_dev != metadata.st_dev
+                    or current.st_ino != metadata.st_ino or current.st_nlink != 1):
+                raise RuntimeError("factory replace target changed during operation")
+            os.replace(temporary, name, src_dir_fd=opened[-1], dst_dir_fd=opened[-1])
+            return {"status": "ok", "path": relative.as_posix()}
         old = request.get("old_string")
         new = request.get("new_string")
         replace_all = request.get("replace_all")
@@ -627,7 +660,7 @@ def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:
 def _handle_factory_file(
     connection: socket.socket, request: dict[str, Any], fds: list[int],
 ) -> None:
-    expected = _FACTORY_WRITE_FIELDS if request.get("op") == "write_file" else _FACTORY_EDIT_FIELDS
+    expected = _FACTORY_WRITE_FIELDS if request.get("op") in {"write_file", "replace_file"} else _FACTORY_EDIT_FIELDS
     if fds or set(request) != expected:
         raise RuntimeError("factory file request must carry the exact contract and no FDs")
     _validate_executor_identity(request)
@@ -1227,7 +1260,7 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_cancel(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)
-        elif request.get("op") in {"write_file", "edit_file"}:
+        elif request.get("op") in {"write_file", "edit_file", "replace_file"}:
             _handle_factory_file(connection, request, fds)
         else:
             raise RuntimeError("unsupported worker operation")

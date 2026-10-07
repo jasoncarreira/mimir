@@ -2366,6 +2366,7 @@ def test_deepagents_synthetic_inventory_uses_dispatchable_mimir_tools() -> None:
         "read_file",
         "write_file",
         "edit_file",
+        "replace_file",
         "glob",
         "grep",
         "execute",
@@ -6347,7 +6348,7 @@ def research_proposal_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         canonical="poller:research", trigger="poller", profile="research",
         tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
         capabilities=("open_proposal", "submit_proposal", "abandon_proposal",
-                      "write_file", "edit_file", "read_file"),
+                      "write_file", "edit_file", "replace_file", "read_file"),
         roots=(persist,), creation_path="mimir.pollers.run_poller",
     )
     scope = PollerProposalScope("poller:research", "turn-one", "paper", "https://example.org/paper")
@@ -6452,7 +6453,7 @@ def test_social_outbox_live_denied_to_all_principals(research_proposal_auth, tmp
             ).allowed
 
 
-@pytest.mark.parametrize("operation", ["write_file", "edit_file"])
+@pytest.mark.parametrize("operation", ["write_file", "edit_file", "replace_file"])
 def test_research_proposal_exact_write_grants(
     research_proposal_auth, tmp_path: Path, operation: str,
 ) -> None:
@@ -6501,6 +6502,22 @@ def test_research_proposal_exact_write_grants(
                     )
     finally:
         reset_current_turn(token)
+
+
+def test_replace_file_protected_path_guard_precedes_authorization(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    protected = Mock(return_value=True)
+    monkeypatch.setattr("mimir.memory_proposals.is_protected_model_path", protected)
+    target = tmp_path / "state" / "protected.md"
+    decision = ToolRegistry().authorize_tool(
+        "replace_file", _write_auth(admin=True), enforce=True,
+        target_channel=str(target),
+    )
+    assert decision.allowed is False
+    assert decision.reason == "protected_memory_proposal_path"
+    protected.assert_called_once_with(target)
 
 
 def test_research_proposal_write_refusal_names_actual_roots(
@@ -6678,8 +6695,9 @@ def test_research_proposal_read_roots_exclude_ordinary_turn_scratch(
         reset_current_turn(token)
 
 
+@pytest.mark.parametrize("operation", ["edit_file", "replace_file"])
 def test_research_proposal_resolver_binds_virtual_path_from_runtime(
-    research_proposal_auth, tmp_path: Path,
+    research_proposal_auth, tmp_path: Path, operation: str,
 ) -> None:
     from mimir.tools.budget_gate import _request_with_resolved_service_write_path
 
@@ -6687,10 +6705,10 @@ def test_research_proposal_resolver_binds_virtual_path_from_runtime(
     target = worktree / "state/wiki/paper.md"
     virtual = "/" + str(target.relative_to(tmp_path))
     request = SimpleNamespace(
-        tool_call={"name": "edit_file", "args": {"file_path": virtual}},
+        tool_call={"name": operation, "args": {"file_path": virtual}},
         override=lambda **changes: SimpleNamespace(**changes),
     )
-    resolved = _request_with_resolved_service_write_path(request, "edit_file", auth)
+    resolved = _request_with_resolved_service_write_path(request, operation, auth)
     assert resolved.tool_call["args"]["file_path"] == str(target)
     (worktree / ".git").write_text("gitdir: /operator/repo/.git/worktrees/research\n")
     assert not ToolRegistry().authorize_tool(
@@ -10491,7 +10509,7 @@ def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
     assert decision.reason == "repo_pr_write_not_granted"
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
 def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
     tool_name: str,
     tmp_path: Path,
@@ -10555,7 +10573,7 @@ def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
     assert escaped.allowed is False
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
 @pytest.mark.parametrize("enforce", [False, True])
 def test_file_writes_resolve_payload_and_server_discovered_leases(
     tool_name: str, enforce: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -16946,7 +16964,7 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
         SinkCategory.SHELL_PROCESS: {"shell_exec", "bash_async", "Bash", "bash", "bash_exec", "execute", "aexecute", "shell"},
         SinkCategory.SPAWN: {"spawn_open_code", "worklink_run", "worklink_resume"},
         SinkCategory.NOTIFICATION: {"operator_alert", "ntfy_send"},
-        SinkCategory.FILE: {"write_file", "edit_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
+        SinkCategory.FILE: {"write_file", "edit_file", "replace_file", "Write", "Edit", "download_files", "adownload_files", "rebuild_index", "request_mimir_update"},
         SinkCategory.SAGA: {"memory_store", "memory_propose", "saga_record_skill_learning", "saga_feedback", "saga_mark_contributions", "saga_forget", "saga_end_session", "commitment_complete", "commitment_snooze", "commitment_dismiss", "defer_injected_message"},
         SinkCategory.SCHEDULER: {"add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers"},
         SinkCategory.PROPOSAL: {"open_proposal", "submit_proposal", "abandon_proposal"},
@@ -17074,6 +17092,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         access_control.ToolFlowDirection.SINK: {"memory_store", "open_proposal", "submit_proposal", "abandon_proposal", "saga_feedback", "saga_mark_contributions", "saga_end_session", "saga_forget", "saga_record_skill_learning", "rebuild_index", "send_message", "operator_alert", "react", "defer_injected_message", "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides", "reload_pollers", "commitment_complete", "commitment_snooze", "commitment_dismiss", "request_mimir_update", "post_message", "webhook", "ntfy_send", "write_file", "edit_file", "Write", "Edit", "harness_auto_deliver", "harness_resend_nudge", "activity_panel_post", "activity_panel_edit", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "issue_comment", "pr_rerequest_review", "unsupported_operation", "repo_cleanup", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
     }
     flows[access_control.ToolFlowDirection.SINK].add("memory_propose")
+    flows[access_control.ToolFlowDirection.SINK].add("replace_file")
     decisions = {
         OperationDecision.OPEN: {"commitment_list", "memory_query", "memory_get", "web_search", "fetch_url", "write_todos", "defer_injected_message", "request_operator_approval", "commitment_complete", "commitment_snooze", "commitment_dismiss"},
         OperationDecision.RESOURCE_SCOPED: {"send_message", "react", "fetch_channel_history", "read_file", "aread", "ls", "als", "glob", "aglob", "grep", "agrep", "file_search", "get_turn", "mimir_get_turn", "write_file", "edit_file", "worklink_run", "worklink_resume", "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review", "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push"},
@@ -17097,6 +17116,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     admin_catalog.add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("memory_propose")
     decisions[OperationDecision.ADMIN_REQUIRED].add("clear_ingest_taint")
+    decisions[OperationDecision.RESOURCE_SCOPED].add("replace_file")
     protected_builtins = {
         "Bash", "bash", "bash_exec", "execute", "aexecute", "shell",
         "Write", "Edit", "Read", "Glob", "Grep", "download_files",
@@ -17130,6 +17150,7 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
         for name in names
     }
     destinations["memory_propose"] = "memory_proposals"
+    destinations["replace_file"] = "filesystem"
 
     for name in ("pr_job_log", "ci_run_jobs", "pr_file_content"):
         flows[access_control.ToolFlowDirection.SOURCE].add(name)
