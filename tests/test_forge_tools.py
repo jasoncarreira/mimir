@@ -45,6 +45,8 @@ from mimir.identities import IdentityResolver
 from mimir.tools.forge import (
     FORGE_TOOLS,
     ci_run_jobs,
+    ci_run,
+    ci_recent_runs,
     issue_comment,
     pr_checks,
     pr_job_log,
@@ -774,6 +776,14 @@ class FakeForge:
         self.calls.append(("run_jobs", repository, run_id))
         return [{"id": 1, "name": "test", "failed_steps": []}]
 
+    def get_run(self, repository, run_id):
+        self.calls.append(("run", repository, run_id))
+        return {"id": run_id, "name": "CI"}
+
+    def list_runs(self, repository, branch, workflow_id, limit):
+        self.calls.append(("runs", repository, branch, workflow_id, limit))
+        return [{"id": 42, "name": "CI"}]
+
     def list_reviews(self, scope):
         self.calls.append(("reviews", scope))
         return self.reviews
@@ -815,21 +825,22 @@ class FakeForge:
 
 def _ci_watch_context(
     *, poller="github-ci-watch", items=None, principal=None,
-    capabilities=("ci_run_jobs",), extra=None, event_ingress=None,
+    capabilities=("ci_run_jobs", "ci_run", "ci_recent_runs"), extra=None, event_ingress=None,
+    trigger="poller", source="poller",
 ):
     authority = access_control.build_trigger_service_principal(
         canonical=principal or f"poller:{poller}", trigger="poller", profile="github",
         tier=access_control.CapabilityTier.CODE_EXECUTION,
-        capabilities=("ci_run_jobs",), creation_path="mimir.pollers.run_poller",
+        capabilities=("ci_run_jobs", "ci_run", "ci_recent_runs"), creation_path="mimir.pollers.run_poller",
     )
     # Vary the capability alone: keep the repository-readable domain and every
     # other authority property intact so another guard cannot hide its removal.
     authority = replace(authority, capabilities=capabilities)
     return access_control.create_auth_context(AgentEvent(
-        trigger="poller", channel_id=f"poller:{poller}", source="poller",
+        trigger=trigger, channel_id=f"poller:{poller}", source=source,
         service_principal=authority.canonical, service_authority=authority,
         extra={"poller_name": poller, "items": items if items is not None else [
-            {"repo": "owner/repo", "run_id": 42, "event_type": "ci_failure"},
+            {"repo": "owner/repo", "run_id": 42, "branch": "main", "workflow_id": 7, "event_type": "ci_failure"},
         ], **(extra or {})},
     ), enforce=True, event_ingress=event_ingress, ifc_labels=InformationFlowLabels())
 
@@ -1017,6 +1028,258 @@ def test_ci_run_jobs_authorization_requires_exact_poller_selector(monkeypatch):
     ).allowed
 
 
+@pytest.mark.asyncio
+async def test_ci_reads_bound_selectors_and_limit(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    runtime = _ci_runtime(_ci_watch_context())
+    assert runtime.context.ci_branch_targets == frozenset({("owner/repo", "main", 7)})
+    assert (await ci_run.coroutine("OWNER/REPO", 42, runtime=runtime))["id"] == 42
+    for limit, expected in [(-1, 1), (100, 20), (10, 10)]:
+        assert await ci_recent_runs.coroutine("owner/repo", "main", 7, limit, runtime=runtime)
+        assert client.calls[-1] == ("runs", "owner/repo", "main", 7, expected)
+    assert await ci_recent_runs.coroutine("owner/repo", "main", runtime=runtime)
+    assert client.calls[-1] == ("runs", "owner/repo", "main", None, 10)
+    calls = list(client.calls)
+    for repo, run_id in [("owner/repo", 43), ("other/repo", 42), ("owner/repo", 0)]:
+        with pytest.raises(ToolException):
+            await ci_run.coroutine(repo, run_id, runtime=runtime)
+    for repo, branch, workflow in [
+        ("other/repo", "main", None), ("owner/repo", "dev", None),
+        ("owner/repo", "main", 8),
+    ]:
+        with pytest.raises(ToolException):
+            await ci_recent_runs.coroutine(repo, branch, workflow, runtime=runtime)
+    assert client.calls == calls
+
+
+@pytest.mark.asyncio
+async def test_ci_reads_reject_unconfigured_repo_even_if_selector_is_carried(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    context = replace(
+        _ci_watch_context(),
+        ci_run_targets=frozenset({("other/repo", 42)}),
+        ci_branch_targets=frozenset({("other/repo", "main", 7)}),
+    )
+    runtime = _ci_runtime(context)
+    with pytest.raises(ToolException, match="repository is not configured"):
+        await ci_run.coroutine("other/repo", 42, runtime=runtime)
+    with pytest.raises(ToolException, match="repository is not configured"):
+        await ci_recent_runs.coroutine("other/repo", "main", runtime=runtime)
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ci_reads_reject_configured_but_unbound_repo(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    client = FakeForge()
+    set_forge_client(client)
+    runtime = _ci_runtime(_ci_watch_context())
+    with pytest.raises(ToolException, match="outside this turn's poller scope"):
+        await ci_run.coroutine("other/repo", 42, runtime=runtime)
+    with pytest.raises(ToolException, match="outside this turn's poller scope"):
+        await ci_recent_runs.coroutine("other/repo", "main", runtime=runtime)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("change", [
+    pytest.param({"trigger": "scheduled_tick"}, id="trigger"),
+    pytest.param({"source": "user"}, id="source"),
+    pytest.param({"event_ingress": "http"}, id="event-ingress"),
+    pytest.param({"extra": {access_control.HTTP_EVENT_INGRESS_EXTRA_KEY: "http"}}, id="extra-ingress"),
+    pytest.param({"extra": {"poller_name": "github-activity"}}, id="poller-name"),
+    pytest.param({"principal": "poller:github-activity"}, id="principal"),
+    pytest.param({"capabilities": ()}, id="capability"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": 42, "branch": "main", "workflow_id": 7,
+                             "event_type": "pr_opened"}]}, id="event-type"),
+    pytest.param({"items": [{"repo": "other/repo", "run_id": 42, "branch": "main", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="configured-repo"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": "42", "branch": "main", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="non-integer-run"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": 42.0, "branch": "main", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="float-run"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": True, "branch": "main", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="boolean-run"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": 0, "branch": "main", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="non-positive-run"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": 42, "branch": 3, "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="non-string-branch"),
+    pytest.param({"items": [{"repo": "owner/repo", "run_id": 42, "branch": "", "workflow_id": 7,
+                             "event_type": "ci_failure"}]}, id="empty-branch"),
+])
+def test_ci_read_binding_fails_closed_one_condition_at_a_time(monkeypatch, change):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    baseline = _ci_watch_context()
+    assert baseline.ci_run_targets == frozenset({("owner/repo", 42)})
+    assert baseline.ci_branch_targets == frozenset({("owner/repo", "main", 7)})
+    context = _ci_watch_context(**change)
+    assert context.ci_run_targets == frozenset()
+    assert context.ci_branch_targets == frozenset()
+
+
+def test_ci_read_trigger_guard_independent_of_service_resolution(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    # Supply the same trusted principal for both events to isolate the local
+    # trigger guard from the preceding service-principal resolution gate.
+    monkeypatch.setattr(
+        access_control, "get_event_service_principal", lambda event: event.service_authority,
+    )
+    assert _ci_watch_context().ci_run_targets == frozenset({("owner/repo", 42)})
+    context = _ci_watch_context(trigger="scheduled_tick")
+    assert context.ci_run_targets == frozenset()
+    assert context.ci_branch_targets == frozenset()
+
+
+@pytest.mark.parametrize("workflow_id,expected", [
+    (None, None), (0, None), (-1, None), (True, None), ("7", None), (7, 7),
+])
+def test_ci_attention_binds_optional_workflow_id(monkeypatch, workflow_id, expected):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    item = {"repo": "owner/repo", "run_id": 42, "branch": "main", "event_type": "ci_attention"}
+    if workflow_id is not None:
+        item["workflow_id"] = workflow_id
+    context = _ci_watch_context(items=[item])
+    assert context.ci_run_targets == frozenset({("owner/repo", 42)})
+    assert context.ci_branch_targets == frozenset({("owner/repo", "main", expected)})
+    registry = access_control.get_tool_registry()
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={"repository": "owner/repo", "branch": "main"},
+    ).allowed
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={"repository": "owner/repo", "branch": "main", "workflow_id": 7},
+    ).allowed is (expected == 7)
+
+
+@pytest.mark.parametrize("name,args", [
+    ("ci_run", {"repository": "owner/repo", "run_id": 42}),
+    ("ci_recent_runs", {"repository": "owner/repo", "branch": "main", "workflow_id": 7}),
+])
+def test_ci_read_authorization_and_untrusted_result(monkeypatch, name, args):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    assert registry.authorize_tool(name, context, enforce=True, arguments=args).allowed
+    for selector in (
+        {**args, "repository": "other/repo"},
+        ({**args, "branch": "dev"} if name == "ci_recent_runs" else {**args, "run_id": 43}),
+        *([{**args, "workflow_id": 8}] if name == "ci_recent_runs" else []),
+    ):
+        auth = registry.authorize_tool(name, context, enforce=True, arguments=selector)
+        assert not auth.allowed and auth.reason == "ci_run_scope_denied"
+        assert auth.would_block
+    no_cap = replace(context, service_authority=replace(
+        context.service_authority,
+        capabilities=tuple(c for c in context.service_authority.capabilities if c != name),
+    ))
+    assert not registry.authorize_tool(name, no_cap, enforce=True, arguments=args).allowed
+    shadow = registry.authorize_tool(name, no_cap, enforce=False, arguments=args)
+    assert shadow.allowed and shadow.would_block and shadow.is_shadow_decision
+    authorization = registry.authorize_tool(name, context, enforce=True, arguments=args)
+    assert not context.ifc_labels.has_untrusted_active_ingest
+    clean = access_control.classify_protected_result(
+        "write_todos", {}, context, authorization, result="ok",
+    )
+    assert clean is None or not clean.has_untrusted_active_ingest
+    labels = access_control.classify_protected_result(
+        name, args, context, authorization, result={"id": 42},
+    )
+    assert labels.has_untrusted_active_ingest
+    expected = ("owner/repo#actions/run/42" if name == "ci_run"
+                else "owner/repo#actions/runs?branch=main&workflow=7")
+    assert [(s.integrity, s.resource_id) for s in labels.sources] == [("untrusted", expected)]
+    assert context.ifc_state.merge(labels, fallback=context.ifc_labels).has_untrusted_active_ingest
+
+
+def test_ci_recent_runs_authorization_rejects_configured_but_unbound_repo(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    args = {"repository": "owner/repo", "branch": "main"}
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Change only the repository; both are configured, so that guard cannot
+    # mask a missing repository match against the carried branch binding.
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={**args, "repository": "other/repo"},
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
+def test_ci_recent_runs_authorization_rejects_unconfigured_carried_branch(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    # Inject an exact branch binding to isolate the authorization-time
+    # configured-repository check from the ingress binding check.
+    context = replace(
+        _ci_watch_context(),
+        ci_branch_targets=frozenset({("other/repo", "main", 7)}),
+    )
+    args = {"repository": "other/repo", "branch": "main"}
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo,other/repo")
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Change only deployment configuration, keeping the exact binding intact.
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
+def test_ci_recent_runs_authorization_cannot_fall_back_to_bound_run(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    registry = access_control.get_tool_registry()
+    context = _ci_watch_context()
+    assert context.ci_run_targets == frozenset({("owner/repo", 42)})
+    args = {"repository": "owner/repo", "branch": "main", "run_id": 42}
+    assert registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    ).allowed
+    # Vary only branch. A stray, otherwise bound run_id cannot authorize a
+    # branch-scoped tool, even before tool-schema validation runs.
+    auth = registry.authorize_tool(
+        "ci_recent_runs", context, enforce=True,
+        arguments={**args, "branch": "dev"},
+    )
+    assert not auth.allowed
+    assert auth.would_block and auth.reason == "ci_run_scope_denied"
+
+
+def test_ci_recent_runs_none_workflow_uses_branch_label(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    context = _ci_watch_context()
+    args = {"repository": "owner/repo", "branch": "main"}
+    authorization = access_control.get_tool_registry().authorize_tool(
+        "ci_recent_runs", context, enforce=True, arguments=args,
+    )
+    assert authorization.allowed
+    labels = access_control.classify_protected_result(
+        "ci_recent_runs", args, context, authorization, result=[],
+    )
+    assert {s.resource_id for s in labels.sources} == {"owner/repo#actions/runs?branch=main"}
+
+
 @pytest.fixture(autouse=True)
 def _reset_client() -> None:
     set_forge_client(None)
@@ -1029,8 +1292,10 @@ def test_tool_surface_requires_exact_repository_and_resource_selectors() -> None
     for forge_tool in FORGE_TOOLS:
         properties = forge_tool.tool_call_schema.model_json_schema()["properties"]
         selectors = {"pull_request", "issue"} & set(properties)
-        if forge_tool.name == "ci_run_jobs":
+        if forge_tool.name in {"ci_run_jobs", "ci_run"}:
             selectors = {"run_id"} & set(properties)
+        if forge_tool.name == "ci_recent_runs":
+            selectors = {"branch"} & set(properties)
         assert "repository" in properties
         assert len(selectors) == (0 if forge_tool.name == "pr_list" else 1), forge_tool.name
         assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))

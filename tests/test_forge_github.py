@@ -64,6 +64,58 @@ class Session:
         return self.responses.pop(0)
 
 
+def test_ci_run_projects_only_bounded_metadata():
+    run = {
+        "id": 42, "name": "C" * 300, "display_title": "D" * 300,
+        "status": "completed", "conclusion": "failure", "event": "push",
+        "head_branch": "branch" * 40, "head_sha": "a" * 40,
+        "run_attempt": 2, "workflow_id": 7,
+        "created_at": "created", "updated_at": "updated", "run_started_at": "started",
+        "html_url": "private", "url": "private", "jobs_url": "private",
+        "logs_url": "private", "actor": {"login": "private"},
+        "pull_requests": [{"title": "private"}], "repository": {"name": "private"},
+    }
+    session = Session([Response(run)])
+    result = GitHubForgeClient(token="secret", session=session).get_run("owner/repo", 42)
+    assert result == {
+        "id": 42, "name": "C" * 200, "display_title": "D" * 200,
+        "status": "completed", "conclusion": "failure", "event": "push",
+        "head_branch": ("branch" * 40)[:200], "head_sha": "a" * 40,
+        "run_attempt": 2, "workflow_id": 7,
+        "created_at": "created", "updated_at": "updated", "run_started_at": "started",
+    }
+    assert not {"html_url", "url", "jobs_url", "logs_url", "actor", "pull_requests", "repository"} & result.keys()
+    assert session.calls[0][1] == "https://api.github.com/repos/owner/repo/actions/runs/42"
+
+
+@pytest.mark.parametrize("workflow_id,limit,endpoint", [
+    (7, 1, "workflows/7/runs"), (None, 20, "runs"),
+])
+def test_ci_recent_runs_paginates_encoded_bound_branch(workflow_id, limit, endpoint):
+    run = {"id": 42, "name": "CI", "html_url": "private"}
+    session = Session([Response({"workflow_runs": [run] * 50}),
+                       Response({"workflow_runs": [run] * 50})])
+    result = GitHubForgeClient(token="secret", session=session).list_runs(
+        "owner/repo", "release/hot fix", workflow_id, limit,
+    )
+    assert len(result) == limit
+    assert all(item["id"] == 42 and "html_url" not in item for item in result)
+    assert len(session.calls) == 1
+    assert session.calls[0][1] == (
+        f"https://api.github.com/repos/owner/repo/actions/{endpoint}"
+        "?branch=release%2Fhot%20fix&per_page=50&page=1"
+    )
+
+
+@pytest.mark.parametrize("limit", [0, 21])
+def test_ci_recent_runs_client_rejects_out_of_bounds_limit(limit):
+    session = Session([Response({"workflow_runs": []})])
+    client = GitHubForgeClient(token="secret", session=session)
+    with pytest.raises(ForgeError, match="invalid workflow runs selector"):
+        client.list_runs("owner/repo", "main", None, limit)
+    assert session.calls == []
+
+
 def _file_responses(path: str, head: str = "a" * 40) -> list[Response]:
     parts = path.split("/")
     responses = [

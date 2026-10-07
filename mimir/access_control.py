@@ -267,6 +267,8 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "pr_checks": ToolFlowDirection.SOURCE,
     "pr_job_log": ToolFlowDirection.SOURCE,
     "ci_run_jobs": ToolFlowDirection.SOURCE,
+    "ci_run": ToolFlowDirection.SOURCE,
+    "ci_recent_runs": ToolFlowDirection.SOURCE,
     "pr_reviews": ToolFlowDirection.SOURCE,
     "pr_comments": ToolFlowDirection.SOURCE,
     "pr_review_requests": ToolFlowDirection.SOURCE,
@@ -441,6 +443,8 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "pr_checks": CapabilityTier.SCOPE_CONTAINED,
     "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
     "ci_run_jobs": CapabilityTier.SCOPE_CONTAINED,
+    "ci_run": CapabilityTier.SCOPE_CONTAINED,
+    "ci_recent_runs": CapabilityTier.SCOPE_CONTAINED,
     "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
     "pr_comments": CapabilityTier.SCOPE_CONTAINED,
     "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
@@ -523,7 +527,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "pr_metadata", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs",
+        "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
         "issue_comment",
         "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
         "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
@@ -7971,7 +7975,7 @@ class OperationCatalog:
         READ_RESOURCE_OPERATIONS
         | WriteResourceAdapter._RESOURCE_OPERATIONS
         | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
-        | frozenset({"hands_read", "ci_run_jobs"})
+        | frozenset({"hands_read", "ci_run_jobs", "ci_run", "ci_recent_runs"})
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
@@ -9400,18 +9404,32 @@ class ToolRegistry:
                     sink_target = resource
                     requested_target = (arguments or {}).get("path")
                 return finish(hands_auth)
-            if tool_name == "ci_run_jobs":
+            if tool_name in {"ci_run_jobs", "ci_run", "ci_recent_runs"}:
                 args = arguments or {}
                 repo, run_id = args.get("repository"), args.get("run_id")
-                in_scope = (
+                run_scope = (
                     isinstance(repo, str)
                     and type(run_id) is int and run_id > 0
                     and is_configured_github_repo(repo)
                     and (repo.lower(), run_id) in getattr(
                         auth_context, "ci_run_targets", frozenset(),
                     )
+                )
+                branch, workflow_id = args.get("branch"), args.get("workflow_id")
+                branch_scope = (
+                    isinstance(repo, str) and is_configured_github_repo(repo)
+                    and isinstance(branch, str) and bool(branch)
+                    and (workflow_id is None or (type(workflow_id) is int and workflow_id > 0))
+                    and any(
+                        r == repo.lower() and b == branch
+                        and (workflow_id is None or workflow_id == w)
+                        for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset())
+                    )
+                )
+                in_scope = (
+                    (branch_scope if tool_name == "ci_recent_runs" else run_scope)
                     and service_principal is not None
-                    and service_principal.has_capability("ci_run_jobs")
+                    and service_principal.has_capability(tool_name)
                 )
                 return finish(ToolAuthorization(
                     tool_name=tool_name,
@@ -9643,6 +9661,8 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "pr_checks": "repository",
     "pr_job_log": "repository",
     "ci_run_jobs": "repository",
+    "ci_run": "repository",
+    "ci_recent_runs": "repository",
     "pr_reviews": "repository",
     "pr_comments": "repository",
     "pr_review_requests": "repository",
@@ -9687,6 +9707,8 @@ _ACP_HANDS_RESULT_TOOLS = frozenset({
 _READ_BACKEND_RESULT_TOOLS = frozenset({
     "pr_job_log",
     "ci_run_jobs",
+    "ci_run",
+    "ci_recent_runs",
     "Read",
     "Glob",
     "Grep",
@@ -10335,13 +10357,23 @@ def classify_protected_result(
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     descriptor = get_tool_descriptor(tool_name)
-    if tool_name == "ci_run_jobs":
+    if tool_name in {"ci_run_jobs", "ci_run", "ci_recent_runs"}:
         repo, run_id = args.get("repository"), args.get("run_id")
-        if (
-            not isinstance(repo, str)
-            or type(run_id) is not int
-            or (repo.lower(), run_id) not in getattr(auth_context, "ci_run_targets", frozenset())
-        ):
+        branch, workflow_id = args.get("branch"), args.get("workflow_id")
+        valid_run = (
+            isinstance(repo, str) and type(run_id) is int
+            and (repo.lower(), run_id) in getattr(auth_context, "ci_run_targets", frozenset())
+        )
+        valid_branch = (
+            isinstance(repo, str) and isinstance(branch, str) and bool(branch)
+            and (workflow_id is None or type(workflow_id) is int)
+            and any(
+                r == repo.lower() and b == branch
+                and (workflow_id is None or workflow_id == w)
+                for r, b, w in getattr(auth_context, "ci_branch_targets", frozenset())
+            )
+        )
+        if not (valid_branch if tool_name == "ci_recent_runs" else valid_run):
             return _incomplete_protected_result(
                 "repository", args, tool_name=tool_name, auth_context=auth_context,
             )
@@ -10352,7 +10384,13 @@ def classify_protected_result(
             auth_context,
             principal=principal,
             domain="repository",
-            resource_id=f"{repo.lower()}#actions/run/{run_id}/jobs",
+            resource_id=(
+                f"{repo.lower()}#actions/runs?branch={branch}"
+                + (f"&workflow={workflow_id}" if workflow_id is not None else "")
+                if tool_name == "ci_recent_runs" else
+                f"{repo.lower()}#actions/run/{run_id}"
+                + ("/jobs" if tool_name == "ci_run_jobs" else "")
+            ),
             bridge_instance="forge",
         ))
         channel = getattr(auth_context, "channel_id", None)
@@ -10855,6 +10893,8 @@ _OPERATION_READABLE_DOMAIN: dict[str, str] = {
     "memory_query": "saga",
     "memory_get": "saga",
     "ci_run_jobs": "repository",
+    "ci_run": "repository",
+    "ci_recent_runs": "repository",
     "hands_read": "client_provider",
     "hands_python": "client_provider",
     **{
@@ -11669,6 +11709,7 @@ def create_auth_context(
     )
 
     ci_run_targets: frozenset[tuple[str, int]] = frozenset()
+    ci_branch_targets: frozenset[tuple[str, str, int | None]] = frozenset()
     if (
         event.trigger == "poller"
         and event.source == "poller"
@@ -11677,12 +11718,14 @@ def create_auth_context(
         and extra.get("poller_name") == "github-ci-watch"
         and registered_service is not None
         and event.service_principal == registered_service.canonical == "poller:github-ci-watch"
-        and registered_service.has_capability("ci_run_jobs")
+        and any(registered_service.has_capability(name) for name in (
+            "ci_run_jobs", "ci_run", "ci_recent_runs",
+        ))
     ):
         items = extra.get("items")
         if isinstance(items, list):
-            ci_run_targets = frozenset(
-                (item["repo"].lower(), item["run_id"])
+            valid_items = [
+                item
                 for item in items
                 if isinstance(item, dict)
                 and item.get("event_type") in {"ci_failure", "ci_attention"}
@@ -11690,6 +11733,19 @@ def create_auth_context(
                 and is_configured_github_repo(item["repo"])
                 and type(item.get("run_id")) is int
                 and item["run_id"] > 0
+                and isinstance(item.get("branch"), str)
+                and bool(item["branch"])
+            ]
+            ci_run_targets = frozenset(
+                (item["repo"].lower(), item["run_id"]) for item in valid_items
+            )
+            ci_branch_targets = frozenset(
+                (
+                    item["repo"].lower(), item["branch"],
+                    item.get("workflow_id") if type(item.get("workflow_id")) is int
+                    and item["workflow_id"] > 0 else None,
+                )
+                for item in valid_items
             )
 
     return AuthContext(
@@ -11707,6 +11763,7 @@ def create_auth_context(
         repo_review_state=single_state,
         repo_pr_action_scope=action_scope,
         ci_run_targets=ci_run_targets,
+        ci_branch_targets=ci_branch_targets,
         retained_factory_scope=retained_resolution.scope,
         retained_factory_scope_refusal=retained_resolution.refusal_reason,
         enforcement_enabled=enforce,
