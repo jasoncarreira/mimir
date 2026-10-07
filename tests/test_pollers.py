@@ -431,6 +431,17 @@ def test_research_proposal_manifest_caps_are_provenance_scoped(tmp_path: Path, o
             _parse_poller_authority({**authority, **change}, **arguments)
 
 
+def test_replace_file_manifest_requires_scoped_root(tmp_path: Path) -> None:
+    persist = tmp_path / "state/pollers/demo"
+    persist.mkdir(parents=True)
+    with pytest.raises(ValueError, match="file capabilities require at least one scoped root"):
+        _parse_poller_authority(
+            _authority(capabilities=["replace_file"], scoped_roots=[]),
+            name="demo", persist_dir=persist, state_root=persist.parent,
+            manifest_path=tmp_path / "skills/demo/pollers.json",
+        )
+
+
 def test_state_authority_rejects_persist_dir_outside_state_root(tmp_path: Path) -> None:
     state_root = tmp_path / "state" / "pollers"
     outside = tmp_path / "outside"

@@ -269,9 +269,9 @@ async def test_real_graph_surface_and_unknown_tool_listing(kind, asynchronous):
         else:
             assert f"Available tools: {', '.join(expected)}." in prompt
             unavailable = (
-                "bash_exec, execute." if kind == "code_execution" else
+                "bash_exec, execute, replace_file." if kind == "code_execution" else
                 "shell_exec, bash_exec, bash_async, bash_jobs_list, bash_job_output, "
-                "execute, write_file, edit_file, send_message."
+                "execute, write_file, edit_file, replace_file, send_message."
             )
             assert f"Unavailable common shell/background/file-write/reply tools: {unavailable}" in prompt
             # Providers may flatten text blocks with no inserted separator.

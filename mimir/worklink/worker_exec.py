@@ -564,7 +564,8 @@ def _run_factory_file_child(request: dict[str, Any]) -> dict[str, object]:
             if not isinstance(content, str):
                 raise RuntimeError("factory replace content is invalid")
             try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=opened[-1])
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=opened[-1])
             except FileNotFoundError:
                 return {"status": "error", "error": "file does not exist"}
             metadata = os.fstat(fd)

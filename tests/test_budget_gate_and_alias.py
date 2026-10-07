@@ -78,6 +78,23 @@ from tests.auth_helpers import attach_middleware_auth_context
 pytestmark = pytest.mark.usefixtures("middleware_event_logger")
 
 
+def test_replace_file_outbox_payload_control_and_effect_inventory(tmp_path, monkeypatch):
+    from mimir.tools import budget_gate
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    payload = {"file_path": str(tmp_path / "state/pollers/social-cli-feed/outbox.yaml"),
+               "content": "private payload"}
+    assert budget_gate._outbox_write_payloads("replace_file", payload) == ("private payload",)
+    assert budget_gate._outbox_control_write("replace_file", {
+        "file_path": str(tmp_path / "state/pollers/social-cli-feed/config.yaml"),
+        "content": "outbox: changed",
+    }) is True
+    ordinary = {"file_path": str(tmp_path / "state/wiki/public.md"), "content": "public"}
+    assert budget_gate._outbox_write_payloads("replace_file", ordinary) == ()
+    assert budget_gate._outbox_control_write("replace_file", ordinary) is False
+    assert "replace_file" in budget_gate._REMEDIATION_EFFECT_TOOLS
+
+
 def _make_ctx(budget: int = 5) -> TurnContext:
     return attach_middleware_auth_context(TurnContext(
         turn_id="t-budget",

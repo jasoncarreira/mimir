@@ -90,7 +90,7 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
         names = [_tool_name(tool) for tool in tools]
         common = (
             "shell_exec", "bash_exec", "bash_async", "bash_jobs_list",
-            "bash_job_output", "execute", "write_file", "edit_file", "send_message",
+            "bash_job_output", "execute", "write_file", "edit_file", "replace_file", "send_message",
         )
         unavailable = [name for name in common if name not in names]
         note = (

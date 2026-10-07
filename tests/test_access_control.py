@@ -6317,7 +6317,7 @@ def research_proposal_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         canonical="poller:research", trigger="poller", profile="research",
         tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
         capabilities=("open_proposal", "submit_proposal", "abandon_proposal",
-                      "write_file", "edit_file", "read_file"),
+                      "write_file", "edit_file", "replace_file", "read_file"),
         roots=(persist,), creation_path="mimir.pollers.run_poller",
     )
     scope = PollerProposalScope("poller:research", "turn-one", "paper", "https://example.org/paper")
@@ -6422,7 +6422,7 @@ def test_social_outbox_live_denied_to_all_principals(research_proposal_auth, tmp
             ).allowed
 
 
-@pytest.mark.parametrize("operation", ["write_file", "edit_file"])
+@pytest.mark.parametrize("operation", ["write_file", "edit_file", "replace_file"])
 def test_research_proposal_exact_write_grants(
     research_proposal_auth, tmp_path: Path, operation: str,
 ) -> None:
@@ -6471,6 +6471,22 @@ def test_research_proposal_exact_write_grants(
                     )
     finally:
         reset_current_turn(token)
+
+
+def test_replace_file_protected_path_guard_precedes_authorization(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    protected = Mock(return_value=True)
+    monkeypatch.setattr("mimir.memory_proposals.is_protected_model_path", protected)
+    target = tmp_path / "state" / "protected.md"
+    decision = ToolRegistry().authorize_tool(
+        "replace_file", _write_auth(admin=True), enforce=True,
+        target_channel=str(target),
+    )
+    assert decision.allowed is False
+    assert decision.reason == "protected_memory_proposal_path"
+    protected.assert_called_once_with(target)
 
 
 def test_research_proposal_write_refusal_names_actual_roots(
@@ -6648,8 +6664,9 @@ def test_research_proposal_read_roots_exclude_ordinary_turn_scratch(
         reset_current_turn(token)
 
 
+@pytest.mark.parametrize("operation", ["edit_file", "replace_file"])
 def test_research_proposal_resolver_binds_virtual_path_from_runtime(
-    research_proposal_auth, tmp_path: Path,
+    research_proposal_auth, tmp_path: Path, operation: str,
 ) -> None:
     from mimir.tools.budget_gate import _request_with_resolved_service_write_path
 
@@ -6657,10 +6674,10 @@ def test_research_proposal_resolver_binds_virtual_path_from_runtime(
     target = worktree / "state/wiki/paper.md"
     virtual = "/" + str(target.relative_to(tmp_path))
     request = SimpleNamespace(
-        tool_call={"name": "edit_file", "args": {"file_path": virtual}},
+        tool_call={"name": operation, "args": {"file_path": virtual}},
         override=lambda **changes: SimpleNamespace(**changes),
     )
-    resolved = _request_with_resolved_service_write_path(request, "edit_file", auth)
+    resolved = _request_with_resolved_service_write_path(request, operation, auth)
     assert resolved.tool_call["args"]["file_path"] == str(target)
     (worktree / ".git").write_text("gitdir: /operator/repo/.git/worktrees/research\n")
     assert not ToolRegistry().authorize_tool(
@@ -10461,7 +10478,7 @@ def test_heartbeat_maintenance_file_sink_requires_the_scope_write_grant(
     assert decision.reason == "repo_pr_write_not_granted"
 
 
-@pytest.mark.parametrize("tool_name", ["write_file", "edit_file"])
+@pytest.mark.parametrize("tool_name", ["write_file", "edit_file", "replace_file"])
 def test_github_remediation_file_sink_is_confined_to_exact_active_lease(
     tool_name: str,
     tmp_path: Path,

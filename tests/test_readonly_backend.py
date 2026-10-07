@@ -1174,6 +1174,66 @@ def test_replace_file_existing_missing_and_async(home: Path) -> None:
     assert not missing.exists()
 
 
+@pytest.mark.timeout(5)
+def test_replace_file_refuses_fifo_without_blocking(home: Path, monkeypatch) -> None:
+    import stat
+    import mimir.readonly_backend as filesystem
+
+    target = home / "state" / "pipe"
+    os.mkfifo(target)
+    real_open = os.open
+
+    def checked_open(path, flags, *args, **kwargs):
+        if path == "pipe":
+            # A missing flag fails promptly rather than hanging the test worker.
+            assert flags & os.O_NONBLOCK
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(filesystem.os, "open", checked_open)
+    result = filesystem._atomic_replace(home, "/state/pipe", "new", 32)
+    assert "not a regular file" in result.error
+    assert stat.S_ISFIFO(target.stat().st_mode)
+    assert not list(target.parent.glob(".mimir-*.tmp"))
+
+
+def test_replace_file_enforces_utf8_byte_cap(home: Path) -> None:
+    from mimir.readonly_backend import _atomic_replace
+
+    target = home / "state" / "today.md"
+    target.write_text("original")
+    assert "size limit" in _atomic_replace(home, "/state/today.md", "éé", 3).error
+    assert target.read_text() == "original"
+    assert not list(target.parent.glob(".mimir-*.tmp"))
+    assert _atomic_replace(home, "/state/today.md", "é", 2).error is None
+
+
+@pytest.mark.parametrize("field", ["st_ino", "st_dev"])
+def test_replace_file_rechecks_target_identity(home: Path, monkeypatch, field: str) -> None:
+    from types import SimpleNamespace
+    import mimir.readonly_backend as filesystem
+
+    target = home / "state" / "today.md"
+    target.write_text("original")
+    metadata = target.stat()
+    real_stat = os.stat
+
+    def changed_stat(path, *args, **kwargs):
+        if path == "today.md" and kwargs.get("dir_fd") is not None:
+            values = {name: getattr(metadata, name) for name in ("st_mode", "st_dev", "st_ino")}
+            values[field] += 1
+            return SimpleNamespace(**values)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(filesystem.os, "stat", changed_stat)
+    monkeypatch.setattr(filesystem, "_OS_STAT", changed_stat)
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {changed_stat})
+    monkeypatch.setattr(os, "supports_follow_symlinks", os.supports_follow_symlinks | {changed_stat})
+    result = filesystem._atomic_replace(home, "/state/today.md", "new", 32)
+    assert "changed during replacement" in result.error
+    assert target.read_text() == "original"
+    assert not list(target.parent.glob(".mimir-*.tmp"))
+
+
 def test_replace_file_refuses_symlink_to_writable_regular_file(home: Path) -> None:
     target = home / "state" / "real.md"
     target.write_text("original")

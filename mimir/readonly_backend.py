@@ -362,7 +362,8 @@ def _atomic_replace(root: Path, file_path: str, content: str, max_bytes: int) ->
                                   dir_fd=opened[-1]))
         parent = opened[-1]
         try:
-            target_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            target_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=parent)
         except FileNotFoundError:
             return WriteResult(error=_missing_replace_error(file_path))
         try:

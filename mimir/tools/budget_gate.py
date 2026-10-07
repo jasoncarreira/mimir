@@ -158,7 +158,7 @@ _TYPED_ERROR_SIGNAL_TOOLS = frozenset({
 })
 _REMEDIATION_EFFECT_TOOLS = frozenset({
     "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review", "write_file", "edit_file", "worklink_resume",
+    "pr_rerequest_review", "write_file", "edit_file", "replace_file", "worklink_resume",
 })
 
 
