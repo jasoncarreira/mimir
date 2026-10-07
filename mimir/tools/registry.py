@@ -3095,6 +3095,7 @@ def all_mimir_tools(
     from .proposals import (
         abandon_proposal,
         open_proposal,
+        proposal_diff,
         submit_proposal,
     )
     from .extra import file_search, get_turn, mimir_get_turn, rebuild_index, shell_exec
@@ -3120,6 +3121,7 @@ def all_mimir_tools(
         # prompts/*: open a worktree sandbox under scratch/, edit it natively,
         # then submit -> one PR for operator approval (chainlink #337/#339/#344).
         open_proposal,
+        proposal_diff,
         submit_proposal,
         abandon_proposal,
         # SAGA ops (outcome marker, manual credit, session boundary, forget,
