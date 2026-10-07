@@ -9,6 +9,11 @@ All notable changes will land here. Format loosely follows
 - `mimir run` now trims freed glibc heap off the event loop every five minutes
   on supported Linux deployments. Set `MIMIR_MALLOC_TRIM_CRON=""` to disable or
   supply another cron; only RSS drops of at least 16 MB emit an event (#1885).
+- GitHub forge reads now stream only through the request's byte cap (or a
+  64 KiB error-body bound) and close the response promptly. Oversized
+  `pr_file_content` reads still truncate valid UTF-8 with a marker, but binary
+  bytes occurring only after the cap are no longer detected; a valid prefix is
+  returned as truncated text (#1887).
 
 **Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
 inherit the agent's environment. Add any variable a shell workflow genuinely
