@@ -562,6 +562,57 @@ class GitHubForgeClient:
             )]
         )
 
+    def search_pull_requests(
+        self, repository: str, *, query: str, state: str, base: str | None = None,
+        head: str | None = None, author: str | None = None,
+        merged_since: datetime | None = None, limit: int = 30,
+    ) -> tuple[PullRequestSummary, ...]:
+        """Search PRs server-side on the fixed GitHub host, before applying the limit."""
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ForgeError("invalid repository selector")
+        if state not in {"open", "closed", "merged", "all"} or type(limit) is not int or not 1 <= limit <= 100:
+            raise ForgeError("invalid pull-request search selector")
+        qualifiers = [query, "is:pr", f"repo:{repository}"]
+        if state != "all":
+            qualifiers.append(f"is:{state}")
+        if author is not None:
+            qualifiers.append(f"author:{author}")
+        if base is not None:
+            qualifiers.append(f"base:{base}")
+        if head is not None:
+            qualifiers.append(f"head:{head.partition(':')[2] if ':' in head else head}")
+        if merged_since is not None:
+            qualifiers.append(f"merged:>={merged_since.date().isoformat()}")
+        search_query = " ".join(qualifiers)
+        # Validate the final query too: direct callers can supply selectors as
+        # well as query text, and advanced search can otherwise escape repo:.
+        if any(char in search_query for char in '\"()') or any(
+            token.casefold() in {"or", "and", "not"} for token in search_query.split()
+        ):
+            raise ForgeError("pull-request search cannot contain quotes, parentheses, or boolean operators")
+        # GitHub ORs repeated repo: qualifiers; reject even a duplicate of our repo.
+        if search_query.casefold().count("repo:") != 1 or f"repo:{repository}" not in search_query.split():
+            raise ForgeError("pull-request search must target exactly the configured repository")
+        rows = self._paginate(
+            f"/search/issues?{urlencode({'q': search_query, 'sort': 'updated', 'order': 'desc'})}",
+            collection_key="items", limit=limit,
+        )
+        return tuple(
+            PullRequestSummary(
+                number=int(item.get("number", 0)),
+                title=self._text(item.get("title"), 1_024),
+                state="merged" if merged_at is not None else self._text(item.get("state"), 32),
+                author=self._text(self._user(item), 256),
+                head_ref="", base_ref="", head_sha="",
+                updated_at=self._text(item.get("updated_at"), 64),
+                merged_at=self._text(merged_at, 64) or None,
+                url=self._text(item.get("html_url"), 4_096),
+            )
+            for item in rows
+            for pr_data in [item.get("pull_request") if isinstance(item.get("pull_request"), Mapping) else {}]
+            for merged_at in [pr_data.get("merged_at")]
+        )
+
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]:
         repository, number = self._target(scope)
         return tuple(

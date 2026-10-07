@@ -738,6 +738,16 @@ class FakeForge:
             "2026-10-01T00:00:00Z", None, "https://github.com/owner/repo/pull/17",
         ),)
 
+    def search_pull_requests(self, repository, *, query, state, base, head, limit,
+                             author, merged_since):
+        self.calls.append(("pr_search", repository, query, state, base, head, limit,
+                           author, merged_since))
+        return (PullRequestSummary(
+            17, "Title", "merged", "author", "", "", "",
+            "2026-10-03T00:00:00Z", "2026-10-02T00:00:00Z",
+            "https://github.com/owner/repo/pull/17",
+        ),)
+
     def get_pull_request_snapshot(self, repository, number):
         self.calls.append(("snapshot", repository, number))
         head_sha = (
@@ -4082,6 +4092,95 @@ def test_pr_list_passes_author_and_normalized_merged_since_to_pagination(monkeyp
                              "bot", datetime(2026, 10, 1, tzinfo=timezone.utc))]
 
 
+def test_pr_list_search_dispatches_to_client_with_normalized_filters(monkeypatch):
+    from datetime import datetime, timezone
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    result = pr_list.func(
+        repository="owner/repo", search="1445", state="all", author="bot",
+        base="main", head="fork:topic", merged_since="2026-10-01", limit=5,
+    )
+    assert result[0]["head_ref"] == ""
+    assert result[0]["merged_at"] == "2026-10-02T00:00:00Z"
+    assert client.calls == [("pr_search", "owner/repo", "1445", "all", "main",
+                             "fork:topic", 5, "bot", datetime(2026, 10, 1, tzinfo=timezone.utc))]
+
+
+@pytest.mark.parametrize("search", [
+    "repo:other/repo foo", "foo REPO:other/repo", '"repo:other/repo"',
+    "-repo:jasoncarreira/mimir foo", "org:evil foo", "user:evil foo",
+    "is:issue foo", "sort:created foo", "", "a" * 257, "é" * 129, "foo\nbar", "foo\x7fbar",
+    "head:../bad", "author:bad!", "label:", "label:" + "x" * 51,
+    "label:a:b", "label:\u00ad", "merged:>=2026-10-01",
+])
+def test_pr_list_search_refuses_each_invalid_input_before_client_call(monkeypatch, search):
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    forbidden = ("repo:", "org:", "user:", "is:issue")
+    message = "search cannot contain" if any(term in search.casefold() for term in forbidden) else None
+    with pytest.raises(ToolPolicyRefusal, match=message):
+        pr_list.func(repository="owner/repo", search=search)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("search", [
+    '1445 "', '"1445"', "kernel ) OR (", "kernel(", "kernel)",
+    "linux OR", "linux AND", "linux NOT", "linux or", "linux and", "linux not",
+    "linux oR", "linux aNd", "linux nOt",
+    'label:bu"g', "head:topic(foo)",
+])
+def test_pr_list_search_refuses_advanced_syntax_before_client_call(monkeypatch, search):
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    with pytest.raises(ToolPolicyRefusal, match="quotes, parentheses, or boolean operators"):
+        pr_list.func(repository="owner/repo", search=search)
+    assert client.calls == []
+
+
+def test_pr_list_search_refuses_non_string_before_client_call(monkeypatch):
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    with pytest.raises(ToolPolicyRefusal, match="search must be non-empty text"):
+        pr_list.func(repository="owner/repo", search=42)
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("search", [
+    "head:issue/1879-a1", "in:title 1445", "is:merged author:jasoncarreira",
+    "in:body in:comments is:unmerged is:draft base:main label:bug",
+    "ordinary android nothing", "label:OR head:topic/AND base:NOT",
+])
+def test_pr_list_search_allows_documented_qualifiers(monkeypatch, search):
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    pr_list.func(repository="owner/repo", search=search)
+    assert len(client.calls) == 1
+    assert client.calls[0][:3] == ("pr_search", "owner/repo", search)
+
+
+def test_pr_list_search_unconfigured_repository_refused_before_client_call(monkeypatch):
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    with pytest.raises(ToolPolicyRefusal, match="GITHUB_REPOS"):
+        pr_list.func(repository="other/repo", search="1445")
+    assert client.calls == []
+
+
 def test_pr_list_repository_shape_is_independent_of_configuration_check(monkeypatch):
     client = FakeForge()
     set_forge_client(client)
@@ -4091,7 +4190,8 @@ def test_pr_list_repository_shape_is_independent_of_configuration_check(monkeypa
     assert client.calls == []
 
 
-def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch):
+@pytest.mark.parametrize("search", [None, "1445"])
+def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch, search):
     client = FakeForge()
     monkeypatch.setattr(client, "author_is_trusted", lambda *args: pytest.fail("list attested"), raising=False)
     set_forge_client(client)
@@ -4099,7 +4199,7 @@ def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch)
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
     capture = access_control.begin_protected_result_capture()
     try:
-        result = pr_list.func(repository="owner/repo", runtime=runtime)
+        result = pr_list.func(repository="owner/repo", search=search, runtime=runtime)
     finally:
         provenance = access_control.end_protected_result_capture(capture)
     assert provenance is None

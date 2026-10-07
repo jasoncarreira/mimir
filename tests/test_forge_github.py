@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from langchain_core.tools import ToolException
@@ -15,7 +17,7 @@ from mimir.forge.github import (
 )
 from mimir.forge import github as github_module
 from mimir.models import RepoPRActionScope
-from mimir.tools.forge import initialize_github_forge_identity
+from mimir.tools.forge import initialize_github_forge_identity, pr_list, set_forge_client
 
 
 def _scope() -> RepoPRActionScope:
@@ -304,6 +306,133 @@ def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
     )
     assert result == ()
     assert len(session.calls) == 10
+
+
+def _search_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000,
+        "state": "closed" if merged else "open", "user": {"login": "x"},
+        "updated_at": "2026-10-03T00:00:00Z",
+        "pull_request": {"merged_at": "2026-10-02T00:00:00Z" if merged else None},
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+        "head": {"ref": "do-not-use"}, "body": "do-not-return",
+    }
+
+
+def _search_params(session):
+    method, url, kwargs = session.calls[0]
+    assert method == "GET"
+    assert urlsplit(url).scheme == "https"
+    assert urlsplit(url).netloc == "api.github.com"
+    assert urlsplit(url).path == "/search/issues"
+    assert kwargs["json"] is None
+    return parse_qs(urlsplit(url).query)
+
+
+def test_pr_search_projects_items_and_paginates_on_fixed_host():
+    session = Session([
+        Response({"items": [_search_row(n) for n in range(50)]}),
+        Response({"items": [_search_row(50, merged=True)]}),
+    ])
+    result = GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="1445", state="all", limit=51,
+    )
+    assert len(result) == 51
+    assert len(session.calls) == 2
+    assert all(urlsplit(call[1]).path == "/search/issues" for call in session.calls)
+    assert [parse_qs(urlsplit(call[1]).query)["page"] for call in session.calls] == [["1"], ["2"]]
+    params = _search_params(session)
+    assert params["q"] == ["1445 is:pr repo:owner/repo"]
+    assert params["sort"] == ["updated"] and params["order"] == ["desc"]
+    assert result[-1].state == "merged"
+    assert result[-1].merged_at == "2026-10-02T00:00:00Z"
+    assert result[-1].head_ref == result[-1].base_ref == result[-1].head_sha == ""
+    assert result[-1].url == "https://github.com/owner/repo/pull/50"
+    assert result[-1].author == "x" and result[-1].updated_at == "2026-10-03T00:00:00Z"
+    assert len(result[-1].title) == 1024
+
+
+def test_pr_list_search_tool_reaches_url_encoded_api_query(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    session = Session([Response({"items": [_search_row(1445, merged=True)]})])
+    set_forge_client(GitHubForgeClient(session=session))
+    try:
+        result = pr_list.func(repository="owner/repo", search="1445", state="all")
+    finally:
+        set_forge_client(None)
+    assert len(session.calls) == 1
+    assert _search_params(session)["q"] == ["1445 is:pr repo:owner/repo"]
+    assert result[0]["head_ref"] == ""
+    assert result[0]["merged_at"] == "2026-10-02T00:00:00Z"
+
+
+@pytest.mark.parametrize("state,qualifier", [
+    ("open", "is:open"), ("closed", "is:closed"),
+    ("merged", "is:merged"), ("all", None),
+])
+def test_pr_search_sends_filters_server_side_before_limit(state, qualifier):
+    session = Session([Response({"items": [_search_row(n) for n in range(5)]})])
+    result = GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="test name", state=state, author="x", base="main",
+        head="fork:issue/1879-a1", merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        limit=5,
+    )
+    assert len(result) == 5  # Provider has already applied the qualifiers.
+    assert len(session.calls) == 1
+    url = session.calls[0][1]
+    assert "test name" not in url and "%3A" in url  # q, never a raw path/host selector
+    q = _search_params(session)["q"][0]
+    assert q.split().count("repo:owner/repo") == 1
+    if qualifier:
+        assert qualifier in q.split()
+    else:
+        assert not any(token in q.split() for token in ("is:open", "is:closed", "is:merged"))
+    for token in ("is:pr", "author:x", "base:main", "head:issue/1879-a1", "merged:>=2026-10-01"):
+        assert token in q.split()
+
+
+@pytest.mark.parametrize("query", ["repo:other/repo foo", "repo:owner/repo foo", "-repo:evil/repo"])
+def test_pr_search_client_rejects_second_repo_qualifier_without_request(query):
+    session = Session([])
+    with pytest.raises(ForgeError, match="exactly the configured repository"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query=query, state="all", limit=5,
+        )
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("query", [
+    '1445 "', '"1445"', "kernel ) OR (", "kernel(", "kernel)",
+    "linux OR", "linux AND", "linux NOT", "linux or", "linux and", "linux not",
+    "linux oR", "linux aNd", "linux nOt",
+    'label:bu"g', "head:topic(foo)",
+])
+def test_pr_search_client_refuses_advanced_syntax_without_request(query):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query=query, state="all", limit=5,
+        )
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("selector", ["author", "base", "head"])
+@pytest.mark.parametrize("value", ['topic"', "topic(", "topic)", "topic OR"])
+def test_pr_search_client_checks_advanced_syntax_in_final_selectors(selector, value):
+    session = Session([])
+    with pytest.raises(ForgeError, match="quotes, parentheses, or boolean operators"):
+        GitHubForgeClient(session=session).search_pull_requests(
+            "owner/repo", query="1445", state="all", **{selector: value},
+        )
+    assert session.calls == []
+
+
+def test_pr_search_page_cap_and_limit():
+    session = Session([Response({"items": [_search_row(n) for n in range(50)]}) for _ in range(11)])
+    assert len(GitHubForgeClient(session=session).search_pull_requests(
+        "owner/repo", query="1445", state="all", limit=100,
+    )) == 100
+    assert len(session.calls) == 2
 
 
 def test_file_content_reads_verified_blob_from_observed_head() -> None:

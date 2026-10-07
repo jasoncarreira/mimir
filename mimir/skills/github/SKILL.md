@@ -144,6 +144,10 @@ verification (`gh pr view` / `gh pr checks`), and wrap-up.
 Use `pr_list(repository="owner/repo", state="open")` to list open PRs in a
 configured repository. For recently merged PRs, use
 `pr_list(repository="owner/repo", state="merged", merged_since="2026-10-01")`.
+To find a PR by text, use `pr_list(repository="owner/repo", search="1445", state="all")`.
+Search refuses `repo:`, `org:` and `user:` qualifiers, double quotes,
+parentheses, and standalone `OR`/`AND`/`NOT` tokens in any case; the repository
+is always the configured one, independently of GitHub's search parser.
 
 ```bash
 gh pr view 42                                  # view a PR
