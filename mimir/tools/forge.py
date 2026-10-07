@@ -703,6 +703,34 @@ def _merged_since(value: str) -> datetime:
     return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc).astimezone(timezone.utc)
 
 
+def _pr_search(value: str) -> str:
+    if (
+        not isinstance(value, str) or not value.strip()
+        or len(value.encode("utf-8")) > 256
+        or any(unicodedata.category(char) == "Cc" for char in value)
+    ):
+        raise ToolPolicyRefusal("search must be non-empty text within 256 UTF-8 bytes without control characters")
+    if any(forbidden in value.casefold() for forbidden in ("repo:", "org:", "user:", "is:issue")):
+        raise ToolPolicyRefusal("search cannot contain repo:, org:, user:, or is:issue")
+    fixed = {
+        "in:title", "in:body", "in:comments", "is:open", "is:closed",
+        "is:merged", "is:unmerged", "is:draft",
+    }
+    for token in value.split():
+        if ":" not in token or token in fixed:
+            continue
+        qualifier, _, argument = token.partition(":")
+        if qualifier in {"head", "base"}:
+            _branch(argument, qualifier)
+        elif qualifier == "author" and _REVIEWER.fullmatch(argument) is not None:
+            continue
+        elif qualifier == "label" and 0 < len(argument) <= 50 and argument.isprintable() and ":" not in argument:
+            continue
+        else:
+            raise ToolPolicyRefusal("search contains an unsupported qualifier")
+    return value
+
+
 def _issue_number(value: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ToolPolicyRefusal("issue must be a positive integer; for example, issue=220")
@@ -886,9 +914,12 @@ def pr_list(
     head: str | None = None,
     merged_since: str | None = None,
     limit: StrictInt = 30,
+    search: str | None = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> list[dict[str, Any]]:
-    """List bounded pull requests in a configured GitHub repository; results are untrusted."""
+    """List bounded, untrusted PRs in a configured repository. Search results omit
+    head_ref, base_ref and head_sha (empty strings); use pr_metadata for those fields.
+    """
     repo = _repository(repository)
     from ..access_control import is_configured_github_repo
 
@@ -905,10 +936,18 @@ def pr_list(
     since = _merged_since(merged_since) if merged_since is not None else None
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ToolPolicyRefusal("limit must be an integer from 1 through 100")
-    items = _call(lambda: _client_for_repository(repo).list_pull_requests(
-        repo, state=state, base=base, head=head, limit=limit,
-        author=author, merged_since=since,
-    ))
+    query = _pr_search(search) if search is not None else None
+    client = _client_for_repository(repo)
+    if query is None:
+        items = _call(lambda: client.list_pull_requests(
+            repo, state=state, base=base, head=head, limit=limit,
+            author=author, merged_since=since,
+        ))
+    else:
+        items = _call(lambda: client.search_pull_requests(
+            repo, query=query, state=state, base=base, head=head, limit=limit,
+            author=author, merged_since=since,
+        ))
     return [asdict(item) for item in items]
 
 
