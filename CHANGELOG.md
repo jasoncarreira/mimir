@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- GitHub forge reads now stream only through the request's byte cap (or a
+  64 KiB error-body bound) and close the response promptly. Oversized
+  `pr_file_content` reads still truncate valid UTF-8 with a marker, but binary
+  bytes occurring only after the cap are no longer detected; a valid prefix is
+  returned as truncated text (#1887).
+
 **Operator action:** Interactive `shell_exec` and `bash_async` commands no longer
 inherit the agent's environment. Add any variable a shell workflow genuinely
 needs to `MIMIR_SHELL_PASS_ENV` (exact comma-separated names). Ad hoc `gh`,

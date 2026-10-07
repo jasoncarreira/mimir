@@ -45,13 +45,48 @@ class Response:
         self.status_code = status
         self.headers = {"Content-Type": content_type}
         self.content = (
-            payload.encode() if isinstance(payload, str)
+            (json.dumps(payload) if content_type == "application/json" else payload).encode()
+            if isinstance(payload, str)
             else payload if isinstance(payload, bytes)
             else json.dumps(payload).encode()
         )
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size):
+        for start in range(0, len(self.content), chunk_size):
+            yield self.content[start:start + chunk_size]
+
+    def close(self):
+        self.closed = True
+
+
+class CountingResponse:
+    """A large lazy body: touching content or json would buffer it all."""
+
+    def __init__(self, *, status=200, content_type="application/json", chunk=None):
+        self.status_code = status
+        self.headers = {"Content-Type": content_type}
+        self.chunk = chunk if chunk is not None else b"a" * 65_536
+        self.yielded_bytes = 0
+        self.closed = False
+
+    @property
+    def content(self):
+        raise AssertionError("stream was buffered")
+
+    def json(self):
+        raise AssertionError("stream was buffered")
+
+    def iter_content(self, chunk_size):
+        assert chunk_size == 65_536
+        for _ in range(100 * 1_048_576 // len(self.chunk)):
+            self.yielded_bytes += len(self.chunk)
+            yield self.chunk
+
+    def close(self):
+        self.closed = True
 
 
 class Session:
@@ -833,6 +868,93 @@ def test_response_size_and_pagination_are_bounded() -> None:
     client = GitHubForgeClient(session=Session([Response(page) for _ in range(10)]))
     with pytest.raises(ForgeResponseTooLarge, match="page limit"):
         client.list_files(_scope())
+
+
+def test_streamed_json_stops_at_cap_and_closes() -> None:
+    response = CountingResponse()
+    session = Session([response])
+    with pytest.raises(ForgeResponseTooLarge, match="forge response exceeded size limit"):
+        GitHubForgeClient(session=session).get_pull_request(_scope())
+    assert session.calls[0][2]["stream"] is True
+    assert github_module._MAX_RESPONSE_BYTES < response.yielded_bytes <= github_module._MAX_RESPONSE_BYTES + 65_536
+    assert response.closed
+
+
+def test_streamed_blob_truncates_at_cap_and_closes() -> None:
+    response = CountingResponse(content_type="application/vnd.github.raw")
+    session = Session([*_file_responses("large.txt"), response])
+    result = GitHubForgeClient(session=session).get_file_content(_scope(), "large.txt")
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert len(result.encode("utf-8")) <= github_module._MAX_DIFF_FETCH_BYTES
+    assert github_module._MAX_DIFF_FETCH_BYTES < response.yielded_bytes <= github_module._MAX_DIFF_FETCH_BYTES + 65_536
+    assert response.closed
+    assert all(call[2]["stream"] is True for call in session.calls)
+
+
+def test_streamed_blob_refuses_binary_within_cap_and_closes() -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    response = CountingResponse(content_type="application/vnd.github.raw", chunk=b"\xff" + b"a" * 65_535)
+    session = Session([*_file_responses("large.bin"), response])
+    with pytest.raises(ForgeError, match="binary file refused"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "large.bin")
+    assert cap < response.yielded_bytes <= cap + 65_536
+    assert response.closed
+
+
+def test_streamed_text_allows_split_utf8_at_read_boundary() -> None:
+    cap = 65_536  # max_bytes + 1 falls inside a two-byte character.
+    response = Response("é" * (cap + 1), content_type="text/plain")
+    result = GitHubForgeClient(session=Session([response]))._request(
+        "GET", "/test", max_bytes=cap, truncate_text=True,
+    )
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert result.startswith("é" * 100)
+    assert len(result.encode("utf-8")) <= cap
+    assert response.closed
+
+
+def test_streamed_blob_returns_valid_prefix_when_binary_follows_cap() -> None:
+    response = Response(b"a" * 256 + b"\xff", content_type="application/vnd.github.raw")
+    result = GitHubForgeClient(session=Session([response]))._request(
+        "GET", "/test", max_bytes=128, truncate_text=True,
+    )
+    assert result.endswith(github_module._FILE_TRUNCATION_MARKER)
+    assert response.closed
+
+
+@pytest.mark.parametrize("status,reason,retryable", [
+    (401, "authentication failed", False), (403, "operation forbidden", False),
+    (404, "file not found", False), (409, "operation conflicted", False),
+    (422, "operation rejected", False), (429, "rate limited", True),
+    (503, "forge request failed", True),
+])
+def test_streamed_error_mapping_reads_only_small_prefix(status, reason, retryable) -> None:
+    response = CountingResponse(status=status)
+    with pytest.raises(github_module._GitHubRequestError, match=f"^{reason}$") as caught:
+        GitHubForgeClient(session=Session([response]))._request(
+            "GET", "/test", not_found="file not found",
+        )
+    assert caught.value.retryable is retryable
+    assert response.yielded_bytes <= 65_536
+    assert response.closed
+
+
+@pytest.mark.parametrize("truncate_text", [False, True])
+def test_streamed_error_enforces_small_request_cap(truncate_text) -> None:
+    response = CountingResponse(status=403)
+    with pytest.raises(ForgeResponseTooLarge, match="size limit"):
+        GitHubForgeClient(session=Session([response]))._request(
+            "GET", "/test", max_bytes=100, truncate_text=truncate_text,
+        )
+    assert response.yielded_bytes <= 100 + 65_536
+    assert response.closed
+
+
+def test_streamed_invalid_json_preserves_error_and_closes() -> None:
+    response = Response(b"{bad json")
+    with pytest.raises(ForgeError, match="forge returned invalid JSON"):
+        GitHubForgeClient(session=Session([response]))._request("GET", "/test")
+    assert response.closed
 
 
 def _file_diff(path: str, body_bytes: int) -> str:

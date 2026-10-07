@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -303,11 +304,17 @@ class GitHubForgeClient:
         not_found: str = "pull request not found",
         truncate_text: bool = False,
     ) -> Any:
+        """Read a bounded response; oversized text is checked only through the cap.
+
+        Invalid UTF-8 after the cap cannot be detected and a valid prefix is
+        returned as truncated text instead.
+        """
         url = f"https://api.github.com{endpoint}"
         if body is not None and len(
             json.dumps(dict(body), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ) > _MAX_BODY_BYTES:
             raise ForgeError("forge request body exceeded size limit")
+        response = None
         try:
             response = self._session.request(
                 method,
@@ -315,17 +322,29 @@ class GitHubForgeClient:
                 headers=self._headers(accept),
                 json=dict(body) if body is not None else None,
                 timeout=self._timeout,
+                stream=True,
             )
+            # Error responses need only enough bytes to enforce small caps;
+            # their payload is never returned or used to choose the reason.
+            limit = min(max_bytes + 1, 65_536) if response.status_code >= 400 else max_bytes + 1
+            collected = bytearray()
+            for chunk in response.iter_content(chunk_size=65_536):
+                collected.extend(chunk[:limit - len(collected)])
+                if len(collected) >= limit:
+                    break
         except requests.RequestException as exc:
             raise _GitHubRequestError(
                 f"forge transport failed: {type(exc).__name__}", retryable=True,
             ) from exc
-        raw = response.content
+        finally:
+            if response is not None:
+                response.close()
+        raw = bytes(collected)
         if len(raw) > max_bytes:
             if not truncate_text or response.status_code >= 400:
                 raise ForgeResponseTooLarge("forge response exceeded size limit")
             try:
-                raw.decode("utf-8")
+                codecs.getincrementaldecoder("utf-8")("strict").decode(raw, final=False)
             except UnicodeDecodeError as exc:
                 raise ForgeError("forge returned invalid text (binary file refused)") from exc
             prefix = raw[:max_bytes - len(_FILE_TRUNCATION_MARKER.encode("utf-8"))]
@@ -356,7 +375,7 @@ class GitHubForgeClient:
             except UnicodeDecodeError as exc:
                 raise ForgeError("forge returned invalid text") from exc
         try:
-            return response.json()
+            return json.loads(raw)
         except ValueError as exc:
             raise ForgeError("forge returned invalid JSON") from exc
 
