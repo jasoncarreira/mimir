@@ -56,6 +56,30 @@ def test_apt_install_layer_includes_ripgrep() -> None:
     ), "ripgrep is not listed in the apt install layer"
 
 
+def test_runtime_preloads_jemalloc_via_arch_independent_symlink() -> None:
+    """glibc malloc fragmentation grew the long-running agent to ~2 GB RSS;
+    jemalloc held ~550 MB (muninn, 2026-10-06). The package must ship in the
+    cleaned apt layer, and LD_PRELOAD must name the build-time symlink rather
+    than an arch-specific path (amd64 and arm64 install it in different dirs)."""
+    text = _text()
+    block = re.search(
+        r"apt-get install -y --no-install-recommends(?P<body>[\s\S]*?)apt-get clean",
+        text,
+    )
+    assert block is not None, "could not find the apt install -> clean layer"
+    assert re.search(r"\blibjemalloc2\b", block.group("body")), (
+        "libjemalloc2 is not listed in the apt install layer"
+    )
+    assert re.search(
+        r"dpkg -L libjemalloc2[^\n]*\n[\s\S]*?ln -sf \"\$lib\" /usr/local/lib/libjemalloc\.so\.2",
+        text,
+    ), "the jemalloc symlink is not resolved from the installed package"
+    assert re.search(r"(?m)^ENV LD_PRELOAD=/usr/local/lib/libjemalloc\.so\.2$", text), (
+        "LD_PRELOAD must point at the arch-independent jemalloc symlink"
+    )
+    assert "-linux-gnu/libjemalloc" not in text, "LD_PRELOAD must not hardcode an arch path"
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
 # Hang guard above the 300s build subprocess bound, so that bound reports first.
 @pytest.mark.timeout(420)
@@ -124,7 +148,10 @@ def test_built_image_provides_process_tools() -> None:
                 "/bin/sh",
                 image,
                 "-ceu",
-                "command -v ps && command -v pgrep",
+                "command -v ps && command -v pgrep"
+                " && test -e /usr/local/lib/libjemalloc.so.2"
+                " && python3 -c \"import sys; sys.exit(0 if any('libjemalloc' in l"
+                " for l in open('/proc/self/maps')) else 1)\"",
             ],
             check=True,
             timeout=60,
