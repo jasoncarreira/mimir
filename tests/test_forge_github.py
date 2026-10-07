@@ -950,6 +950,33 @@ def test_streamed_error_enforces_small_request_cap(truncate_text) -> None:
     assert response.closed
 
 
+@pytest.mark.parametrize("error_type", [
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ContentDecodingError,
+])
+def test_mid_stream_transport_error_is_retryable_and_closes(error_type) -> None:
+    transport_error = error_type("body interrupted")
+
+    class InterruptedResponse(CountingResponse):
+        def iter_content(self, chunk_size):
+            assert chunk_size == 65_536
+            self.yielded_bytes += len(b'{"partial":')
+            yield b'{"partial":'
+            raise transport_error
+
+    response = InterruptedResponse()
+    with pytest.raises(
+        github_module._GitHubRequestError,
+        match=f"^forge transport failed: {error_type.__name__}$",
+    ) as caught:
+        GitHubForgeClient(session=Session([response]))._request("GET", "/test")
+    assert caught.value.retryable is True
+    assert caught.value.__cause__ is transport_error
+    assert response.yielded_bytes == len(b'{"partial":')
+    assert response.closed
+
+
 def test_streamed_invalid_json_preserves_error_and_closes() -> None:
     response = Response(b"{bad json")
     with pytest.raises(ForgeError, match="forge returned invalid JSON"):
