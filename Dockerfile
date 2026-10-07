@@ -64,6 +64,7 @@ FROM provenance-validation AS base
 #     tesseract-ocr-osd`` (an OR-relation APT can satisfy with osd
 #     alone — orientation detection only). Pinning ``eng`` explicitly
 #     removes that ambiguity.
+#   - libjemalloc2: allocator preloaded below (see the jemalloc block).
 ENV NODE_VERSION=22
 ENV MIMIR_FACTORY_ENTRYPOINT=/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js
 ENV PATH="/opt/mimir-opencode/bin:${PATH}"
@@ -71,7 +72,7 @@ ARG MIMIR_ENABLE_OPENCODE=0
 ARG FACTORY_VERSION=0.10.11
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git jq procps ripgrep xz-utils \
-        poppler-utils tesseract-ocr tesseract-ocr-eng \
+        poppler-utils tesseract-ocr tesseract-ocr-eng libjemalloc2 \
     && curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && if [ "$MIMIR_ENABLE_OPENCODE" = "1" ]; then \
@@ -85,6 +86,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fi \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# jemalloc: under glibc malloc the long-running agent's RSS crept to ~2 GB, and
+# ~500 MB of that was freed-but-retained fragmentation (one malloc_trim(0)
+# released 452 MB). With jemalloc preloaded the same agent held ~530-575 MB
+# steady over 6h, returning its hourly scheduled-job spikes within 10-20 min
+# (muninn, 2026-10-06). The library path is arch-specific (x86_64-linux-gnu vs
+# aarch64-linux-gnu), so resolve it at build time behind a fixed symlink. Opt
+# out at runtime with an empty LD_PRELOAD (e.g. `-e LD_PRELOAD=`).
+RUN set -eu; \
+    lib="$(dpkg -L libjemalloc2 | grep '/libjemalloc\.so\.2$' | head -n 1)"; \
+    test -n "$lib"; \
+    ln -sf "$lib" /usr/local/lib/libjemalloc.so.2
+ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so.2
 
 # s6-overlay (PID 1 + process supervisor). Supersedes tini — it does the same
 # zombie-reaping + signal-forwarding AND supervises multiple services: here the
