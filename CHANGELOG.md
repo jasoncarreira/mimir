@@ -6,6 +6,51 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-10-07
+
+A security release from the 2026-10-06 external review. Bridge intake, attachment
+downloads and reactions are gated on the author allowlist; the interactive shell
+runs with a scrubbed environment and mimir processes are non-dumpable; the
+remaining `fetch_url`/`gh` paths used by routine flows move to scoped, read-only
+forge tools (`pr_file_content`, `pr_list` with scoped `search`, `ci_run_jobs`,
+`ci_run`, `ci_recent_runs`) plus `proposal_diff` and an atomic `replace_file`.
+The canonical image preloads jemalloc, and `mimir run` trims fragmented glibc
+heap when jemalloc is absent. Dependency security bumps throughout.
+
+**Operator actions:**
+
+- Add every Discord/Slack participant who should start turns to
+  `<MIMIR_HOME>/state/identities.yaml` before upgrading, or set
+  `MIMIR_OPEN_BRIDGE=true` while IFC enforcement is off (#1871).
+- Set `MIMIR_SHELL_PASS_ENV` to the exact variables your shell workflows need
+  (e.g. `gog`/`acli` credentials); everything else is scrubbed (#1873).
+- Rebuild the image of a source deployment that runs the canonical image to pick
+  up jemalloc (`LD_PRELOAD=/usr/local/lib/libjemalloc.so.2`; set `LD_PRELOAD=`
+  to opt out) (#2249).
+- Run sidecar processes launched with the container's full environment (for
+  example `codex-auth-sync` and dev `vite`/`esbuild` watchers) with minimal
+  environments (#1873).
+
+**Changes:**
+
+- Bridges: unknown/non-allowlisted authors are refused at intake even in IFC
+  shadow mode (#1871); attachments download only after intake admits the
+  message (#1876); reactions are gated by the same decision (#1877).
+- GitHub Actions are pinned to full commit SHAs and Dependabot covers Actions
+  (#1874).
+- Security lows: `request_mimir_update` validation and approval, a `fetch_url`
+  DNS-rebinding fix, an HttpOnly web-key cookie, SECURITY.md and docs drift
+  (#1875).
+- Forge: `pr_file_content` (#1878), `ci_run_jobs` (#1879), `pr_list` (#1881) with
+  scoped `search` that refuses repo/org/user qualifiers, boolean operators,
+  quotes and parentheses (#1886), `ci_run`/`ci_recent_runs` (#1884).
+- Proposals: `proposal_diff` for upgrade turns (#1880).
+- gmail-poller: file tools replace shell `ls`/`wc`/`cat` of its state (#1882).
+- Filesystem: `replace_file` atomically replaces an existing file (#1883).
+- Dependencies: aiohttp, pillow, pyasn1, pyjwt, pypdf, cryptography, urllib3,
+  anyio, multidict, fsspec, langgraph-sdk, langgraph-checkpoint, starlette,
+  python-multipart, pydantic-settings, mcp; frontend undici, vitest,
+  source-map-js; GitHub Actions versions.
 - `mimir run` now trims freed glibc heap off the event loop every five minutes
   on supported Linux deployments. Set `MIMIR_MALLOC_TRIM_CRON=""` to disable or
   supply another cron; only RSS drops of at least 16 MB emit an event (#1885).

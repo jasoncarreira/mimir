@@ -1,7 +1,7 @@
 {
   "id": "mimir",
   "name": "Mimir",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Memory-centric AI agent accessible through the Agent Client Protocol.",
   "repository": "https://github.com/jasoncarreira/mimir",
   "authors": [
@@ -10,7 +10,7 @@
   "license": "MIT",
   "distribution": {
     "uvx": {
-      "package": "mimir-agent==0.9.3",
+      "package": "mimir-agent==0.9.4",
       "args": [
         "acp"
       ]
