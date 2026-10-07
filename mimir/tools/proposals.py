@@ -222,11 +222,15 @@ def _run_poller(
 
 def _staged_diff(worktree: Path, surfaces: tuple[Path, ...]) -> str:
     """Read only staged proposal surfaces using the timed git subprocess helper."""
-    result = _git(
-        ["-C", str(worktree), "diff", "--cached", "--no-ext-diff",
-         "--no-textconv", "--no-color", "--", *[s.as_posix() + "/" for s in surfaces]],
-        cwd=worktree,
-    )
+    try:
+        result = _git(
+            ["-C", str(worktree), "diff", "--cached", "--no-ext-diff",
+             "--no-textconv", "--no-color", "--", *[s.as_posix() + "/" for s in surfaces]],
+            cwd=worktree,
+        )
+    except UnicodeDecodeError:
+        # The shared subprocess helper decodes strictly before returning stdout.
+        return "proposal_diff failed: staged diff unavailable."
     if result.returncode != 0:
         return "proposal_diff failed: staged diff unavailable."
     data = (result.stdout or "").encode("utf-8", errors="surrogateescape")

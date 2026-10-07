@@ -140,6 +140,31 @@ def test_proposal_diff_staged_surfaces_only(home: Path, monkeypatch: pytest.Monk
         asyncio.run(proposal_tools.proposal_diff.coroutine(path=str(home), lane="agent"))
 
 
+@pytest.mark.parametrize("returncode", [1, 124])
+def test_proposal_diff_git_failure_discards_partial_stdout(
+    home: Path, monkeypatch: pytest.MonkeyPatch, returncode: int,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert open_proposal(home).ok
+    monkeypatch.setattr(proposal_tools, "_git", lambda args, cwd: subprocess.CompletedProcess(
+        args, returncode, stdout="partial diff must not escape", stderr="git failed",
+    ))
+    out = _read_diff()
+    assert out == "proposal_diff failed: staged diff unavailable."
+    assert "partial diff" not in out
+
+
+def test_proposal_diff_non_utf8_staged_file_fails_closed(
+    home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    opened = open_proposal(home)
+    assert opened.ok
+    (opened.worktree / "prompts/reflect.md").write_bytes(b"invalid utf8: \xff\n")
+    _git("add", "prompts/reflect.md", cwd=opened.worktree)
+    assert _read_diff() == "proposal_diff failed: staged diff unavailable."
+
+
 def test_proposal_diff_missing_and_empty(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import mimir.proposals as core
 

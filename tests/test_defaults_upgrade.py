@@ -367,6 +367,7 @@ async def test_upgrade_reconciliation_turn_renders_template_and_enqueues(tmp_pat
     assert "conflicts=true" in event.content
     assert event.extra["proposal_worktree"] == str(wt)
     assert "pr_metadata" in event.content
+    assert "use `pr_list` to find pull requests in a configured repository" in event.content
     assert "Do not run `gh pr view` or `gh pr list`" in event.content
     assert "Do not run shell `ls`" in event.content
     assert "Do not call `list_channels`" in event.content

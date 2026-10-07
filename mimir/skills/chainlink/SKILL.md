@@ -413,8 +413,8 @@ couple that *look* idempotent but aren't:
   Across turns the breaker doesn't help; rely on unique keys in the
   message itself if the same content might be generated twice.
 - **`gh pr create` is *not* idempotent.** It happily makes a second
-  PR against the same branch. Always `gh pr list --head <branch>`
-  first.
+  PR against the same branch. Always call
+  `pr_list(repository="owner/repo", state="all", head="<branch>")` first.
 
 ## Failure modes
 

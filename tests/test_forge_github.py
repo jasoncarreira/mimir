@@ -46,6 +46,7 @@ class Response:
         self.headers = {"Content-Type": content_type}
         self.content = (
             payload.encode() if isinstance(payload, str)
+            else payload if isinstance(payload, bytes)
             else json.dumps(payload).encode()
         )
 
@@ -61,6 +62,21 @@ class Session:
     def request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
         return self.responses.pop(0)
+
+
+def _file_responses(path: str, head: str = "a" * 40) -> list[Response]:
+    parts = path.split("/")
+    responses = [
+        Response({"sha": head, "tree": {"sha": "c" * 40}}),
+    ]
+    for index, part in enumerate(parts):
+        final = index == len(parts) - 1
+        responses.append(Response({"tree": [{
+            "path": part, "type": "blob" if final else "tree",
+            "mode": "100644" if final else "040000",
+            "sha": ("d" if final else "c") * 40,
+        }]}))
+    return responses
 
 
 def test_list_run_jobs_projects_only_bounded_job_metadata():
@@ -133,6 +149,267 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert method == "GET"
     assert url == "https://api.github.com/repos/owner/repo/pulls/17"
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
+
+
+def _pr_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",
+        "user": {"login": "author"}, "head": {"ref": "topic", "sha": "a" * 40},
+        "base": {"ref": "main"}, "updated_at": "2026-10-03T00:00:00Z",
+        "merged_at": "2026-10-02T00:00:00Z" if merged else None,
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+    }
+
+
+def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
+    wrong = _pr_row(1)
+    wrong["head"]["ref"] = "unrelated"
+    session = Session([Response([wrong, _pr_row(2)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", head="topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert "head=owner%3Atopic" in session.calls[0][1]
+
+
+@pytest.mark.parametrize("selector", ["author", "merged_since", "both"])
+def test_pr_list_applies_filters_before_limit_across_pages(selector):
+    from datetime import datetime, timezone
+
+    excluded = [_pr_row(n, merged=True) for n in range(50)]
+    for item in excluded:
+        item["user"]["login"] = "other"
+        item["merged_at"] = "2026-09-01T00:00:00Z"
+    # Matching rows must be discovered after a full page of rejected rows,
+    # not merely beyond limit within an already-fetched page.
+    session = Session([Response(excluded), Response([_pr_row(51, merged=True), _pr_row(52, merged=True)])])
+    kwargs = {}
+    if selector in {"author", "both"}:
+        kwargs["author"] = "AUTHOR"
+    if selector in {"merged_since", "both"}:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1, **kwargs,
+    )
+    assert [item.number for item in result] == [51]
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("state", ["all", "open", "closed"])
+@pytest.mark.parametrize("merged_at", [None, False, 123])
+def test_pr_list_merged_since_drops_unmerged_rows_before_limit(state, merged_at):
+    from datetime import datetime, timezone
+
+    unmerged = _pr_row(1)
+    unmerged["merged_at"] = merged_at
+    if state == "closed":
+        unmerged["state"] = "closed"
+    session = Session([Response([unmerged, _pr_row(2, merged=True)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state=state, limit=1,
+        merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+    # Non-merged state selectors must exercise matches(), not merged_only.
+    # An unmerged row must neither escape the filter nor consume the limit.
+    assert [item.number for item in result] == [2]
+    assert result[0].merged_at == "2026-10-02T00:00:00Z"
+    assert f"state={state}&" in session.calls[0][1]
+
+
+def test_paginate_limited_collection_returns_partial_at_page_cap():
+    session = Session([Response({"jobs": [{"id": n}] * 50}) for n in range(10)])
+    result = GitHubForgeClient(session=session)._paginate(
+        "/repos/owner/repo/actions/runs/42/jobs", collection_key="jobs", limit=501,
+    )
+    assert len(result) == 500
+    assert len(session.calls) == 10
+
+
+def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
+    session = Session([Response([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", base="main", head="fork:topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert result[0].state == "merged"
+    assert len(result[0].title) == 1024
+    assert session.calls[0][0:2] == (
+        "GET", "https://api.github.com/repos/owner/repo/pulls?"
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
+    )
+
+
+def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
+    session = Session([Response([_pr_row(page * 50 + n, merged=True) for n in range(50)])
+                       for page in range(20)])
+    client = GitHubForgeClient(session=session)
+    assert len(client.list_pull_requests("owner/repo", state="all", limit=51)) == 51
+    assert len(session.calls) == 2
+    session = Session([Response([_pr_row(page * 50 + n) for n in range(50)])
+                       for page in range(20)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=100,
+    )
+    assert result == ()
+    assert len(session.calls) == 10
+
+
+def test_file_content_reads_verified_blob_from_observed_head() -> None:
+    session = Session([*_file_responses("src/a #1.py", "b" * 40),
+                       Response("text at observed head", content_type="text/plain")])
+    client = GitHubForgeClient(session=session)
+    scope = replace(_scope(), observed_head_sha="b" * 40)
+    assert client.get_file_content(scope, "src/a #1.py") == "text at observed head"
+    assert [call[1] for call in session.calls] == [
+        f"https://api.github.com/repos/owner/repo/git/commits/{'b' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/trees/{'c' * 40}",
+        f"https://api.github.com/repos/owner/repo/git/blobs/{'d' * 40}",
+    ]
+    assert session.calls[-1][2]["headers"]["Accept"] == "application/vnd.github.raw"
+
+
+@pytest.mark.parametrize("path", ["../x", "a/../../x", "/etc/passwd", "a\\b", "a\x00b", "", "a" * 4_097])
+def test_file_content_invalid_path_does_not_request(path: str) -> None:
+    session = Session([])
+    with pytest.raises(ForgeError, match="invalid repository path"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), path)
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("entry", [
+    {"path": "link", "type": "tree", "mode": "040000", "sha": "d" * 40},
+    {"path": "link", "type": "blob", "mode": "120000", "sha": "d" * 40},
+    {"path": "link", "type": "commit", "mode": "160000", "sha": "d" * 40},
+])
+def test_file_content_refuses_non_regular_file_without_raw_fetch(entry) -> None:
+    responses = _file_responses("link")
+    responses[-1] = Response({"tree": [entry]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="not a regular file"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "link")
+    assert len(session.calls) == 2
+
+
+def test_file_content_refuses_binary_raw_response() -> None:
+    session = Session([
+        *_file_responses("src/app.py"),
+        Response(b"\xffbad", content_type="application/octet-stream"),
+    ])
+    with pytest.raises(ForgeError, match="invalid text"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+
+
+def test_file_content_near_one_mb_does_not_fetch_base64_metadata() -> None:
+    import base64
+    import json
+
+    content = "a" * 900_000
+    metadata = {"type": "file", "sha": "d" * 40,
+                "content": base64.encodebytes(content.encode()).decode()}
+    assert len(json.dumps(metadata).encode()) > github_module._MAX_RESPONSE_BYTES
+
+    class MetadataOverflowSession(Session):
+        def request(self, method, url, **kwargs):
+            if "/contents/" in url:
+                # Reintroducing the Contents read fails at its default 1 MiB cap.
+                self.calls.append((method, url, kwargs))
+                return Response(metadata)
+            return super().request(method, url, **kwargs)
+
+    session = MetadataOverflowSession([
+        *_file_responses("uv.lock"),
+        Response(content, content_type="application/vnd.github.raw; charset=utf-8"),
+    ])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "uv.lock") == content
+    assert all("/contents/" not in call[1] for call in session.calls)
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'d' * 40}")
+
+
+def test_file_content_refuses_over_cap_binary_instead_of_truncating() -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    # Put the invalid byte beyond the retained prefix: validating only that
+    # prefix (or deleting the strict decode) must not silently accept binary.
+    session = Session([
+        *_file_responses("large.bin"),
+        Response(b"a" * cap + b"\xff", content_type="application/octet-stream"),
+    ])
+    with pytest.raises(ForgeError, match="binary file refused"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "large.bin")
+
+
+def test_file_content_allows_empty_regular_file() -> None:
+    session = Session([*_file_responses("empty.txt"), Response("", content_type="text/plain")])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "empty.txt") == ""
+
+
+def test_file_content_preserves_json_file_bytes_as_text() -> None:
+    session = Session([*_file_responses("config.json"), Response({"enabled": True})])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "config.json") == '{"enabled": true}'
+
+
+def test_file_content_refuses_unverified_commit_tree() -> None:
+    responses = _file_responses("src/app.py")
+    responses[0] = Response({"sha": "f" * 40, "tree": {"sha": "c" * 40}})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="scoped commit tree is unavailable"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "src/app.py")
+    assert len(session.calls) == 1
+
+
+def test_file_content_truncates_over_diff_fetch_cap_and_passes_max_bytes(monkeypatch) -> None:
+    cap = github_module._MAX_DIFF_FETCH_BYTES
+    session = Session([
+        *_file_responses("src/app.py"),
+        Response("a" * (cap + 1), content_type="text/plain"),
+    ])
+    client = GitHubForgeClient(session=session)
+    calls = []
+    request = client._request
+
+    def recording_request(*args, **kwargs):
+        calls.append(kwargs)
+        return request(*args, **kwargs)
+
+    monkeypatch.setattr(client, "_request", recording_request)
+    result = client.get_file_content(_scope(), "src/app.py")
+    assert result.startswith("aaaa")
+    assert result.endswith("[pr_file_content truncated: file exceeded size limit]\n")
+    assert len(result.encode("utf-8")) <= cap
+    assert calls[-1]["max_bytes"] == cap
+
+
+@pytest.mark.parametrize("sha", [None, "", "not-a-sha", "e" * 39])
+def test_file_content_refuses_invalid_blob_sha(sha) -> None:
+    responses = _file_responses("link")
+    responses[-1] = Response({"tree": [{
+        "path": "link", "type": "blob", "mode": "100644", "sha": sha,
+    }]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="invalid scoped tree entry"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "link")
+    assert len(session.calls) == 2  # no raw request
+
+
+def test_file_content_fetches_blob_sha_from_tree_not_an_assumed_value() -> None:
+    responses = _file_responses("file.py")
+    responses[-1] = Response({"tree": [{
+        "path": "file.py", "type": "blob", "mode": "100755", "sha": "e" * 40,
+    }]})
+    session = Session([*responses, Response("executable", content_type="text/plain")])
+    assert GitHubForgeClient(session=session).get_file_content(_scope(), "file.py") == "executable"
+    assert session.calls[-1][1].endswith(f"/git/blobs/{'e' * 40}")
+
+
+def test_file_content_refuses_symlinked_parent() -> None:
+    responses = _file_responses("alias/file.py")
+    responses[1] = Response({"tree": [{
+        "path": "alias", "type": "blob", "mode": "120000", "sha": "e" * 40,
+    }]})
+    session = Session(responses)
+    with pytest.raises(ForgeError, match="crosses a symlink"):
+        GitHubForgeClient(session=session).get_file_content(_scope(), "alias/file.py")
+    assert len(session.calls) == 2
 
 
 def _job_metadata():

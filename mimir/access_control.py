@@ -259,8 +259,10 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     "activity_panel_post": ToolFlowDirection.SINK,
     "activity_panel_edit": ToolFlowDirection.SINK,
     "pr_metadata": ToolFlowDirection.SOURCE,
+    "pr_list": ToolFlowDirection.SOURCE,
     "pr_files": ToolFlowDirection.SOURCE,
     "pr_diff": ToolFlowDirection.SOURCE,
+    "pr_file_content": ToolFlowDirection.SOURCE,
     "pr_checks": ToolFlowDirection.SOURCE,
     "pr_job_log": ToolFlowDirection.SOURCE,
     "ci_run_jobs": ToolFlowDirection.SOURCE,
@@ -430,8 +432,10 @@ TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
     "task": CapabilityTier.SCOPE_CONTAINED,
     "list_schedules": CapabilityTier.SCOPE_CONTAINED,
     "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
+    "pr_list": CapabilityTier.SCOPE_CONTAINED,
     "pr_files": CapabilityTier.SCOPE_CONTAINED,
     "pr_diff": CapabilityTier.SCOPE_CONTAINED,
+    "pr_file_content": CapabilityTier.SCOPE_CONTAINED,
     "pr_checks": CapabilityTier.SCOPE_CONTAINED,
     "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
     "ci_run_jobs": CapabilityTier.SCOPE_CONTAINED,
@@ -514,7 +518,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "file_search", "get_turn", "mimir_get_turn", "send_message",
         "operator_alert", "task", "memory_store", "saga_mark_contributions",
         "saga_end_session", "saga_record_skill_learning", "fetch_url",
-        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+        "pr_metadata", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs",
@@ -527,6 +531,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
     # Custom profiles remain tier-validated and cannot request unbounded sinks.
     "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
         "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
+        "proposal_diff",
     },
     "heartbeat": frozenset({
         "write_file", "edit_file", "shell_exec", "bash_async",
@@ -535,7 +540,7 @@ TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
         "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
         "saga_mark_contributions", "worklink_run", "send_message",
         "operator_alert", "fetch_url", "task", "list_schedules",
-        "pr_metadata", "pr_files", "pr_diff", "pr_checks", "pr_reviews",
+        "pr_metadata", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
         "pr_comments", "pr_review_requests", "pr_submit_review",
         "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
         "pr_edit_body",
@@ -1087,6 +1092,7 @@ _FORGE_TOOL_ACTIONS: dict[str, str | None] = {
     "pr_metadata": RepoPRAction.INSPECT.value,
     "pr_files": RepoPRAction.INSPECT.value,
     "pr_diff": RepoPRAction.INSPECT.value,
+    "pr_file_content": RepoPRAction.INSPECT.value,
     "pr_checks": RepoPRAction.INSPECT.value,
     "pr_job_log": RepoPRAction.INSPECT.value,
     "pr_reviews": RepoPRAction.INSPECT.value,
@@ -7967,6 +7973,7 @@ class OperationCatalog:
     )
 
     _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
+        "pr_list",
         "issue_comment",
         "operator_alert",
         "approve_declassification",
@@ -9627,8 +9634,10 @@ _PROTECTED_RESULT_DOMAINS: dict[str, str] = {
     "worklink_resume": "worklink",
     "spawn_open_code": "coding_worker",
     "pr_metadata": "repository",
+    "pr_list": "repository",
     "pr_files": "repository",
     "pr_diff": "repository",
+    "pr_file_content": "repository",
     "pr_checks": "repository",
     "pr_job_log": "repository",
     "ci_run_jobs": "repository",
@@ -9690,8 +9699,10 @@ _READ_BACKEND_RESULT_TOOLS = frozenset({
     "agrep",
     "fetch_url",
     "pr_metadata",
+    "pr_list",
     "pr_files",
     "pr_diff",
+    "pr_file_content",
     "pr_checks",
     "pr_reviews",
     "pr_comments",
@@ -10812,6 +10823,7 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
 
 # Executable capabilities and information-flow metadata are one policy.
 _OPERATION_READABLE_DOMAIN: dict[str, str] = {
+    "pr_list": "repository",
     "list_channels": "channel_metadata",
     "list_schedules": "schedule_metadata",
     "bash_jobs_list": "shell_jobs",

@@ -2074,6 +2074,37 @@ def test_upgrade_gh_pr_shell_attempt_stays_refused(command: str) -> None:
     assert decision.reason == "service_sink_destination_denied"
 
 
+def test_upgrade_trigger_authorizes_proposal_diff() -> None:
+    from mimir.models import AgentEvent
+
+    auth = create_auth_context(AgentEvent(
+        trigger="upgrade", channel_id="upgrade", source="upgrade",
+        service_principal="system",
+    ), enforce=True)
+    assert auth.is_service and auth.trigger == "upgrade"
+    assert auth.service_authority is not None
+    registry = ToolRegistry()
+    decision = registry.authorize_tool(
+        "proposal_diff", auth, enforce=True, arguments={"lane": "upgrade"},
+    )
+    assert decision.allowed is True, decision.reason
+
+    # Prove the positive check depends on the declared upgrade grant.
+    without_grant = replace(auth, service_authority=replace(
+        auth.service_authority,
+        capabilities=tuple(c for c in auth.service_authority.capabilities if c != "proposal_diff"),
+    ))
+    assert registry.authorize_tool(
+        "proposal_diff", without_grant, enforce=True, arguments={"lane": "upgrade"},
+    ).allowed is False
+
+
+def test_custom_profile_excludes_all_proposal_operations() -> None:
+    assert not {
+        "open_proposal", "submit_proposal", "abandon_proposal", "proposal_diff",
+    } & access_control.TRIGGER_AUTHORITY_PROFILES["custom"]
+
+
 def test_upgrade_channel_discovery_stays_refused() -> None:
     principal = get_service_principal("upgrade")
     assert principal is not None
@@ -17100,18 +17131,22 @@ def test_non_acp_execution_decisions_are_unchanged(monkeypatch: pytest.MonkeyPat
     }
     destinations["memory_propose"] = "memory_proposals"
 
-    for name in ("pr_job_log", "ci_run_jobs"):
+    for name in ("pr_job_log", "ci_run_jobs", "pr_file_content"):
         flows[access_control.ToolFlowDirection.SOURCE].add(name)
         decisions[OperationDecision.RESOURCE_SCOPED].add(name)
         readable[name] = "repository"
         protected[name] = "repository"
-    # New local proposal read: admin-cataloged like the proposal workflow,
-    # but an IFC source with the worktree's filesystem result provenance.
+    # Preserve both proposal and repository reads in the frozen inventories.
     flows[access_control.ToolFlowDirection.SOURCE].add("proposal_diff")
     decisions[OperationDecision.ADMIN_REQUIRED].add("proposal_diff")
     admin_catalog.add("proposal_diff")
     readable["proposal_diff"] = "filesystem"
     protected["proposal_diff"] = "filesystem"
+    flows[access_control.ToolFlowDirection.SOURCE].add("pr_list")
+    decisions[OperationDecision.ADMIN_REQUIRED].add("pr_list")
+    admin_catalog.add("pr_list")
+    readable["pr_list"] = "repository"
+    protected["pr_list"] = "repository"
     assert {name for name in access_control._TOOL_FLOW_MAP if name.startswith("hands_")} == hands
     assert {
         direction: {name for name, value in access_control._TOOL_FLOW_MAP.items() if value is direction and name not in hands}

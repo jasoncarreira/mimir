@@ -236,6 +236,9 @@ The framework wraps the JSONL into an `AgentEvent` per item (or per
 `batch_size` items if you bump that in `pollers.json` — default here
 is 5 so a quiet inbox produces one turn for the burst, not five).
 
+In agent turns, inspect your state with `read_file`, `ls`, `glob` and `grep`;
+the shell is only for `run-gog.sh`.
+
 ## Cursor model
 
 **Set of message IDs, not a timestamp.** Gmail can deliver messages
@@ -287,7 +290,7 @@ If the poller isn't emitting:
 3. **Check `events.jsonl`** for `poller_stderr` entries from
    `gmail-inbox` — these surface gog's stderr (auth errors,
    rate-limit hits) verbatim.
-4. **Check the cursor**: `cat <home>/state/pollers/gmail-inbox/cursor.json` — if it's huge / has IDs you don't recognize, the cursor may be holding onto stale entries; delete it to reset (next poll emits everything in the window again).
+4. **Check the cursor**: use `read_file` on `state/pollers/gmail-inbox/cursor.json` — if it's huge / has IDs you don't recognize, the cursor may be holding onto stale entries; delete it to reset (next poll emits everything in the window again).
 
 ## Trust tier
 

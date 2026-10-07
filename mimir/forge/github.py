@@ -7,9 +7,11 @@ import json
 import os
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -22,6 +24,7 @@ from .client import (
     ForgeResponseTooLarge,
     IssueTarget,
     PullRequestProjection,
+    PullRequestSummary,
     ReviewProjection,
     ReviewRequestProjection,
     ReviewVerdict,
@@ -29,9 +32,11 @@ from .client import (
 
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+_SHA = re.compile(r"[a-fA-F0-9]{40}")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_DIFF_BYTES = 524_288
 _MAX_DIFF_FETCH_BYTES = 8_388_608
+_FILE_TRUNCATION_MARKER = "\n[pr_file_content truncated: file exceeded size limit]\n"
 _MAX_ITEMS = 500
 _MAX_PAGES = 10
 _MAX_BODY_BYTES = 65_536
@@ -296,6 +301,7 @@ class GitHubForgeClient:
         accept: str = "application/vnd.github+json",
         max_bytes: int = _MAX_RESPONSE_BYTES,
         not_found: str = "pull request not found",
+        truncate_text: bool = False,
     ) -> Any:
         url = f"https://api.github.com{endpoint}"
         if body is not None and len(
@@ -316,7 +322,14 @@ class GitHubForgeClient:
             ) from exc
         raw = response.content
         if len(raw) > max_bytes:
-            raise ForgeResponseTooLarge("forge response exceeded size limit")
+            if not truncate_text or response.status_code >= 400:
+                raise ForgeResponseTooLarge("forge response exceeded size limit")
+            try:
+                raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
+            prefix = raw[:max_bytes - len(_FILE_TRUNCATION_MARKER.encode("utf-8"))]
+            return prefix.decode("utf-8", errors="ignore") + _FILE_TRUNCATION_MARKER
         if response.status_code >= 400:
             reasons = {
                 401: "authentication failed",
@@ -331,7 +344,12 @@ class GitHubForgeClient:
                 retryable=response.status_code == 429 or response.status_code >= 500,
             )
         if not raw:
-            return None
+            return "" if accept == "application/vnd.github.raw" else None
+        if accept == "application/vnd.github.raw":
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ForgeError("forge returned invalid text (binary file refused)") from exc
         if "application/json" not in response.headers.get("Content-Type", ""):
             try:
                 return raw.decode("utf-8")
@@ -344,8 +362,14 @@ class GitHubForgeClient:
 
     def _paginate(
         self, endpoint: str, *, collection_key: str | None = None,
-        limit: int | None = None,
+        limit: int | None = None, merged_only: bool = False,
+        predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> list[Mapping[str, Any]]:
+        """Count matching rows toward limit; limited queries return partial at 10 pages.
+
+        Unlimited collections still raise on overflow. collection_key supports
+        object-wrapped collections such as Actions jobs without losing this bound.
+        """
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
         for page in range(1, _MAX_PAGES + 1):
@@ -354,7 +378,12 @@ class GitHubForgeClient:
                 payload = payload.get(collection_key) if isinstance(payload, Mapping) else None
             if not isinstance(payload, list):
                 raise ForgeError("forge returned an invalid collection")
-            page_items = [item for item in payload if isinstance(item, Mapping)]
+            page_items = [
+                item for item in payload
+                if isinstance(item, Mapping)
+                and (not merged_only or item.get("merged_at") is not None)
+                and (predicate is None or predicate(item))
+            ]
             items.extend(page_items)
             if limit is not None and len(items) >= limit:
                 return items[:limit]
@@ -362,6 +391,8 @@ class GitHubForgeClient:
                 raise ForgeResponseTooLarge("forge collection exceeded item limit")
             if len(payload) < 50:
                 return items
+        if limit is not None:
+            return items
         raise ForgeResponseTooLarge("forge collection exceeded page limit")
 
     @staticmethod
@@ -468,6 +499,69 @@ class GitHubForgeClient:
             updated_at=self._text(data.get("updated_at"), 64),
         )
 
+    def list_pull_requests(
+        self, repository: str, *, state: str, base: str | None = None,
+        head: str | None = None, limit: int = 30,
+        author: str | None = None, merged_since: datetime | None = None,
+    ) -> tuple[PullRequestSummary, ...]:
+        """List bounded, updated-descending PR summaries from the fixed GitHub host."""
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ForgeError("invalid repository selector")
+        if state not in {"open", "closed", "merged", "all"} or type(limit) is not int or not 1 <= limit <= 100:
+            raise ForgeError("invalid pull-request list selector")
+        query = {"state": "closed" if state == "merged" else state,
+                 "sort": "updated", "direction": "desc"}
+        if base is not None:
+            query["base"] = base
+        head_branch = head.partition(":")[2] if head is not None and ":" in head else head
+        if head is not None:
+            query["head"] = head if ":" in head else f"{repository.split('/')[0]}:{head}"
+
+        def matches(item: Mapping[str, Any]) -> bool:
+            head_data = item.get("head")
+            if head_branch is not None and (
+                not isinstance(head_data, Mapping) or head_data.get("ref") != head_branch
+            ):
+                return False
+            if author is not None and self._user(item).casefold() != author.casefold():
+                return False
+            if merged_since is not None:
+                merged_at = item.get("merged_at")
+                if not isinstance(merged_at, str):
+                    return False
+                try:
+                    merged = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+                    merged = merged.replace(tzinfo=merged.tzinfo or timezone.utc)
+                except ValueError as exc:
+                    raise ForgeError("forge returned invalid merged timestamp") from exc
+                if merged < merged_since:
+                    return False
+            return True
+
+        rows = self._paginate(
+            f"/repos/{repository}/pulls?{urlencode(query)}",
+            limit=limit, merged_only=state == "merged", predicate=matches,
+        )
+        return tuple(
+            PullRequestSummary(
+                number=int(item.get("number", 0)),
+                title=self._text(item.get("title"), 1_024),
+                state="merged" if item.get("merged_at") is not None else self._text(item.get("state"), 32),
+                author=self._text(self._user(item), 256),
+                head_ref=self._text(head_data.get("ref"), 255),
+                base_ref=self._text(base_data.get("ref"), 255),
+                head_sha=self._text(head_data.get("sha"), 64),
+                updated_at=self._text(item.get("updated_at"), 64),
+                merged_at=self._text(item.get("merged_at"), 64) or None,
+                url=self._text(item.get("html_url"), 4_096),
+            )
+            for item in rows
+            for head_data, base_data in [(
+                item.get("head") if isinstance(item.get("head"), Mapping) else {},
+                item.get("base") if isinstance(item.get("base"), Mapping) else {},
+            )]
+        )
+
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]:
         repository, number = self._target(scope)
         return tuple(
@@ -493,6 +587,63 @@ class GitHubForgeClient:
         if not isinstance(data, str):
             raise ForgeError("forge returned an invalid diff")
         return bound_diff(data)
+
+    def get_file_content(self, scope: RepoPRActionScope, path: str) -> str:
+        repository, _number = self._target(scope)
+        # Validate before requesting the pinned commit or walking its tree.
+        parts = path.split("/") if isinstance(path, str) else []
+        if (
+            not parts or not path or path.startswith("/")
+            or any(part in {".", ".."} for part in parts)
+            or any(not part for part in parts[1:]) or "\\" in path
+            or any(ord(character) < 32 for character in path)
+            or len(path.encode("utf-8")) > 4_096
+        ):
+            raise ForgeError("invalid repository path")
+        # The pinned commit's Git tree proves every component's actual mode;
+        # unlike Contents, it never dereferences a symlink to a regular file.
+        commit = self._request(
+            "GET", f"/repos/{repository}/git/commits/{scope.observed_head_sha}",
+        )
+        tree = commit.get("tree") if isinstance(commit, Mapping) else None
+        tree_sha = tree.get("sha") if isinstance(tree, Mapping) else None
+        if (
+            not isinstance(commit, Mapping)
+            or commit.get("sha") != scope.observed_head_sha
+            or not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None
+        ):
+            raise ForgeError("file content refused: scoped commit tree is unavailable")
+        for index, part in enumerate(parts):
+            listing = self._request("GET", f"/repos/{repository}/git/trees/{tree_sha}")
+            entries = listing.get("tree") if isinstance(listing, Mapping) else None
+            if not isinstance(entries, list):
+                raise ForgeError("file content refused: scoped tree is unavailable")
+            matches = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("path") == part]
+            if len(matches) != 1:
+                raise ForgeError("file content refused: path is not a regular file at scoped head")
+            entry = matches[0]
+            final = index == len(parts) - 1
+            if final:
+                if (
+                    entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}
+                ):
+                    raise ForgeError("file content refused: path is not a regular file at scoped head")
+            elif entry.get("type") != "tree" or entry.get("mode") != "040000":
+                raise ForgeError("file content refused: path crosses a symlink or submodule")
+            tree_sha = entry.get("sha")
+            if not isinstance(tree_sha, str) or _SHA.fullmatch(tree_sha) is None:
+                raise ForgeError("file content refused: invalid scoped tree entry")
+        # Fetch the verified blob once: no base64 Contents metadata response
+        # can exceed the smaller JSON cap before this bounded raw read.
+        data = self._request(
+            "GET", f"/repos/{repository}/git/blobs/{tree_sha}",
+            accept="application/vnd.github.raw",
+            max_bytes=_MAX_DIFF_FETCH_BYTES, not_found="file not found at scoped head",
+            truncate_text=True,
+        )
+        if not isinstance(data, str):
+            raise ForgeError("file content refused: directory, symlink or submodule response")
+        return data
 
     def list_checks(self, scope: RepoPRActionScope) -> tuple[CheckProjection, ...]:
         repository, _number = self._target(scope)
