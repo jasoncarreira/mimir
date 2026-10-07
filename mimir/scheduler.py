@@ -68,6 +68,7 @@ from .loop_watchdog import (
     stack_is_apscheduler_logging_flush,
     stack_is_idle,
 )
+from .malloc_trim import trim_heap, trim_supported
 from .quota_windows import provider_store_keys
 from .models import AgentEvent
 from .pollers import (
@@ -87,6 +88,7 @@ log = logging.getLogger(__name__)
 
 # Process-lifetime pools start threads lazily and cannot starve DNS/turn IO.
 _SCRATCH_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scratch-sweep")
+_MALLOC_TRIM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="malloc-trim")
 _WORKLINK_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="worklink-reap")
 
 UTC = timezone.utc
@@ -3279,6 +3281,40 @@ class Scheduler:
             default_cron=cron_expr,
             job_id=job_id,
             misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # ---- glibc heap trim cron ----------------------------------------
+
+    def add_malloc_trim_job(
+        self, cron_expr: str, *, job_id: str = "malloc-trim",
+    ) -> bool:
+        """Return freed glibc heap to the OS every cron fire, off the loop.
+
+        An empty cron or unsupported allocator/platform installs nothing.
+        Environment settings are resolved at registration (restart to change).
+        """
+        if not cron_expr or not trim_supported():
+            return False
+
+        async def _fire() -> None:
+            result = await run_in_pool(_MALLOC_TRIM_POOL, trim_heap)
+            if result is None:
+                return
+            if result.rss_before_bytes - result.rss_after_bytes >= 16 * 1024 * 1024:
+                await log_event(
+                    "malloc_trim",
+                    rss_before_mb=result.rss_before_bytes / (1024 * 1024),
+                    rss_after_mb=result.rss_after_bytes / (1024 * 1024),
+                    released=result.released,
+                )
+
+        return self.register_callable(
+            name=job_id,
+            fn=_fire,
+            default_cron=cron_expr,
+            job_id=job_id,
             max_instances=1,
             coalesce=True,
         )
