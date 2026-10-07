@@ -577,6 +577,126 @@ async def test_on_reaction_rejects_unvalidated_platform_user_id(
 
 
 @pytest.mark.asyncio
+async def test_reaction_admission_exception_propagates_without_side_effects(
+    bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+    error = RuntimeError("intake admission unavailable")
+    bridge.admit = MagicMock(side_effect=error)
+    bridge.identity_resolver = SimpleNamespace(identity=MagicMock())
+    log_event = AsyncMock()
+    monkeypatch.setattr("mimir.event_logger.log_event", log_event)
+
+    with pytest.raises(RuntimeError, match="intake admission unavailable") as raised:
+        await bridge._on_reaction({
+            "type": "reaction_added", "user": "UOUTSIDER", "reaction": "thumbsup",
+            "item": {"type": "message", "channel": "C01ENG",
+                     "ts": "1714768925.000100", "bot_id": "BSELF123"},
+        })
+
+    assert raised.value is error
+    bridge.admit.assert_called_once()
+    bridge.identity_resolver.identity.assert_not_called()
+    log_event.assert_not_called()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_in_item", [False, True])
+async def test_unadmitted_reaction_on_non_bot_message_is_silent(
+    bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    target_in_item: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = "USELF"
+    bridge._bot_id = "BSELF123"
+    bridge.admit = MagicMock(return_value=False)
+    bridge.identity_resolver = SimpleNamespace(identity=MagicMock())
+    log_event = AsyncMock()
+    monkeypatch.setattr("mimir.event_logger.log_event", log_event)
+    event = {
+        "user": "UOUTSIDER", "reaction": "thumbsup",
+        "item": {"type": "message", "channel": "C01ENG",
+                 "ts": "1714768925.000100"},
+    }
+    if target_in_item:
+        event["item"]["item_user"] = "UOTHER"
+    else:
+        event["item_user"] = "UOTHER"
+
+    await bridge._on_reaction(event)
+
+    bridge.admit.assert_not_called()
+    bridge.identity_resolver.identity.assert_not_called()
+    log_event.assert_not_called()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user", "open_bridge", "enforced", "admitted"),
+    [
+        ("UUNKNOWN", False, False, False),
+        ("U05ALICE", False, True, True),
+        ("UUNKNOWN", True, False, True),
+        ("UUNKNOWN", True, True, False),
+    ],
+)
+async def test_reaction_uses_dispatcher_intake_admission(
+    bridge_with_fake_app, tmp_path: Path,
+    user: str, open_bridge: bool, enforced: bool, admitted: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "identities.yaml").write_text(
+        "people:\n  - canonical: alice\n    aliases: [slack-U05ALICE]\n"
+        "    access: {roles: [user]}\n", encoding="utf-8",
+    )
+    resolver = IdentityResolver(home=tmp_path)
+    resolver.reload()
+    dispatcher = Dispatcher(replace(
+        Config.from_env(), home=tmp_path,
+        access_control_enforced=enforced, open_bridge=open_bridge,
+    ), resolver=resolver)
+    bridge.admit = dispatcher.intake_admits
+    bridge.identity_resolver = resolver
+    bridge._bot_user_id = None
+    bridge._bot_id = "BSELF123"
+
+    await bridge._on_reaction({
+        "user": user, "reaction": "thumbsup",
+        "item": {"type": "message", "channel": "C01ENG",
+                 "ts": "1714768925.000100", "bot_id": "BSELF123"},
+    })
+
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    if admitted:
+        assert {key: row[key] for key in (
+            "type", "event_version", "bridge", "channel_id", "emoji", "polarity",
+            "action", "author", "owner_principal", "target_message_id",
+        )} == {
+            "type": "react_received", "event_version": "v1", "bridge": "slack",
+            "channel_id": "slack-C01ENG", "emoji": "👍", "polarity": "positive",
+            "action": "add", "author": f"slack-{user}",
+            "owner_principal": "alice" if user == "U05ALICE" else None,
+            "target_message_id": "1714768925.000100",
+        }
+        assert isinstance(row["target_age_minutes"], float)
+    else:
+        assert {key: row[key] for key in ("type", "reason", "bridge", "author", "channel_id")} == {
+            "type": "reaction_ignored", "reason": "author_not_admitted",
+            "bridge": "slack", "author": "slack-UUNKNOWN", "channel_id": "slack-C01ENG",
+        }
+        assert not ({"emoji", "polarity", "target_message_id", "target_age_minutes", "action"} & row.keys())
+
+
+@pytest.mark.asyncio
 async def test_on_reaction_skips_self_bot_id_when_user_id_unresolved(
     bridge_with_fake_app, tmp_path: Path,
 ):

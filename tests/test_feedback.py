@@ -3644,6 +3644,59 @@ def test_feedback_selection_labels_exactly_security_admitted_events(
     assert source.resource_id == "slack-D-alice"
 
 
+def test_v1_null_owner_reaction_never_reaches_prompt_for_any_context(tmp_path: Path) -> None:
+    """The prompt must reject an unowned v1 row even if its raw author resolves."""
+    resolver = _FeedbackResolver({
+        "alice": "alice", "bob": "bob",
+        "slack-UUNKNOWN": "alice", "slack-U05ALICE": "alice",
+    })
+    log = _make_log(tmp_path, events=[
+        {
+            "timestamp": _ts(0.1), "type": "react_received", "event_version": "v1",
+            "bridge": "slack", "channel_id": "slack-C01ENG",
+            "author": "slack-UUNKNOWN", "owner_principal": None,
+            "emoji": "thumbsdown", "polarity": "negative",
+        },
+        {
+            "timestamp": _ts(0.1), "type": "react_received", "event_version": "v1",
+            "bridge": "slack", "channel_id": "slack-C01ENG",
+            "author": "slack-U05ALICE", "owner_principal": "alice",
+            "emoji": "thumbsup", "polarity": "positive",
+        },
+    ])
+    log.identity_resolver = resolver
+    for auth in (
+        _feedback_owner_auth(resolver),
+        replace(_feedback_owner_auth(resolver), channel_id="slack-C01ENG"),
+        replace(_feedback_owner_auth(resolver), roles=("admin",)),
+        replace(_feedback_owner_auth(resolver), roles=("admin",), channel_id="slack-C01ENG"),
+        _feedback_owner_auth(resolver, principal="bob"),
+    ):
+        block = log.recent_prompt_block(auth)
+        if auth.canonical_principal == "alice":
+            assert block is not None
+            assert "slack-U05ALICE" in block.content
+            assert "slack-UUNKNOWN" not in block.content
+            assert "thumbsdown" not in block.content
+        else:
+            assert block is None
+
+
+def test_reaction_ignored_is_never_feedback(tmp_path: Path) -> None:
+    from mimir.feedback.rules import classify
+
+    assert classify("reaction_ignored") is None
+    resolver = _FeedbackResolver({"slack-UUNKNOWN": "alice"})
+    log = _make_log(tmp_path, events=[{
+        "timestamp": _ts(0.1), "type": "reaction_ignored",
+        "reason": "author_not_admitted", "bridge": "slack",
+        "author": "slack-UUNKNOWN", "channel_id": "slack-C01ENG",
+    }])
+    log.identity_resolver = resolver
+    assert log.recent_block() is None
+    assert log.recent_prompt_block(_feedback_owner_auth(resolver)) is None
+
+
 @pytest.mark.parametrize(
     ("bridge", "author", "expected"),
     [
