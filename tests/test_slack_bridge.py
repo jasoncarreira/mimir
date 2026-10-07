@@ -577,6 +577,37 @@ async def test_on_reaction_rejects_unvalidated_platform_user_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("target_in_item", [False, True])
+async def test_unadmitted_reaction_on_non_bot_message_is_silent(
+    bridge_with_fake_app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    target_in_item: bool,
+) -> None:
+    bridge, _, _ = bridge_with_fake_app
+    bridge._bot_user_id = "USELF"
+    bridge._bot_id = "BSELF123"
+    bridge.admit = MagicMock(return_value=False)
+    bridge.identity_resolver = SimpleNamespace(identity=MagicMock())
+    log_event = AsyncMock()
+    monkeypatch.setattr("mimir.event_logger.log_event", log_event)
+    event = {
+        "user": "UOUTSIDER", "reaction": "thumbsup",
+        "item": {"type": "message", "channel": "C01ENG",
+                 "ts": "1714768925.000100"},
+    }
+    if target_in_item:
+        event["item"]["item_user"] = "UOTHER"
+    else:
+        event["item_user"] = "UOTHER"
+
+    await bridge._on_reaction(event)
+
+    bridge.admit.assert_not_called()
+    bridge.identity_resolver.identity.assert_not_called()
+    log_event.assert_not_called()
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("user", "open_bridge", "enforced", "admitted"),
     [

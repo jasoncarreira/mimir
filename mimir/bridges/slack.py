@@ -973,6 +973,11 @@ class SlackBridge(Bridge):
             return
 
         item = event.get("item") or {}
+        # This is a local check: unrelated reactions must stay silent,
+        # without reaching admission or recording outsider activity.
+        if not self._is_own_bot_message_ref(event, item):
+            return
+
         slack_channel = item.get("channel") or ""
         # Reaction payloads may omit channel_type; use the existing
         # public-channel fallback (bench bridges never get reactions).
@@ -989,9 +994,6 @@ class SlackBridge(Bridge):
                 )
             except Exception:  # noqa: BLE001
                 pass
-            return
-
-        if not self._is_own_bot_message_ref(event, item):
             return
 
         emoji_raw = event.get("reaction") or ""
