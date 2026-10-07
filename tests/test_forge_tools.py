@@ -27,6 +27,7 @@ from mimir.forge import (
     FileProjection,
     IssueTarget,
     PullRequestProjection,
+    PullRequestSummary,
     ReviewProjection,
     ReviewRequestProjection,
     ReviewVerdict,
@@ -55,6 +56,7 @@ from mimir.tools.forge import (
     pr_files,
     pr_inline_review_comment,
     pr_metadata,
+    pr_list,
     pr_rerequest_review,
     pr_review_requests,
     pr_reviews,
@@ -726,6 +728,14 @@ class FakeForge:
             "a" * 40, True, "created", "updated",
         )
 
+    def list_pull_requests(self, repository, *, state, base, head, limit,
+                           author=None, merged_since=None):
+        self.calls.append(("pr_list", repository, state, base, head, limit, author, merged_since))
+        return (PullRequestSummary(
+            17, "Title", "open", "author", "change", "main", "a" * 40,
+            "2026-10-01T00:00:00Z", None, "https://github.com/owner/repo/pull/17",
+        ),)
+
     def get_pull_request_snapshot(self, repository, number):
         self.calls.append(("snapshot", repository, number))
         head_sha = (
@@ -1022,7 +1032,7 @@ def test_tool_surface_requires_exact_repository_and_resource_selectors() -> None
         if forge_tool.name == "ci_run_jobs":
             selectors = {"run_id"} & set(properties)
         assert "repository" in properties
-        assert len(selectors) == 1, forge_tool.name
+        assert len(selectors) == (0 if forge_tool.name == "pr_list" else 1), forge_tool.name
         assert not ({"repo", "pr_number", "issue_number", "url", "host"} & set(properties))
         assert "runtime" not in properties
         assert forge_tool._injected_args_keys == frozenset({"runtime"})
@@ -1238,7 +1248,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     init_logger(home / "events.jsonl", "test")
     invocations = (
-        (pr_metadata, {}), (pr_files, {}), (pr_diff, {}), (pr_checks, {}),
+        (pr_list, {}), (pr_metadata, {}), (pr_files, {}), (pr_diff, {}), (pr_checks, {}),
         (pr_reviews, {}), (pr_comments, {}), (pr_review_requests, {}),
         (pr_submit_review, {"verdict": "approve", "body": "Looks good"}),
         (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "Fix"}),
@@ -1255,7 +1265,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
     node = ToolNode(list(FORGE_TOOLS))
     for index, (forge_tool, arguments) in enumerate(invocations):
         arguments = {"repository": "owner/repo", **arguments}
-        if forge_tool is not issue_comment:
+        if forge_tool not in (issue_comment, pr_list):
             arguments["pull_request"] = 17
         tool_call = {
             "name": forge_tool.name, "args": arguments,
@@ -1266,7 +1276,7 @@ def test_every_tool_class_invokes_through_langchain_with_injected_runtime(
         assert forge_tool.invoke(injected["args"]) is not None, forge_tool.name
 
     assert [call[0] for call in client.calls] == [
-        "metadata", "files", "diff", "checks", "reviews", "comments",
+        "pr_list", "metadata", "files", "diff", "checks", "reviews", "comments",
         "review_requests", "review", "inline", "comment", "edit_body", "issue_target",
         "issue_comment", "rerequest",
     ]
@@ -3764,3 +3774,88 @@ def test_issue_comment_registration_and_capability_preflights() -> None:
     )
     access_control.assert_capability_matrix_complete()
     access_control.assert_model_tool_inventory_cataloged()
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("repository", "other/repo", "GITHUB_REPOS"),
+    ("repository", "https://evil.invalid/owner/repo", "repository"),
+    ("state", "draft", "state"),
+    ("limit", 0, "limit"), ("limit", 101, "limit"),
+    ("limit", True, "limit"),
+    ("author", "bad login!", "author"),
+    ("head", "../x", "head"), ("head", "-x", "head"),
+    ("head", "x" * 256, "head"),
+    ("base", "", "base"), ("head", "fork:-x", "head"),
+    ("base", "x\nmain", "base"),
+    ("merged_since", "yesterday", "merged_since"),
+])
+def test_pr_list_refuses_invalid_selectors_before_client_call(monkeypatch, field, value, message):
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    with pytest.raises(ToolException, match=message):
+        pr_list.func(**{"repository": "owner/repo", field: value})
+    assert client.calls == []
+
+
+def test_pr_list_passes_author_and_normalized_merged_since_to_pagination(monkeypatch):
+    client = FakeForge()
+    client.list_pull_requests = lambda repo, *, state, base, head, limit, author, merged_since: (
+        client.calls.append((repo, state, base, head, limit, author, merged_since)) or (
+            PullRequestSummary(1, "match", "merged", "Bot", "topic", "main", "a" * 40,
+                               "2026-10-03T00:00:00Z", "2026-10-02T12:00:00Z", "url"),
+        )
+    )
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    result = pr_list.func(repository="owner/repo", state="merged", author="bot",
+                          merged_since="2026-10-01", base="main", head="fork:topic", limit=10)
+    assert [item["number"] for item in result] == [1]
+    from datetime import datetime, timezone
+
+    assert client.calls == [("owner/repo", "merged", "main", "fork:topic", 10,
+                             "bot", datetime(2026, 10, 1, tzinfo=timezone.utc))]
+
+
+def test_pr_list_repository_shape_is_independent_of_configuration_check(monkeypatch):
+    client = FakeForge()
+    set_forge_client(client)
+    monkeypatch.setattr(access_control, "is_configured_github_repo", lambda _: True)
+    with pytest.raises(ToolException, match="repository"):
+        pr_list.func(repository="https://evil.invalid/owner/repo")
+    assert client.calls == []
+
+
+def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch):
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *args: pytest.fail("list attested"), raising=False)
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    capture = access_control.begin_protected_result_capture()
+    try:
+        result = pr_list.func(repository="owner/repo", runtime=runtime)
+    finally:
+        provenance = access_control.end_protected_result_capture(capture)
+    assert provenance is None
+    authorization = access_control.ToolAuthorization(
+        tool_name="pr_list", decision=access_control.OperationDecision.ADMIN_REQUIRED,
+        allowed=True, flow_direction=access_control.ToolFlowDirection.SOURCE,
+    )
+    labels = access_control.classify_protected_result(
+        "pr_list", {"repository": "owner/repo"}, runtime.context, authorization,
+        result=result, provenance=provenance,
+    )
+    assert labels.has_untrusted_active_ingest
+    assert labels.sources[0].domain == "repository"
+    assert "pr_list" in access_control.TRIGGER_AUTHORITY_PROFILES["github"]
+    assert "pr_list" in access_control.TRIGGER_AUTHORITY_PROFILES["heartbeat"]
+    assert "pr_list" not in access_control._TYPED_REPO_PR_TOOL_ACTIONS
+
+
+def test_pr_list_guidance_replaces_shell_listing() -> None:
+    skills = Path(__file__).parents[1] / "mimir" / "skills"
+    for name in ("github", "chainlink"):
+        content = (skills / name / "SKILL.md").read_text(encoding="utf-8")
+        assert "gh pr list" not in content
+        assert "pr_list(" in content

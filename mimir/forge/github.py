@@ -7,10 +7,11 @@ import json
 import os
 import re
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -23,6 +24,7 @@ from .client import (
     ForgeResponseTooLarge,
     IssueTarget,
     PullRequestProjection,
+    PullRequestSummary,
     ReviewProjection,
     ReviewRequestProjection,
     ReviewVerdict,
@@ -360,8 +362,14 @@ class GitHubForgeClient:
 
     def _paginate(
         self, endpoint: str, *, collection_key: str | None = None,
-        limit: int | None = None,
+        limit: int | None = None, merged_only: bool = False,
+        predicate: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> list[Mapping[str, Any]]:
+        """Count matching rows toward limit; limited queries return partial at 10 pages.
+
+        Unlimited collections still raise on overflow. collection_key supports
+        object-wrapped collections such as Actions jobs without losing this bound.
+        """
         items: list[Mapping[str, Any]] = []
         separator = "&" if "?" in endpoint else "?"
         for page in range(1, _MAX_PAGES + 1):
@@ -370,7 +378,12 @@ class GitHubForgeClient:
                 payload = payload.get(collection_key) if isinstance(payload, Mapping) else None
             if not isinstance(payload, list):
                 raise ForgeError("forge returned an invalid collection")
-            page_items = [item for item in payload if isinstance(item, Mapping)]
+            page_items = [
+                item for item in payload
+                if isinstance(item, Mapping)
+                and (not merged_only or item.get("merged_at") is not None)
+                and (predicate is None or predicate(item))
+            ]
             items.extend(page_items)
             if limit is not None and len(items) >= limit:
                 return items[:limit]
@@ -378,6 +391,8 @@ class GitHubForgeClient:
                 raise ForgeResponseTooLarge("forge collection exceeded item limit")
             if len(payload) < 50:
                 return items
+        if limit is not None:
+            return items
         raise ForgeResponseTooLarge("forge collection exceeded page limit")
 
     @staticmethod
@@ -482,6 +497,69 @@ class GitHubForgeClient:
             mergeable=data.get("mergeable") if isinstance(data.get("mergeable"), bool) else None,
             created_at=self._text(data.get("created_at"), 64),
             updated_at=self._text(data.get("updated_at"), 64),
+        )
+
+    def list_pull_requests(
+        self, repository: str, *, state: str, base: str | None = None,
+        head: str | None = None, limit: int = 30,
+        author: str | None = None, merged_since: datetime | None = None,
+    ) -> tuple[PullRequestSummary, ...]:
+        """List bounded, updated-descending PR summaries from the fixed GitHub host."""
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ForgeError("invalid repository selector")
+        if state not in {"open", "closed", "merged", "all"} or type(limit) is not int or not 1 <= limit <= 100:
+            raise ForgeError("invalid pull-request list selector")
+        query = {"state": "closed" if state == "merged" else state,
+                 "sort": "updated", "direction": "desc"}
+        if base is not None:
+            query["base"] = base
+        head_branch = head.partition(":")[2] if head is not None and ":" in head else head
+        if head is not None:
+            query["head"] = head if ":" in head else f"{repository.split('/')[0]}:{head}"
+
+        def matches(item: Mapping[str, Any]) -> bool:
+            head_data = item.get("head")
+            if head_branch is not None and (
+                not isinstance(head_data, Mapping) or head_data.get("ref") != head_branch
+            ):
+                return False
+            if author is not None and self._user(item).casefold() != author.casefold():
+                return False
+            if merged_since is not None:
+                merged_at = item.get("merged_at")
+                if not isinstance(merged_at, str):
+                    return False
+                try:
+                    merged = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+                    merged = merged.replace(tzinfo=merged.tzinfo or timezone.utc)
+                except ValueError as exc:
+                    raise ForgeError("forge returned invalid merged timestamp") from exc
+                if merged < merged_since:
+                    return False
+            return True
+
+        rows = self._paginate(
+            f"/repos/{repository}/pulls?{urlencode(query)}",
+            limit=limit, merged_only=state == "merged", predicate=matches,
+        )
+        return tuple(
+            PullRequestSummary(
+                number=int(item.get("number", 0)),
+                title=self._text(item.get("title"), 1_024),
+                state="merged" if item.get("merged_at") is not None else self._text(item.get("state"), 32),
+                author=self._text(self._user(item), 256),
+                head_ref=self._text(head_data.get("ref"), 255),
+                base_ref=self._text(base_data.get("ref"), 255),
+                head_sha=self._text(head_data.get("sha"), 64),
+                updated_at=self._text(item.get("updated_at"), 64),
+                merged_at=self._text(item.get("merged_at"), 64) or None,
+                url=self._text(item.get("html_url"), 4_096),
+            )
+            for item in rows
+            for head_data, base_data in [(
+                item.get("head") if isinstance(item.get("head"), Mapping) else {},
+                item.get("base") if isinstance(item.get("base"), Mapping) else {},
+            )]
         )
 
     def list_files(self, scope: RepoPRActionScope) -> tuple[FileProjection, ...]:

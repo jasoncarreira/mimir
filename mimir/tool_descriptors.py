@@ -335,6 +335,7 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "pr_job_log": _D(result_origin=_E | _R),
     "ci_run_jobs": _D(result_origin=_E | _R),
     "pr_metadata": _D(result_origin=_E | _R),
+    "pr_list": _D(result_origin=_E | _R),
     "pr_rerequest_review": _D(SinkCategory.FORGE, _repo_pr_target, "bound_pull_request", result_origin=_N, sink_payload_extractor=None),
     "pr_review_requests": _D(result_origin=_E | _R),
     "pr_reviews": _D(result_origin=_E | _R),

@@ -151,6 +151,109 @@ def test_metadata_target_and_auth_are_adapter_constructed() -> None:
     assert kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
+def _pr_row(number, *, merged=False):
+    return {
+        "number": number, "title": "外" * 2000, "state": "closed" if merged else "open",
+        "user": {"login": "author"}, "head": {"ref": "topic", "sha": "a" * 40},
+        "base": {"ref": "main"}, "updated_at": "2026-10-03T00:00:00Z",
+        "merged_at": "2026-10-02T00:00:00Z" if merged else None,
+        "html_url": f"https://github.com/owner/repo/pull/{number}",
+    }
+
+
+def test_pr_list_qualifies_bare_head_and_drops_wrong_branch_before_limit():
+    wrong = _pr_row(1)
+    wrong["head"]["ref"] = "unrelated"
+    session = Session([Response([wrong, _pr_row(2)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", head="topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert "head=owner%3Atopic" in session.calls[0][1]
+
+
+@pytest.mark.parametrize("selector", ["author", "merged_since", "both"])
+def test_pr_list_applies_filters_before_limit_across_pages(selector):
+    from datetime import datetime, timezone
+
+    excluded = [_pr_row(n, merged=True) for n in range(50)]
+    for item in excluded:
+        item["user"]["login"] = "other"
+        item["merged_at"] = "2026-09-01T00:00:00Z"
+    # Matching rows must be discovered after a full page of rejected rows,
+    # not merely beyond limit within an already-fetched page.
+    session = Session([Response(excluded), Response([_pr_row(51, merged=True), _pr_row(52, merged=True)])])
+    kwargs = {}
+    if selector in {"author", "both"}:
+        kwargs["author"] = "AUTHOR"
+    if selector in {"merged_since", "both"}:
+        kwargs["merged_since"] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="all", limit=1, **kwargs,
+    )
+    assert [item.number for item in result] == [51]
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("state", ["all", "open", "closed"])
+@pytest.mark.parametrize("merged_at", [None, False, 123])
+def test_pr_list_merged_since_drops_unmerged_rows_before_limit(state, merged_at):
+    from datetime import datetime, timezone
+
+    unmerged = _pr_row(1)
+    unmerged["merged_at"] = merged_at
+    if state == "closed":
+        unmerged["state"] = "closed"
+    session = Session([Response([unmerged, _pr_row(2, merged=True)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state=state, limit=1,
+        merged_since=datetime(2026, 10, 1, tzinfo=timezone.utc),
+    )
+    # Non-merged state selectors must exercise matches(), not merged_only.
+    # An unmerged row must neither escape the filter nor consume the limit.
+    assert [item.number for item in result] == [2]
+    assert result[0].merged_at == "2026-10-02T00:00:00Z"
+    assert f"state={state}&" in session.calls[0][1]
+
+
+def test_paginate_limited_collection_returns_partial_at_page_cap():
+    session = Session([Response({"jobs": [{"id": n}] * 50}) for n in range(10)])
+    result = GitHubForgeClient(session=session)._paginate(
+        "/repos/owner/repo/actions/runs/42/jobs", collection_key="jobs", limit=501,
+    )
+    assert len(result) == 500
+    assert len(session.calls) == 10
+
+
+def test_pr_list_uses_fixed_endpoint_query_and_filters_merged_before_limit():
+    session = Session([Response([_pr_row(1), _pr_row(2, merged=True), _pr_row(3, merged=True)])])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", base="main", head="fork:topic", limit=1,
+    )
+    assert [item.number for item in result] == [2]
+    assert result[0].state == "merged"
+    assert len(result[0].title) == 1024
+    assert session.calls[0][0:2] == (
+        "GET", "https://api.github.com/repos/owner/repo/pulls?"
+        "state=closed&sort=updated&direction=desc&base=main&head=fork%3Atopic&per_page=50&page=1",
+    )
+
+
+def test_pr_list_paginates_to_limit_and_stops_at_ten_pages():
+    session = Session([Response([_pr_row(page * 50 + n, merged=True) for n in range(50)])
+                       for page in range(20)])
+    client = GitHubForgeClient(session=session)
+    assert len(client.list_pull_requests("owner/repo", state="all", limit=51)) == 51
+    assert len(session.calls) == 2
+    session = Session([Response([_pr_row(page * 50 + n) for n in range(50)])
+                       for page in range(20)])
+    result = GitHubForgeClient(session=session).list_pull_requests(
+        "owner/repo", state="merged", limit=100,
+    )
+    assert result == ()
+    assert len(session.calls) == 10
+
+
 def test_file_content_reads_verified_blob_from_observed_head() -> None:
     session = Session([*_file_responses("src/a #1.py", "b" * 40),
                        Response("text at observed head", content_type="text/plain")])

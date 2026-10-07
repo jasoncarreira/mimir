@@ -141,8 +141,11 @@ and then run extra checks if budget remains. When the tool-call count is
 visibly high, reserve roughly 10-15 calls for the side effect,
 verification (`gh pr view` / `gh pr checks`), and wrap-up.
 
+Use `pr_list(repository="owner/repo", state="open")` to list open PRs in a
+configured repository. For recently merged PRs, use
+`pr_list(repository="owner/repo", state="merged", merged_since="2026-10-01")`.
+
 ```bash
-gh pr list --state open                       # open PRs on the current repo
 gh pr view 42                                  # view a PR
 gh pr view 42 --json title,state,reviews       # structured fields
 gh pr checks 42                                # CI status
