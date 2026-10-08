@@ -14,6 +14,9 @@ from langchain_core.tools import StructuredTool, ToolException
 
 from mimir.mcp_client import MCPConnection, MCPManager, MCPServerConfig
 
+# Bound the entire lifecycle, including finally-block transport teardown.
+pytestmark = pytest.mark.timeout(60)
+
 SERVER = Path(__file__).parent / "fixtures" / "mcp_stdio_server.py"
 
 
@@ -21,6 +24,7 @@ async def _contract(
     check: Callable[[MCPConnection, dict[str, StructuredTool]], Awaitable[None]],
     *,
     call_timeout_s: float = 2.0,
+    cross_task_shutdown: bool = False,
 ) -> None:
     manager = MCPManager(call_timeout_s=call_timeout_s)
     pid: int | None = None
@@ -36,7 +40,10 @@ async def _contract(
         pid = int(await by_name["server_pid"].coroutine())
         await check(connection, by_name)
     finally:
-        await manager.shutdown()
+        if cross_task_shutdown:
+            await asyncio.create_task(manager.shutdown())
+        else:
+            await manager.shutdown()
         if pid is not None:
             # Only observe the process owned by this connection, not ambient children.
             for _ in range(50):
@@ -66,6 +73,18 @@ async def test_stdio_handshake_initialize_and_discovery() -> None:
         assert greeting.args_schema.model_json_schema()["properties"]["name"]["type"] == "string"
 
     await asyncio.wait_for(_contract(check), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_stdio_shutdown_from_different_task(caplog: pytest.LogCaptureFixture) -> None:
+    async def check(_conn: MCPConnection, tools: dict[str, StructuredTool]) -> None:
+        assert await tools["greeting"].coroutine(name="Ada") == "Hello, Ada!"
+
+    await asyncio.wait_for(_contract(check, cross_task_shutdown=True), timeout=30)
+    assert not [
+        record for record in caplog.records
+        if record.name == "mimir.mcp_client" and "shutdown failed" in record.getMessage()
+    ]
 
 
 @pytest.mark.asyncio

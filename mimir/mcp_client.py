@@ -748,6 +748,8 @@ class MCPManager:
         self._policy_store = MCPPolicyStore(policy_store_path) if policy_store_path else None
         self.policy_records: dict[str, dict[str, Any]] = {}
         self.startup_failures: list[dict[str, str]] = []
+        self._owner_task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
 
     def _validate_identities(
         self,
@@ -813,6 +815,53 @@ class MCPManager:
         configures the same server name twice or when underscore-laden
         tool names happen to produce the same namespaced string.
         """
+        if self._owner_task is not None and not self._owner_task.done():
+            raise RuntimeError("MCP servers already started; shut down before restarting")
+        ready: asyncio.Future[list[StructuredTool]] = asyncio.get_running_loop().create_future()
+        stop = asyncio.Event()
+        self._stop_event = stop
+        self._owner_task = asyncio.create_task(
+            self._own_servers(configs, fail_fast=fail_fast, ready=ready, stop=stop),
+            name="mcp-manager-owner",
+        )
+        try:
+            return await asyncio.shield(ready)
+        except BaseException:
+            stop.set()
+            # Startup cancellation must not strand a transport owner. Shield its
+            # teardown from the caller; all SDK contexts remain in that task.
+            await asyncio.shield(self._owner_task)
+            if ready.done() and not ready.cancelled():
+                ready.exception()
+            raise
+
+    async def _own_servers(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+        ready: asyncio.Future[list[StructuredTool]],
+        stop: asyncio.Event,
+    ) -> None:
+        """Enter and exit every SDK context in one dedicated, long-lived task."""
+        try:
+            tools = await self._start_servers_owned(configs, fail_fast=fail_fast)
+            ready.set_result(tools)
+            await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                log.exception("MCP owner task failed")
+        finally:
+            await self._close_connections()
+
+    async def _start_servers_owned(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+    ) -> list[StructuredTool]:
         self.startup_failures = []
         records = self._policy_store.load() if self._policy_store else {}
         configs = self._apply_stored_policies(configs, records)
@@ -922,12 +971,18 @@ class MCPManager:
             raise
 
     async def shutdown(self) -> None:
-        """Tear down every subprocess + session.
+        """Signal the transport owner and await teardown from any caller task."""
+        owner = self._owner_task
+        if owner is None:
+            return
+        assert self._stop_event is not None
+        self._stop_event.set()
+        # Do not move SDK context exits to this task, or propagate caller
+        # cancellation into the owner's AnyIO scopes during teardown.
+        await asyncio.shield(owner)
 
-        SDK 2.x enters task-local AnyIO cancel scopes for both the session
-        and transport. Close in reverse order in the owning task, with a
-        per-server bound so a stuck server doesn't block the rest.
-        """
+    async def _close_connections(self) -> None:
+        """Close in reverse order inside the owner, bounded per connection."""
         if not self.connections:
             return
         try:
