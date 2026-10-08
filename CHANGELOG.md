@@ -11,6 +11,7 @@ All notable changes will land here. Format loosely follows
   failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
   A dedicated lifecycle task owns SDK contexts so production shutdown can
   be requested from a different task without leaking the server subprocess.
+- Deliver substantive autonomous `send_message` briefs after stripping a trailing skip-list stop sentence, while continuing to block narration (#1892).
 
 ## [0.9.6] — 2026-10-08
 

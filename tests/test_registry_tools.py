@@ -2342,6 +2342,14 @@ class TestSendMessageInteractivityGuard:
 
 
 class TestSendMessageSkiplistGuard:
+    @staticmethod
+    def _brief() -> str:
+        sections = [
+            f"Section {section}: " + " ".join(f"detail{item}" for item in range(100))
+            for section in range(4)
+        ]
+        return "\n\n".join(sections) + "\nAction: confirm the rollout at noon."
+
     def _turn_ctx(self, trigger: str):
         from mimir._context import reset_current_turn, set_current_turn
         from mimir.models import TurnContext
@@ -2469,6 +2477,25 @@ class TestSendMessageSkiplistGuard:
         finally:
             reset(tok)
 
+        assert out == (
+            "send_message rejected: this autonomous turn found only "
+            "skip-bucket / no-action narration. The correct action is to end "
+            "the turn with no message."
+        )
+        assert bridge.send_calls == []
+
+    @pytest.mark.asyncio
+    async def test_short_stop_phrase_mid_message_is_rejected(self) -> None:
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({
+                "text": "End silent. No dispatch is needed.", "channel_id": "operator",
+            })
+        finally:
+            reset(tok)
+
         assert "send_message rejected" in out
         assert bridge.send_calls == []
 
@@ -2489,6 +2516,11 @@ class TestSendMessageSkiplistGuard:
             (
                 "poller",
                 "   [ SkIp ] long autonomous narration that exceeds the short-message word gate and should still be blocked",
+                "[skip]",
+            ),
+            (
+                "scheduled_tick",
+                "[skip] " + "status " * 210 + "End silent.",
                 "[skip]",
             ),
         ],
@@ -2521,6 +2553,132 @@ class TestSendMessageSkiplistGuard:
         assert ev["channel_id"] == "operator"
         assert ev["trigger"] == trigger
         assert ev["matched_phrase"] == matched_phrase
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("word_count", [150, 200])
+    async def test_narration_at_or_below_substantive_threshold_is_blocked(
+        self, tmp_path, word_count: int,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        message = " ".join(["status"] * (word_count - 4)) + " Review complete. End silent."
+        _ctx, tok, reset = self._turn_ctx("scheduled_tick")
+        try:
+            with pytest.raises(ToolException, match="send_message rejected"):
+                assert send_message.coroutine is not None
+                await send_message.coroutine(text=message, channel_id="operator")
+        finally:
+            reset(tok)
+
+        assert bridge.send_calls == []
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        [event] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert event["channel_id"] == "operator"
+        assert event["trigger"] == "scheduled_tick"
+        assert event["matched_phrase"] == "end silent"
+        assert "removed_chars" not in event
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tail", "expected_suffix"),
+        [
+            ("\n\nEnd silent.", "Action: confirm the rollout at noon."),
+            ("\n\nBrief delivered. End silent.", "Brief delivered."),
+        ],
+    )
+    async def test_substantive_brief_strips_trailing_stop_sentence(
+        self, tmp_path, tail: str, expected_suffix: str,
+    ) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        message = self._brief() + tail
+        _ctx, tok, reset = self._turn_ctx("scheduled_tick")
+        try:
+            out = await send_message.ainvoke({"text": message, "channel_id": "operator"})
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": message[: -len("End silent.")].rstrip()}]
+        delivered = bridge.send_calls[0]["text"]
+        assert delivered.endswith(expected_suffix)
+        assert "Action: confirm the rollout at noon." in delivered
+        assert "End silent" not in delivered
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        [event] = [e for e in events if e["type"] == "send_message_skiplist_tail_stripped"]
+        assert event["channel_id"] == "operator"
+        assert event["trigger"] == "scheduled_tick"
+        assert event["matched_phrase"] == "end silent"
+        assert event["removed_chars"] == len(message) - len(delivered)
+        assert not [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+
+    @pytest.mark.asyncio
+    async def test_substantive_mid_message_stop_phrase_is_unchanged(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        message = self._brief().replace("Section 2:", "Section 2: End silent. Next item:")
+        _ctx, tok, reset = self._turn_ctx("poller")
+        try:
+            out = await send_message.ainvoke({"text": message, "channel_id": "operator"})
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": message}]
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        assert not [e for e in events if e["type"] == "send_message_skiplist_tail_stripped"]
+
+    @pytest.mark.asyncio
+    async def test_only_stop_phrase_lines_still_rejected(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        message = "\n".join(["End silent."] * 101)
+        _ctx, tok, reset = self._turn_ctx("scheduled_tick")
+        try:
+            with pytest.raises(ToolException, match="send_message rejected"):
+                assert send_message.coroutine is not None
+                await send_message.coroutine(text=message, channel_id="operator")
+        finally:
+            reset(tok)
+
+        assert bridge.send_calls == []
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        [event] = [e for e in events if e["type"] == "send_message_blocked_skiplist"]
+        assert event["matched_phrase"] == "end silent"
+        assert not [e for e in events if e["type"] == "send_message_skiplist_tail_stripped"]
+
+    @pytest.mark.asyncio
+    async def test_interactive_substantive_tail_is_unchanged(self, tmp_path) -> None:
+        from mimir.event_logger import init_logger
+
+        init_logger(tmp_path / "events.jsonl", session_id="test-session")
+        bridge = _StubBridge()
+        set_channel_registry(_StubRegistry(bridge, channel_id="operator"))
+        message = self._brief() + "\n\nEnd silent."
+        _ctx, tok, reset = self._turn_ctx("user_message")
+        try:
+            out = await send_message.ainvoke({"text": message, "channel_id": "operator"})
+        finally:
+            reset(tok)
+
+        assert "send_message ok" in out
+        assert bridge.send_calls == [{"cid": "operator", "text": message}]
+        events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+        assert not [e for e in events if e["type"] in {
+            "send_message_skiplist_tail_stripped", "send_message_blocked_skiplist",
+        }]
 
     @pytest.mark.asyncio
     async def test_poller_escalation_containing_stop_phrase_sends(self) -> None:
