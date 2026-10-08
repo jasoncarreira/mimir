@@ -106,7 +106,7 @@ Available extras (combine in one install command — e.g. `pip install
 | `mcp` | Model Context Protocol client |
 
 For **Claude Max** (the subprocess provider via Claude Code), install the
-normal `claude-code` extra (which pulls `langchain-claude-code-mimir>=0.1.2,<0.2`) plus the Claude Code CLI:
+normal `claude-code` extra (which pulls `langchain-claude-code-mimir>=0.1.3,<0.2`) plus the Claude Code CLI:
 
 ```bash
 pip install "mimir-agent[claude-code]"
