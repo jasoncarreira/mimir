@@ -38,6 +38,7 @@ from mimir.access_control import (
     end_protected_result_capture,
 )
 from mimir.models import AuthContext
+from mimir.models import InformationFlowLabels, InformationFlowState, SourceLabel
 from mimir.read_policy import framework_large_tool_results_root
 from mimir.readonly_backend import (
     MAX_GREP_CONTEXT_LINES,
@@ -70,6 +71,147 @@ def home(tmp_path: Path) -> Path:
     (tmp_path / ".mimir").mkdir()
     (tmp_path / "logs" / "existing.txt").write_text("preexisting log line\n")
     return tmp_path
+
+
+_INSTRUCTION_FILES = (
+    "scheduler.yaml", "prompts/heartbeat.md", "pollers-overrides.yaml",
+    "memory/core/policy.md", "memory/INDEX.md", "skills/mail/SKILL.md",
+    "skills/mail/pollers.json", "skills/mail/scripts/run.py",
+)
+
+
+@pytest.mark.parametrize("relative", _INSTRUCTION_FILES)
+@pytest.mark.parametrize("operation", ["write", "edit", "replace", "awrite", "aedit", "areplace"])
+@pytest.mark.asyncio
+async def test_tainted_file_tools_veto_each_live_instruction_surface(
+    home: Path, monkeypatch: pytest.MonkeyPatch, relative: str, operation: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    path = home / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("original", encoding="utf-8")
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="page", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"external"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    auth = SimpleNamespace(ifc_state=InformationFlowState(labels=labels),
+                           ifc_labels=InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(
+        turn_id=f"veto-{operation}-{relative}", auth_context=auth,
+        ifc_labels=InformationFlowLabels(),
+    ))
+    try:
+        backend = WriteGuardBackend(home, ["prompts", "memory", "skills", "scratch"])
+        backend._writable_roots.append(home)  # exercise the veto even with a permissive root
+        args = ("original", "changed") if "edit" in operation else ("changed",)
+        result = getattr(backend, operation)("/" + relative, *args)
+        if operation.startswith("a"):
+            result = await result
+        assert "open_proposal/submit_proposal" in result.error
+        assert path.read_text(encoding="utf-8") == "original"
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("spelling", ["alias.md", "prompts/../scheduler.yaml"])
+def test_tainted_file_guard_resolves_alias_and_traversal(
+    home: Path, monkeypatch: pytest.MonkeyPatch, spelling: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    (home / "prompts").mkdir()
+    (home / "scheduler.yaml").write_text("original", encoding="utf-8")
+    (home / "alias.md").symlink_to(home / "scheduler.yaml")
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="page", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"external"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    auth = SimpleNamespace(ifc_state=InformationFlowState(labels=labels), ifc_labels=InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(turn_id=f"alias-{spelling}", auth_context=auth,
+                                             ifc_labels=InformationFlowLabels()))
+    try:
+        backend = WriteGuardBackend(home, ["prompts"])
+        backend._writable_roots.append(home)
+        assert "open_proposal/submit_proposal" in backend.replace(spelling, "changed").error
+        assert (home / "scheduler.yaml").read_text(encoding="utf-8") == "original"
+    finally:
+        reset_current_turn(token)
+
+
+def test_tainted_upload_cannot_install_live_instructions(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="page", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"external"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    auth = SimpleNamespace(ifc_state=InformationFlowState(labels=labels),
+                           ifc_labels=InformationFlowLabels())
+    token = set_current_turn(SimpleNamespace(turn_id="tainted-upload", auth_context=auth,
+                                             ifc_labels=InformationFlowLabels()))
+    try:
+        backend = WriteGuardBackend(home, ["state", "prompts"])
+        result = backend.upload_files([
+            ("/prompts/heartbeat.md", b"instruction"),
+            ("/state/ordinary.md", b"ordinary"),
+        ])
+        assert all(item.error == "permission_denied" for item in result)
+        assert not (home / "prompts" / "heartbeat.md").exists()
+        assert not (home / "state" / "ordinary.md").exists()
+        assert any(d["op"] == "upload_scheduled_instruction_veto" for d in backend.drain_denials())
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("relative", _INSTRUCTION_FILES)
+def test_clean_instruction_write_and_tainted_proposal_checkout_writes(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    clean = SimpleNamespace(ifc_state=InformationFlowState(labels=InformationFlowLabels()),
+                            ifc_labels=InformationFlowLabels())
+    tainted_labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="page", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"external"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    tainted = SimpleNamespace(ifc_state=InformationFlowState(labels=tainted_labels),
+                              ifc_labels=InformationFlowLabels())
+    live = home / relative
+    live.parent.mkdir(parents=True, exist_ok=True)
+    token = set_current_turn(SimpleNamespace(turn_id=f"clean-{relative}", auth_context=clean,
+                                             ifc_labels=InformationFlowLabels()))
+    try:
+        backend = WriteGuardBackend(home, ["prompts", "memory", "skills"],
+                                    enforce_core_memory_readonly=False)
+        backend._writable_roots.append(home)
+        assert backend.write(relative, "text").error is None
+    finally:
+        reset_current_turn(token)
+    proposal = home / "scratch" / "proposals" / "upgrade" / "branch"
+    checkout = tmp_path / "pr-leases" / "branch"
+    token = set_current_turn(SimpleNamespace(turn_id=f"proposal-{relative}", auth_context=tainted,
+                                             ifc_labels=InformationFlowLabels()))
+    try:
+        # The same backend serves the home and proposal subtree: exclusion must
+        # be based on the resolved target, not on a separate backend instance.
+        home_proposal = home / "scratch" / "proposals" / "upgrade" / "branch" / relative
+        home_proposal.parent.mkdir(parents=True, exist_ok=True)
+        assert WriteGuardBackend(home, ["scratch"]).write(
+            str(home_proposal), "text",
+        ).error is None
+        for root in (proposal, checkout):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_text("seed", encoding="utf-8")
+            backend = WriteGuardBackend(root, ["prompts", "memory", "skills"],
+                                        enforce_core_memory_readonly=False)
+            backend._writable_roots.append(root)
+            assert backend.replace(relative, "text").error is None
+    finally:
+        reset_current_turn(token)
 
 
 @pytest.mark.parametrize("backend_kind", ["guard", "readonly"])

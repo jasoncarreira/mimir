@@ -89,6 +89,183 @@ from mimir.worklink.continuation import (
 ALL_LABELS = frozenset({"private", "confidential", "internal", "public"})
 
 
+@pytest.mark.parametrize("tool", [
+    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
+])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_schedule_mutations_always_veto_live_ingest(tool: str, enforce: bool) -> None:
+    tainted = _labels()
+    # The live state is authoritative even when the caller passes a stale snapshot.
+    auth = replace(_auth(roles=("admin",)), ifc_labels=InformationFlowLabels(),
+                   ifc_state=InformationFlowState(labels=tainted))
+    decision = ToolRegistry().authorize_tool(
+        tool, auth, enforce=enforce, ifc_labels=InformationFlowLabels(),
+    )
+    assert decision.allowed is False
+    assert decision.enforcement_enabled and not decision.is_shadow_decision
+    assert "open_proposal/submit_proposal" in decision.refusal_detail
+    assert SinkGate.check_sink_flow(
+        tool, "scheduler", InformationFlowLabels(), auth, enforce=enforce,
+    ).allowed is False
+
+
+@pytest.mark.parametrize("tool", [
+    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
+    "reload_pollers", "open_proposal", "submit_proposal",
+])
+def test_clean_schedule_and_proposal_calls_remain_available(tool: str) -> None:
+    auth = replace(_auth(roles=("admin",)), ifc_labels=InformationFlowLabels())
+    assert ToolRegistry().authorize_tool(tool, auth, enforce=False).allowed
+
+
+def test_tainted_turn_can_reload_and_propose() -> None:
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    for tool in ("reload_pollers", "open_proposal", "submit_proposal"):
+        assert ToolRegistry().authorize_tool(tool, auth, enforce=False).allowed
+
+
+def test_scheduled_write_unknown_integrity_fails_closed() -> None:
+    auth = replace(_auth(roles=("admin",)), ifc_labels=None)
+    denied = ToolRegistry().authorize_tool("add_schedule", auth, enforce=False)
+    assert not denied.allowed and denied.enforcement_enabled
+
+    class IndeterminateState:
+        def has_untrusted_active_ingest(self, _fallback: object) -> object:
+            return None
+
+    auth = replace(auth, ifc_labels=InformationFlowLabels(), ifc_state=IndeterminateState())
+    denied = ToolRegistry().authorize_tool("set_poller_overrides", auth, enforce=False)
+    assert not denied.allowed and denied.enforcement_enabled
+
+
+@pytest.mark.parametrize("relative", [
+    "scheduler.yaml", "prompts/heartbeat.md", "pollers-overrides.yaml",
+    "memory/core/policy.md", "memory/INDEX.md", "skills/mail/SKILL.md",
+    "skills/mail/pollers.json", "skills/mail/scripts/run.py",
+])
+@pytest.mark.parametrize("tool", ["write_file", "edit_file", "replace_file"])
+def test_authorization_vetoes_tainted_live_file_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str, tool: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    auth = replace(_auth(roles=("admin",)), ifc_labels=InformationFlowLabels(),
+                   ifc_state=InformationFlowState(labels=_labels()))
+    decision = ToolRegistry().authorize_tool(
+        tool, auth, enforce=False, target_channel=str(tmp_path / relative),
+        arguments={"file_path": str(tmp_path / relative)},
+    )
+    assert not decision.allowed and decision.enforcement_enabled
+    assert "open_proposal/submit_proposal" in decision.refusal_detail
+
+
+@pytest.mark.parametrize("relative", [
+    "scheduler.yaml", "prompts/heartbeat.md", "pollers-overrides.yaml",
+    "memory/core/policy.md", "memory/INDEX.md", "skills/mail/SKILL.md",
+    "skills/mail/pollers.json", "skills/mail/scripts/run.py",
+])
+def test_proposal_and_checkout_file_authorization_does_not_inherit_live_veto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    for path in (home / "scratch" / "proposals" / "upgrade" / "branch" / relative,
+                 tmp_path / "pr-leases" / "branch" / relative):
+        decision = ToolRegistry().authorize_tool(
+            "write_file", auth, enforce=False, target_channel=str(path),
+            arguments={"file_path": str(path)},
+        )
+        assert decision.allowed, (path, decision.reason)
+
+
+@pytest.mark.parametrize("spelling", ["alias.md", "prompts/../scheduler.yaml"])
+def test_file_authorization_resolves_live_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "alias.md").symlink_to(tmp_path / "scheduler.yaml")
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    decision = ToolRegistry().authorize_tool(
+        "replace_file", auth, enforce=False,
+        arguments={"file_path": str(tmp_path / spelling)},
+    )
+    assert not decision.allowed and decision.enforcement_enabled
+
+
+@pytest.mark.parametrize("profile", [
+    "scheduler_read_only", "maintenance", "repo_review", "session_boundary",
+    "upgrade_workspace",
+])
+@pytest.mark.parametrize("command", [
+    "printf text > /mimir-home/scheduler.yaml",
+    "tee /mimir-home/prompts/heartbeat.md",
+    "sed -i s/a/b/ /mimir-home/memory/INDEX.md",
+    "mv /tmp/file /mimir-home/scheduler.yaml",
+    "cp /tmp/file /mimir-home/pollers-overrides.yaml",
+    "rm /mimir-home/skills/mail/SKILL.md",
+    "install /tmp/file /mimir-home/skills/mail/scripts/run",
+    "truncate -s 0 /mimir-home/memory/core/policy.md",
+])
+def test_bounded_shell_profiles_refuse_live_instruction_writes(profile: str, command: str) -> None:
+    from mimir.access_control import parse_service_shell_argv
+
+    assert parse_service_shell_argv(command, profile) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    {"name": "daily", "cron": "0 8 * * *", "prompt": "report"},
+    {"name": "daily", "cron": "0 8 * * *", "prompt_file": "daily.md"},
+])
+async def test_tainted_schedule_prompt_variants_refused_before_execution(arguments: dict) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels(), enforcement_enabled=False)
+    request = ToolCallRequest(
+        tool_call={"name": "add_schedule", "args": arguments,
+                   "id": "scheduled-veto", "type": "tool_call"},
+        tool=None, state=None, runtime=Runtime(context=auth),
+    )
+    invoked = False
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        nonlocal invoked
+        invoked = True
+        return ToolMessage(content="scheduled", tool_call_id="scheduled-veto")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    assert result.status == "error" and not invoked
+    assert "open_proposal/submit_proposal" in str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_tainted_reload_pollers_executes_with_enforcement_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+    from mimir.tools.registry import _STATE, reload_pollers
+
+    class Scheduler:
+        async def reload_pollers(self) -> dict[str, int]:
+            return {"total": 1, "registered": 1}
+
+    monkeypatch.setitem(_STATE, "scheduler", Scheduler())
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels(), enforcement_enabled=False)
+    request = ToolCallRequest(
+        tool_call={"name": "reload_pollers", "args": {},
+                   "id": "tainted-reload", "type": "tool_call"},
+        tool=None, state=None, runtime=Runtime(context=auth),
+    )
+
+    async def handler(_request: ToolCallRequest) -> ToolMessage:
+        return ToolMessage(content=await reload_pollers.ainvoke({}),
+                           tool_call_id="tainted-reload")
+
+    result = await BudgetGateMiddleware().awrap_tool_call(request, handler)
+    assert result.status != "error"
+    assert "reload_pollers ok: total=1" in str(result.content)
+
+
 @pytest.fixture
 def ingress_resolver(tmp_path: Path) -> IdentityResolver:
     home = tmp_path / "ingress-identities"

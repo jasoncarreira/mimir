@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Operator action (#1893):** After untrusted ingest, schedule writes and edits to
+  live scheduler, prompt, poller override, core memory, index and skill instruction
+  files are refused even with IFC enforcement in shadow mode. Propose the change
+  with `open_proposal` / `submit_proposal` for operator merge instead. Poller reload
+  and edits inside proposal worktrees remain available. `list_schedules` now
+  preserves trusted turn integrity.
 - Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
   models and real stdio contract tests. This fixes the silent tool-discovery
   failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
