@@ -6,6 +6,7 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
 - Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
   internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).

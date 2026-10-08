@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import math
@@ -48,7 +48,7 @@ from .compute import (
 )
 from .claims import (
     ChainlinkClaims, ClaimRecord, ShutdownAbortRecord, OPERATOR_STOP_PREFIX,
-    SHUTDOWN_ABORT_PREFIX, WORKLINK_EPIC_LABEL,
+    SHUTDOWN_ABORT_PREFIX, QUOTA_HOLD_PREFIX, WORKLINK_EPIC_LABEL,
 )
 from .control import operator_stop_requested
 from .autonomy import chainlink_bin
@@ -1774,28 +1774,52 @@ class WorklinkRunner:
         # Keep the lock until routing succeeds, including through outer finally.
         terminal_release.retain_for_recovery = True
         incident_recorded = False
+        quota_hold = False
         if transition_status == "failed":
             try:
-                incident_owner.record(
+                quota_failure = selected_name == "opencode" and raw.backend_status == "quota_exhausted"
+                reset_at, reset_source = _worklink_quota_reset(self.home, raw.error or "") if quota_failure else (None, "")
+                incident = incident_owner.record(
                     producer="leaf_result",
                     home=self.home,
                     issue_id=issue.issue_id,
                     attempt=attempt,
                     error=transition_reason or "Worklink run failed",
                     failure_kind=(
-                        "tests_failed"
+                        "quota_exhausted" if quota_failure else "tests_failed"
                         if "tests_failed" in validation.reasons
                         else "operator_required"
                     ),
+                    quota_reset_at=reset_at,
                     exit_status=raw.exit_code if raw.exit_code != 0 else 1,
-                    autonomous=autonomous,
+                    autonomous=autonomous or quota_failure,
                     preserved_ref=lease.branch,
                     work_path=str(lease.path),
                 )
+                if incident is not None and incident.get("failure_kind") == "quota_exhausted":
+                    # The marker forgives this exact claim; the ledger bounds the
+                    # number of such holds and fences dispatch until the reset.
+                    hold = ShutdownAbortRecord(
+                        issue_id=issue.issue_id, attempt=attempt,
+                        agent_id=claim_record.agent_id, claimed_at=claim_record.claimed_at,
+                        aborted_at=datetime.now(UTC),
+                    )
+                    claims._run(
+                        "issue", "comment", str(issue.issue_id),
+                        QUOTA_HOLD_PREFIX + hold.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+                        + f"\nOpenCode quota hold until {incident['retry_after']} ({reset_source}).",
+                    )
+                    quota_hold = True
+                    transition_status = "quota_hold"
+                    transition_reason = None
+                    _log_event(
+                        "worklink_quota_hold", issue_id=issue.issue_id, attempt=attempt,
+                        retry_after=incident["retry_after"], reset_source=reset_source,
+                    )
             except OSError as write_exc:
                 incident_owner.bind(write_exc)
                 raise
-            incident_recorded = autonomous
+            incident_recorded = autonomous or quota_hold
         if pr_url:
             # Execution is finished and publication evidence is durable. Retire
             # the worker pointer so startup orphan reconciliation cannot demote
@@ -1809,7 +1833,7 @@ class WorklinkRunner:
                     issue.issue_id,
                     status=transition_status,
                     review_ready=validation.review_ready,
-                    attempt=claim_record.budget_attempt or attempt,
+                    attempt=None if quota_hold else claim_record.budget_attempt or attempt,
                     reason=transition_reason,
                 )
             except Exception as exc:
@@ -4512,6 +4536,7 @@ def _record_run_failure(
     transcript_path: str | None = None,
     work_started: bool | None = None,
     failure_kind: str = "operator_required",
+    quota_reset_at: datetime | None = None,
 ) -> dict[str, Any] | None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
@@ -4522,7 +4547,7 @@ def _record_run_failure(
         "worklink_run_failed",
         issue_id=issue_id,
         attempt=attempt,
-        attempt_consumed=attempt is not None and work_started is not False,
+        attempt_consumed=attempt is not None and work_started is not False and failure_kind != "quota_exhausted",
         exit_status=exit_status,
         terminal_error=safe_error,
         preserved_ref=preserved_ref,
@@ -4543,8 +4568,37 @@ def _record_run_failure(
             transcript_path=transcript_path,
             work_started=work_started,
             failure_kind=failure_kind,
+            quota_reset_at=quota_reset_at,
         )
     return None
+
+
+def _worklink_quota_reset(home: Path, error: str) -> tuple[datetime, str]:
+    """Use a plausible Codex reset, otherwise wait a bounded hour."""
+    from ..quota_pause import QuotaPauseTracker
+
+    now = datetime.now(UTC)
+    tracker = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
+    reset = tracker.reset_at if tracker.last_load_ok and tracker.provider == "codex-plus" else None
+    if reset is None:
+        # Parse the raw text hint: extract_reset_at intentionally clamps for
+        # agent pauses, which hides stale/garbage dates from this validity gate.
+        hint = re.search(
+            r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+            error,
+        )
+        if hint is not None:
+            try:
+                reset = datetime.fromisoformat(hint.group(1).replace("Z", "+00:00"))
+                if reset.tzinfo is None:
+                    reset = reset.replace(tzinfo=UTC)
+            except ValueError:
+                reset = None
+    if reset is not None and reset.tzinfo is not None:
+        reset = reset.astimezone(UTC)
+        if now < reset <= now + timedelta(days=8):
+            return reset, "Codex reset"
+    return now + timedelta(hours=1), "one-hour fallback"
 
 
 def _record_run_success(home: Path, issue_id: int) -> None:

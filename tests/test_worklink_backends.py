@@ -1345,12 +1345,99 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     assert auth.backend_status == "auth_error"
     assert "provider 'unknown'" in (auth.error or "")
 
-    quota = await backend.interpret(order, ComputeResult(1, "rate limit exceeded", ""))
+    quota = await backend.interpret(order, ComputeResult(1, "Error: Rate limit exceeded", ""))
     assert quota.backend_status == "quota_exhausted"
 
     plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
     assert plain.backend_status == "failed"
     assert plain.error == "boom"
+
+
+@pytest.mark.parametrize("line", [
+    "\x1b[91m\x1b[1mError: \x1b[0mThe usage limit has been reached",
+    "Error: The usage limit has been reached",
+    "Error: HTTP 429 Too Many Requests",
+    "Error: Too Many Requests",
+    'Error: Too Many Requests: {"error":{"message":"Try again later"}}',
+    "Error: Rate limit reached",
+])
+def test_opencode_provider_quota_error_records(line: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, "") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("line", [
+    "HTTP 429 Too Many Requests", "HTTP/1.1 429", "HTTP/2 429",
+    "status 429", "status code: 429", "429 Too Many Requests",
+    "Rate limit reached", "The usage limit has been reached",
+])
+def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, "→ Read mimir/budget.py", line) == "quota_exhausted"
+    assert _status_from_output(1, f"Error: {line}", "") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("stdout, stderr", [
+    ("", "Error: tests failed: 3 failed, 429 passed"),
+    ("", "Error: SyntaxError at foo.py line 429"),
+    ("provider: id 429 not found", ""),
+    ("codex rate limit reached in docs", ""),
+    ("openai: HTTP 429 in docs", ""),
+    ("provider: The usage limit has been reached", ""),
+    ("HTTP 429 Too Many Requests", ""),
+])
+def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, stdout, stderr) == "failed"
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("line", [
+    "ERROR: pip: 429 Too Many Requests while fetching index",
+    "ERROR: HTTP 429 Too Many Requests",
+    "Error: test_quota: status code 429 expected",
+    "Error: test_quota: HTTP 429 Too Many Requests expected",
+    "Error: test_quota: The usage limit has been reached expected",
+    "Error:HTTP 429 Too Many Requests",
+    "error: HTTP 429 Too Many Requests",
+    "Error: HTTP 4290",
+    "Error: assert response.status_code == 429",
+    "npm ERR! 429 Too Many Requests",
+    "stack frame: status: 429",
+], ids=[
+    "pip-uppercase", "uppercase-prefix", "test-status-substring",
+    "test-http-substring", "test-usage-substring", "missing-prefix-space",
+    "lowercase-prefix", "not-429", "assertion", "npm", "stack-frame",
+])
+def test_opencode_tool_quota_messages_remain_failures(line: str, stream: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    stdout, stderr = (line, "") if stream == "stdout" else ("", line)
+    assert _status_from_output(1, stdout, stderr) == "failed"
+
+
+@pytest.mark.parametrize("line", [
+    "→ Read mimir/rate_limits.py", "→ Read mimir/budget.py",
+    "→ Grep quota mimir/quota_pause.py",
+    "→ Error: The usage limit has been reached",
+    "| Error: HTTP 429",
+])
+def test_opencode_quoted_quota_is_not_provider_error(line: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, line) == "failed"
+
+
+def test_opencode_auth_error_wins_over_echoed_quota_and_real_quota() -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(
+        1, "→ Read mimir/rate_limits.py\nError: Rate limit reached",
+        "\x1b[91mError: \x1b[0mToken refresh failed: 401",
+    ) == "auth_error"
 
 
 @pytest.mark.parametrize("stderr", [
