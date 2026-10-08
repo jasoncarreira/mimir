@@ -1357,6 +1357,8 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     "\x1b[91m\x1b[1mError: \x1b[0mThe usage limit has been reached",
     "Error: The usage limit has been reached",
     "Error: HTTP 429 Too Many Requests",
+    "Error: Too Many Requests",
+    'Error: Too Many Requests: {"error":{"message":"Try again later"}}',
     "Error: Rate limit reached",
 ])
 def test_opencode_provider_quota_error_records(line: str) -> None:
@@ -1389,6 +1391,31 @@ def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
 def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -> None:
     from mimir.worklink.backends.opencode import _status_from_output
 
+    assert _status_from_output(1, stdout, stderr) == "failed"
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize("line", [
+    "ERROR: pip: 429 Too Many Requests while fetching index",
+    "ERROR: HTTP 429 Too Many Requests",
+    "Error: test_quota: status code 429 expected",
+    "Error: test_quota: HTTP 429 Too Many Requests expected",
+    "Error: test_quota: The usage limit has been reached expected",
+    "Error:HTTP 429 Too Many Requests",
+    "error: HTTP 429 Too Many Requests",
+    "Error: HTTP 4290",
+    "Error: assert response.status_code == 429",
+    "npm ERR! 429 Too Many Requests",
+    "stack frame: status: 429",
+], ids=[
+    "pip-uppercase", "uppercase-prefix", "test-status-substring",
+    "test-http-substring", "test-usage-substring", "missing-prefix-space",
+    "lowercase-prefix", "not-429", "assertion", "npm", "stack-frame",
+])
+def test_opencode_tool_quota_messages_remain_failures(line: str, stream: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    stdout, stderr = (line, "") if stream == "stdout" else ("", line)
     assert _status_from_output(1, stdout, stderr) == "failed"
 
 

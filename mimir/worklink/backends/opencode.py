@@ -621,29 +621,31 @@ _HTTP_QUOTA_STATUS = (
     r"http(?:/\d(?:\.\d)?)?\s+429\b"
     r"|status(?:\s+code)?[:= ]+429\b|429\s+Too Many Requests\b"
 )
+# OpenCode v1.18.21 cli/ui.ts emits exactly "Error: " before the message.
+# cli/cmd/run.ts prints session.error.data.message, not the structured statusCode;
+# provider/error.ts preserves the API message (or falls back to STATUS_CODES).
+# Match the beginning of that message, never a status mentioned in tool output.
+# "Too Many Requests" is the status-text fallback for an HTTP 429 API error.
 _PROVIDER_QUOTA_EVIDENCE = re.compile(
-    r"\bthe usage limit has been reached\b|\b(?:" + _HTTP_QUOTA_STATUS + r")"
-    r"|\brate limit (?:exceeded|reached)\b",
-    re.IGNORECASE,
-)
-# Only OpenCode's Error: prefix establishes an error record on stdout.
-# Unprefixed stderr evidence must itself start with a quota/status message.
-_ERROR_RECORD = re.compile(r"^Error:", re.IGNORECASE)
-_STDERR_QUOTA_RECORD = re.compile(
     r"^(?:the usage limit has been reached\b|rate limit (?:exceeded|reached)\b|"
-    + _HTTP_QUOTA_STATUS + r")",
+    r"Too Many Requests\b|" + _HTTP_QUOTA_STATUS + r")",
     re.IGNORECASE,
 )
+_ERROR_RECORD = re.compile(r"^Error: ")
 
 
 def _provider_quota_line(stdout: str, stderr: str) -> str | None:
     for stream, is_stderr in ((stderr, True), (stdout, False)):
         for line in stream.splitlines():
             clean = _ANSI_CSI.sub("", line).strip()
-            if (
-                (_ERROR_RECORD.search(clean) or (is_stderr and _STDERR_QUOTA_RECORD.search(clean)))
-                and _PROVIDER_QUOTA_EVIDENCE.search(clean)
-            ):
+            prefix = _ERROR_RECORD.match(clean)
+            if prefix is not None:
+                message = clean[prefix.end():]
+            elif is_stderr:
+                message = clean
+            else:
+                continue
+            if _PROVIDER_QUOTA_EVIDENCE.match(message):
                 return clean
     return None
 
