@@ -22,10 +22,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 log = logging.getLogger(__name__)
 
 CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code-mimir"
 UPSTREAM_LANGCHAIN_CLAUDE_CODE_DIST = "langchain-claude-code"
+_MIN_CONTROLLED_ADAPTER_VERSION = "0.1.3"
 
 # These flags describe fixes already shipped by the controlled distribution.
 # Keep the declaration path so a future adapter can assert native support without
@@ -36,6 +39,7 @@ _REQUIRED_ADAPTER_FEATURES = frozenset(
         "tool_call_schema",
         "streaming_result_metadata",
         "sdk_tool_events",
+        "bridged_tool_invoke",
     }
 )
 
@@ -83,7 +87,7 @@ def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> Ad
     ``InjectedToolArg`` fields through schemas, and drops metadata/hook data
     Mimir consumes. Supported paths are:
 
-    * a controlled distribution named ``langchain-claude-code-mimir``;
+    * ``langchain-claude-code-mimir`` version 0.1.3 or newer;
     * an adapter module explicitly declaring all required compatibility
       features.
     """
@@ -98,6 +102,20 @@ def langchain_claude_code_adapter_compatibility(module: Any | None = None) -> Ad
 
     controlled_version = _distribution_version(CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST)
     if controlled_version is not None:
+        try:
+            parsed_version = Version(controlled_version)
+        except InvalidVersion:
+            parsed_version = None
+        if (
+            parsed_version is None
+            or parsed_version < Version(_MIN_CONTROLLED_ADAPTER_VERSION)
+        ):
+            return AdapterCompatibility(
+                False,
+                f"{CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}=={controlled_version} is "
+                f"unsupported; require >= {_MIN_CONTROLLED_ADAPTER_VERSION} to fix "
+                "bridged LangChain tool execution (StructuredTool._arun missing config)",
+            )
         return AdapterCompatibility(
             True,
             f"{CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST}=={controlled_version} is installed",
