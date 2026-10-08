@@ -184,9 +184,10 @@ async def test_external_sigterm_still_fails_and_rearms(tmp_path, monkeypatch):
     assert load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]["failure_kind"] == "operator_required"
 
 
+@pytest.mark.parametrize("prior_used", [0, 2], ids=["first-budget-attempt", "last-budget-attempt"])
 @pytest.mark.parametrize("known_reset", [True, False])
 @pytest.mark.asyncio
-async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_path, monkeypatch, known_reset):
+async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_path, monkeypatch, known_reset, prior_used):
     from mimir.worklink import orchestrator
     from mimir.worklink.backends.base import RawResult
     from mimir.worklink.checkout import CheckoutLease
@@ -239,6 +240,9 @@ async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_pa
     monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kwargs: events.append((name, kwargs)))
     claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner, max_attempts=3)
     state_dir = dispatch_failure_state_dir(tmp_path)
+    for attempt in range(1, prior_used + 1):
+        comments.append(ClaimRecord(700, attempt, "agent", datetime.now(UTC)).to_comment())
+    assert claims.attempts_used(comments) == prior_used
 
     async def finish(attempt):
         claim = ClaimRecord(700, attempt, "agent", datetime.now(UTC), budget_attempt=claims.attempts_used(comments) + 1)
@@ -258,12 +262,13 @@ async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_pa
             autonomous=True,
         )
 
-    for attempt in range(1, 6):
+    for hold_number in range(1, 6):
+        attempt = prior_used + hold_number
         started_hold = datetime.now(UTC)
         outcome = await finish(attempt)
         entry = load_failure_state(state_dir)["issues"]["700"]
-        assert entry["quota_holds"] == attempt
-        if attempt <= 4:
+        assert entry["quota_holds"] == hold_number
+        if hold_number <= 4:
             assert outcome.status == "quota_hold"
             assert entry["failure_kind"] == "quota_exhausted"
             retry_at = datetime.fromisoformat(entry["retry_after"])
@@ -272,18 +277,19 @@ async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_pa
             else:
                 assert started_hold + timedelta(hours=1) <= retry_at <= datetime.now(UTC) + timedelta(hours=1)
             assert entry["attempt_consumed"] is False
-            assert claims.attempts_used(comments) == 0
+            assert claims.attempts_used(comments) == prior_used
             assert labels == {"worklink:ready"}
             assert autonomous_dispatch_block_reason(state_dir, 700, now=retry_at - timedelta(seconds=1))
             assert autonomous_dispatch_block_reason(state_dir, 700, now=retry_at) is None
             assert pending_failure_alerts(state_dir)[1] == []
-            assert len([c for c in comments if c.startswith(QUOTA_HOLD_PREFIX)]) == attempt
+            assert len([c for c in comments if c.startswith(QUOTA_HOLD_PREFIX)]) == hold_number
             assert secret not in comments[-1]
         else:
             assert outcome.status == "failed"
             assert entry["failure_kind"] == "operator_required"
             assert entry["attempt_consumed"] is True
-            assert claims.attempts_used(comments) == 1
+            assert claims.attempts_used(comments) == prior_used + 1
+            assert labels == ({"worklink:blocked"} if prior_used == 2 else {"worklink:ready"})
             assert autonomous_dispatch_block_reason(state_dir, 700, now=reset + timedelta(days=1))
             assert len([c for c in comments if c.startswith(QUOTA_HOLD_PREFIX)]) == 4
             assert len(pending_failure_alerts(state_dir)[1]) == 1
@@ -307,6 +313,37 @@ def test_worklink_quota_reset_fallback_and_absurd_reset(tmp_path):
     reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
     assert source == "one-hour fallback"
     assert reset <= datetime.now(UTC) + timedelta(hours=1)
+
+
+def test_worklink_quota_reset_rejects_past_tracker_reset(tmp_path):
+    from mimir.worklink.orchestrator import _worklink_quota_reset
+
+    before = datetime.now(UTC)
+    pause_file = tmp_path / ".mimir" / "quota_pause.json"
+    pause_file.parent.mkdir()
+    pause_file.write_text(json.dumps({
+        "provider": "codex-plus",
+        "reset_at": (before - timedelta(hours=1)).isoformat(),
+    }))
+    reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
+    assert source == "one-hour fallback"
+    assert before + timedelta(hours=1) <= reset <= datetime.now(UTC) + timedelta(hours=1)
+
+
+def test_failure_kind_change_starts_new_occurrence(tmp_path):
+    from mimir.worklink.dispatch_failures import record_failure
+
+    now = datetime.now(UTC)
+    kwargs = dict(issue_id=700, attempt=1, exit_status=1, error="same error", log_path=None)
+    first = record_failure(tmp_path, **kwargs, failure_kind="tests_failed", now=now)
+    repeat = record_failure(tmp_path, **kwargs, failure_kind="tests_failed", now=now + timedelta(minutes=1))
+    changed = record_failure(tmp_path, **kwargs, failure_kind="quota_exhausted", now=now + timedelta(minutes=2))
+    assert repeat["occurrence_id"] == first["occurrence_id"]
+    assert repeat["consecutive"] == 2
+    assert changed["signature"] == repeat["signature"]
+    assert changed["occurrence_id"] != repeat["occurrence_id"]
+    assert changed["consecutive"] == 1
+    assert changed["failed_at"] == (now + timedelta(minutes=2)).isoformat()
 
 
 def test_quota_hold_marker_only_forgives_matching_claim():

@@ -1365,10 +1365,31 @@ def test_opencode_provider_quota_error_records(line: str) -> None:
     assert _status_from_output(1, line, "") == "quota_exhausted"
 
 
-def test_opencode_stderr_unprefixed_rate_limit_error() -> None:
+@pytest.mark.parametrize("line", [
+    "HTTP 429 Too Many Requests", "HTTP/1.1 429", "HTTP/2 429",
+    "status 429", "status code: 429", "429 Too Many Requests",
+    "Rate limit reached", "The usage limit has been reached",
+])
+def test_opencode_stderr_unprefixed_quota_error(line: str) -> None:
     from mimir.worklink.backends.opencode import _status_from_output
 
-    assert _status_from_output(1, "→ Read mimir/budget.py", "Rate limit reached") == "quota_exhausted"
+    assert _status_from_output(1, "→ Read mimir/budget.py", line) == "quota_exhausted"
+    assert _status_from_output(1, f"Error: {line}", "") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("stdout, stderr", [
+    ("", "Error: tests failed: 3 failed, 429 passed"),
+    ("", "Error: SyntaxError at foo.py line 429"),
+    ("provider: id 429 not found", ""),
+    ("codex rate limit reached in docs", ""),
+    ("openai: HTTP 429 in docs", ""),
+    ("provider: The usage limit has been reached", ""),
+    ("HTTP 429 Too Many Requests", ""),
+])
+def test_opencode_non_provider_quota_false_positives(stdout: str, stderr: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, stdout, stderr) == "failed"
 
 
 @pytest.mark.parametrize("line", [

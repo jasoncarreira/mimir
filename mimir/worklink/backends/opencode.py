@@ -617,14 +617,21 @@ _PROVIDER_AUTH_EVIDENCE = re.compile(
     r"|^token refresh failed[: ]+40[13]\b",
     re.IGNORECASE,
 )
+_HTTP_QUOTA_STATUS = (
+    r"http(?:/\d(?:\.\d)?)?\s+429\b"
+    r"|status(?:\s+code)?[:= ]+429\b|429\s+Too Many Requests\b"
+)
 _PROVIDER_QUOTA_EVIDENCE = re.compile(
-    r"\bthe usage limit has been reached\b|\b(?:http(?:/\d(?:\.\d)?)?\s+)?429\b"
+    r"\bthe usage limit has been reached\b|\b(?:" + _HTTP_QUOTA_STATUS + r")"
     r"|\brate limit (?:exceeded|reached)\b",
     re.IGNORECASE,
 )
-_ERROR_RECORD = re.compile(r"^(?:Error:|(?:provider|openai|codex)[: ]+|HTTP(?:/\d(?:\.\d)?)?\s+429\b)", re.IGNORECASE)
+# Only OpenCode's Error: prefix establishes an error record on stdout.
+# Unprefixed stderr evidence must itself start with a quota/status message.
+_ERROR_RECORD = re.compile(r"^Error:", re.IGNORECASE)
 _STDERR_QUOTA_RECORD = re.compile(
-    r"^(?:the usage limit has been reached|rate limit (?:exceeded|reached))\b",
+    r"^(?:the usage limit has been reached\b|rate limit (?:exceeded|reached)\b|"
+    + _HTTP_QUOTA_STATUS + r")",
     re.IGNORECASE,
 )
 
