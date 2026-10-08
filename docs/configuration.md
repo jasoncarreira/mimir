@@ -180,6 +180,41 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 
 ## Scheduler, pollers, usage/quota & health
 
+### `scheduler.yaml` operator chat shell declarations
+
+The legacy top-level job list remains valid. To opt into bounded commands in a
+tainted **admin operator chat** turn, use a mapping with `jobs:` (the original
+list) and a separate `operator_shell_commands:` list:
+
+```yaml
+operator_shell_commands:
+  - exec: gog
+    path: /usr/local/bin/gog
+    subcommands: [[calendar, events], [gmail, search]]
+    options: [--from, --to, --limit]
+    pass_env: [GOG_CONFIG_DIR]
+jobs:
+  - name: morning-briefing
+    cron: "0 8 * * *"
+    prompt: Prepare the morning brief.
+```
+
+Use only read-only verbs: **never declare** `gog gmail send`, `acli jira workitem
+create/transition`, or another mutating command. This is an explicit chat grant,
+not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
+executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
+`payload_args`, and interpreter/script entries are rejected. A malformed grant
+rejects the document at load. The agent cannot write `scheduler.yaml` with file
+tools, even on an untainted admin turn. Scheduled turns continue to use their
+own job declarations. The executable runs as server-bound argv, in a server-
+selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
+baseline; it never receives the whole process environment.
+
+An injected read query can still bring sensitive data into the turn. Command
+output remains untrusted active ingest; outbound sinks retain their taint checks.
+`operator_declared_shell_exec` audits the executable, subcommand, option **names**,
+outcome, and taint source domains without logging option values.
+
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `MIMIR_SCHEDULER_TZ` | str | `UTC` | IANA timezone all cron expressions are interpreted in. Invalid → UTC + warning. |

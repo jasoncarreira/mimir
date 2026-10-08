@@ -2263,6 +2263,28 @@ def parse_declared_shell_commands(
     return tuple(out)
 
 
+def parse_operator_shell_commands(
+    raw: object, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple[DeclaredShellCommand, ...]:
+    """Validate the chat-only, argv-only subset of shell declarations."""
+    if raw is not None and not isinstance(raw, list):
+        raise ValueError("operator_shell_commands must be a list")
+    for entry in raw or ():
+        if not isinstance(entry, dict):
+            raise ValueError("operator_shell_commands entries must be mappings")
+        for key in ("external_send", "payload_args", "script"):
+            if key in entry and (key != "external_send" or entry[key] is True):
+                raise ValueError(
+                    f"operator_shell_commands[{entry.get('exec')!r}]: {key} is not "
+                    "allowed in operator chat; declare read-only argv subcommands only"
+                )
+    try:
+        commands = parse_declared_shell_commands(raw, writable_roots=writable_roots)
+    except ValueError as exc:
+        raise DeclaredShellCommandError(f"operator_shell_commands: {exc}") from exc
+    return commands
+
+
 def _declared_command_execution_argv(
     argv: list[str], declared: tuple[DeclaredShellCommand, ...],
 ) -> list[str] | None:
@@ -3609,6 +3631,7 @@ class _OperatorShellArgvArtifact:
     family: str
     resolved_cwd: str
     _issuer: Any = field(repr=False, compare=False)
+    declaration: DeclaredShellCommand | None = None
 
 
 @dataclass(frozen=True)
@@ -3624,6 +3647,7 @@ class OperatorShellBinding:
     _request_identity: Any = field(repr=False, compare=False)
     _auth_context_identity: Any = field(repr=False, compare=False)
     _issuer: Any = field(repr=False, compare=False)
+    declaration: DeclaredShellCommand | None = None
 
 
 def _operator_argv_has_current_pin(argv: tuple[str, ...]) -> bool:
@@ -3641,6 +3665,25 @@ def _operator_argv_has_current_pin(argv: tuple[str, ...]) -> bool:
             and executable.is_file()
             and os.access(executable, os.X_OK)
             and not _maintenance_pin_is_service_writable(executable)
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
+def _operator_declared_pin_matches(
+    argv: tuple[str, ...], declaration: DeclaredShellCommand,
+) -> bool:
+    try:
+        return (
+            bool(argv) and argv[0] == str(declaration.path)
+            and declaration.script is None and not declaration.external_send
+            and not declaration.payload_args
+            and declaration.resolved_path is not None
+            and declaration.path.resolve(strict=True) == declaration.resolved_path
+            and declaration.path.is_file() and os.access(declaration.path, os.X_OK)
+            and _agent_writable_root_for_path(
+                declaration.path, agent_writable_roots(), admin_operator_turn=False,
+            ) is None
         )
     except (OSError, RuntimeError):
         return False
@@ -3674,7 +3717,11 @@ def _issue_operator_shell_binding(
         or not isinstance(argv_artifact, _OperatorShellArgvArtifact)
         or argv_artifact._issuer is not _OPERATOR_SHELL_ARGV_ISSUER
         or argv_artifact.resolved_cwd != resolved_cwd
-        or not _operator_argv_has_current_pin(argv_artifact.argv)
+        or not (
+            _operator_declared_pin_matches(argv_artifact.argv, argv_artifact.declaration)
+            if argv_artifact.declaration is not None
+            else _operator_argv_has_current_pin(argv_artifact.argv)
+        )
         or not _operator_final_argv_matches_family(argv_artifact)
     ):
         return None
@@ -3685,8 +3732,9 @@ def _issue_operator_shell_binding(
         or ".." in Path(requested_cwd).parts
     ):
         return None
-    cwd = _resolve_operator_bounded_cwd(
-        requested_cwd, git=argv_artifact.family == "git",
+    cwd = (
+        _resolve_operator_declared_cwd() if argv_artifact.declaration is not None
+        else _resolve_operator_bounded_cwd(requested_cwd, git=argv_artifact.family == "git")
     )
     if cwd is None or str(cwd) != resolved_cwd:
         return None
@@ -3705,6 +3753,7 @@ def _issue_operator_shell_binding(
         _request_identity=request_identity,
         _auth_context_identity=auth_context_identity,
         _issuer=_OPERATOR_SHELL_BINDING_ISSUER,
+        declaration=argv_artifact.declaration,
     )
 
 
@@ -3740,7 +3789,11 @@ def _operator_shell_binding_matches(
         or not isinstance(binding.resolved_cwd, str)
         or not binding.resolved_cwd
         or not binding.argv
-        or not _operator_argv_has_current_pin(binding.argv)
+        or not (
+            _operator_declared_pin_matches(binding.argv, binding.declaration)
+            if binding.declaration is not None
+            else _operator_argv_has_current_pin(binding.argv)
+        )
     ):
         return False
     if requested_cwd is not None and (
@@ -3762,11 +3815,13 @@ def _operator_shell_binding_matches(
         Path(binding.argv[0]).name,
         binding.resolved_cwd,
         _OPERATOR_SHELL_ARGV_ISSUER,
+        binding.declaration,
     )
     if not _operator_final_argv_matches_family(artifact):
         return False
-    resolved = _resolve_operator_bounded_cwd(
-        binding.requested_cwd, git=artifact.family == "git",
+    resolved = (
+        _resolve_operator_declared_cwd() if binding.declaration is not None
+        else _resolve_operator_bounded_cwd(binding.requested_cwd, git=artifact.family == "git")
     )
     return resolved is not None and str(resolved) == binding.resolved_cwd
 
@@ -3822,6 +3877,18 @@ def _operator_read_target(
     return resolve_non_admin_read_target(
         str(candidate), scan_file=scan_file, allow_home_root=not scan_file,
     )
+
+
+def _resolve_operator_declared_cwd() -> Path | None:
+    """Use an operator-owned working directory, never the model's cwd."""
+    home_raw = os.environ.get("MIMIR_HOME", "").strip()
+    if not home_raw:
+        return None
+    try:
+        home = Path(home_raw).resolve(strict=True)
+        return home if home.is_dir() else None
+    except (OSError, RuntimeError):
+        return None
 
 
 def _operator_recursive_read_preflight(
@@ -4002,12 +4069,19 @@ def _validated_operator_shell_argv_artifact(
     final_argv: list[str],
     *,
     resolved_cwd: str | Path,
+    declaration: DeclaredShellCommand | None = None,
 ) -> _OperatorShellArgvArtifact | None:
     if (
         not parsed_argv
         or not final_argv
-        or not _operator_argv_has_current_pin(tuple(parsed_argv))
-        or not _operator_argv_has_current_pin(tuple(final_argv))
+        or not (
+            _operator_declared_pin_matches(tuple(parsed_argv), declaration)
+            if declaration is not None else _operator_argv_has_current_pin(tuple(parsed_argv))
+        )
+        or not (
+            _operator_declared_pin_matches(tuple(final_argv), declaration)
+            if declaration is not None else _operator_argv_has_current_pin(tuple(final_argv))
+        )
     ):
         return None
     try:
@@ -4018,7 +4092,11 @@ def _validated_operator_shell_argv_artifact(
         return None
     family = Path(parsed_argv[0]).name
     expected: list[str] | None
-    if family in _OPERATOR_BINDABLE_READ_COMMANDS:
+    if declaration is not None:
+        expected = _declared_command_execution_argv(
+            [declaration.executable, *parsed_argv[1:]], (declaration,),
+        )
+    elif family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             parsed_argv, resolved_cwd=cwd,
         )
@@ -4038,6 +4116,7 @@ def _validated_operator_shell_argv_artifact(
         return None
     return _OperatorShellArgvArtifact(
         tuple(final_argv), family, str(cwd), _OPERATOR_SHELL_ARGV_ISSUER,
+        declaration,
     )
 
 
@@ -4048,6 +4127,14 @@ def _operator_final_argv_matches_family(
     family = artifact.family
     if not argv or Path(argv[0]).name != family:
         return False
+    if artifact.declaration is not None:
+        declaration = artifact.declaration
+        return (
+            _operator_declared_pin_matches(tuple(argv), declaration)
+            and _declared_command_execution_argv(
+                [declaration.executable, *argv[1:]], (declaration,),
+            ) == argv
+        )
     if family in _OPERATOR_BINDABLE_READ_COMMANDS:
         expected, _reason, _rule = _operator_read_execution_argv_with_diagnostics(
             argv, resolved_cwd=artifact.resolved_cwd,
@@ -9148,6 +9235,14 @@ class ToolRegistry:
                 candidate = Path(raw_path)
                 if not candidate.is_relative_to(root):
                     candidate = root / raw_path.lstrip("/")
+                try:
+                    scheduler_target = candidate.resolve(strict=False) == (root / "scheduler.yaml").resolve(strict=False)
+                except (OSError, RuntimeError):
+                    # A looping target cannot resolve to the live declaration;
+                    # let the existing filesystem/sink classifier deny it.
+                    scheduler_target = False
+                if scheduler_target:
+                    return finish(_scheduled_write_denial(tool_name))
                 if (_live_instruction_surface(root, candidate)
                         and _scheduled_write_tainted(auth_context, ifc_labels)):
                     try:

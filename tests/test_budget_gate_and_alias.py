@@ -5182,6 +5182,125 @@ def _arm2_operator_auth(
     )
 
 
+@pytest.mark.parametrize("command,admitted", [
+    ("gog gmail search --limit 5 secret-query", True),
+    ("gog gmail send --limit 5 secret-query", False),
+    ("acli jira workitem search secret-query", False),
+    ("gog gmail search && gog gmail search", False),
+])
+def test_tainted_operator_declared_argv_is_bound_audited_and_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, admitted: bool,
+) -> None:
+    import yaml
+
+    from mimir.tools import budget_gate, extra
+
+    home = tmp_path / "home"
+    scripts = home / "scripts"
+    scripts.mkdir(parents=True)
+    (home / "state").mkdir()
+    executable = scripts / "gog"
+    executable.write_text("#!/bin/sh\n/usr/bin/env\n")
+    executable.chmod(0o755)
+    (home / "scheduler.yaml").write_text(yaml.safe_dump({
+        "jobs": [{"name": "other", "prompt": "read", "cron": "0 * * * *",
+                  "shell_commands": [{"exec": "acli", "path": str(executable),
+                                      "subcommands": [["jira", "workitem", "search"]]}]}],
+        "operator_shell_commands": [{
+            "exec": "gog", "path": str(executable),
+            "subcommands": [["gmail", "search"]], "options": ["--limit"],
+            "pass_env": ["OPERATOR_TEST_ALLOWED"],
+        }],
+    }))
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", f"{home / 'state'}:rw")
+    monkeypatch.setenv("OPERATOR_TEST_ALLOWED", "visible")
+    monkeypatch.setenv("OPERATOR_TEST_SECRET", "never")
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "OPERATOR_TEST_BASELINE")
+    monkeypatch.setenv("OPERATOR_TEST_BASELINE", "baseline")
+    monkeypatch.setattr("mimir.read_policy.configured_non_admin_read_roots", lambda: (home / "state",))
+    state = InformationFlowState()
+    auth = _arm2_operator_auth(state, enforcement_enabled=True)
+    state.merge(InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="mail", bridge_instance="test",
+        sensitivity="private", authorized_principals=frozenset({"user-1"}),
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+    ),)), fallback=auth.ifc_labels)
+    events = []
+    original_emit = budget_gate._emit_event_sync
+
+    def emit(kind, **fields):
+        if kind == "operator_declared_shell_exec":
+            events.append(fields)
+        return original_emit(kind, **fields)
+
+    monkeypatch.setattr(budget_gate, "_emit_event_sync", emit)
+    request = _make_request("shell_exec", "operator-declared", auth,
+                            {"command": command, "cwd": str(home / "scripts")})
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", auth,
+                                                    auth.ifc_state.current(auth.ifc_labels))
+    if admitted:
+        assert preparation is not None and preparation.binding is not None, preparation
+        assert preparation.binding.resolved_cwd == str(home)
+    def handler(req):
+        return ToolMessage(content=extra.shell_exec.invoke(req.tool_call["args"]),
+                           tool_call_id=req.tool_call["id"])
+
+    result = BudgetGateMiddleware().wrap_tool_call(request, handler)
+    if admitted:
+        assert result.status != "error"
+        assert "OPERATOR_TEST_ALLOWED=" in str(result.content)
+        assert "OPERATOR_TEST_BASELINE=baseline" in str(result.content)
+        assert "OPERATOR_TEST_SECRET" not in str(result.content)
+        assert len(events) == 1
+        assert events[0] == {
+            "executable": "gog", "subcommand_path": "gmail search",
+            "option_names": "--limit", "taint_source_domains": "web", "outcome": "success",
+        }
+        assert state.has_untrusted_active_ingest(auth.ifc_labels)
+        assert any(source.domain == "shell" and source.has_untrusted_active_ingest
+                   for source in state.current(auth.ifc_labels).sources)
+    else:
+        assert result.status == "error"
+        assert not events
+
+
+def test_operator_declaration_only_applies_to_tainted_admin_chat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+    from mimir.tools import budget_gate
+    from mimir.models import TurnInteractivity
+
+    home = tmp_path / "home"
+    (home / "scripts").mkdir(parents=True)
+    (home / "state").mkdir()
+    executable = home / "scripts" / "gog"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    (home / "scheduler.yaml").write_text(
+        f"operator_shell_commands:\n  - exec: gog\n    path: {executable}\n"
+        "    subcommands: [[gmail, search]]\njobs: []\n"
+    )
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr("mimir.read_policy.configured_non_admin_read_roots", lambda: (home / "state",))
+    original = _arm2_operator_auth(_Arm2LiveState(False), enforcement_enabled=True)
+    request = _make_request("shell_exec", "unchanged-admin", original,
+                            {"command": "gog gmail search", "cwd": str(home / "state")})
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", original, original.ifc_labels)
+    assert preparation is not None and preparation.declaration is None
+    assert preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+    user = replace(original, roles=("user",), ifc_state=_Arm2LiveState(True))
+    request = _make_request("shell_exec", "unchanged-user", user,
+                            {"command": "gog gmail search", "cwd": str(home / "state")})
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", user, user.ifc_labels)
+    assert preparation is not None and preparation.declaration is None
+    service = replace(original, trigger="scheduled_tick", interactivity=TurnInteractivity.NON_INTERACTIVE)
+    request = _make_request("shell_exec", "unchanged-service", service,
+                            {"command": "gog gmail search", "cwd": str(home / "state")})
+    assert _prepare_operator_shell_execution(request, "shell_exec", service, service.ifc_labels) is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("middleware_path", "outcome"),

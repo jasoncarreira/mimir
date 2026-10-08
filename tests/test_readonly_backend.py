@@ -80,6 +80,34 @@ _INSTRUCTION_FILES = (
 )
 
 
+@pytest.mark.parametrize("operation,args", [
+    ("write", ("changed",)),
+    ("edit", ("original", "changed")),
+    ("replace", ("changed",)),
+])
+def test_admin_agent_cannot_write_operator_scheduler_declaration(
+    home: Path, monkeypatch: pytest.MonkeyPatch, operation: str, args: tuple[str, ...],
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = home / "scheduler.yaml"
+    target.write_text("original", encoding="utf-8")
+    backend = WriteGuardBackend(home, ["scratch"])
+    backend._writable_roots.append(home)  # Even a permissive home root cannot bypass it.
+    result = getattr(backend, operation)("scheduler.yaml", *args)
+    assert result.error
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_admin_agent_upload_cannot_replace_scheduler(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = home / "scheduler.yaml"
+    target.write_text("original", encoding="utf-8")
+    backend = WriteGuardBackend(home, ["scratch"])
+    backend._writable_roots.append(home)
+    assert backend.upload_files([("scheduler.yaml", b"changed")])[0].error == "permission_denied"
+    assert target.read_text(encoding="utf-8") == "original"
+
+
 @pytest.mark.parametrize("relative", _INSTRUCTION_FILES + (
     "memory/index.md", "MEMORY/INDEX.md", "Scheduler.yaml",
     "PROMPTS/heartbeat.md", "prompts/heartbeat.MD", "memory/core/POLICY.MD",
@@ -230,7 +258,7 @@ def test_tainted_upload_cannot_install_live_instructions(home: Path, monkeypatch
         reset_current_turn(token)
 
 
-@pytest.mark.parametrize("relative", _INSTRUCTION_FILES)
+@pytest.mark.parametrize("relative", _INSTRUCTION_FILES[1:])
 def test_clean_instruction_write_and_tainted_proposal_checkout_writes(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
 ) -> None:

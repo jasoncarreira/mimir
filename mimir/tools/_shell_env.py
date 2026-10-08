@@ -46,6 +46,7 @@ _CREDENTIAL_ENV_BY_EXECUTABLE = {
 class _DirectExecBinding:
     argv: tuple[str, ...]
     pass_env: tuple[str, ...] = ()
+    operator_declared: bool = False
 
 
 _DIRECT_EXEC_ARGV: ContextVar[_DirectExecBinding | None] = ContextVar(
@@ -56,6 +57,7 @@ _DIRECT_EXEC_ARGV: ContextVar[_DirectExecBinding | None] = ContextVar(
 def bind_direct_exec_argv(
     argv: list[str], *, command: str = "",
     declared: tuple[DeclaredShellCommand, ...] = (),
+    operator_declared: bool = False,
 ) -> Token[_DirectExecBinding | None]:
     """Bind middleware-authorized argv across ToolNode's injected-arg scrub."""
     from ..access_control import _declared_command_execution_argv
@@ -72,7 +74,7 @@ def bind_direct_exec_argv(
                 if candidate == argv:
                     names = declaration.pass_env
                 break
-    return _DIRECT_EXEC_ARGV.set(_DirectExecBinding(tuple(argv), names))
+    return _DIRECT_EXEC_ARGV.set(_DirectExecBinding(tuple(argv), names, operator_declared))
 
 
 def reset_direct_exec_argv(token: Token[_DirectExecBinding | None]) -> None:
@@ -283,6 +285,14 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     gh credential grant retains its config isolation and identity confirmation.
     """
     env = _minimal_direct_exec_env()
+    binding = _DIRECT_EXEC_ARGV.get()
+    if binding is not None and binding.operator_declared and binding.argv == tuple(argv or ()):
+        # The interactive shell's explicitly configured pass-through is a
+        # deployment baseline, but direct execution still pins PATH.
+        for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(","):
+            name = name.strip()
+            if name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ:
+                env[name] = os.environ[name]
     names = direct_exec_pass_env(argv)
     passed = [key for key in names if key in os.environ]
     for key in passed:
@@ -292,10 +302,11 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
 
         log_event_sync("service_shell_env_passthrough", pass_env=passed)
     executable = Path(argv[0]).name if argv else ""
-    for key in _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ()):
+    for key in (() if binding is not None and binding.operator_declared
+                else _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())):
         if key in os.environ:
             env[key] = os.environ[key]
-    if _is_gh_argv(argv):
+    if _is_gh_argv(argv) and not (binding is not None and binding.operator_declared):
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
         from .forge import confirm_github_tool_identity
 

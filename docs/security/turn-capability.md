@@ -173,6 +173,24 @@ is not required to implement Arm 2.
 
 ### Selected profile and conditional coverage
 
+Tainted admin `user_message` turns may additionally run explicitly listed
+`operator_shell_commands` from the operator-owned `scheduler.yaml` mapping. These
+are validated with the scheduled-command shape but reject `external_send`,
+`payload_args`, and scripts/interpreters. They do **not** inherit a union of job
+grants: jobs run under their own unattended fixed prompts and some deliberately
+declare scripts or outbound sends. An admitted command is pinned to a server-
+selected executable and subcommand prefix, constrained to declared option names,
+and executed as one argv without a shell. The server fixes cwd to
+`<MIMIR_HOME>` independent of the model's requested cwd; the child
+receives only declared `pass_env` and the scrubbed shell baseline. Output is
+untrusted active ingest and cannot declassify the turn. `operator_declared_shell_exec`
+records executable, subcommand path, option names (no values), outcome, and taint
+source domains. Untrusted email can steer a permitted read query toward sensitive
+mail; exfiltration still requires a separately permitted outbound sink, whose
+existing taint checks are unchanged. Operators must list read-only verbs, never
+send/create/transition verbs. Untainted admin shell and scheduled service shell
+keep their existing independent authority.
+
 Arm 2 uses the existing `scheduler_read_only` profile. It does not use
 `repo_review`: repository-sensitive commands in that profile depend on immutable
 `RepoReviewState`, authority an ordinary operator turn does not have. No profile

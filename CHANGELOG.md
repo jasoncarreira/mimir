@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
+  `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
+  bounded argv with scrubbed environment and value-free audit events; job grants
+  remain job-scoped. Mutating verbs must not be declared. Read queries can bring
+  sensitive data into the still-tainted turn; outbound sink checks remain in force.
+
 - **Operator action (#1893):** After untrusted ingest, schedule writes and edits to
   live scheduler, prompt, poller override, core memory, index and skill instruction
   files are refused even with IFC enforcement in shadow mode. Propose the change

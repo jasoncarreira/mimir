@@ -92,6 +92,7 @@ from ..access_control import (
     ServicePrincipal,
     ServiceShellBindingRule,
     _OPERATOR_SHELL_BINDING_ISSUER,
+    _declared_command_execution_argv,
     _issue_operator_shell_binding,
     _live_untrusted_active_ingest,
     _operator_can_invoke_admin_shell,
@@ -100,6 +101,7 @@ from ..access_control import (
     _project_test_execution_argv,
     _resolve_file_tool_target,
     _resolve_operator_bounded_cwd,
+    _resolve_operator_declared_cwd,
     _validated_operator_shell_argv_artifact,
     service_filesystem_read_roots,
     service_shell_argv_for_log,
@@ -1075,11 +1077,12 @@ class _OperatorShellPreparation:
     refusal: str | None
     binding_rule: ServiceShellBindingRule | None
     command_family: str
+    declaration: Any = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.outcome, OperatorShellPreparationOutcome):
             raise ValueError("unknown operator shell preparation outcome")
-        if self.command_family not in _OPERATOR_SHELL_COMMAND_FAMILIES:
+        if self.command_family not in _OPERATOR_SHELL_COMMAND_FAMILIES and self.declaration is None:
             raise ValueError("unknown operator shell command family")
         if self.outcome is OperatorShellPreparationOutcome.BOUND:
             if (
@@ -1194,7 +1197,8 @@ def _operator_shell_unbound(
         binding=None,
         refusal=refusal,
         binding_rule=binding_rule,
-        command_family=command_family,
+        command_family=(command_family if command_family in _OPERATOR_SHELL_COMMAND_FAMILIES
+                        else "profile_miss"),
     )
 
 
@@ -1203,7 +1207,7 @@ def _operator_shell_audit_summary(
 ) -> dict[str, str] | None:
     if preparation is None:
         return None
-    return {
+    summary = {
         "shell_profile": OPERATOR_SHELL_PROFILE,
         "preparation_outcome": preparation.outcome.value,
         "command_family": preparation.command_family,
@@ -1213,6 +1217,22 @@ def _operator_shell_audit_summary(
             else "exact_argv_binding"
         ),
     }
+    if preparation.declaration is not None and preparation.binding is not None:
+        import shlex
+
+        argv = shlex.split(preparation.binding.command)[1:]
+        prefix = next((parts for parts in preparation.declaration.subcommands
+                       if tuple(argv[:len(parts)]) == parts), ())
+        labels = _current_ifc_labels(preparation.binding._auth_context_identity)
+        summary.update({
+            "declared_executable": preparation.declaration.executable,
+            "subcommand_path": " ".join(prefix),
+            "option_names": ",".join(sorted({part.split("=", 1)[0] for part in argv
+                                               if part.startswith("-") and part != "--"})),
+            "taint_source_domains": ",".join(sorted({source.domain for source in getattr(labels, "sources", ())
+                if getattr(source, "has_untrusted_active_ingest", False)})),
+        })
+    return summary
 
 
 def _operator_shell_hard_refusal(
@@ -1362,6 +1382,28 @@ def _prepare_operator_shell_execution(
 ) -> _OperatorShellPreparation | None:
     if not _operator_can_invoke_admin_shell(tool_name, ifc_labels, auth_context):
         return None
+    declared = ()
+    if (
+        "admin" in (getattr(auth_context, "roles", ()) or ())
+        and getattr(auth_context, "trigger", None) == "user_message"
+        and _live_untrusted_active_ingest(auth_context, ifc_labels) is True
+    ):
+        from ..scheduler import load_operator_shell_commands
+        from ..access_control import agent_writable_roots
+
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if home:
+            try:
+                declared = load_operator_shell_commands(
+                    Path(home) / "scheduler.yaml",
+                    writable_roots=agent_writable_roots(home),
+                )
+            except (OSError, ValueError):
+                return _operator_shell_unbound(
+                    OperatorShellPreparationOutcome.HARD_REFUSED,
+                    _OPERATOR_PARSER_FAILURE_REFUSAL,
+                    ServiceShellBindingRule.UNKNOWN_PROFILE, "parser",
+                )
     arguments = (getattr(request, "tool_call", None) or {}).get("args")
     if not isinstance(arguments, dict):
         return _operator_shell_unbound(
@@ -1382,7 +1424,7 @@ def _prepare_operator_shell_execution(
         parsed_argv, refusal, binding_rule = parse_service_shell_argv_with_diagnostics(
             command,
             OPERATOR_SHELL_PROFILE,
-            declared=(),
+            declared=declared,
             service=None,
             auth_context=None,
             review_state=None,
@@ -1439,10 +1481,15 @@ def _prepare_operator_shell_execution(
             command_family,
         )
 
+    import shlex
+
+    original = shlex.split(command)
+    matched_declaration = next((entry for entry in declared
+        if _declared_command_execution_argv(original, (entry,)) == parsed_argv), None)
     family = Path(parsed_argv[0]).name if parsed_argv else "parser"
-    if family not in _OPERATOR_SHELL_COMMAND_FAMILIES or family in {
+    if matched_declaration is None and (family not in _OPERATOR_SHELL_COMMAND_FAMILIES or family in {
         "invalid_command", "parser", "project_test", "profile_miss",
-    }:
+    }):
         return _operator_shell_unbound(
             OperatorShellPreparationOutcome.HARD_REFUSED,
             _OPERATOR_PARSER_FAILURE_REFUSAL,
@@ -1450,7 +1497,10 @@ def _prepare_operator_shell_execution(
             "parser",
         )
     requested_cwd = arguments.get("cwd")
-    resolved_cwd = _resolve_operator_bounded_cwd(requested_cwd, git=family == "git")
+    resolved_cwd = (
+        _resolve_operator_declared_cwd() if matched_declaration is not None
+        else _resolve_operator_bounded_cwd(requested_cwd, git=family == "git")
+    )
     if resolved_cwd is None:
         return _operator_shell_unbound(
             OperatorShellPreparationOutcome.HARD_REFUSED,
@@ -1459,7 +1509,9 @@ def _prepare_operator_shell_execution(
             family,
         )
     final_argv = parsed_argv
-    if family in {"ls", "wc", "grep", "jq", "rg"}:
+    if matched_declaration is not None:
+        pass  # Already pinned and validated as one declared argv.
+    elif family in {"ls", "wc", "grep", "jq", "rg"}:
         final_argv, refusal, binding_rule = _operator_read_execution_argv_with_diagnostics(
             parsed_argv, resolved_cwd=resolved_cwd,
         )
@@ -1492,6 +1544,7 @@ def _prepare_operator_shell_execution(
             )
     artifact = _validated_operator_shell_argv_artifact(
         parsed_argv, final_argv, resolved_cwd=resolved_cwd,
+        **({"declaration": matched_declaration} if matched_declaration is not None else {}),
     )
     if artifact is None:
         return _operator_shell_unbound(
@@ -1522,6 +1575,7 @@ def _prepare_operator_shell_execution(
         refusal=None,
         binding_rule=None,
         command_family=family,
+        declaration=matched_declaration,
     )
 
 
@@ -2221,6 +2275,7 @@ def _result_labels_for_call(
     provenance: Any = None,
     policy_refusal: ToolPolicyRefusal | None = None,
     failed: bool = False,
+    operator_declared_shell: bool = False,
 ) -> Any:
     if not failed and tool_name == "repo_checkout" and auth_context is not None:
         original_scope = authorization.repo_pr_action_scope
@@ -2246,7 +2301,7 @@ def _result_labels_for_call(
             authorization = replace(
                 authorization, repo_pr_action_scope=current_scope,
             )
-    return classify_protected_result(
+    labels = classify_protected_result(
         tool_name,
         arguments,
         auth_context,
@@ -2256,6 +2311,26 @@ def _result_labels_for_call(
         policy_refusal=policy_refusal,
         failed=failed,
     )
+    if operator_declared_shell and labels is not None:
+        from dataclasses import replace
+
+        from ..models import SourceLabel
+
+        source = next((item for item in labels.sources if item.domain == "shell"), None)
+        if source is None:
+            principal = getattr(auth_context, "canonical_principal", None)
+            source = SourceLabel(
+                principal=principal, domain="shell", resource_id="shell_exec",
+                bridge_instance=getattr(auth_context, "bridge_instance", None),
+                sensitivity="internal", authorized_principals=(
+                    frozenset({principal}) if principal else frozenset()
+                ), source_kind="protected_tool", integrity="untrusted",
+                integrity_effect="active_ingest",
+            )
+        else:
+            source = replace(source, integrity_effect="active_ingest")
+        labels = labels.with_source(source)
+    return labels
 
 
 def _is_admin_sensitive_tool(
@@ -2565,6 +2640,15 @@ def _emit_tool_call_sync(
     if denied:
         payload["denied"] = True
     _emit_event_sync("tool_call", **payload)
+    if operator_shell_audit is not None and "declared_executable" in operator_shell_audit:
+        _emit_event_sync(
+            "operator_declared_shell_exec",
+            executable=operator_shell_audit["declared_executable"],
+            subcommand_path=operator_shell_audit["subcommand_path"],
+            option_names=operator_shell_audit["option_names"],
+            taint_source_domains=operator_shell_audit["taint_source_domains"],
+            outcome="refused" if denied else "success" if ok else "error",
+        )
     if not ok:
         error_payload = {"tool": tool_name}
         if operator_shell_audit is not None:
@@ -3596,7 +3680,13 @@ def _begin_tool_execution(
     if operator_direct_argv is not None:
         from ._shell_env import bind_direct_exec_argv
 
-        capture.direct_argv_token = bind_direct_exec_argv(operator_direct_argv)
+        preparation = call.operator_shell_preparation
+        capture.direct_argv_token = bind_direct_exec_argv(
+            operator_direct_argv,
+            command=call.request.tool_call["args"].get("command", ""),
+            declared=((preparation.declaration,) if preparation.declaration is not None else ()),
+            operator_declared=preparation.declaration is not None,
+        )
     elif call.tool_name in {"shell_exec", "bash_async"} and isinstance(direct_argv, list):
         from ._shell_env import bind_direct_exec_argv
 
@@ -3728,6 +3818,7 @@ def _finish_tool_exception(
             result=exc,
             provenance=capture.provenance,
             failed=True,
+            operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
         )
         _merge_result_labels_from_result(
             call.auth_context, result_labels, exc,
@@ -3741,6 +3832,7 @@ def _finish_tool_exception(
             call.authorization,
             provenance=capture.provenance,
             failed=True,
+            operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
         )
         _merge_result_labels(call.auth_context, result_labels)
     emit_kwargs: dict[str, Any] = {
@@ -3775,6 +3867,7 @@ def _finish_tool_result(
         provenance=capture.provenance,
         policy_refusal=capture.policy_refusal,
         failed=is_error,
+        operator_declared_shell=bool(call.operator_shell_preparation and call.operator_shell_preparation.declaration),
     )
     _merge_result_labels_from_result(
         call.auth_context, result_labels, result,
