@@ -296,7 +296,7 @@ class TestResolveModelClaudeCode:
             lcc_patches.importlib_metadata,
             "version",
             lambda name: (
-                "0.1.2"
+                "0.1.3"
                 if name == lcc_patches.CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST
                 else (_raise_package_not_found(name))
             ),

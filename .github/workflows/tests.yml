@@ -810,7 +810,7 @@ jobs:
       - name: Sync dependencies (with Claude Code extra)
         run: uv sync --extra dev --extra claude-code
 
-      - name: Import adapter and verify Mimir enforcement hook
+      - name: Verify adapter, enforcement hook and bridged tool execution
         run: |
           uv run python - <<'PY'
           import langchain_claude_code
@@ -820,6 +820,7 @@ jobs:
           patches.ensure_tool_enforcement_hooks_installed(langchain_claude_code)
           print("claude-code adapter smoke ok")
           PY
+          uv run --extra dev --extra claude-code pytest -q -n 0 tests/test_langchain_claude_code_patches.py::test_bridged_structured_tool_executes
 
   frontend:
     runs-on: ubuntu-latest

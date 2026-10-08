@@ -25,9 +25,69 @@ from mimir._langchain_claude_code_patches import (
     install_tool_event_hooks,
 )
 from mimir.models import AuthContext, InformationFlowLabels
+from mimir import _langchain_claude_code_patches as patches
 
 
 _OUTBOUND_CREDENTIAL = "sk-" + "Z" * 24
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [("0.1.2", False), ("0.1.3", True), ("not-a-version", False)],
+)
+def test_controlled_adapter_version_floor(monkeypatch, version, supported):
+    monkeypatch.setattr(
+        patches,
+        "_distribution_version",
+        lambda name: (
+            version if name == patches.CONTROLLED_LANGCHAIN_CLAUDE_CODE_DIST else None
+        ),
+    )
+    status = patches.langchain_claude_code_adapter_compatibility(
+        types.SimpleNamespace(),
+    )
+    assert status.supported is supported
+    if not supported:
+        assert version in status.reason
+        assert "0.1.3" in status.reason
+        assert "bridged" in status.reason
+
+
+def test_declared_features_require_bridged_tool_invoke(monkeypatch):
+    monkeypatch.setattr(patches, "_distribution_version", lambda _name: None)
+    old_features = {
+        "arun_config", "tool_call_schema", "streaming_result_metadata", "sdk_tool_events",
+    }
+    module = types.SimpleNamespace(MIMIR_COMPATIBILITY={"features": old_features})
+    assert not patches.langchain_claude_code_adapter_compatibility(module).supported
+
+    module.MIMIR_COMPATIBILITY = {"features": old_features | {"bridged_tool_invoke"}}
+    assert patches.langchain_claude_code_adapter_compatibility(module).supported
+
+
+@pytest.mark.asyncio
+async def test_bridged_structured_tool_executes():
+    """Drive the adapter's SDK-tool handler without starting a Claude CLI."""
+    pytest.importorskip("langchain_claude_code")
+    from langchain_claude_code import ChatClaudeCode
+    from langchain_core.tools import StructuredTool
+
+    calls: list[tuple[str, int]] = []
+
+    async def multiply(label: str, count: int) -> str:
+        calls.append((label, count))
+        return f"{label}:{count * 2}"
+
+    tool = StructuredTool.from_function(
+        coroutine=multiply, name="multiply", description="Double a count",
+    )
+    model = ChatClaudeCode(model="claude-sonnet-4-6")
+    sdk_tool = model._wrap_langchain_tool(tool, model._get_tool_schema(tool))
+
+    result = await sdk_tool.handler({"label": "items", "count": 3})
+
+    assert calls == [("items", 3)]
+    assert result == {"content": [{"type": "text", "text": "items:6"}]}
 
 
 def _auth_context(
