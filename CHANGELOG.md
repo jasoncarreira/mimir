@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- `mimir setup` re-runs report and configure provider/usage-monitor defaults for
+  the existing home's `MIMIR_MODEL_SPEC` (unless overridden by an exported spec),
+  with a hint explaining the preserved value. Correct the HTTP API key header
+  example to `X-API-Key` (#1889).
+
 ## [0.9.4] — 2026-10-07
 
 A security release from the 2026-10-06 external review. Bridge intake, attachment

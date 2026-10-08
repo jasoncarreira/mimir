@@ -118,13 +118,14 @@ def test_setup_banner_reports_effective_env_model_spec(
     assert status["provider_name"] == PROVIDER_OPENAI
     assert status["billing_mode"] == "subscription"
     assert status["model_spec_from_env"] is True
+    assert status["model_spec_from_home_env"] is False
     # The --model/default route is still surfaced (banner note + the
     # <home>/.env template scaffold).
     assert status["setup_default_spec"] == "codex-plus:gpt-5.6-luna"
 
 
 def test_setup_banner_uses_default_route_without_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
 ):
     """No MIMIR_MODEL_SPEC in the env → banner reports setup's
     --model/default route (unchanged behavior)."""
@@ -132,6 +133,99 @@ def test_setup_banner_uses_default_route_without_env(
     status = setup_home(tmp_path / "agent")
     assert status["model_spec"] == "codex-plus:gpt-5.6-luna"
     assert status["model_spec_from_env"] is False
+    assert status["model_spec_from_home_env"] is False
+    assert status["setup_default_spec"] == status["model_spec"]
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert "model spec:    codex-plus:gpt-5.6-luna" in output
+    assert "↑ from" not in output
+    assert "setup --model/default would be:" not in output
+
+
+def test_setup_rerun_uses_home_model_for_status_and_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+):
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env_path = home / ".env"
+    before = env_path.read_text()
+
+    status = setup_home(home, model=None, subscription=True)
+    assert status["model_spec"] == "claude-code:claude-sonnet-4-6"
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+    assert "Anthropic" in status["monitor_status"]
+    assert status["model_spec_from_env"] is False
+    assert status["model_spec_from_home_env"] is True
+    assert status["setup_default_spec"] == "codex-plus:gpt-5.6-luna"
+    # The default route adds no new provider/monitor keys on this re-run.
+    keys = lambda body: {line.partition("=")[0] for line in body.splitlines()
+                         if line and not line.lstrip().startswith("#") and "=" in line}
+    assert keys(env_path.read_text()) == keys(before)
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert "model spec:    claude-code:claude-sonnet-4-6" in output
+    assert f"↑ from {home}/.env (existing value preserved; edit .env to change)" in output
+    assert "setup --model/default would be:" not in output
+
+
+def test_setup_rerun_injects_only_home_route_monitor_and_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
+    home = tmp_path / "agent"
+    setup_home(home, model="MiniMax-M2.7")
+    env_path = home / ".env"
+    before = env_path.read_text()
+    assert "MIMIR_QUOTA_POLL_ENABLED=" not in before
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in before
+
+    status = setup_home(home, subscription=True)
+    after = env_path.read_text()
+    assert status["model_spec"] == "anthropic:MiniMax-M2.7"
+    assert status["billing_mode"] == "api"
+    assert "cost monitoring" in status["monitor_status"]
+    assert "MIMIR_QUOTA_POLL_ENABLED=" not in after
+    assert "ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic" in after
+
+    # A different --model with provider env cannot fill the blank base URL
+    # of a home configured for claude-code.
+    claude_home = tmp_path / "claude"
+    setup_home(claude_home, model="claude-sonnet-4-6", subscription=True)
+    claude_env = claude_home / ".env"
+    claude_before = claude_env.read_text()
+    assert "ANTHROPIC_BASE_URL=\n" in claude_before
+    setup_home(claude_home, model="kimi-k2-0905-preview")
+    assert claude_env.read_text() == claude_before
+
+
+def test_setup_exported_model_wins_over_existing_home_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    monkeypatch.setenv("MIMIR_MODEL_SPEC", "openai:gpt-4.1-mini")
+
+    status = setup_home(home, subscription=True)
+    assert status["model_spec"] == "openai:gpt-4.1-mini"
+    assert status["provider_name"] == "openai"
+    assert status["billing_mode"] == "api"
+    assert status["model_spec_from_env"] is True
+    assert status["model_spec_from_home_env"] is False
+    assert "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6" in (home / ".env").read_text()
+
+
+def test_setup_home_hint_shows_differing_explicit_model(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+):
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    status = setup_home(home, model="gpt-4.1-mini")
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert f"↑ from {home}/.env" in output
+    assert "(setup --model/default would be: openai:gpt-4.1-mini)" in output
 
 
 def test_setup_is_idempotent_and_preserves_user_edits(tmp_path: Path):
