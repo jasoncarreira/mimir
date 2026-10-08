@@ -45,9 +45,38 @@ def test_acp_and_mcp_dependency_declarations() -> None:
     assert optional["dev"].count("keyring==25.7.0") == 0
     assert dependency_groups["dev"].count("keyring==25.7.0") == 0
 
-    assert optional["mcp"] == ["mcp>=1.27"]
-    assert optional["dev"].count("mcp>=1.27") == 1
-    assert dependency_groups["dev"].count("mcp>=1.27") == 1
+    assert optional["mcp"] == ["mcp>=1.27,<2"]
+    assert optional["dev"].count("mcp>=1.27,<2") == 1
+    assert dependency_groups["dev"].count("mcp>=1.27,<2") == 1
+
+
+def test_every_mcp_requirement_excludes_sdk_2() -> None:
+    """MCP Python SDK 2.x renamed result fields to snake_case
+    (``input_schema``/``is_error``/``mime_type``), which breaks
+    ``mimir/mcp_client.py`` tool discovery. Keep every declaration capped below
+    2.0 until the 2.x upgrade lands (#1891)."""
+    from packaging.requirements import Requirement
+
+    config = _project_config()
+    project = config["project"]
+    declarations = [
+        *project["dependencies"],
+        *(r for reqs in project["optional-dependencies"].values() for r in reqs),
+        *(
+            r
+            for reqs in config["dependency-groups"].values()
+            for r in reqs
+            if isinstance(r, str)
+        ),
+    ]
+    mcp_requirements = [
+        Requirement(r) for r in declarations if Requirement(r).name == "mcp"
+    ]
+    assert mcp_requirements, "expected at least one mcp declaration"
+    for requirement in mcp_requirements:
+        assert not requirement.specifier.contains("2.0.0"), str(requirement)
+        assert not requirement.specifier.contains("2.3.0"), str(requirement)
+        assert requirement.specifier.contains("1.28.1"), str(requirement)
 
 
 def test_project_readme_and_urls() -> None:

@@ -6,6 +6,15 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-10-08
+
+**Fixed:**
+
+- Cap `mcp<2`: the MCP Python SDK 2.x renamed result fields to snake_case,
+  which broke MCP tool discovery for PyPI installs (every configured MCP
+  server's tools silently disappeared); the full 2.x upgrade is tracked in
+  #1891.
+
 ## [0.9.5] — 2026-10-08
 
 The `claude-code:*` route now works end to end on a fresh install. The
