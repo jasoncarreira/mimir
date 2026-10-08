@@ -6,7 +6,7 @@
 # code keeps writing ``from mimir.agent import ...`` — only the
 # install incantation changes: ``pip install mimir-agent``.
 name = "mimir-agent"
-version = "0.9.5"
+version = "0.9.6"
 description = "Memory-centric agent harness on deepagents / LangGraph"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -84,7 +84,7 @@ codex-plus = [
 # to come along transitively via the Claude Code adapter, but MCP now
 # has its own explicit extra so operators who want MCP know to install it.
 mcp = [
-    "mcp>=1.27",
+    "mcp>=1.27,<2",
 ]
 acp = []
 # LongMemEval bench harness — pulls the workspace ``saga`` package
@@ -137,7 +137,7 @@ dev = [
     "langchain-anthropic>=1.5.3,<2",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.11,<0.1",
-    "mcp>=1.27",
+    "mcp>=1.27,<2",
     # mimir.saga.vector_index uses FAISS for ANN search; without it
     # the index degrades to an empty-result stub and tests asserting
     # on indexed-atom counts (test_saga_correctness_regressions,
@@ -312,7 +312,7 @@ dev = [
     "langchain-anthropic>=1.5.3,<2",
     "langchain-openai>=1.2.1",
     "langchain-codex-plus>=0.0.11,<0.1",
-    "mcp>=1.27",
+    "mcp>=1.27,<2",
     "faiss-cpu>=1.13",
     "botocore>=1.35",
 ]
