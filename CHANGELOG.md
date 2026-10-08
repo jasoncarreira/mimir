@@ -6,6 +6,23 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-10-08
+
+The `claude-code:*` route now works end to end on a fresh install. The
+`claude-code` extra requires `langchain-claude-code-mimir>=0.1.3`, whose fix
+lets bridged mimir tools (e.g. `memory_query`) execute — earlier adapter builds
+failed every bridged tool with a missing `config` argument. A Claude Code login
+managed by the CLI itself (macOS Keychain) is accepted for inference, `mimir
+setup` re-runs report the home's real model, and frontend dependencies pick up
+security bumps (react-router, fflate, postcss, browserslist, vite).
+
+**Operator actions:**
+
+- Upgrade the adapter with the package: `pip install -U 'mimir-agent[claude-code]'`
+  (or `uv sync --extra claude-code`); mimir refuses adapters older than 0.1.3.
+
+**Changes:**
+
 - Accept CLI-managed Claude Code logins (including macOS Keychain) for inference
   after a bounded `claude -p ping` succeeds; cache successful checks per CLI path.
   Quota polling still requires file-based OAuth credentials (#1888).
