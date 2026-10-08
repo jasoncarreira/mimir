@@ -68,6 +68,10 @@ class ClaudeCodeAuthStatus:
     remediation: str
 
 
+# Only successful CLI-managed logins are cached; a failed probe can be retried.
+_CLAUDE_CODE_CLI_MANAGED_AUTH: dict[str, ClaudeCodeAuthStatus] = {}
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
     """One LLM provider's facts, consulted by the routing + quota paths.
@@ -319,19 +323,20 @@ def claude_code_auth_status(
     """Probe Claude Code subscription auth without exposing tokens.
 
     The check is intentionally diagnostic rather than a token dumper:
-    it verifies the ``claude`` CLI is installed, that either a
+    it verifies the ``claude`` CLI is installed, and either finds a
     ``CLAUDE_CODE_OAUTH_TOKEN`` env token or a Claude Code
-    ``.credentials.json`` file with an OAuth block is present, and
-    optionally runs a tiny ``claude -p ping`` smoke check while discarding
-    stdout/stderr. Error strings tell the operator what to fix without
-    echoing credential contents.
+    ``.credentials.json`` file with an OAuth block, or verifies a
+    CLI-managed login with ``claude -p ping``. The smoke check is optional
+    when a credential marker exists. It always discards stdout/stderr;
+    error strings never echo credential contents.
     """
     cli = shutil.which(_ANTHROPIC_MAX.requires_cli or "claude")
     remediation = (
         "Install the Claude Code CLI with "
         "`npm install -g @anthropic-ai/claude-code`, authenticate with "
         "`claude login` for quota polling or `claude setup-token` for "
-        "inference-only use, then verify with `claude -p 'ping'`. Do not "
+        "inference-only use. A working `claude -p 'ping'` with a CLI-managed "
+        "login is sufficient for inference. Do not "
         "paste tokens or ~/.claude/.credentials.json contents into chat, "
         "logs, or Chainlink comments."
     )
@@ -355,15 +360,12 @@ def claude_code_auth_status(
                 remediation,
             )
 
-    if not (has_env_token or has_credentials):
-        return ClaudeCodeAuthStatus(
-            False,
-            "Claude Code is installed but no usable OAuth token or "
-            f".credentials.json was found at {path}",
-            remediation,
-        )
+    cli_managed = not (has_env_token or has_credentials)
+    cli_path = str(Path(cli).resolve()) if cli_managed else ""
+    if cli_managed and cli_path in _CLAUDE_CODE_CLI_MANAGED_AUTH:
+        return _CLAUDE_CODE_CLI_MANAGED_AUTH[cli_path]
 
-    if run_smoke:
+    if cli_managed or run_smoke:
         try:
             completed = subprocess.run(
                 [cli, "-p", "ping"],
@@ -374,18 +376,43 @@ def claude_code_auth_status(
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if cli_managed:
+                return ClaudeCodeAuthStatus(
+                    False,
+                    "Claude Code is installed but no usable OAuth token or "
+                    f".credentials.json was found at {path}; CLI smoke check "
+                    f"failed or timed out: {type(exc).__name__}",
+                    remediation,
+                )
             return ClaudeCodeAuthStatus(
                 False,
                 f"Claude Code smoke check could not run: {type(exc).__name__}",
                 remediation,
             )
         if completed.returncode != 0:
+            if cli_managed:
+                return ClaudeCodeAuthStatus(
+                    False,
+                    "Claude Code is installed but no usable OAuth token or "
+                    f".credentials.json was found at {path}; CLI smoke check failed",
+                    remediation,
+                )
             return ClaudeCodeAuthStatus(
                 False,
                 "Claude Code smoke check failed; the CLI is installed but "
                 "is not authenticated or cannot use the configured credentials",
                 remediation,
             )
+
+    if cli_managed:
+        status = ClaudeCodeAuthStatus(
+            True,
+            "Claude Code CLI-managed login verified by smoke check (no "
+            "CLAUDE_CODE_OAUTH_TOKEN or .credentials.json; e.g. macOS Keychain)",
+            "",
+        )
+        _CLAUDE_CODE_CLI_MANAGED_AUTH[cli_path] = status
+        return status
 
     return ClaudeCodeAuthStatus(
         True,

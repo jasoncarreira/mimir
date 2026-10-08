@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Accept CLI-managed Claude Code logins (including macOS Keychain) for inference
+  after a bounded `claude -p ping` succeeds; cache successful checks per CLI path.
+  Quota polling still requires file-based OAuth credentials (#1888).
 - `mimir setup` re-runs report and configure provider/usage-monitor defaults for
   the existing home's `MIMIR_MODEL_SPEC` (unless overridden by an exported spec),
   with a hint explaining the preserved value. Correct the HTTP API key header
