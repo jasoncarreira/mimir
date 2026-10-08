@@ -50,6 +50,33 @@ def test_acp_and_mcp_dependency_declarations() -> None:
     assert dependency_groups["dev"].count("mcp>=2.3,<3") == 1
 
 
+def test_every_mcp_requirement_excludes_sdk_3() -> None:
+    """SDK 2.x contracts are tested; do not admit an untested major upgrade."""
+    from packaging.requirements import Requirement
+
+    config = _project_config()
+    project = config["project"]
+    declarations = [
+        *project["dependencies"],
+        *(r for reqs in project["optional-dependencies"].values() for r in reqs),
+        *(
+            r
+            for reqs in config["dependency-groups"].values()
+            for r in reqs
+            if isinstance(r, str)
+        ),
+    ]
+    mcp_requirements = [
+        Requirement(r) for r in declarations if Requirement(r).name == "mcp"
+    ]
+    assert mcp_requirements, "expected at least one mcp declaration"
+    for requirement in mcp_requirements:
+        assert not requirement.specifier.contains("3.0.0"), str(requirement)
+        assert not requirement.specifier.contains("3.3.0"), str(requirement)
+        assert requirement.specifier.contains("2.3.0"), str(requirement)
+        assert not requirement.specifier.contains("2.2.0"), str(requirement)
+
+
 def test_project_readme_and_urls() -> None:
     project = _project_config()["project"]
     assert project["readme"] == "README.md"

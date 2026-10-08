@@ -9,6 +9,17 @@ All notable changes will land here. Format loosely follows
 - Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
   models and real stdio contract tests. This fixes the silent tool-discovery
   failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
+  A dedicated lifecycle task owns SDK contexts so production shutdown can
+  be requested from a different task without leaking the server subprocess.
+
+## [0.9.6] — 2026-10-08
+
+**Fixed:**
+
+- Cap `mcp<2`: the MCP Python SDK 2.x renamed result fields to snake_case,
+  which broke MCP tool discovery for PyPI installs (every configured MCP
+  server's tools silently disappeared); the full 2.x upgrade is tracked in
+  #1891.
 
 ## [0.9.5] — 2026-10-08
 
