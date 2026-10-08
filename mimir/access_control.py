@@ -5854,11 +5854,14 @@ def _live_instruction_surface(home: Path, target: Path) -> bool:
     except (OSError, RuntimeError):
         # Indeterminate identity cannot establish that an in-home path is safe.
         return True
-    parts = relative.parts
+    # APFS/virtiofs live homes preserve the caller's spelling in resolve(),
+    # even when differently cased paths identify the same file. Conservatively
+    # match these surfaces case-insensitively on every filesystem.
+    parts = tuple(part.casefold() for part in relative.parts)
     if not parts:
         return False
     if parts in {("scheduler.yaml",), ("pollers-overrides.yaml",),
-                 ("memory", "INDEX.md")}:
+                 ("memory", "index.md")}:
         return True
     if len(parts) == 2 and parts[0] == "prompts" and parts[1].endswith(".md"):
         return True
@@ -5866,7 +5869,7 @@ def _live_instruction_surface(home: Path, target: Path) -> bool:
         return True
     return (
         len(parts) >= 3 and parts[0] == "skills"
-        and ((parts[2] in {"SKILL.md", "pollers.json"} and len(parts) == 3)
+        and ((parts[2] in {"skill.md", "pollers.json"} and len(parts) == 3)
              or (parts[2] == "scripts" and len(parts) >= 4))
     )
 
@@ -9147,10 +9150,14 @@ class ToolRegistry:
                     candidate = root / raw_path.lstrip("/")
                 if (_live_instruction_surface(root, candidate)
                         and _scheduled_write_tainted(auth_context, ifc_labels)):
-                    resolved = candidate.resolve(strict=False)
-                    return finish(_scheduled_write_denial(
-                        tool_name, skill=resolved.is_relative_to(root / "skills"),
-                    ))
+                    try:
+                        resolved_parts = candidate.resolve(strict=False).relative_to(root).parts
+                        skill = bool(resolved_parts and resolved_parts[0].casefold() == "skills")
+                    except (ValueError, OSError, RuntimeError):
+                        # The classifier deliberately vetoes indeterminate paths;
+                        # do not resolve them again without preserving that denial.
+                        skill = False
+                    return finish(_scheduled_write_denial(tool_name, skill=skill))
         skill_write = WriteResourceAdapter.authorize_skill_write(
             tool_name,
             target_channel,

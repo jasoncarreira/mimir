@@ -80,11 +80,19 @@ _INSTRUCTION_FILES = (
 )
 
 
-@pytest.mark.parametrize("relative", _INSTRUCTION_FILES)
-@pytest.mark.parametrize("operation", ["write", "edit", "replace", "awrite", "aedit", "areplace"])
+@pytest.mark.parametrize("relative", _INSTRUCTION_FILES + (
+    "memory/index.md", "MEMORY/INDEX.md", "Scheduler.yaml",
+    "PROMPTS/heartbeat.md", "prompts/heartbeat.MD", "memory/core/POLICY.MD",
+    "skills/mail/skill.md", "Pollers-Overrides.yaml", "Skills/mail/POLLERS.JSON",
+    "skills/mail/SCRIPTS/run.py",
+))
+@pytest.mark.parametrize("absolute", [False, True])
+@pytest.mark.parametrize("operation", [
+    "write", "edit", "replace", "awrite", "aedit", "areplace", "upload_files", "aupload_files",
+])
 @pytest.mark.asyncio
 async def test_tainted_file_tools_veto_each_live_instruction_surface(
-    home: Path, monkeypatch: pytest.MonkeyPatch, relative: str, operation: str,
+    home: Path, monkeypatch: pytest.MonkeyPatch, relative: str, operation: str, absolute: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(home))
     path = home / relative
@@ -104,11 +112,19 @@ async def test_tainted_file_tools_veto_each_live_instruction_surface(
     try:
         backend = WriteGuardBackend(home, ["prompts", "memory", "skills", "scratch"])
         backend._writable_roots.append(home)  # exercise the veto even with a permissive root
-        args = ("original", "changed") if "edit" in operation else ("changed",)
-        result = getattr(backend, operation)("/" + relative, *args)
+        spelling = str(path) if absolute else "/" + relative
+        if "upload" in operation:
+            result = getattr(backend, operation)([(spelling, b"changed")])
+        else:
+            args = ("original", "changed") if "edit" in operation else ("changed",)
+            result = getattr(backend, operation)(spelling, *args)
         if operation.startswith("a"):
             result = await result
-        assert "open_proposal/submit_proposal" in result.error
+        if "upload" in operation:
+            assert result[0].error == "permission_denied"
+        else:
+            assert "open_proposal/submit_proposal" in result.error
+        assert any("scheduled_instruction_veto" in d["op"] for d in backend.drain_denials())
         assert path.read_text(encoding="utf-8") == "original"
     finally:
         reset_current_turn(token)
@@ -135,6 +151,56 @@ def test_tainted_file_guard_resolves_alias_and_traversal(
         backend._writable_roots.append(home)
         assert "open_proposal/submit_proposal" in backend.replace(spelling, "changed").error
         assert (home / "scheduler.yaml").read_text(encoding="utf-8") == "original"
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("operation", [
+    "write", "edit", "replace", "awrite", "aedit", "areplace", "upload_files", "aupload_files",
+])
+@pytest.mark.parametrize("error", [RuntimeError, OSError])
+@pytest.mark.asyncio
+async def test_tainted_looping_symlink_backend_fails_closed(
+    home: Path, monkeypatch: pytest.MonkeyPatch, operation: str, error: type[Exception],
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    loop = home / "prompts/loop.md"
+    loop.parent.mkdir()
+    loop.symlink_to(loop)
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == loop:
+            # Also exercise older Python's RuntimeError semantics on newer
+            # interpreters where strict=False preserves an unresolved loop.
+            raise error("indeterminate looping symlink")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    labels = InformationFlowLabels(sources=(SourceLabel(
+        principal="external", domain="web", resource_id="page", bridge_instance="web",
+        sensitivity="internal", authorized_principals=frozenset({"external"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ),))
+    auth = SimpleNamespace(ifc_state=InformationFlowState(labels=labels), ifc_labels=labels)
+    token = set_current_turn(SimpleNamespace(turn_id="looping-instruction", auth_context=auth,
+                                             ifc_labels=labels))
+    try:
+        backend = WriteGuardBackend(home, ["prompts"])
+        if "upload" in operation:
+            result = getattr(backend, operation)([(str(loop), b"changed")])
+        else:
+            args = ("original", "changed") if "edit" in operation else ("changed",)
+            result = getattr(backend, operation)(str(loop), *args)
+        if operation.startswith("a"):
+            result = await result
+        if "upload" in operation:
+            assert result[0].error == "permission_denied"
+        else:
+            assert "open_proposal/submit_proposal" in result.error
+        assert any("scheduled_instruction_veto" in d["op"] for d in backend.drain_denials())
+        assert loop.is_symlink()
+        assert loop.readlink() == loop
     finally:
         reset_current_turn(token)
 

@@ -142,6 +142,10 @@ def test_scheduled_write_unknown_integrity_fails_closed() -> None:
     "scheduler.yaml", "prompts/heartbeat.md", "pollers-overrides.yaml",
     "memory/core/policy.md", "memory/INDEX.md", "skills/mail/SKILL.md",
     "skills/mail/pollers.json", "skills/mail/scripts/run.py",
+    "memory/index.md", "MEMORY/INDEX.md", "Scheduler.yaml",
+    "PROMPTS/heartbeat.md", "prompts/heartbeat.MD", "memory/core/POLICY.MD",
+    "skills/mail/skill.md", "Pollers-Overrides.yaml", "Skills/mail/POLLERS.JSON",
+    "skills/mail/SCRIPTS/run.py",
 ])
 @pytest.mark.parametrize("tool", ["write_file", "edit_file", "replace_file"])
 def test_authorization_vetoes_tainted_live_file_paths(
@@ -192,6 +196,52 @@ def test_file_authorization_resolves_live_aliases(
         arguments={"file_path": str(tmp_path / spelling)},
     )
     assert not decision.allowed and decision.enforcement_enabled
+
+
+@pytest.mark.parametrize("relative", [
+    "memory/index.md", "MEMORY/INDEX.md", "Scheduler.yaml",
+    "PROMPTS/heartbeat.md", "prompts/heartbeat.MD", "memory/core/POLICY.MD",
+    "skills/mail/skill.md", "Pollers-Overrides.yaml", "Skills/mail/POLLERS.JSON",
+    "skills/mail/SCRIPTS/run.py",
+])
+def test_live_instruction_classifier_matches_case_variants(tmp_path: Path, relative: str) -> None:
+    from mimir.access_control import _live_instruction_surface
+
+    # The classifier intentionally over-matches on case-sensitive filesystems,
+    # so this test needs neither APFS nor a case-normalising resolve() mock.
+    assert _live_instruction_surface(tmp_path, tmp_path / relative)
+    assert not _live_instruction_surface(tmp_path, tmp_path / "scratch/proposals/p" / relative)
+
+
+@pytest.mark.parametrize("error", [RuntimeError, OSError])
+@pytest.mark.parametrize("tool", ["write_file", "edit_file", "replace_file"])
+def test_tainted_looping_symlink_authorization_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[Exception], tool: str,
+) -> None:
+    from mimir.access_control import _live_instruction_surface
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    loop = tmp_path / "prompts/loop.md"
+    loop.parent.mkdir()
+    loop.symlink_to(loop)
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        if path == loop:
+            # Python 3.13 no longer raises for loops with strict=False. Pin the
+            # indeterminate identity branch also reached on 3.12 and I/O errors.
+            raise error("indeterminate looping symlink")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert _live_instruction_surface(tmp_path, loop)
+    auth = replace(_auth(roles=("admin",)), ifc_labels=_labels())
+    decision = ToolRegistry().authorize_tool(
+        tool, auth, enforce=False, arguments={"file_path": str(loop)},
+    )
+    assert not decision.allowed and decision.enforcement_enabled
+    assert "open_proposal/submit_proposal" in decision.refusal_detail
+    assert loop.is_symlink()
 
 
 @pytest.mark.parametrize("profile", [

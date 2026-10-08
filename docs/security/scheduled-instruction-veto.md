@@ -6,7 +6,10 @@ After a turn ingests an untrusted active source, schedule mutations
 The same veto applies to file-tool writes, edits, replacements and uploads to
 the live home's `scheduler.yaml`, `pollers-overrides.yaml`, `prompts/*.md`,
 `memory/core/*.md`, `memory/INDEX.md`, and a skill's `SKILL.md`, `pollers.json`
-or `scripts/**`. Targets are compared after resolving traversal and symlinks.
+or `scripts/**`. Targets are compared after resolving traversal and symlinks,
+with case-insensitive surface matching (including filename suffixes) so
+case-preserving APFS/virtiofs paths cannot bypass the veto. Indeterminate path
+resolution fails closed.
 
 The veto is scoped to the live home. Proposal worktrees under
 `scratch/proposals/` and PR-lease checkouts remain writable under their existing
