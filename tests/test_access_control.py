@@ -14011,6 +14011,11 @@ def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
         ("chainlink issue unlabel 1051 worklink:in-progress", False, True),
         ("chainlink issue create 'New leaf' -l bug --label=worklink:ready", False, True),
         ("chainlink issue quick 'New leaf' -lworklink:ready", False, True),
+        ("chainlink issue create 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue quick 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue subissue 1051 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue create 'New leaf' -l=bug,worklink:ready", False, True),
+        ("chainlink issue create 'Plain issue' -l=bug", False, False),
         ("chainlink issue subissue 1051 'New leaf' --label worklink:ready", False, True),
         ("chainlink issue update 1051 -d 'new spec'", True, True),
         ("chainlink issue update 1051 --title revised", True, True),
@@ -14069,6 +14074,62 @@ def test_tainted_chainlink_armed_work_veto_on_all_shell_paths(
         assert decision.allowed is True, (path, command, decision.reason)
         assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
     assert bool(lookups) == ("issue update" in command)
+
+
+@pytest.mark.parametrize("path", ["service", "generic"])
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue label -- 1051 worklink:ready",
+        "chainlink issue create y -ql worklink:ready",
+        "chainlink issue create y -qlworklink:ready",
+        "chainlink issue create y -ql=worklink:ready",
+        "cd /tmp && chainlink issue label 1051 worklink:ready",
+        "true; chainlink issue label 1051 worklink:ready",
+        "env chainlink issue label 1051 worklink:ready",
+        "sh -c 'chainlink issue label 1051 worklink:ready'",
+        "chainlink issue label 1051 worklink:ready > /dev/null",
+        "chainlink issue update 1051 -d changed > /dev/null",
+        "chainlink issue update not-an-id -d changed",
+        "chainlink issue create 'unterminated",
+        "printf worklink:ready > labels.txt",
+        # Unparseable unarmed commands are deliberately refused too.
+        "env chainlink issue create unarmed",
+    ],
+)
+def test_tainted_unrecognized_chainlink_shell_fails_closed(
+    path: str, tool_name: str, command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    if path == "service":
+        labels = _chainlink_ifc_labels(tainted=True)
+        service = replace(
+            _chainlink_service("maintenance", "heartbeat"),
+            capabilities=(tool_name,),
+            sink_policies=(ServiceSinkPolicy(tool_name, "shell_profile", "maintenance"),),
+        )
+        auth = replace(
+            _service_auth(service, labels),
+            ifc_state=InformationFlowState(labels=labels),
+        )
+    else:
+        auth = _tainted_admin_operator_write_auth()
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=False, target_channel=command,
+    )
+    assert decision.allowed is False
+    assert decision.enforcement_enabled is True
+    assert decision.is_shadow_decision is False
+    assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+    assert "Unrecognized" in decision.refusal_detail
+
+
+def test_chainlink_update_without_id_fails_closed() -> None:
+    assert "label lookup failed" in access_control._chainlink_armed_work_refusal(
+        ["chainlink", "issue", "update", "-d", "changed"],
+        None, session_cwd=False,
+    )
 
 
 @pytest.mark.parametrize("path", ["service", "operator", "generic"])

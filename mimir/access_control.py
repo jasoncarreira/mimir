@@ -1735,6 +1735,8 @@ def _chainlink_arguments(argv: list[str]) -> list[str]:
     for argument in argv[1:]:
         if argument.startswith("--label="):
             arguments.extend(("--label", argument[len("--label="):]))
+        elif argument.startswith("-l="):
+            arguments.extend(("-l", argument[3:]))
         elif argument.startswith("-l") and argument != "-l" and not argument.startswith("--"):
             arguments.extend(("-l", argument[2:]))
         elif argument not in _CHAINLINK_OUTPUT_OPTIONS:
@@ -6587,18 +6589,26 @@ class SinkGate:
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             chainlink_argv = _chainlink_target_argv(target)
+            refusal = None
             if chainlink_argv is not None:
                 refusal = _chainlink_armed_work_refusal(
                     chainlink_argv, requested_cwd,
                     session_cwd=service is None and operator_shell_binding is None,
                 )
-                if refusal is not None:
-                    return ToolAuthorization(
-                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
-                        allowed=False, reason="chainlink_armed_work_blocked_by_untrusted_ingest",
-                        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
-                        would_block=True, refusal_detail=refusal,
-                    )
+            elif isinstance(target, str) and (
+                "chainlink" in target.lower() or "worklink:" in target.lower()
+            ):
+                # Unknown CLI forms, wrappers and compound shell cannot be
+                # proved unarmed. Never turn a failed bounded parse into an
+                # exemption on the generic shell path (or any other profile).
+                refusal = _CHAINLINK_ARMED_WORK_REFUSAL + " Unrecognized Chainlink/Worklink shell target."
+            if refusal is not None:
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason="chainlink_armed_work_blocked_by_untrusted_ingest",
+                    required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+                    would_block=True, refusal_detail=refusal,
+                )
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
                 tool_name=tool_name,

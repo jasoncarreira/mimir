@@ -9,8 +9,15 @@ All notable changes will land here. Format loosely follows
 - Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
 - After untrusted ingest, agent Chainlink shell calls cannot change `worklink:*`
   labels, create armed issues, or update armed issues even in shadow mode (#1897).
-  Unarmed issue filing and comments remain available; the operator must review
-  an unarmed description before applying `worklink:ready`.
+  Bounded unarmed issue filing and comments remain available; the operator must
+  review an unarmed description before applying `worklink:ready`. Attached
+  `-l=worklink:ready` labels are normalized like Clap. On tainted shadow-mode
+  turns, shell targets mentioning `chainlink` or `worklink:` that do not parse
+  as one admitted invocation are refused, including wrappers, compound commands,
+  redirections and unknown flag forms, on service and generic shell paths.
+  This is an argv/text-level veto, not generic-shell confinement: indirect or
+  obfuscated execution and direct writes to the tracker SQLite database are not
+  prevented by this check. Enable IFC enforcement for the broader shell gate.
 - Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
   internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
