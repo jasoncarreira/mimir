@@ -2165,7 +2165,7 @@ class WriteGuardBackend:
 
     def _is_tainted_instruction_write(self, file_path: str) -> bool:
         from ._context import get_current_turn
-        from .access_control import _live_instruction_surface, _scheduled_write_tainted
+        from .access_control import _live_instruction_surface, _turn_has_untrusted_active_ingest
 
         turn = get_current_turn()
         if turn is None:
@@ -2182,7 +2182,7 @@ class WriteGuardBackend:
         candidate = self._root / self._canonicalize_path(file_path).lstrip("/")
         return (
             _live_instruction_surface(self._root, candidate)
-            and _scheduled_write_tainted(auth, getattr(turn, "ifc_labels", None))
+            and _turn_has_untrusted_active_ingest(auth, getattr(turn, "ifc_labels", None))
         )
 
     _SCHEDULED_INSTRUCTION_DENY_REASON = (

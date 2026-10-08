@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- After untrusted ingest, agent Chainlink shell calls cannot change `worklink:*`
+  labels, create armed issues, or update armed issues even in shadow mode (#1897).
+  Unarmed issue filing and comments remain available; the operator must review
+  an unarmed description before applying `worklink:ready`.
 - Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
   internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).

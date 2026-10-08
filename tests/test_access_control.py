@@ -14003,6 +14003,186 @@ def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
     return InformationFlowLabels().with_channel("poller:test").with_source(source)
 
 
+@pytest.mark.parametrize("path", ["service", "operator", "generic"])
+@pytest.mark.parametrize(
+    ("command", "armed", "veto"),
+    [
+        ("chainlink issue label 1051 worklink:ready", False, True),
+        ("chainlink issue unlabel 1051 worklink:in-progress", False, True),
+        ("chainlink issue create 'New leaf' -l bug --label=worklink:ready", False, True),
+        ("chainlink issue quick 'New leaf' -lworklink:ready", False, True),
+        ("chainlink issue subissue 1051 'New leaf' --label worklink:ready", False, True),
+        ("chainlink issue update 1051 -d 'new spec'", True, True),
+        ("chainlink issue update 1051 --title revised", True, True),
+        ("chainlink issue create 'Plain issue' -l bug", False, False),
+        ("chainlink issue comment 1051 'Review note'", True, False),
+        ("chainlink issue label 1051 bug", False, False),
+        ("chainlink issue update 1051 -d 'plain edit'", False, False),
+        ("chainlink issue close 1051", True, False),
+    ],
+)
+def test_tainted_chainlink_armed_work_veto_on_all_shell_paths(
+    path: str, command: str, armed: bool, veto: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    lookups: list[tuple[str, object]] = []
+
+    def labels(argv: list[str], issue_id: str, cwd: object, *, session_cwd: bool) -> bool:
+        lookups.append((issue_id, cwd))
+        assert session_cwd is (path == "generic")
+        return armed
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", labels)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=True)
+        auth = replace(
+            _service_auth(_chainlink_service("maintenance", "heartbeat"), ifc),
+            ifc_state=InformationFlowState(labels=ifc),
+        )
+    elif path == "operator":
+        _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = _tainted_admin_operator_write_auth()
+        request = object()
+        kwargs = {
+            "arguments": {"cwd": str(root)},
+            "operator_shell_binding": _operator_chainlink_binding(
+                command, request=request, auth=auth, root=root,
+            ),
+            "operator_shell_request_identity": request,
+            "tool_call_id": "call-arm2",
+        }
+    else:
+        auth = _tainted_admin_operator_write_auth()
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    if veto:
+        assert decision.allowed is False, (path, command, decision.reason)
+        assert decision.is_shadow_decision is False
+        assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+        assert "clean turn or the operator" in decision.refusal_detail
+        assert "unarmed issue or comment" in decision.refusal_detail
+    else:
+        assert decision.allowed is True, (path, command, decision.reason)
+        assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+    assert bool(lookups) == ("issue update" in command)
+
+
+@pytest.mark.parametrize("path", ["service", "operator", "generic"])
+def test_tainted_chainlink_update_label_lookup_failure_is_always_refused(
+    path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    command = "chainlink issue update 1051 -d changed"
+
+    def unavailable(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unavailable)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=True)
+        auth = replace(_service_auth(_chainlink_service("maintenance", "heartbeat"), ifc),
+                       ifc_state=InformationFlowState(labels=ifc))
+    elif path == "operator":
+        _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = _tainted_admin_operator_write_auth()
+        request = object()
+        kwargs = {
+            "arguments": {"cwd": str(root)},
+            "operator_shell_binding": _operator_chainlink_binding(
+                command, request=request, auth=auth, root=root,
+            ),
+            "operator_shell_request_identity": request,
+            "tool_call_id": "call-arm2",
+        }
+    else:
+        auth = _tainted_admin_operator_write_auth()
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert "label lookup failed" in decision.refusal_detail
+
+
+def test_clean_chainlink_armed_work_does_not_lookup_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=False)
+    auth = replace(_service_auth(_chainlink_service("maintenance", "heartbeat"), labels),
+                   ifc_state=InformationFlowState(labels=labels))
+
+    def unexpected(*_args: object) -> bool:
+        raise AssertionError("clean turn performed label lookup")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unexpected)
+    for command in ("chainlink issue label 1051 worklink:ready",
+                    "chainlink issue update 1051 -d changed"):
+        for enforce in (False, True):
+            decision = ToolRegistry().authorize_tool(
+                "shell_exec", auth, enforce=enforce, target_channel=command,
+            )
+            assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("payload", "refused"),
+    [
+        ('{"id":1051,"labels":["bug"]}', False),
+        ('{"id":1051,"labels":[{"name":"worklink:ready"}]}', True),
+        ('{"id":1051}', True),
+        ('{"id":1052,"labels":[]}', True),
+        ('{"id":1051,"labels":[42]}', True),
+        ('not json', True),
+    ],
+)
+def test_chainlink_update_lookup_validates_issue_and_labels(
+    payload: str, refused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def show(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == ["chainlink", "issue", "show", "1051", "--json"]
+        assert kwargs["cwd"] == tmp_path
+        assert kwargs["timeout"] == 5
+        return subprocess.CompletedProcess(argv, 0, payload, "")
+
+    monkeypatch.setattr(access_control.subprocess, "run", show)
+    argv = shlex.split("chainlink issue update 1051 -d changed")
+    if refused and "worklink:ready" not in payload:
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            access_control._chainlink_issue_has_worklink_labels(
+                argv, "1051", str(tmp_path), session_cwd=False,
+            )
+    else:
+        assert access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", str(tmp_path), session_cwd=False,
+        ) is refused
+
+
+def test_chainlink_update_lookup_refuses_missing_cwd_and_failed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = shlex.split("chainlink issue update 1051 -d changed")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    with pytest.raises(ValueError, match="working directory"):
+        access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", None, session_cwd=False,
+        )
+
+    def failure(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 1, '{"id":1051,"labels":[]}', "error")
+
+    monkeypatch.setattr(access_control.subprocess, "run", failure)
+    with pytest.raises(ValueError, match="lookup failed"):
+        access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", "/tmp", session_cwd=False,
+        )
+
+
 @pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
 @pytest.mark.parametrize("case", ["missing_labels", "missing_state", "missing_predicate", "none", "non_boolean", "raises"])
 @pytest.mark.parametrize("roles", [("user",), ("admin",)])
