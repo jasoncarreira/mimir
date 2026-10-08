@@ -253,6 +253,8 @@ def _scheduler_delta(home: Path) -> list[str]:
     def _tick_names(path: Path) -> set[str]:
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8")) or []
+            if isinstance(data, dict):
+                data = data.get("jobs", [])
             if isinstance(data, list):
                 return {e["name"] for e in data if isinstance(e, dict) and "name" in e}
         except Exception:

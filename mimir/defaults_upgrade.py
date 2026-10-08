@@ -481,7 +481,11 @@ def _merge_scheduler_defaults(
         f"tick(s) — edit cron/priority/channel or remove as needed ---\n"
     )
     stripped = home_text.rstrip("\n")
-    if not stripped or stripped == "[]":
+    document = yaml.safe_load(home_text)
+    if isinstance(document, dict) and isinstance(document.get("jobs"), list):
+        document["jobs"].extend(j.to_yaml_entry() for j in to_add)
+        new_text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+    elif not stripped or stripped == "[]":
         new_text = banner + addition
     else:
         new_text = f"{stripped}\n\n{banner}{addition}"

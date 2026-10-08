@@ -59,6 +59,7 @@ from .access_control import (
     build_scheduled_tick_service_principal,
     builtin_trigger_service_principal,
     parse_declared_shell_commands,
+    parse_operator_shell_commands,
 )
 from .core_blocks import read_text_lossy
 from .event_logger import get_events_path, log_event, log_event_sync, safe_log_event
@@ -419,6 +420,22 @@ def load_jobs_from_text(
         }]
     if raw is None:
         return [], []
+    if isinstance(raw, dict):
+        if set(raw) - {"jobs", "operator_shell_commands"} or not isinstance(raw.get("jobs"), list):
+            return [], [{
+                "path": str(source), "job": "<document>", "scope": "document",
+                "reason": "scheduler mapping requires a jobs list and only operator_shell_commands",
+            }]
+        try:
+            parse_operator_shell_commands(
+                raw.get("operator_shell_commands"), writable_roots=writable_roots,
+            )
+        except ValueError as exc:
+            return [], [{
+                "path": str(source), "job": "<document>", "scope": "document",
+                "reason": str(exc),
+            }]
+        raw = raw["jobs"]
     if not isinstance(raw, list):
         return [], [{
             "path": str(source),
@@ -487,6 +504,22 @@ def load_jobs(
     )
 
 
+def load_operator_shell_commands(
+    path: Path, *, writable_roots: tuple[Path, ...] = (),
+) -> tuple["DeclaredShellCommand", ...]:
+    """Read operator-owned grants at call time; malformed edits fail closed."""
+    if not path.exists():
+        return ()
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("jobs"), list):
+        return () if isinstance(raw, list) else parse_operator_shell_commands(raw)
+    if set(raw) - {"jobs", "operator_shell_commands"}:
+        raise ValueError("unknown scheduler.yaml top-level keys")
+    return parse_operator_shell_commands(
+        raw.get("operator_shell_commands"), writable_roots=writable_roots,
+    )
+
+
 _BUNDLED_TEMPLATE = Path(__file__).parent / "scheduler_template.yaml"
 
 
@@ -501,8 +534,17 @@ def bundled_scheduler_template_text() -> str:
 
 def write_jobs(path: Path, jobs: list[SchedulerJob]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+    grants = None
+    if isinstance(existing, dict):
+        if set(existing) - {"jobs", "operator_shell_commands"}:
+            raise ValueError("unknown scheduler.yaml top-level keys")
+        grants = existing.get("operator_shell_commands")
+        parse_operator_shell_commands(grants, writable_roots=agent_writable_roots(path.parent))
     body = yaml.safe_dump(
-        [j.to_yaml_entry() for j in jobs],
+        ({"operator_shell_commands": grants, "jobs": [j.to_yaml_entry() for j in jobs]}
+         if isinstance(existing, dict) and "operator_shell_commands" in existing
+         else [j.to_yaml_entry() for j in jobs]),
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,

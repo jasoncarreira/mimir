@@ -49,6 +49,111 @@ def _gog(**over):
     return entry
 
 
+@pytest.mark.parametrize("key,value", [
+    ("external_send", True), ("payload_args", ["--body"]),
+    ("script", "/bin/true"),
+])
+def test_operator_declaration_rejects_outbound_and_script_entries(key, value):
+    with pytest.raises(ValueError, match=key):
+        access_control.parse_operator_shell_commands([_gog(**{key: value})])
+
+
+def test_operator_declaration_rejects_interpreter_and_bad_shape():
+    with pytest.raises(ValueError, match="interpreter"):
+        access_control.parse_operator_shell_commands([_gog(exec="python3", path="/usr/bin/python3")])
+    with pytest.raises(ValueError, match="operator_shell_commands must be a list"):
+        access_control.parse_operator_shell_commands({"exec": "gog"})
+
+
+def test_operator_declaration_refuses_base_parser_valid_script(home: Path):
+    entry = {"exec": "python3", "path": sys.executable,
+             "script": str(home / "scripts" / "todo.py")}
+    commands = parse_declared_shell_commands([entry], writable_roots=(home / "scratch",))
+    assert len(commands) == 1 and commands[0].script is not None
+    with pytest.raises(ValueError, match="script"):
+        access_control.parse_operator_shell_commands([entry], writable_roots=(home / "scratch",))
+
+
+def test_scheduler_unknown_document_key_refuses_jobs_and_chat_grants(tmp_path: Path):
+    import yaml
+    from mimir.scheduler import load_jobs_from_text, load_operator_shell_commands
+
+    text = yaml.safe_dump({
+        "jobs": [{"name": "brief", "cron": "0 * * * *", "prompt": "brief"}],
+        "operator_shell_commands": [_gog()], "unknown_grant": [],
+    })
+    jobs, rejections = load_jobs_from_text(text, source=tmp_path / "scheduler.yaml")
+    assert jobs == []
+    assert len(rejections) == 1 and rejections[0]["scope"] == "document"
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="unknown"):
+        load_operator_shell_commands(path)
+
+
+def test_operator_declaration_refuses_valid_external_send_shape():
+    with pytest.raises(ValueError, match="external_send"):
+        access_control.parse_operator_shell_commands([
+            _gog(external_send=True, payload_args=["--body"], options=["--body"]),
+        ])
+
+
+def test_scheduler_operator_grants_load_and_survive_job_rewrites(tmp_path: Path):
+    import yaml
+    from mimir.scheduler import load_jobs, load_operator_shell_commands, write_jobs
+
+    executable = tmp_path / "gog"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    document = {"jobs": [{"name": "read", "prompt": "read", "cron": "0 * * * *"}],
+                "operator_shell_commands": [{"exec": "gog", "path": str(executable),
+                                              "subcommands": [["gmail", "search"]]}]}
+    path.write_text(yaml.safe_dump(document))
+    jobs, rejections = load_jobs(path)
+    assert not rejections and len(jobs) == 1
+    assert load_operator_shell_commands(path)[0].executable == "gog"
+    write_jobs(path, jobs)
+    rewritten = yaml.safe_load(path.read_text())
+    assert rewritten["operator_shell_commands"] == document["operator_shell_commands"]
+    assert [job["name"] for job in rewritten["jobs"]] == ["read"]
+    document["operator_shell_commands"][0]["external_send"] = True
+    path.write_text(yaml.safe_dump(document))
+    jobs, rejections = load_jobs(path)
+    assert not jobs and rejections[0]["scope"] == "document"
+    assert "external_send" in rejections[0]["reason"]
+
+
+def test_scheduled_service_uses_only_its_job_grant(tmp_path: Path):
+    import yaml
+    from dataclasses import replace
+    from mimir.scheduler import load_jobs, load_operator_shell_commands
+    from mimir.access_control import get_service_principal
+
+    executable = tmp_path / "gog"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    job_grant = {"exec": "gog", "path": str(executable),
+                 "subcommands": [["calendar", "events"]]}
+    chat_grant = {"exec": "gog", "path": str(executable),
+                  "subcommands": [["gmail", "search"]]}
+    path.write_text(yaml.safe_dump({
+        "operator_shell_commands": [chat_grant],
+        "jobs": [{"name": "brief", "cron": "0 * * * *", "prompt": "brief",
+                  "shell_commands": [job_grant]}],
+    }))
+    jobs, rejections = load_jobs(path)
+    assert not rejections
+    service = replace(get_service_principal("scheduled_tick"),
+                      declared_shell_commands=parse_declared_shell_commands(jobs[0].shell_commands))
+    assert parse_service_shell_argv("gog calendar events", "scheduler_read_only",
+                                    declared=service.declared_shell_commands) is not None
+    assert parse_service_shell_argv("gog gmail search", "scheduler_read_only",
+                                    declared=service.declared_shell_commands) is None
+    assert load_operator_shell_commands(path)[0].subcommands == (("gmail", "search"),)
+
+
 @pytest.mark.parametrize("missing_kind", ["final", "intermediate", "dangling_link"])
 def test_missing_executable_component_preserves_raw_diagnostic(
     tmp_path: Path, missing_kind: str,

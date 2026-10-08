@@ -6,6 +6,12 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
+  `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
+  bounded argv with scrubbed environment and value-free audit events; job grants
+  remain job-scoped. Mutating verbs must not be declared. Read queries can bring
+  sensitive data into the still-tainted turn; outbound sink checks remain in force.
+
 - Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
 - After untrusted ingest, agent Chainlink shell calls cannot change `worklink:*`
   labels, create armed issues, or update armed issues even in shadow mode (#1897).
