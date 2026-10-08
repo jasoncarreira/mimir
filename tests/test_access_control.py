@@ -14024,6 +14024,21 @@ def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
         ("chainlink issue label 1051 bug", False, False),
         ("chainlink issue update 1051 -d 'plain edit'", False, False),
         ("chainlink issue close 1051", True, False),
+        *[
+            (command, armed, veto)
+            for text in ("Why? fix", "x*y", "a [b]", "see {spec}")
+            for quote in ("'", '"')
+            for command, armed, veto in (
+                (f"chainlink issue create {quote}{text}{quote} -l worklink:ready", False, True),
+                (f"chainlink issue quick {quote}{text}{quote} -l=worklink:ready", False, True),
+                (f"chainlink issue subissue 1051 {quote}{text}{quote} --label worklink:ready", False, True),
+                (f"chainlink issue update 1051 --title {quote}{text}{quote}", True, True),
+                (f"chainlink issue update 1051 -d {quote}{text}{quote}", True, True),
+                (f"chainlink issue update 1051 -d {quote}{text}{quote}", False, False),
+                (f"chainlink issue create {quote}{text}{quote} -l bug", False, False),
+                (f"chainlink issue comment 1051 {quote}{text}{quote}", True, False),
+            )
+        ],
     ],
 )
 def test_tainted_chainlink_armed_work_veto_on_declared_shell_paths(
@@ -14036,6 +14051,8 @@ def test_tainted_chainlink_armed_work_veto_on_declared_shell_paths(
     def labels(argv: list[str], issue_id: str, cwd: object, *, session_cwd: bool) -> bool:
         lookups.append((issue_id, cwd))
         assert session_cwd is False
+        assert argv[0] == str(maintenance_pinned_executables["chainlink"])
+        assert argv[1:] == shlex.split(command)[1:]
         return armed
 
     monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", labels)

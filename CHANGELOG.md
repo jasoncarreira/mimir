@@ -18,9 +18,11 @@ All notable changes will land here. Format loosely follows
   armed issues, or update armed issues even in shadow mode (#1897). Bounded
   unarmed issue filing and comments remain available; the operator must review
   an unarmed description before applying `worklink:ready`. Attached
-  `-l=worklink:ready` labels are normalized like Clap. Unknown service commands
-  remain subject to the existing exact-argv profile gate, without a substring
-  veto on read-only diagnostics. Generic `shell_exec`/`bash_async` behavior and
+  `-l=worklink:ready` labels are normalized like Clap. The veto classifies the
+  admitted execution argv (the operator binding or service-profile parser), so
+  quoted literal `? * [ ] { }` in titles and descriptions cannot skip it.
+  Unknown service commands remain subject to the existing exact-argv profile
+  gate, without a substring veto on read-only diagnostics. Generic `shell_exec`/`bash_async` behavior and
   explicit one-time operator sink approvals are unchanged. Open shell execution
   is not covered by this arming veto: runtime-built names, encoded payloads,
   indirect execution and direct tracker SQLite writes cannot be confined by

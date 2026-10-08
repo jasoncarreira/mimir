@@ -6675,7 +6675,7 @@ class SinkGate:
         # original reason/detail; only shadow mode needs this narrower veto.
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            chainlink_argv = _chainlink_target_argv(target)
+            execution_argv = None
             refusal = None
             reason = "chainlink_armed_work_blocked_by_untrusted_ingest"
             bounded_operator = _operator_shell_binding_matches(
@@ -6692,10 +6692,26 @@ class SinkGate:
             # not by a substring check (which also catches read-only diagnostics).
             # Generic bash execution cannot be confined by argv inspection; its
             # post-ingest policy and approval semantics remain unchanged (#1872).
-            if chainlink_argv is not None and (service is not None or bounded_operator):
-                refusal = _chainlink_armed_work_refusal(
-                    chainlink_argv, requested_cwd, session_cwd=False,
-                )
+            if bounded_operator:
+                execution_argv = list(operator_shell_binding.argv)
+            elif service is not None and isinstance(target, str):
+                policy = service.sink_policy_for(tool_name)
+                if policy is not None and policy.adapter == "shell_profile":
+                    execution_argv, _reason, _rule = parse_service_shell_argv_with_diagnostics(
+                        target, policy.destination, review_state=repo_review_state,
+                        declared=getattr(service, "declared_shell_commands", ()) or (),
+                    )
+            if execution_argv:
+                # The gate pins Chainlink before execution. Normalize only that
+                # admitted executable for family classification, never re-parse
+                # the command text: quoted glob characters are literal operands.
+                classifier_argv = list(execution_argv)
+                if Path(classifier_argv[0]).name == "chainlink":
+                    classifier_argv[0] = "chainlink"
+                if _target_matches_chainlink_command(classifier_argv):
+                    refusal = _chainlink_armed_work_refusal(
+                        execution_argv, requested_cwd, session_cwd=False,
+                    )
             if refusal is not None:
                 return ToolAuthorization(
                     tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
