@@ -7516,6 +7516,21 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
         await asyncio.sleep(0)
 
     events = [event for event in captured if event["reason"] == reason]
+    if tool_name == "shell_exec":
+        # Generic shell is now an always-on denial, not a shadow decision.
+        # Other sinks still exercise bounded/redacted shadow telemetry below.
+        assert shadow.allowed is False
+        assert shadow.reason == reason
+        assert shadow.enforcement_enabled is True
+        assert shadow.is_shadow_decision is False
+        assert events == []
+        for enforce in (False, True):
+            sink = SinkGate.check_sink_flow(
+                tool_name, target, labels, auth, enforce=enforce,
+            )
+            assert sink.allowed is False
+            assert sink.reason == reason
+        return
     assert len(events) == 1
     event = events[0]
     assert event["ifc_source_scope"] == "causing_source"
@@ -14035,7 +14050,7 @@ def test_tainted_chainlink_armed_work_veto_on_all_shell_paths(
 
     def labels(argv: list[str], issue_id: str, cwd: object, *, session_cwd: bool) -> bool:
         lookups.append((issue_id, cwd))
-        assert session_cwd is (path == "generic")
+        assert session_cwd is False
         return armed
 
     monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", labels)
@@ -14064,7 +14079,13 @@ def test_tainted_chainlink_armed_work_veto_on_all_shell_paths(
     decision = ToolRegistry().authorize_tool(
         "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
     )
-    if veto:
+    if path == "generic":
+        assert decision.allowed is False, (path, command, decision.reason)
+        assert decision.enforcement_enabled is True
+        assert decision.is_shadow_decision is False
+        assert decision.reason == "ifc_label_blocked:shell_process"
+        assert "Generic shell execution" in decision.refusal_detail
+    elif veto:
         assert decision.allowed is False, (path, command, decision.reason)
         assert decision.is_shadow_decision is False
         assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
@@ -14073,7 +14094,7 @@ def test_tainted_chainlink_armed_work_veto_on_all_shell_paths(
     else:
         assert decision.allowed is True, (path, command, decision.reason)
         assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
-    assert bool(lookups) == ("issue update" in command)
+    assert bool(lookups) == (path != "generic" and "issue update" in command)
 
 
 @pytest.mark.parametrize("path", ["service", "generic"])
@@ -14121,8 +14142,49 @@ def test_tainted_unrecognized_chainlink_shell_fails_closed(
     assert decision.allowed is False
     assert decision.enforcement_enabled is True
     assert decision.is_shadow_decision is False
-    assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
-    assert "Unrecognized" in decision.refusal_detail
+    if path == "generic":
+        assert decision.reason == "ifc_label_blocked:shell_process"
+        assert "Generic shell execution" in decision.refusal_detail
+    else:
+        assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+        assert "Unrecognized" in decision.refusal_detail
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(printf chain%s link) issue label 5 $(printf work%s link):ready",
+        "echo Y2hhaW5saW5rIGlzc3VlIGxhYmVsIDUgd29ya2xpbms6cmVhZHk= | base64 -d | sh",
+        "C=chain; L=link; $C$L issue label 5 work${L}:ready",
+        # Plain argv and apparently read-only commands also need a binding:
+        # allowing arbitrary interpreters would reopen direct tracker writes.
+        "python -c 'print(1)'",
+        "sh helper.sh",
+        "pwd",
+        "chainlink issue show 5 --json",
+        "chainlink issue create unarmed",
+    ],
+)
+def test_tainted_generic_shell_requires_bound_profile_even_in_shadow_mode(
+    tool_name: str, command: str,
+) -> None:
+    registry = ToolRegistry()
+    decision = registry.authorize_tool(
+        tool_name, _tainted_admin_operator_write_auth(),
+        enforce=False, target_channel=command,
+    )
+    assert decision.allowed is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+    assert decision.enforcement_enabled is True
+    assert decision.is_shadow_decision is False
+    assert decision.would_block is True
+    assert "server-bound shell profile" in decision.refusal_detail
+    clean = registry.authorize_tool(
+        tool_name, _trusted_operator_write_auth(admin=True),
+        enforce=False, target_channel=command,
+    )
+    assert clean.allowed is True, clean.reason
 
 
 def test_chainlink_update_without_id_fails_closed() -> None:
@@ -14167,7 +14229,11 @@ def test_tainted_chainlink_update_label_lookup_failure_is_always_refused(
     )
     assert decision.allowed is False
     assert decision.is_shadow_decision is False
-    assert "label lookup failed" in decision.refusal_detail
+    if path == "generic":
+        assert decision.reason == "ifc_label_blocked:shell_process"
+        assert "Generic shell execution" in decision.refusal_detail
+    else:
+        assert "label lookup failed" in decision.refusal_detail
 
 
 def test_clean_chainlink_armed_work_does_not_lookup_labels(

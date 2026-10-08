@@ -6677,22 +6677,41 @@ class SinkGate:
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             chainlink_argv = _chainlink_target_argv(target)
             refusal = None
-            if chainlink_argv is not None:
+            reason = "chainlink_armed_work_blocked_by_untrusted_ingest"
+            bounded_operator = _operator_shell_binding_matches(
+                operator_shell_binding,
+                request_identity=operator_shell_request_identity,
+                auth_context_identity=auth_context,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                command=target,
+                requested_cwd=requested_cwd,
+            ) and cls._is_trusted_operator_turn(ifc_labels, auth_context)
+            if service is None and not bounded_operator:
+                # Generic shell executes bash -lc, so neither argv inspection
+                # nor text blocklists can prove it cannot arm work. Refuse the
+                # entire unbound execution surface, even in IFC shadow mode.
+                # Bounded profiles remain subject to their exact-argv gate.
+                reason = "ifc_label_blocked:shell_process"
+                refusal = (
+                    "Generic shell execution after untrusted ingest needs a clean "
+                    "turn or a server-bound shell profile. File unarmed Chainlink "
+                    "issues or comments through a bounded profile instead."
+                )
+            elif chainlink_argv is not None:
                 refusal = _chainlink_armed_work_refusal(
-                    chainlink_argv, requested_cwd,
-                    session_cwd=service is None and operator_shell_binding is None,
+                    chainlink_argv, requested_cwd, session_cwd=False,
                 )
             elif isinstance(target, str) and (
                 "chainlink" in target.lower() or "worklink:" in target.lower()
             ):
-                # Unknown CLI forms, wrappers and compound shell cannot be
-                # proved unarmed. Never turn a failed bounded parse into an
-                # exemption on the generic shell path (or any other profile).
+                # Bounded profiles separately execute one server-verified argv;
+                # unknown tracker forms never receive an armed-work exemption.
                 refusal = _CHAINLINK_ARMED_WORK_REFUSAL + " Unrecognized Chainlink/Worklink shell target."
             if refusal is not None:
                 return ToolAuthorization(
                     tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
-                    allowed=False, reason="chainlink_armed_work_blocked_by_untrusted_ingest",
+                    allowed=False, reason=reason,
                     required_tier=AccessTier.ADMIN, enforcement_enabled=True,
                     would_block=True, refusal_detail=refusal,
                 )
