@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
+  internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
 - Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
   models and real stdio contract tests. This fixes the silent tool-discovery
   failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
