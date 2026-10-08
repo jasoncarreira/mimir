@@ -17,6 +17,7 @@ from pathlib import Path
 from textwrap import dedent
 
 import yaml
+from dotenv import dotenv_values
 
 from ..skill_defs import seed_skills
 from ..subagent_defs import seed_subagent_defs
@@ -745,7 +746,13 @@ def setup_home(
     # existing spec, even when --model is omitted or differs. On a fresh
     # home, route still seeds .env from --model/default. (chainlink #447)
     env_spec = os.environ.get("MIMIR_MODEL_SPEC", "").strip()
-    home_spec = _env_get_var(home / ".env", _MIMIR_MODEL_SPEC_LINE_RE) or ""
+    # Match runtime's python-dotenv syntax (quotes and inline comments),
+    # without loading the home's defaults into setup's process environment.
+    env_path = home / ".env"
+    home_spec = (
+        (dotenv_values(env_path).get("MIMIR_MODEL_SPEC") or "")
+        if env_path.is_file() else ""
+    )
     effective_spec = env_spec or home_spec
     effective_route = detect_route(effective_spec) if effective_spec else route
     model_spec_from_env = bool(env_spec)

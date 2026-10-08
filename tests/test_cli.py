@@ -170,6 +170,55 @@ def test_setup_rerun_uses_home_model_for_status_and_report(
     assert "setup --model/default would be:" not in output
 
 
+@pytest.mark.parametrize(
+    "dotenv_value",
+    [
+        '"claude-code:claude-sonnet-4-6"',
+        "'claude-code:claude-sonnet-4-6'",
+        "claude-code:claude-sonnet-4-6  # chosen",
+    ],
+    ids=["double-quoted", "single-quoted", "inline-comment"],
+)
+def test_setup_rerun_parses_home_model_like_runtime(
+    tmp_path: Path, capsys: pytest.CaptureFixture, dotenv_value: str,
+):
+    from mimir.config import _load_home_dotenv
+
+    home = tmp_path / "agent"
+    setup_home(home, model="claude-sonnet-4-6", subscription=True)
+    env_path = home / ".env"
+    before = env_path.read_text().replace(
+        "MIMIR_MODEL_SPEC=claude-code:claude-sonnet-4-6\n",
+        f"MIMIR_MODEL_SPEC={dotenv_value}\n",
+    ).replace("MIMIR_COST_HOURLY_LIMIT_USD=\n", "")
+    env_path.write_text(before)
+    # Exercise the actual runtime parser without leaking the loaded defaults
+    # into this or later tests' process environment.
+    with patch.dict(os.environ):
+        _load_home_dotenv(home)
+        runtime_spec = os.environ["MIMIR_MODEL_SPEC"]
+    assert runtime_spec == "claude-code:claude-sonnet-4-6"
+
+    status = setup_home(home, model=None)
+
+    assert status["model_spec"] == runtime_spec
+    assert status["provider_name"] == "anthropic-max"
+    assert status["billing_mode"] == "subscription"
+    assert status["model_spec_from_home_env"] is True
+    assert status["model_spec_from_env"] is False
+    assert "Anthropic" in status["monitor_status"]
+    after = env_path.read_text()
+    assert after == before  # No default-route provider or monitor injection.
+    assert "MIMIR_COST_HOURLY_LIMIT_USD=" not in after
+    _print_setup_report(status)
+    output = capsys.readouterr().out
+    assert (
+        f"model spec:    {runtime_spec}   "
+        "(provider: anthropic-max; billing: subscription)"
+    ) in output
+    assert f"↑ from {home}/.env" in output
+
+
 def test_setup_rerun_injects_only_home_route_monitor_and_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
