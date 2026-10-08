@@ -308,6 +308,16 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         if key in os.environ:
             env[key] = os.environ[key]
     if _is_gh_argv(argv):
+        if (binding is not None and binding.operator_declared
+                and ("GITHUB_TOKEN" not in names or not env.get("GITHUB_TOKEN", "").strip())):
+            # Missing authority/credentials is a per-call refusal, not evidence
+            # that the process's verified GitHub identity changed. Do not let
+            # tainted chat input trip the global identity-degraded latch.
+            from .refusals import ToolPolicyRefusal
+
+            raise ToolPolicyRefusal(
+                "operator-declared gh requires an explicit non-empty GITHUB_TOKEN grant"
+            )
         # Even explicit chat declarations must not discover ambient on-disk auth.
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
         from .forge import confirm_github_tool_identity
