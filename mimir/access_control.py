@@ -6708,10 +6708,23 @@ class SinkGate:
                 classifier_argv = list(execution_argv)
                 if Path(classifier_argv[0]).name == "chainlink":
                     classifier_argv[0] = "chainlink"
-                if _target_matches_chainlink_command(classifier_argv):
-                    refusal = _chainlink_armed_work_refusal(
-                        execution_argv, requested_cwd, session_cwd=False,
-                    )
+                    if _target_matches_chainlink_command(classifier_argv):
+                        refusal = _chainlink_armed_work_refusal(
+                            execution_argv, requested_cwd, session_cwd=False,
+                        )
+                    else:
+                        # Operator declarations can admit more argv shapes than
+                        # the built-in classifier (notably Clap's `--`). Never
+                        # let an unclassified mutation skip the always-on veto.
+                        # Only an explicit read-only issue namespace is exempt;
+                        # no command text or label substring is consulted.
+                        arguments = _chainlink_arguments(classifier_argv)
+                        if not (arguments[:1] == ["issue"] and len(arguments) >= 2
+                                and arguments[1] in _CHAINLINK_QUERY_SUBCOMMANDS):
+                            refusal = (
+                                _CHAINLINK_ARMED_WORK_REFUSAL
+                                + " Unclassified Chainlink command; refusing the mutation."
+                            )
             if refusal is not None:
                 return ToolAuthorization(
                     tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,

@@ -14093,6 +14093,94 @@ def test_tainted_chainlink_armed_work_veto_on_declared_shell_paths(
     assert bool(lookups) == ("issue update" in command)
 
 
+@pytest.mark.parametrize("path", ["service", "operator"])
+@pytest.mark.parametrize("tainted", [True, False])
+@pytest.mark.parametrize(
+    ("command", "veto"),
+    [
+        ("chainlink issue label -- 1051 worklink:ready", True),
+        ("chainlink issue label 1051 -- worklink:ready", True),
+        ("chainlink issue create -l worklink:ready -- title", True),
+        ("chainlink issue update -- 1051 -d changed", True),
+        ("chainlink issue create -- unarmed", True),
+        ("chainlink issue label -- 1051 bug", True),
+        ("chainlink issue show -- 1051", False),
+        ("chainlink issue list --", False),
+        ("chainlink issue search -- 'worklink:ready'", False),
+        ("chainlink issue create unarmed -l bug", False),
+        ("chainlink issue comment 1051 'review note'", False),
+    ],
+    ids=["label-before-id", "label-before-value", "create-after-label", "update",
+         "unarmed-create", "unarmed-label", "show", "list", "search", "create", "comment"],
+)
+def test_chainlink_custom_declarations_fail_closed_on_unclassified_mutations(
+    path: str, tainted: bool, command: str, veto: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    # Match the live declaration rather than the stricter built-in family gate.
+    declared = access_control.parse_declared_shell_commands([{
+        "exec": "chainlink",
+        "path": str(maintenance_pinned_executables["chainlink"]),
+        "subcommands": [["issue", subcommand] for subcommand in (
+            "create", "comment", "update", "label", "show", "list", "search",
+        )],
+        "options": ["-d", "-p", "-t", "-l", "-s", "-q", "--kind", "--json"],
+    }], writable_roots=())
+
+    def unexpected(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("unclassified mutation performed an armed-issue lookup")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unexpected)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=tainted)
+        service = replace(
+            _chainlink_service("maintenance", "heartbeat"),
+            declared_shell_commands=declared,
+        )
+        auth = replace(_service_auth(service, ifc), ifc_state=InformationFlowState(labels=ifc))
+        argv = parse_service_shell_argv(command, "maintenance", declared=declared)
+    else:
+        root, _project, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = (_tainted_admin_operator_write_auth() if tainted
+                else _trusted_operator_write_auth(admin=True))
+        request = object()
+        argv = parse_service_shell_argv(
+            command, access_control.OPERATOR_SHELL_PROFILE,
+            allow_project_test=False, declared=declared,
+        )
+        assert argv is not None
+        artifact = access_control._validated_operator_shell_argv_artifact(
+            argv, argv, resolved_cwd=root, declaration=declared[0],
+        )
+        assert artifact is not None
+        binding = access_control._issue_operator_shell_binding(
+            request_identity=request, auth_context_identity=auth,
+            tool_call_id="call-arm2", command=command,
+            requested_cwd=str(root), resolved_cwd=str(root), argv_artifact=artifact,
+        )
+        assert binding is not None
+        kwargs = {
+            "arguments": {"cwd": str(root)}, "operator_shell_binding": binding,
+            "operator_shell_request_identity": request, "tool_call_id": "call-arm2",
+        }
+    # Prove these commands really cross declaration admission on BOTH paths.
+    assert argv == [str(maintenance_pinned_executables["chainlink"]), *shlex.split(command)[1:]]
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    if tainted and veto:
+        assert decision.allowed is False, (path, command, decision.reason)
+        assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+        assert decision.enforcement_enabled is True
+        assert decision.is_shadow_decision is False
+        assert "Unclassified Chainlink command" in decision.refusal_detail
+    else:
+        assert decision.allowed is True, (path, command, decision.reason)
+        assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+
+
 @pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
 @pytest.mark.parametrize(
     "command",
