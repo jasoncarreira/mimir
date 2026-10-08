@@ -1727,6 +1727,21 @@ _CHAINLINK_MUTATION_SUBCOMMANDS = frozenset({
     "create", "update", "comment", "label", "unlabel", "block", "unblock",
     "relate", "unrelate", "close", "reopen", "subissue", "quick",
 })
+
+
+def _chainlink_arguments(argv: list[str]) -> list[str]:
+    """Normalize Clap's attached label values before bounded shape checks."""
+    arguments: list[str] = []
+    for argument in argv[1:]:
+        if argument.startswith("--label="):
+            arguments.extend(("--label", argument[len("--label="):]))
+        elif argument.startswith("-l") and argument != "-l" and not argument.startswith("--"):
+            arguments.extend(("-l", argument[2:]))
+        elif argument not in _CHAINLINK_OUTPUT_OPTIONS:
+            arguments.append(argument)
+    return arguments
+
+
 # Audited against ``chainlink issue --help``. These commands are mutations that
 # remain outside the bounded service surface rather than unclassified reads.
 _CHAINLINK_REFUSED_ISSUE_SUBCOMMANDS = {
@@ -1853,10 +1868,7 @@ def _target_matches_chainlink_command(argv: list[str]) -> bool:
         return False
     # Clap marks these options global, so accept them at the executable,
     # resource, or subcommand level without widening any operand shape.
-    arguments = [
-        argument for argument in argv[1:]
-        if argument not in _CHAINLINK_OUTPUT_OPTIONS
-    ]
+    arguments = _chainlink_arguments(argv)
     if arguments[:1] == ["issue"]:
         return _chainlink_issue_arguments_match(arguments[1:])
     if arguments[:2] == ["session", "status"]:
@@ -1868,10 +1880,7 @@ def _chainlink_command_is_mutation(argv: list[str]) -> bool:
     """Classify one admitted Chainlink argv without consulting IFC state."""
     if not _target_matches_chainlink_command(argv):
         return False
-    arguments = [
-        argument for argument in argv[1:]
-        if argument not in _CHAINLINK_OUTPUT_OPTIONS
-    ]
+    arguments = _chainlink_arguments(argv)
     return (
         arguments[:1] == ["issue"]
         and len(arguments) >= 2
@@ -1888,6 +1897,84 @@ def _chainlink_target_argv(target: str | None) -> list[str] | None:
     except ValueError:
         return None
     return argv if _target_matches_chainlink_command(argv) else None
+
+
+_CHAINLINK_ARMED_WORK_REFUSAL = (
+    "Arming or editing armed Worklink work after untrusted ingest needs a clean "
+    "turn or the operator. File an unarmed issue or comment instead."
+)
+
+
+def _worklink_label(value: str) -> bool:
+    return any(label.startswith("worklink:") for label in value.split(","))
+
+
+def _chainlink_issue_has_worklink_labels(
+    argv: list[str], issue_id: str, requested_cwd: object, *, session_cwd: bool,
+) -> bool:
+    """Read the target's current labels with a bounded query; uncertainty denies."""
+    from .tools.extra import _effective_shell_cwd
+
+    cwd = _effective_shell_cwd(
+        requested_cwd if isinstance(requested_cwd, str) else None,
+        allow_session_state=session_cwd,
+    )
+    if not cwd:
+        raise ValueError("Chainlink issue label lookup has no working directory")
+    result = subprocess.run(
+        [argv[0], "issue", "show", issue_id, "--json"],
+        cwd=cwd, capture_output=True, text=True, timeout=5, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("Chainlink issue label lookup failed")
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict) or str(payload.get("id")) != issue_id:
+        raise ValueError("Chainlink issue label lookup returned the wrong issue")
+    labels = payload.get("labels")
+    if not isinstance(labels, list):
+        raise ValueError("Chainlink issue label lookup omitted labels")
+    for label in labels:
+        name = (
+            label if isinstance(label, str) else
+            label.get("name") if isinstance(label, dict) else None
+        )
+        if not isinstance(name, str):
+            raise ValueError("Chainlink issue label lookup returned invalid labels")
+        if _worklink_label(name):
+            return True
+    return False
+
+
+def _chainlink_armed_work_refusal(
+    argv: list[str], requested_cwd: object, *, session_cwd: bool,
+) -> str | None:
+    """Classify only shell mutations that arm or rewrite armed tracker work."""
+    arguments = _chainlink_arguments(argv)
+    if arguments[:1] != ["issue"] or len(arguments) < 3:
+        return None
+    subcommand = arguments[1]
+    operands = arguments[2:]
+    if subcommand in {"label", "unlabel"}:
+        return _CHAINLINK_ARMED_WORK_REFUSAL if _worklink_label(operands[-1]) else None
+    if subcommand in {"create", "quick", "subissue"}:
+        if any(
+            option in {"-l", "--label"} and _worklink_label(operands[index + 1])
+            for index, option in enumerate(operands[:-1])
+        ):
+            return _CHAINLINK_ARMED_WORK_REFUSAL
+        return None
+    if subcommand == "update":
+        issue_id = next((value for value in operands if value.isascii() and value.isdigit()), None)
+        if issue_id is None:
+            return _CHAINLINK_ARMED_WORK_REFUSAL + " Chainlink issue label lookup failed."
+        try:
+            armed = _chainlink_issue_has_worklink_labels(
+                argv, issue_id, requested_cwd, session_cwd=session_cwd,
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return _CHAINLINK_ARMED_WORK_REFUSAL + " Chainlink issue label lookup failed; refusing the update."
+        return _CHAINLINK_ARMED_WORK_REFUSAL if armed else None
+    return None
 
 
 #: Refused even when quoted. A newline inside a command string is never a
@@ -5874,7 +5961,7 @@ def _live_instruction_surface(home: Path, target: Path) -> bool:
     )
 
 
-def _scheduled_write_tainted(auth_context: Any, ifc_labels: Any) -> bool:
+def _turn_has_untrusted_active_ingest(auth_context: Any, ifc_labels: Any) -> bool:
     if ifc_labels is None:
         ifc_labels = getattr(auth_context, "ifc_labels", None)
     state = getattr(auth_context, "ifc_state", None)
@@ -6493,8 +6580,25 @@ class SinkGate:
 
         sink_category = sink_category or get_sink_category(tool_name)
         service = get_trusted_service_from_auth_context(auth_context)
-        if tool_name in _SCHEDULE_WRITE_TOOLS and _scheduled_write_tainted(auth_context, ifc_labels):
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
+        # Enforcement already refuses all tainted tracker mutations with the
+        # original reason/detail; only shadow mode needs this narrower veto.
+        if (not enforce and tool_name in {"shell_exec", "bash_async"}
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            chainlink_argv = _chainlink_target_argv(target)
+            if chainlink_argv is not None:
+                refusal = _chainlink_armed_work_refusal(
+                    chainlink_argv, requested_cwd,
+                    session_cwd=service is None and operator_shell_binding is None,
+                )
+                if refusal is not None:
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="chainlink_armed_work_blocked_by_untrusted_ingest",
+                        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+                        would_block=True, refusal_detail=refusal,
+                    )
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -9138,7 +9242,7 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
-        if tool_name in _SCHEDULE_WRITE_TOOLS and _scheduled_write_tainted(auth_context, ifc_labels):
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if tool_name in {"write_file", "edit_file", "replace_file"}:
             home = os.environ.get("MIMIR_HOME", "").strip()
@@ -9149,7 +9253,7 @@ class ToolRegistry:
                 if not candidate.is_relative_to(root):
                     candidate = root / raw_path.lstrip("/")
                 if (_live_instruction_surface(root, candidate)
-                        and _scheduled_write_tainted(auth_context, ifc_labels)):
+                        and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
                     try:
                         resolved_parts = candidate.resolve(strict=False).relative_to(root).parts
                         skill = bool(resolved_parts and resolved_parts[0].casefold() == "skills")
@@ -9391,7 +9495,8 @@ class ToolRegistry:
                 request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
-            if not sink_check.allowed and enforce and not preliminary_admin_denied:
+            if (not sink_check.allowed and sink_check.enforcement_enabled
+                    and not preliminary_admin_denied):
                 return finish(sink_check)
             if sink_check.is_shadow_decision and sink_check.would_block:
                 if preliminary_admin_denied:
