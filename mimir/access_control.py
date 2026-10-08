@@ -5835,6 +5835,74 @@ def _has_untrusted_active_ingest(
     )
 
 
+_SCHEDULE_WRITE_TOOLS = frozenset({
+    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
+})
+_SCHEDULE_WRITE_REFUSAL = (
+    "Scheduled work and autonomous instruction surfaces cannot be changed after "
+    "untrusted ingest; propose this change with open_proposal/submit_proposal; "
+    "the operator merges it."
+)
+
+
+def _live_instruction_surface(home: Path, target: Path) -> bool:
+    """Match resolved *live* HOME instruction files, not proposal/checkouts."""
+    try:
+        relative = target.resolve(strict=False).relative_to(home.resolve(strict=False))
+    except ValueError:
+        return False  # outside the live home (e.g. a PR lease checkout)
+    except (OSError, RuntimeError):
+        # Indeterminate identity cannot establish that an in-home path is safe.
+        return True
+    # APFS/virtiofs live homes preserve the caller's spelling in resolve(),
+    # even when differently cased paths identify the same file. Conservatively
+    # match these surfaces case-insensitively on every filesystem.
+    parts = tuple(part.casefold() for part in relative.parts)
+    if not parts:
+        return False
+    if parts in {("scheduler.yaml",), ("pollers-overrides.yaml",),
+                 ("memory", "index.md")}:
+        return True
+    if len(parts) == 2 and parts[0] == "prompts" and parts[1].endswith(".md"):
+        return True
+    if len(parts) == 3 and parts[:2] == ("memory", "core") and parts[2].endswith(".md"):
+        return True
+    return (
+        len(parts) >= 3 and parts[0] == "skills"
+        and ((parts[2] in {"skill.md", "pollers.json"} and len(parts) == 3)
+             or (parts[2] == "scripts" and len(parts) >= 4))
+    )
+
+
+def _scheduled_write_tainted(auth_context: Any, ifc_labels: Any) -> bool:
+    if ifc_labels is None:
+        ifc_labels = getattr(auth_context, "ifc_labels", None)
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    if ifc_labels is None:
+        try:
+            if not callable(current) or current() is None:
+                return True
+        except Exception:
+            return True
+    return _has_untrusted_active_ingest(
+        auth_context, ifc_labels, missing_is_tainted=ifc_labels is None,
+    )
+
+
+def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuthorization":
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason=(
+            "skill_write_requires_admin_operator" if skill else
+            "ifc_label_blocked:file" if tool_name in {"write_file", "edit_file", "replace_file"}
+            else "ifc_label_blocked:scheduler"
+        ),
+        required_tier=AccessTier.ADMIN, enforcement_enabled=True,
+        would_block=True, refusal_detail=_SCHEDULE_WRITE_REFUSAL,
+    )
+
+
 def _same_channel_authority(
     source: Any,
     triggering_bridge_instance: str | None,
@@ -6425,6 +6493,8 @@ class SinkGate:
 
         sink_category = sink_category or get_sink_category(tool_name)
         service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _scheduled_write_tainted(auth_context, ifc_labels):
+            return _scheduled_write_denial(tool_name)
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
                 tool_name=tool_name,
@@ -9068,6 +9138,26 @@ class ToolRegistry:
         sink_category = get_sink_category(tool_name)
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
+        if tool_name in _SCHEDULE_WRITE_TOOLS and _scheduled_write_tainted(auth_context, ifc_labels):
+            return finish(_scheduled_write_denial(tool_name))
+        if tool_name in {"write_file", "edit_file", "replace_file"}:
+            home = os.environ.get("MIMIR_HOME", "").strip()
+            raw_path = (arguments or {}).get("file_path") or (arguments or {}).get("path") or target_channel
+            if home and isinstance(raw_path, str) and raw_path.strip():
+                root = Path(home).resolve()
+                candidate = Path(raw_path)
+                if not candidate.is_relative_to(root):
+                    candidate = root / raw_path.lstrip("/")
+                if (_live_instruction_surface(root, candidate)
+                        and _scheduled_write_tainted(auth_context, ifc_labels)):
+                    try:
+                        resolved_parts = candidate.resolve(strict=False).relative_to(root).parts
+                        skill = bool(resolved_parts and resolved_parts[0].casefold() == "skills")
+                    except (ValueError, OSError, RuntimeError):
+                        # The classifier deliberately vetoes indeterminate paths;
+                        # do not resolve them again without preserving that denial.
+                        skill = False
+                    return finish(_scheduled_write_denial(tool_name, skill=skill))
         skill_write = WriteResourceAdapter.authorize_skill_write(
             tool_name,
             target_channel,
@@ -9984,7 +10074,9 @@ def protected_result_source(
     requester = getattr(auth_context, "canonical_principal", None)
     if getattr(auth_context, "is_service", False) and requester:
         requester = f"service:{requester}"
-    integrity = "untrusted"
+    # Only clean turns can install schedule metadata or the instructions that
+    # feed it; reading the resulting schedule does not ingest attacker input.
+    integrity = "trusted" if domain == "schedule_metadata" else "untrusted"
     integrity_effect = "active_ingest"
     if domain == "filesystem" and isinstance(resource_id, str):
         from .pr_checkout_lease import active_pr_checkout_lease_for_path

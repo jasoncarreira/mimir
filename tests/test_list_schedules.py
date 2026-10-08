@@ -17,6 +17,7 @@ path.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,13 @@ import pytest
 
 from mimir.scheduler import SchedulerJob
 from mimir.tools.registry import _STATE, list_schedules
+from mimir._context import set_current_turn, reset_current_turn
+from mimir.access_control import (
+    SinkGate, _operator_can_invoke_admin_shell, begin_protected_result_capture,
+    end_protected_result_capture, classify_protected_result, ToolRegistry,
+)
+from mimir.models import AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel, TurnInteractivity
+from types import SimpleNamespace
 
 
 class _StubScheduler:
@@ -53,6 +61,50 @@ def stub_scheduler():
         "scheduler", _StubScheduler(jobs, pollers, home=home)
     )
     _STATE["scheduler"] = prev
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_preserves_trusted_operator_ingest(stub_scheduler) -> None:
+    stub_scheduler([SchedulerJob(name="daily", cron="0 8 * * *", prompt="report")],
+                   pollers=[{"name": "mail", "cron": "* * * * *", "priority": "normal"}])
+    auth = AuthContext(
+        principal="operator", canonical_principal="operator", roles=("user",),
+        trigger="user_message", channel_id="channel", resource_id="channel",
+        domain="channel", bridge_instance="discord", event_ingress=None,
+        interactivity=TurnInteractivity.INTERACTIVE,
+    )
+    operator = SourceLabel(
+        principal="operator", domain="channel", resource_id="channel",
+        bridge_instance="discord", sensitivity="internal",
+        authorized_principals=frozenset({"operator"}), source_kind="channel",
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(operator)
+    state = InformationFlowState(labels=labels)
+    auth = replace(auth, ifc_labels=labels, ifc_state=state)
+    token = set_current_turn(SimpleNamespace(turn_id="trusted-schedule-list", auth_context=auth))
+    try:
+        capture = begin_protected_result_capture()
+        try:
+            result = await list_schedules.ainvoke({})
+        finally:
+            provenance = end_protected_result_capture(capture)
+        assert len(json.loads(result)) == 2
+        assert provenance is not None and len(provenance.sources) == 2
+        assert all(s.integrity == "trusted" and s.domain == "schedule_metadata"
+                   for s in provenance.sources)
+        decision = ToolRegistry().authorize_tool("list_schedules", auth, enforce=False)
+        ingested = classify_protected_result(
+            "list_schedules", {}, auth, decision, result=result, provenance=provenance,
+        )
+        assert ingested is not None
+        for source in ingested.sources:
+            state.labels = state.labels.with_source(source)
+        current = state.current(labels)
+        assert not state.has_untrusted_active_ingest(labels)
+        assert _operator_can_invoke_admin_shell("shell_exec", current, auth)
+    finally:
+        reset_current_turn(token)
 
 
 # ─── Regression: was crashing on j.last_run / j.next_fire ──────────────

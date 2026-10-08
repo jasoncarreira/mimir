@@ -25,6 +25,14 @@ updates:
       - dependency-type: "direct"
       - dependency-name: "claude-agent-sdk"
     open-pull-requests-limit: 10
+    ignore:
+      # Stay on agent-client-protocol==0.12.0 until a planned migration to ACP
+      # 1.0. The 0.12.1 SDK refactor (python-sdk#132) removed the acp.task
+      # internals mimir/acp/sdk.py builds on, so mimir.acp would not import
+      # (Dependabot #2281). The range also skips 1.0 pre-releases; the final
+      # 1.0.0 still opens a PR in the agent-protocols group.
+      - dependency-name: "agent-client-protocol"
+        versions: [">=0.12.1, <1.0.0"]
     groups:
       # Protocol/adapter surfaces get their own PR, all update types, so they
       # are never buried in the rolling minor/patch PR. First matching group
