@@ -4,3 +4,62 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # Python (pyproject.toml + uv.lock). Daily, so protocol releases surface
+  # quickly: mcp 2.x shipped unnoticed while the requirement had no upper
+  # bound, and broke MCP tool discovery for PyPI installs (fixed by the
+  # 0.9.6 `mcp<2` cap; the real upgrade is chainlink #1891).
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "daily"
+    # increase-if-necessary: a release inside the declared range only moves
+    # uv.lock (no churn to the published floors of this library), while a
+    # release outside it -- e.g. mcp 2.x past `<2`, or anything past the exact
+    # `agent-client-protocol==0.12.0` pin -- widens the requirement and so
+    # always produces a PR. That PR is the notification.
+    versioning-strategy: "increase-if-necessary"
+    allow:
+      # Direct dependencies, plus the claude-code SDK, which arrives
+      # transitively through langchain-claude-code-mimir.
+      - dependency-type: "direct"
+      - dependency-name: "claude-agent-sdk"
+    open-pull-requests-limit: 10
+    groups:
+      # Protocol/adapter surfaces get their own PR, all update types, so they
+      # are never buried in the rolling minor/patch PR. First matching group
+      # wins, so these are excluded from python-minor-patch.
+      agent-protocols:
+        patterns:
+          - "mcp"
+          - "agent-client-protocol"
+          - "claude-agent-sdk"
+          - "langchain-claude-code-mimir"
+          - "langchain-codex-plus"
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      # Majors of everything else are left ungrouped: one PR each.
+
+  # Frontend (root package.json + package-lock.json).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Base image of the root Dockerfile.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
