@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 import errno
 import json
 import os
@@ -11,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+from types import SimpleNamespace
 import time
 import uuid
 from unittest.mock import AsyncMock, Mock, call
@@ -35,6 +38,152 @@ from mimir.worklink.run_state import (
 )
 
 
+@pytest.mark.asyncio
+async def test_operator_stop_records_terminal_evidence_without_incident(tmp_path, monkeypatch):
+    from mimir.worklink import orchestrator
+    from mimir.worklink.checkout import CheckoutLease
+    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, OPERATOR_STOP_PREFIX
+    from mimir.worklink.compute import ComputeResult
+    from mimir.worklink.dispatch_failures import (
+        autonomous_dispatch_block_reason, dispatch_failure_state_dir, load_failure_state,
+    )
+
+    issue_id = 700
+    attempt = 3
+    state = WorklinkRunState(
+        issue_id=issue_id, attempt=attempt, backend="opencode", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier="1234", process_start_ticks=42,
+        branch="issue/700-a3", base_ref="main", local_base="main", repo=str(tmp_path),
+        repo_url="", test_command=None, started_at=datetime.now(UTC).isoformat(),
+    )
+    save_run_state(tmp_path, state)
+    labels = {"worklink:ready", "worklink:in-progress"}
+    comments = []
+    locks = {issue_id}
+    claim = ClaimRecord(issue_id, attempt, "agent", datetime.now(UTC))
+    comments.append(claim.to_comment())
+
+    def runner(args):
+        action = list(args[1:])
+        if action[:2] == ["issue", "comment"]:
+            comments.append(action[-1])
+        elif action[:2] == ["issue", "unlabel"]:
+            labels.discard(action[-1])
+        elif action[:2] == ["issue", "label"]:
+            labels.add(action[-1])
+        elif action[:2] == ["locks", "release"]:
+            locks.discard(issue_id)
+        else:
+            raise AssertionError(action)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    from mimir.worklink import control
+    monkeypatch.setattr(control, "process_is_alive", lambda state: True)
+    monkeypatch.setattr(control, "process_identity_verified", lambda state: True)
+
+    async def cancel(self, handle):
+        assert control.operator_stop_requested(tmp_path, issue_id, attempt)
+
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    result = await asyncio.to_thread(stop_worklink, tmp_path, issue_id, runner=runner)
+    assert result.stopped
+
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner, max_attempts=5)
+    assert orchestrator._record_run_failure(
+        home=tmp_path, issue_id=issue_id, attempt=attempt,
+        error="worker SIGTERM", exit_status=-signal.SIGTERM, autonomous=True,
+    ) is None
+    lease = CheckoutLease(issue_id, attempt, tmp_path, tmp_path, state.branch, "main")
+    terminal = orchestrator._TerminalClaimRelease(claims, home=tmp_path, issue_id=issue_id, attempt=attempt)
+    backend = SimpleNamespace(name="opencode", interpret=Mock(side_effect=AssertionError("stop must bypass backend")))
+    outcome = await orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finalize(
+        issue=orchestrator.IssueContext(issue_id, "title", "body", set()),
+        claims=claims, claim_record=claim, attempt=attempt, config=None,
+        backend=backend, compute=None, compute_result=ComputeResult(-signal.SIGTERM, "", ""),
+        order=None, lease=lease, spec=None, started=datetime.now(UTC), test_cmd=None,
+        root_dirty_before=(), runner=runner, terminal_release=terminal, autonomous=True,
+    )
+    assert outcome.status == "stopped" and outcome.reason == "stopped by operator"
+    assert json.loads(outcome.evidence_path.read_text())["status"] == "stopped"
+    assert len([comment for comment in comments if comment.startswith(OPERATOR_STOP_PREFIX)]) == 1
+    assert "WORKLINK_EVIDENCE issue=700 attempt=3 status=stopped" in comments[-1]
+    assert claims.attempts_used(comments) == 0
+    assert claims.next_attempt(comments) == attempt + 1
+    assert not labels and not locks
+    assert autonomous_dispatch_block_reason(dispatch_failure_state_dir(tmp_path), issue_id) is None
+    assert load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"] == {}
+
+    # The marker is inert for the next claim, even though it remains durable.
+    orchestrator._record_run_failure(
+        home=tmp_path, issue_id=issue_id, attempt=attempt + 1,
+        error="external SIGTERM", exit_status=-signal.SIGTERM, autonomous=True,
+    )
+    assert load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"][str(issue_id)]["failure_kind"] == "operator_required"
+    assert autonomous_dispatch_block_reason(dispatch_failure_state_dir(tmp_path), issue_id) is not None
+    claims.transition_issue(issue_id, status="failed", review_ready=False, attempt=attempt + 1)
+    assert labels == {"worklink:ready"}
+
+
+@pytest.mark.asyncio
+async def test_external_sigterm_still_fails_and_rearms(tmp_path, monkeypatch):
+    from mimir.worklink import orchestrator
+    from mimir.worklink.backends.base import RawResult
+    from mimir.worklink.checkout import CheckoutLease
+    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord
+    from mimir.worklink.compute import ComputeResult
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
+
+    labels = {"worklink:in-progress"}
+    comments = []
+
+    def runner(args):
+        action = list(args[1:])
+        if action[:2] == ["issue", "unlabel"]:
+            labels.discard(action[-1])
+        elif action[:2] == ["issue", "label"]:
+            labels.add(action[-1])
+        elif action[:2] == ["issue", "comment"]:
+            comments.append(action[-1])
+        elif action[:2] != ["locks", "release"]:
+            raise AssertionError(action)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    async def interpret(order, result):
+        return RawResult(-signal.SIGTERM, None, "failed", "worker terminated")
+
+    async def observe_evidence(**kwargs):
+        evidence = WorklinkEvidence(
+            issue=700, attempt=1, backend="opencode", branch="issue/700-a1",
+            checkout=str(tmp_path), started_at=datetime.now(UTC).isoformat(),
+            finished_at=datetime.now(UTC).isoformat(), files_changed=[], diff_stat="",
+            commands=[], tests=None, pr_url=None, status="failed",
+            failure_reason="worker terminated",
+        )
+        return EvidenceValidation("failed", False, ("worker terminated",), evidence)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe_evidence)
+    monkeypatch.setattr(orchestrator, "_with_outside_checkout_detection", lambda validation, **kwargs: validation)
+    monkeypatch.setattr(orchestrator, "_cleanup_checkout_after_transition", lambda *args, **kwargs: None)
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner)
+    terminal = orchestrator._TerminalClaimRelease(claims, tmp_path, 700, 1)
+    result = await orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finalize(
+        issue=orchestrator.IssueContext(700, "title", "body", set()),
+        claims=claims, claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+        attempt=1, config=SimpleNamespace(defaults=SimpleNamespace(gate_rerun_max_failures=0)),
+        backend=SimpleNamespace(name="opencode", interpret=interpret), compute=None,
+        compute_result=ComputeResult(-signal.SIGTERM, "", ""), order=None,
+        lease=CheckoutLease(700, 1, tmp_path, tmp_path, "issue/700-a1", "main"),
+        spec=SimpleNamespace(backend_config={}), started=datetime.now(UTC), test_cmd=None,
+        root_dirty_before=(), runner=runner, terminal_release=terminal, autonomous=True,
+    )
+    assert result.status == "failed"
+    assert json.loads(result.evidence_path.read_text())["status"] == "failed"
+    assert any("WORKLINK_EVIDENCE issue=700 attempt=1 status=failed" in comment for comment in comments)
+    assert labels == {"worklink:ready"}
+    assert load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]["failure_kind"] == "operator_required"
+
+
 def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:
     record = FactoryRunRecord(
         run_id=run_id, issue_id=700, attempt=2, repository="owner/repo",
@@ -45,6 +194,18 @@ def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:
     )
     save_factory_record(home, record)
     return record
+
+
+def test_operator_stop_marker_requires_matching_issue_and_attempt(tmp_path):
+    from mimir.worklink.control import _mark_operator_stop, _operator_stop_path, operator_stop_requested
+
+    _mark_operator_stop(tmp_path, 700, 2)
+    assert operator_stop_requested(tmp_path, 700, 2)
+    assert not operator_stop_requested(tmp_path, 700, 3)
+    assert not operator_stop_requested(tmp_path, 701, 2)
+    # A file at the requested issue path with somebody else's issue id is inert.
+    _operator_stop_path(tmp_path, 700).write_text('{"issue_id": 701, "attempt": 2}')
+    assert not operator_stop_requested(tmp_path, 700, 2)
 
 
 @pytest.fixture

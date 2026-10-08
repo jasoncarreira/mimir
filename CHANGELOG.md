@@ -6,6 +6,7 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
   models and real stdio contract tests. This fixes the silent tool-discovery
   failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
