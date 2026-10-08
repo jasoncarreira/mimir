@@ -1973,6 +1973,8 @@ class WriteGuardBackend:
             tool = "upload_files"
         if "prompts_readonly" in op:
             reason = "prompts_readonly"
+        elif "scheduled_instruction_veto" in op:
+            reason = "scheduled_instruction_veto"
         elif "core_memory_readonly" in op:
             reason = "core_memory_readonly"
         elif "identities_protected" in op:
@@ -2161,10 +2163,40 @@ class WriteGuardBackend:
         "admin Users UI / web-key endpoints — not by editing this file."
     )
 
+    def _is_tainted_instruction_write(self, file_path: str) -> bool:
+        from ._context import get_current_turn
+        from .access_control import _live_instruction_surface, _scheduled_write_tainted
+
+        turn = get_current_turn()
+        if turn is None:
+            return False
+        auth = getattr(turn, "auth_context", None)
+        if auth is None:
+            # Setup and legacy in-process callers have no authorization carrier.
+            return False
+        configured_home = os.environ.get("MIMIR_HOME", "").strip()
+        if configured_home and self._root != Path(configured_home).resolve():
+            return False
+        # Resolve the lexical spelling as well as symlinks before classifying.
+        # The ordinary writable-root guard still rejects traversal attempts.
+        candidate = self._root / self._canonicalize_path(file_path).lstrip("/")
+        return (
+            _live_instruction_surface(self._root, candidate)
+            and _scheduled_write_tainted(auth, getattr(turn, "ifc_labels", None))
+        )
+
+    _SCHEDULED_INSTRUCTION_DENY_REASON = (
+        "Write blocked after untrusted ingest: propose this change with "
+        "open_proposal/submit_proposal; the operator merges it."
+    )
+
     def _allowed_dirs_label(self) -> str:
         return ", ".join(f"{label}/" for label in self._writable_labels)
 
     def write(self, file_path: str, content: str) -> WriteResult:
+        if self._is_tainted_instruction_write(file_path):
+            self._record_denial("write_scheduled_instruction_veto", file_path)
+            return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if not self._is_write_allowed(file_path):
             if self._is_prompts_path(file_path):
                 self._record_denial("write_prompts_readonly", file_path)
@@ -2200,6 +2232,9 @@ class WriteGuardBackend:
         return await asyncio.to_thread(self.write, file_path, content)
 
     def replace(self, file_path: str, content: str) -> WriteResult:
+        if self._is_tainted_instruction_write(file_path):
+            self._record_denial("replace_scheduled_instruction_veto", file_path)
+            return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if not self._is_write_allowed(file_path):
             if self._is_prompts_path(file_path):
                 self._record_denial("replace_prompts_readonly", file_path)
@@ -2227,6 +2262,9 @@ class WriteGuardBackend:
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
+        if self._is_tainted_instruction_write(file_path):
+            self._record_denial("edit_scheduled_instruction_veto", file_path)
+            return EditResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if self._fs._is_outside_root(file_path):
             return EditResult(error=self._fs._outside_root_msg(file_path, tool="edit_file"))
         if not self._is_write_allowed(file_path):
@@ -2274,10 +2312,13 @@ class WriteGuardBackend:
         # This is the documented semantic — partial uploads with a
         # mixed response shape would be more surprising than failing
         # the batch cleanly.
+        instruction_blocked = {p for p, _ in files if self._is_tainted_instruction_write(p)}
         blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
         core_blocked = {p for p, _ in files if self._is_core_memory_write_blocked(p)}
         identities_blocked = {p for p, _ in files if self._is_identities_write_blocked(p)}
-        if blocked_paths or core_blocked or identities_blocked:
+        if blocked_paths or core_blocked or identities_blocked or instruction_blocked:
+            for p in instruction_blocked:
+                self._record_denial("upload_scheduled_instruction_veto", p)
             for p in blocked_paths:
                 self._record_denial("upload", p)
             for p in core_blocked - blocked_paths:

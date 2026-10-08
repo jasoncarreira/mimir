@@ -5422,7 +5422,9 @@ def test_skill_writes_require_an_untainted_admin_operator_turn(
     assert decision.allowed is allowed, case
     assert decision.reason == (None if allowed else "skill_write_requires_admin_operator"), case
     assert decision.refusal_detail == (
-        None if allowed else "writes under skills/ require an untainted admin operator turn"
+        None if allowed else
+        access_control._SCHEDULE_WRITE_REFUSAL if case == "tainted_admin_operator" else
+        "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=False, target_channel=target,

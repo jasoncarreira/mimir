@@ -3277,7 +3277,10 @@ def test_file_taint_refusal_names_way_forward(
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:file"
     prefix = f"{tool_name} was refused before execution (ifc_label_blocked:file): "
-    if durable:
+    if path.startswith("memory/core/"):
+        assert "open_proposal/submit_proposal; the operator merges it" in message
+        assert decision.enforcement_enabled and not decision.is_shadow_decision
+    elif durable:
         assert message == prefix + (
             "information-flow policy blocked this durable memory write. "
             "Untrusted content must not be written to memory/ or state/ "

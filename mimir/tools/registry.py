@@ -1593,6 +1593,8 @@ async def list_schedules() -> str:
 
     turn = get_current_turn()
     auth_context = getattr(turn, "auth_context", None)
+    # Schedule definitions and poller metadata are trusted by construction:
+    # tainted turns cannot write the live instruction surfaces they come from.
     publish_protected_result(tuple(
         protected_result_source(
             auth_context,
