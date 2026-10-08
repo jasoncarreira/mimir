@@ -14003,6 +14003,423 @@ def _chainlink_ifc_labels(*, tainted: bool) -> InformationFlowLabels:
     return InformationFlowLabels().with_channel("poller:test").with_source(source)
 
 
+@pytest.mark.parametrize("path", ["service", "operator"])
+@pytest.mark.parametrize(
+    ("command", "armed", "veto"),
+    [
+        ("chainlink issue label 1051 worklink:ready", False, True),
+        ("chainlink issue unlabel 1051 worklink:in-progress", False, True),
+        ("chainlink issue create 'New leaf' -l bug --label=worklink:ready", False, True),
+        ("chainlink issue quick 'New leaf' -lworklink:ready", False, True),
+        ("chainlink issue create 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue quick 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue subissue 1051 'New leaf' -l=worklink:ready", False, True),
+        ("chainlink issue create 'New leaf' -l=bug,worklink:ready", False, True),
+        ("chainlink issue create 'Plain issue' -l=bug", False, False),
+        ("chainlink issue subissue 1051 'New leaf' --label worklink:ready", False, True),
+        ("chainlink issue update 1051 -d 'new spec'", True, True),
+        ("chainlink issue update 1051 --title revised", True, True),
+        ("chainlink issue create 'Plain issue' -l bug", False, False),
+        ("chainlink issue comment 1051 'Review note'", True, False),
+        ("chainlink issue label 1051 bug", False, False),
+        ("chainlink issue update 1051 -d 'plain edit'", False, False),
+        ("chainlink issue close 1051", True, False),
+        *[
+            (command, armed, veto)
+            for text in ("Why? fix", "x*y", "a [b]", "see {spec}")
+            for quote in ("'", '"')
+            for command, armed, veto in (
+                (f"chainlink issue create {quote}{text}{quote} -l worklink:ready", False, True),
+                (f"chainlink issue quick {quote}{text}{quote} -l=worklink:ready", False, True),
+                (f"chainlink issue subissue 1051 {quote}{text}{quote} --label worklink:ready", False, True),
+                (f"chainlink issue update 1051 --title {quote}{text}{quote}", True, True),
+                (f"chainlink issue update 1051 -d {quote}{text}{quote}", True, True),
+                (f"chainlink issue update 1051 -d {quote}{text}{quote}", False, False),
+                (f"chainlink issue create {quote}{text}{quote} -l bug", False, False),
+                (f"chainlink issue comment 1051 {quote}{text}{quote}", True, False),
+            )
+        ],
+    ],
+)
+def test_tainted_chainlink_armed_work_veto_on_declared_shell_paths(
+    path: str, command: str, armed: bool, veto: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    lookups: list[tuple[str, object]] = []
+
+    def labels(argv: list[str], issue_id: str, cwd: object, *, session_cwd: bool) -> bool:
+        lookups.append((issue_id, cwd))
+        assert session_cwd is False
+        assert argv[0] == str(maintenance_pinned_executables["chainlink"])
+        assert argv[1:] == shlex.split(command)[1:]
+        return armed
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", labels)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=True)
+        auth = replace(
+            _service_auth(_chainlink_service("maintenance", "heartbeat"), ifc),
+            ifc_state=InformationFlowState(labels=ifc),
+        )
+    elif path == "operator":
+        _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = _tainted_admin_operator_write_auth()
+        request = object()
+        kwargs = {
+            "arguments": {"cwd": str(root)},
+            "operator_shell_binding": _operator_chainlink_binding(
+                command, request=request, auth=auth, root=root,
+            ),
+            "operator_shell_request_identity": request,
+            "tool_call_id": "call-arm2",
+        }
+    else:
+        auth = _tainted_admin_operator_write_auth()
+
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    if veto:
+        assert decision.allowed is False, (path, command, decision.reason)
+        assert decision.is_shadow_decision is False
+        assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+        assert "clean turn or the operator" in decision.refusal_detail
+        assert "unarmed issue or comment" in decision.refusal_detail
+    else:
+        assert decision.allowed is True, (path, command, decision.reason)
+        assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+    assert bool(lookups) == ("issue update" in command)
+
+
+@pytest.mark.parametrize("path", ["service", "operator"])
+@pytest.mark.parametrize("tainted", [True, False])
+@pytest.mark.parametrize(
+    ("command", "veto"),
+    [
+        ("chainlink issue label -- 1051 worklink:ready", True),
+        ("chainlink issue label 1051 -- worklink:ready", True),
+        ("chainlink issue create -l worklink:ready -- title", True),
+        ("chainlink issue update -- 1051 -d changed", True),
+        ("chainlink issue create -- unarmed", True),
+        ("chainlink issue label -- 1051 bug", True),
+        ("chainlink issue show -- 1051", False),
+        ("chainlink issue list --", False),
+        ("chainlink issue search -- 'worklink:ready'", False),
+        ("chainlink issue create unarmed -l bug", False),
+        ("chainlink issue comment 1051 'review note'", False),
+    ],
+    ids=["label-before-id", "label-before-value", "create-after-label", "update",
+         "unarmed-create", "unarmed-label", "show", "list", "search", "create", "comment"],
+)
+def test_chainlink_custom_declarations_fail_closed_on_unclassified_mutations(
+    path: str, tainted: bool, command: str, veto: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    # Match the live declaration rather than the stricter built-in family gate.
+    declared = access_control.parse_declared_shell_commands([{
+        "exec": "chainlink",
+        "path": str(maintenance_pinned_executables["chainlink"]),
+        "subcommands": [["issue", subcommand] for subcommand in (
+            "create", "comment", "update", "label", "show", "list", "search",
+        )],
+        "options": ["-d", "-p", "-t", "-l", "-s", "-q", "--kind", "--json"],
+    }], writable_roots=())
+
+    def unexpected(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("unclassified mutation performed an armed-issue lookup")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unexpected)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=tainted)
+        service = replace(
+            _chainlink_service("maintenance", "heartbeat"),
+            declared_shell_commands=declared,
+        )
+        auth = replace(_service_auth(service, ifc), ifc_state=InformationFlowState(labels=ifc))
+        argv = parse_service_shell_argv(command, "maintenance", declared=declared)
+    else:
+        root, _project, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = (_tainted_admin_operator_write_auth() if tainted
+                else _trusted_operator_write_auth(admin=True))
+        request = object()
+        argv = parse_service_shell_argv(
+            command, access_control.OPERATOR_SHELL_PROFILE,
+            allow_project_test=False, declared=declared,
+        )
+        assert argv is not None
+        artifact = access_control._validated_operator_shell_argv_artifact(
+            argv, argv, resolved_cwd=root, declaration=declared[0],
+        )
+        assert artifact is not None
+        binding = access_control._issue_operator_shell_binding(
+            request_identity=request, auth_context_identity=auth,
+            tool_call_id="call-arm2", command=command,
+            requested_cwd=str(root), resolved_cwd=str(root), argv_artifact=artifact,
+        )
+        assert binding is not None
+        kwargs = {
+            "arguments": {"cwd": str(root)}, "operator_shell_binding": binding,
+            "operator_shell_request_identity": request, "tool_call_id": "call-arm2",
+        }
+    # Prove these commands really cross declaration admission on BOTH paths.
+    assert argv == [str(maintenance_pinned_executables["chainlink"]), *shlex.split(command)[1:]]
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    if tainted and veto:
+        assert decision.allowed is False, (path, command, decision.reason)
+        assert decision.reason == "chainlink_armed_work_blocked_by_untrusted_ingest"
+        assert decision.enforcement_enabled is True
+        assert decision.is_shadow_decision is False
+        assert "Unclassified Chainlink command" in decision.refusal_detail
+    else:
+        assert decision.allowed is True, (path, command, decision.reason)
+        assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "chainlink issue label -- 1051 worklink:ready",
+        "chainlink issue create y -ql worklink:ready",
+        "chainlink issue create y -qlworklink:ready",
+        "chainlink issue create y -ql=worklink:ready",
+        "cd /tmp && chainlink issue label 1051 worklink:ready",
+        "true; chainlink issue label 1051 worklink:ready",
+        "env chainlink issue label 1051 worklink:ready",
+        "sh -c 'chainlink issue label 1051 worklink:ready'",
+        "chainlink issue label 1051 worklink:ready > /dev/null",
+        "chainlink issue update 1051 -d changed > /dev/null",
+        "chainlink issue update not-an-id -d changed",
+        "chainlink issue create 'unterminated",
+        "printf worklink:ready > labels.txt",
+        # Unparseable unarmed commands are deliberately refused too.
+        "env chainlink issue create unarmed",
+    ],
+)
+def test_tainted_unrecognized_chainlink_shell_is_not_admitted_by_service_profile(
+    tool_name: str, command: str,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=True)
+    service = replace(
+        _chainlink_service("maintenance", "heartbeat"),
+        capabilities=(tool_name,),
+        sink_policies=(ServiceSinkPolicy(tool_name, "shell_profile", "maintenance"),),
+    )
+    auth = replace(
+        _service_auth(service, labels),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    # Shadow IFC is not the execution boundary. The declared service profile
+    # rejects these unknown argv independently, without inspecting substrings.
+    assert parse_service_shell_argv(command, "maintenance") is None
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=True, target_channel=command,
+    )
+    assert decision.allowed is False
+    assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "$(printf chain%s link) issue label 5 $(printf work%s link):ready",
+        "echo Y2hhaW5saW5rIGlzc3VlIGxhYmVsIDUgd29ya2xpbms6cmVhZHk= | base64 -d | sh",
+        "C=chain; L=link; $C$L issue label 5 work${L}:ready",
+        # Generic-shell policy is outside #1897: these retain shadow behavior.
+        "python -c 'print(1)'",
+        "sh helper.sh",
+        "pwd",
+        "chainlink issue show 5 --json",
+        "chainlink issue create unarmed",
+        "chainlink issue label 5 worklink:ready",
+        "chainlink issue update 5 -d changed",
+    ],
+)
+def test_tainted_generic_shell_shadow_policy_is_unchanged(
+    tool_name: str, command: str,
+) -> None:
+    registry = ToolRegistry()
+    decision = registry.authorize_tool(
+        tool_name, _tainted_admin_operator_write_auth(),
+        enforce=False, target_channel=command,
+    )
+    assert decision.allowed is True
+    assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+    auth = _tainted_admin_operator_write_auth()
+    sink = SinkGate.check_sink_flow(
+        tool_name, command, auth.ifc_labels, auth, enforce=False,
+    )
+    assert sink.allowed is True
+    mutation = command.startswith((
+        "chainlink issue create", "chainlink issue label", "chainlink issue update",
+    ))
+    assert sink.reason == (
+        "chainlink_mutation_blocked_by_untrusted_ingest" if mutation
+        else "ifc_label_blocked:shell_process"
+    )
+    assert sink.enforcement_enabled is False
+    assert sink.is_shadow_decision is True
+    assert sink.would_block is True
+    clean = registry.authorize_tool(
+        tool_name, _trusted_operator_write_auth(admin=True),
+        enforce=False, target_channel=command,
+    )
+    assert clean.allowed is True, clean.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat /mimir-home/state/chainlink-1783.json",
+        "git -C /workspace/chainlink-1783 status",
+        "which chainlink",
+        "ls /mimir-home/.chainlink",
+    ],
+)
+def test_tainted_service_diagnostics_do_not_trigger_armed_work_veto(
+    command: str,
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=True)
+    auth = replace(
+        _service_auth(_chainlink_service("maintenance", "heartbeat"), labels),
+        ifc_state=InformationFlowState(labels=labels),
+    )
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command,
+    )
+    # Actual execution still requires admission by the service's argv profile;
+    # diagnostics mentioning the tracker are not arming actions.
+    assert decision.allowed is True
+    assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
+
+
+def test_chainlink_update_without_id_fails_closed() -> None:
+    assert "label lookup failed" in access_control._chainlink_armed_work_refusal(
+        ["chainlink", "issue", "update", "-d", "changed"],
+        None, session_cwd=False,
+    )
+
+
+@pytest.mark.parametrize("path", ["service", "operator"])
+def test_tainted_chainlink_update_label_lookup_failure_is_always_refused(
+    path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    command = "chainlink issue update 1051 -d changed"
+
+    def unavailable(*_args: object, **_kwargs: object) -> bool:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unavailable)
+    kwargs: dict[str, object] = {}
+    if path == "service":
+        ifc = _chainlink_ifc_labels(tainted=True)
+        auth = replace(_service_auth(_chainlink_service("maintenance", "heartbeat"), ifc),
+                       ifc_state=InformationFlowState(labels=ifc))
+    elif path == "operator":
+        _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+        auth = _tainted_admin_operator_write_auth()
+        request = object()
+        kwargs = {
+            "arguments": {"cwd": str(root)},
+            "operator_shell_binding": _operator_chainlink_binding(
+                command, request=request, auth=auth, root=root,
+            ),
+            "operator_shell_request_identity": request,
+            "tool_call_id": "call-arm2",
+        }
+    else:
+        auth = _tainted_admin_operator_write_auth()
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel=command, **kwargs,
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert "label lookup failed" in decision.refusal_detail
+
+
+def test_clean_chainlink_armed_work_does_not_lookup_labels(
+    monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    labels = _chainlink_ifc_labels(tainted=False)
+    auth = replace(_service_auth(_chainlink_service("maintenance", "heartbeat"), labels),
+                   ifc_state=InformationFlowState(labels=labels))
+
+    def unexpected(*_args: object) -> bool:
+        raise AssertionError("clean turn performed label lookup")
+
+    monkeypatch.setattr(access_control, "_chainlink_issue_has_worklink_labels", unexpected)
+    for command in ("chainlink issue label 1051 worklink:ready",
+                    "chainlink issue update 1051 -d changed"):
+        for enforce in (False, True):
+            decision = ToolRegistry().authorize_tool(
+                "shell_exec", auth, enforce=enforce, target_channel=command,
+            )
+            assert decision.allowed is True, decision.reason
+
+
+@pytest.mark.parametrize(
+    ("payload", "refused"),
+    [
+        ('{"id":1051,"labels":["bug"]}', False),
+        ('{"id":1051,"labels":[{"name":"worklink:ready"}]}', True),
+        ('{"id":1051}', True),
+        ('{"id":1052,"labels":[]}', True),
+        ('{"id":1051,"labels":[42]}', True),
+        ('not json', True),
+    ],
+)
+def test_chainlink_update_lookup_validates_issue_and_labels(
+    payload: str, refused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def show(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == ["chainlink", "issue", "show", "1051", "--json"]
+        assert kwargs["cwd"] == tmp_path
+        assert kwargs["timeout"] == 5
+        return subprocess.CompletedProcess(argv, 0, payload, "")
+
+    monkeypatch.setattr(access_control.subprocess, "run", show)
+    argv = shlex.split("chainlink issue update 1051 -d changed")
+    if refused and "worklink:ready" not in payload:
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            access_control._chainlink_issue_has_worklink_labels(
+                argv, "1051", str(tmp_path), session_cwd=False,
+            )
+    else:
+        assert access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", str(tmp_path), session_cwd=False,
+        ) is refused
+
+
+def test_chainlink_update_lookup_refuses_missing_cwd_and_failed_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = shlex.split("chainlink issue update 1051 -d changed")
+    monkeypatch.delenv("MIMIR_HOME", raising=False)
+    with pytest.raises(ValueError, match="working directory"):
+        access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", None, session_cwd=False,
+        )
+
+    def failure(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 1, '{"id":1051,"labels":[]}', "error")
+
+    monkeypatch.setattr(access_control.subprocess, "run", failure)
+    with pytest.raises(ValueError, match="lookup failed"):
+        access_control._chainlink_issue_has_worklink_labels(
+            argv, "1051", "/tmp", session_cwd=False,
+        )
+
+
 @pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async"])
 @pytest.mark.parametrize("case", ["missing_labels", "missing_state", "missing_predicate", "none", "non_boolean", "raises"])
 @pytest.mark.parametrize("roles", [("user",), ("admin",)])

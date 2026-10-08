@@ -13,6 +13,26 @@ All notable changes will land here. Format loosely follows
   sensitive data into the still-tainted turn; outbound sink checks remain in force.
 
 - Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
+- After untrusted ingest, admitted Chainlink calls through declared service or
+  request-bound operator command paths cannot change `worklink:*` labels, create
+  armed issues, or update armed issues even in shadow mode (#1897). Bounded
+  unarmed issue filing and comments remain available; the operator must review
+  an unarmed description before applying `worklink:ready`. Attached
+  `-l=worklink:ready` labels are normalized like Clap. The veto classifies the
+  admitted execution argv (the operator binding or service-profile parser), so
+  quoted literal `? * [ ] { }` in titles and descriptions cannot skip it.
+  Admitted Chainlink argv outside the built-in classifier fail closed on tainted
+  turns (including end-of-options `--`), except known read-only issue queries.
+  This also refuses unclassified unarmed mutations; use a canonical unarmed
+  command or comment instead. Unknown service commands remain subject to the
+  existing exact-argv profile gate, without a substring veto on read-only
+  diagnostics. Generic `shell_exec`/`bash_async` behavior and
+  explicit one-time operator sink approvals are unchanged. Open shell execution
+  is not covered by this arming veto: runtime-built names, encoded payloads,
+  indirect execution and direct tracker SQLite writes cannot be confined by
+  argv inspection. A shell-wide post-ingest policy remains separate (#1872).
+  Clean turns are unchanged; this gate does not provide filesystem confinement
+  for other tools or broaden any declared-command profile.
 - Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
   internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
