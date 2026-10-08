@@ -23,7 +23,8 @@ MAX_BACKOFF_MINUTES = 240
 MAX_NOTIFIED_SIGNATURES = 32
 # A fresh attempt can repair a failing gate; spec and operational incidents
 # require changed external state and therefore remain operator-gated.
-AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed"})
+AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted"})
+MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
@@ -582,6 +583,7 @@ def record_failure(
     transcript_path: str | None = None,
     work_started: bool | None = None,
     failure_kind: str = "operator_required",
+    quota_reset_at: datetime | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Record a dispatch failure.
@@ -618,11 +620,21 @@ def record_failure(
         key = str(issue_id)
         prior = state["issues"].get(key)
         prior = prior if isinstance(prior, dict) else {}
+        quota_holds = (
+            int(prior.get("quota_holds", 0))
+            if failure_kind == "quota_exhausted" and prior.get("active") is True
+            and prior.get("failure_kind") == "quota_exhausted" else 0
+        )
+        if failure_kind == "quota_exhausted":
+            quota_holds += 1
+            if quota_holds > MAX_CONSECUTIVE_QUOTA_HOLDS:
+                failure_kind = "operator_required"
         prework_refusal = work_started is False
         same_occurrence = (
             not prework_refusal
             and prior.get("active") is True
             and prior.get("signature") == signature
+            and prior.get("failure_kind") == failure_kind
         )
         consecutive = (
             int(prior.get("consecutive", 0)) + 1
@@ -637,10 +649,11 @@ def record_failure(
             "active": not prework_refusal,
             "issue_id": issue_id,
             "attempt": attempt,
-            "attempt_consumed": attempt is not None and not prework_refusal,
+            "attempt_consumed": attempt is not None and not prework_refusal and failure_kind != "quota_exhausted",
             "exit_status": exit_status,
             "terminal_error": safe_error,
             "failure_kind": failure_kind,
+            "quota_holds": quota_holds if failure_kind in {"quota_exhausted", "operator_required"} and quota_holds else 0,
             "signature": signature,
             "occurrence_id": (
                 str(prior.get("occurrence_id") or uuid.uuid4().hex)
@@ -654,7 +667,8 @@ def record_failure(
             "retry_after": (
                 None
                 if prework_refusal
-                else (now + timedelta(minutes=delay)).isoformat()
+                else (quota_reset_at if failure_kind == "quota_exhausted" and quota_reset_at is not None
+                      else now + timedelta(minutes=delay)).isoformat()
             ),
             "log_path": redact_text(
                 log_path if log_path is not None else str(prior.get("log_path") or "")
@@ -703,6 +717,8 @@ def pending_failure_alerts(
                 continue
             if _incident_blocks_dispatch(entry, now):
                 backed_off.add(issue_id)
+            if entry.get("failure_kind") == "quota_exhausted":
+                continue  # A scheduled hold is not an operator incident.
             signature = str(entry.get("signature") or "")
             notified = entry.get("notified_signatures")
             notified = list(notified) if isinstance(notified, list) else []

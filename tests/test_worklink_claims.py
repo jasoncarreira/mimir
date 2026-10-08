@@ -1400,6 +1400,71 @@ def test_graceful_shutdown_releases_only_this_process_claim_and_forgives_budget(
     assert claims.next_attempt(history) == 2
 
 
+def test_shutdown_operator_stop_disarms_only_matching_attempt(tmp_path: Path) -> None:
+    from mimir.worklink.control import _mark_operator_stop
+
+    now = datetime(2026, 10, 8, tzinfo=UTC)
+    stopped = ClaimRecord(1033, 2, "agent", now)
+    other = ClaimRecord(1029, 1, "agent", now)
+    _mark_operator_stop(tmp_path, stopped.issue_id, stopped.attempt)
+    calls: list[list[str]] = []
+
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        call = list(args)
+        calls.append(call)
+        if call[1:3] == ["issue", "list"]:
+            return subprocess.CompletedProcess(call, 0, json.dumps([{"id": 1033}, {"id": 1029}]), "")
+        if call[1:3] == ["issue", "show"]:
+            record = stopped if call[3] == "1033" else other
+            return subprocess.CompletedProcess(
+                call, 0, json.dumps({"comments": [{"content": record.to_comment()}]}), "",
+            )
+        return completed(call)
+
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner)
+    released, failed = claims.release_owned_claims_for_shutdown()
+    assert released == [stopped, other] and not failed
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:ready"] in calls
+    assert ["chainlink", "issue", "unlabel", "1033", "worklink:in-progress"] in calls
+    assert not any(call[1:3] == ["issue", "label"] and call[3] == "1033" for call in calls)
+    assert not any(call[1:3] == ["issue", "comment"] and call[3] == "1033" for call in calls)
+    assert ["chainlink", "issue", "label", "1029", "worklink:ready"] in calls
+
+    # The old marker must not disarm attempt N+1 during a later shutdown.
+    calls.clear()
+    latest = ClaimRecord(1033, 3, "agent", now + timedelta(minutes=1))
+    def next_runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if list(args[1:4]) == ["issue", "show", "1033"]:
+            call = list(args)
+            return subprocess.CompletedProcess(call, 0, json.dumps({"comments": [
+                {"content": stopped.to_comment()}, {"content": latest.to_comment()},
+            ]}), "")
+        return runner(args)
+
+    ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=next_runner).release_owned_claims_for_shutdown()
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+
+
+def test_transition_issue_operator_stop_does_not_rearm(tmp_path: Path) -> None:
+    from mimir.worklink.control import _mark_operator_stop
+
+    calls: list[list[str]] = []
+    def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(args))
+        return completed(args)
+
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner, max_attempts=5)
+    _mark_operator_stop(tmp_path, 1033, 2)
+    claims.transition_issue(1033, status="stopped", review_ready=False, attempt=2)
+    assert not any(call[1:3] == ["issue", "label"] for call in calls)
+    assert {call[-1] for call in calls if call[1:3] == ["issue", "unlabel"]} >= {
+        "worklink:ready", "worklink:in-progress",
+    }
+    calls.clear()
+    claims.transition_issue(1033, status="failed", review_ready=False, attempt=3)
+    assert ["chainlink", "issue", "label", "1033", "worklink:ready"] in calls
+
+
 def test_part_c_shutdown_reports_partial_failure_and_timeout_remainder(tmp_path: Path) -> None:
     now = datetime(2026, 8, 23, tzinfo=UTC)
     records = {

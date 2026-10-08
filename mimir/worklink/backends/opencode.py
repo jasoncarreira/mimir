@@ -603,15 +603,72 @@ def _remove_transcript_outputs(path: Path) -> None:
             output.unlink(missing_ok=True)
 
 
+# OpenCode styles both the error prefix and tool-output markers. Normalize
+# before classification and quoting so ANSI codes cannot hide either one.
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_PROVIDER_AUTH_EVIDENCE = re.compile(
+    r"^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)?"
+    r"(?:https?://\S*oauth/token\s+)?(?:http(?:/\d(?:\.\d)?)?\s+|status(?:\s+code)?[:= ]+)?40[13]\b"
+    r"|^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)"
+    r".*(?:invalid or expired token|authentication failed|unauthorized token|"
+    r"(?:refresh|oauth/token).*?(?:refused|failed|40[13]))\b"
+    r"|^(?:(?:error|provider|openai|codex|post|request)[: ]+)?"
+    r"(?:https?://\S*)?oauth/token\b.*\b40[13]\b"
+    r"|^token refresh failed[: ]+40[13]\b",
+    re.IGNORECASE,
+)
+_HTTP_QUOTA_STATUS = (
+    r"http(?:/\d(?:\.\d)?)?\s+429\b"
+    r"|status(?:\s+code)?[:= ]+429\b|429\s+Too Many Requests\b"
+)
+# OpenCode v1.18.21 cli/ui.ts emits exactly "Error: " before the message.
+# cli/cmd/run.ts prints session.error.data.message, not the structured statusCode;
+# provider/error.ts preserves the API message (or falls back to STATUS_CODES).
+# Match the beginning of that message, never a status mentioned in tool output.
+# "Too Many Requests" is the status-text fallback for an HTTP 429 API error.
+_PROVIDER_QUOTA_EVIDENCE = re.compile(
+    r"^(?:the usage limit has been reached\b|rate limit (?:exceeded|reached)\b|"
+    r"Too Many Requests\b|" + _HTTP_QUOTA_STATUS + r")",
+    re.IGNORECASE,
+)
+_ERROR_RECORD = re.compile(r"^Error: ")
+
+
+def _provider_quota_line(stdout: str, stderr: str) -> str | None:
+    for stream, is_stderr in ((stderr, True), (stdout, False)):
+        for line in stream.splitlines():
+            clean = _ANSI_CSI.sub("", line).strip()
+            prefix = _ERROR_RECORD.match(clean)
+            if prefix is not None:
+                message = clean[prefix.end():]
+            elif is_stderr:
+                message = clean
+            else:
+                continue
+            if _PROVIDER_QUOTA_EVIDENCE.match(message):
+                return clean
+    return None
+
+
+def _provider_auth_line(stderr: str) -> str | None:
+    for line in stderr.splitlines():
+        stripped = _ANSI_CSI.sub("", line).strip()
+        if (
+            stripped
+            and not stripped.startswith(("→", ">", "|"))
+            and _PROVIDER_AUTH_EVIDENCE.search(stripped)
+        ):
+            return stripped
+    return None
+
+
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
-    combined = f"{stdout}\n{stderr}".lower()
     if exit_code == 0:
         return "success"
-    if "429" in combined or "quota" in combined or "rate limit" in combined:
-        return "quota_exhausted"
-    auth_text = stderr.lower()
-    if re.search(r"\b(auth|authentication|oauth|login|credential|api key|unauthorized)\b", auth_text):
+    if _provider_auth_line(stderr) is not None:
         return "auth_error"
+    if _provider_quota_line(stdout, stderr) is not None:
+        return "quota_exhausted"
     return "failed"
 
 
@@ -625,6 +682,10 @@ def _error_from_status(
         return None
     detail = stderr.strip() or stdout.strip()
     message = detail.splitlines()[-1] if detail else status
+    if status == "auth_error":
+        message = _provider_auth_line(stderr) or message
+    if status == "quota_exhausted":
+        message = _provider_quota_line(stdout, stderr) or message
     if status == "timeout":
         return f"opencode execution timed out: {message}"
     if status == "auth_error":

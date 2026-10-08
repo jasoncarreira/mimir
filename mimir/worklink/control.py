@@ -38,11 +38,33 @@ from .run_state import (
     runs_dir,
     save_orphan_block_record,
 )
+from .._atomic import atomic_write_json
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 EventLogger = Callable[..., None]
 
 _CHAINLINK_COMMAND_TIMEOUT_SECONDS = 10
+
+
+def _operator_stop_path(home: Path, issue_id: int) -> Path:
+    return runs_dir(home).parent / "operator-stops" / f"{issue_id}.json"
+
+
+def operator_stop_requested(home: Path | None, issue_id: int, attempt: int | None) -> bool:
+    """Only the stopped issue's exact claim attempt may use this marker."""
+    if home is None or attempt is None:
+        return False
+    try:
+        data = json.loads(_operator_stop_path(home, issue_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("issue_id") == issue_id and data.get("attempt") == attempt
+
+
+def _mark_operator_stop(home: Path, issue_id: int, attempt: int) -> None:
+    path = _operator_stop_path(home, issue_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, {"issue_id": issue_id, "attempt": attempt})
 
 
 @dataclass(frozen=True)
@@ -394,8 +416,10 @@ def stop_worklink(
             shim_pid=state.shim_pid,
         )
         try:
+            _mark_operator_stop(home, issue_id, state.attempt)
             asyncio.run(LocalSubprocessComputeBackend().cancel(handle))
         except (KeyError, RuntimeError, OSError) as exc:
+            _operator_stop_path(home, issue_id).unlink(missing_ok=True)
             return WorklinkStopResult(issue_id, False, reason=str(exc))
 
         clear_run_state(home, issue_id)
@@ -404,6 +428,7 @@ def stop_worklink(
         unlabel = run(
             [chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:in-progress"]
         )
+        run([chainlink_bin, "issue", "unlabel", str(issue_id), "worklink:ready"])
         return WorklinkStopResult(
             issue_id,
             True,

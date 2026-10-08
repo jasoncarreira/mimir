@@ -21,6 +21,7 @@ import time
 from typing import Any, Callable, Iterable, Sequence
 
 from .checkout import _default_runner
+from .control import operator_stop_requested
 
 CLAIM_PREFIX = "WORKLINK_CLAIM "
 WORKLINK_EPIC_LABEL = "worklink:epic"
@@ -47,6 +48,8 @@ CLAIM_RESET_PREFIX = "WORKLINK_CLAIM_RESET "
 #: needs a human decision rather than another retry.
 MAX_CLAIM_RESETS = 2
 SHUTDOWN_ABORT_PREFIX = "WORKLINK_SHUTDOWN_ABORT "
+OPERATOR_STOP_PREFIX = "WORKLINK_STOPPED "
+QUOTA_HOLD_PREFIX = "WORKLINK_QUOTA_HOLD "
 # A planned restart must not consume the ordinary retry budget, but repeated
 # restarts must not turn max_attempts into an infinite-retry loophole.
 MAX_SHUTDOWN_ABORT_FORGIVENESS = 2
@@ -227,7 +230,7 @@ def _parse_dt(value: str) -> datetime:
 
 def _scan_claim_history(
     comments: Iterable[str],
-) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], int]:
+) -> tuple[list[ClaimRecord], list[ShutdownAbortRecord], list[ShutdownAbortRecord], int]:
     """Parse every claim record with its reset generation, plus the final one.
 
     Scans in comment order, so a ``WORKLINK_CLAIM_RESET`` marker advances the
@@ -247,6 +250,7 @@ def _scan_claim_history(
     """
     records: list[ClaimRecord] = []
     aborts: list[ShutdownAbortRecord] = []
+    stops: list[ShutdownAbortRecord] = []
     seen_claims: set[tuple[int, int, str, datetime]] = set()
     generation = 0
     for comment in comments:
@@ -256,11 +260,12 @@ def _scan_claim_history(
                     generation += 1
                 continue
             if not line.startswith(CLAIM_PREFIX):
-                if not line.startswith(SHUTDOWN_ABORT_PREFIX):
+                prefix = next((p for p in (SHUTDOWN_ABORT_PREFIX, OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX) if line.startswith(p)), None)
+                if prefix is None:
                     continue
                 try:
                     abort = ShutdownAbortRecord.from_payload(
-                        json.loads(line[len(SHUTDOWN_ABORT_PREFIX) :])
+                        json.loads(line[len(prefix) :])
                     )
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                     continue
@@ -272,7 +277,9 @@ def _scan_claim_history(
                 )
                 if abort_key not in seen_claims:
                     continue
-                aborts.append(replace(abort, generation=generation))
+                (stops if prefix in {OPERATOR_STOP_PREFIX, QUOTA_HOLD_PREFIX} else aborts).append(
+                    replace(abort, generation=generation)
+                )
                 continue
             try:
                 record = ClaimRecord.from_payload(json.loads(line[len(CLAIM_PREFIX) :]))
@@ -282,11 +289,11 @@ def _scan_claim_history(
             seen_claims.add(
                 (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             )
-    return records, aborts, generation
+    return records, aborts, stops, generation
 
 
 def _scan_claim_comments(comments: Iterable[str]) -> tuple[list[ClaimRecord], int]:
-    records, _aborts, generation = _scan_claim_history(comments)
+    records, _aborts, _stops, generation = _scan_claim_history(comments)
     return records, generation
 
 
@@ -737,6 +744,17 @@ class ChainlinkClaims:
                 if latest is None or latest.agent_id != self.agent_id:
                     continue
 
+                if operator_stop_requested(self.home_path, issue_id, latest.attempt):
+                    # The run owns the terminal evidence and stop comment. This
+                    # release must not forgive via a shutdown abort or re-arm it.
+                    lock = self._run("locks", "release", str(issue_id), check=False)
+                    if lock.returncode != 0:
+                        raise RuntimeError((lock.stderr or lock.stdout).strip() or "chainlink lock release failed")
+                    self._run("issue", "unlabel", str(issue_id), "worklink:ready")
+                    self._run("issue", "unlabel", str(issue_id), "worklink:in-progress")
+                    released.append(latest)
+                    continue
+
                 abort = ShutdownAbortRecord(
                     issue_id=issue_id,
                     attempt=latest.attempt,
@@ -822,11 +840,14 @@ class ChainlinkClaims:
         reason: str | None = None,
     ) -> None:
         """Move Worklink labels after evidence validation."""
+        stopped = status in {"failed", "stopped"} and operator_stop_requested(self.home_path, issue_id, attempt)
         self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:review", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:blocked", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:failed", check=False)
+        if stopped:
+            return
         if review_ready:
             self._run("issue", "label", str(issue_id), "worklink:review")
             return
@@ -865,7 +886,7 @@ class ChainlinkClaims:
         history forgive their matching claims. Attempt ordinals still advance,
         preventing checkout/branch/evidence collisions.
         """
-        records, aborts, generation = _scan_claim_history(comments)
+        records, aborts, stops, generation = _scan_claim_history(comments)
         claim_keys = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
@@ -878,6 +899,10 @@ class ChainlinkClaims:
             if len(forgiven) >= MAX_SHUTDOWN_ABORT_FORGIVENESS:
                 break
             forgiven.add(key)
+        forgiven.update(
+            key for stop in stops
+            if (key := (stop.issue_id, stop.attempt, stop.agent_id, stop.claimed_at)) in claim_keys
+        )
         active_claims = {
             (record.issue_id, record.attempt, record.agent_id, record.claimed_at)
             for record in records
