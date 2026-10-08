@@ -45,9 +45,9 @@ def test_acp_and_mcp_dependency_declarations() -> None:
     assert optional["dev"].count("keyring==25.7.0") == 0
     assert dependency_groups["dev"].count("keyring==25.7.0") == 0
 
-    assert optional["mcp"] == ["mcp>=1.27"]
-    assert optional["dev"].count("mcp>=1.27") == 1
-    assert dependency_groups["dev"].count("mcp>=1.27") == 1
+    assert optional["mcp"] == ["mcp>=2.3,<3"]
+    assert optional["dev"].count("mcp>=2.3,<3") == 1
+    assert dependency_groups["dev"].count("mcp>=2.3,<3") == 1
 
 
 def test_project_readme_and_urls() -> None:

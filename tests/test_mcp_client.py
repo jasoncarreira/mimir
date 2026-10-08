@@ -1,8 +1,6 @@
 """Tests for ``mimir.mcp_client`` config parsing + tool registry plumbing.
 
-Subprocess + session behavior is delegated to ``mcp.client.stdio``;
-those paths need a real MCP server to exercise end-to-end, so we
-don't attempt them in unit tests. We do cover:
+Real stdio behavior is exercised in ``test_mcp_contract.py``. Here we cover:
 
 * ``MCPServerConfig.from_dict`` shape validation + ${ENV} expansion.
 * ``parse_mcp_server_configs`` — list form, ``mcpServers`` wrapper, bad entries.
@@ -425,7 +423,7 @@ class _FakeMCPTool:
     def __init__(self, name: str, description: str = "", schema: dict | None = None) -> None:
         self.name = name
         self.description = description
-        self.inputSchema = schema or {}
+        self.input_schema = schema or {}
 
 
 class _FakeListResult:
@@ -551,7 +549,7 @@ async def test_bridge_tool_surfaces_call_timeout(
     from langchain_core.tools import ToolException
 
     class _SlowSession:
-        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
             await _asyncio.sleep(1.0)
 
     tool = _bridge_mcp_tool(
@@ -571,11 +569,11 @@ async def test_bridge_tool_surfaces_is_error_result() -> None:
         text = "remote validation failed"
 
     class _ErrResult:
-        isError = True
+        is_error = True
         content = [_ErrContent()]
 
     class _ErrSession:
-        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
             return _ErrResult()
 
     tool = _bridge_mcp_tool(
@@ -584,6 +582,58 @@ async def test_bridge_tool_surfaces_is_error_result() -> None:
     )
     with pytest.raises(ToolException, match="remote validation failed"):
         await tool.coroutine()
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_unexpected_result_shape_is_tool_exception() -> None:
+    from langchain_core.tools import ToolException
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _UnexpectedSession:
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
+            return object()
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_UnexpectedSession(),
+    )
+    with pytest.raises(ToolException, match="MCP tool 't' failed: .*is_error"):
+        await tool.coroutine()
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_rejects_interactive_input() -> None:
+    from langchain_core.tools import ToolException
+    from mcp.types import InputRequiredResult
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _InputSession:
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
+            assert allow_input_required is True
+            return InputRequiredResult(request_state="continue")
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_InputSession(),
+    )
+    with pytest.raises(ToolException, match="requested interactive input.*does not support"):
+        await tool.coroutine()
+
+
+@pytest.mark.asyncio
+async def test_bridge_tool_renders_image_mime_type() -> None:
+    from mcp.types import CallToolResult, ImageContent
+    from mimir.mcp_client import _bridge_mcp_tool
+
+    class _ImageSession:
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
+            return CallToolResult(content=[ImageContent(data="eA==", mime_type="image/png")])
+
+    tool = _bridge_mcp_tool(
+        server_name="s", tool_name="t", description="",
+        input_schema={}, session=_ImageSession(),
+    )
+    assert await tool.coroutine() == "[image/png data]"
 
 
 def test_bridge_tool_builds_args_schema() -> None:
@@ -646,11 +696,12 @@ async def test_bridge_tool_renders_text_content() -> None:
         text = "hello"
 
     class _OKResult:
-        isError = False
+        is_error = False
         content = [_TextContent()]
+        structured_content = None
 
     class _OKSession:
-        async def call_tool(self, name, kwargs):  # type: ignore[no-untyped-def]
+        async def call_tool(self, name, kwargs, *, allow_input_required=False):  # type: ignore[no-untyped-def]
             return _OKResult()
 
     tool = _bridge_mcp_tool(
@@ -1462,7 +1513,7 @@ class TestUnderscoreDisplayNameCollisions:
             def __init__(self, name: str):
                 self.name = name
                 self.description = ""
-                self.inputSchema = {}
+                self.input_schema = {}
 
         class _FakeListResult:
             def __init__(self, tools: list):
@@ -1640,7 +1691,7 @@ class TestProductionMCPPolicyWiring:
         class Tool:
             name = "get_repository"
             description = ""
-            inputSchema = schema
+            input_schema = schema
 
         class Session:
             async def list_tools(self):  # type: ignore[no-untyped-def]
@@ -1690,7 +1741,7 @@ class TestProductionMCPPolicyWiring:
         class Tool:
             name = "get_repository"
             description = ""
-            inputSchema = changed_schema
+            input_schema = changed_schema
 
         class Session:
             async def list_tools(self):  # type: ignore[no-untyped-def]
@@ -1733,7 +1784,7 @@ class TestProductionMCPPolicyWiring:
         class Tool:
             name = "get_repository"
             description = ""
-            inputSchema = schema
+            input_schema = schema
 
         class Session:
             async def list_tools(self):  # type: ignore[no-untyped-def]
@@ -1778,7 +1829,7 @@ class TestProductionMCPPolicyWiring:
         class Tool:
             name = "get_repository"
             description = ""
-            inputSchema = schema
+            input_schema = schema
 
         class Session:
             async def list_tools(self):  # type: ignore[no-untyped-def]
@@ -1954,10 +2005,10 @@ async def test_discovery_prompt_boundary(tmp_path, monkeypatch, hostile):
         "query": {"type": "string", "description": description},
         "other": {"type": "string", "description": description},
     }}
-    remote = [SimpleNamespace(name="search-1", description=description, inputSchema=schema)]
+    remote = [SimpleNamespace(name="search-1", description=description, input_schema=schema)]
     if hostile:
-        remote += [SimpleNamespace(name="bad/name", description="bad", inputSchema={})]
-        remote += [SimpleNamespace(name=f"tool_{i}", description="ok", inputSchema={}) for i in range(5000)]
+        remote += [SimpleNamespace(name="bad/name", description="bad", input_schema={})]
+        remote += [SimpleNamespace(name=f"tool_{i}", description="ok", input_schema={}) for i in range(5000)]
     conn = MCPConnection(
         MCPServerConfig(name="docs", command="unused", args=[]),
         AsyncMock(list_tools=AsyncMock(return_value=SimpleNamespace(tools=remote))),

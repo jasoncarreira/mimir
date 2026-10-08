@@ -49,6 +49,7 @@ from typing import Any, Callable
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import InputRequiredResult
 from pydantic import Field, create_model
 
 from ._atomic import atomic_write_json
@@ -538,7 +539,7 @@ class MCPConnection:
             provenance = MCPProvenance.create(
                 config=self.config,
                 tool_name=mcp_tool.name,
-                input_schema=mcp_tool.inputSchema or {},
+                input_schema=mcp_tool.input_schema or {},
                 server_config_id=config_id,
             )
             policy = next(
@@ -573,7 +574,7 @@ class MCPConnection:
                 server_name=self.config.name,
                 tool_name=mcp_tool.name,
                 description=mcp_tool.description or "",
-                input_schema=mcp_tool.inputSchema or {},
+                input_schema=mcp_tool.input_schema or {},
                 session=self.session,
                 call_timeout_s=call_timeout_s,
                 provenance=provenance,
@@ -727,12 +728,9 @@ def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[
 class MCPManager:
     """Lifecycle owner for all MCP server connections.
 
-    Pre-fix every server shared a single ``AsyncExitStack`` — a hang in
-    one session's ``__aexit__`` blocked the teardown of every server
-    after it in the stack. Now each connection owns its own
-    ``AsyncExitStack``; shutdown gathers them concurrently with
-    ``return_exceptions=True`` under an overall timeout so one stuck
-    process can't keep the others alive.
+    Each connection owns its own ``AsyncExitStack``. The SDK's AnyIO
+    cancel scopes must be exited in the task that entered them, in
+    reverse order; teardown is bounded per connection.
     """
 
     def __init__(
@@ -926,30 +924,26 @@ class MCPManager:
     async def shutdown(self) -> None:
         """Tear down every subprocess + session.
 
-        ``asyncio.gather`` with ``return_exceptions=True`` ensures one
-        stuck server can't keep the others alive. Each gather is bounded
-        by ``shutdown_timeout_s`` so process exit isn't held up.
+        SDK 2.x enters task-local AnyIO cancel scopes for both the session
+        and transport. Close in reverse order in the owning task, with a
+        per-server bound so a stuck server doesn't block the rest.
         """
         if not self.connections:
             return
-        tasks = [
-            asyncio.create_task(conn.exit_stack.aclose())
-            for conn in self.connections
-        ]
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=self._shutdown_timeout,
-            )
-        except asyncio.TimeoutError:
-            log.warning(
-                "MCP shutdown exceeded %.1fs — some servers may not have "
-                "torn down cleanly", self._shutdown_timeout,
-            )
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-        self.connections.clear()
+            for conn in reversed(self.connections):
+                try:
+                    async with asyncio.timeout(self._shutdown_timeout):
+                        await conn.exit_stack.aclose()
+                except TimeoutError:
+                    log.warning(
+                        "MCP server '%s' shutdown exceeded %.1fs",
+                        conn.config.name, self._shutdown_timeout,
+                    )
+                except Exception:
+                    log.exception("MCP server '%s' shutdown failed", conn.config.name)
+        finally:
+            self.connections.clear()
 
 
 _JSON_TYPE_MAP: dict[str, type] = {
@@ -1096,28 +1090,40 @@ def _bridge_mcp_tool(
     async def _call_mcp_tool(**kwargs: Any) -> str:
         try:
             result = await asyncio.wait_for(
-                session.call_tool(tool_name, kwargs if kwargs else None),
+                session.call_tool(
+                    tool_name, kwargs if kwargs else None, allow_input_required=True,
+                ),
                 timeout=call_timeout_s,
             )
+            if isinstance(result, InputRequiredResult):
+                raise ToolException(
+                    f"MCP tool '{tool_name}' requested interactive input, which mimir does not support"
+                )
+            if result.is_error:
+                text_parts = [c.text for c in result.content if hasattr(c, "text")]
+                error_text = "\n".join(text_parts) if text_parts else "Unknown error"
+                raise ToolException(f"MCP tool '{tool_name}' returned error: {error_text}")
+            parts: list[str] = []
+            has_text = False
+            for content in result.content:
+                if hasattr(content, "text"):
+                    parts.append(content.text)
+                    has_text = True
+                elif hasattr(content, "data"):
+                    parts.append(f"[{content.mime_type} data]")
+                else:
+                    parts.append(json.dumps(content.model_dump(), default=str))
+            if not has_text and result.structured_content is not None:
+                parts.append(json.dumps(result.structured_content, default=str))
+            return "\n".join(parts) if parts else "(empty result)"
         except asyncio.TimeoutError as exc:
             raise ToolException(
                 f"MCP tool '{tool_name}' timed out after {call_timeout_s}s"
             ) from exc
+        except ToolException:
+            raise
         except Exception as exc:
             raise ToolException(f"MCP tool '{tool_name}' failed: {exc}") from exc
-        if result.isError:
-            text_parts = [c.text for c in result.content if hasattr(c, "text")]
-            error_text = "\n".join(text_parts) if text_parts else "Unknown error"
-            raise ToolException(f"MCP tool '{tool_name}' returned error: {error_text}")
-        parts: list[str] = []
-        for content in result.content:
-            if hasattr(content, "text"):
-                parts.append(content.text)
-            elif hasattr(content, "data"):
-                parts.append(f"[{getattr(content, 'mimeType', 'binary')} data]")
-            else:
-                parts.append(json.dumps(content.model_dump(), default=str))
-        return "\n".join(parts) if parts else "(empty result)"
 
     kwargs: dict[str, Any] = {
         "coroutine": _call_mcp_tool,

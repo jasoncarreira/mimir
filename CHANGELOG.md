@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
+  models and real stdio contract tests. This fixes the silent tool-discovery
+  failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
+
 ## [0.9.5] — 2026-10-08
 
 The `claude-code:*` route now works end to end on a fresh install. The
