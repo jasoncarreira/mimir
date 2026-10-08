@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Claude Code: require `langchain-claude-code-mimir>=0.1.3` so bridged
+  LangChain tools execute through the adapter's public invocation path;
+  reject older builds and exercise a bridged tool in CI (#1890).
+
 ## [0.9.4] — 2026-10-07
 
 A security release from the 2026-10-06 external review. Bridge intake, attachment

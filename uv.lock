@@ -1287,15 +1287,15 @@ wheels = [
 
 [[package]]
 name = "langchain-claude-code-mimir"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "claude-agent-sdk" },
     { name = "langchain-core" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8a/65/db66e7baa08aacefa2a51f3339cf2d0c99718e8a8a94845458345f0d56c9/langchain_claude_code_mimir-0.1.2.tar.gz", hash = "sha256:99c11e0b34c852c4b93f5e75f69beae2ca296f28277f5532d12b54651ad6886e", size = 193641, upload-time = "2026-07-02T01:39:02.531Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/68/7700a1046ba28b3e30d1b22d2deed1e7b513df910def2843e204e88b66a7/langchain_claude_code_mimir-0.1.3.tar.gz", hash = "sha256:22ec7b265d090e7611990a126da672e21442c9b5e744c0703f2179253e9ae00c", size = 194517, upload-time = "2026-10-08T00:12:11.148Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/68/a8/31f84fdf856dffae16c77739663cb69c24ad616a94f523d47fa8a321dd42/langchain_claude_code_mimir-0.1.2-py3-none-any.whl", hash = "sha256:78757df574b2efe7cd6f4deb2984f9f40d0817f8c70c68ac83955a770c645d0e", size = 14886, upload-time = "2026-07-02T01:39:01.2Z" },
+    { url = "https://files.pythonhosted.org/packages/51/1b/d7ff8b176711b5875b7e9eb6cca95e954f43ad09d26d26d73ef1ec61345d/langchain_claude_code_mimir-0.1.3-py3-none-any.whl", hash = "sha256:215daa3191fbca9ea1f21ac80e6c140a6de32d17c787a5a85bde4907d907fecc", size = 15161, upload-time = "2026-10-08T00:12:09.754Z" },
 ]
 
 [[package]]
@@ -1620,7 +1620,7 @@ requires-dist = [
     { name = "langchain", specifier = ">=1.3.14,<2" },
     { name = "langchain-anthropic", marker = "extra == 'anthropic'", specifier = ">=1.5.3,<2" },
     { name = "langchain-anthropic", marker = "extra == 'dev'", specifier = ">=1.5.3,<2" },
-    { name = "langchain-claude-code-mimir", marker = "extra == 'claude-code'", specifier = ">=0.1.2,<0.2" },
+    { name = "langchain-claude-code-mimir", marker = "extra == 'claude-code'", specifier = ">=0.1.3,<0.2" },
     { name = "langchain-codex-plus", marker = "extra == 'codex-plus'", specifier = ">=0.0.11,<0.1" },
     { name = "langchain-codex-plus", marker = "extra == 'dev'", specifier = ">=0.0.11,<0.1" },
     { name = "langchain-openai", marker = "extra == 'dev'", specifier = ">=1.2.1" },
