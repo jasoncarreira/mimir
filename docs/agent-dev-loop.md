@@ -23,7 +23,7 @@ flowchart LR
 Nothing merges until an independent strict review passes. Three actors split the work:
 - **You** decide what gets built and grant releases and deploys.
 - **Your local coding agent** (Claude Code) writes specs, reviews every PR adversarially, and merges only a reviewed head with green CI.
-- **The mimir agent** builds each armed issue in a sandbox, opens the PR from its own bot account, and pushes fixes when a review requests changes.
+- **The mimir agent** builds each armed issue in its own checkout, opens the PR from its own bot account, and pushes fixes when a review requests changes.
 
 | Actor | Does | Never does |
 | --- | --- | --- |
@@ -149,10 +149,29 @@ mimir scaffold-docker --home ~/agents/my-agent --service-name my-agent --mode py
 
 Settings live in `<home>/.env`, and the process environment overrides them. The scaffolded compose file binds the web port to 127.0.0.1 and sets `MIMIR_WEB_HOST=0.0.0.0` inside the container. Set `MIMIR_API_KEY` if you expose the port any further.
 
-**2. Clone your repo where the agent can reach it.** Worklink never clones for you, and the checkout's `origin` must match the slug. In Docker, bind-mount it.
+**2. Clone your repo and create the PR checkout lease root, side by side in one directory.** Worklink never clones for you, and the checkout's `origin` must match the slug. Remediation needs `MIMIR_PR_CHECKOUT_LEASE_ROOT`: an existing, non-symlink directory, writable by the agent's runtime user, on the **same filesystem as the repo** (leases use hardlinks). mimir checks it at startup and does not create it or fix its ownership.
 
 ```bash
+mkdir -p ~/agents/my-agent-work/.pr-leases
 git clone https://github.com/<owner/repo>.git ~/agents/my-agent-work/<repo>
+```
+
+The PyPI scaffold mounts only the agent home, so mount that one work directory into the container with a `compose.override.yml` next to the generated compose file:
+
+```yaml
+services:
+  my-agent:                                  # your --service-name
+    volumes:
+      - ~/agents/my-agent-work:/workspace    # repo at /workspace/<repo>, leases at /workspace/.pr-leases
+```
+
+Then give the runtime user ownership. Find its UID and GID once the container is up, and re-check from inside the container:
+
+```bash
+docker compose exec my-agent sh -c 'id'                       # note the runtime user's uid/gid
+sudo chown -R <uid>:<gid> ~/agents/my-agent-work              # on Linux; Docker Desktop/OrbStack map ownership for you
+docker compose exec -u <runtime-user> my-agent sh -c \
+  'test -d /workspace/.pr-leases -a ! -L /workspace/.pr-leases -a -w /workspace/.pr-leases && echo lease-root-ok'
 ```
 
 **3. Describe the repo: `<home>/repositories.yaml`.**
@@ -181,11 +200,15 @@ repository: <owner/repo>
 defaults:
   backend: opencode                     # the shipping builder; feature_factory handles epics
   max_concurrent: 2                     # builds at once; size to the host
+  # Required for autonomous runs. It accepts that builds run as local subprocesses
+  # that share the host filesystem and are not network-isolated.
   allow_autonomous_local_subprocess: true
-backends:
-  opencode:
-    bash_allowlist: ["uv run pytest"]    # must admit your test command
 ```
+
+Leave `backends.opencode.bash_allowlist` unset: mimir derives it from your `test_command`. For `uv run pytest -q` the derived list is `["git *", "uv *"]`. If you do set it, it replaces that list entirely, and its entries are anchored globs (`*` and `?` only):
+- `"uv run pytest"` admits only that exact string, and worklink refuses to start against `uv run pytest -q`;
+- a trailing ` *` admits the command with any arguments, e.g. `["git *", "uv run pytest *"]`;
+- keep `"git *"` (or the narrower git commands you intend) or the builder loses git.
 
 **5. Give the agent the bot's identity** in `<home>/.env`. Never print these values.
 
@@ -275,27 +298,35 @@ Commit under a personal email you choose, and set it per repo (`git config user.
 
 **3. Memory.** Claude Code's auto-memory keeps lessons across sessions. Ask it to save a memory whenever a rule earns its keep or a new failure mode appears. The rules in the "Rules that keep it safe" section all started as memories.
 
-**4. A PR watcher.** Run this in the background from Claude Code. It exits, which wakes the session, when the bot opens a PR or pushes a new head. Mark heads as handled when you start each review.
+**4. A PR watcher.** Run this in the background from Claude Code. It exits, which wakes the session, when the bot opens a PR or pushes a new head, and prints exactly which `PR=SHA` pairs are new. Acknowledge **only those pairs**, after their reviews are launched. Never acknowledge by taking a fresh snapshot of all open PRs: a PR that arrives between the notification and the snapshot would be marked handled and never reviewed.
 
 ```bash
 #!/bin/bash
-# watch_prs.sh: exit when any open <bot-login> PR is new or has a new head.
-STATE="$HOME/.cache/pr_watch_state"; touch "$STATE"
-cd /path/to/your/repo
+# watch_prs.sh <owner/repo> <bot-login>: exit and print the new PR=SHA pairs when any
+# open PR by <bot-login> is new or has a new head. Acknowledge with ack_prs.sh.
+REPO="$1"; BOT="$2"
+STATE_DIR="$HOME/.cache/pr-watch"; mkdir -p "$STATE_DIR"
+STATE="$STATE_DIR/${REPO//\//_}.acked"; touch "$STATE"
 while true; do
-  CUR=$(gh pr list --author <bot-login> --state open --limit 30 \
-        --json number,headRefOid --jq '.[]|"\(.number)=\(.headRefOid[0:9])"' | sort)
-  NEW=$(comm -13 "$STATE" <(echo "$CUR"))
-  if [ -n "$NEW" ]; then echo "CHANGED: $NEW"; exit 0; fi
+  CUR=$(gh pr list -R "$REPO" --author "$BOT" --state open --limit 50 \
+        --json number,headRefOid --jq '.[]|"\(.number)=\(.headRefOid)"' | sort -u)
+  NEW=$(comm -13 <(sort -u "$STATE") <(echo "$CUR"))
+  if [ -n "$NEW" ]; then echo "$NEW"; exit 0; fi
   sleep 120
 done
 ```
 
 ```bash
-# mark_handled.sh: record every open PR head as seen.
-gh pr list --author <bot-login> --state open --limit 30 \
-  --json number,headRefOid --jq '.[]|"\(.number)=\(.headRefOid[0:9])"' | sort > "$HOME/.cache/pr_watch_state"
+#!/bin/bash
+# ack_prs.sh <owner/repo> <PR=SHA>...: record exactly the pairs whose reviews you launched.
+REPO="$1"; shift
+STATE_DIR="$HOME/.cache/pr-watch"; mkdir -p "$STATE_DIR"
+STATE="$STATE_DIR/${REPO//\//_}.acked"; touch "$STATE"
+printf '%s\n' "$@" >> "$STATE"
+sort -u -o "$STATE" "$STATE"
 ```
+
+The loop is: start `watch_prs.sh`; when it exits, launch a review for each printed pair; run `ack_prs.sh <repo> <those pairs>`; start the watcher again. A pair that arrived meanwhile isn't in the acknowledged set, so the next watcher run reports it immediately.
 
 **5. Subagents for reviews.** Have Claude Code run each review in its own subagent or forked session. That way several PRs can be reviewed in parallel, and their test output stays out of the main context. Each review works in a fresh `git worktree` from `origin/main` and removes it afterwards.
 
@@ -347,7 +378,7 @@ Arming is your decision: the agent builds whatever carries `worklink:ready`. Dis
 
 **3. Build.** Every 10 minutes the queue claims ready leaves, lowest ID first, up to `max_concurrent`.
 1. The label becomes `worklink:in-progress`.
-2. The builder works in a fresh sandbox checkout, and the controller re-runs the tests.
+2. The builder works in a fresh checkout of its own, and the controller re-runs the tests.
 3. The bot pushes a branch and opens the PR.
 4. On success, the label becomes `worklink:review`, and an evidence comment with the PR link lands on the issue.
 
@@ -421,7 +452,7 @@ Each rule below exists because breaking it once cost a bad merge, a false diagno
 
 **Specs**
 
-11. **Every acceptance criterion must be buildable offline.** The builder sandbox has no network, no PR access and no tracker. Mark anything else as a reviewer-only live check, in those words.
+11. **Write criteria a build can meet from its checkout alone.** The builder can't open or read the PR, see reviews, or update the tracker; the controller does those around it. Anything that needs a live service, a PR or the tracker goes in the review criteria as a reviewer-only live check, in those words. This is a spec rule, not a containment boundary: the shipping `local_subprocess` compute backend is **not** network-isolated and shares the host filesystem (`network_isolated=False`, `shared_filesystem=True` in `mimir/worklink/compute.py`). Enabling autonomous runs accepts that risk.
 12. **Criteria must hold against main, not a sibling branch.** Declare ordering with `chainlink issue block <leaf> <blocker>`.
 13. **Ground every spec in the current code.** Cite `file:line` on today's main. Before writing that a mechanism is missing, verify that it really is.
 14. **Test sentinels must not look like secrets.** The publication scanner refuses `sk-…`, JWT or long base64 shapes even in tests. Use plain strings like `fake-oauth-sentinel-not-a-token`.
@@ -444,7 +475,7 @@ These are the failures we actually hit, roughly by frequency.
 | Leaf sits at `worklink:ready` and never builds | Queue full (`max_concurrent`), an unmet `issue block`, or a dispatch incident recorded after a failure | Run `chainlink issue show <id>` and check `state/pollers/worklink-ready-queue/run-<id>.log`. A recorded incident blocks dispatch until it's cleared, even after `retry_after` passes |
 | Leaf goes straight to `worklink:blocked` with "template validation failed" | A required section or the column-0 `- [ ]` line is missing | Run `missing_leaf_template_parts` on the description, fix it with `chainlink issue update <id> -d`, remove the `blocked` label and add `ready` back |
 | Build blocked: "staged path contains a secret-shaped token" | A test uses a realistic fake credential | Amend the spec to require plain sentinels, then re-arm |
-| Build blocked on a step it can't do | A criterion needs network, a PR or the tracker | Rewrite it as a reviewer-only live check |
+| Build blocked on a step it can't do | A criterion needs a live service, the PR or the tracker | Rewrite it as a reviewer-only live check |
 | Review requested changes, nothing happens | The `github-activity` poller isn't running, or its token falls back to the wrong `gh` account | Check the poller's events. Make sure `GITHUB_TOKEN` is in its `pass_env` and `MIMIR_GITHUB_SELF_LOGIN` matches the bot |
 | The bot's push only rebased | Normal on a first pass | Request changes again in two lines; ask the agent directly after two no-op pushes |
 | Tests pass alone, fail in the full suite | A test leaks environment or global state, e.g. `monkeypatch.setenv` called after code that already wrote `os.environ` | Run the leaking test plus the failing file with `-p no:xdist`; set env before the code under test runs |
@@ -493,8 +524,9 @@ then close the chainlink issue.
 **Watch the loop**
 
 ```text
-Start the PR watcher in the background. Whenever <bot-login> opens a PR or pushes a new head, launch a
-strict review of it in a subagent, then re-arm the watcher. Tell me after each verdict, in two lines.
+Start the PR watcher in the background. When it exits, launch a strict review in a subagent for each PR=SHA
+pair it printed, acknowledge exactly those pairs with ack_prs.sh, then re-arm the watcher. Tell me after each
+verdict, in two lines.
 ```
 
 **Release**
