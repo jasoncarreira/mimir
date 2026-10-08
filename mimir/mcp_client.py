@@ -1,7 +1,7 @@
 """MCP client — run MCP servers as subprocesses and bridge their tools into LangChain.
 
 Each ``MCPServerConfig`` describes one stdio subprocess (command + args +
-env). ``MCPManager.start_servers`` spawns them concurrently, calls
+env). ``MCPManager.start_servers`` starts them in a dedicated owner task, calls
 ``ClientSession.list_tools``, and wraps each remote tool as a
 ``langchain_core.tools.StructuredTool``. The resulting flat list is
 appended to the agent's tool surface alongside mimir's native tools.
@@ -49,6 +49,7 @@ from typing import Any, Callable
 from langchain_core.tools import StructuredTool, ToolException
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.types import InputRequiredResult
 from pydantic import Field, create_model
 
 from ._atomic import atomic_write_json
@@ -538,7 +539,7 @@ class MCPConnection:
             provenance = MCPProvenance.create(
                 config=self.config,
                 tool_name=mcp_tool.name,
-                input_schema=mcp_tool.inputSchema or {},
+                input_schema=mcp_tool.input_schema or {},
                 server_config_id=config_id,
             )
             policy = next(
@@ -573,7 +574,7 @@ class MCPConnection:
                 server_name=self.config.name,
                 tool_name=mcp_tool.name,
                 description=mcp_tool.description or "",
-                input_schema=mcp_tool.inputSchema or {},
+                input_schema=mcp_tool.input_schema or {},
                 session=self.session,
                 call_timeout_s=call_timeout_s,
                 provenance=provenance,
@@ -727,12 +728,9 @@ def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[
 class MCPManager:
     """Lifecycle owner for all MCP server connections.
 
-    Pre-fix every server shared a single ``AsyncExitStack`` — a hang in
-    one session's ``__aexit__`` blocked the teardown of every server
-    after it in the stack. Now each connection owns its own
-    ``AsyncExitStack``; shutdown gathers them concurrently with
-    ``return_exceptions=True`` under an overall timeout so one stuck
-    process can't keep the others alive.
+    Each connection owns its own ``AsyncExitStack``. The SDK's AnyIO
+    cancel scopes must be exited in the task that entered them, in
+    reverse order; teardown is bounded per connection.
     """
 
     def __init__(
@@ -750,6 +748,8 @@ class MCPManager:
         self._policy_store = MCPPolicyStore(policy_store_path) if policy_store_path else None
         self.policy_records: dict[str, dict[str, Any]] = {}
         self.startup_failures: list[dict[str, str]] = []
+        self._owner_task: asyncio.Task[None] | None = None
+        self._stop_event: asyncio.Event | None = None
 
     def _validate_identities(
         self,
@@ -815,6 +815,53 @@ class MCPManager:
         configures the same server name twice or when underscore-laden
         tool names happen to produce the same namespaced string.
         """
+        if self._owner_task is not None and not self._owner_task.done():
+            raise RuntimeError("MCP servers already started; shut down before restarting")
+        ready: asyncio.Future[list[StructuredTool]] = asyncio.get_running_loop().create_future()
+        stop = asyncio.Event()
+        self._stop_event = stop
+        self._owner_task = asyncio.create_task(
+            self._own_servers(configs, fail_fast=fail_fast, ready=ready, stop=stop),
+            name="mcp-manager-owner",
+        )
+        try:
+            return await asyncio.shield(ready)
+        except BaseException:
+            stop.set()
+            # Startup cancellation must not strand a transport owner. Shield its
+            # teardown from the caller; all SDK contexts remain in that task.
+            await asyncio.shield(self._owner_task)
+            if ready.done() and not ready.cancelled():
+                ready.exception()
+            raise
+
+    async def _own_servers(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+        ready: asyncio.Future[list[StructuredTool]],
+        stop: asyncio.Event,
+    ) -> None:
+        """Enter and exit every SDK context in one dedicated, long-lived task."""
+        try:
+            tools = await self._start_servers_owned(configs, fail_fast=fail_fast)
+            ready.set_result(tools)
+            await stop.wait()
+        except BaseException as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                log.exception("MCP owner task failed")
+        finally:
+            await self._close_connections()
+
+    async def _start_servers_owned(
+        self,
+        configs: list[MCPServerConfig],
+        *,
+        fail_fast: bool,
+    ) -> list[StructuredTool]:
         self.startup_failures = []
         records = self._policy_store.load() if self._policy_store else {}
         configs = self._apply_stored_policies(configs, records)
@@ -924,32 +971,34 @@ class MCPManager:
             raise
 
     async def shutdown(self) -> None:
-        """Tear down every subprocess + session.
+        """Signal the transport owner and await teardown from any caller task."""
+        owner = self._owner_task
+        if owner is None:
+            return
+        assert self._stop_event is not None
+        self._stop_event.set()
+        # Do not move SDK context exits to this task, or propagate caller
+        # cancellation into the owner's AnyIO scopes during teardown.
+        await asyncio.shield(owner)
 
-        ``asyncio.gather`` with ``return_exceptions=True`` ensures one
-        stuck server can't keep the others alive. Each gather is bounded
-        by ``shutdown_timeout_s`` so process exit isn't held up.
-        """
+    async def _close_connections(self) -> None:
+        """Close in reverse order inside the owner, bounded per connection."""
         if not self.connections:
             return
-        tasks = [
-            asyncio.create_task(conn.exit_stack.aclose())
-            for conn in self.connections
-        ]
         try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=self._shutdown_timeout,
-            )
-        except asyncio.TimeoutError:
-            log.warning(
-                "MCP shutdown exceeded %.1fs — some servers may not have "
-                "torn down cleanly", self._shutdown_timeout,
-            )
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-        self.connections.clear()
+            for conn in reversed(self.connections):
+                try:
+                    async with asyncio.timeout(self._shutdown_timeout):
+                        await conn.exit_stack.aclose()
+                except TimeoutError:
+                    log.warning(
+                        "MCP server '%s' shutdown exceeded %.1fs",
+                        conn.config.name, self._shutdown_timeout,
+                    )
+                except Exception:
+                    log.exception("MCP server '%s' shutdown failed", conn.config.name)
+        finally:
+            self.connections.clear()
 
 
 _JSON_TYPE_MAP: dict[str, type] = {
@@ -1096,28 +1145,40 @@ def _bridge_mcp_tool(
     async def _call_mcp_tool(**kwargs: Any) -> str:
         try:
             result = await asyncio.wait_for(
-                session.call_tool(tool_name, kwargs if kwargs else None),
+                session.call_tool(
+                    tool_name, kwargs if kwargs else None, allow_input_required=True,
+                ),
                 timeout=call_timeout_s,
             )
+            if isinstance(result, InputRequiredResult):
+                raise ToolException(
+                    f"MCP tool '{tool_name}' requested interactive input, which mimir does not support"
+                )
+            if result.is_error:
+                text_parts = [c.text for c in result.content if hasattr(c, "text")]
+                error_text = "\n".join(text_parts) if text_parts else "Unknown error"
+                raise ToolException(f"MCP tool '{tool_name}' returned error: {error_text}")
+            parts: list[str] = []
+            has_text = False
+            for content in result.content:
+                if hasattr(content, "text"):
+                    parts.append(content.text)
+                    has_text = True
+                elif hasattr(content, "data"):
+                    parts.append(f"[{content.mime_type} data]")
+                else:
+                    parts.append(json.dumps(content.model_dump(), default=str))
+            if not has_text and result.structured_content is not None:
+                parts.append(json.dumps(result.structured_content, default=str))
+            return "\n".join(parts) if parts else "(empty result)"
         except asyncio.TimeoutError as exc:
             raise ToolException(
                 f"MCP tool '{tool_name}' timed out after {call_timeout_s}s"
             ) from exc
+        except ToolException:
+            raise
         except Exception as exc:
             raise ToolException(f"MCP tool '{tool_name}' failed: {exc}") from exc
-        if result.isError:
-            text_parts = [c.text for c in result.content if hasattr(c, "text")]
-            error_text = "\n".join(text_parts) if text_parts else "Unknown error"
-            raise ToolException(f"MCP tool '{tool_name}' returned error: {error_text}")
-        parts: list[str] = []
-        for content in result.content:
-            if hasattr(content, "text"):
-                parts.append(content.text)
-            elif hasattr(content, "data"):
-                parts.append(f"[{getattr(content, 'mimeType', 'binary')} data]")
-            else:
-                parts.append(json.dumps(content.model_dump(), default=str))
-        return "\n".join(parts) if parts else "(empty result)"
 
     kwargs: dict[str, Any] = {
         "coroutine": _call_mcp_tool,
