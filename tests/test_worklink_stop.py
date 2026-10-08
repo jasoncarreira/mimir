@@ -277,6 +277,8 @@ async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_pa
             else:
                 assert started_hold + timedelta(hours=1) <= retry_at <= datetime.now(UTC) + timedelta(hours=1)
             assert entry["attempt_consumed"] is False
+            failure_event = [fields for name, fields in events if name == "worklink_run_failed"][-1]
+            assert failure_event["attempt_consumed"] is False
             assert claims.attempts_used(comments) == prior_used
             assert labels == {"worklink:ready"}
             assert autonomous_dispatch_block_reason(state_dir, 700, now=retry_at - timedelta(seconds=1))
@@ -328,6 +330,38 @@ def test_worklink_quota_reset_rejects_past_tracker_reset(tmp_path):
     reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
     assert source == "one-hour fallback"
     assert before + timedelta(hours=1) <= reset <= datetime.now(UTC) + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("hint, expected", [
+    ("9999-01-01T00:00:00Z", None),
+    ("2020-01-01T00:00:00Z", None),
+    ("2030-01-01T15:00:00Z", datetime(2030, 1, 1, 15, tzinfo=UTC)),
+    ("2030-01-01T17:00:00+02:00", datetime(2030, 1, 1, 15, tzinfo=UTC)),
+    ("2030-01-01 15:00:00", datetime(2030, 1, 1, 15, tzinfo=UTC)),
+    ("2030-01-01T12:00:00Z", None),
+    ("2030-01-09T12:00:00Z", datetime(2030, 1, 9, 12, tzinfo=UTC)),
+    ("2030-01-09T12:00:01Z", None),
+    ("2030-99-99T00:00:00Z", None),
+], ids=["far-future", "past", "plausible", "offset", "naive-utc", "now", "max-window", "over-window", "malformed"])
+def test_worklink_quota_reset_text_hint(tmp_path, monkeypatch, hint, expected):
+    from mimir.worklink import orchestrator
+
+    now = datetime(2030, 1, 1, 12, tzinfo=UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    from mimir import quota_pause
+
+    monkeypatch.setattr(orchestrator, "datetime", FixedDatetime)
+    monkeypatch.setattr(quota_pause, "datetime", FixedDatetime)
+    reset, source = orchestrator._worklink_quota_reset(
+        tmp_path, f"Error: The usage limit has been reached, resets at {hint}",
+    )
+    assert source == ("Codex reset" if expected is not None else "one-hour fallback")
+    assert reset == (expected if expected is not None else now + timedelta(hours=1))
 
 
 def test_failure_kind_change_starts_new_occurrence(tmp_path):

@@ -4575,17 +4575,25 @@ def _record_run_failure(
 
 def _worklink_quota_reset(home: Path, error: str) -> tuple[datetime, str]:
     """Use a plausible Codex reset, otherwise wait a bounded hour."""
-    from ..quota_pause import QuotaPauseTracker, extract_reset_at
+    from ..quota_pause import QuotaPauseTracker
 
     now = datetime.now(UTC)
     tracker = QuotaPauseTracker(home / ".mimir" / "quota_pause.json")
     reset = tracker.reset_at if tracker.last_load_ok and tracker.provider == "codex-plus" else None
     if reset is None:
-        reset, _ = extract_reset_at(RuntimeError(error))
-        # extract_reset_at caps implausible text hints at eight days; its
-        # clamped endpoint is not evidence of a real window reset.
-        if reset is not None and reset.tzinfo is not None and reset.astimezone(UTC) >= now + timedelta(days=8, minutes=-1):
-            reset = None
+        # Parse the raw text hint: extract_reset_at intentionally clamps for
+        # agent pauses, which hides stale/garbage dates from this validity gate.
+        hint = re.search(
+            r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+            error,
+        )
+        if hint is not None:
+            try:
+                reset = datetime.fromisoformat(hint.group(1).replace("Z", "+00:00"))
+                if reset.tzinfo is None:
+                    reset = reset.replace(tzinfo=UTC)
+            except ValueError:
+                reset = None
     if reset is not None and reset.tzinfo is not None:
         reset = reset.astimezone(UTC)
         if now < reset <= now + timedelta(days=8):
