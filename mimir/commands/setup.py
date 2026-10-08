@@ -17,6 +17,7 @@ from pathlib import Path
 from textwrap import dedent
 
 import yaml
+from dotenv import dotenv_values
 
 from ..skill_defs import seed_skills
 from ..subagent_defs import seed_subagent_defs
@@ -725,8 +726,9 @@ def setup_home(
     plan (not pay-per-token). Effect is provider-polymorphic — see
     ``detect_route``.
 
-    Setup always writes the usage monitor env vars matching the
-    route's billing mode:
+    Setup writes the usage monitor env vars matching the effective
+    route's billing mode (exported spec, existing home spec, then
+    ``--model``/default):
 
     * subscription routes → ``MIMIR_QUOTA_POLL_ENABLED=1``
     * API routes → ``MIMIR_COST_HOURLY_LIMIT_USD=5.0`` (sane default
@@ -734,20 +736,27 @@ def setup_home(
     """
     from ..model_registry import detect_route
     route = detect_route(model, subscription=subscription)
-    # Runtime loads <home>/.env as defaults; exported environment still wins.
-    # When MIMIR_MODEL_SPEC is already in the process environment, that is
-    # the effective model for this setup run and for ``mimir run``. Setup
-    # still writes <home>/.env from ``route`` (the --model/default) so a
-    # fresh local quickstart works without manual exports.
-    # (chainlink #447)
-    env_spec = os.environ.get("MIMIR_MODEL_SPEC", "").strip()
-    effective_route = detect_route(env_spec) if env_spec else route
-    model_spec_from_env = bool(env_spec)
     home = home.resolve()
     if home.exists() and not home.is_dir():
         raise ValueError(
             f"--home {home} exists and is not a directory; refusing to scaffold over it."
         )
+    # Runtime loads <home>/.env as defaults; exported environment wins.
+    # Read before scaffolding so a re-run reports and injects for the
+    # existing spec, even when --model is omitted or differs. On a fresh
+    # home, route still seeds .env from --model/default. (chainlink #447)
+    env_spec = os.environ.get("MIMIR_MODEL_SPEC", "").strip()
+    # Match runtime's python-dotenv syntax (quotes and inline comments),
+    # without loading the home's defaults into setup's process environment.
+    env_path = home / ".env"
+    home_spec = (
+        (dotenv_values(env_path).get("MIMIR_MODEL_SPEC") or "")
+        if env_path.is_file() else ""
+    )
+    effective_spec = env_spec or home_spec
+    effective_route = detect_route(effective_spec) if effective_spec else route
+    model_spec_from_env = bool(env_spec)
+    model_spec_from_home_env = bool(home_spec) and not model_spec_from_env
     home.mkdir(parents=True, exist_ok=True)
 
     # First-ever setup? Decide BEFORE the mkdir loop below creates
@@ -798,7 +807,7 @@ def setup_home(
     # Provider-specific env (e.g., ``ANTHROPIC_BASE_URL`` for Minimax /
     # Moonshot routed deployments). Same idempotency: only write when
     # the line is empty.
-    for var_name, var_value in route.env.items():
+    for var_name, var_value in effective_route.env.items():
         # Use a per-var regex by-name so this generalizes to any future
         # provider that adds a different env var (OPENAI_BASE_URL, etc.).
         line_re = re.compile(
@@ -812,7 +821,7 @@ def setup_home(
     # (no opt-in flag) because the right monitor for the chosen
     # billing model should just work. Idempotent: don't clobber an
     # operator-set value on re-run.
-    for var_name, var_value in route.monitor_env.items():
+    for var_name, var_value in effective_route.monitor_env.items():
         line_re = re.compile(
             rf"^(\s*){re.escape(var_name)}\s*=.*$", re.MULTILINE,
         )
@@ -966,10 +975,11 @@ def setup_home(
         "provider_name": effective_route.provider_name,
         "billing_mode": effective_route.billing_mode,
         "monitor_status": monitor_status,
-        # When MIMIR_MODEL_SPEC is set in the environment the three fields
-        # above reflect it (the runtime's real model) rather than the
-        # --model/default route scaffolded into <home>/.env. (chainlink #297)
+        # These fields reflect the runtime's effective model, not merely
+        # the --model/default route used to seed a blank .env.
         "model_spec_from_env": model_spec_from_env,
+        "model_spec_from_home_env": model_spec_from_home_env,
+        "model_was_explicit": model is not None,
         "setup_default_spec": route.model_spec,
     }
 
@@ -1102,6 +1112,11 @@ def _print_setup_report(status: dict[str, object]) -> None:
                     f"                   (setup --model/default would be: "
                     f"{_default_spec})"
                 )
+        elif status.get("model_spec_from_home_env"):
+            print(f"                 ↑ from {home}/.env (existing value preserved; edit .env to change)")
+            _default_spec = status.get("setup_default_spec")
+            if status.get("model_was_explicit") and _default_spec and _default_spec != model_spec:
+                print(f"                   (setup --model/default would be: {_default_spec})")
     monitor_status = status.get("monitor_status")
     if monitor_status:
         print(f"  usage monitor: {monitor_status}")
