@@ -96,7 +96,7 @@ analogue for git credentials.
 | `OPENAI_API_KEY` | Alternate embedding provider | https://platform.openai.com/api-keys | `mimir saga calibrate --dry-run` |
 | `NVIDIA_API_KEY` / `NVIDIA_NIM_API_KEY` | NVIDIA NIM embedder (alternate) | NVIDIA NGC console | `mimir saga calibrate --dry-run` |
 | `TAVILY_API_KEY` | `web_search` / `fetch_url` tools | https://tavily.com/dashboard | One-turn `web_search` test |
-| `MIMIR_API_KEY` | mimir's own HTTP server's auth gate | Operator-chosen | `curl -H "X-Mimir-Api-Key: $KEY" http://localhost:8080/event` returns 200 (or 401 if wrong) |
+| `MIMIR_API_KEY` | mimir's own HTTP server's auth gate | Operator-chosen | `curl -H "X-API-Key: $KEY" http://localhost:8080/event` returns 200 (or 401 if wrong) |
 | `MOLTBOOK_API_KEY`, `THREADBORN_API_KEY` | muninn-only external services | Per-service operator | Service-specific probe (TBD per service) |
 | `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN`, `X_ACCESS_TOKEN_SECRET` | `social-cli` X provider (OAuth 1.0a) | https://developer.x.com/portal — Keys and tokens | `social-cli whoami -p x` |
 | `ATPROTO_APP_PASSWORD` (a.k.a. `BSKY_APP_PASSWORD` in some docs) | `social-cli` Bluesky provider | Bluesky app → Settings → App passwords | `social-cli whoami -p bsky` |
