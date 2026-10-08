@@ -309,6 +309,77 @@ def test_declared_environment_is_bound_to_exact_argv(tmp_path, monkeypatch, over
     assert "weather-private-value" not in audit
 
 
+@pytest.mark.parametrize("overlay", [False, True])
+@pytest.mark.parametrize("credential", [None, "GITHUB_TOKEN"])
+def test_operator_declared_gh_isolates_config_and_checks_only_explicit_token(
+    tmp_path, monkeypatch, overlay, credential,
+):
+    from mimir.access_control import parse_operator_shell_commands
+
+    executable = tmp_path / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    home = tmp_path / "home"
+    config = home / ".config" / "gh"
+    config.mkdir(parents=True)
+    (config / "hosts.yml").write_text("github.com:\n  oauth_token: disk-secret\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-github-secret")
+    monkeypatch.setenv("GH_TOKEN", "ambient-gh-secret")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(config))
+    # The general shell baseline is not a substitute for a gh credential grant.
+    monkeypatch.setenv("GH_HOST", "alternate.invalid")
+    monkeypatch.setenv("MIMIR_SHELL_PASS_ENV", "GITHUB_TOKEN,GH_TOKEN,GH_CONFIG_DIR,GH_HOST")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "test-bot")
+    checks = []
+    monkeypatch.setattr("mimir.tools.forge.confirm_github_tool_identity",
+                        lambda principal, token: checks.append((principal, token)))
+    monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
+    declarations = parse_operator_shell_commands([{
+        "exec": "gh", "path": str(executable), "subcommands": [["issue", "list"]],
+        "pass_env": ([credential] if credential else []),
+    }])
+    argv = [str(executable), "issue", "list"]
+    token = _shell_env.bind_direct_exec_argv(
+        argv, command="gh issue list", declared=declarations, operator_declared=True,
+    )
+    try:
+        env = direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
+        assert env["GH_CONFIG_DIR"] == _shell_env._GH_CONFIG_DIR
+        assert Path(env["GH_CONFIG_DIR"]) != config
+        assert not (Path(env["GH_CONFIG_DIR"]) / "hosts.yml").exists()
+        assert env.get("GITHUB_TOKEN") == ("ambient-github-secret" if credential == "GITHUB_TOKEN" else None)
+        assert env.get("GH_TOKEN") is None
+        assert env.get("GH_HOST") is None
+        assert checks == [("test-bot", os.environ[credential] if credential else "")]
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+
+
+def test_operator_declared_gh_identity_refusal_is_not_skipped(tmp_path, monkeypatch):
+    from mimir.access_control import parse_operator_shell_commands
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    executable = tmp_path / "gh"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    declarations = parse_operator_shell_commands([{
+        "exec": "gh", "path": str(executable), "subcommands": [["issue", "list"]],
+    }])
+    def refuse(*args):
+        raise ToolPolicyRefusal("identity refused")
+    monkeypatch.setattr("mimir.tools.forge.confirm_github_tool_identity", refuse)
+    argv = [str(executable), "issue", "list"]
+    token = _shell_env.bind_direct_exec_argv(
+        argv, command="gh issue list", declared=declarations, operator_declared=True,
+    )
+    try:
+        with pytest.raises(ToolPolicyRefusal, match="identity refused"):
+            direct_exec_env(argv)
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+
+
 def test_declared_environment_requires_matching_pinned_execution(tmp_path, monkeypatch):
     from mimir.access_control import parse_declared_shell_commands
 

@@ -5184,6 +5184,7 @@ def _arm2_operator_auth(
 
 @pytest.mark.parametrize("command,admitted", [
     ("gog gmail search --limit 5 secret-query", True),
+    ("gog gmail search --limit 5 -- --send secret-query", True),
     ("gog gmail send --limit 5 secret-query", False),
     ("acli jira workitem search secret-query", False),
     ("gog gmail search && gog gmail search", False),
@@ -5265,6 +5266,43 @@ def test_tainted_operator_declared_argv_is_bound_audited_and_isolated(
         assert not events
 
 
+@pytest.mark.parametrize("command", ["gog gmail search", "pwd"])
+def test_malformed_operator_grant_hard_refuses_even_builtin_command(tmp_path, monkeypatch, command):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "scheduler.yaml").write_text("jobs: []\noperator_shell_commands: broken\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _arm2_operator_auth(_Arm2LiveState(True), enforcement_enabled=True)
+    request = _make_request("shell_exec", "malformed-grant", auth,
+                            {"command": command, "cwd": str(home)})
+    preparation = _prepare_operator_shell_execution(request, "shell_exec", auth, auth.ifc_labels)
+    assert preparation is not None
+    assert preparation.outcome is OperatorShellPreparationOutcome.HARD_REFUSED
+    assert preparation.binding is None
+
+
+@pytest.mark.parametrize("tool", ["write_file", "edit_file", "replace_file"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_authorization_refuses_clean_admin_scheduler_write(tmp_path, monkeypatch, tool, enforce):
+    from mimir.access_control import ToolRegistry
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "scheduler.yaml").write_text("jobs: []\n")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    auth = _arm2_operator_auth(_Arm2LiveState(False), enforcement_enabled=enforce)
+    for target in (str(home / "scheduler.yaml"), "/scheduler.yaml", "scheduler.yaml"):
+        authorization = ToolRegistry().authorize_tool(
+            tool, auth, enforce=enforce, arguments={"file_path": target},
+        )
+        assert not authorization.allowed
+        assert authorization.refusal_detail
+    control = ToolRegistry().authorize_tool(
+        tool, auth, enforce=enforce, arguments={"file_path": str(home / "state" / "note.md")},
+    )
+    assert control.allowed, control.reason
+
+
 def test_operator_declaration_only_applies_to_tainted_admin_chat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5295,10 +5333,33 @@ def test_operator_declaration_only_applies_to_tainted_admin_chat(
                             {"command": "gog gmail search", "cwd": str(home / "state")})
     preparation = _prepare_operator_shell_execution(request, "shell_exec", user, user.ifc_labels)
     assert preparation is not None and preparation.declaration is None
+    # Isolate the declaration's trigger check from the independent outer
+    # operator-turn gate, which also rejects these triggers today.
+    with monkeypatch.context() as patch:
+        patch.setattr(budget_gate, "_operator_can_invoke_admin_shell", lambda *args: True)
+        def unexpected_grant_load(*args, **kwargs):
+            pytest.fail("operator declaration loaded outside user_message")
+        patch.setattr("mimir.scheduler.load_operator_shell_commands", unexpected_grant_load)
+        _assert_non_user_trigger_cannot_get_operator_declaration(original, home)
     service = replace(original, trigger="scheduled_tick", interactivity=TurnInteractivity.NON_INTERACTIVE)
     request = _make_request("shell_exec", "unchanged-service", service,
                             {"command": "gog gmail search", "cwd": str(home / "state")})
     assert _prepare_operator_shell_execution(request, "shell_exec", service, service.ifc_labels) is None
+
+
+def _assert_non_user_trigger_cannot_get_operator_declaration(original, home):
+    from dataclasses import replace
+
+    for trigger in ("shell_job_complete", "continuation"):
+        interactive = replace(original, trigger=trigger, ifc_state=_Arm2LiveState(True))
+        request = _make_request("shell_exec", "non-user-trigger", interactive,
+                                {"command": "gog gmail search", "cwd": str(home)})
+        preparation = _prepare_operator_shell_execution(
+            request, "shell_exec", interactive, interactive.ifc_labels,
+        )
+        assert preparation is not None
+        assert preparation.declaration is None and preparation.binding is None
+        assert preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
 
 
 @pytest.mark.asyncio

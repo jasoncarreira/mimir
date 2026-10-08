@@ -3,19 +3,27 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import importlib
 import inspect
 import io
 import json
+from enum import Enum
 from importlib.metadata import version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from acp.task import RpcTask, RpcTaskKind
 from pydantic import ValidationError
 
-from mimir.acp import sdk
+try:
+    from mimir.acp import sdk
+except ImportError as exc:
+    pytest.fail(
+        f"agent-client-protocol {version('agent-client-protocol')} cannot import "
+        f"mimir.acp.sdk: {exc}",
+        pytrace=False,
+    )
 from mimir.acp.stdio import _DrainProtocol, _ReservedFrameTransport
 
 
@@ -60,6 +68,65 @@ FORBIDDEN_SCHEMA_IMPORTS = {
     "HttpMcpServer",
     "SseMcpServer",
 }
+
+
+class TaskKind(Enum):
+    REQUEST = "request"
+    NOTIFICATION = "notification"
+
+
+@dataclasses.dataclass(slots=True)
+class WireTask:
+    kind: TaskKind
+    message: dict[str, Any]
+
+
+def test_no_mimir_module_imports_private_acp_task() -> None:
+    package = Path(sdk.__file__).parents[1]
+    offenders = []
+    for path in package.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+                if node.module == "acp" and any(alias.name == "task" for alias in node.names):
+                    modules.append("acp.task")
+            elif isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            else:
+                continue
+            if any(name == "acp.task" or name.startswith("acp.task.") for name in modules):
+                offenders.append(f"{path.relative_to(package)}:{node.lineno}")
+    assert not offenders, f"private ACP task imports: {offenders}"
+
+
+def test_installed_acp_public_symbols_used_by_sdk() -> None:
+    # Report all missing public symbols with the installed version; the import
+    # guard above also labels import failures during test collection.
+    expected = {
+        "acp": {"PROTOCOL_VERSION", "RequestError"},
+        "acp.agent.router": {"build_agent_router"},
+        "acp.connection": {"Connection"},
+        "acp.interfaces": {"Agent", "Client"},
+        "acp.meta": {"AGENT_METHODS", "CLIENT_METHODS"},
+        "acp.schema": EXPECTED_SCHEMA_IMPORTS,
+    }
+    missing = []
+    for module_name, symbols in expected.items():
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError as exc:
+            missing.extend(f"{module_name}.{name} ({exc})" for name in sorted(symbols))
+        else:
+            missing.extend(
+                f"{module_name}.{name}" for name in sorted(symbols)
+                if not hasattr(module, name)
+            )
+    assert not missing, (
+        f"agent-client-protocol {version('agent-client-protocol')} missing SDK symbols: "
+        + ", ".join(missing)
+    )
+    assert importlib.import_module("mimir.acp.sdk") is sdk
 
 
 class FakeConnection:
@@ -933,7 +1000,7 @@ async def test_dispatcher_stop_is_bounded_when_queue_drain_stalls(
     )
     stalled = asyncio.create_task(asyncio.Event().wait())
     dispatcher._task = stalled
-    await queue.publish(RpcTask(RpcTaskKind.REQUEST, {"method": "stalled"}))
+    await queue.publish(WireTask(TaskKind.REQUEST, {"method": "stalled"}))
     monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
 
     await asyncio.wait_for(dispatcher.stop(), 0.1)
@@ -968,8 +1035,8 @@ async def test_dispatcher_stop_drains_buffered_requests_before_shutdown() -> Non
     )
     for request_id in range(3):
         await queue.publish(
-            RpcTask(
-                RpcTaskKind.REQUEST,
+            WireTask(
+                TaskKind.REQUEST,
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -1022,8 +1089,8 @@ async def test_dispatcher_stop_timeout_cancels_active_runners(
         lambda message: message,
     )
     dispatcher.start()
-    await queue.publish(RpcTask(
-        RpcTaskKind.REQUEST,
+    await queue.publish(WireTask(
+        TaskKind.REQUEST,
         {"jsonrpc": "2.0", "id": 1, "method": "blocked", "params": {}},
     ))
     await started.wait()
@@ -1065,8 +1132,8 @@ async def test_dispatcher_stop_cancellation_waits_for_bounded_cleanup(
         lambda message: message,
     )
     dispatcher.start()
-    await queue.publish(RpcTask(
-        RpcTaskKind.REQUEST,
+    await queue.publish(WireTask(
+        TaskKind.REQUEST,
         {"jsonrpc": "2.0", "id": 1, "method": "blocked", "params": {}},
     ))
     await started.wait()
@@ -1212,6 +1279,42 @@ async def test_buffered_stateful_request_waits_for_authentication() -> None:
     assert connection._recv_task is not None
     await connection._recv_task
     await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_waits_behind_authentication_fence() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    notified = asyncio.Event()
+
+    class Supervisor:
+        def create(self, coroutine: Any, *, name: str) -> asyncio.Task[Any]:
+            del name
+            return asyncio.create_task(coroutine)
+
+    async def authenticate(message: dict[str, Any]) -> dict[str, Any]:
+        del message
+        started.set()
+        await release.wait()
+        return {}
+
+    async def notification(message: dict[str, Any]) -> None:
+        del message
+        notified.set()
+
+    dispatcher = sdk.BoundedMessageDispatcher(
+        sdk.BoundedMessageQueue(), Supervisor(), sdk.StrictMessageStateStore(),
+        authenticate, notification,
+    )
+    await dispatcher._dispatch_request({"method": "authenticate"})
+    await started.wait()
+    await dispatcher._dispatch_notification({"method": "mcp/message"})
+    await asyncio.sleep(0)
+    assert not notified.is_set()
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*tuple(dispatcher._runner_tasks)), 1)
+    assert notified.is_set()
 
 
 @pytest.mark.parametrize(
@@ -2104,13 +2207,15 @@ async def test_input_queue_close_rejects_blocked_publisher_without_tail_item() -
     )
     await asyncio.sleep(0)
     closing = asyncio.create_task(queue.close())
-    await asyncio.sleep(0)
+    # The reserved physical slot lets close commit without waiting for a
+    # consumer, even while a publisher is blocked at the item boundary.
+    await asyncio.wait_for(closing, 1)
+    assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS + 1
 
     for _ in range(sdk.INPUT_QUEUE_MAX_ITEMS):
         item = await queue._queue.get()
         assert item is not None
         queue.task_done()
-    await closing
     with pytest.raises(RuntimeError, match="already closed"):
         await waiting
     sentinel = await queue._queue.get()

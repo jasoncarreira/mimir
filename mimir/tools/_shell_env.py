@@ -291,7 +291,8 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         # deployment baseline, but direct execution still pins PATH.
         for name in os.environ.get("MIMIR_SHELL_PASS_ENV", "").split(","):
             name = name.strip()
-            if name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ:
+            if (name != "PATH" and _ENV_NAME.fullmatch(name) and name in os.environ
+                    and not (_is_gh_argv(argv) and (name == "GITHUB_TOKEN" or name.startswith("GH_")))):
                 env[name] = os.environ[name]
     names = direct_exec_pass_env(argv)
     passed = [key for key in names if key in os.environ]
@@ -306,7 +307,8 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
                 else _CREDENTIAL_ENV_BY_EXECUTABLE.get(executable, ())):
         if key in os.environ:
             env[key] = os.environ[key]
-    if _is_gh_argv(argv) and not (binding is not None and binding.operator_declared):
+    if _is_gh_argv(argv):
+        # Even explicit chat declarations must not discover ambient on-disk auth.
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
         from .forge import confirm_github_tool_identity
 

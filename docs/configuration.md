@@ -208,7 +208,15 @@ rejects the document at load. The agent cannot write `scheduler.yaml` with file
 tools, even on an untainted admin turn. Scheduled turns continue to use their
 own job declarations. The executable runs as server-bound argv, in a server-
 selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
-baseline; it never receives the whole process environment.
+baseline; it never receives the whole process environment. For declared `gh`,
+`GITHUB_TOKEN` must be named in the command's `pass_env`, not merely the shell
+baseline (`GH_*` overrides remain rejected by the declaration parser). Its config directory is isolated
+from `$HOME/.config/gh` and its identity is confirmed before execution.
+
+Each subcommand prefix admits **every deeper verb**. Declare full read-only leaf
+paths such as `[jira, workitem, search]`, never `[jira, workitem]`. This grant
+intentionally includes authenticated admin ACP `user_message` turns as well as
+bridge chat; interactive completion/continuation events do not inherit it.
 
 An injected read query can still bring sensitive data into the turn. Command
 output remains untrusted active ingest; outbound sinks retain their taint checks.

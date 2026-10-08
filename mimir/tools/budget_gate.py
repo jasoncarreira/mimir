@@ -1223,12 +1223,13 @@ def _operator_shell_audit_summary(
         argv = shlex.split(preparation.binding.command)[1:]
         prefix = next((parts for parts in preparation.declaration.subcommands
                        if tuple(argv[:len(parts)]) == parts), ())
+        option_argv = argv[:argv.index("--")] if "--" in argv else argv
         labels = _current_ifc_labels(preparation.binding._auth_context_identity)
         summary.update({
             "declared_executable": preparation.declaration.executable,
             "subcommand_path": " ".join(prefix),
-            "option_names": ",".join(sorted({part.split("=", 1)[0] for part in argv
-                                               if part.startswith("-") and part != "--"})),
+            "option_names": ",".join(sorted({part.split("=", 1)[0] for part in option_argv
+                                               if part.startswith("-")})),
             "taint_source_domains": ",".join(sorted({source.domain for source in getattr(labels, "sources", ())
                 if getattr(source, "has_untrusted_active_ingest", False)})),
         })

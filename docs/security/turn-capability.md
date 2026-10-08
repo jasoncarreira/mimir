@@ -189,7 +189,12 @@ source domains. Untrusted email can steer a permitted read query toward sensitiv
 mail; exfiltration still requires a separately permitted outbound sink, whose
 existing taint checks are unchanged. Operators must list read-only verbs, never
 send/create/transition verbs. Untainted admin shell and scheduled service shell
-keep their existing independent authority.
+keep their existing independent authority. Prefixes admit all deeper verbs;
+use full read-only leaf paths (`[jira, workitem, search]` rather than
+`[jira, workitem]`). Authenticated admin ACP `user_message` turns intentionally
+qualify; chat completion/continuation events do not. Declared `gh` retains config
+isolation and identity confirmation, and receives GitHub credentials only through
+its explicit `pass_env`, never implicit executable grants or the shell baseline.
 
 Arm 2 uses the existing `scheduler_read_only` profile. It does not use
 `repo_review`: repository-sensitive commands in that profile depend on immutable

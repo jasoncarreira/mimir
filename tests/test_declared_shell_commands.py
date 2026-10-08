@@ -65,6 +65,32 @@ def test_operator_declaration_rejects_interpreter_and_bad_shape():
         access_control.parse_operator_shell_commands({"exec": "gog"})
 
 
+def test_operator_declaration_refuses_base_parser_valid_script(home: Path):
+    entry = {"exec": "python3", "path": sys.executable,
+             "script": str(home / "scripts" / "todo.py")}
+    commands = parse_declared_shell_commands([entry], writable_roots=(home / "scratch",))
+    assert len(commands) == 1 and commands[0].script is not None
+    with pytest.raises(ValueError, match="script"):
+        access_control.parse_operator_shell_commands([entry], writable_roots=(home / "scratch",))
+
+
+def test_scheduler_unknown_document_key_refuses_jobs_and_chat_grants(tmp_path: Path):
+    import yaml
+    from mimir.scheduler import load_jobs_from_text, load_operator_shell_commands
+
+    text = yaml.safe_dump({
+        "jobs": [{"name": "brief", "cron": "0 * * * *", "prompt": "brief"}],
+        "operator_shell_commands": [_gog()], "unknown_grant": [],
+    })
+    jobs, rejections = load_jobs_from_text(text, source=tmp_path / "scheduler.yaml")
+    assert jobs == []
+    assert len(rejections) == 1 and rejections[0]["scope"] == "document"
+    path = tmp_path / "scheduler.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="unknown"):
+        load_operator_shell_commands(path)
+
+
 def test_operator_declaration_refuses_valid_external_send_shape():
     with pytest.raises(ValueError, match="external_send"):
         access_control.parse_operator_shell_commands([
