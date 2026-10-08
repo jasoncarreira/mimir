@@ -1,7 +1,7 @@
 """MCP client — run MCP servers as subprocesses and bridge their tools into LangChain.
 
 Each ``MCPServerConfig`` describes one stdio subprocess (command + args +
-env). ``MCPManager.start_servers`` spawns them concurrently, calls
+env). ``MCPManager.start_servers`` starts them in a dedicated owner task, calls
 ``ClientSession.list_tools``, and wraps each remote tool as a
 ``langchain_core.tools.StructuredTool``. The resulting flat list is
 appended to the agent's tool surface alongside mimir's native tools.

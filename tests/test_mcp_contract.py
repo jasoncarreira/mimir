@@ -88,6 +88,51 @@ async def test_stdio_shutdown_from_different_task(caplog: pytest.LogCaptureFixtu
 
 
 @pytest.mark.asyncio
+async def test_stdio_multiple_servers_shutdown_from_different_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    manager = MCPManager()
+    pids: list[int] = []
+    try:
+        tools = await manager.start_servers([
+            MCPServerConfig(name=name, command=sys.executable, args=[str(SERVER)])
+            for name in ("first", "second")
+        ], fail_fast=True)
+        assert len(manager.connections) == 2
+        for tool in tools:
+            if tool.name.endswith("_server_pid"):
+                pids.append(int(await tool.coroutine()))
+        assert len(set(pids)) == 2
+    finally:
+        await asyncio.create_task(manager.shutdown())
+    await manager.shutdown()  # Repeated shutdown must be harmless.
+    assert not manager.connections
+    assert manager._owner_task is not None and manager._owner_task.done()
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    assert not [
+        record for record in caplog.records
+        if record.name == "mimir.mcp_client" and "shutdown failed" in record.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stdio_fail_fast_cleans_up_started_servers() -> None:
+    manager = MCPManager()
+    with pytest.raises(FileNotFoundError):
+        await manager.start_servers([
+            MCPServerConfig(name="first", command=sys.executable, args=[str(SERVER)]),
+            MCPServerConfig(name="missing", command="/nonexistent/mcp-contract-server", args=[]),
+        ], fail_fast=True)
+    assert not manager.connections
+    assert manager._owner_task is not None and manager._owner_task.done()
+    assert len(manager.startup_failures) == 1
+    assert manager.startup_failures[0]["server_name"] == "missing"
+    await asyncio.create_task(manager.shutdown())
+
+
+@pytest.mark.asyncio
 async def test_stdio_successful_text_call() -> None:
     async def check(_conn: MCPConnection, tools: dict[str, StructuredTool]) -> None:
         assert await tools["greeting"].coroutine(name="Ada") == "Hello, Ada!"
