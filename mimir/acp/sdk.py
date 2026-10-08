@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -13,8 +14,6 @@ from acp.agent.router import build_agent_router
 from acp.connection import Connection
 from acp.interfaces import Agent, Client
 from acp.meta import AGENT_METHODS, CLIENT_METHODS
-from acp.task import DefaultMessageDispatcher
-from acp.task.queue import InMemoryMessageQueue
 from acp.schema import (
     AcpMcpServer,
     AgentCapabilities,
@@ -795,9 +794,14 @@ class AcpPeer:
         return None
 
 
-class BoundedMessageQueue(InMemoryMessageQueue):
+class BoundedMessageQueue:
     def __init__(self, frame_bytes: Any = None) -> None:
-        super().__init__(maxsize=INPUT_QUEUE_MAX_ITEMS)
+        # Publishers fill at most INPUT_QUEUE_MAX_ITEMS; the extra physical slot
+        # belongs to the shutdown sentinel even when no consumer can make space.
+        self._queue: asyncio.Queue[Any | None] = asyncio.Queue(
+            maxsize=INPUT_QUEUE_MAX_ITEMS + 1
+        )
+        self._closed = False
         self._frame_bytes = frame_bytes
         self._pending_bytes = 0
         self._sizes: deque[int] = deque()
@@ -859,7 +863,19 @@ class BoundedMessageQueue(InMemoryMessageQueue):
             self._pending_bytes -= self._sizes.popleft()
             self._publish_slots.release()
             self._space_available.set()
-        super().task_done()
+        with suppress(ValueError):
+            self._queue.task_done()
+
+    async def join(self) -> None:
+        await self._queue.join()
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                self.task_done()
+                return
+            yield item
 
     def _message_bytes(self, task: Any) -> int:
         if self._frame_bytes is not None:
@@ -872,7 +888,7 @@ class BoundedMessageQueue(InMemoryMessageQueue):
         return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-class BoundedMessageDispatcher(DefaultMessageDispatcher):
+class BoundedMessageDispatcher:
     def __init__(
         self,
         queue: BoundedMessageQueue,
@@ -883,19 +899,38 @@ class BoundedMessageDispatcher(DefaultMessageDispatcher):
         *,
         max_active: int = MAX_ACTIVE_INBOUND_RUNNERS,
     ) -> None:
-        super().__init__(
-            queue=queue,
-            supervisor=supervisor,
-            store=store,
-            request_runner=request_runner,
-            notification_runner=notification_runner,
-        )
+        self._queue = queue
+        self._supervisor = supervisor
+        self._store = store
+        self._request_runner = request_runner
+        self._notification_runner = notification_runner
+        self._task: asyncio.Task[None] | None = None
         if max_active <= 0:
             raise ValueError("max_active must be positive")
         self._runner_slots = asyncio.BoundedSemaphore(max_active)
         self._runner_tasks: set[asyncio.Task[Any]] = set()
         self._authentication_fence: asyncio.Task[Any] | None = None
         self._transport_dead = False
+
+    def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("dispatcher already started")
+        self._task = self._supervisor.create(self._run(), name="mimir.acp.Dispatcher.loop")
+
+    async def _run(self) -> None:
+        try:
+            async for task in self._queue:
+                try:
+                    # Connection 0.12.0 produces enum-valued tasks. Only their
+                    # attributes are part of our boundary, not their SDK types.
+                    if task.kind.value == "request":
+                        await self._dispatch_request(task.message)
+                    else:
+                        await self._dispatch_notification(task.message)
+                finally:
+                    self._queue.task_done()
+        except asyncio.CancelledError:
+            return
 
     def mark_transport_dead(self) -> None:
         self._transport_dead = True
