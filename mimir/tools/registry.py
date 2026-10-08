@@ -104,6 +104,8 @@ SEND_MESSAGE_SKIPLIST_PHRASES: tuple[str, ...] = (
     "routed to skip",
 )
 SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS = 8
+# #1892: observed tail narration ran to ~200 words; real briefs were 363–721 words.
+SEND_MESSAGE_SKIPLIST_SUBSTANTIVE_MIN_WORDS = 200
 
 
 def _compile_skiplist_phrase_pattern(phrase: str) -> re.Pattern[str]:
@@ -201,26 +203,60 @@ async def dispatch_send_message_directives(
     return delivered_by_directive
 
 
-def _matched_send_message_skiplist_phrase(text: str) -> str | None:
+@dataclass(frozen=True)
+class _SkiplistMatch:
+    phrase: str
+    stripped_text: str | None = None  # None means reject, as before.
+
+
+def _strip_skiplist_tail(text: str, phrase_start: int) -> str:
+    # Remove the sentence containing the trailing phrase, retaining everything
+    # before the nearest line or sentence boundary.
+    last_newline = text.rfind("\n", 0, phrase_start) + 1
+    sentence_ends = list(re.finditer(r"[.!?](?=\s)", text[:phrase_start]))
+    last_sentence_end = sentence_ends[-1].end() if sentence_ends else 0
+    return text[:max(last_newline, last_sentence_end)].rstrip()
+
+
+def _matched_send_message_skiplist_phrase(text: str) -> _SkiplistMatch | None:
     stripped = text.strip()
     if not stripped:
         return None
 
     marker_match = _SEND_MESSAGE_SKIPLIST_LEADING_MARKER_PATTERN.match(stripped)
     if marker_match is not None:
-        return "[skipped]" if marker_match.group(1) else "[skip]"
+        return _SkiplistMatch("[skipped]" if marker_match.group(1) else "[skip]")
 
-    # Narration sends that should have been silent are short one-liners. A
-    # substantive escalation may mention a stop phrase in passing, so only block
-    # when the stop phrase dominates the message: either the entire message is
-    # short, or the phrase is at the tail of a short narration sentence.
+    # A substantive escalation may mention a stop phrase in passing. Reject
+    # short messages with a phrase anywhere and narration-sized trailing phrases.
     text_word_count = _word_count(stripped)
     for phrase, pattern in _SEND_MESSAGE_SKIPLIST_PATTERNS:
         for match in pattern.finditer(stripped):
             trailing = stripped[match.end() :].strip()
             phrase_is_tail = not trailing or not re.search(r"[A-Za-z0-9]", trailing)
-            if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS or phrase_is_tail:
-                return phrase
+            if text_word_count <= SEND_MESSAGE_SKIPLIST_SHORT_MAX_WORDS:
+                return _SkiplistMatch(phrase)
+            if phrase_is_tail:
+                if text_word_count <= SEND_MESSAGE_SKIPLIST_SUBSTANTIVE_MIN_WORDS:
+                    return _SkiplistMatch(phrase)
+                remaining = _strip_skiplist_tail(stripped, match.start())
+                # A long run of stop-phrase lines is still narration: remove
+                # each trailing stop phrase before testing for real content.
+                while remaining:
+                    tail_match = next(
+                        (
+                            m for _, p in _SEND_MESSAGE_SKIPLIST_PATTERNS
+                            for m in p.finditer(remaining)
+                            if not re.search(r"[A-Za-z0-9]", remaining[m.end() :])
+                        ),
+                        None,
+                    )
+                    if tail_match is None:
+                        break
+                    remaining = _strip_skiplist_tail(remaining, tail_match.start())
+                if not re.search(r"[A-Za-z0-9]", remaining):
+                    return _SkiplistMatch(phrase)
+                return _SkiplistMatch(phrase, remaining)
     return None
 
 
@@ -843,6 +879,8 @@ async def send_message(
     Requires an explicit deliverable bridge channel_id. Subject to a
     per-turn loop-detection circuit breaker — repeated near-duplicates
     first warn, then refuse.
+    Autonomous skip-list narration is rejected; substantive messages over 200
+    words with a trailing stop phrase are delivered after that tail is stripped.
 
     Args:
         text: The message body to send.
@@ -887,18 +925,18 @@ async def send_message(
     undelivered_decision = None
     ctx = get_current_turn()
     trigger = (getattr(ctx, "trigger", "") if ctx is not None else "").strip()
-    matched_skiplist_phrase = (
+    skiplist_match = (
         _matched_send_message_skiplist_phrase(text)
         if _send_message_skiplist_guard_armed(trigger)
         else None
     )
-    if matched_skiplist_phrase is not None:
+    if skiplist_match is not None and skiplist_match.stripped_text is None:
         try:
             await _log_event(
                 "send_message_blocked_skiplist",
                 channel_id=cid,
                 trigger=trigger,
-                matched_phrase=matched_skiplist_phrase,
+                matched_phrase=skiplist_match.phrase,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -907,6 +945,17 @@ async def send_message(
             "skip-bucket / no-action narration. The correct action is to end "
             "the turn with no message."
         )
+    if skiplist_match is not None:
+        stripped_text = skiplist_match.stripped_text
+        assert stripped_text is not None
+        await _log_event(
+            "send_message_skiplist_tail_stripped",
+            channel_id=cid,
+            trigger=trigger,
+            matched_phrase=skiplist_match.phrase,
+            removed_chars=len(text) - len(stripped_text),
+        )
+        text = stripped_text
     if ctx is not None:
         detector = getattr(ctx, "loop_detector", None)
 
