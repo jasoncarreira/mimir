@@ -4,7 +4,7 @@ import ctypes
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import errno
 import json
 import os
@@ -182,6 +182,142 @@ async def test_external_sigterm_still_fails_and_rearms(tmp_path, monkeypatch):
     assert any("WORKLINK_EVIDENCE issue=700 attempt=1 status=failed" in comment for comment in comments)
     assert labels == {"worklink:ready"}
     assert load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]["failure_kind"] == "operator_required"
+
+
+@pytest.mark.parametrize("known_reset", [True, False])
+@pytest.mark.asyncio
+async def test_opencode_quota_hold_resumes_without_charging_and_escalates(tmp_path, monkeypatch, known_reset):
+    from mimir.worklink import orchestrator
+    from mimir.worklink.backends.base import RawResult
+    from mimir.worklink.checkout import CheckoutLease
+    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX
+    from mimir.worklink.compute import ComputeResult
+    from mimir.worklink.dispatch_failures import (
+        autonomous_dispatch_block_reason, dispatch_failure_state_dir,
+        load_failure_state, pending_failure_alerts,
+    )
+    from mimir.worklink.evidence import EvidenceValidation, WorklinkEvidence
+
+    reset = datetime.now(UTC) + timedelta(hours=5)
+    if known_reset:
+        pause_file = tmp_path / ".mimir" / "quota_pause.json"
+        pause_file.parent.mkdir()
+        pause_file.write_text(json.dumps({"provider": "codex-plus", "reset_at": reset.isoformat()}))
+    labels = {"worklink:in-progress"}
+    comments = []
+    events = []
+
+    def runner(args):
+        action = list(args[1:])
+        if action[:2] == ["issue", "unlabel"]:
+            labels.discard(action[-1])
+        elif action[:2] == ["issue", "label"]:
+            labels.add(action[-1])
+        elif action[:2] == ["issue", "comment"]:
+            comments.append(action[-1])
+        elif action[:2] != ["locks", "release"]:
+            raise AssertionError(action)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    secret = "sk-secret-provider-token"
+    async def interpret(order, result):
+        return RawResult(1, None, "quota_exhausted", f"Error: The usage limit has been reached {secret}")
+
+    async def observe_evidence(**kwargs):
+        evidence = WorklinkEvidence(
+            issue=700, attempt=kwargs["attempt"], backend="opencode", branch="issue/700",
+            checkout=str(tmp_path), started_at=datetime.now(UTC).isoformat(),
+            finished_at=datetime.now(UTC).isoformat(), files_changed=[], diff_stat="",
+            commands=[], tests=None, pr_url=None, status="failed",
+            failure_reason="quota exhausted",
+        )
+        return EvidenceValidation("failed", False, ("backend_failed",), evidence)
+
+    monkeypatch.setattr(orchestrator, "observe_evidence", observe_evidence)
+    monkeypatch.setattr(orchestrator, "_with_outside_checkout_detection", lambda validation, **kwargs: validation)
+    monkeypatch.setattr(orchestrator, "_cleanup_checkout_after_transition", lambda *args, **kwargs: None)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kwargs: events.append((name, kwargs)))
+    claims = ChainlinkClaims(agent_id="agent", home_path=tmp_path, runner=runner, max_attempts=3)
+    state_dir = dispatch_failure_state_dir(tmp_path)
+
+    async def finish(attempt):
+        claim = ClaimRecord(700, attempt, "agent", datetime.now(UTC), budget_attempt=claims.attempts_used(comments) + 1)
+        comments.append(claim.to_comment())
+        labels.discard("worklink:ready")
+        labels.add("worklink:in-progress")
+        return await orchestrator.WorklinkRunner(home=tmp_path, repo=tmp_path)._finalize(
+            issue=orchestrator.IssueContext(700, "title", "body", set()),
+            claims=claims, claim_record=claim, attempt=attempt,
+            config=SimpleNamespace(defaults=SimpleNamespace(gate_rerun_max_failures=0)),
+            backend=SimpleNamespace(name="opencode", interpret=interpret), compute=None,
+            compute_result=ComputeResult(1, "", ""), order=None,
+            lease=CheckoutLease(700, attempt, tmp_path, tmp_path, "issue/700", "main"),
+            spec=SimpleNamespace(backend_config={}), started=datetime.now(UTC), test_cmd=None,
+            root_dirty_before=(), runner=runner,
+            terminal_release=orchestrator._TerminalClaimRelease(claims, tmp_path, 700, attempt),
+            autonomous=True,
+        )
+
+    for attempt in range(1, 6):
+        started_hold = datetime.now(UTC)
+        outcome = await finish(attempt)
+        entry = load_failure_state(state_dir)["issues"]["700"]
+        assert entry["quota_holds"] == attempt
+        if attempt <= 4:
+            assert outcome.status == "quota_hold"
+            assert entry["failure_kind"] == "quota_exhausted"
+            retry_at = datetime.fromisoformat(entry["retry_after"])
+            if known_reset:
+                assert retry_at == reset
+            else:
+                assert started_hold + timedelta(hours=1) <= retry_at <= datetime.now(UTC) + timedelta(hours=1)
+            assert entry["attempt_consumed"] is False
+            assert claims.attempts_used(comments) == 0
+            assert labels == {"worklink:ready"}
+            assert autonomous_dispatch_block_reason(state_dir, 700, now=retry_at - timedelta(seconds=1))
+            assert autonomous_dispatch_block_reason(state_dir, 700, now=retry_at) is None
+            assert pending_failure_alerts(state_dir)[1] == []
+            assert len([c for c in comments if c.startswith(QUOTA_HOLD_PREFIX)]) == attempt
+            assert secret not in comments[-1]
+        else:
+            assert outcome.status == "failed"
+            assert entry["failure_kind"] == "operator_required"
+            assert entry["attempt_consumed"] is True
+            assert claims.attempts_used(comments) == 1
+            assert autonomous_dispatch_block_reason(state_dir, 700, now=reset + timedelta(days=1))
+            assert len([c for c in comments if c.startswith(QUOTA_HOLD_PREFIX)]) == 4
+            assert len(pending_failure_alerts(state_dir)[1]) == 1
+    assert len([name for name, _ in events if name == "worklink_quota_hold"]) == 4
+
+
+def test_worklink_quota_reset_fallback_and_absurd_reset(tmp_path):
+    from mimir.worklink.orchestrator import _worklink_quota_reset
+
+    before = datetime.now(UTC)
+    reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
+    assert source == "one-hour fallback"
+    assert before + timedelta(hours=1) <= reset <= datetime.now(UTC) + timedelta(hours=1)
+    pause_file = tmp_path / ".mimir" / "quota_pause.json"
+    pause_file.parent.mkdir()
+    pause_file.write_text(json.dumps({"provider": "codex-plus", "reset_at": (before + timedelta(days=9)).isoformat()}))
+    reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
+    assert source == "one-hour fallback"
+    assert reset <= datetime.now(UTC) + timedelta(hours=1)
+    pause_file.write_text(json.dumps({"provider": "anthropic", "reset_at": (before + timedelta(hours=4)).isoformat()}))
+    reset, source = _worklink_quota_reset(tmp_path, "Error: The usage limit has been reached")
+    assert source == "one-hour fallback"
+    assert reset <= datetime.now(UTC) + timedelta(hours=1)
+
+
+def test_quota_hold_marker_only_forgives_matching_claim():
+    from mimir.worklink.claims import ChainlinkClaims, ClaimRecord, QUOTA_HOLD_PREFIX, SHUTDOWN_ABORT_PREFIX, ShutdownAbortRecord
+
+    claimed = datetime.now(UTC)
+    claim = ClaimRecord(700, 1, "agent", claimed)
+    wrong_issue = ShutdownAbortRecord(701, 1, "agent", claimed, claimed)
+    marker = QUOTA_HOLD_PREFIX + wrong_issue.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+    claims = ChainlinkClaims(agent_id="agent")
+    assert claims.attempts_used([claim.to_comment(), marker]) == 1
 
 
 def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:

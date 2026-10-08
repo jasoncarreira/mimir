@@ -617,6 +617,28 @@ _PROVIDER_AUTH_EVIDENCE = re.compile(
     r"|^token refresh failed[: ]+40[13]\b",
     re.IGNORECASE,
 )
+_PROVIDER_QUOTA_EVIDENCE = re.compile(
+    r"\bthe usage limit has been reached\b|\b(?:http(?:/\d(?:\.\d)?)?\s+)?429\b"
+    r"|\brate limit (?:exceeded|reached)\b",
+    re.IGNORECASE,
+)
+_ERROR_RECORD = re.compile(r"^(?:Error:|(?:provider|openai|codex)[: ]+|HTTP(?:/\d(?:\.\d)?)?\s+429\b)", re.IGNORECASE)
+_STDERR_QUOTA_RECORD = re.compile(
+    r"^(?:the usage limit has been reached|rate limit (?:exceeded|reached))\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_quota_line(stdout: str, stderr: str) -> str | None:
+    for stream, is_stderr in ((stderr, True), (stdout, False)):
+        for line in stream.splitlines():
+            clean = _ANSI_CSI.sub("", line).strip()
+            if (
+                (_ERROR_RECORD.search(clean) or (is_stderr and _STDERR_QUOTA_RECORD.search(clean)))
+                and _PROVIDER_QUOTA_EVIDENCE.search(clean)
+            ):
+                return clean
+    return None
 
 
 def _provider_auth_line(stderr: str) -> str | None:
@@ -632,13 +654,12 @@ def _provider_auth_line(stderr: str) -> str | None:
 
 
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
-    combined = f"{stdout}\n{stderr}".lower()
     if exit_code == 0:
         return "success"
-    if "429" in combined or "quota" in combined or "rate limit" in combined:
-        return "quota_exhausted"
     if _provider_auth_line(stderr) is not None:
         return "auth_error"
+    if _provider_quota_line(stdout, stderr) is not None:
+        return "quota_exhausted"
     return "failed"
 
 
@@ -654,6 +675,8 @@ def _error_from_status(
     message = detail.splitlines()[-1] if detail else status
     if status == "auth_error":
         message = _provider_auth_line(stderr) or message
+    if status == "quota_exhausted":
+        message = _provider_quota_line(stdout, stderr) or message
     if status == "timeout":
         return f"opencode execution timed out: {message}"
     if status == "auth_error":

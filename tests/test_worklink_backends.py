@@ -1345,12 +1345,51 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     assert auth.backend_status == "auth_error"
     assert "provider 'unknown'" in (auth.error or "")
 
-    quota = await backend.interpret(order, ComputeResult(1, "rate limit exceeded", ""))
+    quota = await backend.interpret(order, ComputeResult(1, "Error: Rate limit exceeded", ""))
     assert quota.backend_status == "quota_exhausted"
 
     plain = await backend.interpret(order, ComputeResult(3, "", "boom"))
     assert plain.backend_status == "failed"
     assert plain.error == "boom"
+
+
+@pytest.mark.parametrize("line", [
+    "\x1b[91m\x1b[1mError: \x1b[0mThe usage limit has been reached",
+    "Error: The usage limit has been reached",
+    "Error: HTTP 429 Too Many Requests",
+    "Error: Rate limit reached",
+])
+def test_opencode_provider_quota_error_records(line: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, "") == "quota_exhausted"
+
+
+def test_opencode_stderr_unprefixed_rate_limit_error() -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, "→ Read mimir/budget.py", "Rate limit reached") == "quota_exhausted"
+
+
+@pytest.mark.parametrize("line", [
+    "→ Read mimir/rate_limits.py", "→ Read mimir/budget.py",
+    "→ Grep quota mimir/quota_pause.py",
+    "→ Error: The usage limit has been reached",
+    "| Error: HTTP 429",
+])
+def test_opencode_quoted_quota_is_not_provider_error(line: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, line, line) == "failed"
+
+
+def test_opencode_auth_error_wins_over_echoed_quota_and_real_quota() -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(
+        1, "→ Read mimir/rate_limits.py\nError: Rate limit reached",
+        "\x1b[91mError: \x1b[0mToken refresh failed: 401",
+    ) == "auth_error"
 
 
 @pytest.mark.parametrize("stderr", [
