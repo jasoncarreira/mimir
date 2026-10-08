@@ -603,6 +603,9 @@ def _remove_transcript_outputs(path: Path) -> None:
             output.unlink(missing_ok=True)
 
 
+# OpenCode styles both the error prefix and tool-output markers. Normalize
+# before classification and quoting so ANSI codes cannot hide either one.
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _PROVIDER_AUTH_EVIDENCE = re.compile(
     r"^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)?"
     r"(?:https?://\S*oauth/token\s+)?(?:http(?:/\d(?:\.\d)?)?\s+|status(?:\s+code)?[:= ]+)?40[13]\b"
@@ -610,15 +613,20 @@ _PROVIDER_AUTH_EVIDENCE = re.compile(
     r".*(?:invalid or expired token|authentication failed|unauthorized token|"
     r"(?:refresh|oauth/token).*?(?:refused|failed|40[13]))\b"
     r"|^(?:(?:error|provider|openai|codex|post|request)[: ]+)?"
-    r"(?:https?://\S*)?oauth/token\b.*\b40[13]\b",
+    r"(?:https?://\S*)?oauth/token\b.*\b40[13]\b"
+    r"|^token refresh failed[: ]+40[13]\b",
     re.IGNORECASE,
 )
 
 
 def _provider_auth_line(stderr: str) -> str | None:
     for line in stderr.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith(("→", ">", "|")) and _PROVIDER_AUTH_EVIDENCE.search(stripped):
+        stripped = _ANSI_CSI.sub("", line).strip()
+        if (
+            stripped
+            and not stripped.startswith(("→", ">", "|"))
+            and _PROVIDER_AUTH_EVIDENCE.search(stripped)
+        ):
             return stripped
     return None
 
