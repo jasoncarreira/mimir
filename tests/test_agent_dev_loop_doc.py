@@ -136,3 +136,102 @@ def test_watcher_reports_a_pr_that_arrives_before_the_ack(tmp_path: Path) -> Non
     assert watch() == f"2={sha_b}"
     state = fake_home / ".cache" / "pr-watch" / "acme_widget.acked"
     assert state.read_text().split() == [f"1={sha_a}"]
+
+
+# --- Docker bootstrap: the doc must match what `mimir scaffold-docker` generates ---
+
+from mimir import scaffold_docker  # noqa: E402
+
+
+def _bash_block_after(marker: str) -> str:
+    text = _doc()
+    match = re.search(r"```bash\n(.*?)```", text[text.index(marker):], re.S)
+    assert match, f"no bash block after {marker!r}"
+    return match.group(1)
+
+
+def _assigned_keys(block: str) -> set[str]:
+    return set(re.findall(r"^\s*([A-Z][A-Z0-9_]*)=", block, re.M))
+
+
+def test_runtime_settings_go_in_compose_env_and_the_coding_toggle_in_dotenv() -> None:
+    runtime = _assigned_keys(_bash_block_after("**`compose.env` is the container's runtime environment.**"))
+    toggle = _assigned_keys(_bash_block_after("**`.env` (in the agent home) holds the coding toggle.**"))
+    assert runtime == {
+        "GITHUB_TOKEN",
+        "MIMIR_GITHUB_SELF_LOGIN",
+        "GH_USER_NAME",
+        "GH_USER_EMAIL",
+        "MIMIR_PR_CHECKOUT_LEASE_ROOT",
+    }
+    assert toggle == {"MIMIR_CODING_ENABLED"}
+
+    # Why the split is right, per the generated files: the container gets compose.env as
+    # its runtime env, the coding toggle is Compose-interpolated (from the project .env),
+    # and start.sh consumes the identity + token before mimir reads <home>/.env.
+    compose = scaffold_docker.render_compose_yml(service_name="my-agent", web_port=8090, mode="pypi")
+    assert "env_file:\n      - compose.env" in compose
+    assert 'MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"' in compose
+    start = scaffold_docker.render_start_sh(mode="pypi")
+    for key in ("GH_USER_NAME", "GH_USER_EMAIL", "GITHUB_TOKEN"):
+        assert key in start
+    assert start.index("GITHUB_TOKEN") < start.index("mimir setup")
+
+
+def test_pypi_image_needs_the_documented_uv_fragment() -> None:
+    base = scaffold_docker.render_dockerfile([], mode="pypi")
+    assert "astral-sh/uv" not in base and "pip install uv" not in base
+
+    fragment = _bash_block_after("Add your test runner to the image")
+    copy_line = re.search(r"^COPY --from=ghcr\.io/astral-sh/uv:\S+ /uv /uvx /usr/local/bin/$", fragment, re.M)
+    assert copy_line, "the doc's uv fragment must copy uv onto the runtime PATH"
+    rendered = scaffold_docker.render_dockerfile(
+        [scaffold_docker.Fragment(skill_name="uv-runtime", content=copy_line.group(0))], mode="pypi"
+    )
+    # Fragments run as root, before the runtime user exists; /usr/local/bin is on its PATH.
+    assert rendered.index(copy_line.group(0)) < rendered.index("useradd")
+
+
+def test_known_compose_issue_note_tracks_the_scaffold() -> None:
+    raw = scaffold_docker.render_compose_yml(service_name="my-agent", web_port=8090, mode="pypi")
+    doc = _doc()
+    try:
+        yaml.safe_load(raw)
+    except yaml.YAMLError:
+        assert "Known issue" in doc, "scaffold compose.yml is unparseable but the runbook doesn't say so"
+        old, new = re.search(r's\.replace\(("[^"\n]*(?:\n)?[^"\n]*"), ("[^"\n]*")\)', doc).groups()
+        import ast
+
+        fixed = raw.replace(ast.literal_eval(old), ast.literal_eval(new))
+        assert yaml.safe_load(fixed)["services"]["my-agent"]["env_file"] == ["compose.env"]
+    else:
+        assert "Known issue" not in doc, "scaffold compose.yml parses now; drop the runbook's workaround"
+
+
+def test_lease_root_is_checked_before_first_boot_with_a_one_off_container() -> None:
+    doc = _doc()
+    precheck = doc.index("docker compose run --rm --no-deps --entrypoint sh my-agent")
+    assert precheck < doc.index("docker compose up -d\n")
+    assert "docker compose exec my-agent sh -c 'id'" not in doc
+
+
+@pytest.mark.skipif(shutil.which("sed") is None, reason="needs sed")
+def test_saga_paths_are_rewritten_to_the_container_home(tmp_path: Path) -> None:
+    from mimir.commands.setup import _default_saga_toml
+
+    home = tmp_path / "agents" / "my-agent"
+    generated = _default_saga_toml(home)
+    # `mimir setup` on the host writes absolute host paths, which don't exist in the container.
+    assert f'db_path = "{home}/.mimir/saga.db"' in generated
+
+    match = re.search(r"^sed -i\.bak -E '([^']+)' ~/agents/my-agent/saga\.toml$", _doc(), re.M)
+    assert match, "the runbook must run the saga.toml path rewrite as a command (column 0)"
+    expression = match.group(1)
+    toml = tmp_path / "saga.toml"
+    toml.write_text(generated)
+    rewritten = subprocess.run(
+        ["sed", "-E", expression, str(toml)], capture_output=True, text=True, check=True
+    ).stdout
+    assert 'db_path = "/mimir-home/.mimir/saga.db"' in rewritten
+    assert 'metrics_db_path = "/mimir-home/.mimir/saga_metrics.db"' in rewritten
+    assert str(home) not in rewritten
