@@ -46,7 +46,11 @@ from .compute import (
     LocalSubprocessComputeBackend,
     with_worker_environment,
 )
-from .claims import ChainlinkClaims, ClaimRecord, WORKLINK_EPIC_LABEL
+from .claims import (
+    ChainlinkClaims, ClaimRecord, ShutdownAbortRecord, OPERATOR_STOP_PREFIX,
+    SHUTDOWN_ABORT_PREFIX, WORKLINK_EPIC_LABEL,
+)
+from .control import operator_stop_requested
 from .autonomy import chainlink_bin
 from .evidence import (
     _paths_from_status,
@@ -1500,6 +1504,41 @@ class WorklinkRunner:
             autonomous
         )
         selected_name = backend.name
+        if compute_result.exit_code != 0 and operator_stop_requested(self.home, issue.issue_id, attempt):
+            reason = "stopped by operator"
+            evidence = WorklinkEvidence(
+                issue=issue.issue_id, attempt=attempt, backend=selected_name,
+                branch=lease.branch, checkout=str(lease.path),
+                started_at=started.astimezone(UTC).isoformat(),
+                finished_at=datetime.now(UTC).isoformat(), files_changed=[],
+                diff_stat="", commands=[], tests=None, pr_url=None,
+                status="stopped", base_ref=lease.local_base or lease.base_ref,
+                diff_observed=False, failure_reason=reason,
+            )
+            evidence_path = _write_evidence(self.home, evidence)
+            stop = ShutdownAbortRecord(
+                issue_id=issue.issue_id, attempt=attempt,
+                agent_id=claim_record.agent_id, claimed_at=claim_record.claimed_at,
+                aborted_at=datetime.now(UTC),
+            )
+            claims._run(
+                "issue", "comment", str(issue.issue_id),
+                OPERATOR_STOP_PREFIX + stop.to_comment().removeprefix(SHUTDOWN_ABORT_PREFIX)
+                + f"\nWORKLINK_EVIDENCE issue={issue.issue_id} attempt={attempt} status=stopped"
+                + f" evidence={evidence_path} reason={reason}",
+            )
+            claims.transition_issue(
+                issue.issue_id, status="stopped", review_ready=False, attempt=attempt,
+            )
+            terminal_release.label_transition_applied = True
+            terminal_release.retain_for_recovery = False
+            terminal_release()
+            _log_event("worklink_transition", issue_id=issue.issue_id, attempt=attempt,
+                       status="stopped", reason=reason, review_ready=False, pr_url=None)
+            return WorklinkRunResult(
+                issue.issue_id, attempt, "stopped", reason=reason,
+                evidence_path=evidence_path, checkout=lease.path, branch=lease.branch,
+            )
         raw = await backend.interpret(order, compute_result)
         executor_tests: TestResult | None = None
         if executor_report_dir is not None:
@@ -4476,6 +4515,8 @@ def _record_run_failure(
 ) -> dict[str, Any] | None:
     from .dispatch_failures import dispatch_failure_state_dir, record_failure, terminal_error
 
+    if operator_stop_requested(home, issue_id, attempt):
+        return None
     safe_error = terminal_error(error)
     _log_event(
         "worklink_run_failed",

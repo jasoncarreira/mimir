@@ -1353,6 +1353,47 @@ async def test_opencode_backend_maps_blocked_auth_and_quota(tmp_path: Path) -> N
     assert plain.error == "boom"
 
 
+@pytest.mark.parametrize("stderr", [
+    "→ Read mimir/access_control.py [offset=7433, limit=13]\n",
+    "auth login credential = source_text\n→ Read mimir/access_control.py [offset=7433, limit=13]\n",
+    "→ HTTP 401 in a source file\n→ Read mimir/access_control.py\n",
+    "\x1b[0m→ \x1b[0mRead mimir/access_control.py\x1b[90m [offset=7433, limit=13]\n",
+    "\x1b[0m→ \x1b[0mHTTP 401 in a source file\x1b[90m\n",
+    "\x1b[0m→ \x1b[0mError: Token refresh failed: 401\n",
+    "\x1b[90m> \x1b[0mError: Token refresh failed: 401\n",
+    "\x1b[90m| \x1b[0mHTTP 401 Unauthorized\n",
+])
+def test_opencode_builder_output_is_not_provider_auth(stderr: str) -> None:
+    from mimir.worklink.backends.opencode import _status_from_output
+
+    assert _status_from_output(1, "", stderr) == "failed"
+
+
+@pytest.mark.parametrize("line, evidence", [
+    ("HTTP 401 Unauthorized", "HTTP 401 Unauthorized"),
+    ("HTTP 403 Forbidden", "HTTP 403 Forbidden"),
+    ("OpenAI error: invalid or expired token", "OpenAI error: invalid or expired token"),
+    ("Error: refresh refused: oauth/token 401", "Error: refresh refused: oauth/token 401"),
+    ("provider: unauthorized token", "provider: unauthorized token"),
+    ("Token refresh failed: 401", "Token refresh failed: 401"),
+    ("Token refresh failed: 403", "Token refresh failed: 403"),
+    (
+        "\x1b[91m\x1b[1mError: \x1b[0mToken refresh failed: 401",
+        "Error: Token refresh failed: 401",
+    ),
+    ("\x1b[91mToken refresh failed: 401\x1b[0m", "Token refresh failed: 401"),
+])
+def test_opencode_provider_auth_quotes_evidence_line(line: str, evidence: str) -> None:
+    from mimir.worklink.backends.opencode import _error_from_status, _status_from_output
+
+    stderr = f"{line}\n→ Read mimir/access_control.py [offset=7433, limit=13]\n"
+    status = _status_from_output(1, "", stderr)
+    assert status == "auth_error"
+    message = _error_from_status(status, "", stderr, ["opencode", "-m", "openai/gpt"])
+    assert message == f"OpenCode provider 'openai' authentication failed: {evidence}"
+    assert "\x1b" not in message
+
+
 @pytest.mark.asyncio
 async def test_opencode_backend_transcript_filename_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -6,6 +6,7 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
 - ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
   internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
 - **Operator action (#1893):** After untrusted ingest, schedule writes and edits to

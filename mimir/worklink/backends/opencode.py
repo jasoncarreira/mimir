@@ -603,14 +603,41 @@ def _remove_transcript_outputs(path: Path) -> None:
             output.unlink(missing_ok=True)
 
 
+# OpenCode styles both the error prefix and tool-output markers. Normalize
+# before classification and quoting so ANSI codes cannot hide either one.
+_ANSI_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_PROVIDER_AUTH_EVIDENCE = re.compile(
+    r"^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)?"
+    r"(?:https?://\S*oauth/token\s+)?(?:http(?:/\d(?:\.\d)?)?\s+|status(?:\s+code)?[:= ]+)?40[13]\b"
+    r"|^(?:error[: ]+|provider(?:\s+\w+)?[: ]+|openai[: ]+|codex[: ]+)"
+    r".*(?:invalid or expired token|authentication failed|unauthorized token|"
+    r"(?:refresh|oauth/token).*?(?:refused|failed|40[13]))\b"
+    r"|^(?:(?:error|provider|openai|codex|post|request)[: ]+)?"
+    r"(?:https?://\S*)?oauth/token\b.*\b40[13]\b"
+    r"|^token refresh failed[: ]+40[13]\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_auth_line(stderr: str) -> str | None:
+    for line in stderr.splitlines():
+        stripped = _ANSI_CSI.sub("", line).strip()
+        if (
+            stripped
+            and not stripped.startswith(("→", ">", "|"))
+            and _PROVIDER_AUTH_EVIDENCE.search(stripped)
+        ):
+            return stripped
+    return None
+
+
 def _status_from_output(exit_code: int, stdout: str, stderr: str) -> str:
     combined = f"{stdout}\n{stderr}".lower()
     if exit_code == 0:
         return "success"
     if "429" in combined or "quota" in combined or "rate limit" in combined:
         return "quota_exhausted"
-    auth_text = stderr.lower()
-    if re.search(r"\b(auth|authentication|oauth|login|credential|api key|unauthorized)\b", auth_text):
+    if _provider_auth_line(stderr) is not None:
         return "auth_error"
     return "failed"
 
@@ -625,6 +652,8 @@ def _error_from_status(
         return None
     detail = stderr.strip() or stdout.strip()
     message = detail.splitlines()[-1] if detail else status
+    if status == "auth_error":
+        message = _provider_auth_line(stderr) or message
     if status == "timeout":
         return f"opencode execution timed out: {message}"
     if status == "auth_error":
