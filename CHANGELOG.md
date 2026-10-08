@@ -20,7 +20,8 @@ All notable changes will land here. Format loosely follows
   `-l=worklink:ready` labels are normalized like Clap. On tainted shadow-mode
   turns, shell targets mentioning `chainlink` or `worklink:` that do not parse
   as one admitted invocation are refused, including wrappers, compound commands,
-  redirections and unknown flag forms, on service and generic shell paths.
+  redirections and unknown flag forms, on service and generic shell paths for
+  both `shell_exec` and `bash_async`.
   This is an argv/text-level veto, not generic-shell confinement: indirect or
   obfuscated execution and direct writes to the tracker SQLite database are not
   prevented by this check. Enable IFC enforcement for the broader shell gate.
