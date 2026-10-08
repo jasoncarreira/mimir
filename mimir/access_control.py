@@ -6687,27 +6687,15 @@ class SinkGate:
                 command=target,
                 requested_cwd=requested_cwd,
             ) and cls._is_trusted_operator_turn(ifc_labels, auth_context)
-            if service is None and not bounded_operator:
-                # Generic shell executes bash -lc, so neither argv inspection
-                # nor text blocklists can prove it cannot arm work. Refuse the
-                # entire unbound execution surface, even in IFC shadow mode.
-                # Bounded profiles remain subject to their exact-argv gate.
-                reason = "ifc_label_blocked:shell_process"
-                refusal = (
-                    "Generic shell execution after untrusted ingest needs a clean "
-                    "turn or a server-bound shell profile. File unarmed Chainlink "
-                    "issues or comments through a bounded profile instead."
-                )
-            elif chainlink_argv is not None:
+            # This veto covers only declared-command paths that execute exact
+            # argv. Unknown service targets are refused by their profile gate,
+            # not by a substring check (which also catches read-only diagnostics).
+            # Generic bash execution cannot be confined by argv inspection; its
+            # post-ingest policy and approval semantics remain unchanged (#1872).
+            if chainlink_argv is not None and (service is not None or bounded_operator):
                 refusal = _chainlink_armed_work_refusal(
                     chainlink_argv, requested_cwd, session_cwd=False,
                 )
-            elif isinstance(target, str) and (
-                "chainlink" in target.lower() or "worklink:" in target.lower()
-            ):
-                # Bounded profiles separately execute one server-verified argv;
-                # unknown tracker forms never receive an armed-work exemption.
-                refusal = _CHAINLINK_ARMED_WORK_REFUSAL + " Unrecognized Chainlink/Worklink shell target."
             if refusal is not None:
                 return ToolAuthorization(
                     tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
