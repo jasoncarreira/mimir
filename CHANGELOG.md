@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
+  active ingest even in shadow mode, for service and operator turns alike. Ask
+  the operator to arm the leaf for server-side ready-queue dispatch or run the
+  Worklink CLI from a clean operator context.
+
 - **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
   `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
   bounded argv with scrubbed environment and value-free audit events; job grants

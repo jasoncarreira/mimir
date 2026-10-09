@@ -2136,6 +2136,32 @@ def _run_poller(tmp: Path, env_extra: dict[str, str]) -> list[dict]:
     return events
 
 
+def test_ready_queue_dispatch_bypasses_agent_tool_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.access_control import ToolRegistry
+
+    poller = _load_poller_module()
+    launched: list[dict] = []
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("server-side dispatch routed through agent tool authorization")
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", forbidden)
+    monkeypatch.setattr(poller, "launch_detached_worklink", lambda **kwargs: launched.append(kwargs))
+    monkeypatch.setattr(poller, "_emit", lambda record: None)
+
+    assert poller._dispatch(
+        item=poller.DispatchItem(1896, "leaf"),
+        home=tmp_path, repo=str(tmp_path), state_dir=tmp_path,
+        run_bin=["mimir"], active=0, leaf_cap=2, factory_cap=1,
+    ) is True
+    assert len(launched) == 1
+    assert launched[0]["command"] == "run"
+    assert launched[0]["issue_id"] == 1896
+    assert launched[0]["run_bin"] == ["mimir"]
+
+
 def test_ready_dispatch_spawn_failure_records_intended_log_without_consuming_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
