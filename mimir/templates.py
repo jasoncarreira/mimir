@@ -23,6 +23,11 @@ turns from this session — the full transcripts are NOT embedded here
 line carries cost, tool-call count, output preview, and atom IDs cited
 so you can score atoms and write memory without re-reading anything.
 
+Available tools for this session-boundary turn (from its capability set):
+{available_tools}
+File reads, directory listings, memory search, todo tools, and commitment
+tools are not available in this turn.
+
 If you do need the full content of a specific turn (its tool sequence,
 reasoning, or full output) for memory capture, call:
 
@@ -93,14 +98,14 @@ laundering guardrails:
 
 - Do not coin or cite formal rule / pattern / heuristic names as if
   they are durable doctrine unless the name appears in a durable source
-  you verified this turn (`memory/core/`, `memory/issues/`, `state/wiki/`,
-  Chainlink, or a PR / issue comment). If you did not verify it, describe
-  the behavior plainly instead of naming it.
+  you can verify with `memory_get` or `mimir_get_turn` using an atom or turn
+  id already present in this session context. Otherwise describe the behavior
+  plainly, or tag a claim needing a file read `[verify before quoting]`.
 - For artifact-status claims in `summary`, `unfinished`, or `closed_since`
-  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify the
-  canonical source in this turn when the status matters. If you cannot
-  verify cheaply, mark the claim with `[verify before quoting]` rather
-  than presenting it as known-live state.
+  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify only via
+  `memory_get` or `mimir_get_turn` against ids already in the session context.
+  If the claim would require reading a file or another canonical source,
+  mark it `[verify before quoting]` instead of presenting it as known-live state.
 - `closed_since` is only for refs you confirmed resolved during this
   session; do not use it to tidy old summaries based on memory alone.
 
@@ -167,6 +172,11 @@ this is a leaner bookkeeping turn focused on memory capture and the
 session boundary record. Each turn line below carries cost,
 tool-call count, and output preview.
 
+Available tools for this session-boundary turn (from its capability set):
+{available_tools}
+File reads, directory listings, memory search, todo tools, and commitment
+tools are not available in this turn.
+
 If you do need the full content of a specific turn (its tool sequence,
 reasoning, or full output) for memory capture, call:
 
@@ -219,14 +229,14 @@ laundering guardrails:
 
 - Do not coin or cite formal rule / pattern / heuristic names as if
   they are durable doctrine unless the name appears in a durable source
-  you verified this turn (`memory/core/`, `memory/issues/`, `state/wiki/`,
-  Chainlink, or a PR / issue comment). If you did not verify it, describe
-  the behavior plainly instead of naming it.
+  you can verify with `memory_get` or `mimir_get_turn` using an atom or turn
+  id already present in this session context. Otherwise describe the behavior
+  plainly, or tag a claim needing a file read `[verify before quoting]`.
 - For artifact-status claims in `summary`, `unfinished`, or `closed_since`
-  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify the
-  canonical source in this turn when the status matters. If you cannot
-  verify cheaply, mark the claim with `[verify before quoting]` rather
-  than presenting it as known-live state.
+  — PRs, Chainlink IDs, branches, files, jobs, proposals — verify only via
+  `memory_get` or `mimir_get_turn` against ids already in the session context.
+  If the claim would require reading a file or another canonical source,
+  mark it `[verify before quoting]` instead of presenting it as known-live state.
 - `closed_since` is only for refs you confirmed resolved during this
   session; do not use it to tidy old summaries based on memory alone.
 
@@ -422,6 +432,11 @@ def render_saga_session_end(
     rendering passes only the placeholders the active template actually
     uses, so an operator's full-template override still works after
     this change."""
+    from .access_control import TRIGGER_AUTHORITY_PROFILES
+
+    available_tools = "\n".join(
+        f"- `{tool}`" for tool in sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])
+    )
     if _session_has_atoms(turns_window):
         template = load_template(
             "saga_session_end", SAGA_SESSION_END_DEFAULT, prompts_dir,
@@ -431,6 +446,7 @@ def render_saga_session_end(
             channel_id=channel_id,
             saga_session_id=saga_session_id,
             idle_minutes=idle_minutes,
+            available_tools=available_tools,
             turn_summary_block=_turn_summary_lines(turns_window),
             atom_feedback_block=_atom_feedback_lines(turns_window),
         )
@@ -442,6 +458,7 @@ def render_saga_session_end(
         channel_id=channel_id,
         saga_session_id=saga_session_id,
         idle_minutes=idle_minutes,
+        available_tools=available_tools,
         turn_summary_block=_turn_summary_lines(turns_window),
     )
 

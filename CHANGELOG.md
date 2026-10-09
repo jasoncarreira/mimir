@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **SAGA (#1908):** Session-end prompts list tools from the session-boundary
+  capability set and limit verification to known atom and turn IDs; claims
+  needing file reads are tagged for later verification.
+
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
   the operator to arm the leaf for server-side ready-queue dispatch or run the
