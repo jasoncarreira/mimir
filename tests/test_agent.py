@@ -2186,7 +2186,113 @@ async def test_turn_integrity_sources_are_bounded_and_keep_taint_cause(
     assert record.integrity == "untrusted"
     assert len(record.integrity_sources) == 32
     assert record.integrity_sources_omitted == 11
-    assert record.integrity_sources[0]["resource_id"] == "taint:cause"
+    assert [source["resource_id"] for source in record.integrity_sources[:2]] == [
+        "ch-1", "taint:cause",
+    ]
+    assert record.integrity_sources[2]["integrity_effect"] == "informational"
+    assert record.integrity_source_counts == {
+        "untrusted/active_ingest": 2,  # inbound channel and taint cause
+        "untrusted/informational": 1,  # framework prompt provenance
+        "trusted/active_ingest": 40,
+    }
+    assert record.untrusted_active_ingest_domains == ["channel", "internet"]
+
+
+async def test_turn_integrity_sources_prioritize_taint_over_feedback_independent_of_insertion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    feedback = [
+        SourceLabel(
+            principal="feedback", domain="feedback",
+            resource_id=f"chain:{index:02d}", bridge_instance="test",
+            sensitivity="internal", authorized_principals=frozenset({"alice"}),
+            source_kind="feedback_chain", integrity="untrusted",
+            integrity_effect="informational",
+        )
+        for index in range(40)
+    ]
+    active = [
+        SourceLabel(
+            principal="external", domain=domain,
+            resource_id=f"taint:{domain}", bridge_instance="test",
+            sensitivity="internal", authorized_principals=frozenset({"alice"}),
+            source_kind="protected_tool", integrity="untrusted",
+            integrity_effect="active_ingest",
+        )
+        for domain in ("repository", "channel")
+    ]
+    sources = tuple(feedback + active)
+    previews = []
+    for index, inserted in enumerate((sources, tuple(reversed(sources)))):
+        home_root = tmp_path / str(index)
+        monkeypatch.setenv("MIMIR_HOME", str(home_root / "home"))
+        labels = InformationFlowLabels(sources=inserted)
+        agent = _build_agent(
+            home_root, fake_agent=_FakeAgent([AIMessage(content="ok")]), fake_saga=None,
+        )
+        agent._identity_resolver = _resolver(
+            agent._config.home,
+            "people:\n  - canonical: alice\n    access: {roles: [user]}\n",
+        )
+        record = await agent.run_turn(AgentEvent(
+            trigger="user_message", channel_id="ch-1", content="hi",
+            author="alice", source="discord", ifc_labels=labels,
+        ))
+
+        assert labels.sources == inserted  # persistence does not reorder live IFC labels
+        assert labels.has_untrusted_active_ingest
+        assert record.integrity == "untrusted"
+        assert record.integrity_effect == "active_ingest"
+        assert len(record.integrity_sources) == 32
+        assert record.integrity_sources_omitted == 12
+        assert [source["domain"] for source in record.integrity_sources[:2]] == [
+            "channel", "repository",
+        ]
+        assert [source["resource_id"] for source in record.integrity_sources[:2]] == [
+            "taint:channel", "taint:repository",
+        ]
+        assert record.integrity_source_counts == {
+            "untrusted/active_ingest": 2,
+            "untrusted/informational": 41,  # feedback plus framework prompt
+            "trusted/active_ingest": 1,
+        }
+        assert record.untrusted_active_ingest_domains == ["channel", "repository"]
+        row = json.loads((agent._config.home / "logs" / "turns.jsonl").read_text().splitlines()[-1])
+        for field in (
+            "integrity_sources", "integrity_sources_omitted",
+            "integrity_source_counts", "untrusted_active_ingest_domains",
+        ):
+            assert row[field] == getattr(record, field)
+        previews.append(record.integrity_sources)
+    assert previews[0] == previews[1]
+
+
+async def test_turn_integrity_domains_are_bounded_independently_of_source_preview(
+    tmp_path: Path,
+):
+    labels = InformationFlowLabels(sources=tuple(
+        SourceLabel(
+            principal="external", domain=f"domain{index:02d}",
+            resource_id=f"source:{index:02d}", bridge_instance="test",
+            sensitivity="internal", authorized_principals=frozenset({"alice"}),
+            source_kind="protected_tool", integrity="untrusted",
+            integrity_effect="active_ingest",
+        )
+        for index in range(35)
+    ))
+    agent = _build_agent(
+        tmp_path, fake_agent=_FakeAgent([AIMessage(content="ok")]), fake_saga=None,
+    )
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi",
+        author="alice", source="discord", ifc_labels=labels,
+    ))
+
+    assert len(record.integrity_sources) == 32
+    assert record.integrity_source_counts["untrusted/active_ingest"] == 36
+    assert record.untrusted_active_ingest_domains == ["channel", *(
+        f"domain{index:02d}" for index in range(31)
+    )]
 
 
 async def test_budget_exhaustion_creates_worklink_continuation_sidecar(

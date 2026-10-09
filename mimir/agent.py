@@ -3449,8 +3449,27 @@ class Agent:
         max_integrity_sources = 32
         ordered_integrity_sources = sorted(
             final_labels.sources,
-            key=lambda source: source.integrity == Integrity.TRUSTED,
+            key=lambda source: (
+                0 if source.has_untrusted_active_ingest else (
+                    1 if source.integrity == Integrity.UNTRUSTED else 2
+                ),
+                source.domain or "",
+                source.resource_id or "",
+                source.domain_qualifier or "",
+                source.principal or "",
+                str(source.source_kind),
+                str(source.integrity_effect),
+            ),
         )
+        integrity_source_counts: dict[str, int] = {}
+        for source in ordered_integrity_sources:
+            category = f"{source.integrity}/{source.integrity_effect}"
+            integrity_source_counts[category] = integrity_source_counts.get(category, 0) + 1
+        untrusted_active_ingest_domains = sorted({
+            source.domain
+            for source in final_labels.sources
+            if source.has_untrusted_active_ingest and isinstance(source.domain, str)
+        })[:max_integrity_sources]
         integrity_sources = [
             {
                 "principal": source.principal,
@@ -3505,6 +3524,8 @@ class Agent:
             integrity=final_labels.persisted_integrity,
             integrity_effect=final_labels.persisted_integrity_effect,
             integrity_sources=integrity_sources,
+            integrity_source_counts=integrity_source_counts,
+            untrusted_active_ingest_domains=untrusted_active_ingest_domains,
             integrity_sources_omitted=max(
                 0, len(final_labels.sources) - max_integrity_sources,
             ),
