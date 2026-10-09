@@ -31,6 +31,16 @@ from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, Perm
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.turn_event_bus import TurnEventBus
+from tests.timing import HANG_GUARD_SECONDS
+
+
+async def _wait_until(predicate) -> None:
+    """Wait for state owned by this test's ACP peer to become observable."""
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), HANG_GUARD_SECONDS)
 
 
 def _resolver(home: Path, *, canonical: str = "operator", key: str = "secret") -> IdentityResolver:
@@ -338,12 +348,12 @@ async def test_dead_update_forwarder_fails_prompt_without_wedging_session(
             agent.prompt(
                 session_id, [sdk.TextContentBlock(type="text", text="first")]
             ),
-            1,
+            HANG_GUARD_SECONDS,
         )
 
     response = await asyncio.wait_for(
         agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")]),
-        1,
+        HANG_GUARD_SECONDS,
     )
     assert response.stop_reason == "end_turn"
     assert agent._sessions[session_id].active_prompt is None
@@ -407,13 +417,13 @@ async def test_reauthenticate_fence_still_dispatches_session_cancel(
 
     ordered_dispatch = asyncio.create_task(dispatch_in_order())
 
-    await asyncio.wait_for(core.entered.wait(), 1)
-    await asyncio.wait_for(cancel_reached.wait(), 1)
+    await asyncio.wait_for(core.entered.wait(), HANG_GUARD_SECONDS)
+    await asyncio.wait_for(cancel_reached.wait(), HANG_GUARD_SECONDS)
     assert not authentication_started.is_set()
-    await asyncio.wait_for(authentication_started.wait(), 1)
-    await asyncio.wait_for(ordered_dispatch, 1)
+    await asyncio.wait_for(authentication_started.wait(), HANG_GUARD_SECONDS)
+    await asyncio.wait_for(ordered_dispatch, HANG_GUARD_SECONDS)
 
-    deadline = asyncio.get_running_loop().time() + 1
+    deadline = asyncio.get_running_loop().time() + HANG_GUARD_SECONDS
     while dispatcher._runner_tasks:
         remaining = deadline - asyncio.get_running_loop().time()
         assert remaining > 0, "dispatcher runners did not drain"
@@ -820,10 +830,7 @@ async def test_admin_hands_permissions_precede_execution_and_preserve_raw_argume
     prompt = asyncio.create_task(
         agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="run shell")]),
     )
-    for _ in range(100):
-        if client.permission_snapshots:
-            break
-        await asyncio.sleep(0.01)
+    await _wait_until(lambda: bool(client.permission_snapshots))
     assert client.permission_snapshots
     if setup_error:
         with pytest.raises(sdk.RequestError) as raised:
@@ -1031,7 +1038,7 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
             permission = await permission_sent.get()
             active = agent._active_prompts[session_id]
             # Sending precedes handle registration by a few event-loop turns.
-            async with asyncio.timeout(3):
+            async with asyncio.timeout(HANG_GUARD_SECONDS):
                 while not active.permission_handles:
                     await asyncio.sleep(0)
             handles = tuple(active.permission_handles)
@@ -1050,26 +1057,26 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 assert all(not handle.task.done() for handle in handles)
                 assert executions == []
                 await transport.incoming.put(answer)
-                assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+                assert (await asyncio.wait_for(prompting, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
                 assert executions == ["waiting-edit"]
                 assert results[0].status != "error"
             else:
                 if ending == "cancel":
-                    await asyncio.wait_for(agent.cancel(session_id), 3)
+                    await asyncio.wait_for(agent.cancel(session_id), HANG_GUARD_SECONDS)
                 elif ending == "model_cancel":
                     # Cancel only the model, without first withdrawing peer handles.
                     active.model_task.cancel()
                 elif ending == "replace":
                     agent.on_connect(Client())
                     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
-                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 3)
+                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), HANG_GUARD_SECONDS)
                 else:
                     if ending == "shutdown":
                         await transport.incoming.put(None)
-                        await asyncio.wait_for(runner, 3)
+                        await asyncio.wait_for(runner, HANG_GUARD_SECONDS)
                     peer.mark_transport_dead()
-                    await asyncio.wait_for(agent.on_transport_closed(peer.peer_generation), 3)
-                outcome = (await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), 3))[0]
+                    await asyncio.wait_for(agent.on_transport_closed(peer.peer_generation), HANG_GUARD_SECONDS)
+                outcome = (await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), HANG_GUARD_SECONDS))[0]
                 if ending == "cancel":
                     assert outcome.stop_reason == "cancelled"
                     assert active.model_task.cancelled()
@@ -1080,7 +1087,7 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                     assert "was withdrawn while waiting for the operator" in str(terminal_wire[-1]["rawOutput"])
                 else:
                     assert isinstance(outcome, sdk.RequestError)
-                denied = await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), 3)
+                denied = await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), HANG_GUARD_SECONDS)
                 if shield:
                     assert denied[0].status == "error"
                     assert decisions == [agent_module.ToolPermissionDecision.CANCELLED]
@@ -1102,7 +1109,7 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 if ending in {"cancel", "replace", "model_cancel"}:
                     await transport.incoming.put(answer)
                     await transport.incoming.put({"jsonrpc": "2.0", "method": "test/barrier", "params": {}})
-                    await asyncio.wait_for(barrier.wait(), 3)
+                    await asyncio.wait_for(barrier.wait(), HANG_GUARD_SECONDS)
                     assert not runner.done()
                     assert journal.read_bytes() == before_late_answer
                 else:
@@ -1133,12 +1140,12 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
         finally:
             await agent.on_transport_closed(peer.peer_generation)
             await transport.incoming.put(None)
-            await asyncio.wait_for(runner, 3)
+            await asyncio.wait_for(runner, HANG_GUARD_SECONDS)
             await connection.close()
             if prompting is not None:
                 await asyncio.gather(prompting, return_exceptions=True)
             if gate_tasks:
-                await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), 3)
+                await asyncio.wait_for(asyncio.gather(*gate_tasks, return_exceptions=True), HANG_GUARD_SECONDS)
 
     # A thread's run_coroutine_threadsafe permission is outside the model await
     # chain; only prompt teardown (not model.cancel alone) withdraws that request.
@@ -1478,7 +1485,7 @@ async def test_transport_death_releases_prompt_blocked_on_update_delivery(
 
     await agent.on_transport_closed(generation)
     with pytest.raises(sdk.RequestError, match="Internal error"):
-        await asyncio.wait_for(prompting, 0.1)
+        await asyncio.wait_for(prompting, HANG_GUARD_SECONDS)
 
     assert active.completed.is_set()
     assert active.dispatcher._worker is None
@@ -1712,7 +1719,7 @@ async def test_detach_waits_for_prompt_before_reloading(
     try:
         await asyncio.wait_for(
             asyncio.wait((loading, cancellation_started), return_when=asyncio.FIRST_COMPLETED),
-            2,
+            HANG_GUARD_SECONDS,
         )
         # Another session must remain usable even while cancellation unwinds.
         assert (await agent.prompt(other, [sdk.TextContentBlock(type="text", text="other")])).stop_reason == "end_turn"
@@ -1722,7 +1729,7 @@ async def test_detach_waits_for_prompt_before_reloading(
             assert agent._sessions[session_id] is state
             assert not active.completed.is_set()
             release.set()
-        await asyncio.wait_for(loading, 2)
+        await asyncio.wait_for(loading, HANG_GUARD_SECONDS)
         second = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
         assert maximum == 1, "two turns ran concurrently on the same session"
         assert active.completed.is_set()
@@ -1818,7 +1825,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
     runner = asyncio.create_task(connection.main_loop())
     revalidating = None
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         active = state.active_prompt
         assert active is not None
         if already_cancelling:
@@ -1836,7 +1843,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 if task.get_coro().__name__ == "_revalidate_provider"
             )
             with pytest.raises(sdk.RequestError, match="retry session/load"):
-                await asyncio.wait_for(asyncio.shield(revalidating), 1)
+                await asyncio.wait_for(asyncio.shield(revalidating), HANG_GUARD_SECONDS)
 
         # Repeated wire requests must receive the specific refusal and return
         # their dispatcher slots, even though the model remains stalled.
@@ -1851,11 +1858,11 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 "jsonrpc": "2.0", "id": request_id, "method": "session/load",
                 "params": {"sessionId": session_id, "cwd": "/two"},
             })
-            response = await asyncio.wait_for(transport.outgoing.get(), 1)
+            response = await asyncio.wait_for(transport.outgoing.get(), HANG_GUARD_SECONDS)
             assert response["id"] == request_id
             assert response["error"]["code"] == -32003
             assert "retry session/load" in response["error"]["message"]
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(HANG_GUARD_SECONDS):
                 while dispatcher._runner_tasks:
                     await asyncio.sleep(0)
             assert dispatcher._runner_slots._value == capacity
@@ -1867,7 +1874,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
             assert agent._journals._sessions[session_id] is prior_journal
             assert prior_journal.current_client is prior_client
             assert state.provider is None and provider.closed
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(HANG_GUARD_SECONDS):
                 while "connection-1" not in client.disconnects:
                     await asyncio.sleep(0)
             if load_server:
@@ -1887,17 +1894,17 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="blocked")])
 
         release.set()
-        assert (await asyncio.wait_for(prompting, 1)).stop_reason == "cancelled"
+        assert (await asyncio.wait_for(prompting, HANG_GUARD_SECONDS)).stop_reason == "cancelled"
         monkeypatch.undo()
         await agent.load_session("/retry", session_id)
         assert agent._sessions[session_id] is not state
     finally:
         release.set()
-        await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), 2)
+        await asyncio.wait_for(asyncio.gather(prompting, return_exceptions=True), HANG_GUARD_SECONDS)
         if revalidating is not None:
-            await asyncio.wait_for(asyncio.gather(revalidating, return_exceptions=True), 2)
+            await asyncio.wait_for(asyncio.gather(revalidating, return_exceptions=True), HANG_GUARD_SECONDS)
         await transport.incoming.put(None)
-        await asyncio.wait_for(runner, 2)
+        await asyncio.wait_for(runner, HANG_GUARD_SECONDS)
         await connection.close()
 
 
@@ -1961,17 +1968,17 @@ async def test_stalled_read_peer_prompt_then_load_is_bounded(
         # pytest's test timeout bounds setup if the tool update never arrives.
         await delivery_ready.wait()
         start_delivery.set()
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         active = state.active_prompt
         assert active is not None
         loading = asyncio.create_task(agent.load_session("/two", session_id))
         # Shield so a missing production bound fails here by TimeoutError,
         # rather than test cancellation accidentally rescuing the handler.
         with pytest.raises(sdk.RequestError):
-            await asyncio.wait_for(asyncio.shield(loading), 3)
+            await asyncio.wait_for(asyncio.shield(loading), HANG_GUARD_SECONDS)
         with pytest.raises(sdk.RequestError):
-            await asyncio.wait_for(asyncio.shield(prompting), 3)
-        await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 3)
+            await asyncio.wait_for(asyncio.shield(prompting), HANG_GUARD_SECONDS)
+        await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), HANG_GUARD_SECONDS)
         assert connection.transport_dead and active.transport_dead
         assert active.completed.is_set()
         assert not release.is_set()
@@ -2025,7 +2032,7 @@ async def test_slow_replay_renews_waiting_prompt_drain_budget(
     started = loop.time()
     loading = asyncio.create_task(agent.load_session("/two", session_id))
     try:
-        await asyncio.wait_for(replay_started.wait(), 2)
+        await asyncio.wait_for(replay_started.wait(), HANG_GUARD_SECONDS)
         core.gate.set()
         await asyncio.wait_for(asyncio.shield(loading), 15)
         await asyncio.wait_for(asyncio.shield(prompting), 15)
@@ -2057,7 +2064,7 @@ async def test_detaching_state_blocks_prompts_without_unbinding_replacement(tmp_
     client.disconnect_mcp = disconnect
     detaching = asyncio.create_task(agent._detach_state(state))
     try:
-        await asyncio.wait_for(disconnecting.wait(), 2)
+        await asyncio.wait_for(disconnecting.wait(), HANG_GUARD_SECONDS)
         with pytest.raises(sdk.RequestError):
             await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="blocked")])
         await agent.load_session("/replacement", session_id)
@@ -3646,9 +3653,9 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
             assert agent._sessions[session_id] is state
             assert not active.completed.is_set()
         release.set()
-        await asyncio.wait_for(handler, 1)
+        await asyncio.wait_for(handler, HANG_GUARD_SECONDS)
         if transition is not None:
-            await asyncio.wait_for(transition, 1)
+            await asyncio.wait_for(transition, HANG_GUARD_SECONDS)
         assert active.completed.is_set()
     finally:
         release.set()
@@ -4304,7 +4311,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
     peer.peer_generation = agent.on_connect(peer)
 
     async def next_outgoing() -> dict[str, Any]:
-        return await asyncio.wait_for(transport.outgoing.get(), 3)
+        return await asyncio.wait_for(transport.outgoing.get(), HANG_GUARD_SECONDS)
 
     owned_tasks: list[asyncio.Task[Any]] = []
     try:
@@ -4565,10 +4572,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
                 "params": {"level": "info", "logger": "hands", "data": {"token": "secret", "message": "working"}},
             },
         })
-        for _ in range(20):
-            if len(agent._audit_events) >= 3:
-                break
-            await asyncio.sleep(0.01)
+        await _wait_until(lambda: len(agent._audit_events) >= 3)
         assert agent._audit_events[-3]["status"] == "accepted"
         assert agent._audit_events[-2]["status"] == "ignored"
         assert agent._audit_events[-1]["data"] == {"token": "[redacted]", "message": "working"}
@@ -4584,10 +4588,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
                 "params": {"progressToken": progress_token, "progress": 3},
             },
         })
-        for _ in range(20):
-            if len(agent._audit_events) >= 4:
-                break
-            await asyncio.sleep(0.01)
+        await _wait_until(lambda: len(agent._audit_events) >= 4)
         assert agent._audit_events[-1]["status"] == "ignored"
         terminal_1 = await next_outgoing()
         terminal_1_update = terminal_1["params"]["update"]
@@ -4596,7 +4597,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-1",
             "status": "completed", "rawOutput": '{"changed": true}',
         }
-        assert (await asyncio.wait_for(prompting, 3)).stop_reason == "end_turn"
+        assert (await asyncio.wait_for(prompting, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
         state = agent._sessions[session_id]
         assert not hasattr(agent, "_permission_grants")
         assert not hasattr(state, "permission_grants")
@@ -4650,7 +4651,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
             "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
             "status": "completed", "rawOutput": '{"changed": true}',
         }
-        assert (await asyncio.wait_for(prompting_2, 3)).stop_reason == "end_turn"
+        assert (await asyncio.wait_for(prompting_2, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
 
         rejecting = asyncio.create_task(
             agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="reject it")])
@@ -4690,7 +4691,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert rejected_body["rawOutput"] == (
             "hands_edit permission was rejected by the operator before execution"
         )
-        assert (await asyncio.wait_for(rejecting, 3)).stop_reason == "end_turn"
+        assert (await asyncio.wait_for(rejecting, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
         # A reject consumed only its permission outer ID: there is no tools/call
         # frame, and no stale allow_once decision was retained from either call.
         assert transport.outgoing.empty()
@@ -4731,7 +4732,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert reaction["sessionUpdate"] == "agent_message_chunk"
         assert "edit-4" in reaction["content"]["text"]
         assert "missing structuredContent" in reaction["content"]["text"]
-        assert (await asyncio.wait_for(bare_result, 3)).stop_reason == "end_turn"
+        assert (await asyncio.wait_for(bare_result, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
         assert transport.outgoing.empty()
         rejection_log = next(
             record for record in caplog.records
@@ -4743,7 +4744,7 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
 
     finally:
         await transport.incoming.put(None)
-        await asyncio.wait_for(runner, 3)
+        await asyncio.wait_for(runner, HANG_GUARD_SECONDS)
         await agent.on_transport_closed(peer.peer_generation)
         await connection.close()
         await asyncio.gather(*owned_tasks, return_exceptions=True)

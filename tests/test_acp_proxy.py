@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 import yaml
 
 from mimir.acp.daemon import AcpDaemon
@@ -1361,7 +1362,7 @@ async def test_disconnect_and_cancel_kill_active_execution_but_release_idle_kern
             await asyncio.wait_for(router.route_daemon({
                 "jsonrpc": "2.0", "id": 120, "method": "mcp/disconnect",
                 "params": {"connectionId": connection_id},
-            }), 2)
+            }), HANG_GUARD_SECONDS)
             assert router._provider._python_kernels._processes == {}
             assert await owned_process_reaped(worker.pid)
             assert not any(
@@ -1599,7 +1600,7 @@ async def test_hosted_failures_are_supervised_and_generation_state_is_bounded(
             "jsonrpc": "2.0", "id": 40, "method": "mcp/message",
             "params": {"connectionId": connection_id, "method": "tools/list"},
         })
-        failure = await asyncio.wait_for(router.wait_failed(), 1)
+        failure = await asyncio.wait_for(router.wait_failed(), HANG_GUARD_SECONDS)
         assert isinstance(failure, RuntimeError) and str(failure) == "provider failed"
     finally:
         await router.close()
@@ -1672,7 +1673,7 @@ async def test_hosted_error_response_writer_failure_fails_generation(
             "jsonrpc": "2.0", "id": 60, "method": "mcp/message",
             "params": {"connectionId": connection_id, "method": "tools/list"},
         })
-        failure = await asyncio.wait_for(router.wait_failed(), 1)
+        failure = await asyncio.wait_for(router.wait_failed(), HANG_GUARD_SECONDS)
         assert isinstance(failure, BrokenPipeError)
     finally:
         await router.close()
@@ -2242,7 +2243,7 @@ async def test_scope_permission_timeout_and_late_answer_fail_closed(
         daemon.data.clear()
         task = await start_scope_permission(router, connection_id, 13, "/outside", monkeypatch, unconfined=unconfined)
         request, = messages(client)
-        await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
         assert messages(daemon)[-1]["result"] == {"approved": False}
         await router.route_client({
             "jsonrpc": "2.0", "id": request["id"],

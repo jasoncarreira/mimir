@@ -15,6 +15,7 @@ from typing import Any
 import uuid
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 import mimir.worklink.compute as compute
 import mimir.worklink.worker_exec as worker_exec
@@ -249,7 +250,7 @@ async def test_enabled_launch_cancellation_waits_for_handshake_then_cancels(
     )
     launch = asyncio.create_task(backend.launch(spec()))
     try:
-        await asyncio.wait_for(client.entered.wait(), timeout=1)
+        await asyncio.wait_for(client.entered.wait(), timeout=HANG_GUARD_SECONDS)
     except TimeoutError:
         if launch.done():
             await launch

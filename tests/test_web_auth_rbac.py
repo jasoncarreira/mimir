@@ -8,6 +8,7 @@ import ssl
 from pathlib import Path
 
 from aiohttp import web
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from mimir.bridges.web_chat import WebChatBridge
@@ -700,7 +701,7 @@ async def test_user_live_events_endpoint_filters_every_poll_to_own_channel(
 
     async def read_data(response) -> dict:
         while True:
-            line = await asyncio.wait_for(response.content.readline(), timeout=2)
+            line = await asyncio.wait_for(response.content.readline(), timeout=HANG_GUARD_SECONDS)
             assert line, "live-events stream ended before another event arrived"
             if line.startswith(b"data: "):
                 return json.loads(line.removeprefix(b"data: "))

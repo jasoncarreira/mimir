@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.acp.agent import MimirAcpAgent
 from mimir.acp.sdk import RequestError
@@ -46,7 +47,7 @@ async def test_stalled_dispatcher_join_is_bounded(monkeypatch, method) -> None:
     await publisher.entered.wait()
     try:
         with pytest.raises(TimeoutError, match="ACP update delivery stalled"):
-            await asyncio.wait_for(getattr(dispatcher, method)(), 1)
+            await asyncio.wait_for(getattr(dispatcher, method)(), HANG_GUARD_SECONDS)
         assert stalled.is_set()
         assert isinstance(dispatcher.failure, RuntimeError if method == "terminalize_failure" else TimeoutError)
         assert not publisher.release.is_set()

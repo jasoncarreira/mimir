@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.models import AuthContext
 from mimir.commitments import (
@@ -27,7 +28,7 @@ from mimir.commitments import (
     make_dedupe_key,
 )
 from mimir.commitments.models import CommitmentOwnershipProvenance
-from mimir.commitments.store import run_store_io
+from mimir.commitments.store import _WRITE_LOCK_TIMEOUT_SECS, run_store_io
 
 
 # ─── make_dedupe_key ────────────────────────────────────────────────
@@ -59,7 +60,7 @@ async def test_replay_leaves_loop_and_default_pool_free(tmp_path, monkeypatch, o
     args = ("owned",) if operation in {"complete", "alarm_pileup"} else ()
     task = asyncio.create_task(getattr(store, operation)(*args))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         await asyncio.sleep(0)
         assert not task.done()
         assert executors
@@ -95,7 +96,7 @@ async def test_run_store_io_cancellation_waits_and_wins(cancel, fails):
 
     task = asyncio.create_task(caller())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         if cancel:
             for _ in range(2):
                 task.cancel()
@@ -142,7 +143,7 @@ async def test_append_awaits_locked_flush_fsync(tmp_path, monkeypatch, cancel, o
     arg = CommitmentRecord(id="new", channel_id="c1", text="Check result") if operation == "add" else "owned"
     task = asyncio.create_task(getattr(store, operation)(arg))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         # Bytes are flushed, but neither lock nor await may finish before fsync.
         assert len(store.path.read_text().splitlines()) == 2
         with store.path.with_suffix(".jsonl.lock").open("a") as lock:
@@ -188,7 +189,7 @@ async def test_writer_timeout_propagates_while_loop_progresses(tmp_path, monkeyp
         started = time.monotonic()
         task = asyncio.create_task(getattr(store, operation)(arg))
         try:
-            await asyncio.wait_for(contended.wait(), 2)
+            await asyncio.wait_for(contended.wait(), HANG_GUARD_SECONDS)
             assert not task.done()
         finally:
             with pytest.raises(TimeoutError, match="writer lock busy"):
@@ -590,7 +591,7 @@ async def test_concurrent_complete_and_expire_append_one_transition(
 
     monkeypatch.setattr(store, "current_state_async", paused_current_state)
     complete = asyncio.create_task(store.complete(rec.id, message_id="m-1"))
-    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(entered.wait(), timeout=HANG_GUARD_SECONDS)
     expire = asyncio.create_task(store.expire(rec.id))
     await asyncio.sleep(0)
     assert not complete.done()
@@ -958,7 +959,9 @@ with CommitmentsStore(path=Path(sys.argv[1]))._writer_lock():
                 asyncio.run(store.trim())
             else:
                 store.migrate_ownership()
-        assert time.monotonic() - start < 2
+        # The lock's own deadline enforces the behavior; this only rules out
+        # silently waiting indefinitely for the child to release the lock.
+        assert time.monotonic() - start < _WRITE_LOCK_TIMEOUT_SECS + 10
         assert store.path.read_bytes() == before
         assert not list(tmp_path.glob("*.tmp"))
     finally:

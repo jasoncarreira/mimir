@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 # Skip the whole module if discord-py isn't installed in the test env.
 pytest.importorskip("discord")
@@ -1066,7 +1067,7 @@ class _FakeTyping:
         return None
 
 
-async def _wait_for(predicate, timeout: float = 1.0, interval: float = 0.01):
+async def _wait_for(predicate, timeout: float = HANG_GUARD_SECONDS, interval: float = 0.01):
     """Loop until ``predicate()`` is truthy or ``timeout`` elapses. Used
     to poll the typing-hold task's state without sleep-then-assert
     races (the task spawns asynchronously)."""
@@ -1205,7 +1206,7 @@ async def test_typing_hold_capped_at_timeout(bridge_with_fake_client):
     await bridge.send_typing_indicator("discord-1")
     task = bridge._typing_tasks["discord-1"]
     # Task should exit on its own once the inner asyncio.sleep wakes.
-    assert await _wait_for(lambda: task.done(), timeout=1.0)
+    assert await _wait_for(lambda: task.done(), timeout=HANG_GUARD_SECONDS)
     # And aexit has run.
     assert getattr(channel, "typing_aexit_calls", 0) >= 1
 
@@ -1709,10 +1710,10 @@ async def test_discord_connect_retains_runner_task(monkeypatch):
 
     await bridge.connect()
     assert bridge._runner in bridge._background_tasks
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
 
     release.set()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     await asyncio.sleep(0)
     assert bridge._runner not in bridge._background_tasks
 
@@ -1760,7 +1761,7 @@ async def test_supervisor_retries_on_transient_5xx(monkeypatch, tmp_path: Path):
     await bridge.connect()
     # Wait for the supervisor task to finish — the second attempt
     # should return cleanly.
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 2  # one failure, one success
 
 
@@ -1788,7 +1789,7 @@ async def test_supervisor_does_not_retry_on_login_failure(monkeypatch, tmp_path:
     await bridge.connect()
     # The runner task should fail with LoginFailure.
     with pytest.raises(discord.LoginFailure):
-        await asyncio.wait_for(bridge._runner, timeout=1.0)
+        await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # Only one attempt — no retries on operator-actionable errors.
     assert attempts["n"] == 1
 
@@ -1830,7 +1831,7 @@ async def test_supervisor_caps_backoff(monkeypatch, tmp_path: Path):
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # First sleep is the initial 0.01; subsequent doublings 0.02, 0.04 (cap), 0.04.
     assert sleeps[0] == pytest.approx(0.01)
     # After 4 retries (5th attempt succeeds), the last sleep we recorded
@@ -1934,7 +1935,7 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1  # no retries on clean exit
     assert captured == [(
         "discord_bridge_exited",
@@ -2032,7 +2033,7 @@ async def test_supervisor_closes_old_client_before_constructing_new(monkeypatch,
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Three constructions: initial + 2 retries (2 failures + 1 success).
     assert construct_calls == [0, 1, 2]

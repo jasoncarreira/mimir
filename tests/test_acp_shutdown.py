@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
@@ -191,16 +192,16 @@ async def _diagnostic_command(*argv: str) -> str:
     except Exception as exc:
         return f"capture failed starting {argv[0]}: {type(exc).__name__}: {exc}"
     try:
-        async with asyncio.timeout(2):
+        async with asyncio.timeout(HANG_GUARD_SECONDS):
             output, _ = await command.communicate()
     except TimeoutError:
         command.kill()
         try:
-            async with asyncio.timeout(1):
+            async with asyncio.timeout(HANG_GUARD_SECONDS):
                 await command.wait()
         except TimeoutError:
             pass
-        return f"capture failed: {' '.join(argv)} exceeded 2s"
+        return f"capture failed: {' '.join(argv)} exceeded {HANG_GUARD_SECONDS}s"
     text = output.decode(errors="replace").strip()
     if command.returncode:
         return f"capture failed ({command.returncode}): {' '.join(argv)}\n{text}"

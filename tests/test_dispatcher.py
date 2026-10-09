@@ -10,6 +10,7 @@ from textwrap import dedent
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.config import Config
 from mimir.dispatcher import Dispatcher, TRUSTED_INTERNAL_SOURCES, _ChannelQueue
@@ -103,7 +104,7 @@ async def test_event_observer_failure_is_observed(tmp_path: Path, monkeypatch):
         completed = asyncio.Event()
         tasks[0].add_done_callback(lambda task: completed.set())
         release.set()
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=HANG_GUARD_SECONDS)
         assert not disp._bg_tasks
         assert failures == [("background_task_failed", {
             "name": "dispatcher-event-observer",
@@ -131,12 +132,12 @@ async def test_drain_cancels_retained_event_observer(tmp_path: Path, retire_work
     await disp.enqueue(AgentEvent(
         channel_id="c1", source="api", trigger="user_message", content="hello",
     ))
-    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     tasks = tuple(disp._bg_tasks)
     try:
         if retire_workers:
             await asyncio.wait_for(
-                asyncio.gather(*disp._workers.values()), timeout=3,
+                asyncio.gather(*disp._workers.values()), timeout=HANG_GUARD_SECONDS,
             )
             assert not disp._workers
         await disp.drain(timeout=1)
@@ -357,7 +358,7 @@ async def test_separate_channels_run_concurrently(tmp_path: Path):
     await started.wait()
     # slow channel is parked; a different channel must still progress
     await disp.enqueue(AgentEvent(trigger="x", channel_id="fast", content="0"))
-    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+    await asyncio.wait_for(second_started.wait(), timeout=HANG_GUARD_SECONDS)
     assert finished == ["fast"]
     release.set()
     await disp.drain()
@@ -410,7 +411,7 @@ async def test_event_enqueued_during_worker_retire_is_not_stranded(
     # Buggy version strands "raced" → drain()'s queue.join() hangs; guard it
     # so the test fails on the assertion rather than hanging the suite.
     try:
-        await asyncio.wait_for(disp.drain(), timeout=3.0)
+        await asyncio.wait_for(disp.drain(), timeout=HANG_GUARD_SECONDS)
     except asyncio.TimeoutError:
         pass
 
@@ -649,7 +650,7 @@ async def test_drain_completes_when_run_turn_is_cancelled(tmp_path: Path):
     )
     # Bound the drain so the deadlock-shape test fails fast rather than
     # hanging the test runner.
-    await asyncio.wait_for(disp.drain(), timeout=2.0)
+    await asyncio.wait_for(disp.drain(), timeout=HANG_GUARD_SECONDS)
     assert cancelled_count == 1
 
 
@@ -791,7 +792,7 @@ class TestSchedulerTickSerialization:
             ))
             # User turn proceeds even though scheduler is holding the
             # scheduler-tick lock.
-            await asyncio.wait_for(user_started.wait(), timeout=1.0)
+            await asyncio.wait_for(user_started.wait(), timeout=HANG_GUARD_SECONDS)
             assert completed == ["user"]
         finally:
             release_scheduler.set()
@@ -853,13 +854,13 @@ class TestSchedulerTickSerialization:
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-1", content="", source="api",
         ))
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await asyncio.wait_for(first_started.wait(), timeout=HANG_GUARD_SECONDS)
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-2", content="", source="api",
         ))
         # Second user_message proceeds in parallel — no scheduler-tick
         # mutex constrains it.
-        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        await asyncio.wait_for(second_started.wait(), timeout=HANG_GUARD_SECONDS)
         assert completed == ["c2"]
         release.set()
         await disp.drain()
@@ -886,8 +887,12 @@ async def test_drain_does_not_purge_dict_entries_for_busy_channels(
     )
     # Worker is parked in runner — closed flag not yet set.
     drain_task = asyncio.create_task(disp.drain())
-    # Brief yield to ensure drain started.
-    await asyncio.sleep(0.02)
+    # Observe drain's own closed flag before checking its queue bookkeeping.
+    async def drain_started() -> None:
+        while not disp._closed:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(drain_started(), HANG_GUARD_SECONDS)
     # Channel is still tracked while drain is waiting.
     assert "c-busy" in disp._queues
     release.set()
@@ -1669,7 +1674,8 @@ async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
             channel_id=f"slack-C{i}",
             delivery="public_shared_channel",
         )
-    await asyncio.sleep(0.05)
+    assert notifier._operator_task is not None
+    await asyncio.wait_for(notifier._operator_task, HANG_GUARD_SECONDS)
 
     operator_sends = [s for s in channels.sent if s[0] == "dm-slack-OPS"]
     assert len(operator_sends) == 1
@@ -1792,7 +1798,7 @@ async def test_startup_principal_boundary_preserves_fifo(tmp_path, author):
     assert [queue.get_nowait(), queue.get_nowait()] == events[1:]
     queue.task_done()
     queue.task_done()
-    await asyncio.wait_for(queue.join(), timeout=1)
+    await asyncio.wait_for(queue.join(), timeout=HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -1885,7 +1891,7 @@ async def test_leftover_injection_reroutes_ahead_of_later_queued_event(tmp_path:
 
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
     await disp.enqueue(AgentEvent(trigger="user_message", channel_id="c1", content="turn1"))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     assert "c1" in disp._in_flight
 
     # Two follow-ups arrive mid-turn and are accepted as injections, but the
@@ -2027,7 +2033,7 @@ async def test_drain_startup_user_messages_drains_contiguous_user_prefix(tmp_pat
 
     assert [e.content for e in drained] == ["follow-1", "follow-2"]
     assert q.qsize() == 0
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -2048,7 +2054,7 @@ async def test_drain_startup_user_messages_stops_at_non_user_boundary(tmp_path: 
     assert [q.get_nowait().content, q.get_nowait().content] == ["react", "follow-2"]
     q.task_done()
     q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 # ─── chainlink #384: force_new_turn (deferred messages) ──────────────
@@ -2092,7 +2098,7 @@ async def test_drain_startup_treats_force_new_turn_as_boundary(tmp_path: Path):
     assert [q.get_nowait().content, q.get_nowait().content] == ["deferred", "behind"]
     q.task_done()
     q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 # ─── chainlink #510: bounded graceful drain ──────────────────────────
@@ -2113,7 +2119,7 @@ async def test_drain_timeout_cancels_slow_inflight_turn(tmp_path: Path):
 
     disp = Dispatcher(cfg, runner)
     await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="slow"))
-    await asyncio.wait_for(started.wait(), timeout=2)  # ensure it's in-flight
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)  # ensure it's in-flight
 
     # This outer bound is a hang guard, not a latency assertion. Cancellation
     # state below witnesses that the dispatcher's 0.2s timeout fired.

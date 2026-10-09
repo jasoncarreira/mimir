@@ -111,6 +111,16 @@ raw descriptors, and subprocess consumers need explicit synchronization.
 See [Event-log read consistency](docs/event-log-consistency.md) for the
 reader audit, exact coverage, and production consistency requirements.
 
+### Timing in tests
+
+Outer timeouts on expected events are hang guards: size them loosely, not as
+latency assertions. Await tasks or signals owned by the component instead of
+sleeping before a positive assertion. Prove overlap and ordering by observing
+entries, exits, and signals rather than elapsed wall time. When timing samples
+are necessary, use the minimum rather than the median to exclude scheduler
+stalls. See [Don't assert on ambient state you don't own](#dont-assert-on-ambient-state-you-dont-own)
+when choosing what to observe.
+
 ### Don't assert on ambient state you don't own
 
 Asserting on mutable process state is fine when that state is the *subject* of the

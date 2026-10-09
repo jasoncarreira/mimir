@@ -146,7 +146,9 @@ async def test_stdio_tool_error_surfaces_server_text() -> None:
         with pytest.raises(ToolException, match="contract failure from server"):
             await tools["failure"].coroutine()
 
-    await asyncio.wait_for(_contract(check), timeout=30)
+    # This checks the server's error text, not the client's normal-call latency.
+    # Keep the short deadline in test_stdio_call_timeout, where it is the subject.
+    await asyncio.wait_for(_contract(check, call_timeout_s=10), timeout=30)
 
 
 @pytest.mark.asyncio

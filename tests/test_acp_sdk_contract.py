@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from pydantic import ValidationError
 
 try:
@@ -642,7 +643,7 @@ async def test_permission_completion_preserves_telemetry_only_marker_in_both_pat
     snapshot = sdk.PermissionSnapshot("t", "Run", "execute", {"command": "true"})
     task = asyncio.create_task(peer.request_tool_permission("s", snapshot))
     try:
-        emitted = await asyncio.wait_for(transport.outgoing.get(), 1)
+        emitted = await asyncio.wait_for(transport.outgoing.get(), HANG_GUARD_SECONDS)
         outcome = {"outcome": "cancelled"} if decision == "cancelled" else {
             "outcome": "selected", "optionId": decision,
             "_meta": {"mimir.permission_source": "session_grant"},
@@ -651,7 +652,7 @@ async def test_permission_completion_preserves_telemetry_only_marker_in_both_pat
             "jsonrpc": "2.0", "id": emitted["id"],
             "result": {"outcome": outcome, **extra},
         })
-        completion = await asyncio.wait_for(task, 1)
+        completion = await asyncio.wait_for(task, HANG_GUARD_SECONDS)
         assert completion.session_grant is session_grant
         assert completion.decision == ("reject_once" if has_error else decision)
         assert completion.executable is (
@@ -962,21 +963,21 @@ async def test_live_connection_bounds_active_inbound_runners() -> None:
             request_ids.append(index)
         await transport.incoming.put(message)
 
-    await asyncio.wait_for(boundary.wait(), 1)
+    await asyncio.wait_for(boundary.wait(), HANG_GUARD_SECONDS)
     while not transport.incoming.empty():
         await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert started == peak == limit
 
     release.set()
-    await asyncio.wait_for(handled.wait(), 1)
-    await asyncio.wait_for(queue.join(), 1)
+    await asyncio.wait_for(handled.wait(), HANG_GUARD_SECONDS)
+    await asyncio.wait_for(queue.join(), HANG_GUARD_SECONDS)
     responses = [await transport.outgoing.get() for _ in request_ids]
     assert sorted(response["id"] for response in responses) == request_ids
 
     await transport.incoming.put(None)
     assert connection._recv_task is not None
-    await asyncio.wait_for(connection._recv_task, 1)
+    await asyncio.wait_for(connection._recv_task, HANG_GUARD_SECONDS)
     await connection.close()
 
 
@@ -1060,7 +1061,7 @@ async def test_dispatcher_stop_drains_buffered_requests_before_shutdown() -> Non
     assert not closing.done()
 
     gate.set()
-    await asyncio.wait_for(closing, 1)
+    await asyncio.wait_for(closing, HANG_GUARD_SECONDS)
     responses = [await transport.outgoing.get() for _ in range(3)]
     assert sorted(response["id"] for response in responses) == [0, 1, 2]
     assert queue._queue.empty()
@@ -1103,7 +1104,9 @@ async def test_dispatcher_stop_timeout_cancels_active_runners(
     await started.wait()
     monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
 
-    await asyncio.wait_for(dispatcher.stop(), 0.1)
+    started_at = asyncio.get_running_loop().time()
+    await asyncio.wait_for(dispatcher.stop(), 10)
+    assert asyncio.get_running_loop().time() - started_at < 5
 
     assert cancelled.is_set()
     assert not dispatcher._runner_tasks
@@ -1195,8 +1198,8 @@ async def test_authentication_waiters_do_not_consume_runner_slots() -> None:
     assert started == ["authenticate"]
     assert dispatcher._runner_slots.locked()
     gate.set()
-    await asyncio.wait_for(authentication, 1)
-    await asyncio.wait_for(waiter, 1)
+    await asyncio.wait_for(authentication, HANG_GUARD_SECONDS)
+    await asyncio.wait_for(waiter, HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -1236,8 +1239,8 @@ async def test_second_authentication_waits_for_first_without_runner_slot() -> No
     assert started == [1]
     assert dispatcher._runner_slots.locked()
     first_gate.set()
-    await asyncio.wait_for(first, 1)
-    await asyncio.wait_for(second, 1)
+    await asyncio.wait_for(first, HANG_GUARD_SECONDS)
+    await asyncio.wait_for(second, HANG_GUARD_SECONDS)
     while started != [1, 2]:
         await asyncio.sleep(0)
 
@@ -1320,7 +1323,7 @@ async def test_notification_waits_behind_authentication_fence() -> None:
     assert not notified.is_set()
 
     release.set()
-    await asyncio.wait_for(asyncio.gather(*tuple(dispatcher._runner_tasks)), 1)
+    await asyncio.wait_for(asyncio.gather(*tuple(dispatcher._runner_tasks)), HANG_GUARD_SECONDS)
     assert notified.is_set()
 
 
@@ -1716,12 +1719,12 @@ async def test_runner_retires_failed_transport_before_cancelling_handlers(
 
     if main_loop_error is None:
         await asyncio.wait_for(
-            sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), 1
+            sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), HANG_GUARD_SECONDS
         )
     else:
         with pytest.raises(RuntimeError, match="receive failed") as exc_info:
             await asyncio.wait_for(
-                sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), 1
+                sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer), HANG_GUARD_SECONDS
             )
         assert exc_info.value is main_loop_error
 
@@ -1855,7 +1858,7 @@ async def test_request_handle_start_failure_does_not_wait_for_unregistered_id() 
 
     with pytest.raises(Exception):
         await asyncio.wait_for(
-            peer.start_request("session/request_permission", {}), timeout=0.1
+            peer.start_request("session/request_permission", {}), timeout=HANG_GUARD_SECONDS
         )
 
 
@@ -2176,7 +2179,7 @@ async def test_input_queue_capacity_release_admits_waiting_publisher() -> None:
     assert waiting.done() is False
     await queue._queue.get()
     queue.task_done()
-    await asyncio.wait_for(waiting, 1)
+    await asyncio.wait_for(waiting, HANG_GUARD_SECONDS)
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS
 
     while not queue._queue.empty():
@@ -2216,7 +2219,7 @@ async def test_input_queue_close_rejects_blocked_publisher_without_tail_item() -
     closing = asyncio.create_task(queue.close())
     # The reserved physical slot lets close commit without waiting for a
     # consumer, even while a publisher is blocked at the item boundary.
-    await asyncio.wait_for(closing, 1)
+    await asyncio.wait_for(closing, HANG_GUARD_SECONDS)
     assert queue._queue.qsize() == sdk.INPUT_QUEUE_MAX_ITEMS + 1
 
     for _ in range(sdk.INPUT_QUEUE_MAX_ITEMS):
@@ -2231,4 +2234,4 @@ async def test_input_queue_close_rejects_blocked_publisher_without_tail_item() -
 
     assert queue._queue.empty()
     assert queue.pending_bytes == 0
-    await asyncio.wait_for(queue.join(), 1)
+    await asyncio.wait_for(queue.join(), HANG_GUARD_SECONDS)
