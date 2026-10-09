@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Intake (#1907):** Start Discord typing only after admission, preserving
+  an authorized turn's hold when another message is refused or fails. Print
+  escaped console pairing hints with a bounded, process-wide 1024-author LRU.
+
 - **Operator action (#1872):** Generic shell execution after untrusted active
   ingest is refused on interactive and continuation turns for every shell-process
   tool, even with IFC enforcement off. Use a bounded or declared command,
