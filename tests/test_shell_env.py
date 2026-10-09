@@ -347,6 +347,53 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
         _shell_env.reset_direct_exec_argv(token)
 
 
+@pytest.mark.parametrize("overlay", [False, True])
+@pytest.mark.parametrize("wrapper,prefix,args", [
+    ("nice", ["gh", "pr", "view"], ["gh", "pr", "view", "5"]),
+    ("timeout", ["5", "gh"], ["5", "gh", "pr", "view", "5"]),
+    ("nice", ["timeout"], ["timeout", "5", "/usr/bin/gh", "pr", "view"]),
+    ("timeout", ["5"], ["5", "/usr/bin/../bin/gh", "pr", "view"]),
+])
+def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
+    tmp_path, monkeypatch, overlay, wrapper, prefix, args,
+):
+    from mimir.access_control import parse_declared_shell_commands
+    from mimir.tools import forge as forge_tools
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    executable = tmp_path / wrapper
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    declarations = parse_declared_shell_commands([{
+        "exec": wrapper, "path": str(executable), "subcommands": [prefix],
+        "pass_env": ["GITHUB_TOKEN"],
+    }])
+    monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
+    monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded", False)
+    monkeypatch.setattr(forge_tools, "_github_identity_degraded_error", None)
+    checks = []
+    env_builds = []
+    monkeypatch.setattr(forge_tools, "confirm_github_tool_identity",
+                        lambda *args: checks.append(args))
+    monkeypatch.setattr(_shell_env, "_minimal_direct_exec_env",
+                        lambda: env_builds.append(True) or {})
+    argv = [str(executable), *args]
+    token = _shell_env.bind_direct_exec_argv(
+        argv, command=" ".join([wrapper, *args]), declared=declarations,
+        operator_declared=True,
+    )
+    try:
+        assert _shell_env.direct_exec_pass_env(argv) == ("GITHUB_TOKEN",)
+        with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused"):
+            direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
+        assert env_builds == []
+        assert checks == []
+        assert not forge_tools.github_identity_is_degraded()
+    finally:
+        _shell_env.reset_direct_exec_argv(token)
+
+
 def test_declared_environment_requires_matching_pinned_execution(tmp_path, monkeypatch):
     from mimir.access_control import parse_declared_shell_commands
 

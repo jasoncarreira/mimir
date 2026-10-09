@@ -2380,6 +2380,15 @@ def parse_operator_shell_commands(
         commands = parse_declared_shell_commands(raw, writable_roots=writable_roots)
     except ValueError as exc:
         raise DeclaredShellCommandError(f"operator_shell_commands: {exc}") from exc
+    for command in commands:
+        # Exec wrappers can invoke gh at any depth in a declared prefix.
+        if any(Path(token).name == "gh"
+               for prefix in command.subcommands for token in prefix):
+            raise ValueError(
+                f"operator_shell_commands[{command.executable!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
     return commands
 
 

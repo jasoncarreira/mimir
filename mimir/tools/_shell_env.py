@@ -285,14 +285,15 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     gh credential grant retains its config isolation and identity confirmation
     for non-declared service commands.
     """
-    env = _minimal_direct_exec_env()
     binding = _DIRECT_EXEC_ARGV.get()
-    if binding is not None and binding.operator_declared and _is_gh_argv(argv):
+    if (binding is not None and binding.operator_declared
+            and any(Path(token).name == "gh" for token in argv or ())):
         from .refusals import ToolPolicyRefusal
 
         raise ToolPolicyRefusal(
             "operator-declared gh is refused; use a fresh untainted turn or the forge tools"
         )
+    env = _minimal_direct_exec_env()
     if binding is not None and binding.operator_declared and binding.argv == tuple(argv or ()):
         # The interactive shell's explicitly configured pass-through is a
         # deployment baseline, but direct execution still pins PATH.

@@ -204,7 +204,10 @@ create/transition`, or another mutating command. This is an explicit chat grant,
 not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
 executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
 `payload_args`, interpreter/script entries, and `gh` (including paths or symlinks
-resolving to `gh`) are rejected. GitHub access from operator chat after untrusted
+resolving to `gh`) are rejected. Any subcommand token with basename `gh` is
+also rejected, including behind exec wrappers such as `nice` or `timeout`.
+At execution the same refusal covers every argv element, before environment
+construction or identity handling. GitHub access from operator chat after untrusted
 ingest goes through a fresh untainted turn or the forge tools. A malformed grant
 rejects the document at load. The agent cannot write `scheduler.yaml` with file
 tools, even on an untainted admin turn. Scheduled turns continue to use their

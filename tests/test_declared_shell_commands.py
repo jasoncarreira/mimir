@@ -108,6 +108,27 @@ def test_operator_declaration_refuses_gh_by_name_path_and_resolved_target(
     assert "fresh untainted turn or the forge tools" in str(caught.value)
 
 
+@pytest.mark.parametrize("wrapper,prefix", [
+    ("nice", []), ("timeout", ["5"]), ("stdbuf", ["-oL"]),
+    ("nohup", []), ("setsid", []), ("ionice", []), ("chrt", ["0"]),
+    ("taskset", ["1"]), ("flock", ["lock"]),
+    ("nice", ["timeout", "5"]),
+])
+@pytest.mark.parametrize("gh_token", ["gh", "/usr/bin/gh", "/usr/bin/../bin/gh"])
+def test_operator_declaration_refuses_wrapped_gh_at_any_depth(
+    tmp_path: Path, wrapper: str, prefix: list[str], gh_token: str,
+) -> None:
+    executable = tmp_path / wrapper
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    entry = {"exec": wrapper, "path": str(executable),
+             "subcommands": [["status"], [*prefix, gh_token, "pr", "view"]]}
+    # Service declarations retain their independent authority.
+    assert len(parse_declared_shell_commands([entry])) == 1
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        access_control.parse_operator_shell_commands([entry])
+
+
 def test_operator_declaration_non_gh_commands_still_match(tmp_path: Path) -> None:
     entries = []
     for name, subcommand in (("gog", ["gmail", "search"]),
