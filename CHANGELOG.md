@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Gmail poller (#1909):** Pass the declared agent command its gog account and
+  keyring environment, permit read-only message and thread gets, and enforce
+  gog's `--readonly` and `--gmail-no-send` flags. Installed homes must refresh
+  their copy of `<home>/skills/gmail-poller` to pick up this fix.
+
 - **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
 
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted

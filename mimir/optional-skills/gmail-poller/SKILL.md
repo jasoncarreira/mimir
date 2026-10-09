@@ -108,13 +108,15 @@ won't watch a Gmail inbox, so the framework doesn't seed it by default.
    | `MIMIR_GMAIL_QUERY` | no | Gmail search override. Default: `in:inbox newer_than:1d`. Use Gmail's search language: `is:unread`, `from:`, `to:`, `subject:`, `label:`, `-from:` (exclude), `category:primary`, etc. Applies to every account. |
    | `MIMIR_GMAIL_MAX_FETCH` | no | Per-account fetch cap. Default 50, clamp 1–200. |
     | `MIMIR_HOME` | no (yes if any `prompt-file` is set) | Agent home root. Used to resolve `prompt-file` entries against `<MIMIR_HOME>/prompts/`. |
-    | `GOG_ACCOUNT` | only in Mode B | Gmail address for single-account legacy mode. Ignored when `config.json` is present. |
+    | `GOG_ACCOUNT` | Mode B and agent-turn reads | Gmail address for single-account legacy mode. The poller ignores it when `config.json` is present, but the declared agent-turn wrapper still requires it and restricts reads to that account. |
+    | `GOG_KEYRING_PASSWORD` | if gog's keyring needs it | Passed only to the declared agent-turn command; the poller script's `pass_env` is unchanged. |
     | `JEV_KEY` | only when `triage` is enabled | TypeSafe API key used by the optional Jev pre-turn triage. |
 
-   All env vars listed above (including `MIMIR_HOME` and `JEV_KEY`) are declared in
-   `pollers.json` `pass_env`. `MIMIR_*`-prefixed keys would otherwise
-   be stripped by the env filter — explicit `pass_env` bypasses both
-   gates.
+    The poller script's env vars (including `MIMIR_HOME` and `JEV_KEY`) are
+    declared in the poller's `pass_env`. The agent-turn command separately
+    passes `GOG_ACCOUNT` and `GOG_KEYRING_PASSWORD`. `MIMIR_*`-prefixed keys
+    would otherwise be stripped by the env filter — explicit `pass_env`
+    bypasses both gates.
 
 ### Optional Jev triage
 
@@ -236,8 +238,19 @@ The framework wraps the JSONL into an `AgentEvent` per item (or per
 `batch_size` items if you bump that in `pollers.json` — default here
 is 5 so a quiet inbox produces one turn for the burst, not five).
 
-In agent turns, inspect your state with `read_file`, `ls`, `glob` and `grep`;
-the shell is only for `run-gog.sh`.
+In agent turns, inspect your state with `read_file`, `ls`, `glob` and `grep`.
+The shell is only for `run-gog.sh`, which supports exactly these commands:
+
+```sh
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox is:unread' --account "$GOG_ACCOUNT" --max 5 --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail get 19483abc --account "$GOG_ACCOUNT" --full --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail thread get 19483abc --account "$GOG_ACCOUNT" --full --json --no-input
+```
+
+It also supports `auth list` for checking authentication. Message and thread
+reads require one ID; search requires one query. The wrapper restricts options
+and accounts and always passes gog's `--readonly` and `--gmail-no-send` runtime
+blocks on mutating requests and sends. Attachment downloads are not permitted.
 
 ## Cursor model
 
@@ -310,9 +323,11 @@ unfamiliar senders' requests.
   own fire interval — read the effective value from the injected
   `POLLER_TIMEOUT_SECONDS`). Overrunning discards every event the run
   had already emitted, so it loses the whole poll, not just the tail.
-- **Don't put gog credentials in `pass_env`**. gog reads its own creds
-  from `~/.config/gogcli/`. `JEV_KEY` is the sole API credential passed
-  explicitly, and is used only for accounts that opt in to triage.
+- **Don't put gog OAuth tokens in `pass_env`**. gog reads its own creds
+  from `~/.config/gogcli/`. The declared agent-turn command passes
+  `GOG_KEYRING_PASSWORD` when needed to unlock that store; the poller
+  script's `pass_env` does not pass it. `JEV_KEY` is passed to the poller
+  only for accounts that opt in to triage.
 - **Don't delete the cursor on every container rebuild**. Cursor
   lives at `<home>/state/pollers/gmail-inbox/` (persistent volume),
   separate from the skill dir — same rationale as github-poller.
