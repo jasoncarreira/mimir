@@ -9917,7 +9917,8 @@ print(json.dumps([str(path) for path in pruned]))
     monkeypatch.setattr(ChainlinkClaims, "release_issue", release_issue)
     monkeypatch.setattr(FeatureFactoryBackend, "admit", lambda self: Path(retained.launcher))
     compute = LocalCompute() if local_compute else Compute()
-    backend = Backend(entrypoint=retained.launcher)
+    # Poll promptly in this recovery test; production retains its 10s cadence.
+    backend = Backend(entrypoint=retained.launcher, poll_interval_s=0.05)
     try:
         result = asyncio.run(
             WorklinkRunner(
