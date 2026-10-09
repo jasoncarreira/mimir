@@ -467,6 +467,18 @@ def _validated_paths(paths: tuple[str, ...], *, required: bool) -> tuple[str, ..
     return paths
 
 
+def _out_of_scope_paths_message(paths: set[str]) -> str:
+    """Bound index path names and escape controls before adding them to a refusal."""
+    if not paths:
+        return "nothing staged"
+    # These names come from the index, not from a requested Git operation.
+    # Render them as data without changing the dirty_out_of_scope refusal code.
+    shown = sorted(paths)[:10]
+    names = ", ".join(repr(path) for path in shown)
+    more = len(paths) - len(shown)
+    return f"{names} … and {more} more" if more else names
+
+
 class RepoGitTools:
     """Execute closed Git operations against one active repository scope."""
 
@@ -1030,13 +1042,23 @@ class RepoGitTools:
                 "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
             )).stdout.split("\x00")))
             if not staged_before.issubset(paths):
-                raise GitRefusal("dirty_out_of_scope", "the index contains paths outside this commit")
+                raise GitRefusal(
+                    "dirty_out_of_scope",
+                    "the index contains paths outside this commit: "
+                    f"{_out_of_scope_paths_message(staged_before - set(paths))}; "
+                    "include them in `paths`, or unstage them",
+                )
             self._stage(paths)
             staged_after = set(filter(None, self._command((
                 "diff", "--cached", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
             )).stdout.split("\x00")))
             if not staged_after or not staged_after.issubset(paths):
-                raise GitRefusal("dirty_out_of_scope", "staged paths do not match the explicit commit scope")
+                raise GitRefusal(
+                    "dirty_out_of_scope",
+                    "staged paths do not match the explicit commit scope: "
+                    f"{_out_of_scope_paths_message(staged_after - set(paths))}; "
+                    "include them in `paths`, or unstage them",
+                )
             result = self._command(("commit", "-m", operation.message), identity=True)
             self._refresh_expected_head()
         elif isinstance(operation, GitMerge):

@@ -165,6 +165,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_ALLOW_UNAUTHENTICATED` | bool | `false` | Suppress the empty-`MIMIR_API_KEY` startup warning (dev/localhost only). |
 | `MIMIR_ATTACHMENTS_MAX_BYTES` | int | `26214400` (25 MiB) | Per-file cap on inbound chat attachments downloaded to disk. |
 
+The browser session cookie is `Secure` only over HTTPS. Plain-HTTP remote access works, but sends the key unencrypted; use HTTPS or a tunnel when possible.
+
 ## Cost & usage limits
 
 | Flag | Type | Default | Description |
@@ -203,15 +205,21 @@ Use only read-only verbs: **never declare** `gog gmail send`, `acli jira workite
 create/transition`, or another mutating command. This is an explicit chat grant,
 not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
 executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
-`payload_args`, and interpreter/script entries are rejected. A malformed grant
+`payload_args`, interpreter/script entries, and `gh` (including paths or symlinks
+resolving to `gh`) are rejected. Any subcommand token with basename `gh` is
+also rejected, including behind exec wrappers such as `nice` or `timeout`.
+All these basename comparisons are case-insensitive (`gh`, `GH`, and `Gh`).
+At execution the same refusal covers every argv element, before environment
+construction or identity handling, and names the offending argument. This
+fail-closed rule also refuses literal search arguments such as
+`chainlink issue search gh`. GitHub access from operator chat after untrusted
+ingest goes through a fresh untainted turn or the forge tools. A malformed grant
 rejects the document at load. The agent cannot write `scheduler.yaml` with file
 tools, even on an untainted admin turn. Scheduled turns continue to use their
 own job declarations. The executable runs as server-bound argv, in a server-
 selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
-baseline; it never receives the whole process environment. For declared `gh`,
-`GITHUB_TOKEN` must be named in the command's `pass_env`, not merely the shell
-baseline (`GH_*` overrides remain rejected by the declaration parser). Its config directory is isolated
-from `$HOME/.config/gh` and its identity is confirmed before execution.
+baseline; it never receives the whole process environment. `GH_*` overrides
+remain rejected by the declaration parser.
 
 Each subcommand prefix admits **every deeper verb**. Declare full read-only leaf
 paths such as `[jira, workitem, search]`, never `[jira, workitem]`. This grant
@@ -396,7 +404,7 @@ repository files and model-generated values never add permission entries.
 | `MIMIR_SCRATCH_JANITOR_ROOTS` | list | `scratch` | Comma-separated home-relative roots to sweep (nested paths allowed, e.g. `state/worklink/transcripts`); absolute or `..` entries are rejected. |
 | `MIMIR_CHAINLINK_AUTOINIT` | bool | `1` (on) | Auto-run `chainlink init` on boot if `.chainlink` absent and the CLI is present. |
 | `MIMIR_FACTORY_EPICS_ENABLED` | bool | off | Feature-factory epic dispatch in the chainlink-orchestrator poller (`worklink:epic`). |
-| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.10.11 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
+| `MIMIR_FACTORY_ENTRYPOINT` | absolute path | `/opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` | Package-bound feature-factory 0.10.14 launcher. Worklink rejects relative, missing, unpinned, or adapter-version-mismatched entrypoints. |
 | `MIMIR_FACTORY_MAX_CONCURRENT` | positive int | `1` | Factory-only concurrent Chainlink claim cap. The ordinary leaf cap remains `defaults.max_concurrent` with default `2`. |
 | `MIMIR_FACTORY_MAX_RETRIES` | ASCII decimal integer | `5` | Factory `/feature` retry budget. Accepts exactly ASCII `[0-9]+` valued from `1` through `9007199254740991`; absent or invalid values fall back to `5`. |
 | `MIMIR_FACTORY_RUN_TIMEOUT_S` | float | `43200` (12h) | OpenCode process liveness backstop. Expiry cancels only the verified process group. |
@@ -591,14 +599,14 @@ bypass that gate; the default Python suite remains required.
 | `defaults.max_concurrent` | positive int | `2` | Caps claims across autonomous poller/tool dispatch; the operator CLI is uncapped. | `max_concurrent: 4` |
 | `defaults.reaper_ttl_s` | positive int | `86400` | Lost-heartbeat recovery grace in seconds. Minimum `2 * timeout_s` (3600 for a 1800-second leaf); lower values warn and are raised at load. Backend waiting and finalization, including gate reruns, heartbeat throughout; this is not a total-runtime bound or atomic publication fence. Factory claims are excluded from the leaf reaper. | `reaper_ttl_s: 86400` |
 | `defaults.allow_autonomous_local_subprocess` | bool | `false` | Allows autonomous use of `local_subprocess`, which has shared filesystem access and no network isolation. This accepts that blast radius; the operator CLI is unaffected. | `allow_autonomous_local_subprocess: true` |
-| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.10.11 runtime consumes it. | `epic_branch_prefix: "epic/"` |
-| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.10.11 runtime consumes it. | `max_review_retries: 3` |
-| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.10.11 runtime consumes it. | `max_claim_attempts: 5` |
-| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.10.11 runtime consumes it. | `reviewer_backend: opencode` |
+| `defaults.epic_branch_prefix` | str | `epic/` | Compatibility-only field retained after integrated epic execution was removed; no 0.10.14 runtime consumes it. | `epic_branch_prefix: "epic/"` |
+| `defaults.max_review_retries` | positive int | `3` | Compatibility-only parsed field; no 0.10.14 runtime consumes it. | `max_review_retries: 3` |
+| `defaults.max_claim_attempts` | positive int | `3` | Compatibility-only parsed field; no 0.10.14 runtime consumes it. | `max_claim_attempts: 5` |
+| `defaults.reviewer_backend` | backend name | value of `defaults.backend` | Compatibility-only parsed field from integrated epic review; no 0.10.14 runtime consumes it. | `reviewer_backend: opencode` |
 | `defaults.tiered_review` | mapping | framework defaults | Compatibility-only parsed review classifier; its child keys are described below. | `tiered_review: {multi_vote_reviewer_count: 5}` |
 
 `defaults.trusted_test_retries` is **retired**, not an operator setting in
-0.10.11. It belonged to the removed distributed trusted-test runner. A value in
+0.10.14. It belonged to the removed distributed trusted-test runner. A value in
 YAML has no effect and must not be used as a retry guarantee; for example,
 remove `trusted_test_retries: 1` from an older deployment file.
 
@@ -650,7 +658,7 @@ routes:
 ### Backend blocks
 
 `backends` defaults to `{}`. Only `opencode` and `feature_factory` ship in
-0.10.11. An unknown referenced backend fails configuration loading; stale settings
+0.10.14. An unknown referenced backend fails configuration loading; stale settings
 for an unreferenced backend are warned and dropped.
 
 | Key | Type | Default | Effect | Example |
@@ -661,7 +669,7 @@ for an unreferenced backend are warned and dropped.
 | `backends.opencode.bash_allowlist` | list[str] | `["git *", "uv *"]` | Replaces the deny-first shell command grants sent through `OPENCODE_PERMISSION`. Empty denies all shell commands; catch-all `*` is rejected. This is not a process sandbox. | `bash_allowlist: ["git *", "npm test*"]` |
 | `backends.feature_factory.entrypoint` | absolute path | `MIMIR_FACTORY_ENTRYPOINT` or the fixed image path | Exact `feature-factory/bin/factory.js` used by every `node` control command and retained recovery record. | `entrypoint: /opt/mimir-opencode/lib/node_modules/feature-factory/bin/factory.js` |
 
-The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.10.11` and `opencode-feature-factory@0.10.11` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
+The retired `backends.feature_factory.bin`, `args`, `ready`, and `reviewer` keys are rejected with migration guidance. The image installs `feature-factory@0.10.14` and `opencode-feature-factory@0.10.14` under one npm prefix and registers only the OpenCode adapter. Runtime controls are `status`, `resume`, `heartbeat`, and run-ID-first `lock` actions; cancellation uses `mimir worklink stop` and never invokes a factory cancel transition.
 
 For example, to bound pytest runs launched by the model (including through bash):
 
@@ -722,6 +730,7 @@ by the core proposals helper that verifies social-outbox merge approval.
 | `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
 | `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. |
+| `MIMIR_GITHUB_TRUSTED_BOT_LOGINS` | csv exact logins | `""` (none) | Operator action: explicitly trust PR authors that are GitHub bots/apps, e.g. `dependabot[bot]`. Case-insensitive exact match only; other bots remain untrusted. Set only for bot identities whose repository output you intend to attest. |
 | `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
 
 ## Bridges (credentials)

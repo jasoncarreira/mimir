@@ -6,57 +6,7 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-- **SAGA (#1908):** Session-end prompts list tools from the session-boundary
-  capability set and limit verification to known atom and turn IDs; claims
-  needing file reads are tagged for later verification.
-
-- **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
-  active ingest even in shadow mode, for service and operator turns alike. Ask
-  the operator to arm the leaf for server-side ready-queue dispatch or run the
-  Worklink CLI from a clean operator context.
-
-- **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
-  `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
-  bounded argv with scrubbed environment and value-free audit events; job grants
-  remain job-scoped. Mutating verbs must not be declared. Read queries can bring
-  sensitive data into the still-tainted turn; outbound sink checks remain in force.
-
-- Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
-- After untrusted ingest, admitted Chainlink calls through declared service or
-  request-bound operator command paths cannot change `worklink:*` labels, create
-  armed issues, or update armed issues even in shadow mode (#1897). Bounded
-  unarmed issue filing and comments remain available; the operator must review
-  an unarmed description before applying `worklink:ready`. Attached
-  `-l=worklink:ready` labels are normalized like Clap. The veto classifies the
-  admitted execution argv (the operator binding or service-profile parser), so
-  quoted literal `? * [ ] { }` in titles and descriptions cannot skip it.
-  Admitted Chainlink argv outside the built-in classifier fail closed on tainted
-  turns (including end-of-options `--`), except known read-only issue queries.
-  This also refuses unclassified unarmed mutations; use a canonical unarmed
-  command or comment instead. Unknown service commands remain subject to the
-  existing exact-argv profile gate, without a substring veto on read-only
-  diagnostics. Generic `shell_exec`/`bash_async` behavior and
-  explicit one-time operator sink approvals are unchanged. Open shell execution
-  is not covered by this arming veto: runtime-built names, encoded payloads,
-  indirect execution and direct tracker SQLite writes cannot be confined by
-  argv inspection. A shell-wide post-ingest policy remains separate (#1872).
-  Clean turns are unchanged; this gate does not provide filesystem confinement
-  for other tools or broaden any declared-command profile.
-- Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
-- ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
-  internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
-- **Operator action (#1893):** After untrusted ingest, schedule writes and edits to
-  live scheduler, prompt, poller override, core memory, index and skill instruction
-  files are refused even with IFC enforcement in shadow mode. Propose the change
-  with `open_proposal` / `submit_proposal` for operator merge instead. Poller reload
-  and edits inside proposal worktrees remain available. `list_schedules` now
-  preserves trusted turn integrity.
-- Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
-  models and real stdio contract tests. This fixes the silent tool-discovery
-  failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
-  A dedicated lifecycle task owns SDK contexts so production shutdown can
-  be requested from a different task without leaking the server subprocess.
-- Deliver substantive autonomous `send_message` briefs after stripping a trailing skip-list stop sentence, while continuing to block narration (#1892).
+Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
 ## [0.9.6] — 2026-10-08
 

@@ -282,10 +282,24 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     from operator configuration rather than language-specific inference here.
     Children receive only non-secret process settings by default. Executables
     can receive exact names from the matching operator declaration. The legacy
-    gh credential grant retains its config isolation and identity confirmation.
+    gh credential grant retains its config isolation and identity confirmation
+    for non-declared service commands.
     """
-    env = _minimal_direct_exec_env()
     binding = _DIRECT_EXEC_ARGV.get()
+    if binding is not None and binding.operator_declared:
+        offending = next(
+            ((index, token) for index, token in enumerate(argv or ())
+             if Path(token).name.casefold() == "gh"), None,
+        )
+        if offending is not None:
+            from .refusals import ToolPolicyRefusal
+
+            index, token = offending
+            raise ToolPolicyRefusal(
+                f"operator-declared gh is refused: argv[{index}]={token!r}; "
+                "use a fresh untainted turn or the forge tools"
+            )
+    env = _minimal_direct_exec_env()
     if binding is not None and binding.operator_declared and binding.argv == tuple(argv or ()):
         # The interactive shell's explicitly configured pass-through is a
         # deployment baseline, but direct execution still pins PATH.
@@ -308,17 +322,7 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
         if key in os.environ:
             env[key] = os.environ[key]
     if _is_gh_argv(argv):
-        if (binding is not None and binding.operator_declared
-                and ("GITHUB_TOKEN" not in names or not env.get("GITHUB_TOKEN", "").strip())):
-            # Missing authority/credentials is a per-call refusal, not evidence
-            # that the process's verified GitHub identity changed. Do not let
-            # tainted chat input trip the global identity-degraded latch.
-            from .refusals import ToolPolicyRefusal
-
-            raise ToolPolicyRefusal(
-                "operator-declared gh requires an explicit non-empty GITHUB_TOKEN grant"
-            )
-        # Even explicit chat declarations must not discover ambient on-disk auth.
+        # Non-declared gh must not discover ambient on-disk auth.
         env["GH_CONFIG_DIR"] = _GH_CONFIG_DIR
         from .forge import confirm_github_tool_identity
 

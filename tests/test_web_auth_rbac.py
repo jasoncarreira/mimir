@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from pathlib import Path
 
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from mimir.bridges.web_chat import WebChatBridge
 from mimir.turn_event_bus import TurnEventBus
@@ -49,15 +50,44 @@ async def test_cookie_session_requires_valid_header_and_keeps_csrf_gate(tmp_path
         assert good.status == 200
         cookie = good.cookies["mimir_session"]
         assert cookie["httponly"] and cookie["samesite"] == "Strict"
-        assert not cookie["secure"]  # loopback Host
+        assert not cookie["secure"]  # plain HTTP, including localhost
+        assert cookie["path"] == "/"
         only_cookie = {"Cookie": "mimir_session=master-secret"}
         assert (await c.get("/api/v1/turns", headers=only_cookie)).status == 200
         assert (await c.post("/api/v1/turns", headers={**only_cookie, "Sec-Fetch-Site": "cross-site"})).status == 403
         assert (await c.post("/api/v1/turns", headers={"X-API-Key": "master-secret"})).status == 200
         cleared = await c.delete("/api/v1/web/session", headers=only_cookie)
         assert cleared.cookies["mimir_session"]["max-age"] == "0"
-        public = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret", "Host": "example.org"})
-        assert public.cookies["mimir_session"]["secure"]
+        for host in ("example.org", "192.168.1.20:8080", "localhost"):
+            public = await c.post("/api/v1/web/session", headers={"X-API-Key": "master-secret", "Host": host})
+            assert public.status == 200
+            cookie = public.cookies["mimir_session"]
+            assert not cookie["secure"], host
+            assert cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+        proxied = await c.post("/api/v1/web/session", headers={
+            "X-API-Key": "master-secret", "Host": "example.org", "X-Forwarded-Proto": "https, http",
+        })
+        cookie = proxied.cookies["mimir_session"]
+        assert cookie["secure"] and cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+
+    # A TLS transport cannot be downgraded by a forwarded HTTP claim.
+    for headers in ({}, {"X-Forwarded-Proto": "http"}):
+        request = make_mocked_request(
+            "POST", "/api/v1/web/session",
+            headers={"X-API-Key": "master-secret", "Host": "example.org", **headers},
+            app=app, sslcontext=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
+        )
+        assert request.secure
+        response = await _web_session_post(request)
+        cookie = response.cookies["mimir_session"]
+        assert cookie["secure"] and cookie["httponly"] and cookie["samesite"] == "Strict" and cookie["path"] == "/"
+
+    # The handler also refuses bad credentials independently of the middleware.
+    bad_request = make_mocked_request(
+        "POST", "/api/v1/web/session", headers={"X-API-Key": "wrong"}, app=app,
+    )
+    bad_response = await _web_session_post(bad_request)
+    assert bad_response.status == 401 and "mimir_session" not in bad_response.cookies
 
 
 def _resolver(home: Path) -> IdentityResolver:

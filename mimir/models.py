@@ -561,6 +561,11 @@ class RepositoryAuthorTrustCache:
     _verdicts: dict[tuple[str, str], bool] = field(default_factory=dict, repr=False)
     _lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
+    def trusted(self, repository: str, author: str) -> bool:
+        """Inspect an existing affirmative verdict without contacting the forge."""
+        with self._lock:
+            return self._verdicts.get((repository.casefold(), author.casefold())) is True
+
     def resolve(self, repository: str, author: str, attest: Any) -> bool | None:
         key = (repository.casefold(), author.casefold())
         # Serialize concurrent reads so one author incurs only one attestation.

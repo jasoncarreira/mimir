@@ -33,6 +33,16 @@ Less likely to be accepted without prior discussion:
 
 If you're unsure, open an issue first.
 
+## Changelog
+
+For each change, add one `changelog.d/<issue-id>.md` (or a short slug if there
+is no issue ID), starting with a Markdown bullet exactly as it should appear in
+the release notes. See [changelog.d/README.md](changelog.d/README.md) for an
+example. Do not edit `CHANGELOG.md`'s `[Unreleased]` section in a change PR.
+When preparing a release, run `python scripts/changelog_collect.py X.Y.Z`
+(optionally with `--date YYYY-MM-DD`) in the release PR. Commit the
+generated versioned section and fragment removals with the version bump.
+
 ## Code style
 
 - Python 3.11+

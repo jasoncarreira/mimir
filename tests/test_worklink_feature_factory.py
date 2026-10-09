@@ -27,6 +27,7 @@ from mimir.worklink.backends.feature_factory import (
     _factory_max_retries,
     _run_bounded,
 )
+from mimir.worklink.factory_state import FactoryRunRecord, load_factory_record, save_factory_record
 
 
 def status_payload(**overrides: Any) -> dict[str, Any]:
@@ -95,7 +96,7 @@ def package_entrypoint(tmp_path: Path) -> Path:
 
 
 def structured_status_payload() -> dict[str, Any]:
-    # 0.10.11 release shape, including Gate 3's commit binding, not a live probe.
+    # Release shape including Gate 3's commit binding, not a live probe.
     return status_payload(
         steps=[{"agent": "spec-writer", "status": "blocked", "attempts": 2}],
         slices=[{
@@ -608,7 +609,7 @@ def test_status_rejects_invalid_utf8_nul_and_oversize(payload: bytes) -> None:
 def test_resolve_entrypoint_is_absolute_package_bound_and_lockstep(tmp_path: Path) -> None:
     entrypoint = package_entrypoint(tmp_path)
     assert resolve_factory_entrypoint(entrypoint) == entrypoint.resolve()
-    assert FACTORY_VERSION == "0.10.11"
+    assert FACTORY_VERSION == "0.10.14"
     with pytest.raises(FactoryContractError, match="absolute"):
         resolve_factory_entrypoint(Path("feature-factory/bin/factory.js"))
 
@@ -633,7 +634,7 @@ def test_admit_rejects_either_package_version_mismatch(
     entrypoint = package_entrypoint(tmp_path)
     manifest = entrypoint.parents[2] / package / "package.json"
     manifest.write_text(
-        json.dumps({"name": expected_name, "version": "0.8.2"}),
+        json.dumps({"name": expected_name, "version": "0.10.11"}),
         encoding="utf-8",
     )
     calls: list[tuple[str, ...]] = []
@@ -1057,6 +1058,55 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
     ]
     assert all(args[:2] == ("node", str(entrypoint.resolve())) for args, _ in calls)
     assert all("cwd" not in kwargs for _, kwargs in calls)
+
+
+def test_synced_base_status_reads_through_controls_and_retained_record(tmp_path: Path) -> None:
+    entrypoint = package_entrypoint(tmp_path)
+    sandbox = tmp_path / "operator"
+    sandbox.mkdir()
+    base_syncs = [{
+        "merge_commit": "a" * 40,
+        "previous_head": "b" * 40,
+        "base": "c" * 40,
+        "previous_base": "d" * 40,
+        "reason": "base fix for bootstrap",
+        "at": "2026-10-06T12:00:00Z",
+    }]
+    payload = status_payload(sandbox_path=str(sandbox), base_syncs=base_syncs)
+    seen: list[str] = []
+
+    def runner(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        seen.append(args[2])
+        return subprocess.CompletedProcess(
+            args, 0,
+            stdout=json.dumps(payload).encode() if args[2] == "status" else b"",
+            stderr=b"",
+        )
+
+    backend = FeatureFactoryBackend(entrypoint=str(entrypoint), runner=runner)
+    status = backend.status("1551", sandbox=sandbox, launcher=entrypoint)
+    resumed = backend.resume(
+        "1551", session="session-1", sandbox=sandbox, launcher=entrypoint,
+    )
+    backend.heartbeat("1551", session="session-1", sandbox=sandbox, launcher=entrypoint)
+    backend.lock("1551", "steal", session="session-1", sandbox=sandbox, launcher=entrypoint)
+    assert seen == ["status", "resume", "status", "heartbeat", "lock"]
+    assert resumed == status
+
+    # The retained Worklink envelope is strict, but its cached factory status
+    # passes through the same additive top-level status parser.
+    record = FactoryRunRecord.from_json({
+        "version": 2,
+        "run_id": "1551", "issue_id": 1551, "attempt": 1,
+        "repository": "owner/repo", "base_ref": "main", "branch": "epic/1551",
+        "launcher": str(entrypoint), "sandbox": str(sandbox),
+        "session": "session-1", "handle": None, "status": payload,
+        "observed_at": None, "controller_phase": "parked",
+        "controller_error": None, "transcript": None,
+    })
+    assert record.status == status
+    save_factory_record(tmp_path, record)
+    assert load_factory_record(tmp_path, "1551") == record
 
 
 @pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])

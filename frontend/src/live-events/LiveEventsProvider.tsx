@@ -91,6 +91,7 @@ export function LiveEventsProvider({
       return;
     }
     setValue((current) => ({ ...current, status: "connecting", error: null, degraded: false }));
+    const epoch = useUiState.getState().apiKeyEpoch;
 
     const flushAggregateInvalidations = () => {
       invalidateTimer.current = null;
@@ -137,13 +138,18 @@ export function LiveEventsProvider({
         baseUrl,
         fetchImpl,
         initialCursor,
-        onOpen: () => setValue((current) => ({ ...current, status: "open", error: null })),
+        onOpen: () => {
+          if (useUiState.getState().apiKeyEpoch === epoch) useUiState.getState().confirmSessionCookie();
+          setValue((current) => ({ ...current, status: "open", error: null }));
+        },
         onCursor: (cursor) => setValue((current) => ({ ...current, cursor })),
         // The stream has no recovery frame; ordinary events can still be partial.
         onDegraded: () => setValue((current) => ({ ...current, degraded: true })),
         onError: (error) => {
           const reauthenticate = isAuthenticationSseError(error);
-          if (reauthenticate) useUiState.getState().setApiKeyRejected(true);
+          if (reauthenticate && useUiState.getState().apiKeyEpoch === epoch) {
+            useUiState.getState().setApiKeyRejected(true);
+          }
           setValue((current) => ({
             ...current,
             status: reauthenticate ? "reauthenticate" : "error",

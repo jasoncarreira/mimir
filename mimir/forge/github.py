@@ -689,8 +689,15 @@ class GitHubForgeClient:
             if not isinstance(entries, list):
                 raise ForgeError("file content refused: scoped tree is unavailable")
             matches = [entry for entry in entries if isinstance(entry, Mapping) and entry.get("path") == part]
+            if not matches:
+                missing = f" (missing component {part!r})" if index < len(parts) - 1 else ""
+                raise ForgeError(
+                    f"file content refused: path not found at scoped head "
+                    f"{scope.observed_head_sha[:12]}{missing}; list the PR's changed paths "
+                    "with pr_files, or check the path's spelling"
+                )
             if len(matches) != 1:
-                raise ForgeError("file content refused: path is not a regular file at scoped head")
+                raise ForgeError("file content refused: scoped tree is unavailable")
             entry = matches[0]
             final = index == len(parts) - 1
             if final:
