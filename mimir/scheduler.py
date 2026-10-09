@@ -397,6 +397,23 @@ class SchedulerJob:
         )
 
 
+def scheduler_document_jobs(raw: object) -> list[Any]:
+    """Return the jobs in either accepted scheduler.yaml document shape.
+
+    This checks the top-level shape only; callers validate individual jobs and
+    operator shell commands separately. A null document is handled by callers.
+    """
+    if isinstance(raw, list):
+        return raw
+    if (
+        isinstance(raw, dict)
+        and not set(raw) - {"jobs", "operator_shell_commands"}
+        and isinstance(raw.get("jobs"), list)
+    ):
+        return raw["jobs"]
+    raise ValueError("scheduler document requires a list or a mapping with a jobs list")
+
+
 def load_jobs_from_text(
     text: str,
     *,
@@ -420,12 +437,18 @@ def load_jobs_from_text(
         }]
     if raw is None:
         return [], []
+    try:
+        jobs = scheduler_document_jobs(raw)
+    except ValueError:
+        reason = (
+            "scheduler mapping requires a jobs list and only operator_shell_commands"
+            if isinstance(raw, dict) else "scheduler document must be a list"
+        )
+        return [], [{
+            "path": str(source), "job": "<document>", "scope": "document",
+            "reason": reason,
+        }]
     if isinstance(raw, dict):
-        if set(raw) - {"jobs", "operator_shell_commands"} or not isinstance(raw.get("jobs"), list):
-            return [], [{
-                "path": str(source), "job": "<document>", "scope": "document",
-                "reason": "scheduler mapping requires a jobs list and only operator_shell_commands",
-            }]
         try:
             parse_operator_shell_commands(
                 raw.get("operator_shell_commands"), writable_roots=writable_roots,
@@ -435,16 +458,8 @@ def load_jobs_from_text(
                 "path": str(source), "job": "<document>", "scope": "document",
                 "reason": str(exc),
             }]
-        raw = raw["jobs"]
-    if not isinstance(raw, list):
-        return [], [{
-            "path": str(source),
-            "job": "<document>",
-            "scope": "document",
-            "reason": "scheduler document must be a list",
-        }]
     out: list[SchedulerJob] = []
-    for index, entry in enumerate(raw):
+    for index, entry in enumerate(jobs):
         entry_name = f"entry[{index}]"
         if not isinstance(entry, dict):
             rejections.append({

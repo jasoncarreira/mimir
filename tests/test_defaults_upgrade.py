@@ -816,6 +816,70 @@ def test_merge_preserves_operator_comments_via_text_append() -> None:
     assert "# hourly" in new_text
 
 
+@pytest.mark.parametrize("jobs_last", [False, True])
+def test_merge_mapping_inserts_in_jobs_without_rewriting_operator_config(jobs_last) -> None:
+    jobs_block = (
+        "jobs:\n"
+        "  # operator's heartbeat\n"
+        "  - name: heartbeat\n"
+        "    cron: '0 * * * *'  # hourly\n"
+        "    prompt_file: heartbeat.md\n"
+    )
+    commands_block = "operator_shell_commands: []  # operator grants\n"
+    home = (commands_block + jobs_block) if jobs_last else (jobs_block + commands_block)
+    new_text, added = du._merge_scheduler_defaults(
+        base_text=_HEARTBEAT, their_text=_HEARTBEAT + _MEMHYG,
+        home_text=home, version="0.6.7",
+    )
+    assert added == ["memory-hygiene"]
+    assert new_text is not None
+    assert "  # operator's heartbeat" in new_text
+    assert "# hourly" in new_text
+    assert commands_block in new_text
+    assert (new_text.index("  - name: memory-hygiene")
+            < new_text.index("operator_shell_commands:")) == (not jobs_last)
+    jobs, rejections = load_jobs_from_text(new_text)
+    assert rejections == []
+    assert [job.name for job in jobs] == ["heartbeat", "memory-hygiene"]
+
+
+@pytest.mark.parametrize("home", [
+    "jobs: [{name: heartbeat, cron: '0 * * * *', prompt_file: heartbeat.md}]\noperator_shell_commands: []\n",
+    "jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\n    prompt_file: heartbeat.md\njobs: []\n",
+])
+def test_merge_mapping_ambiguous_insertion_is_noop(home, caplog) -> None:
+    assert du._merge_scheduler_defaults(
+        base_text=_HEARTBEAT, their_text=_HEARTBEAT + _MEMHYG,
+        home_text=home, version="0.6.7",
+    ) == (None, [])
+    assert "ambiguous jobs insertion point" in caplog.text
+
+
+def test_merge_rejects_result_with_invalid_existing_job(caplog) -> None:
+    home = (
+        "jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\n    prompt_file: heartbeat.md\n"
+        "  - broken\n"
+        "operator_shell_commands: []\n"
+    )
+    assert du._merge_scheduler_defaults(
+        base_text=_HEARTBEAT, their_text=_HEARTBEAT + _MEMHYG,
+        home_text=home, version="0.6.7",
+    ) == (None, [])
+    assert "merged scheduler.yaml failed validation" in caplog.text
+
+
+def test_merge_rejects_result_missing_new_job(monkeypatch, caplog) -> None:
+    home = "jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\n    prompt_file: heartbeat.md\n"
+    # Even if an insertion yields parseable YAML, it must actually carry the
+    # new jobs before the reconciler can write the result.
+    monkeypatch.setattr(du, "_insert_scheduler_jobs", lambda text, addition, banner: text)
+    assert du._merge_scheduler_defaults(
+        base_text=_HEARTBEAT, their_text=_HEARTBEAT + _MEMHYG,
+        home_text=home, version="0.6.7",
+    ) == (None, [])
+    assert "merged scheduler.yaml failed validation" in caplog.text
+
+
 def test_scheduler_reconcile_proposes_new_default_tick(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
