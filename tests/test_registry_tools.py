@@ -1384,8 +1384,20 @@ class TestSetPollerOverrides:
             explicit_closes.append(fd)
             real_close(fd)
 
+        # Assert on the file object that owns the fd, not on the fd number:
+        # another thread in this worker can reuse a closed fd number at once,
+        # so ``os.fstat(fd)`` would observe state this test doesn't own.
+        owned_files: list[Any] = []
+        real_fdopen = registry.os.fdopen
+
+        def tracked_fdopen(*args: Any, **kwargs: Any) -> Any:
+            fh = real_fdopen(*args, **kwargs)
+            owned_files.append(fh)
+            return fh
+
         monkeypatch.setattr(registry.tempfile, "mkstemp", tracked_mkstemp)
         monkeypatch.setattr(registry.os, "close", tracked_close)
+        monkeypatch.setattr(registry.os, "fdopen", tracked_fdopen)
         monkeypatch.setattr(
             registry.os,
             "fsync",
@@ -1397,8 +1409,7 @@ class TestSetPollerOverrides:
             registry._atomic_write_text(destination, "value")
 
         assert created_fd[0] not in explicit_closes
-        with pytest.raises(OSError):
-            os.fstat(created_fd[0])
+        assert len(owned_files) == 1 and owned_files[0].closed
         assert not destination.exists()
         assert list(tmp_path.iterdir()) == []
 
