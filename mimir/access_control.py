@@ -6084,7 +6084,7 @@ _WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
 
 def _worklink_build_denial(
     tool_name: str, service: ServicePrincipal | None, auth_context: Any,
-    ifc_labels: Any, *, enforce: bool,
+    ifc_labels: Any,
 ) -> "ToolAuthorization":
     state = getattr(auth_context, "ifc_state", None)
     current = getattr(state, "current", None)
@@ -6102,10 +6102,7 @@ def _worklink_build_denial(
     )
     return ToolAuthorization(
         tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
-        allowed=False, reason=(
-            "ifc_label_blocked:spawn" if enforce
-            else "worklink_build_blocked_by_untrusted_ingest"
-        ),
+        allowed=False, reason="worklink_build_blocked_by_untrusted_ingest",
         service_principal=service, required_tier=AccessTier.ADMIN,
         enforcement_enabled=True, would_block=True,
         refusal_detail=(
@@ -6710,18 +6707,13 @@ class SinkGate:
         service = get_trusted_service_from_auth_context(auth_context)
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
-        # The service code-execution tier and the generic SPAWN sink both shadow
-        # their IFC denials. Veto each route before either can return a shadow
-        # allow (or a missing-destination/label shadow allow).
-        if (service is not None and tool_name in _WORKLINK_BUILD_TOOLS
+        # Both service and operator routes need a veto before any shadow allow.
+        # Enforcement already refuses these calls; leave its original decisions,
+        # including destination-denial reasons and refusal details, unchanged.
+        if (not enforce and tool_name in _WORKLINK_BUILD_TOOLS
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             return _worklink_build_denial(
-                tool_name, service, auth_context, ifc_labels, enforce=enforce,
-            )
-        if (service is None and tool_name in _WORKLINK_BUILD_TOOLS
-                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return _worklink_build_denial(
-                tool_name, service, auth_context, ifc_labels, enforce=enforce,
+                tool_name, service, auth_context, ifc_labels,
             )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.

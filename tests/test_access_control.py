@@ -15267,8 +15267,12 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
         integrity_effect="active_ingest",
     )
     tainted_labels = clean.ifc_labels.with_source(source)
-    # A stale fallback must not hide the server-owned live taint.
-    tainted = replace(clean, ifc_state=InformationFlowState(labels=tainted_labels))
+    # Shadow veto must consult live taint even with a stale clean fallback.
+    # Enforcement exercises the existing path with its normal tainted labels.
+    tainted = replace(
+        clean, ifc_labels=tainted_labels if enforce else clean.ifc_labels,
+        ifc_state=InformationFlowState(labels=tainted_labels),
+    )
     registry = ToolRegistry()
     for auth, should_allow in ((clean, True), (tainted, False)):
         decision = registry.authorize_tool(
@@ -15278,20 +15282,20 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
         if not should_allow:
             assert decision.is_shadow_decision is False
             assert decision.enforcement_enabled is True
-            assert decision.reason == (
-                "ifc_label_blocked:spawn" if enforce
-                else "worklink_build_blocked_by_untrusted_ingest"
-            )
-            assert "protected_tool / filesystem" in decision.refusal_detail
-            assert "cannot be started or resumed" in decision.refusal_detail
-            assert "operator" in decision.refusal_detail
-            assert "mimir worklink run" in decision.refusal_detail
-            assert "mimir worklink resume" in decision.refusal_detail
+            if enforce:
+                assert decision.reason == "ifc_label_blocked:spawn"
+            else:
+                assert decision.reason == "worklink_build_blocked_by_untrusted_ingest"
+                assert "protected_tool / filesystem" in decision.refusal_detail
+                assert "cannot be started or resumed" in decision.refusal_detail
+                assert "operator" in decision.refusal_detail
+                assert "mimir worklink run" in decision.refusal_detail
+                assert "mimir worklink resume" in decision.refusal_detail
 
     # Exercise the sink gate itself, including the generic SPAWN route without
     # the registry's preliminary admin/capability decision.
     direct = SinkGate.check_sink_flow(
-        tool_name, str(repo), clean.ifc_labels, tainted, enforce=enforce,
+        tool_name, str(repo), tainted.ifc_labels, tainted, enforce=enforce,
     )
     assert direct.allowed is False
     assert direct.is_shadow_decision is False
@@ -15299,6 +15303,35 @@ def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
         "ifc_label_blocked:spawn" if enforce
         else "worklink_build_blocked_by_untrusted_ingest"
     )
+    if enforce:
+        # Main has no Worklink-specific veto. Disabling its tool set exercises
+        # the unchanged pre-veto path and compares the entire decision, not just
+        # allowed=False (reason, detail, resolved target, and audit flags count).
+        # Pinning the reason above also prevents a vacuous comparison.
+        with monkeypatch.context() as baseline:
+            baseline.setattr(access_control, "_WORKLINK_BUILD_TOOLS", frozenset())
+            main_direct = SinkGate.check_sink_flow(
+                tool_name, str(repo), tainted.ifc_labels, tainted, enforce=True,
+            )
+            main_decision = registry.authorize_tool(
+                tool_name, tainted, enforce=True, target_channel=str(repo),
+            )
+        assert direct == main_direct
+        assert decision == main_decision
+        # Also preserve main's early/mismatched-destination decisions and stale
+        # fallback behavior, even when those differ from the normal tainted path.
+        for fallback in (clean.ifc_labels, tainted_labels):
+            context = replace(tainted, ifc_labels=fallback)
+            for target in (None, str(tmp_path / "outside-repo")):
+                current = registry.authorize_tool(
+                    tool_name, context, enforce=True, target_channel=target,
+                )
+                with monkeypatch.context() as baseline:
+                    baseline.setattr(access_control, "_WORKLINK_BUILD_TOOLS", frozenset())
+                    original = registry.authorize_tool(
+                        tool_name, context, enforce=True, target_channel=target,
+                    )
+                assert current == original
 
 
 def test_worklink_build_veto_does_not_catch_informational_untrusted_sources(
