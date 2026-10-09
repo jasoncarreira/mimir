@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from github_poller_test_support import poller
+from mimir.pollers import _github_author_is_trusted
 
 
 _REAL_PR_AUTHOR_IS_TRUSTED = poller._pr_author_is_trusted
@@ -70,6 +73,26 @@ def test_collaborator_pr_is_reviewed_from_server_attested_author(monkeypatch):
     assert [event["event_type"] for event in events] == ["pr_opened"]
     assert signals == []
     assert seen == [("acme/widget", "api-collaborator", "server-token")]
+
+
+def test_allowlisted_bot_pr_uses_server_actor_without_trust_http(monkeypatch):
+    events, signals = _capture(monkeypatch)
+    _use_real_trust_filter(monkeypatch)
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    monkeypatch.setattr(poller, "_github_content_author", lambda *args: "DEPENDABOT[BOT]")
+    monkeypatch.setattr(poller, "_github_author_is_trusted", _github_author_is_trusted)
+    monkeypatch.setattr(
+        "mimir.pollers.urllib.request.urlopen",
+        Mock(side_effect=AssertionError("unexpected HTTP")),
+    )
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token: [_pr(8, author="impostor")])
+
+    assert poller._check_prs(
+        "acme/widget", "2026-07-28T11:00:00Z", "token", "",
+        trust_cache={}, surfaced_untrusted=set(),
+    ) == 1
+    assert [event["event_type"] for event in events] == ["pr_opened"]
+    assert signals == []
 
 
 def test_non_collaborator_pr_is_not_reviewed_and_surfaces_once(monkeypatch):
