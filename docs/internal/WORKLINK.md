@@ -1083,7 +1083,9 @@ Current slice-1 recovery is manual:
   parents (the recorded integration tip and a PR-base commit strictly advancing
   the branch point), match a clean automatic `git merge-tree` result, and change
   bytes. Conflicts, hand edits, stale or off-base second parents, and no-op
-  merges are refused; failed bootstrap or verify remains recorded and refuses.
+  merges are refused. The command also refuses if the merge is not the
+  integration worktree's HEAD, the integration worktree is not clean, or no slice
+  has merged yet; failed bootstrap or verify remains recorded and refuses.
   For cases `sync-base` refuses, preserve the sandbox and relaunch a new run to
   move the base; never rebase a factory sandbox.
 - **Factory sandbox cleanup:** treat `.factory/<run-id>`, its plan, artifacts, and
