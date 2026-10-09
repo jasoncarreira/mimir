@@ -2381,6 +2381,17 @@ def parse_operator_shell_commands(
     for entry in raw or ():
         if not isinstance(entry, dict):
             raise ValueError("operator_shell_commands entries must be mappings")
+        raw_path = entry.get("path")
+        raw_exec = entry.get("exec")
+        if (isinstance(raw_exec, str) and Path(raw_exec).name.casefold() == "gh"
+                or isinstance(raw_path, str) and raw_path
+                and (Path(raw_path).name.casefold() == "gh"
+                     or Path(raw_path).resolve().name.casefold() == "gh")):
+            raise ValueError(
+                f"operator_shell_commands[{entry.get('exec')!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
         for key in ("external_send", "payload_args", "script"):
             if key in entry and (key != "external_send" or entry[key] is True):
                 raise ValueError(
@@ -2391,6 +2402,15 @@ def parse_operator_shell_commands(
         commands = parse_declared_shell_commands(raw, writable_roots=writable_roots)
     except ValueError as exc:
         raise DeclaredShellCommandError(f"operator_shell_commands: {exc}") from exc
+    for command in commands:
+        # Exec wrappers can invoke gh at any depth in a declared prefix.
+        if any(Path(token).name.casefold() == "gh"
+               for prefix in command.subcommands for token in prefix):
+            raise ValueError(
+                f"operator_shell_commands[{command.executable!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
     return commands
 
 
