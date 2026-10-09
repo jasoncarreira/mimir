@@ -156,7 +156,7 @@ def test_named_author_anchor_requires_bound_attestation(tmp_path, monkeypatch, m
         ifc_state=SimpleNamespace(pr_checkout_author_trust={scope.scope_id: mismatch != "verdict"}),
     )
     monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: None if mismatch == "no_lease" else lease)
-    monkeypatch.setattr(ac, "_lease_head_is_author_attested", lambda *args: True)
+    monkeypatch.setattr(ac, "_lease_head_is_author_attested", lambda *args, **kwargs: True)
     decisions = []
     classify = ac._filesystem_read_trust_anchor
 

@@ -46,6 +46,14 @@ def _env_allow_empty(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def trusted_github_bot_logins() -> frozenset[str]:
+    """Exact, case-insensitive operator-approved GitHub bot logins."""
+    return frozenset(
+        login.casefold() for entry in _env("MIMIR_GITHUB_TRUSTED_BOT_LOGINS").split(",")
+        if (login := entry.strip()) and re.fullmatch(r"[A-Za-z0-9-]{1,39}\[bot\]", login, re.I)
+    )
+
+
 def _load_home_dotenv(home: Path) -> list[str]:
     """Load ``<home>/.env`` as runtime defaults.
 
@@ -1173,6 +1181,7 @@ class Config:
     acp_journal_ttl_days: int = 7
     # Per-process cap for concurrent web-chat SSE subscribers.
     chat_stream_max_subscribers: int = 8
+    github_trusted_bot_logins: frozenset[str] = field(default_factory=trusted_github_bot_logins)
 
     @classmethod
     def from_env(cls) -> "Config":

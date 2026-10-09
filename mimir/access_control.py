@@ -10171,6 +10171,7 @@ def _attested_pr_checkout_lease(
         # cache, but still fail closed against the immutable attested head.
         return _lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
         )
     recorded_head = getattr(review_state, "git_expected_head", None)
     if not recorded_head:
@@ -10189,6 +10190,7 @@ def _attested_pr_checkout_lease(
         lambda: _lease_head_is_author_attested(
             path, expected_branch, expected_head, observed_head,
             observed_state=observed_state,
+            scope=scope, lease=lease, ifc_state=ifc_state,
         ),
     )
 
@@ -10232,10 +10234,13 @@ def _lease_head_is_author_attested(
     current_head: str,
     *,
     observed_state: tuple[str, str] | None = None,
+    scope: Any = None,
+    lease: Any = None,
+    ifc_state: Any = None,
 ) -> bool:
-    """Verify HEAD is the attested commit plus only server-identity commits."""
+    """Verify HEAD against the attested head and the observed protected base."""
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from .repo_tools import hardened_git_command
+    from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
 
     def run(*arguments: str):
         return hardened_git_command(path, arguments, timeout=5)
@@ -10244,21 +10249,35 @@ def _lease_head_is_author_attested(
         actual_state = observed_state or _observed_checkout_state(path)
         if actual_state != (expected_branch, current_head.lower()):
             return False
-        if current_head.lower() == expected_head:
+        if current_head.lower() == expected_head.lower():
             return True
-        ancestry = run("merge-base", "--is-ancestor", expected_head, current_head)
-        if ancestry.returncode != 0:
+        base = getattr(scope, "observed_base_sha", "").lower()
+        protected_base = (
+            getattr(scope, "destination_ref", None) in _PROTECTED_BRANCH_REFS
+            and len(base) == 40 and all(c in "0123456789abcdef" for c in base)
+            and base == getattr(lease, "base_sha", "").lower()
+        )
+        head_ancestor = run("merge-base", "--is-ancestor", expected_head, current_head).returncode == 0
+        base_ancestor = protected_base and run(
+            "merge-base", "--is-ancestor", base, current_head,
+        ).returncode == 0
+        if not head_ancestor and not base_ancestor:
             return False
         commits = run(
             "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce",
-            f"{expected_head}..{current_head}", "--",
+            current_head, "--not", expected_head, *( (base,) if base_ancestor else () ), "--",
         )
         if commits.returncode != 0:
             return False
         fields = [field for field in commits.stdout.split("\x00") if field]
-        expected_identity = [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL] * 2
-        return bool(fields) and len(fields) % 4 == 0 and all(
-            fields[index:index + 4] == expected_identity
+        return len(fields) % 4 == 0 and all(
+            fields[index + 2:index + 4] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]
+            and (
+                fields[index:index + 2] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]
+                or ifc_state is not None and ifc_state.repository_author_trust.trusted(
+                    scope.canonical_repo, fields[index],
+                )
+            )
             for index in range(0, len(fields), 4)
         )
     except (OSError, subprocess.SubprocessError):

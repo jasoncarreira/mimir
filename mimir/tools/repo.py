@@ -146,7 +146,7 @@ def _publish_attested_lease_result(
     state: RepoReviewState,
 ) -> None:
     """Publish exact-scope provenance when the checkout remains author-attested."""
-    from ..access_control import _attested_pr_checkout_lease, publish_protected_result
+    from ..access_control import _attested_pr_checkout_lease
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     if context is None:
@@ -154,13 +154,25 @@ def _publish_attested_lease_result(
     scope = state.action_scope
     if not _attested_pr_checkout_lease(context, scope, state.checkout_lease):
         return
+    _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
+
+
+def _publish_attested_scope_result(
+    runtime: ToolRuntime[AuthContext] | None, scope: Any, head_sha: str,
+) -> None:
+    """Publish the exact repository source shared by checkout and Git results."""
+    from ..access_control import publish_protected_result
+
+    context = getattr(runtime, "context", None) if runtime is not None else None
+    if context is None:
+        return
     principal = getattr(context, "canonical_principal", None)
     if getattr(context, "is_service", False) and principal:
         principal = f"service:{principal}"
     publish_protected_result((SourceLabel(
         principal=principal,
         domain="repository",
-        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{head_sha}",
         bridge_instance="forge",
         sensitivity="internal",
         authorized_principals=frozenset({principal}) if principal else frozenset(),
@@ -252,7 +264,7 @@ def _execute(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,
                     previous_head,
                 )
-        if isinstance(operation, (GitStatus, GitDiff, GitUnmerged)):
+        if result["ok"]:
             _publish_attested_lease_result(runtime, state)
         return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
@@ -314,15 +326,17 @@ def repo_checkout(
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
     client = _client(scope)
-    attest = getattr(client, "author_is_trusted", None)
-    if callable(attest):
+    from .forge import _author_verdict
+
+    if callable(getattr(client, "author_is_trusted", None)) or (
+        isinstance(scope.pull_request_author, str) and scope.pull_request_author.endswith("[bot]")
+    ):
         authors, _ = _call(lambda: _pr_content_authors(client, scope))
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
-            verdict = context.ifc_state.repository_author_trust.resolve(
-                scope.canonical_repo, scope.pull_request_author,
-                lambda: attest(scope.canonical_repo, scope.pull_request_author),
-            )
+            verdict = _author_verdict(context, scope, scope.pull_request_author, client)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    if context.ifc_state.pr_checkout_author_trust[scope.scope_id] is True:
+        _publish_attested_scope_result(runtime, scope, lease.head_sha)
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),

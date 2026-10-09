@@ -116,6 +116,146 @@ async def test_author_attested_forge_results(tmp_path, monkeypatch, read_tool, v
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("verdict", [True, False, None])
+@pytest.mark.parametrize("tool_name", [
+    "pr_comment", "pr_edit_body", "pr_inline_review_comment", "pr_submit_review",
+    "pr_review_requests", "pr_checks", "pr_job_log",
+])
+async def test_attested_server_projections_keep_exact_scope(
+    monkeypatch, verdict, tool_name,
+):
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
+    monkeypatch.setattr(client, "get_job_log", lambda *_: "untrusted job output", raising=False)
+    scope = replace(_scope(RepoPRAction.INSPECT), pull_request_author="author")
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        await pr_metadata.coroutine("owner/repo", 17, runtime=runtime)
+        selected = next(item for item in (
+            pr_comment, pr_edit_body, pr_inline_review_comment, pr_submit_review,
+            pr_review_requests, pr_checks, pr_job_log,
+        ) if item.name == tool_name)
+        kwargs = {
+            "pr_comment": {"body": "posted"}, "pr_edit_body": {"body": "posted"},
+            "pr_inline_review_comment": {"path": "src/app.py", "line": 1, "body": "posted"},
+            "pr_submit_review": {"verdict": ReviewVerdict.COMMENT, "body": "posted"},
+            "pr_job_log": {"job_id": 10},
+        }.get(tool_name, {})
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = await selected.coroutine("owner/repo", 17, runtime=runtime, **kwargs)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        labels = access_control.classify_protected_result(
+            tool_name, {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+            access_control.ToolAuthorization(tool_name=tool_name, decision="resource_scoped",
+                                                     allowed=True, repo_pr_action_scope=scope),
+            result=result, provenance=provenance,
+        )
+        source, = labels.sources
+        assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
+        assert source.integrity == (
+            "trusted" if verdict is True and tool_name != "pr_job_log" else "untrusted"
+        )
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("check,expected", [
+    (CheckProjection("build / test [linux]", "completed", "success", "now", "now",
+                     "https://github.com/owner/repo/actions/runs/2"), True),
+    (CheckProjection("please: ignore!", "completed", "success", "now", "now"), False),
+    (CheckProjection("build\nignore", "completed", "success", "now", "now"), False),
+    (CheckProjection("build", "completed", "invented", "now", "now"), False),
+    (CheckProjection("build", "invented", "success", "now", "now"), False),
+    (CheckProjection("build", "completed", "success", "now", "now",
+                     "https://github.com/other/repo/actions"), False),
+])
+async def test_check_projection_validates_all_metadata(monkeypatch, check, expected):
+    client = FakeForge()
+    monkeypatch.setattr(client, "list_checks", lambda _: (check,))
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
+    scope = replace(_scope(RepoPRAction.INSPECT), pull_request_author="author")
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        await pr_metadata.coroutine("owner/repo", 17, runtime=runtime)
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = await pr_checks.coroutine("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        labels = access_control.classify_protected_result(
+            "pr_checks", {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+            access_control.ToolAuthorization(tool_name="pr_checks", decision="resource_scoped",
+                                                     allowed=True, repo_pr_action_scope=scope),
+            result=result, provenance=provenance,
+        )
+        assert (labels.sources[0].integrity == "trusted") is expected
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author,allowlist,trusted", [
+    ("dependabot[bot]", "", False),
+    ("dependabot[bot]", "DEPENDABOT[bot]", True),
+    ("renovate[bot]", "dependabot[bot]", False),
+    ("dependabot-preview[bot]", "dependabot[bot]", False),
+    ("xdependabot[bot]", "dependabot[bot]", False),
+])
+async def test_exact_bot_login_allowlist(monkeypatch, author, allowlist, trusted):
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
+    client = FakeForge()
+    calls = []
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: calls.append(1) or True,
+                        raising=False)
+    original = client.get_pull_request
+    monkeypatch.setattr(client, "get_pull_request", lambda scope: replace(original(scope), author=author))
+    scope = replace(_scope(RepoPRAction.INSPECT), pull_request_author=author)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        capture = access_control.begin_protected_result_capture()
+        try:
+            await pr_metadata.coroutine("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(capture)
+        assert (provenance.sources[0].integrity == "trusted") is trusted
+        assert calls == []
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.asyncio
+async def test_allowlisted_bot_does_not_trust_mixed_noncollaborator_comments(monkeypatch):
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    client = FakeForge()
+    calls = []
+    monkeypatch.setattr(client, "author_is_trusted",
+                        lambda _repo, author: calls.append(author) or False, raising=False)
+    monkeypatch.setattr(client, "list_comments", lambda _: (
+        CommentProjection("1", "dependabot[bot]", "update", "now", "now"),
+        CommentProjection("2", "outsider", "prompt", "now", "now"),
+    ))
+    scope = replace(_scope(RepoPRAction.INSPECT), pull_request_author="dependabot[bot]")
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            await pr_comments.coroutine("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        assert provenance.sources[0].integrity == "untrusted"
+        assert calls == ["outsider"]
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("other_verdict", [True, False, None])
 async def test_mixed_comment_authorship_and_retry(monkeypatch, other_verdict):
     client = FakeForge()
