@@ -519,6 +519,55 @@ def test_read_heartbeat_cron_ignores_authority_profile_and_disabled_records(
         assert ntfy._read_heartbeat_cron(scheduler_yaml) is None
 
 
+@pytest.mark.parametrize("jobs_last", [False, True])
+def test_read_heartbeat_cron_mapping_forms(tmp_path, jobs_last):
+    scheduler = tmp_path / "scheduler.yaml"
+    jobs = "jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\n"
+    commands = "operator_shell_commands: []\n"
+    scheduler.write_text((commands + jobs) if jobs_last else (jobs + commands))
+    assert ntfy._read_heartbeat_cron(scheduler) == "0 * * * *"
+
+    scheduler.write_text(scheduler.read_text().replace("heartbeat", "reflect"))
+    assert ntfy._read_heartbeat_cron(scheduler) is None
+
+
+@pytest.mark.parametrize("text", [
+    "jobs: []\nunknown: true\n",
+    "jobs: false\noperator_shell_commands: []\n",
+])
+def test_read_heartbeat_cron_rejects_malformed_mapping(tmp_path, text):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_text(text)
+    assert ntfy._read_heartbeat_cron(scheduler) == "*/1 * * * *"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minutes_since_tick, should_alarm", [(40, False), (180, True)])
+async def test_mapping_heartbeat_hourly_ticks_use_hourly_wedge_threshold(
+    tmp_path, monkeypatch, minutes_since_tick, should_alarm,
+):
+    scheduler = tmp_path / "scheduler.yaml"
+    scheduler.write_text("jobs:\n  - name: heartbeat\n    cron: '0 * * * *'\noperator_shell_commands: []\n")
+    events_file = tmp_path / "events.jsonl"
+    last_tick = datetime(2026, 5, 27, 4, tzinfo=timezone.utc)
+    _write_events(events_file, [
+        _heartbeat_event((last_tick - timedelta(hours=hours)).isoformat())
+        for hours in (2, 1, 0)
+    ])
+    alarm = AsyncMock()
+    monkeypatch.setattr(ntfy, "post_algedonic_alarm", alarm)
+    await ntfy.fire_scheduler_wedge_alarm_if_warranted(
+        events_file, scheduler_yaml_path=scheduler,
+        now=last_tick + timedelta(minutes=minutes_since_tick),
+    )
+    if should_alarm:
+        alarm.assert_awaited_once()
+        assert alarm.call_args.kwargs["category"] == "scheduler-wedge"
+        assert "threshold: 120 min" in alarm.call_args.kwargs["body"]
+    else:
+        alarm.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("document", [
     pytest.param("- name: [heartbeat", id="syntax"),

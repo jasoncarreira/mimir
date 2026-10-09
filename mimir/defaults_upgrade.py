@@ -158,6 +158,45 @@ def _read_prompt_template(home: Path, name: str) -> str:
 SCHEDULER_YAML_REL = Path("scheduler.yaml")
 
 
+def _insert_scheduler_jobs(home_text: str, addition: str, banner: str) -> str | None:
+    """Insert entries after a block-style jobs sequence without rewriting the file."""
+    import yaml
+    from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+    node = yaml.compose(home_text)
+    if not isinstance(node, MappingNode):
+        return None
+    keys = [key.value for key, _ in node.value if isinstance(key, ScalarNode)]
+    matches = [value for key, value in node.value
+               if isinstance(key, ScalarNode) and key.value == "jobs"]
+    if len(keys) != len(node.value) or len(keys) != len(set(keys)) or len(matches) != 1:
+        return None
+    jobs = matches[0]
+    if not isinstance(jobs, SequenceNode) or jobs.flow_style or not jobs.value:
+        return None
+    lines = home_text.splitlines(keepends=True)
+    indent = jobs.start_mark.column
+    if any(
+        entry.start_mark.column != indent + 2
+        or not lines[entry.start_mark.line].startswith(" " * indent + "- ")
+        for entry in jobs.value
+    ):
+        return None
+    end = jobs.end_mark
+    insert_line = end.line + (end.column != 0)
+    if insert_line > len(lines):
+        return None
+    prefix = " " * indent
+    insertion = "\n".join(
+        prefix + line for line in (banner + addition).rstrip("\n").split("\n")
+    ) + "\n"
+    before = "".join(lines[:insert_line])
+    after = "".join(lines[insert_line:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    return before + insertion + after
+
+
 def _shipped_default_files() -> dict[Path, str]:
     """Return shipped default files keyed by their home-relative paths.
 
@@ -441,7 +480,7 @@ def _merge_scheduler_defaults(
     - NEVER remove a job, including a default the home dropped (a dropped
       default is in ``base_text``, so it is not "new" and is not re-added).
 
-    The home file is appended to as TEXT (not re-serialized) so operator
+    The home file is edited as TEXT (not re-serialized) so operator
     comments/formatting survive. Returns ``(new_home_text, added_names)``;
     ``new_home_text`` is None when there is nothing to add.
 
@@ -481,15 +520,26 @@ def _merge_scheduler_defaults(
         f"tick(s) — edit cron/priority/channel or remove as needed ---\n"
     )
     stripped = home_text.rstrip("\n")
-    document = yaml.safe_load(home_text)
-    if isinstance(document, dict) and isinstance(document.get("jobs"), list):
-        document["jobs"].extend(j.to_yaml_entry() for j in to_add)
-        new_text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
+    try:
+        document = yaml.safe_load(home_text)
+    except yaml.YAMLError as exc:
+        log.warning("scheduler reconcile: malformed home scheduler.yaml: %s", exc)
+        return None, []
+    if isinstance(document, dict):
+        new_text = _insert_scheduler_jobs(home_text, addition, banner)
+        if new_text is None:
+            log.warning("scheduler reconcile: ambiguous jobs insertion point in scheduler.yaml")
+            return None, []
     elif not stripped or stripped == "[]":
         new_text = banner + addition
     else:
         new_text = f"{stripped}\n\n{banner}{addition}"
-    return new_text, [j.name for j in to_add]
+    added_names = [j.name for j in to_add]
+    merged_jobs, rejections = load_jobs_from_text(new_text)
+    if rejections or not set(added_names) <= {j.name for j in merged_jobs}:
+        log.warning("scheduler reconcile: merged scheduler.yaml failed validation: %s", rejections)
+        return None, []
+    return new_text, added_names
 
 
 def _reconcile_scheduler_yaml(

@@ -64,6 +64,7 @@ import aiohttp
 import yaml
 
 from .event_logger import log_event
+from .scheduler import scheduler_document_jobs
 
 _log = logging.getLogger(__name__)
 
@@ -332,10 +333,12 @@ def _read_heartbeat_cron(scheduler_yaml_path: Path) -> str | None:
         return fallback
     if raw is None:
         return None
-    if not isinstance(raw, list):
+    try:
+        entries = scheduler_document_jobs(raw)
+    except ValueError:
         return fallback
     malformed_entry = False
-    for entry in raw:
+    for entry in entries:
         if not isinstance(entry, dict):
             malformed_entry = True
             continue
