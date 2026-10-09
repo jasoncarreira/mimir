@@ -837,6 +837,19 @@ def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope:
     )
 
 
+def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
+    """Best-effort attestation must not turn a completed write into a retry.
+
+    On adapter/read failure publish no trusted provenance: result classification
+    retains its default untrusted label. Never reuse cached trust as a fallback.
+    """
+    try:
+        _publish_trusted_projection(runtime, scope)
+    except (ForgeError, ToolException):
+        # Do not expose arbitrary adapter error text after the write succeeded.
+        log.warning("forge write completed; result attestation unavailable")
+
+
 def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
     url = check.details_url
     return (
@@ -1268,7 +1281,7 @@ def pr_submit_review(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).submit_review(scope, verdict, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1292,7 +1305,7 @@ def pr_inline_review_comment(
     result = asdict(_call(lambda: _client(scope).add_inline_review_comment(
         scope, path=safe_path, line=line, body=safe_body,
     )))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1307,7 +1320,7 @@ def pr_comment(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1322,7 +1335,7 @@ def pr_edit_body(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 
 

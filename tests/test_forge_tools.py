@@ -305,6 +305,125 @@ def test_first_projection_attests_without_metadata_warmup(monkeypatch, verdict, 
         set_forge_client(None)
 
 
+@pytest.mark.parametrize("selected,kwargs,operation", [
+    (pr_comment, {"body": "posted"}, "comment"),
+    (pr_edit_body, {"body": "posted"}, "edit_body"),
+    (pr_inline_review_comment, {"path": "src/app.py", "line": 1, "body": "posted"}, "inline"),
+    (pr_submit_review, {"verdict": ReviewVerdict.COMMENT, "body": "posted"}, "review"),
+])
+@pytest.mark.parametrize("failure_phase,prewarmed", [
+    ("metadata", False), ("metadata", True), ("author", False),
+])
+def test_successful_write_survives_failed_attestation_without_trust(
+    monkeypatch, selected, kwargs, operation, failure_phase, prewarmed,
+):
+    from mimir.forge import ForgeError
+
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        if prewarmed:
+            pr_metadata.func("owner/repo", 17, runtime=runtime)
+
+        def fail(*_):
+            raise ForgeError("attestation transport failed")
+
+        monkeypatch.setattr(
+            client, "get_pull_request" if failure_phase == "metadata" else "author_is_trusted", fail,
+        )
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        assert sum(call[0] == operation for call in client.calls) == 1
+        if selected is pr_edit_body:
+            assert result == {"status": "body_updated"}
+        else:
+            assert result["body"] == "posted"
+        assert provenance is None or not provenance.sources
+        labels = access_control.classify_protected_result(
+            selected.name, {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+            access_control.ToolAuthorization(
+                tool_name=selected.name, decision="resource_scoped", allowed=True,
+                repo_pr_action_scope=scope,
+            ), result=result, provenance=provenance,
+        )
+        assert labels.has_untrusted_active_ingest
+        assert labels.sources[0].integrity == "untrusted"
+        runtime.context.ifc_state.merge(labels)
+        decision = access_control.SinkGate.check_sink_flow(
+            "repo_test", f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}",
+            labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
+        )
+        assert not decision.allowed
+        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("verdict", [True, False, None])
+@pytest.mark.parametrize("verified", [True, False])
+def test_checks_and_job_log_after_push_keep_scoped_labels_and_repo_test_decision(
+    monkeypatch, verdict, verified,
+):
+    import uuid
+
+    from mimir.repo_tools import _record_verified_push
+
+    old_head = uuid.uuid4().hex + "0" * 8
+    new_head = uuid.uuid4().hex + "0" * 8
+    scope = replace(_scope(RepoPRAction.INSPECT, head_sha=old_head), event_type="pr_ci_failure")
+    runtime = _runtime(scope)
+    client = FakeForge()
+    monkeypatch.setattr(client, "get_pull_request", lambda _: PullRequestProjection(
+        17, "Title", "open", "author", False, "main", "change",
+        new_head, True, "created", "updated",
+    ))
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
+    monkeypatch.setattr(client, "get_job_log", lambda *_: "redacted excerpt", raising=False)
+    if verified:
+        _record_verified_push(scope, old_head, new_head)
+    set_forge_client(client)
+    try:
+        for selected, kwargs in ((pr_checks, {}), (pr_job_log, {"job_id": 123})):
+            token = access_control.begin_protected_result_capture()
+            try:
+                result = selected.func("owner/repo", 17, runtime=runtime, **kwargs)
+            finally:
+                provenance = access_control.end_protected_result_capture(token)
+            # Check actual publication as well as classification. Publishing the
+            # live head instead would downgrade the result and block repo_test.
+            source, = provenance.sources
+            assert source.resource_id == f"owner/repo#pull/17@{old_head}"
+            expected_trust = verified and verdict is True
+            assert source.integrity == ("trusted" if expected_trust else "untrusted")
+            labels = access_control.classify_protected_result(
+                selected.name, {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+                access_control.ToolAuthorization(
+                    tool_name=selected.name, decision="resource_scoped", allowed=True,
+                    repo_pr_action_scope=scope,
+                ), result=result, provenance=provenance,
+            )
+            source, = labels.sources
+            assert source.resource_id == f"owner/repo#pull/17@{old_head}"
+            assert source.integrity == ("trusted" if expected_trust else "untrusted")
+            runtime.context.ifc_state.merge(labels)
+            decision = access_control.SinkGate.check_sink_flow(
+                "repo_test", f"owner/repo#pull/17@{old_head}:{scope.scope_id}",
+                labels, runtime.context,
+                enforce=False, repo_pr_action_scope=scope,
+            )
+            assert decision.allowed is expected_trust
+            if not expected_trust:
+                assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+    finally:
+        set_forge_client(None)
+
+
 @pytest.mark.parametrize("attested", [True, False])
 @pytest.mark.parametrize("error_kind", ["unavailable", "policy", "arbitrary"])
 def test_failed_forge_read_only_content_free_diagnostics_avoid_taint(monkeypatch, attested, error_kind):
