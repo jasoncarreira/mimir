@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **IFC (#1905):** `memory_query` and `memory_get` now preserve SAGA's
+  server-reported per-atom integrity. Trusted reads no longer taint the turn;
+  absent or invalid provenance remains untrusted active ingest.
+
 - **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
   `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
   bounded argv with scrubbed environment and value-free audit events; job grants
