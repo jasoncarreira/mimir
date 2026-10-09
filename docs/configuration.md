@@ -165,6 +165,8 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_ALLOW_UNAUTHENTICATED` | bool | `false` | Suppress the empty-`MIMIR_API_KEY` startup warning (dev/localhost only). |
 | `MIMIR_ATTACHMENTS_MAX_BYTES` | int | `26214400` (25 MiB) | Per-file cap on inbound chat attachments downloaded to disk. |
 
+The browser session cookie is `Secure` only over HTTPS. Plain-HTTP remote access works, but sends the key unencrypted; use HTTPS or a tunnel when possible.
+
 ## Cost & usage limits
 
 | Flag | Type | Default | Description |

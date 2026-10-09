@@ -10,6 +10,9 @@ interface UiState {
   // Set when an authenticated stream rejects the stored key. Presence remains
   // separate because the rejected key can be replaced directly in the login form.
   apiKeyRejected: boolean;
+  // A successful session POST has not yet been confirmed by an authenticated GET/stream.
+  sessionCookiePending: boolean;
+  sessionCookieMissing: boolean;
   // chainlink #616: bumped on EVERY key change (set/clear/switch). A switch from
   // one valid key to another keeps apiKeyPresent=true, so identity-scoped SSE
   // streams need this monotonic signal to reconnect with the new key and stop
@@ -26,6 +29,8 @@ interface UiState {
   setComposerActive: (active: boolean) => void;
   setApiKeyPresent: (present: boolean) => void;
   setApiKeyRejected: (rejected: boolean) => void;
+  setSessionCookiePending: () => void;
+  confirmSessionCookie: () => void;
 }
 
 export const useUiState = create<UiState>((set) => ({
@@ -35,13 +40,22 @@ export const useUiState = create<UiState>((set) => ({
   composerActive: false,
   apiKeyPresent: false,
   apiKeyRejected: false,
+  sessionCookiePending: false,
+  sessionCookieMissing: false,
   apiKeyEpoch: 0,
   setComposerActive: (composerActive) => set({ composerActive }),
   // setApiKeyPresent is only invoked by useSetApiKey on an actual key change, so
   // bumping the epoch here is 1:1 with key changes (#616).
   setApiKeyPresent: (apiKeyPresent) =>
-    set((state) => ({ apiKeyPresent, apiKeyRejected: false, apiKeyEpoch: state.apiKeyEpoch + 1 })),
-  setApiKeyRejected: (apiKeyRejected) => set({ apiKeyRejected }),
+    set((state) => ({ apiKeyPresent, apiKeyRejected: false, sessionCookiePending: false,
+      sessionCookieMissing: false, apiKeyEpoch: state.apiKeyEpoch + 1 })),
+  setSessionCookiePending: () => set({ sessionCookiePending: true }),
+  confirmSessionCookie: () => set({ sessionCookiePending: false }),
+  setApiKeyRejected: (apiKeyRejected) => set((state) => ({
+    apiKeyRejected,
+    sessionCookieMissing: apiKeyRejected && state.sessionCookiePending,
+    sessionCookiePending: false
+  })),
   setDetailsPanelOpen: (detailsPanelOpen) => set({ detailsPanelOpen }),
   setSelectedChatMessageId: (selectedChatMessageId) => set({ selectedChatMessageId }),
   setCollapsedRegion: (id, collapsed) =>
