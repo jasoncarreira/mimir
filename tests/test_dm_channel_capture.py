@@ -8,6 +8,10 @@ accessor that reads it back, and the read-only ``list_channels`` tool.
 from __future__ import annotations
 
 import json
+import argparse
+import hashlib
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -18,6 +22,9 @@ from mimir import identities_populator as _pop
 from mimir.identities_populator import capture_dm_channel, merge_into_yaml
 from mimir.identities_populator import approve_pairing, request_dm_pairing
 from mimir.identities_populator import request_pairing, request_pairing_status
+from mimir.identities_populator import (
+    PairingCodeLockedError, approve_pairing_code, request_pairing_with_code,
+)
 from mimir.bridges.bench import BenchBridge
 from mimir.tools.registry import (
     list_channels,
@@ -363,3 +370,232 @@ def test_approve_pairing_preserves_operator_fields_and_allowlists_canonical(
     resolver.reload()
     assert resolver.is_authorized("slack-U05ABC") is True
     assert resolver.resolve("discord-456") == "alice"
+
+
+def _clock(monkeypatch):
+    class Clock(datetime):
+        current = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(_pop, "datetime", Clock)
+    return Clock
+
+
+def test_pairing_codes_are_hashed_rate_limited_and_dm_only(tmp_path, monkeypatch):
+    clock = _clock(monkeypatch)
+    home = tmp_path / "agent"
+    kwargs = dict(channel_id="dm-discord-100", is_dm=True, max_pending=1)
+    status, first = request_pairing_with_code(home, "discord-1", "discord", **kwargs)
+    assert status == "changed" and re.fullmatch(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}", first)
+    raw = (home / "state" / "identities.yaml").read_text()
+    assert first not in raw
+    pairing = _read(home)["people"][0]["pairing"]
+    assert len(bytes.fromhex(pairing["code_salt"])) == 16
+    assert pairing["code_hash"] == hashlib.sha256(
+        bytes.fromhex(pairing["code_salt"]) + first.encode()
+    ).hexdigest()
+    assert datetime.fromisoformat(pairing["code_expires_at"]) == clock.current + timedelta(hours=1)
+    clock.current += timedelta(minutes=9)
+    assert request_pairing_with_code(home, "discord-1", "discord", **kwargs) == ("unchanged", None)
+    assert request_pairing_with_code(home, "discord-2", "discord", channel_id="dm-discord-200", is_dm=True, max_pending=1) == ("capped", None)
+    assert len(_read(home)["people"]) == 1
+    clock.current += timedelta(minutes=1)
+    status, second = request_pairing_with_code(home, "discord-1", "discord", **kwargs)
+    assert status == "changed" and second != first
+    assert _read(home)["people"][0]["pairing"]["code_hash"] != pairing["code_hash"]
+    assert second not in (home / "state" / "identities.yaml").read_text()
+    assert request_pairing_with_code(home, "slack-U1", "slack", channel_id="slack-C1", is_dm=False) == ("changed", None)
+    assert "code_hash" not in _read(home)["people"][1]["pairing"]
+
+
+def test_authorized_sender_does_not_receive_a_pairing_code(tmp_path):
+    home = tmp_path / "agent"
+    assert request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)[1]
+    assert approve_pairing(home, "slack-U1")
+    assert request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True) == ("unchanged", None)
+    assert "code_hash" not in _read(home)["people"][0]["pairing"]
+
+
+def test_approved_pairing_with_stale_code_cannot_be_approved_again(tmp_path):
+    home = tmp_path / "agent"
+    _, code = request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    doc = _read(home)
+    doc["people"][0]["pairing"]["status"] = "approved"
+    (home / "state" / "identities.yaml").write_text(yaml.safe_dump(doc))
+    assert not approve_pairing_code(home, code)
+    assert "access" not in _read(home)["people"][0]
+
+
+def test_malformed_lockout_state_refuses_even_valid_code(tmp_path):
+    home = tmp_path / "agent"
+    _, code = request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    (home / "state" / "pairing_lockout.json").write_text('{"failed_attempts": "unknown"}')
+    with pytest.raises(PairingCodeLockedError, match="locked"):
+        approve_pairing_code(home, code)
+    assert "access" not in _read(home)["people"][0]
+
+
+def test_pairing_code_approval_lockout_expiration_and_canonical_bypass(tmp_path, monkeypatch):
+    clock = _clock(monkeypatch)
+    home = tmp_path / "agent"
+    _, code = request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    assert code is not None
+    calls = []
+    compare = _pop.secrets.compare_digest
+
+    def observed(a, b):
+        calls.append((a, b))
+        return compare(a, b)
+
+    monkeypatch.setattr(_pop.secrets, "compare_digest", observed)
+    for n in range(5):
+        assert not approve_pairing_code(home, "ZZZZZZZZ")
+        assert json.loads((home / "state" / "pairing_lockout.json").read_text())["failed_attempts"] == n + 1
+    assert len(calls) == 5
+    with pytest.raises(PairingCodeLockedError, match="locked"):
+        approve_pairing_code(home, code)
+    assert len(calls) == 5  # even a valid code cannot reach lookup during lockout
+    clock.current += timedelta(minutes=10)
+    _, code = request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    clock.current += timedelta(minutes=50)
+    assert approve_pairing_code(home, "  ".join(code.lower()))
+    person = _read(home)["people"][0]
+    assert person["access"]["roles"] == ["user"]
+    assert person["pairing"]["status"] == "approved"
+    assert not {"code_hash", "code_salt", "code_expires_at"} & person["pairing"].keys()
+    assert json.loads((home / "state" / "pairing_lockout.json").read_text())["failed_attempts"] == 0
+    assert not approve_pairing_code(home, code)  # single use
+
+    _, expired = request_pairing_with_code(home, "discord-2", "discord", channel_id="dm-discord-2", is_dm=True)
+    clock.current += timedelta(hours=1)
+    assert not approve_pairing_code(home, expired)
+    assert _read(home)["people"][1]["pairing"]["status"] == "pending"
+    assert approve_pairing(home, "discord-2", roles=["user", "admin"])
+    assert _read(home)["people"][1]["access"]["roles"] == ["user", "admin"]
+    assert "code_hash" not in _read(home)["people"][1]["pairing"]
+
+
+def test_pairing_code_cli_and_mutual_exclusion(tmp_path, capsys):
+    from mimir.commands import identities as cmd
+
+    _, code = request_pairing_with_code(tmp_path, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    id_parser = cmd.add_argparse(sub)
+
+    def run(*args):
+        return cmd.dispatch(parser.parse_args(["identities", "approve-pairing", "--home", str(tmp_path), *args]), id_parser)
+
+    assert run("--code", code, "--admin") == 0
+    assert _read(tmp_path)["people"][0]["access"]["roles"] == ["user", "admin"]
+    assert code not in capsys.readouterr().out
+    assert run("--code", code) == 1
+    assert "invalid or expired" in capsys.readouterr().err
+    assert run("slack-U1", "--code", code) == 1
+    assert "either an identity or --code" in capsys.readouterr().err
+    assert run() == 1
+    assert run("slack-U1") == 0  # canonical form retains existing role semantics
+    _, other = request_pairing_with_code(tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True)
+    assert run("slack-U2") == 0
+    assert other not in capsys.readouterr().out
+
+    for _ in range(5):
+        assert run("--code", "ZZZZZZZZ") == 1
+    capsys.readouterr()
+    assert run("--code", "ABCDEF23") == 1
+    assert "locked" in capsys.readouterr().err
+    _, third = request_pairing_with_code(tmp_path, "slack-U3", "slack", channel_id="dm-slack-D3", is_dm=True)
+    assert run("slack-U3") == 0  # canonical form bypasses code lockout
+    assert third not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("platform,channel", [
+    ("slack", "dm-slack-G123"), ("discord", "discord-123"),
+    ("slack", "slack-C123"), ("discord", "dm-unknown"),
+])
+def test_shared_channels_never_mint_pairing_codes(tmp_path, platform, channel):
+    _, code = request_pairing_with_code(tmp_path, f"{platform}-1", platform,
+                                       channel_id=channel, is_dm=True)
+    assert code is None
+    assert "code_hash" not in _read(tmp_path)["people"][0]["pairing"]
+
+
+def test_status_only_pairing_never_consumes_a_code(tmp_path):
+    request_pairing_status(tmp_path, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    assert "code_hash" not in _read(tmp_path)["people"][0]["pairing"]
+    assert request_pairing_with_code(tmp_path, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)[1]
+
+
+def test_delivery_cleanup_cannot_erase_a_newer_code(tmp_path, monkeypatch):
+    clock = _clock(monkeypatch)
+    kwargs = dict(channel_id="dm-slack-D1", is_dm=True)
+    _, first = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    clock.current += timedelta(minutes=10)
+    _, second = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", first, failed=True)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", first)
+    assert approve_pairing_code(tmp_path, second)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", second)
+
+
+@pytest.mark.parametrize("operation", ["mint", "guess"])
+def test_identity_transactions_serialize_across_processes(tmp_path, operation):
+    import subprocess
+    import sys
+    import select
+
+    request_pairing_with_code(tmp_path, "slack-U0", "slack", channel_id="dm-slack-D0", is_dm=True)
+    script = '''
+import sys
+from pathlib import Path
+from mimir import identities_populator as pop
+home, operation, actor = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+original = pop._load_yaml
+def load(path):
+    result = original(path)
+    print("loaded", flush=True)
+    if actor == "1":
+        sys.stdin.readline()
+    return result
+pop._load_yaml = load
+print("started", flush=True)
+if operation == "mint":
+    pop.request_pairing_with_code(home, "slack-U" + actor, "slack",
+                                 channel_id="dm-slack-D" + actor, is_dm=True)
+else:
+    pop.approve_pairing_code(home, "ZZZZZZZZ")
+'''
+    first = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), operation, "1"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    second = None
+    try:
+        assert select.select([first.stdout], [], [], 15)[0]
+        assert first.stdout.readline().strip() == b"started"
+        assert select.select([first.stdout], [], [], 15)[0]
+        assert first.stdout.readline().strip() == b"loaded"
+        second = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), operation, "2"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        assert select.select([second.stdout], [], [], 15)[0]
+        assert second.stdout.readline().strip() == b"started"
+        # The second process cannot load a stale snapshot while the first
+        # transaction is paused after reading but before writing.
+        assert not select.select([second.stdout], [], [], 0.2)[0]
+        _, error = first.communicate(b"continue\n", timeout=15)
+        assert first.returncode == 0, error
+        output, error = second.communicate(timeout=15)
+        assert second.returncode == 0, error
+        assert output.strip() == b"loaded"
+        if operation == "mint":
+            assert {p["canonical"] for p in _read(tmp_path)["people"]} == {"slack-U0", "slack-U1", "slack-U2"}
+            assert all("code_hash" in p["pairing"] for p in _read(tmp_path)["people"])
+        else:
+            state = json.loads((tmp_path / "state" / "pairing_lockout.json").read_text())
+            assert state["failed_attempts"] == 2
+    finally:
+        for child in (first, second):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)

@@ -197,6 +197,7 @@ _PROTECTED_BASENAMES = frozenset({
     "identities.json",
     "identities.yaml",
     "identities.yml",
+    "pairing_lockout.json",
     "secrets.json",
     "secrets.yaml",
     "secrets.yml",

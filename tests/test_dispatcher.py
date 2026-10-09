@@ -1644,13 +1644,15 @@ class _FakePairingChannels:
 
     async def send(self, channel_id: str, text: str, attachment_paths=None, *, final=True):
         self.sent.append((channel_id, text))
-        return object()
+        from mimir.bridges.base import SendResult
+        return SendResult(sent=True)
 
 
 @pytest.mark.asyncio
 async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ):
+    monkeypatch.setattr("mimir.identities_populator.prepare_pairing_code_delivery", lambda *a, **k: True)
     channels = _FakePairingChannels()
     cfg = replace(
         _make_config(tmp_path),
@@ -1676,17 +1678,20 @@ async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
     for i in range(5):
         assert f"mimir identities approve-pairing slack-U{i}" in operator_sends[0][1]
 
-    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
-    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
-    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="slack-C1")
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF23")
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF23")
+    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="slack-C1", code="ABCDEF23")
     await notifier._dm_reply_queue.join()
 
     dm_sends = [s for s in channels.sent if s[0] == "dm-slack-D0"]
     public_sends = [s for s in channels.sent if s[0] == "slack-C1"]
     assert dm_sends == [
-        ("dm-slack-D0", "Request forwarded to operator; no access until approved.")
+        ("dm-slack-D0", cfg.pairing_dm_auto_reply_text.replace("{code}", "ABCDEF23"))
     ]
     assert public_sends == []
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF24")
+    await notifier._dm_reply_queue.join()
+    assert len([s for s in channels.sent if s[0] == "dm-slack-D0"]) == 2
 
 
 @pytest.mark.asyncio
@@ -1715,6 +1720,160 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "Pairing pending cap reached" in channels.sent[0][1]
     assert "max=1" in channels.sent[0][1]
     assert "slack-C1" in channels.sent[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template,expected", [
+    ("Wait for approval", "Wait for approval\nPairing code: `ABCDEF23`"),
+    ("Code {code} — keep it private", "Code ABCDEF23 — keep it private"),
+])
+async def test_pairing_dm_custom_template_always_includes_code(tmp_path, monkeypatch, template, expected):
+    monkeypatch.setattr("mimir.identities_populator.prepare_pairing_code_delivery", lambda *a, **k: True)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_text=template,
+        pairing_dm_auto_reply_interval_seconds=0), channels)
+    try:
+        await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code="ABCDEF23")
+        await notifier._dm_reply_queue.join()
+        assert channels.sent == [("dm-slack-D1", expected)]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_dm_reply_can_be_disabled(tmp_path):
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=False), channels)
+    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code="ABCDEF23")
+    await notifier._dm_reply_queue.join()
+    assert channels.sent == []
+    await notifier.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,author,private_channel,shared_channel", [
+    ("slack", "slack-U123", "dm-slack-D123", "dm-slack-G123"),
+    ("discord", "discord-123", "dm-discord-123", "discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123", "slack-C123"),
+])
+async def test_pairing_notifier_refuses_shared_destination(
+    tmp_path, platform, author, private_channel, shared_channel,
+):
+    from mimir.identities_populator import (
+        prepare_pairing_code_delivery, request_pairing_with_code,
+    )
+
+    # A real deliverable code keeps the worker's hash gate from masking a
+    # missing destination guard in maybe_reply_dm.
+    status, code = request_pairing_with_code(
+        tmp_path, author, platform, channel_id=private_channel, is_dm=True,
+    )
+    assert status == "changed"
+    assert code is not None
+    assert prepare_pairing_code_delivery(tmp_path, author, code) is True
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_interval_seconds=0), channels)
+    try:
+        await notifier.maybe_reply_dm(
+            canonical=author, dm_channel_id=shared_channel, code=code,
+        )
+        await notifier._dm_reply_queue.join()
+        assert not channels.sent
+        assert not notifier._dm_reply_sent
+        # Refusal must not consume or invalidate the valid private code.
+        assert prepare_pairing_code_delivery(tmp_path, author, code) is True
+        await notifier.maybe_reply_dm(
+            canonical=author, dm_channel_id=private_channel, code=code,
+        )
+        await notifier._dm_reply_queue.join()
+        assert channels.sent == [(
+            private_channel,
+            notifier._config.pairing_dm_auto_reply_text.replace("{code}", code),
+        )]
+        assert notifier._dm_reply_sent
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "result"])
+async def test_failed_pairing_send_allows_immediate_reissue(tmp_path, caplog, failure):
+    from mimir.identities_populator import request_pairing_with_code, approve_pairing_code
+    from mimir.bridges.base import SendResult
+
+    class Channels:
+        calls = 0
+        sent = []
+
+        async def send(self, destination, text, *, final=True):
+            self.calls += 1
+            if self.calls == 1:
+                if failure == "exception":
+                    raise RuntimeError(text)  # plaintext in exception must not be logged
+                return SendResult(sent=False, error=text)
+            self.sent.append(text)
+            return SendResult(sent=True)
+
+    channels = Channels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_interval_seconds=0), channels)
+    kwargs = dict(channel_id="dm-slack-D1", is_dm=True)
+    _, first = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    try:
+        with caplog.at_level("DEBUG"):
+            await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code=first)
+            await notifier._dm_reply_queue.join()
+        assert first not in caplog.text
+        assert not notifier._dm_reply_sent
+        _, second = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+        assert second and second != first
+        await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code=second)
+        await notifier._dm_reply_queue.join()
+        assert len(channels.sent) == 1 and second in channels.sent[0]
+        assert approve_pairing_code(tmp_path, second)
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_queued_pairing_code_gets_full_ttl_and_superseded_code_is_not_sent(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from mimir import identities_populator as pop
+    import yaml
+
+    class Clock(datetime):
+        current = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(pop, "datetime", Clock)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_interval_seconds=0), channels)
+    kwargs = dict(channel_id="dm-slack-D1", is_dm=True)
+    _, first = pop.request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    Clock.current += timedelta(minutes=10)
+    _, second = pop.request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    try:
+        # Enqueue both before the worker runs, simulating a delayed backlog.
+        await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code=first)
+        await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code=second)
+        Clock.current += timedelta(hours=2)
+        await notifier._dm_reply_queue.join()
+        assert len(channels.sent) == 1 and second in channels.sent[0][1]
+        raw = (tmp_path / "state" / "identities.yaml").read_text()
+        assert first not in raw and second not in raw
+        pairing = yaml.safe_load(raw)["people"][0]["pairing"]
+        assert datetime.fromisoformat(pairing["code_expires_at"]) == Clock.current + timedelta(hours=1)
+        Clock.current += timedelta(minutes=59)
+        assert pop.approve_pairing_code(tmp_path, second)
+    finally:
+        await notifier.aclose()
 
 
 def _arm_authenticated_injection(disp, tmp_path):
