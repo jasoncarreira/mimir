@@ -21,6 +21,7 @@ import re
 
 import pytest
 
+from mimir import access_control
 from mimir.templates import (
     SAGA_SESSION_END_DEFAULT,
     SAGA_SESSION_END_LEAN_DEFAULT,
@@ -367,6 +368,7 @@ class TestRenderSagaSessionEnd:
             assert "{channel_id}" in tmpl
             assert "{saga_session_id}" in tmpl
             assert "{idle_minutes}" in tmpl
+            assert "{available_tools}" in tmpl
             assert "{turn_summary_block}" in tmpl
 
     def test_default_templates_include_session_summary_confabulation_guardrails(self) -> None:
@@ -383,23 +385,73 @@ class TestRenderSagaSessionEnd:
             assert "`closed_since` is only for refs you confirmed resolved" in tmpl
 
     def test_rendered_synthesis_only_requests_available_tools_and_new_files(self) -> None:
-        from mimir.access_control import TRIGGER_AUTHORITY_PROFILES
-
         for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
             prompt = render_saga_session_end(
                 channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
                 turns_window=turns, prompts_dir=None,
             )
-            tools = set(re.findall(
-                r"\b(?:mimir_get_turn|memory_get|saga_\w+|write_file|read_file|edit_file|memory_query)\b",
+            allowed = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
+            tool_names = set(access_control._TOOL_FLOW_MAP) | set(
+                access_control.TRIGGER_CAPABILITY_TIERS
+            )
+            named_tools = set(re.findall(
+                r"\b(?:" + "|".join(map(re.escape, sorted(tool_names, key=len, reverse=True))) + r")\b",
                 prompt,
             ))
-            assert tools <= TRIGGER_AUTHORITY_PROFILES["session-boundary"]
+            assert named_tools == allowed
+            listed_tools = re.search(
+                r"Available tools for this session-boundary turn \(from its capability set\):\n"
+                r"((?:- `[^`]+`\n)+)", prompt,
+            )
+            assert listed_tools is not None
+            assert re.findall(r"^- `([^`]+)`$", listed_tools[1], re.MULTILINE) == sorted(allowed)
+            assert "File reads, directory listings, memory search, todo tools, and commitment" in prompt
+            assert "tools are not available in this turn" in prompt
             assert "create new files" in prompt
+            assert "cannot overwrite existing files" in prompt
             assert "memory/learnings-inbox/<YYYY-MM-DD>-<turn_id>-<n>.md" in prompt
             assert "learnings-pending/" not in prompt
             assert "learnings-pending.md" not in prompt
             assert not re.search(r"\b(?:edit|append|overwrite) (?:files?|it|to)\b", prompt)
+
+    def test_rendered_defaults_verify_only_known_ids_and_defer_file_checks(self) -> None:
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            guidance = prompt.split("Before calling `saga_end_session`", 1)[1].split(
+                "Synthesize and call:", 1,
+            )[0]
+            assert "`memory_get` or `mimir_get_turn`" in guidance
+            assert "already present in this session context" in guidance
+            assert "[verify before quoting]" in guidance
+            assert not any(path in guidance for path in (
+                "memory/core/", "memory/issues/", "state/wiki/",
+            ))
+            assert not re.search(
+                r"\b(?:read|list|search|verify)\s+`(?:memory/core/|memory/issues/|state/wiki/)",
+                prompt, re.I,
+            )
+            assert not re.search(
+                r"\b(?:read_file|file_search|memory_query|write_todos|commitment_\w+)\b",
+                prompt,
+            )
+
+    def test_rendered_tool_list_follows_capability_changes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        current = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
+        monkeypatch.setitem(
+            access_control.TRIGGER_AUTHORITY_PROFILES,
+            "session-boundary",
+            current | {"new_boundary_tool"},
+        )
+        for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
+            prompt = render_saga_session_end(
+                channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
+                turns_window=turns, prompts_dir=None,
+            )
+            assert "- `new_boundary_tool`\n" in prompt
+            assert all(f"- `{tool}`\n" in prompt for tool in current)
 
 
 # ─── chainlink #388: malformed operator template must not crash synthesis ──
