@@ -1230,6 +1230,45 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
 
 
 @pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_pairing_reply_bypasses_model_and_reloads_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+):
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir import approval_requests
+
+    model = _FakeAgent([AIMessage(content="model must not handle pairing")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    channel = f"discord-pair-ops-{tmp_path.name}"
+    agent._config.operator_alert_channel = channel
+    identity = _resolver(home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    agent._identity_resolver = identity
+    request_pairing_with_code(home, "discord-123", "discord", channel_id="dm-discord-123", is_dm=True)
+    identity.reload()
+    request_id = identity.identity("discord-123").pairing.request_id
+    notices = []
+
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+
+    agent._dispatcher = SimpleNamespace(_send_approval_notice=send_notice)
+    monkeypatch.setattr("mimir.agent._initialize_ifc_labels", lambda *args, **kwargs: pytest.fail("pairing entered model turn"))
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"{decision} {request_id}",
+    ))
+    assert record.kind == "operator_approval"
+    assert notices == [(channel, record.output)]
+    assert identity.identity("discord-123").pairing.status == ("approved" if decision == "approve" else "rejected")
+    assert identity.access_metadata("discord-123").roles == (("user",) if decision == "approve" else ())
+    assert request_id not in {entry.approval_id for entry in approval_requests.pending(channel)}
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
 async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
 ):

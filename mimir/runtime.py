@@ -527,6 +527,8 @@ async def create_agent_runtime(
                 if status != "changed":
                     return
                 await asyncio.to_thread(core.identity_resolver.reload)
+                from .pairing_approval import sync_pending as sync_pairings
+                sync_pairings(config.home, config.operator_alert_channel, core.identity_resolver)
                 canonical = (
                     getattr(decision, "canonical_author", None) or author
                 ).strip()

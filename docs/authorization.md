@@ -494,6 +494,15 @@ approval for one hour. The existing
 the lockout. Add `--admin` for both `user` and `admin`. The identities populator
 may add aliases and metadata but preserves operator-managed access fields.
 
+Admins can also review pending Discord and Slack pairings in the admin Users page:
+Approve grants `user`, Grant admin requires confirmation and grants `user` plus
+`admin`, and Reject blocks subsequent contact from reopening the pairing. The
+page shows the request ID and metadata, never the DM code or its hash. When an
+operator alert channel is configured, an authenticated admin may reply there
+with `approve pair-xxxx` or `decline pair-xxxx`; chat approval grants `user`
+only. IDs expire after seven days for chat replies, but the page and CLI still
+work. No model tool can approve or reject pairings.
+
 ### Denied-user handling
 
 | Setting | Default | Authorization effect |

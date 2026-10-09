@@ -1461,6 +1461,8 @@ class Agent:
         if self._saga_store is not None:
             from .memory_proposals import configure_approvals
             configure_approvals(config.home, config.operator_alert_channel, self._saga_store)
+        from .pairing_approval import sync_pending as sync_pairings
+        sync_pairings(config.home, getattr(config, "operator_alert_channel", ""), self._identity_resolver)
 
     def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
         """If saga_client is a SagaStore (or wraps one at any depth),
@@ -1927,6 +1929,7 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         from .operator_approval import _is_authenticated_operator
         from .memory_proposals import complete_reply, is_mp_reply, sync_pending
+        from .pairing_approval import complete_reply as complete_pairing_reply, sync_pending as sync_pairings
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
@@ -1934,6 +1937,7 @@ class Agent:
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver) and (named_reply or bare_reply):
             sync_pending(self._config.home)
+            sync_pairings(self._config.home, getattr(self._config, "operator_alert_channel", ""), self._identity_resolver)
             pending_entries = pending_approvals(event.channel_id)
             memory_reply = is_mp_reply(event) or (bare_reply and bool(pending_entries) and all(
                 entry.kind == "mp" for entry in pending_entries
@@ -1946,7 +1950,12 @@ class Agent:
                 resolution = None
             if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
                     or (resolution.entry is None and (named_reply or bare_reply))):
-                if memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
+                if resolution.entry is not None and resolution.entry.kind == "pair":
+                    notice = await complete_pairing_reply(
+                        self._config.home, getattr(self._config, "operator_alert_channel", ""),
+                        event, resolution, self._identity_resolver,
+                    )
+                elif memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
                     notice = await complete_reply(
                         self._config.home, event, resolution, self._identity_resolver,
                     )

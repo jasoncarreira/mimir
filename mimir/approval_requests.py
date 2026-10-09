@@ -195,6 +195,8 @@ def resolve(
                 return Resolution("no_pending_request")
         if edit is not None and not entry.supports_edits:
             return Resolution("not_an_approval_response")
+        if entry.kind == "pair" and named_id is None:
+            return Resolution("no_pending_request", message="specify a pair-xxxx request id")
         _PENDING.pop(entry.approval_id)
         _RECENT[entry.approval_id] = (now + _RECENT_SECONDS, entry.channel_id)
     status = entry.resolver(decision.lower(), edit, event, identity_resolver, now,
