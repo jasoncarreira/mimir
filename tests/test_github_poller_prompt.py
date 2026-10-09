@@ -160,3 +160,11 @@ def test_remediation_skill_guidance():
         "CI is the validation surface",
     ):
         assert phrase in guidance
+
+
+def test_skill_base_update_section_names_merge_default_and_rebase_exception():
+    skill = (_POLLER.parent.parent / "SKILL.md").read_text()
+    section = skill.split("## Updating a PR with its base\n", 1)[1].split("\n## ", 1)[0]
+    assert "Default to `repo_merge`" in section
+    assert "`repo_rebase`" in section
+    assert "only on history-rewrite turns" in section

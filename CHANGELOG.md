@@ -6,6 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Clarify that `repo_merge` is the default PR base-update path; reserve
+  `repo_rebase` guidance for history-rewrite event turns (#1910).
+
 - Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
   (#1900). The release adds concept/name drift review instructions, an audited
   operator `sync-base` recovery for eligible parked runs, and remediation-slice

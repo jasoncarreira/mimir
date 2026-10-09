@@ -10,6 +10,7 @@ import grp
 import os
 from pathlib import Path
 import pwd
+import re
 import shutil
 import socket
 import select
@@ -68,12 +69,38 @@ from mimir.repo_tools import (
     GitStatus,
     GitUnmerged,
     RepoGitTools,
+    _HISTORY_REWRITE_EVENT_TYPES,
     _bounded_subprocess_runner,
     retained_factory_snapshot_bundle,
     was_agent_push,
 )
 from mimir.tools.refusals import ToolPolicyRefusal
 from mimir.worklink.worker_client import StaleWorkerExecutorError
+
+
+def test_repo_rebase_description_matches_history_rewrite_events():
+    from mimir.tools.repo import repo_rebase
+
+    description = repo_rebase.description  # The description exposed to the model.
+    assert "Available only on turns for history-rewrite event types" in description
+    assert "_HISTORY_REWRITE_EVENT_TYPES" in description
+    event_text = description.split("_HISTORY_REWRITE_EVENT_TYPES (mimir/repo_tools.py):", 1)[1]
+    event_text = event_text.split("In other PR-remediation scopes", 1)[0]
+    named_events = re.findall(r"`([a-z][a-z0-9_]*)`", event_text)
+    assert len(named_events) == len(set(named_events))
+    assert set(named_events) == _HISTORY_REWRITE_EVENT_TYPES
+    assert "use repo_merge" in description
+
+
+def test_repo_merge_description_is_default_base_update_path():
+    from mimir.tools.repo import repo_merge
+
+    description = repo_merge.description
+    assert "default way to update a PR branch with its base" in description
+    assert "every PR-remediation scope" in description
+    for tool_name in ("repo_unmerged", "repo_stage", "repo_push"):
+        assert tool_name in description
+    assert "commit" in description
 
 
 @pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],
