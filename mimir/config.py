@@ -46,6 +46,14 @@ def _env_allow_empty(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def trusted_github_bot_logins() -> frozenset[str]:
+    """Exact, case-insensitive operator-approved GitHub bot logins."""
+    return frozenset(
+        login.casefold() for entry in _env("MIMIR_GITHUB_TRUSTED_BOT_LOGINS").split(",")
+        if (login := entry.strip()) and re.fullmatch(r"[A-Za-z0-9-]{1,39}\[bot\]", login, re.I)
+    )
+
+
 def _load_home_dotenv(home: Path) -> list[str]:
     """Load ``<home>/.env`` as runtime defaults.
 

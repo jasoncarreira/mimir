@@ -9176,7 +9176,7 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
     monkeypatch.setenv("GITHUB_REPOS", "o/r")
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease_root))
     monkeypatch.setattr(
-        access_control, "_lease_head_is_author_attested", lambda *args: True,
+        access_control, "_lease_head_is_author_attested", lambda *args, **kwargs: True,
     )
     state = _review_state("o/r", 7, "worklink/7", str(tmp_path))
     checkout = _attach_test_checkout_lease(state, lease_root, "lease-7")
