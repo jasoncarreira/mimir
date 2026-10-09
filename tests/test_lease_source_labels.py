@@ -382,6 +382,59 @@ def test_repo_result_without_author_verdict_stays_blocking(
     assert auth.ifc_state.has_untrusted_active_ingest()
 
 
+@pytest.mark.parametrize("verdict", [True, False, None])
+@pytest.mark.parametrize("operation", [
+    "repo_fetch", "repo_status", "repo_diff", "repo_unmerged", "repo_stage",
+    "repo_commit", "repo_merge", "repo_merge_abort", "repo_rebase",
+    "repo_rebase_abort", "repo_revert", "repo_revert_abort", "repo_push",
+])
+def test_successful_git_operations_publish_only_attested_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, verdict, operation,
+) -> None:
+    from mimir.repo_tools import GitOperationResult
+    from mimir.tools import repo
+
+    monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    state = auth.repo_review_state
+    assert state is not None
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+
+    class FakeGit:
+        execution_started = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _operation):
+            return GitOperationResult(True, "ok")
+
+    monkeypatch.setattr(repo, "RepoGitTools", FakeGit)
+    arguments = {
+        "repo_stage": {"paths": ("work.py",)},
+        "repo_commit": {"paths": ("work.py",), "message": "update"},
+        "repo_rebase": {}, "repo_revert": {"commit": scope.observed_head_sha},
+    }.get(operation, {})
+    tool = getattr(repo, operation)
+    token = begin_protected_result_capture()
+    try:
+        result = tool.func("owner/repo", 7, runtime=SimpleNamespace(context=auth), **arguments)
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        operation, {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name=operation, decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=result, provenance=provenance,
+    )
+    if operation == "repo_stage" and verdict is not True:
+        assert labels is None  # stage acknowledgements do not ingest without provenance
+        return
+    assert len(labels.sources) == 1
+    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+    assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+
+
 @pytest.mark.parametrize("tool_name", ["pr_job_log", "pr_comment"])
 def test_non_author_content_repository_results_remain_untrusted(
     tool_name: str,
@@ -478,6 +531,23 @@ def test_checkout_records_native_author_trust_for_file_reads(
     )
     assert calls == ([] if mismatch else [("owner/repo", "collaborator")])
 
+    # The checkout's own tool result carries the same exact-scope provenance
+    # as subsequent lease reads, but only after an affirmative native verdict.
+    token = begin_protected_result_capture()
+    try:
+        repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
+    finally:
+        checkout_provenance = end_protected_result_capture(token)
+    checkout_labels = classify_protected_result(
+        "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=result, provenance=checkout_provenance,
+    )
+    assert checkout_labels.sources[0].integrity == (
+        "trusted" if verdict is True and mismatch is None else "untrusted"
+    )
+
     def no_attestation(*args):
         pytest.fail("filesystem read attempted author attestation")
 
@@ -529,7 +599,305 @@ def test_checkout_records_native_author_trust_for_file_reads(
     assert source.resource_id == f"owner/repo#pull/7@{'a' * 40}"
     auth.ifc_state.merge(labels)
     assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
-    assert len(calls) == (2 if verdict is None else 1)
+    assert len(calls) == (3 if verdict is None else 1)
+
+
+@pytest.mark.parametrize("allowlist,author,trusted", [
+    ("", "dependabot[bot]", False),
+    ("DePeNdAbOt[bot]", "dependabot[bot]", True),
+    ("dependabot[bot]", "DEPENDABOT[BOT]", True),
+    ("dependabot[bot]", "renovate[bot]", False),
+])
+def test_checkout_bot_attestation_requires_exact_operator_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowlist, author, trusted,
+) -> None:
+    from dataclasses import replace
+    from mimir.forge import PullRequestProjection
+    from mimir.tools import forge, repo
+
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
+    scope = _scope(author=author)
+    auth = _auth(scope=scope, recorded_verdict=False)
+    runtime = SimpleNamespace(context=auth)
+    root = tmp_path / "leases"
+    root.mkdir()
+    _, target, _ = _recorded_lease(root, scope=scope)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
+    lease = active_pr_checkout_lease_for_path(target)
+    state = RepoReviewState(scope)
+    auth.server_discovered_pr_states.remember(state)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
+    monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
+    metadata = replace(PullRequestProjection(
+        7, "Title", "open", "author", False, "main", "change",
+        "a" * 40, True, "created", "updated",
+    ), author=author)
+    # No collaborator adapter: the mixed-case bot path must still attest.
+    monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(
+        get_pull_request=lambda _: metadata,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        result = repo.repo_checkout.func("owner/repo", 7, runtime=runtime)
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=result, provenance=provenance,
+    )
+    assert (labels.sources[0].integrity == "trusted") is trusted
+
+
+def _git_commit(path: Path, target: Path, message: str, author: str, committer: str) -> str:
+    target.write_text(message + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", target.name], check=True)
+    env = {
+        "GIT_AUTHOR_NAME": author, "GIT_AUTHOR_EMAIL": f"{author}@example.test",
+        "GIT_COMMITTER_NAME": committer, "GIT_COMMITTER_EMAIL": f"{committer}@example.test",
+    }
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    if committer == DEFAULT_USER_NAME:
+        env["GIT_COMMITTER_EMAIL"] = DEFAULT_USER_EMAIL
+    if author == DEFAULT_USER_NAME:
+        env["GIT_AUTHOR_EMAIL"] = DEFAULT_USER_EMAIL
+    import os
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", message], check=True,
+                   env={**os.environ, **env})
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.mark.parametrize("operation", ["merge", "rebase"])
+def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _self_login, operation: str,
+) -> None:
+    from dataclasses import replace
+    from mimir.git_bootstrap import DEFAULT_USER_NAME
+    from mimir.tools.repo import _publish_attested_lease_result
+
+    monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
+    auth, original, lease, target, _ = _real_attested_lease(tmp_path)
+    subprocess.run(["git", "-C", str(lease.path), "branch", "-m", "main"], check=True)
+    # A real fork: the attested range contains a human display name, not
+    # the verified forge login. Replay must rely on the original patch only.
+    common = original.observed_head_sha
+    attested = _git_commit(lease.path, target, "feature", "Jason Carreira", "Jason Carreira")
+    original = replace(original, observed_head_sha=attested)
+    object.__setattr__(lease, "head_sha", attested)
+    subprocess.run(["git", "-C", str(lease.path), "checkout", "-qb", "base", common], check=True)
+    base_file = lease.path / "base.txt"
+    base = _git_commit(lease.path, base_file, "base", "outsider", "outsider")
+    subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "main"], check=True)
+    if operation == "merge":
+        subprocess.run(["git", "-C", str(lease.path), "-c", f"user.name={DEFAULT_USER_NAME}",
+                        "-c", "user.email=noreply@mimir-agent.local", "merge", "-q",
+                        "--allow-unrelated-histories", "--no-ff", "base", "-m", "merge base"], check=True)
+    else:
+        # Preserve the human display name while the server is the committer.
+        subprocess.run(["git", "-C", str(lease.path),
+                        "-c", f"user.name={DEFAULT_USER_NAME}",
+                        "-c", "user.email=noreply@mimir-agent.local", "rebase", "-q",
+                        "--onto", "base", common, "main"], check=True)
+        auth.ifc_state.repository_author_trust.resolve("owner/repo", "jasoncarreira", lambda: True)
+    scope = replace(original, destination_ref="refs/heads/main", observed_base_sha=base)
+    object.__setattr__(lease, "scope_id", scope.scope_id)
+    object.__setattr__(lease, "base_sha", base)
+    object.__setattr__(auth, "repo_pr_action_scope", scope)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    head = subprocess.run(["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    state.record_git_head(scope.scope_id, head)
+    object.__setattr__(auth, "repo_review_state", state)
+    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    from mimir import pr_checkout_lease
+
+    monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: lease)
+    read_source = protected_result_source(
+        auth, principal="filesystem", domain="filesystem", resource_id=str(target),
+        bridge_instance="filesystem",
+    )
+    assert (read_source.domain, read_source.integrity) == ("repository", "trusted")
+    wrong_base = SimpleNamespace(**{**vars(lease), "base_sha": "f" * 40})
+    if operation == "rebase":
+        assert not access_control_module._lease_head_is_author_attested(
+            lease.path, "main", original.observed_head_sha, head,
+            scope=scope, lease=wrong_base, ifc_state=auth.ifc_state,
+        )
+    assert not access_control_module._lease_head_is_author_attested(
+        lease.path, "other-branch", original.observed_head_sha, head,
+        scope=scope, lease=lease, ifc_state=auth.ifc_state,
+    )
+    unprotected = replace(scope, destination_ref="refs/heads/main-copy")
+    assert not access_control_module._lease_head_is_author_attested(
+        lease.path, "main", original.observed_head_sha, head,
+        scope=unprotected, lease=lease, ifc_state=auth.ifc_state,
+    )
+    if operation == "rebase":
+        # A conflict-resolution edit is not a patch-identical replay, even with
+        # the original human author and the server committer.
+        target.write_text("altered replay\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+        subprocess.run(["git", "-C", str(lease.path), "-c", f"user.name={DEFAULT_USER_NAME}",
+                        "-c", "user.email=noreply@mimir-agent.local", "commit", "-q",
+                        "--amend", "--no-edit"], check=True)
+        altered = subprocess.run(["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
+                                 capture_output=True, text=True).stdout.strip()
+        assert not access_control_module._lease_head_is_author_attested(
+            lease.path, "main", original.observed_head_sha, altered,
+            scope=scope, lease=lease, ifc_state=auth.ifc_state,
+        )
+        subprocess.run(["git", "-C", str(lease.path), "reset", "-q", "--hard", head], check=True)
+    auth.ifc_state.repository_author_trust.resolve("owner/repo", "jasoncarreira", lambda: True)
+    for author, committer in (
+        ("outsider", "outsider"), ("collaborator", "outsider"),
+        ("uncached", DEFAULT_USER_NAME), ("jasoncarreira", DEFAULT_USER_NAME),
+    ):
+        bad_head = _git_commit(lease.path, target, author + committer, author, committer)
+        assert not access_control_module._lease_head_is_author_attested(
+            lease.path, "main", original.observed_head_sha, bad_head,
+            scope=scope, lease=lease, ifc_state=auth.ifc_state,
+        )
+        subprocess.run(["git", "-C", str(lease.path), "reset", "-q", "--hard", head], check=True)
+    # An unrelated HEAD is neither a descendant of the PR head nor the base.
+    subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "--orphan", "unrelated"], check=True)
+    subprocess.run(["git", "-C", str(lease.path), "rm", "-qrf", "."], check=True)
+    detached = _git_commit(lease.path, target, "unrelated", DEFAULT_USER_NAME, DEFAULT_USER_NAME)
+    subprocess.run(["git", "-C", str(lease.path), "branch", "-f", "main", detached], check=True)
+    subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "main"], check=True)
+    assert not access_control_module._lease_head_is_author_attested(
+        lease.path, "main", original.observed_head_sha, detached,
+        scope=scope, lease=lease, ifc_state=auth.ifc_state,
+    )
+    subprocess.run(["git", "-C", str(lease.path), "reset", "-q", "--hard", head], check=True)
+    for tool in ("repo_status", "repo_test"):
+        capture = begin_protected_result_capture()
+        try:
+            _publish_attested_lease_result(SimpleNamespace(context=auth), state)
+        finally:
+            provenance = end_protected_result_capture(capture)
+        labels = classify_protected_result(tool, {"repository": "owner/repo", "pull_request": 7},
+            auth, ToolAuthorization(tool_name=tool, decision="resource_scoped", allowed=True,
+                                    repo_pr_action_scope=scope), result="ok", provenance=provenance)
+        assert labels.sources[0].integrity == "trusted"
+
+
+def _replay_test_repo(tmp_path: Path):
+    """A real attested patch with a whitespace-sensitive statement addition."""
+    from dataclasses import replace
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    _, original, lease, target, _ = _real_attested_lease(tmp_path)
+    path = lease.path
+    subprocess.run(["git", "-C", str(path), "branch", "-m", "main"], check=True)
+
+    def git(*args):
+        return subprocess.run([
+            "git", "-C", str(path), "-c", f"user.name={DEFAULT_USER_NAME}",
+            "-c", f"user.email={DEFAULT_USER_EMAIL}", *args,
+        ], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(content, author="Jason Carreira"):
+        target.write_text(content, encoding="utf-8")
+        git("add", "work.py")
+        git("commit", "-qm", "statement", "--author", f"{author} <{author.replace(' ', '')}@example.test>")
+        return git("rev-parse", "HEAD")
+
+    common_text = "if enabled:\n    preserve_everything()\n"
+    patch_text = common_text + "    delete_everything()\n"
+    common = commit(common_text)
+    attested = commit(patch_text)
+    git("checkout", "-qb", "base", common)
+    (path / "base.txt").write_text("protected base\n", encoding="utf-8")
+    git("add", "base.txt")
+    git("commit", "-qm", "protected base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    scope = replace(original, observed_head_sha=attested,
+                    observed_base_sha=base, destination_ref="refs/heads/main")
+    lease.base_sha = base
+    return path, target, common, attested, scope, lease, git, commit, common_text, patch_text
+
+
+def test_replay_indentation_semantic_change_is_untrusted(tmp_path, _self_login):
+    path, target, common, attested, scope, lease, git, _, _, patch_text = _replay_test_repo(tmp_path)
+    git("rebase", "-q", "--onto", "base", common, "main")
+    replay = git("rev-parse", "HEAD")
+    assert _self_login(path, "main", attested, replay, scope=scope, lease=lease)
+    # Same tokens, but the destructive call is now unconditional. Stable
+    # patch-id accepts this; verbatim must reject it.
+    altered_text = patch_text.replace("    delete_everything()", "delete_everything()")
+    target.write_text(altered_text, encoding="utf-8")
+    git("add", "work.py")
+    git("commit", "-q", "--amend", "--no-edit")
+    assert not _self_login(path, "main", attested, git("rev-parse", "HEAD"),
+                           scope=scope, lease=lease)
+
+
+@pytest.mark.parametrize("original_copies, trusted", [(1, False), (2, True)])
+def test_replayed_patch_consumes_one_original_match(tmp_path, _self_login, original_copies, trusted):
+    from dataclasses import replace
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    path, _, _, attested, scope, lease, git, commit, common_text, patch_text = _replay_test_repo(tmp_path)
+    if original_copies == 2:
+        # Two genuine occurrences in the attested range must remain usable.
+        commit(common_text, DEFAULT_USER_NAME)
+        attested = commit(patch_text)
+        scope = replace(scope, observed_head_sha=attested)
+    git("reset", "-q", "--hard", "base")
+    git("cherry-pick", attested)
+    first_replay = git("rev-parse", "HEAD")
+    assert _self_login(path, "main", attested, first_replay, scope=scope, lease=lease)
+    git("revert", "--no-commit", first_replay)
+    # This intermediary is server-authored, not another attested replay.
+    git("commit", "-qm", "server revert", "--author", f"{DEFAULT_USER_NAME} <{DEFAULT_USER_EMAIL}>")
+    git("cherry-pick", attested)
+    assert _self_login(path, "main", attested, git("rev-parse", "HEAD"),
+                       scope=scope, lease=lease) is trusted
+
+
+@pytest.mark.parametrize("count, trusted", [(500, True), (501, False)])
+def test_original_patch_range_budget_fails_before_patch_subprocesses(monkeypatch, _self_login, count, trusted):
+    from mimir import repo_tools
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    head, base, replay, original = (c * 40 for c in "abcd")
+    calls = []
+
+    def run(_path, arguments, **_kwargs):
+        calls.append(arguments)
+        if arguments[0] == "log":
+            output = "\x00".join([replay, base, "Jason Carreira", "human@example.test",
+                                   DEFAULT_USER_NAME, DEFAULT_USER_EMAIL, ""])
+        elif arguments[0] == "merge-base":
+            output = original + "\n"
+        elif arguments[0] == "rev-list":
+            assert "--max-count=501" in arguments
+            output = (head + "\n") * count
+        elif arguments[0] == "show":
+            output = "immutable diff"
+        else:
+            pytest.fail(f"unexpected Git command: {arguments}")
+        return SimpleNamespace(returncode=0, stdout=output, timed_out=False, output_limited=False)
+
+    patch_calls = []
+
+    def patch_run(argv, **kwargs):
+        assert argv[-2:] == ["patch-id", "--verbatim"]
+        patch_calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=f"{'f' * 40} {'0' * 40}\n")
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", run)
+    monkeypatch.setattr(access_control_module.subprocess, "run", patch_run)
+    scope = SimpleNamespace(observed_base_sha=base, destination_ref="refs/heads/main")
+    lease = SimpleNamespace(base_sha=base)
+    assert _self_login(Path("/unused"), "main", head, replay, observed_state=("main", replay),
+                       scope=scope, lease=lease) is trusted
+    assert len(patch_calls) == (501 if trusted else 0)
+    assert sum(args[0] == "show" for args in calls) == (501 if trusted else 0)
 
 
 @pytest.mark.parametrize("author", ["collaborator", "mimir-bot"])

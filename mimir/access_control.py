@@ -164,6 +164,26 @@ SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
     if descriptor.sink_category is SinkCategory.SHELL_PROCESS
 )
 
+_GENERIC_SHELL_INGEST_REFUSAL = (
+    "Shell execution was refused after untrusted active ingest "
+    "(ifc_label_blocked:shell_process). Use a declared or bounded command, "
+    "read_file/glob/grep for local reads, or open_proposal for repository changes. "
+    "Ask the operator for a fresh turn or a one-time approve_sink_once approval "
+    "(request_operator_approval on an eligible operator turn)."
+)
+
+
+def _generic_shell_ingest_refusal(auth_context: Any) -> str:
+    state = getattr(auth_context, "ifc_state", None)
+    unavailable = getattr(state, "author_attestation_was_unavailable", None)
+    if callable(unavailable) and unavailable():
+        return _GENERIC_SHELL_INGEST_REFUSAL + (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
+    return _GENERIC_SHELL_INGEST_REFUSAL
+
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Native model tools. This is intentionally exhaustive rather than derived
     # from the sink map: startup checks the assembled surface against this map,
@@ -2361,6 +2381,17 @@ def parse_operator_shell_commands(
     for entry in raw or ():
         if not isinstance(entry, dict):
             raise ValueError("operator_shell_commands entries must be mappings")
+        raw_path = entry.get("path")
+        raw_exec = entry.get("exec")
+        if (isinstance(raw_exec, str) and Path(raw_exec).name.casefold() == "gh"
+                or isinstance(raw_path, str) and raw_path
+                and (Path(raw_path).name.casefold() == "gh"
+                     or Path(raw_path).resolve().name.casefold() == "gh")):
+            raise ValueError(
+                f"operator_shell_commands[{entry.get('exec')!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
         for key in ("external_send", "payload_args", "script"):
             if key in entry and (key != "external_send" or entry[key] is True):
                 raise ValueError(
@@ -2371,6 +2402,15 @@ def parse_operator_shell_commands(
         commands = parse_declared_shell_commands(raw, writable_roots=writable_roots)
     except ValueError as exc:
         raise DeclaredShellCommandError(f"operator_shell_commands: {exc}") from exc
+    for command in commands:
+        # Exec wrappers can invoke gh at any depth in a declared prefix.
+        if any(Path(token).name.casefold() == "gh"
+               for prefix in command.subcommands for token in prefix):
+            raise ValueError(
+                f"operator_shell_commands[{command.executable!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
     return commands
 
 
@@ -6734,8 +6774,8 @@ class SinkGate:
             # This veto covers only declared-command paths that execute exact
             # argv. Unknown service targets are refused by their profile gate,
             # not by a substring check (which also catches read-only diagnostics).
-            # Generic bash execution cannot be confined by argv inspection; its
-            # post-ingest policy and approval semantics remain unchanged (#1872).
+            # Generic bash execution cannot be confined by argv inspection; the
+            # shell-wide post-ingest veto below handles unbound execution.
             if bounded_operator:
                 execution_argv = list(operator_shell_binding.argv)
             elif service is not None and isinstance(target, str):
@@ -6775,6 +6815,56 @@ class SinkGate:
                     allowed=False, reason=reason,
                     required_tier=AccessTier.ADMIN, enforcement_enabled=True,
                     would_block=True, refusal_detail=refusal,
+                )
+        # A shell command with no execution binding is not confined by inspecting
+        # its text. Apply this on continuations as well as chat turns. Keep the
+        # enforced route's existing decisions and reasons unchanged.
+        if (not enforce and tool_name in SHELL_PROCESS_TOOL_NAMES
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            bounded_operator = (
+                cls._is_trusted_operator_turn(ifc_labels, auth_context)
+                and _operator_shell_binding_matches(
+                    operator_shell_binding,
+                    request_identity=operator_shell_request_identity,
+                    auth_context_identity=auth_context,
+                    tool_name=tool_name, tool_call_id=tool_call_id,
+                    command=target, requested_cwd=requested_cwd,
+                )
+            )
+            # Trusted services retain their existing profile authorization and
+            # execution binding; a trigger string alone is never service authority.
+            bounded_service = service is not None
+            client_authorized = False
+            if client_authorized_host_execution is not None:
+                from .tools.client_provider import client_authorized_host_execution_matches
+
+                client_authorized = client_authorized_host_execution_matches(
+                    client_authorized_host_execution,
+                    request_identity=request_identity,
+                    auth_context_identity=auth_context,
+                    wrapper_name=tool_name,
+                )
+            if not (bounded_operator or bounded_service or client_authorized):
+                normalized = normalize_sink_destination(sink_category, target)
+                state = getattr(auth_context, "ifc_state", None)
+                principal = getattr(auth_context, "canonical_principal", None)
+                if (normalized is not None and isinstance(principal, str)
+                        and state is not None and state.consume_sink_approval(
+                            current=ifc_labels, sink_category=sink_category.value,
+                            destination=normalized, canonical_principal=principal,
+                            shadow=False,
+                        )):
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.OPEN,
+                        allowed=True, reason="ifc_declassification_approved",
+                        service_principal=service, enforcement_enabled=False,
+                    )
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason="ifc_label_blocked:shell_process",
+                    service_principal=service, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=True, would_block=True,
+                    refusal_detail=_generic_shell_ingest_refusal(auth_context),
                 )
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
@@ -9680,6 +9770,10 @@ class ToolRegistry:
                 request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
+            if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
+                    and sink_check.reason == "ifc_declassification_approved"
+                    and not preliminary_admin_denied):
+                return finish(sink_check)
             if (not sink_check.allowed and sink_check.enforcement_enabled
                     and not preliminary_admin_denied):
                 return finish(sink_check)
@@ -10171,6 +10265,7 @@ def _attested_pr_checkout_lease(
         # cache, but still fail closed against the immutable attested head.
         return _lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
         )
     recorded_head = getattr(review_state, "git_expected_head", None)
     if not recorded_head:
@@ -10189,6 +10284,7 @@ def _attested_pr_checkout_lease(
         lambda: _lease_head_is_author_attested(
             path, expected_branch, expected_head, observed_head,
             observed_state=observed_state,
+            scope=scope, lease=lease, ifc_state=ifc_state,
         ),
     )
 
@@ -10232,35 +10328,111 @@ def _lease_head_is_author_attested(
     current_head: str,
     *,
     observed_state: tuple[str, str] | None = None,
+    scope: Any = None,
+    lease: Any = None,
+    ifc_state: Any = None,
 ) -> bool:
-    """Verify HEAD is the attested commit plus only server-identity commits."""
+    """Verify HEAD against the attested head and the observed protected base."""
+    from collections import Counter
+
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from .repo_tools import hardened_git_command
+    from .repo_tools import (
+        _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS,
+        _sanitized_git_env, hardened_git_command,
+    )
 
     def run(*arguments: str):
         return hardened_git_command(path, arguments, timeout=5)
+
+    def patch_id(commit: str) -> str | None:
+        # Read only immutable objects with hardened Git; patch-id receives the
+        # bounded diff on stdin, never a shell pipeline or checkout config.
+        # --stable discards whitespace (including semantic Python indentation).
+        # Require --verbatim; unsupported Git versions fail closed.
+        diff = run("show", "--format=", "--root", "--no-ext-diff", "--no-textconv", commit, "--")
+        if diff.returncode != 0 or diff.timed_out or diff.output_limited:
+            return None
+        result = subprocess.run(
+            [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
+            input=diff.stdout, capture_output=True, text=True, timeout=5,
+            env=_sanitized_git_env(),
+        )
+        fields = result.stdout.split()
+        if result.returncode != 0 or len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+            return None
+        return fields[0]
 
     try:
         actual_state = observed_state or _observed_checkout_state(path)
         if actual_state != (expected_branch, current_head.lower()):
             return False
-        if current_head.lower() == expected_head:
+        if current_head.lower() == expected_head.lower():
             return True
-        ancestry = run("merge-base", "--is-ancestor", expected_head, current_head)
-        if ancestry.returncode != 0:
+        base = getattr(scope, "observed_base_sha", "").lower()
+        protected_base = (
+            getattr(scope, "destination_ref", None) in _PROTECTED_BRANCH_REFS
+            and len(base) == 40 and all(c in "0123456789abcdef" for c in base)
+            and base == getattr(lease, "base_sha", "").lower()
+        )
+        head_ancestor = run("merge-base", "--is-ancestor", expected_head, current_head).returncode == 0
+        base_ancestor = protected_base and run(
+            "merge-base", "--is-ancestor", base, current_head,
+        ).returncode == 0
+        if not head_ancestor and not base_ancestor:
             return False
         commits = run(
-            "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce",
-            f"{expected_head}..{current_head}", "--",
+            "log", "-z", "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce",
+            current_head, "--not", expected_head, *((base,) if base_ancestor else ()), "--",
         )
-        if commits.returncode != 0:
+        if commits.returncode != 0 or commits.timed_out or commits.output_limited:
             return False
-        fields = [field for field in commits.stdout.split("\x00") if field]
-        expected_identity = [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL] * 2
-        return bool(fields) and len(fields) % 4 == 0 and all(
-            fields[index:index + 4] == expected_identity
-            for index in range(0, len(fields), 4)
-        )
+        fields = commits.stdout.split("\x00")
+        if fields[-1] != "":
+            return False
+        fields.pop()
+        if len(fields) % 6:
+            return False
+        original_patches: Counter[str] | None = None
+        for index in range(0, len(fields), 6):
+            commit, parents, author, email, committer, committer_email = fields[index:index + 6]
+            if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                return False
+            if len(parents.split()) > 1:
+                # Only a server-authored merge of the exact protected base may
+                # introduce another ancestry. Never accept arbitrary side merges.
+                if not base_ancestor or [author, email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                    return False
+                if any(parent != base and run("merge-base", "--is-ancestor", expected_head, parent).returncode != 0
+                       for parent in parents.split()):
+                    return False
+                continue
+            if [author, email] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                continue
+            if not base_ancestor:
+                return False
+            if original_patches is None:
+                merge_base = run("merge-base", expected_head, base)
+                if merge_base.returncode != 0:
+                    return False
+                # Read one beyond the budget so oversized ranges fail closed
+                # before any per-commit show/patch-id subprocess is launched.
+                original = run("rev-list", "--no-merges", "--max-count=501",
+                               f"{merge_base.stdout.strip()}..{expected_head}", "--")
+                if original.returncode != 0 or original.timed_out or original.output_limited:
+                    return False
+                original_commits = original.stdout.splitlines()
+                if len(original_commits) > 500:
+                    return False
+                original_patches = Counter()
+                for original_commit in original_commits:
+                    original_patch = patch_id(original_commit)
+                    if original_patch is not None:
+                        original_patches[original_patch] += 1
+            replayed_patch = patch_id(commit)
+            if replayed_patch is None or original_patches[replayed_patch] <= 0:
+                return False
+            original_patches[replayed_patch] -= 1
+        return True
     except (OSError, subprocess.SubprocessError):
         return False
 

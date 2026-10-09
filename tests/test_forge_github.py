@@ -493,6 +493,25 @@ def test_file_content_invalid_path_does_not_request(path: str) -> None:
     assert session.calls == []
 
 
+@pytest.mark.parametrize("path,missing,requests", [
+    ("src/missing.py", "missing.py", 3),
+    ("absent/file.py", "absent", 2),
+])
+def test_file_content_missing_path_names_missing_component_and_pr_files(path, missing, requests) -> None:
+    responses = _file_responses(path)
+    responses[1 if missing == "absent" else 2] = Response({"tree": []})
+    session = Session(responses)
+    with pytest.raises(ForgeError) as refusal:
+        GitHubForgeClient(session=session).get_file_content(_scope(), path)
+    message = str(refusal.value)
+    assert f"path not found at scoped head {'a' * 12}" in message
+    assert "pr_files" in message and "check the path's spelling" in message
+    assert "not a regular file" not in message
+    if missing == "absent":
+        assert "missing component 'absent'" in message
+    assert len(session.calls) == requests  # no blob request
+
+
 @pytest.mark.parametrize("entry", [
     {"path": "link", "type": "tree", "mode": "040000", "sha": "d" * 40},
     {"path": "link", "type": "blob", "mode": "120000", "sha": "d" * 40},

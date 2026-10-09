@@ -1129,6 +1129,7 @@ def _with_author_attestation_note(message: str, reason: str, ctx: Any | None) ->
     """Decorate refusal prose without changing the decision or machine reason."""
     if (
         reason.startswith("ifc_label_blocked:")
+        and "GitHub author attestation was unavailable" not in message
         and isinstance(ctx, AuthContext)
         and getattr(ctx, "ifc_state", None) is not None
         and ctx.ifc_state.author_attestation_was_unavailable()
@@ -3471,7 +3472,14 @@ def _prepare_tool_call_execution(
             and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
             and authorization.reason == "ifc_label_blocked:shell_process"
         ):
-            admin_denial = _operator_shell_live_taint_refusal(auth_context)
+            admin_denial = (
+                authorization.refusal_detail
+                if not auth_context.enforcement_enabled and authorization.refusal_detail
+                else _operator_shell_live_taint_refusal(auth_context)
+            )
+            admin_denial = _with_author_attestation_note(
+                admin_denial, "ifc_label_blocked:shell_process", auth_context,
+            ) if not auth_context.enforcement_enabled else admin_denial
             _operator_shell_recorded_refusal(
                 request, record=True, audit=operator_shell_audit, refusal=admin_denial,
             )
@@ -3608,6 +3616,17 @@ def _prepare_tool_call_execution(
         )
         _merge_result_labels(auth_context, propagated)
     started = time.monotonic()
+    # A consumed one-time grant admits this exact open-shell call. Do not
+    # re-apply the operator's soft-unbound refusal after authorization.
+    approved_unbound = (
+        operator_shell_preparation is not None
+        and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
+        and isinstance(authorization, ToolAuthorization)
+        and authorization.reason == "ifc_declassification_approved"
+        and not auth_context.enforcement_enabled
+    )
+    if approved_unbound:
+        operator_shell_preparation = None
     execution_request = (
         _request_for_authorized_execution(
             request,
