@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from mimir.access_control import parse_declared_shell_commands
+from mimir.access_control import (
+    parse_declared_shell_commands,
+    parse_service_shell_argv_with_diagnostics,
+)
 
 
 SKILL = Path(__file__).resolve().parents[1]
@@ -23,12 +26,38 @@ def test_declared_agent_command_parses_with_required_environment(tmp_path: Path)
     installed.mkdir(parents=True)
     shutil.copy2(WRAPPER, installed / WRAPPER.name)
     declaration["script"] = str(installed / WRAPPER.name)
+    declaration["path"] = shutil.which("bash")
+    assert declaration["path"] is not None
     parsed, = parse_declared_shell_commands([declaration], writable_roots=(tmp_path / "state",))
     assert parsed.pass_env == ("GOG_ACCOUNT", "GOG_KEYRING_PASSWORD")
     assert parsed.options == ("--account", "--max", "--json", "--no-input", "--full")
     assert manifest["pollers"][0]["pass_env"] == [
         "GOG_ACCOUNT", "MIMIR_GMAIL_QUERY", "MIMIR_GMAIL_MAX_FETCH", "MIMIR_HOME", "JEV_KEY",
     ]
+
+
+def test_documented_commands_are_admitted_by_service_gate(tmp_path: Path) -> None:
+    manifest = json.loads((SKILL / "pollers.json").read_text(encoding="utf-8"))
+    declaration = manifest["pollers"][0]["authority"]["shell_commands"][0].copy()
+    original_script = declaration["script"]
+    installed = tmp_path / "skills" / "gmail-poller" / "scripts"
+    installed.mkdir(parents=True)
+    shutil.copy2(WRAPPER, installed / WRAPPER.name)
+    declaration["script"] = str(installed / WRAPPER.name)
+    declaration["path"] = shutil.which("bash")
+    assert declaration["path"] is not None
+    declared = parse_declared_shell_commands([declaration], writable_roots=(tmp_path / "state",))
+    documentation = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    examples = documentation.split("```sh\n", 1)[1].split("```", 1)[0].splitlines()
+    assert len(examples) == 3
+    for example in examples:
+        assert "--account" not in example
+        argv, reason, _ = parse_service_shell_argv_with_diagnostics(
+            example.replace(original_script, declaration["script"]),
+            "scheduler_read_only", declared=declared,
+        )
+        assert argv is not None, reason
+        assert "GOG_ACCOUNT" not in " ".join(argv)
 
 
 @pytest.fixture
@@ -45,11 +74,22 @@ def gog_stub(tmp_path: Path):
         encoding="utf-8",
     )
     binary.chmod(0o755)
+    source = WRAPPER.read_text(encoding="utf-8")
+    assert "exec /usr/local/bin/gog " in source
+    wrapper = tmp_path / WRAPPER.name
+    # Substitute only in this private copy; production has no binary override.
+    wrapper.write_text(source.replace("/usr/local/bin/gog", str(binary)), encoding="utf-8")
+    hijack_dir = tmp_path / ".local" / "bin"
+    hijack_dir.mkdir(parents=True)
+    hijacked = tmp_path / "hijacked"
+    hijack = hijack_dir / "gog"
+    hijack.write_text(f"#!/bin/sh\ntouch '{hijacked}'\nexit 99\n", encoding="utf-8")
+    hijack.chmod(0o755)
     output = tmp_path / "invocation.json"
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path),
-        "PATH": f"{binary_dir}:{env['PATH']}",
+        "PATH": f"{hijack_dir}:{env['PATH']}",
         "GOG_ACCOUNT": "agent@example.test",
         "GOG_KEYRING_PASSWORD": "stub-password",
         "GOG_STUB_OUTPUT": str(output),
@@ -63,9 +103,10 @@ def gog_stub(tmp_path: Path):
         else:
             command_env["GOG_ACCOUNT"] = account
         result = subprocess.run(
-            ["bash", str(WRAPPER), *args], env=command_env,
+            ["bash", str(wrapper), *args], env=command_env,
             capture_output=True, text=True, check=False,
         )
+        assert not hijacked.exists(), "agent-writable PATH gog was executed"
         invocation = json.loads(output.read_text()) if output.exists() else None
         return result, invocation
 
@@ -78,8 +119,12 @@ def gog_stub(tmp_path: Path):
     ("gmail", "thread", "get", "thread_123-A", "--full", "--json", "--no-input"),
     ("auth", "list"),
 ])
-def test_read_commands_force_runtime_guards(gog_stub, arguments: tuple[str, ...]) -> None:
-    result, invocation = gog_stub(*arguments, *(["--account", "agent@example.test"] if arguments[0] == "gmail" else []))
+@pytest.mark.parametrize("explicit_account", [False, True])
+def test_read_commands_force_runtime_guards(
+    gog_stub, arguments: tuple[str, ...], explicit_account: bool,
+) -> None:
+    account_args = ["--account", "agent@example.test"] if explicit_account and arguments[0] == "gmail" else []
+    result, invocation = gog_stub(*arguments, *account_args)
     assert result.returncode == 0, result.stderr
     assert invocation is not None
     assert invocation["args"] == ["--readonly", "--gmail-no-send", *arguments, *(

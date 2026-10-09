@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the read-only gog operations used by Gmail poller turns with the same
-# account, credential home, and user-local binary path as the deployment.
+# account and credential home as the deployment, using its pinned gog binary.
 set -euo pipefail
 
 if [[ -z "${GOG_ACCOUNT:-}" ]]; then
@@ -26,6 +26,7 @@ else
 fi
 
 EXPECT_VALUE=""
+ACCOUNT_PROVIDED=0
 POSITIONALS=0
 for ARG in "$@"; do
   if [[ -n "$EXPECT_VALUE" ]]; then
@@ -33,9 +34,12 @@ for ARG in "$@"; do
       echo "run-gog.sh: invalid value for $EXPECT_VALUE" >&2
       exit 2
     fi
-    if [[ "$EXPECT_VALUE" == "--account" && "$ARG" != "$GOG_ACCOUNT" ]]; then
-      echo "run-gog.sh: --account does not match the declared account" >&2
-      exit 2
+    if [[ "$EXPECT_VALUE" == "--account" ]]; then
+      if [[ "$ARG" != "$GOG_ACCOUNT" ]]; then
+        echo "run-gog.sh: --account does not match the declared account" >&2
+        exit 2
+      fi
+      ACCOUNT_PROVIDED=1
     fi
     if [[ "$EXPECT_VALUE" == "--max" && ! "$ARG" =~ ^[0-9]+$ ]]; then
       echo "run-gog.sh: invalid value for --max" >&2
@@ -72,7 +76,10 @@ if [[ "${SUBCOMMAND[0]}" == gmail && "$POSITIONALS" -ne 1 ]]; then
   exit 2
 fi
 
+if [[ "${SUBCOMMAND[0]}" == gmail && "$ACCOUNT_PROVIDED" -eq 0 ]]; then
+  set -- "$@" --account "$GOG_ACCOUNT"
+fi
+
 export GOG_ACCOUNT
 export GOG_HOME="$HOME/.local/share/gog"
-export PATH="$HOME/.local/bin:$PATH"
-exec gog --readonly --gmail-no-send "${SUBCOMMAND[@]}" "$@"
+exec /usr/local/bin/gog --readonly --gmail-no-send "${SUBCOMMAND[@]}" "$@"

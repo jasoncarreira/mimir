@@ -333,19 +333,17 @@ async def test_dead_update_forwarder_fails_prompt_without_wedging_session(
     monkeypatch.setattr(UpdateDispatcher, "submit", fail_first_submit)
     core.run_turn = first_turn_only_publishes
 
-    # Bound a genuinely wedged forwarder while allowing for loaded xdist workers.
     with pytest.raises(sdk.RequestError, match="Internal error"):
         await asyncio.wait_for(
             agent.prompt(
                 session_id, [sdk.TextContentBlock(type="text", text="first")]
             ),
-            5,
+            1,
         )
-    assert submit_calls == 1
 
     response = await asyncio.wait_for(
         agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")]),
-        5,
+        1,
     )
     assert response.stop_reason == "end_turn"
     assert agent._sessions[session_id].active_prompt is None

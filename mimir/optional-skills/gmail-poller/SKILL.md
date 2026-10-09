@@ -242,14 +242,18 @@ In agent turns, inspect your state with `read_file`, `ls`, `glob` and `grep`.
 The shell is only for `run-gog.sh`, which supports exactly these commands:
 
 ```sh
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox is:unread' --account "$GOG_ACCOUNT" --max 5 --json --no-input
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail get 19483abc --account "$GOG_ACCOUNT" --full --json --no-input
-bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail thread get 19483abc --account "$GOG_ACCOUNT" --full --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox is:unread' --max 5 --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail get 19483abc --full --json --no-input
+bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail thread get 19483abc --full --json --no-input
 ```
 
 It also supports `auth list` for checking authentication. Message and thread
-reads require one ID; search requires one query. The wrapper restricts options
-and accounts and always passes gog's `--readonly` and `--gmail-no-send` runtime
+reads require one ID; search requires one query. Do not expand environment
+variables in these commands: the service gate executes a literal argv, not a
+shell. The wrapper adds `--account` from its passed `GOG_ACCOUNT` environment
+when omitted and rejects any explicit account that does not match. It invokes
+the pinned `/usr/local/bin/gog`, restricts options and accounts, and always
+passes gog's `--readonly` and `--gmail-no-send` runtime
 blocks on mutating requests and sends. Attachment downloads are not permitted.
 
 ## Cursor model
@@ -299,7 +303,7 @@ If the poller isn't emitting:
 
 1. **Verify gog is authed**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh auth list` should show `GOG_ACCOUNT`.
    In container: `docker exec mimirbot gog auth list`.
-2. **Run the search manually**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search "$MIMIR_GMAIL_QUERY" --account "$GOG_ACCOUNT" --max 5 --json --no-input` — if this returns zero hits, the query is wrong.
+2. **Run the search manually**: `bash /mimir-home/skills/gmail-poller/scripts/run-gog.sh gmail messages search 'in:inbox newer_than:1d' --max 5 --json --no-input` — if this returns zero hits, the query is wrong.
 3. **Check `events.jsonl`** for `poller_stderr` entries from
    `gmail-inbox` — these surface gog's stderr (auth errors,
    rate-limit hits) verbatim.
