@@ -7654,7 +7654,7 @@ def test_model_written_fetch_cache_read_does_not_contribute_verbatim_url(
 @pytest.mark.parametrize("enforcement_enabled", [False, True])
 @pytest.mark.parametrize("attestation_unavailable", [False, True])
 @pytest.mark.parametrize("exact_grant", [False, True])
-async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_command(
+async def test_exact_shell_grant_admits_only_one_shadow_operator_command(
     middleware_path: str,
     enforcement_enabled: bool,
     attestation_unavailable: bool,
@@ -7688,14 +7688,6 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
 
     def capture_decision(*args: Any, **kwargs: Any) -> ToolAuthorization:
         decision = check_sink_flow(*args, **kwargs)
-        if not exact_grant:
-            # Exercise the middleware's authorization-denial override explicitly;
-            # the exact-grant arm uses the real non-bypassable shell veto.
-            from dataclasses import replace
-
-            decision = replace(
-                decision, allowed=False, reason="ifc_label_blocked:shell_process",
-            )
         decisions.append(decision)
         return decision
 
@@ -7732,27 +7724,43 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
     finally:
         reset_current_turn(token)
 
-    assert len(decisions) == 1
+    approved = exact_grant and not enforcement_enabled
+    assert len(decisions) == (2 if approved else 1)
     assert repeated.status == "error"
     assert repeated.tool_call_id == "grant-repeat"
+    if approved:
+        assert decisions[0].allowed and decisions[0].reason == "ifc_declassification_approved"
+        assert not decisions[1].allowed and not decisions[1].is_shadow_decision
+        assert handler_calls == 1
+        assert result.content == "ran"
+        assert result.status != "error"
+        assert "ifc_label_blocked:shell_process" in repeated.content
+        assert not SinkGate.check_sink_flow(
+            "shell_exec", command, labels, auth, enforce=False,
+        ).allowed
+        assert state.current().has_untrusted_active_ingest is True
+        return
     assert repeated.content == (
         f"Repeat of an identical command refused in this turn. {result.content}"
     )
-    # #1725 now vetoes tainted unbounded shell before declassification. Shadow
-    # mode can report allowed, but the middleware still refuses execution. Keep
-    # the externally observable refusal assertions below unchanged.
-    assert decisions[0].allowed is (exact_grant and not enforcement_enabled)
+    assert decisions[0].allowed is False
     assert decisions[0].reason == "ifc_label_blocked:shell_process"
     assert ("GitHub author attestation was unavailable" in result.content) is attestation_unavailable
+    if attestation_unavailable:
+        assert result.content.count("GitHub author attestation was unavailable") == 1
     assert ("GitHub author attestation was unavailable" in repeated.content) is attestation_unavailable
     assert handler_calls == 0
     assert result.status == "error"
     assert result.tool_call_id == "exact-shell-grant"
     assert result.name == "shell_exec"
     assert "ifc_label_blocked:shell_process" in result.content
-    assert "operator shell fallback requires exactly untainted live IFC" in result.content
-    assert "single bounded command from the pinned operator family with no shell metacharacters" in result.content
-    assert "send the operator a message asking them to open a fresh user turn" in result.content
+    if enforcement_enabled:
+        assert "operator shell fallback requires exactly untainted live IFC" in result.content
+        assert "single bounded command from the pinned operator family with no shell metacharacters" in result.content
+        assert "send the operator a message asking them to open a fresh user turn" in result.content
+    else:
+        assert "declared or bounded command" in result.content
+        assert "read_file/glob/grep" in result.content
     assert state.current().has_untrusted_active_ingest is True
     hard = [fields for kind, fields in captured if kind == "hard_boundary_denied"]
     assert hard == [{
@@ -7767,5 +7775,5 @@ async def test_exact_shell_grant_still_refuses_tainted_unbounded_operator_comman
         "preparation_outcome": "soft_unbound",
         "command_family": "profile_miss",
         "binding_rule": ServiceShellBindingRule.PROFILE_ALLOWLIST.value,
-    }] * (1 if enforcement_enabled else 2)
+    }]
     assert command not in json.dumps(captured)

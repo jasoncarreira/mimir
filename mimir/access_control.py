@@ -164,6 +164,26 @@ SHELL_PROCESS_TOOL_NAMES: frozenset[str] = frozenset(
     if descriptor.sink_category is SinkCategory.SHELL_PROCESS
 )
 
+_GENERIC_SHELL_INGEST_REFUSAL = (
+    "Shell execution was refused after untrusted active ingest "
+    "(ifc_label_blocked:shell_process). Use a declared or bounded command, "
+    "read_file/glob/grep for local reads, or open_proposal for repository changes. "
+    "Ask the operator for a fresh turn or a one-time approve_sink_once approval "
+    "(request_operator_approval on an eligible operator turn)."
+)
+
+
+def _generic_shell_ingest_refusal(auth_context: Any) -> str:
+    state = getattr(auth_context, "ifc_state", None)
+    unavailable = getattr(state, "author_attestation_was_unavailable", None)
+    if callable(unavailable) and unavailable():
+        return _GENERIC_SHELL_INGEST_REFUSAL + (
+            " GitHub author attestation was unavailable during this turn and is a possible "
+            "cause of the taint (for example, GitHub could not be reached). This is not "
+            "a measured non-collaborator verdict; the read still failed closed."
+        )
+    return _GENERIC_SHELL_INGEST_REFUSAL
+
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Native model tools. This is intentionally exhaustive rather than derived
     # from the sink map: startup checks the assembled surface against this map,
@@ -6734,8 +6754,8 @@ class SinkGate:
             # This veto covers only declared-command paths that execute exact
             # argv. Unknown service targets are refused by their profile gate,
             # not by a substring check (which also catches read-only diagnostics).
-            # Generic bash execution cannot be confined by argv inspection; its
-            # post-ingest policy and approval semantics remain unchanged (#1872).
+            # Generic bash execution cannot be confined by argv inspection; the
+            # shell-wide post-ingest veto below handles unbound execution.
             if bounded_operator:
                 execution_argv = list(operator_shell_binding.argv)
             elif service is not None and isinstance(target, str):
@@ -6775,6 +6795,56 @@ class SinkGate:
                     allowed=False, reason=reason,
                     required_tier=AccessTier.ADMIN, enforcement_enabled=True,
                     would_block=True, refusal_detail=refusal,
+                )
+        # A shell command with no execution binding is not confined by inspecting
+        # its text. Apply this on continuations as well as chat turns. Keep the
+        # enforced route's existing decisions and reasons unchanged.
+        if (not enforce and tool_name in SHELL_PROCESS_TOOL_NAMES
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            bounded_operator = (
+                cls._is_trusted_operator_turn(ifc_labels, auth_context)
+                and _operator_shell_binding_matches(
+                    operator_shell_binding,
+                    request_identity=operator_shell_request_identity,
+                    auth_context_identity=auth_context,
+                    tool_name=tool_name, tool_call_id=tool_call_id,
+                    command=target, requested_cwd=requested_cwd,
+                )
+            )
+            # Trusted services retain their existing profile authorization and
+            # execution binding; a trigger string alone is never service authority.
+            bounded_service = service is not None
+            client_authorized = False
+            if client_authorized_host_execution is not None:
+                from .tools.client_provider import client_authorized_host_execution_matches
+
+                client_authorized = client_authorized_host_execution_matches(
+                    client_authorized_host_execution,
+                    request_identity=request_identity,
+                    auth_context_identity=auth_context,
+                    wrapper_name=tool_name,
+                )
+            if not (bounded_operator or bounded_service or client_authorized):
+                normalized = normalize_sink_destination(sink_category, target)
+                state = getattr(auth_context, "ifc_state", None)
+                principal = getattr(auth_context, "canonical_principal", None)
+                if (normalized is not None and isinstance(principal, str)
+                        and state is not None and state.consume_sink_approval(
+                            current=ifc_labels, sink_category=sink_category.value,
+                            destination=normalized, canonical_principal=principal,
+                            shadow=False,
+                        )):
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.OPEN,
+                        allowed=True, reason="ifc_declassification_approved",
+                        service_principal=service, enforcement_enabled=False,
+                    )
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason="ifc_label_blocked:shell_process",
+                    service_principal=service, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=True, would_block=True,
+                    refusal_detail=_generic_shell_ingest_refusal(auth_context),
                 )
         if not isinstance(ifc_labels, InformationFlowLabels):
             return ToolAuthorization(
@@ -9680,6 +9750,10 @@ class ToolRegistry:
                 request_identity=request_identity,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
+            if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
+                    and sink_check.reason == "ifc_declassification_approved"
+                    and not preliminary_admin_denied):
+                return finish(sink_check)
             if (not sink_check.allowed and sink_check.enforcement_enabled
                     and not preliminary_admin_denied):
                 return finish(sink_check)
