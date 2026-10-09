@@ -21,6 +21,7 @@ import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
 import { getWhoami } from "./api/whoami";
+import { ApiError } from "./api/http";
 import { AdminRoute } from "./routes/AdminRoute";
 import { LiveEventsProvider, LiveEventsWarning, useLiveEvents } from "./live-events";
 import { SagaDashboard } from "./SagaDashboard";
@@ -102,7 +103,22 @@ function appBasename() {
 function useWhoami(enabled: boolean) {
   return useQuery({
     queryKey: ["whoami"],
-    queryFn: async () => (await getWhoami()).data,
+    queryFn: async () => {
+      const epoch = useUiState.getState().apiKeyEpoch;
+      try {
+        const result = await getWhoami();
+        if (useUiState.getState().apiKeyEpoch === epoch) {
+          useUiState.getState().confirmSessionCookie();
+        }
+        return result.data;
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 401 &&
+            useUiState.getState().apiKeyPresent && useUiState.getState().apiKeyEpoch === epoch) {
+          useUiState.getState().setApiKeyRejected(true);
+        }
+        throw error;
+      }
+    },
     // Don't call /api/v1/whoami until the user is signed in — a protected server
     // with no key would otherwise issue an unauthenticated request pre-login.
     enabled
@@ -152,6 +168,7 @@ function useSetApiKey() {
       else await deleteWebSession();
       resetBrowserSessionStateForApiKeyChange(client, navigate);
       setApiKeyPresent(Boolean(trimmed));
+      if (trimmed) useUiState.getState().setSessionCookiePending();
       if (trimmed) void client.invalidateQueries({ queryKey: ["whoami"] });
     },
     [client, navigate, setApiKeyPresent]
@@ -538,6 +555,7 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
   const [entry, setEntry] = React.useState("");
   const [sessionError, setSessionError] = React.useState("");
   const setApiKey = useSetApiKey();
+  const sessionCookieMissing = useUiState((state) => state.sessionCookieMissing);
   const host = bootstrap?.server?.web_host || "this server";
 
   return (
@@ -554,7 +572,9 @@ function LoginScreen({ bootstrap, error, isError, isLoading, reauthenticate = fa
           <>
             <p className="login-screen__subtitle">
               {reauthenticate
-                ? "Your API key was rejected or revoked. Enter a valid key to re-authenticate."
+                ? sessionCookieMissing
+                  ? "Signed in, but your browser didn't keep the session cookie. Open mimir over HTTPS, or at http://localhost:<port> (for example through an SSH tunnel)."
+                  : "Your API key was rejected or revoked. Enter a valid key to re-authenticate."
                 : `Protected server on ${host}. Enter your API key to continue.`}
             </p>
             <form

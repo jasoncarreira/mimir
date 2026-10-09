@@ -9,7 +9,7 @@ export class SseResponseError extends Error {
 }
 
 export function isAuthenticationSseError(error: unknown): boolean {
-  return error instanceof SseResponseError && (error.status === 401 || error.status === 403);
+  return error instanceof SseResponseError && error.status === 401;
 }
 
 export function isTerminalSseError(error: unknown): boolean {

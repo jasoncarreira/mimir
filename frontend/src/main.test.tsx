@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
+import { ApiError } from "./api/http";
 
 // Regression for github #563 / PR #774: saving an API key must refetch whoami so
 // role-gated admin surfaces appear immediately, without a page reload. Plus the
@@ -149,13 +150,14 @@ const { useUiState } = await import("./uiState");
 function renderApp(initialEntries = ["/"]) {
   useUiState.setState({ apiKeyPresent: false });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const view = render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={initialEntries}>
         <AppFrame />
       </MemoryRouter>
     </QueryClientProvider>
   );
+  return { ...view, queryClient: qc };
 }
 
 afterEach(() => {
@@ -173,7 +175,9 @@ afterEach(() => {
     composerActive: false,
     collapsedRegions: {},
     apiKeyPresent: false,
-    apiKeyRejected: false
+    apiKeyRejected: false,
+    sessionCookiePending: false,
+    sessionCookieMissing: false
   });
   wikiRouteLoads.count = 0;
   liveEventsState.status = "idle";
@@ -389,6 +393,70 @@ describe("AppFrame login gate + admin surface gating (#563 / #577)", () => {
     expect(await screen.findByRole("link", { name: /Chat/ })).toBeTruthy();
     expect(await screen.findByRole("link", { name: /Users/ })).toBeTruthy();
     expect(await screen.findByRole("link", { name: /Wiki/ })).toBeTruthy();
+  });
+
+  it("explains a lost cookie when whoami returns 401 right after a successful session POST", async () => {
+    vi.mocked(whoami.getWhoami).mockRejectedValueOnce(new ApiError(401, { error: "unauthorized" }));
+    renderApp();
+    await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), { target: { value: "valid-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByText(/browser didn't keep the session cookie/)).toBeTruthy();
+    expect(screen.queryByText(/rejected or revoked/)).toBeNull();
+    expect(sessionKey).toBe("valid-key");
+  });
+
+  it("keeps the invalid-key error for a 401 from the session POST", async () => {
+    renderApp();
+    await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), { target: { value: "revoked-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "Invalid API key");
+    expect(screen.queryByText(/browser didn't keep/)).toBeNull();
+    expect(whoami.getWhoami).not.toHaveBeenCalled();
+  });
+
+  it("reports rejection after an authenticated whoami has succeeded", async () => {
+    const { queryClient } = renderApp();
+    await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), { target: { value: "valid-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(await screen.findByText("chat-stub")).toBeTruthy();
+    expect(useUiState.getState().sessionCookiePending).toBe(false);
+
+    vi.mocked(whoami.getWhoami).mockRejectedValueOnce(new ApiError(401, { error: "unauthorized" }));
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: ["whoami"] }); });
+    expect(await screen.findByText(/rejected or revoked/)).toBeTruthy();
+    expect(screen.queryByText(/browser didn't keep/)).toBeNull();
+  });
+
+  it("keeps a forbidden whoami response in the identity error view", async () => {
+    vi.mocked(whoami.getWhoami).mockRejectedValueOnce(new ApiError(403, { error: "forbidden" }));
+    renderApp();
+    await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), { target: { value: "valid-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByText("Couldn't verify your identity")).toBeTruthy();
+    expect(screen.queryByText(/rejected or revoked/)).toBeNull();
+    expect(useUiState.getState().apiKeyRejected).toBe(false);
+  });
+
+  it("ignores a stale whoami 401 after switching sessions", async () => {
+    let rejectOld!: (error: Error) => void;
+    const oldResponse = new Promise<unknown>((_, reject) => { rejectOld = reject; });
+    vi.mocked(whoami.getWhoami).mockReturnValueOnce(oldResponse);
+    renderApp();
+    await screen.findByRole("button", { name: "Sign in" });
+    fireEvent.change(screen.getByLabelText("MIMIR_API_KEY"), { target: { value: "old-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await waitFor(() => expect(whoami.getWhoami).toHaveBeenCalled());
+    act(() => useUiState.getState().setApiKeyPresent(true));
+    await act(async () => { rejectOld(new ApiError(401, { error: "unauthorized" })); await oldResponse.catch(() => {}); });
+
+    expect(useUiState.getState().apiKeyRejected).toBe(false);
   });
 
   it("returns to the login screen after clearing the key", async () => {
