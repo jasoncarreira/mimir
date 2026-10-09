@@ -99,10 +99,15 @@ export function TurnSpansProvider({
       },
       {
         channel,
-        onOpen: () => setStatus("open"),
+        onOpen: () => {
+          if (useUiState.getState().apiKeyEpoch === apiKeyEpoch) useUiState.getState().confirmSessionCookie();
+          setStatus("open");
+        },
         onError: (error) => {
           const reauthenticate = isAuthenticationSseError(error);
-          if (reauthenticate) useUiState.getState().setApiKeyRejected(true);
+          if (reauthenticate && useUiState.getState().apiKeyEpoch === apiKeyEpoch) {
+            useUiState.getState().setApiKeyRejected(true);
+          }
           setStatus(reauthenticate ? "reauthenticate" : "error");
         }
       }

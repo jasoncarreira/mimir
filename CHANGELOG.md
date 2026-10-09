@@ -6,6 +6,8 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
+
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
   the operator to arm the leaf for server-side ready-queue dispatch or run the
