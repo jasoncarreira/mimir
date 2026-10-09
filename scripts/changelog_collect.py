@@ -47,7 +47,7 @@ def collect(root: Path, version: str, release_date: str) -> None:
         # Keep every byte of the entry, adding only the missing section separator.
         return entry + ("" if entry.endswith("\n\n") else "\n" if entry.endswith("\n") else "\n\n")
 
-    section = f"## [{version}] - {release_date}\n\n" + "".join(map(separated, entries))
+    section = f"## [{version}] — {release_date}\n\n" + "".join(map(separated, entries))
     changelog.write_text(
         before + f"## [Unreleased]\n\n{POINTER}\n\n" + section + after,
         encoding="utf-8",

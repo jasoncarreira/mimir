@@ -13,4 +13,5 @@ Do not add entries to `CHANGELOG.md`'s `[Unreleased]` section. During release
 preparation, run `python scripts/changelog_collect.py X.Y.Z --date YYYY-MM-DD`
 (omit `--date` to use today). The collector sorts fragments by filename, includes
 any older entries still in `[Unreleased]`, and removes the collected fragments.
-`README.md` is never collected.
+`README.md` is never collected. Release headings use an em dash, matching the
+existing changelog: `## [X.Y.Z] — YYYY-MM-DD`.

@@ -62,7 +62,7 @@ def test_collects_fragments_sorted_and_verbatim(release_tree: Path) -> None:
     assert _run(release_tree).returncode == 0
     assert (release_tree / "CHANGELOG.md").read_text() == (
         BASE.split("## [0.9.6]", 1)[0]
-        + "## [1.2.3] - 2026-10-09\n\n"
+        + "## [1.2.3] — 2026-10-09\n\n"
         + "- First\n  continued.\n\n- Last  \n  with trailing spaces.\n\n"
         + "## [0.9.6] — 2026-10-08\n\nOld release.\n"
     )
@@ -78,7 +78,7 @@ def test_collects_legacy_unreleased_entries(release_tree: Path) -> None:
     assert _run(release_tree).returncode == 0
     result = (release_tree / "CHANGELOG.md").read_text()
     assert _unreleased(result) == f"\n{POINTER}\n\n"
-    assert "## [1.2.3] - 2026-10-09\n\n- New item\n\n- Legacy item\n  continuation.\n\n" in result
+    assert "## [1.2.3] — 2026-10-09\n\n- New item\n\n- Legacy item\n  continuation.\n\n" in result
     assert "## [0.9.6] — 2026-10-08\n\nOld release.\n" in result
 
 
@@ -86,7 +86,7 @@ def test_collects_legacy_entries_without_fragments(release_tree: Path) -> None:
     changelog = release_tree / "CHANGELOG.md"
     changelog.write_text(BASE.replace(f"{POINTER}\n\n", "- Older bullet\n\n- Another bullet\n\n"))
     assert _run(release_tree).returncode == 0
-    assert "## [1.2.3] - 2026-10-09\n\n- Older bullet\n\n- Another bullet\n\n" in changelog.read_text()
+    assert "## [1.2.3] — 2026-10-09\n\n- Older bullet\n\n- Another bullet\n\n" in changelog.read_text()
     assert _unreleased(changelog.read_text()) == f"\n{POINTER}\n\n"
 
 
@@ -109,7 +109,7 @@ def test_publish_workflow_extracts_collector_section(release_tree: Path) -> None
         ["awk", "-v", "v=1.2.3", pattern.group(1), "CHANGELOG.md"],
         cwd=release_tree, capture_output=True, text=True, check=True,
     ).stdout
-    assert extracted == "## [1.2.3] - 2026-10-09\n\n- Released item\n\n"
+    assert extracted == "## [1.2.3] — 2026-10-09\n\n- Released item\n\n"
 
 
 @pytest.mark.parametrize("bad", ["", "Not a bullet\n"])
