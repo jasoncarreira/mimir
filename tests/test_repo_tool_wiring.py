@@ -19,6 +19,7 @@ from mimir.access_control import (
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     NormalizedPullRequestSnapshot,
     RepoPRAction,
     RepoPRActionScope,
@@ -149,6 +150,36 @@ def test_repo_enforcement_state_preserves_explicit_flag() -> None:
         repository="owner/repo",
         pull_request=7,
     ) is True
+
+
+def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow() -> None:
+    scope = _scope(RepoPRAction.INSPECT, RepoPRAction.TEST)
+    context = _auth(scope)
+    source = SourceLabel(
+        principal="external-author", domain="repository",
+        resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({"heartbeat"}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    channel_labels = replace(context.ifc_labels, sources=(replace(
+        context.ifc_labels.sources[0], integrity="trusted", integrity_effect="active_ingest",
+    ),))
+    labels = channel_labels.with_source(source)
+    context = replace(
+        context, ifc_labels=labels, ifc_state=InformationFlowState(labels),
+        enforcement_enabled=False,
+        service_authority=replace(context.service_authority, capabilities=("repo_test",)),
+    )
+    decision = ToolRegistry().authorize_tool(
+        "repo_test", context, enforce=False,
+        arguments={"repository": "owner/repo", "pull_request": 7},
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert "protected_tool / repository" in decision.refusal_detail
 
 
 @pytest.mark.asyncio

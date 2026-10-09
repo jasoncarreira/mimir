@@ -174,15 +174,19 @@ _GENERIC_SHELL_INGEST_REFUSAL = (
 
 
 def _generic_shell_ingest_refusal(auth_context: Any) -> str:
+    return _GENERIC_SHELL_INGEST_REFUSAL + _author_attestation_note(auth_context)
+
+
+def _author_attestation_note(auth_context: Any) -> str:
     state = getattr(auth_context, "ifc_state", None)
     unavailable = getattr(state, "author_attestation_was_unavailable", None)
     if callable(unavailable) and unavailable():
-        return _GENERIC_SHELL_INGEST_REFUSAL + (
+        return (
             " GitHub author attestation was unavailable during this turn and is a possible "
             "cause of the taint (for example, GitHub could not be reached). This is not "
             "a measured non-collaborator verdict; the read still failed closed."
         )
-    return _GENERIC_SHELL_INGEST_REFUSAL
+    return ""
 
 _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Native model tools. This is intentionally exhaustive rather than derived
@@ -6122,6 +6126,31 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
 _WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
 
 
+def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    source_name = (
+        f"{source.source_kind} / {source.domain}" if source is not None
+        else "unknown untrusted source"
+    )
+    return (
+        f"repo_test cannot execute repository code after untrusted active ingest "
+        f"from {source_name}. Review the diff with pr_diff/repo_diff without "
+        "executing it, rely on the PR's CI (pr_checks), or ask the operator for "
+        "a fresh turn or a one-time approve_sink_once grant "
+        "(request_operator_approval on an eligible operator turn)."
+        + _author_attestation_note(auth_context)
+    )
+
+
 def _worklink_build_denial(
     tool_name: str, service: ServicePrincipal | None, auth_context: Any,
     ifc_labels: Any,
@@ -6754,6 +6783,33 @@ class SinkGate:
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             return _worklink_build_denial(
                 tool_name, service, auth_context, ifc_labels,
+            )
+        # repo_test executes the scoped checkout, including edits from this turn.
+        # No trigger or service authority exempts a turn that read untrusted content.
+        # Keep the enforced path's existing decisions byte-identical.
+        if (not enforce and tool_name == "repo_test"
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            normalized = normalize_sink_destination(sink_category, target)
+            state = getattr(auth_context, "ifc_state", None)
+            principal = getattr(auth_context, "canonical_principal", None)
+            if (isinstance(ifc_labels, InformationFlowLabels)
+                    and normalized is not None and isinstance(principal, str)
+                    and state is not None and state.consume_sink_approval(
+                        current=ifc_labels, sink_category=sink_category.value,
+                        destination=normalized, canonical_principal=principal,
+                        shadow=False,
+                    )):
+                return ToolAuthorization(
+                    tool_name=tool_name, decision=OperationDecision.OPEN,
+                    allowed=True, reason="ifc_declassification_approved",
+                    service_principal=service, enforcement_enabled=False,
+                )
+            return ToolAuthorization(
+                tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                allowed=False, reason="repo_test_blocked_by_untrusted_ingest",
+                service_principal=service, required_tier=AccessTier.ADMIN,
+                enforcement_enabled=True, would_block=True,
+                refusal_detail=_repo_test_ingest_refusal(auth_context, ifc_labels),
             )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
