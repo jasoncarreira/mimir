@@ -1112,6 +1112,20 @@ async def test_turn_logger_redacts_token_shaped_secrets(tmp_path: Path):
         "integrity": "untrusted",
         "integrity_effect": "active_ingest",
     }]
+    assert rec["integrity_source_counts"] == {}
+    assert rec["untrusted_active_ingest_domains"] == []
+
+
+def test_legacy_turn_record_defaults_integrity_source_summary():
+    legacy = {
+        "ts": "2026-05-15T12:00:00Z", "turn_id": "old", "session_id": "old",
+        "saga_session_id": None, "trigger": "user_message", "channel_id": "ch-1",
+        "input": "hi", "integrity_sources": [{"domain": "channel"}],
+    }
+    record = TurnRecord(**json.loads(json.dumps(legacy)))
+    assert record.integrity_source_counts == {}
+    assert record.untrusted_active_ingest_domains == []
+    assert record.integrity_sources == legacy["integrity_sources"]
 
 
 async def test_turn_logger_redacts_yaml_block_scalars_without_erasing_context(
