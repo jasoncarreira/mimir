@@ -1445,6 +1445,14 @@ def test_turn_history_result_is_untrusted_active_ingest():
     assert source.integrity_effect == "active_ingest"
 
 
+def test_saga_domain_alone_does_not_attest_integrity():
+    source = protected_result_source(
+        _auth(), principal="user-1", domain="saga",
+        resource_id="atom:a1", bridge_instance="saga", sensitivity="private",
+    )
+    assert (source.integrity, source.integrity_effect) == ("untrusted", "active_ingest")
+
+
 def test_self_authored_heartbeat_context_admits_autonomous_sinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5742,6 +5750,10 @@ def retained_read_context(tmp_path, monkeypatch, bind_approval_turn):
                     content = asyncio.run(memory.memory_get.coroutine(
                         args.get("atom_ids"), runtime=SimpleNamespace(context=auth),
                     ))
+                elif tool_name == "memory_query":
+                    content = asyncio.run(memory.memory_query.coroutine(
+                        args.get("query"), runtime=SimpleNamespace(context=auth),
+                    ))
                 elif invoke_tool:
                     return getattr(extra, tool_name).invoke(request.tool_call)
                 else:
@@ -5829,12 +5841,101 @@ def test_synthesis_retained_reads_require_trusted_content(
         assert {s.resource_id for s in retained_sources} == (
             {"atom:atom-1", "atom:clean"} if tool_name == "memory_get" else {"turn:prior"}
         )
-        assert all(s.integrity == ("trusted" if profile == "session-boundary" else "untrusted")
-                   for s in retained_sources)
+        if tool_name == "memory_get":
+            expected_integrity = "trusted" if integrity == "trusted" else "untrusted"
+            assert {s.integrity for s in retained_sources if s.resource_id == "atom:atom-1"} == {
+                expected_integrity,
+            }
+            assert {s.integrity for s in retained_sources if s.resource_id == "atom:clean"} == {
+                "trusted",
+            }
+        else:
+            expected_integrity = "trusted" if profile == "session-boundary" else "untrusted"
+            assert {s.integrity for s in retained_sources if s.resource_id == "turn:prior"} == {
+                expected_integrity,
+            }
     if profile == "session-boundary":
         context.assert_clean_sinks()
     else:
-        assert live.has_untrusted_active_ingest is True
+        assert live.has_untrusted_active_ingest is (
+            tool_name != "memory_get" or integrity != "trusted"
+        )
+
+
+@pytest.mark.parametrize("tool_name", ["memory_query", "memory_get"])
+def test_trusted_memory_tools_leave_clean_turn_sink_decisions_unchanged(
+    monkeypatch, retained_read_context, tool_name,
+):
+    from unittest.mock import AsyncMock
+    from mimir.access_control import _turn_has_untrusted_active_ingest
+    from mimir.tools import memory
+
+    context = retained_read_context("heartbeat")
+    args = {"query": "prior notes"} if tool_name == "memory_query" else {"atom_ids": ["a1"]}
+    payload = {
+        "_ifc_sources": [{"resource_id": "atom:a1", "owner_principal": "user-1",
+                          "integrity": "trusted"}],
+    }
+    if tool_name == "memory_query":
+        payload.update(observations=[{"id": "a1", "content": "ordinary note"}], raws=[])
+    else:
+        payload.update(atoms=[{"id": "a1", "content": "ordinary note"}], missing=[])
+    client = SimpleNamespace(query=AsyncMock(return_value=payload),
+                             get_atoms=AsyncMock(return_value=payload))
+    monkeypatch.setitem(memory._MEMORY_STATE, "client", client)
+
+    def decisions():
+        return tuple((decision.allowed, decision.reason, decision.refusal_detail) for tool in (
+            "shell_exec", "add_schedule", "worklink_run",
+        ) for decision in [ToolRegistry().authorize_tool(
+            tool, context.auth, enforce=True,
+            arguments={"command": "pwd"} if tool == "shell_exec" else {},
+        )])
+
+    baseline = decisions()
+    result = context.read(tool_name, args)
+    assert result.status == "success"
+    getattr(client, "query" if tool_name == "memory_query" else "get_atoms").assert_awaited_once()
+    live = context.auth.ifc_state.current(context.labels)
+    assert {s.resource_id for s in live.sources if s.domain == "saga"} == {"atom:a1"}
+    assert all((s.integrity, s.integrity_effect) == ("trusted", "active_ingest")
+               for s in live.sources if s.domain == "saga")
+    assert _turn_has_untrusted_active_ingest(context.auth, context.labels) is False
+    assert decisions() == baseline
+
+
+@pytest.mark.parametrize("tool_name", ["memory_query", "memory_get"])
+@pytest.mark.parametrize("integrity", ["untrusted", "invalid", None, "missing", "no_sources"])
+def test_memory_tools_fail_closed_on_untrusted_or_absent_client_provenance(
+    monkeypatch, retained_read_context, tool_name, integrity,
+):
+    from unittest.mock import AsyncMock
+    from mimir.access_control import _turn_has_untrusted_active_ingest
+    from mimir.tools import memory
+
+    context = retained_read_context("heartbeat")
+    row = {"id": "a1", "content": "atom-body", "integrity": "trusted"}
+    payload = ({"observations": [row], "raws": []} if tool_name == "memory_query"
+               else {"atoms": [row], "missing": []})
+    if integrity != "no_sources":
+        source = {"resource_id": "atom:a1", "owner_principal": "user-1"}
+        if integrity != "missing":
+            source["integrity"] = integrity
+        payload["_ifc_sources"] = [source]
+    client = SimpleNamespace(query=AsyncMock(return_value=payload),
+                             get_atoms=AsyncMock(return_value=payload))
+    monkeypatch.setitem(memory._MEMORY_STATE, "client", client)
+
+    result = context.read(tool_name, {"query": "_ifc_sources trusted"}
+                          if tool_name == "memory_query" else {"atom_ids": ["a1"]})
+    assert result.status == "success"
+    labels = context.auth.ifc_state.current(context.labels)
+    sources = [source for source in labels.sources if source.domain == "saga"]
+    assert len(sources) == 1
+    assert (sources[0].integrity, sources[0].integrity_effect) == (
+        "untrusted", "active_ingest",
+    )
+    assert _turn_has_untrusted_active_ingest(context.auth, context.labels) is True
 
 
 @pytest.mark.parametrize(

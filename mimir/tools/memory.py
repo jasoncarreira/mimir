@@ -18,6 +18,7 @@ from langchain.tools import ToolRuntime
 from langchain_core.tools import tool
 
 from mimir.models import AuthContext
+from mimir.models import Integrity, SourceLabel
 from mimir.saga.client import SagaStore
 from mimir.sagatools import _format_saga_payload, _provenance_tag
 
@@ -33,24 +34,45 @@ def set_memory_client(client: SagaStore | None) -> None:
     _MEMORY_STATE["client"] = client
 
 
-def _publish_memory_provenance(payload: dict, auth_context: AuthContext | None) -> None:
-    """Publish ownership rows selected by the same authorized SAGA query."""
-    metadata = payload.get("_ifc_sources")
-    if not isinstance(metadata, list):
-        return
-    from mimir.access_control import protected_result_source, publish_protected_result
+def _memory_source(
+    auth_context: AuthContext | None, item: dict, *, atom: dict | None = None,
+) -> SourceLabel:
+    """Label a SAGA result using only the client's per-atom IFC integrity."""
+    from mimir.access_control import protected_result_source
 
-    publish_protected_result(tuple(
-        protected_result_source(
-            auth_context,
-            principal=item.get("owner_principal") if isinstance(item, dict) else None,
-            domain="saga",
-            resource_id=item.get("resource_id") if isinstance(item, dict) else None,
-            bridge_instance="saga",
-            sensitivity="private",
-        )
-        for item in metadata
-    ))
+    source = protected_result_source(
+        auth_context,
+        principal=atom.get("owner_principal") if atom is not None else item.get("owner_principal"),
+        domain="saga",
+        resource_id=f"atom:{atom['id']}" if atom is not None else item.get("resource_id"),
+        bridge_instance="saga",
+        sensitivity="private",
+    )
+    integrity = item.get("integrity")
+    # A missing or unknown report retains protected_result_source's untrusted
+    # active-ingest default. Never infer trust from the domain or atom row.
+    if integrity not in Integrity._value2member_map_:
+        integrity = Integrity.UNTRUSTED
+    return replace(source, integrity=integrity)
+
+
+def _publish_memory_provenance(payload: dict, auth_context: AuthContext | None) -> None:
+    """Publish the client's authorized atom sources, failing closed on missing metadata."""
+    from mimir.access_control import publish_protected_result
+
+    metadata = payload.get("_ifc_sources")
+    items = [item for item in metadata if isinstance(item, dict)] if isinstance(metadata, list) else []
+    by_id = {item.get("resource_id"): item for item in items
+             if isinstance(item.get("resource_id"), str)}
+    # If provenance is absent (or incomplete), returned content still counts as
+    # untrusted ingest. Display rows cannot attest to their own integrity.
+    rows = (payload.get("atoms") or []) + (payload.get("observations") or []) + (payload.get("raws") or [])
+    ids = {f"atom:{row['id']}" for row in rows if isinstance(row, dict) and row.get("id")}
+    ids.update(f"atom:{row['source_atom_id']}" for row in payload.get("triples", [])
+               if isinstance(row, dict) and row.get("source_atom_id"))
+    for resource_id in ids - by_id.keys():
+        items.append({"resource_id": resource_id})
+    publish_protected_result(tuple(_memory_source(auth_context, item) for item in items))
 
 
 @tool
@@ -154,7 +176,6 @@ async def memory_get(
     """
     from mimir.access_control import (
         get_trusted_service_from_auth_context,
-        protected_result_source,
         publish_protected_result,
     )
     from .refusals import ToolPolicyRefusal
@@ -193,22 +214,15 @@ async def memory_get(
         atoms = payload.get("atoms") or []
         # Atom rows no longer carry integrity. Check the server-owned IFC
         # provenance instead, retaining the whole-batch fail-closed boundary.
-        sources = {source.get("resource_id"): source
-                   for source in payload.get("_ifc_sources", [])}
-        if any(sources.get(f"atom:{atom['id']}", {}).get("integrity") != "trusted"
-               for atom in atoms):
+        metadata = payload.get("_ifc_sources")
+        sources = {source.get("resource_id"): source for source in metadata
+                   if isinstance(source, dict)} if isinstance(metadata, list) else {}
+        labels = tuple(_memory_source(
+            auth_context, sources.get(f"atom:{atom['id']}", {}), atom=atom,
+        ) for atom in atoms)
+        if any(source.integrity != Integrity.TRUSTED for source in labels):
             raise ToolPolicyRefusal("memory_get failed: synthesis requires trusted memory atoms")
-        publish_protected_result(tuple(
-            replace(protected_result_source(
-                auth_context,
-                principal=atom.get("owner_principal"),
-                domain="saga",
-                resource_id=f"atom:{atom['id']}",
-                bridge_instance="saga",
-                sensitivity="private",
-            ), integrity="trusted")
-            for atom in atoms
-        ))
+        publish_protected_result(labels)
         return _format_get_atoms(payload)
     _publish_memory_provenance(payload, auth_context)
     return _format_get_atoms(payload)
