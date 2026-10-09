@@ -160,6 +160,51 @@ def test_incident_prompt_treats_captured_output_as_non_authoritative(tmp_path: P
     assert "If state is uncertain or recovery is unavailable" in prompt
 
 
+def test_incident_prompt_names_attempt_evidence_and_marks_absent_records(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state_dir = dispatch_failure_state_dir(home)
+    issue_id = 1918
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    first = evidence_dir / f"{issue_id}-1.json"
+    newer = evidence_dir / f"{issue_id}-3.json"
+    first.write_text('{"attempt": 1}', encoding="utf-8")
+    newer.write_text('{"attempt": 3}', encoding="utf-8")
+    leaf = home / "state" / "worklink" / "runs" / f"{issue_id}.json"
+    factory = home / "state" / "worklink" / "factory-runs" / f"chainlink-{issue_id}.json"
+    record_failure(
+        state_dir, issue_id=issue_id, attempt=1, exit_status=1,
+        error="tests failed", log_path=None,
+    )
+
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] == str(first)
+    assert f"Evidence: {first}\n" in alert["prompt"]
+    assert "Read the evidence file first" in alert["prompt"]
+    assert "gate's counts, failing and flaky test ids, and redacted output summary" in alert["prompt"]
+    assert f"Retained leaf record: {leaf} (absent)\n" in alert["prompt"]
+    assert f"Retained factory record: {factory} (absent)\n" in alert["prompt"]
+
+    leaf.parent.mkdir(parents=True)
+    leaf.write_text("{}", encoding="utf-8")
+    factory.parent.mkdir(parents=True)
+    factory.write_text("{}", encoding="utf-8")
+    first.unlink()
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] == str(newer)
+    assert f"Evidence: {newer}\n" in alert["prompt"]
+    assert f"Retained leaf record: {leaf}\n" in alert["prompt"]
+    assert f"Retained factory record: {factory}\n" in alert["prompt"]
+
+    with failure_state_transaction(state_dir) as state:
+        state["issues"][str(issue_id)]["attempt"] = None
+    assert pending_failure_alerts(state_dir)[1][0]["evidence"] == str(newer)
+    newer.unlink()
+    alert = pending_failure_alerts(state_dir)[1][0]
+    assert alert["evidence"] is None
+    assert "Evidence: (none)\n" in alert["prompt"]
+
+
 @pytest.mark.parametrize("retry_after", [None, "not-a-timestamp"])
 def test_invalid_retry_after_fails_closed(
     tmp_path: Path, retry_after: str | None

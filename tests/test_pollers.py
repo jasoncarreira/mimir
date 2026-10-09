@@ -1045,6 +1045,87 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
     assert denied.reason == "admin_required"
 
 
+def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.read_policy import is_current_service_scoped_read_path
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = (tmp_path / "home").resolve()
+    state = home / "state"
+    runs = state / "worklink" / "runs"
+    evidence = state / "worklink" / "evidence" / "1918-1.json"
+    runs.mkdir(parents=True)
+    (state / "pollers" / "worklink-ready-queue").mkdir(parents=True)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"failing_test_ids": ["test_red"]}', encoding="utf-8")
+    other_channel = home / "memory" / "channels" / "other" / "private.md"
+    other_channel.parent.mkdir(parents=True)
+    other_channel.write_text("private\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    (state / "broken-escape").symlink_to(outside / "missing.json")
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    manifest = (
+        Path(__file__).parents[1] / "mimir" / "optional-skills"
+        / "chainlink-orchestrator" / "pollers.json"
+    )
+    entry = next(
+        item for item in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if item["name"] == "worklink-ready-queue"
+    )
+    service = _parse_poller_authority(
+        entry["authority"], name=entry["name"], persist_dir=state / "pollers" / entry["name"],
+        state_root=state / "pollers", manifest_path=manifest,
+    )
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=True, ifc_labels=InformationFlowLabels())
+    hard_denials = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: hard_denials.append((kind, fields)),
+    )
+    token = set_current_turn(SimpleNamespace(turn_id="worklink-incident-read", auth_context=context))
+    try:
+        backend = WriteGuardBackend(home, ["state"])
+        result = backend.read(str(evidence))
+        assert result.error is None
+        assert "test_red" in result.file_data["content"]
+        missing = runs / "missing" / "record.json"
+        assert is_current_service_scoped_read_path(missing)
+        result = backend.read(str(missing))
+        assert result.error == f"File '{missing}' not found"
+        assert hard_denials == []
+
+        denied = {
+            outside / "missing.json": "service_scoped_read_boundary",
+            state / ".." / "outside.json": "unresolved_read_target",
+            state / "escape" / "missing.json": "unresolved_read_target",
+            state / "identities.yaml": "protected_name_match",
+            other_channel: "service_scoped_read_boundary",
+        }
+        assert not is_current_service_scoped_read_path(outside / "missing.json")
+        assert not is_current_service_scoped_read_path(state / ".." / "outside.json")
+        assert not is_current_service_scoped_read_path(state / "escape" / "missing.json")
+        assert not is_current_service_scoped_read_path(state / "broken-escape")
+        for path, reason in denied.items():
+            result = backend.read(str(path))
+            expected = "Read denied: unresolved path" if reason == "unresolved_read_target" else f"Read denied: {reason}."
+            assert result.error is not None and expected in result.error, path
+        assert len(hard_denials) == len(denied)
+        assert all(
+            kind == "hard_boundary_denied"
+            and fields["reason"] == denied[Path(fields["target"])]
+            for kind, fields in hard_denials
+        )
+    finally:
+        reset_current_turn(token)
+
+
 def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
