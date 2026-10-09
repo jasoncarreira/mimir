@@ -240,7 +240,7 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
                 i for i, step in enumerate(steps) if "--basetemp" in step.get("run", "")
             )
         for upload in uploads:
-            assert upload["if"] == "failure()"
+            assert upload["if"] == "${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}"
             assert not upload.get("continue-on-error", False)
             assert "${{ github.run_id }}" in upload["with"]["name"]
             assert "${{ github.run_attempt }}" in upload["with"]["name"]
@@ -273,6 +273,29 @@ def test_ci_evidence_fixtures_stay_outside_controller_home() -> None:
     )
     assert 'evidence_root="$(cd /tmp && pwd -P)/$PYTEST_EVIDENCE_DIR_NAME"' in worker_runs
     assert 'sudo chmod o+x "$RUNNER_TEMP"' not in worker_runs
+
+
+@pytest.mark.parametrize("root_state", ["unset", "missing"])
+def test_ci_evidence_staging_skips_when_setup_failed(tmp_path, root_state) -> None:
+    """Early failures must not create a staging artifact or raise KeyError."""
+    import os
+    import subprocess
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+    stage = next(step for step in workflow["jobs"]["skill-conformance"]["steps"]
+                 if step.get("id") == "stage-pytest-evidence")
+    output = tmp_path / "github-output"
+    output.touch()
+    env = {**os.environ, "PYTEST_EVIDENCE_PATHS": stage["env"]["PYTEST_EVIDENCE_PATHS"],
+           "GITHUB_OUTPUT": str(output)}
+    env.pop("PYTEST_EVIDENCE_ROOT", None)
+    if root_state == "missing":
+        env["PYTEST_EVIDENCE_ROOT"] = str(tmp_path / "not-created")
+    result = subprocess.run(["bash", "-c", stage["run"]], env=env,
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "no pytest evidence (setup failed before tests)" in result.stdout
+    assert output.read_text() == ""
 
 
 def test_ci_evidence_staging_skips_symlinks(tmp_path) -> None:

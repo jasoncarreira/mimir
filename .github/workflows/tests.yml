@@ -165,7 +165,11 @@ jobs:
               # '+' is escaped by quote; '+/' uniquely marks a continuation.
               return "+/".join(encoded[i:i + 200] for i in range(0, len(encoded), 200))
 
-          root = Path(os.environ["PYTEST_EVIDENCE_ROOT"])
+          root_value = os.environ.get("PYTEST_EVIDENCE_ROOT")
+          if not root_value or not Path(root_value).is_dir():
+              print("no pytest evidence (setup failed before tests)")
+              raise SystemExit(0)
+          root = Path(root_value)
           staged = Path(tempfile.mkdtemp(prefix="mimir-pytest-upload-", dir="/tmp")).resolve()
           long_paths = {}
           patterns = [Path(p).name for p in os.environ["PYTEST_EVIDENCE_PATHS"].splitlines()]
@@ -225,7 +229,7 @@ jobs:
           PY
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-skill-conformance-3.11-${{ github.run_id }}-${{ github.run_attempt }}
@@ -258,16 +262,6 @@ jobs:
       - name: Sync dependencies (with dev and bench extras)
         run: uv sync --extra dev --extra bench
 
-      - name: Install pinned Chainlink CLI
-        # Keep this pin in sync with mimir/skills/chainlink/dockerfile.fragment.
-        run: |
-          cargo install \
-            --git https://github.com/dollspace-gay/chainlink.git \
-            --tag chainlink-1.6.0 \
-            --root "$RUNNER_TEMP/chainlink" \
-            chainlink-tracker
-          echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
-
       - name: Prepare pytest evidence directory
         run: |
           set -euo pipefail
@@ -279,6 +273,41 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
+      - name: Install pinned Chainlink CLI
+        # Keep this tag in sync with mimir/skills/chainlink/dockerfile.fragment.
+        # The expected commit is recorded here; fail closed if the tag moves.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          GIT_TERMINAL_PROMPT: "0"
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: credential.https://github.com.helper
+          GIT_CONFIG_VALUE_0: '!f() { if [ "$1" = get ]; then printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; fi; }; f'
+        run: |
+          set -euo pipefail
+          expected_sha=0e830bf230fdade13b148a99a1a3c19bfbd33b98
+          for attempt in 1 2 3; do
+            if resolved="$(git ls-remote --exit-code https://x-access-token@github.com/dollspace-gay/chainlink.git refs/tags/chainlink-1.6.0)"; then
+              if [[ "$resolved" != "$expected_sha"$'\t'refs/tags/chainlink-1.6.0 ]]; then
+                echo "::error::Chainlink tag chainlink-1.6.0 no longer resolves to the pinned commit"
+                exit 1
+              fi
+              if cargo install \
+                --git https://x-access-token@github.com/dollspace-gay/chainlink.git \
+                --tag chainlink-1.6.0 \
+                --root "$RUNNER_TEMP/chainlink" \
+                chainlink-tracker; then
+                echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
+                exit 0
+              fi
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Pinned Chainlink CLI install failed after 3 attempts"
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
+
       - name: Audit live Chainlink command surface
         run: |
           chainlink --version
@@ -289,7 +318,7 @@ jobs:
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-chainlink-cli-audit-3.12-${{ github.run_id }}-${{ github.run_attempt }}
@@ -393,7 +422,7 @@ jobs:
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -538,14 +567,14 @@ jobs:
       - name: Make worker pytest evidence readable for upload
         if: failure()
         run: |
-          if [ -d "$PYTEST_EVIDENCE_ROOT" ]; then
+          if [ -n "${PYTEST_EVIDENCE_ROOT:-}" ] && [ -d "$PYTEST_EVIDENCE_ROOT" ]; then
             sudo chown -R "$(id -u):$(id -g)" "$PYTEST_EVIDENCE_ROOT"
           fi
 
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-pytest-worker-uid-3.12-${{ github.run_id }}-${{ github.run_attempt }}
@@ -621,7 +650,7 @@ jobs:
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-${{ github.job }}-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -687,7 +716,7 @@ jobs:
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-pytest-fresh-resolve-3.12-${{ github.run_id }}-${{ github.run_attempt }}
@@ -762,7 +791,7 @@ jobs:
       - *stage-pytest-evidence
 
       - name: Upload pytest evidence
-        if: failure()
+        if: ${{ failure() && steps.stage-pytest-evidence.outputs.path != '' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pytest-evidence-pytest-enforced-3.12-${{ github.run_id }}-${{ github.run_attempt }}
