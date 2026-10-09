@@ -445,6 +445,24 @@ fetch adapter, and every redirect hop must independently be an exact approved or
 approved-and-ingested URL. `http://` URLs, userinfo, and explicit ports do not
 populate the set. A new turn starts with an empty set.
 
+### Egress veto shadow telemetry (#1903)
+
+After untrusted active ingest, the proposed egress veto is measured **only**:
+`fetch_url` outside verbatim-ingest URLs and approved fetch URLs (including poller
+`approved_urls`), `web_search` outside its fixed URL, `webhook`/`http_request`
+outside `MIMIR_EGRESS_APPROVED_URLS`, and cross-channel/DM `send_message` carrying
+private-source labels without a sink approval or declassification. Same-channel
+replies and clean turns do not generate a would-block. This telemetry does not
+refuse a call or change any existing shadow/enforced decision.
+
+Each `egress_veto_would_block` event includes the tool, sink category, trigger,
+service principal/poller, destination **host only** for URLs, missed exemption,
+reason, untrusted source metadata and whether the actual decision allowed it.
+To review counts by tool, host, trigger/poller and reason without writing to the
+agent home, run `mimir stats --home <home> --egress-shadow` (optionally
+`--since 2026-10-09T00:00:00Z`). Arming an actual veto requires a separate
+operator decision.
+
 ### Ingest acknowledgement
 
 `clear_ingest_taint` is a model tool for an authenticated, non-service admin on
