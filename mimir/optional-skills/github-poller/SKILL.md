@@ -195,6 +195,17 @@ state, labels, assignees, draft status) remain unsupported: use
 `unsupported_operation`, not shell, `gh`, or direct API fallbacks. The existing
 `pr_rerequest_review` path remains supported only with `pr.rerequest` authority.
 
+## Updating a PR with its base
+
+Default to `repo_merge` to update a PR branch with its observed base in any
+PR-remediation scope. If it merges cleanly, the merge commit already exists;
+next call `repo_push`. On conflicts: `repo_unmerged`, resolve, `repo_stage`,
+then `repo_commit` listing every staged path (the merge stages auto-merged
+files too), then `repo_push`. Use `repo_rebase` only on history-rewrite turns (`heartbeat_pr_maintenance`,
+`pr_changes_requested_stale`, `pr_ci_failure`, `pr_mergeability_rebase`,
+`pr_mergeability_conflicting`) where the poller prompt asks for it; use
+`repo_merge` elsewhere.
+
 ## What it doesn't watch (deliberate)
 
 - **Commits** — already handled by `git pull`. No GitHub-API path for "new commit" wakes today.

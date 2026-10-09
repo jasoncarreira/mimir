@@ -548,7 +548,13 @@ def repo_merge(
     repository: str, pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Merge the immutable observed base commit into the bound checkout."""
+    """The default way to update a PR branch with its base in every PR-remediation scope.
+
+    Merge the immutable observed base into the bound checkout. If it merges
+    cleanly, the merge commit already exists; next call repo_push.
+    On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing
+    every staged path (the merge stages auto-merged files too), then repo_push.
+    """
     return _execute(runtime, repository, pull_request, GitMerge())
 
 
@@ -571,7 +577,14 @@ def repo_rebase(
     head_verification: str = "",
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
-    """Start a bound rebase, or continue it with two-sided preservation evidence."""
+    """Start a bound rebase, or continue it with two-sided preservation evidence.
+
+    Available only on turns for history-rewrite event types in
+    _HISTORY_REWRITE_EVENT_TYPES (mimir/repo_tools.py):
+    `heartbeat_pr_maintenance`, `pr_changes_requested_stale`, `pr_ci_failure`,
+    `pr_mergeability_rebase`, `pr_mergeability_conflicting`.
+    In other PR-remediation scopes, use repo_merge to update the branch with its base.
+    """
     return _execute(runtime, repository, pull_request, GitRebase(
         base_property, base_verification, head_property, head_verification,
     ))
