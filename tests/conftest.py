@@ -271,6 +271,7 @@ def repo_review_state(repo_review_git_root):
 _HOST_ONLY_ENV = frozenset(
     {
         "MIMIR_API_KEY",
+        "MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS",
         "MIMIR_CLAUDE_OAUTH_CREDENTIALS",
         "MIMIR_HOME",
         "MIMIR_MODEL_REASONING_EFFORT",

@@ -744,6 +744,10 @@ class Dispatcher:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise
 
+    def close_admission(self) -> None:
+        """Reject new work synchronously before HTTP handlers begin draining."""
+        self._closed = True
+
     async def drain(self, *, timeout: float | None = None) -> None:
         """Stop accepting new events and wait for in-flight turns to finish.
 
@@ -756,7 +760,7 @@ class Dispatcher:
         Best-effort event observers are cancelled first using the shared bounded
         background-task cleanup, independently of the turn timeout.
         """
-        self._closed = True
+        self.close_admission()
         for error in await cancel_background_tasks(
             self._bg_tasks, label="dispatcher observers",
         ):

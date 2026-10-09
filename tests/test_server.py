@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import os
+import signal
 import shutil
 import sys
 import tempfile
@@ -35,7 +36,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.server import (
@@ -52,7 +53,109 @@ from mimir.server import (
     _handle_root,
     build_app,
     reattach_inflight_worklink_runs,
+    _http_runner,
+    _record_shutdown_signal,
 )
+
+
+@pytest.mark.asyncio
+async def test_real_http_shutdown_closes_all_sse_before_marker(tmp_path, monkeypatch, caplog):
+    """Three real SSE handlers must release aiohttp before graceful cleanup."""
+    from mimir import web_ui
+    from mimir.bridges.web_chat import WebChatBridge as RealWebChatBridge
+    from mimir.http_shutdown import HTTP_SHUTDOWN
+    from mimir.turn_event_bus import TurnEventBus
+
+    real_routes = web_ui.register_routes
+    controlled, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(controlled)
+    app = web.Application()
+    app[HTTP_SHUTDOWN] = controlled[HTTP_SHUTDOWN]
+    real_routes(app, turns_log=tmp_path / "turns.jsonl",
+                events_log=tmp_path / "events.jsonl", turn_event_bus=TurnEventBus())
+
+    @web.middleware
+    async def identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    app.middlewares.append(identity)
+    chat = RealWebChatBridge(enqueue=AsyncMock(return_value=True), home=tmp_path)
+    chat.register_routes(app)
+    # These are the actual build_app lifecycle hooks, shared with the app-level
+    # signal; the small app avoids starting the unrelated runtime a second time.
+    app.on_shutdown.append(next(h for h in controlled.on_shutdown
+                                if getattr(h, "__name__", "") == "_on_shutdown"))
+    app.on_cleanup.append(next(h for h in controlled.on_cleanup
+                               if getattr(h, "__name__", "") == "_handlers_drained"))
+    completed = []
+
+    async def finish(_app):
+        await _run_cleanup(controlled)
+        completed.append("marker")
+
+    app.on_cleanup.append(finish)
+    # An ignored shutdown signal must fail the 9s hang guard rather than
+    # succeeding only because aiohttp forcibly cancels handlers at its bound.
+    runner = _http_runner(app, SimpleNamespace(http_shutdown_timeout_seconds=30.0))
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    caplog.set_level(logging.INFO, logger="mimir.server")
+    async with ClientSession() as session:
+        streams = [await session.get(f"http://127.0.0.1:{port}{path}") for path in (
+            "/api/v1/live-events", "/api/v1/turn-events", "/chat/stream",
+        )]
+        try:
+            assert all(stream.status == 200 for stream in streams)
+            assert app[HTTP_SHUTDOWN].active_streams == 3
+            _record_shutdown_signal(app, signal.SIGTERM)
+            await asyncio.wait_for(runner.cleanup(), 9)
+            assert completed == ["marker"]
+            assert "liveness:clean" in control.events
+            assert [await stream.content.read() for stream in streams] == [b"", b"", b""]
+            assert app[HTTP_SHUTDOWN].active_streams == 0
+            stages = [r.getMessage() for r in caplog.records if r.name == "mimir.server"
+                      and r.getMessage().startswith("shutdown:")]
+            expected = ("signal received (SIGTERM)", "sites stopped", "dispatcher drain start",
+                        "streams closed (3)", "handlers drained", "dispatcher drain end",
+                        "cleanup complete", "clean marker written")
+            assert [next(s for s in stages if name in s) for name in expected] == stages
+            assert all("elapsed=" in stage for stage in stages)
+        finally:
+            if not completed:
+                for stream in streams:
+                    stream.close()
+                await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_on_shutdown_closes_admission_before_handler_drain_and_cleanup_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+    shutdown = next(h for h in app.on_shutdown if getattr(h, "__name__", "") == "_on_shutdown")
+    await shutdown(app)
+    control.events.append("handlers:drained")
+    await _run_cleanup(app)
+    assert control.events.count("scheduler:stop") == 1
+    assert control.events.count("dispatcher:drain") == 1
+    assert control.events.index("dispatcher:close") < control.events.index("handlers:drained")
+    assert control.events.index("dispatcher:close") < control.events.index("dispatcher:drain")
+    assert control.events.index("webchat:disconnect") < control.events.index("handlers:drained")
+
+
+def test_http_runner_uses_configured_shutdown_bound(tmp_path, monkeypatch):
+    from mimir.config import Config
+    monkeypatch.delenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    assert Config.from_env().http_shutdown_timeout_seconds == 5.0
+    monkeypatch.setenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", "2.5")
+    config = Config.from_env()
+    runner = _http_runner(web.Application(), config)
+    assert runner._shutdown_timeout == 2.5
 
 
 def test_server_startup_routes_factory_recovery_to_run_epic(
@@ -733,6 +836,9 @@ def _controlled_server_app(
         def intake_admits(self, event: Any) -> bool:
             return True
 
+        def close_admission(self) -> None:
+            control.hit("dispatcher:close")
+
         async def drain(self, *, timeout: float) -> None:
             control.hit("dispatcher:drain")
 
@@ -828,6 +934,9 @@ def _controlled_server_app(
 
             app.router.add_post("/chat", ok)
             app.router.add_get("/chat/stream", ok)
+
+        async def disconnect(self) -> None:
+            control.hit("webchat:disconnect")
 
     class DiscordBridge:
         def __init__(self, **kwargs: Any) -> None:
@@ -1129,6 +1238,7 @@ async def _run_cleanup(app: web.Application) -> None:
         hook
         for hook in app.on_cleanup
         if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        and getattr(hook, "__name__", "") == "_on_cleanup"
     ]
     assert len(hooks) == 1
     await hooks[0](app)
@@ -1268,7 +1378,7 @@ def test_route_and_hook_parity_with_runtime_proxies(
     assert sum(
         getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
         for hook in app.on_cleanup
-    ) == 1
+    ) == 2
     assert _capture_controller_source_commit in app.on_startup
     assert app.on_startup.index(_capture_controller_source_commit) < next(
         index for index, hook in enumerate(app.on_startup)
@@ -2006,7 +2116,6 @@ async def test_server_startup_and_cleanup_resource_order(
     await _run_cleanup(app)
 
     ordered = [
-        "liveness:clean",
         "claims:release",
         "log:shutdown",
         "scheduler:stop",
@@ -2017,6 +2126,7 @@ async def test_server_startup_and_cleanup_resource_order(
         "pairing:close",
         "bridges:disconnect",
         "mcp:shutdown",
+        "liveness:clean",
     ]
     positions = [control.events.index(name) for name in ordered]
     assert positions == sorted(positions)

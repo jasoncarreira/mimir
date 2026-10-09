@@ -948,6 +948,10 @@ class Config:
     # through). Keep stop_grace_period >= this. 0 = wait unbounded.
     drain_timeout_seconds: int
 
+    # aiohttp's in-flight HTTP handler grace, including SSE streams. Keep this
+    # plus drain_timeout_seconds and cleanup margin below the supervisor grace.
+    http_shutdown_timeout_seconds: float
+
     # Algedonic surfacing (v0.4 §2). Window for the Recent feedback
     # signals prompt section; per-polarity cap on rendered items. 0 for
     # the limit disables the section entirely. Tune small if the prompt
@@ -1373,6 +1377,9 @@ class Config:
             turn_timeout_seconds=_env_int("MIMIR_TURN_TIMEOUT_SECONDS", 3600),
             post_turn_timeout_seconds=_env_int("MIMIR_POST_TURN_TIMEOUT_SECONDS", 180),
             drain_timeout_seconds=_env_int("MIMIR_DRAIN_TIMEOUT_SECONDS", 30),
+            http_shutdown_timeout_seconds=_env_float(
+                "MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", 5.0,
+            ),
 
             feedback_window_hours=_env_int("MIMIR_FEEDBACK_WINDOW_HOURS", 24),
             feedback_limit_per_polarity=_env_int("MIMIR_FEEDBACK_LIMIT", 5),

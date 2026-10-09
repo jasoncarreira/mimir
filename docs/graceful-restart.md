@@ -9,7 +9,9 @@ finish (up to a bound), records a clean shutdown, and exits. (chainlink #510)
 
 On `SIGTERM`/`SIGINT` (what `docker compose stop`/`restart` and systemd send):
 
-1. The dispatcher is **closed** — new inbound is rejected cleanly (`POST /event`
+1. HTTP sites stop accepting connections; the shared shutdown signal closes
+   live-event, turn-event and chat SSE streams. The dispatcher is **closed**
+   during `on_shutdown`, before aiohttp waits for handlers — new inbound is rejected cleanly (`POST /event`
    → `503 queue_full_or_closed`; bridge events drop rather than half-process).
 2. In-flight turns are **drained**: it waits up to `MIMIR_DRAIN_TIMEOUT_SECONDS`
    (default **30**) for the live turns to finish.
@@ -24,26 +26,34 @@ On `SIGTERM`/`SIGINT` (what `docker compose stop`/`restart` and systemd send):
 Net: `docker compose restart` mid-turn lets the turn finish first; deploys no
 longer need a manual idle-check.
 
-## Configuration — the two timeouts must agree
+## Configuration — keep the shutdown inside the supervisor grace
 
-`MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) bounds the in-process drain. The
-**supervisor's** kill grace must be **≥** that, or it SIGKILLs straight through
-the drain:
+`MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` (default 5) bounds aiohttp's wait for
+in-flight handlers. `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) bounds the
+dispatcher drain; it starts while handlers are closing. Budget conservatively:
+
+**HTTP shutdown timeout + drain timeout + cleanup margin < supervisor stop grace**.
+
+The **supervisor's** kill grace must exceed this total, or it SIGKILLs before
+cleanup and the clean marker:
 
 - **Docker Compose:** `stop_grace_period`. Docker's default is only **10s** —
   too short. The scaffold `compose.yml` sets `stop_grace_period: 45s`; match it
-  to (drain timeout + a few seconds of other cleanup) in operator composes.
+   to the budget above in operator composes. With defaults, 5 + 30 + 9 < 45.
 
   ```yaml
   services:
     mimir:
       restart: unless-stopped
-      stop_grace_period: 45s   # >= MIMIR_DRAIN_TIMEOUT_SECONDS (default 30)
+      stop_grace_period: 45s   # > HTTP timeout (5) + drain (30) + cleanup margin
   ```
 
 - **systemd:** `TimeoutStopSec` (default 90s — already comfortably above the
   drain default; lower it only if you also lower the drain). See
-  [`docs/systemd.md`](systemd.md).
+   [`docs/systemd.md`](systemd.md).
+
+- **s6:** Set `S6_SERVICES_GRACETIME` to more than the same budget (in
+  milliseconds); check Compose `stop_grace_period` too when both supervise.
 
 Set `MIMIR_DRAIN_TIMEOUT_SECONDS=0` to wait unbounded (not recommended with a
 supervisor that has its own kill grace).
