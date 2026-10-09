@@ -23,6 +23,7 @@ import pytest
 from mimir.worklink.backends.feature_factory import FACTORY_VERSION
 from mimir.worklink.tool_pins import OPENCODE_VERSION
 from mimir.scaffold_docker import (
+    DEFAULT_BASE_IMAGE,
     Fragment,
     collect_fragments,
     collect_required_env_vars,
@@ -344,9 +345,20 @@ def test_render_dockerfile_has_base_layer():
     """Sanity: regardless of fragments, the base image + tooling are
     present (git, gh, uv, pinned mermaid). Claude Code is optional."""
     out = render_dockerfile([])
-    assert "FROM python:3.11-slim" in out
+    assert f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}" in out
+    assert "FROM ${BASE_IMAGE}" in out
     assert "@mermaid-js/mermaid-cli@11.16.0" in out
     assert "astral.sh/uv/install.sh" in out
+
+
+@pytest.mark.parametrize("mode", ["workspace", "pypi"])
+def test_render_dockerfile_uses_mirrored_base_image(mode):
+    out = render_dockerfile([], mode=mode)
+    instructions = [line for line in out.splitlines() if line.startswith(("ARG ", "FROM "))]
+    assert DEFAULT_BASE_IMAGE == "public.ecr.aws/docker/library/python:3.11-slim"
+    assert instructions[0] == f"ARG BASE_IMAGE={DEFAULT_BASE_IMAGE}"
+    assert instructions[1] == "FROM ${BASE_IMAGE}"
+    assert not any(line.startswith("FROM python:") for line in instructions)
 
 
 def test_render_dockerfile_uses_tini_as_init():
