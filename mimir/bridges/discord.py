@@ -1004,20 +1004,15 @@ class DiscordBridge(Bridge):
                     event.attachment_names.append(str(target))
             if attachment_urls:
                 event.extra["inbound_attachment_urls"] = attachment_urls
-        # Fire-and-forget the typing indicator so the user sees the
-        # bot "thinking" while the agent spins up. Discord renders
-        # the dots for ~10s on a single trigger; for longer turns
-        # it'll just expire naturally — that's better than blocking
-        # enqueue on a typing call.
-        self._spawn_background(
-            self.send_typing_indicator(channel_id),
-            name=f"mimir-discord-typing-trigger-{channel_id}",
-        )
         try:
             accepted = await self.enqueue(event)
         except BaseException:
             self._release_inbound_claim(source_id)
             raise
+        # Admission must precede touching the channel's typing hold: a
+        # refused message must not replace or cancel an authorized turn's hold.
+        if accepted:
+            await self.send_typing_indicator(channel_id)
         if source_id:
             self._inbound_claims.discard(source_id)
             if not accepted:
