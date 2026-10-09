@@ -163,7 +163,6 @@ class SlackBridge(Bridge):
     app_token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
     channel_scope: ChannelScope = field(default_factory=ChannelScope)
-    respond_to_bots: bool = False  # compatibility for direct bridge constructions
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
@@ -821,11 +820,8 @@ class SlackBridge(Bridge):
         mentioned = bool(
             self._bot_user_id and f"<@{self._bot_user_id}>" in (event.get("text") or "")
         )
-        scope = self.channel_scope
-        if self.respond_to_bots and scope == ChannelScope():
-            scope = ChannelScope(allow_bots="all")
         admitted, reason = scope_admit(
-            scope, channel_id=channel_id, parent_channel_id=None,
+            self.channel_scope, channel_id=channel_id, parent_channel_id=None,
             is_dm=is_dm, mentioned=mentioned, author_is_bot=is_bot,
             author_id=f"slack-{user_id}",
         )

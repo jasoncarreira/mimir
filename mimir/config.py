@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import dotenv_values
+from dotenv import dotenv_values, load_dotenv
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
@@ -74,15 +74,21 @@ def _load_home_dotenv(home: Path) -> list[str]:
     if not env_path.is_file():
         return []
 
-    values = dotenv_values(env_path)
-    for key in sorted(values.keys() & _SCOPE_ENV_KEYS):
+    before = set(os.environ)
+    for key in sorted(dotenv_values(env_path, interpolate=False).keys() & _SCOPE_ENV_KEYS):
         log.warning("ignoring operator-only scope key %s in %s", key, env_path)
+    # Preserve load_dotenv's empty-value and process-first interpolation
+    # semantics. Remove only scope keys introduced by the home defaults;
+    # operator scope values already present in the process remain untouched.
+    try:
+        load_dotenv(env_path, override=False)
+    finally:
+        for key in _SCOPE_ENV_KEYS - before:
+            os.environ.pop(key, None)
     loaded = sorted(
-        key for key, value in values.items()
-        if key not in _SCOPE_ENV_KEYS and value and key not in os.environ
+        key for key in set(os.environ) - before
+        if os.environ.get(key, "") != ""
     )
-    for key in loaded:
-        os.environ[key] = values[key]  # type: ignore[assignment]
     if loaded:
         log.info(
             "loaded %s env default(s) from %s: %s",
@@ -115,6 +121,9 @@ def _scope_ids(raw: object, platform: str, *, yaml_list: bool = False) -> frozen
         entries = str(raw or "").split(",")
     result = set()
     for entry in entries:
+        # bool is an int subclass, but neither booleans nor floats are ids.
+        if yaml_list and platform == "discord" and type(entry) is int:
+            entry = str(entry)
         if not isinstance(entry, str) or not entry.strip():
             raise ValueError(f"{platform} ids must be nonempty strings")
         value = entry.strip()

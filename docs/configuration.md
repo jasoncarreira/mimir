@@ -43,7 +43,8 @@ chat instructions are not enforced. For **only channel X**, set
 `MIMIR_DISCORD_REQUIRE_MENTION=true` to require a direct mention there. Threads
 inherit their parent channel's policy. Scope is checked before intake, pairing,
 profile lookups, and attachment downloads. DMs bypass channel lists and mention
-requirements, retaining their existing identity/pairing gate.
+requirements, retaining their existing identity/pairing gate. Group DMs are not
+treated as DMs: channel lists and mention requirements apply to them.
 
 Each of the following has a `MIMIR_DISCORD_` and a `MIMIR_SLACK_` form:
 
@@ -87,10 +88,15 @@ slack:
   allowed_bot_ids: []
 ```
 
-File lists are YAML lists. A missing `allowed_channels` means all; an empty list
+File lists are YAML lists. Discord ids may be quoted strings or unquoted YAML
+integers, which are normalized to strings; booleans and floats are rejected.
+Slack ids must be strings. A missing `allowed_channels` means all; an empty list
 means none. The resolved file (including symlink targets) and **every ancestor
 directory up to `/`** must be non-writable by the running process, and the file
-must not be under `MIMIR_HOME`. An unreadable, writable, or invalid file, or
+must not be under `MIMIR_HOME`. **File-based scope requires a non-root runtime**:
+running as root always rejects the scope file because root can write every path.
+Root deployments must instead use operator-supplied process environment scope.
+An unreadable, writable, or invalid file, or
 mixing a file with any platform scope env key, rejects the configuration and
 prevents **both** chat bridges from starting; the failure emits
 `channel_scope_config_rejected` without file contents. A configured file is the

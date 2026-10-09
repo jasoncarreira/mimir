@@ -836,11 +836,12 @@ async def test_on_message_skips_self(bridge_with_fake_app):
 @pytest.mark.asyncio
 async def test_on_message_skips_self_bot_id_when_user_id_unresolved(bridge_with_fake_app):
     """Own bot messages are dropped even when auth_test has not resolved
-    the bot user id and respond_to_bots is enabled."""
+    the bot user id and channel scope allows other bots."""
     bridge, enqueued, _ = bridge_with_fake_app
     bridge._bot_user_id = None
     bridge._bot_id = None
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
 
     await bridge.send("slack-C01ENG", "outbound")
     assert bridge._bot_id == "BSELF123"
@@ -1017,9 +1018,8 @@ async def test_file_share_download_respects_intake_admission(
 
 @pytest.mark.asyncio
 async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
-    """A non-self bot is dropped unless ``respond_to_bots=True``."""
+    """A non-self bot is dropped unless channel scope sets ``allow_bots="all"``."""
     bridge, enqueued, _ = bridge_with_fake_app
-    bridge.respond_to_bots = False
     await bridge._on_message(
         {
             "user": "UOTHERBOT",
@@ -1031,7 +1031,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
     )
     assert enqueued == []
 
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
     await bridge._on_message(
         {
             "user": "UOTHERBOT",

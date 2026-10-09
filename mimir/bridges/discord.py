@@ -250,7 +250,6 @@ class DiscordBridge(Bridge):
     token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
     channel_scope: ChannelScope = field(default_factory=ChannelScope)
-    respond_to_bots: bool = False  # compatibility for direct bridge constructions
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
@@ -895,11 +894,8 @@ class DiscordBridge(Bridge):
             any(getattr(user, "id", None) == own_id for user in (getattr(message, "mentions", None) or []))
             or getattr(getattr(resolved, "author", None), "id", None) == own_id
         )
-        scope = self.channel_scope
-        if self.respond_to_bots and scope == ChannelScope():
-            scope = ChannelScope(allow_bots="all")
         admitted, reason = scope_admit(
-            scope, channel_id=channel_id,
+            self.channel_scope, channel_id=channel_id,
             parent_channel_id=parent_channel_id, is_dm=conv_type == "dm",
             mentioned=mentioned, author_is_bot=author_is_bot,
             author_id=f"discord-{getattr(message.author, 'id', '')}",

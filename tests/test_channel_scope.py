@@ -11,7 +11,10 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from mimir.bridges.channel_scope import ChannelScope, admit
-from mimir.config import Config, _protected_channel_scope_file, load_channel_scopes
+from mimir.config import (
+    Config, _SCOPE_ENV_KEYS, _load_home_dotenv, _protected_channel_scope_file,
+    load_channel_scopes,
+)
 
 
 def decision(scope: ChannelScope, **overrides):
@@ -101,6 +104,49 @@ def test_home_dotenv_is_never_scope_source(monkeypatch, tmp_path, caplog):
     assert load_channel_scopes(tmp_path)["discord"].allowed == frozenset({"discord-2"})
 
 
+@pytest.mark.parametrize("key", [
+    "MIMIR_CLAUDE_OAUTH_CREDENTIALS", "MIMIR_SYSTEM_PROMPT_OVERRIDE",
+])
+def test_home_dotenv_preserves_explicit_empty_values(key, monkeypatch, tmp_path):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.delenv(key, raising=False)
+    (tmp_path / ".env").write_text(f"{key}=\n")
+    _load_home_dotenv(tmp_path)
+    assert os.environ[key] == ""
+
+
+@pytest.mark.parametrize("key", sorted(_SCOPE_ENV_KEYS))
+@pytest.mark.parametrize("process_value", [None, "operator-value", ""])
+def test_home_dotenv_never_adds_or_overrides_scope_keys(
+    key, process_value, monkeypatch, tmp_path, caplog,
+):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.delenv(key, raising=False)
+    if process_value is not None:
+        monkeypatch.setenv(key, process_value)
+    (tmp_path / ".env").write_text(f"{key}=home-value\n")
+    _load_home_dotenv(tmp_path)
+    assert os.environ.get(key) == process_value
+    assert key in caplog.text
+    assert "home-value" not in caplog.text
+    assert "operator-value" not in caplog.text
+
+
+def test_home_dotenv_interpolation_prefers_process_environment(monkeypatch, tmp_path):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setenv("DOTENV_SOURCE", "process")
+    for key in ("DOTENV_RESULT", "DOTENV_BARE"):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / ".env").write_text(
+        "DOTENV_SOURCE=home\nDOTENV_RESULT=${DOTENV_SOURCE}\nDOTENV_BARE\n"
+    )
+    loaded = _load_home_dotenv(tmp_path)
+    assert os.environ["DOTENV_SOURCE"] == "process"
+    assert os.environ["DOTENV_RESULT"] == "process"
+    assert "DOTENV_BARE" not in os.environ
+    assert loaded == ["DOTENV_RESULT"]
+
+
 def test_scope_env_keys_are_isolated_from_host():
     source = Path(__file__).with_name("conftest.py").read_text()
     for key in {
@@ -122,6 +168,38 @@ def protected_file(monkeypatch, tmp_path):
     monkeypatch.setattr("mimir.config.os.access", lambda path, mode: False)
     monkeypatch.setenv("MIMIR_CHANNEL_SCOPE_FILE", str(policy))
     return policy, home
+
+
+@pytest.mark.parametrize("key,attribute", [
+    ("allowed_channels", "allowed"), ("ignored_channels", "ignored"),
+    ("free_response_channels", "free_response"), ("allowed_bot_ids", "allowed_bot_ids"),
+])
+def test_file_normalizes_unquoted_discord_integers(key, attribute, protected_file):
+    policy, home = protected_file
+    policy.write_text(f'discord:\n  {key}: [1234567890123456789, "discord-2"]\n')
+    scopes = load_channel_scopes(home)
+    assert getattr(scopes["discord"], attribute) == frozenset({
+        "discord-1234567890123456789", "discord-2",
+    })
+    assert scopes["slack"] == ChannelScope()
+
+
+@pytest.mark.parametrize("key", [
+    "allowed_channels", "ignored_channels", "free_response_channels", "allowed_bot_ids",
+])
+@pytest.mark.parametrize("value", ["true", "false", "1.5"])
+def test_file_rejects_discord_booleans_and_floats(key, value, protected_file):
+    policy, home = protected_file
+    policy.write_text(f"discord:\n  {key}: [{value}]\n")
+    with pytest.raises(ValueError, match="ids must be nonempty strings"):
+        load_channel_scopes(home)
+
+
+def test_file_rejects_integer_slack_ids(protected_file):
+    policy, home = protected_file
+    policy.write_text("slack:\n  allowed_channels: [123]\n")
+    with pytest.raises(ValueError, match="ids must be nonempty strings"):
+        load_channel_scopes(home)
 
 
 def test_protected_file_loads_and_enforces_both_platforms(protected_file):
