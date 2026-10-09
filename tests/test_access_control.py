@@ -5417,6 +5417,133 @@ def test_post_ingest_shell_approval_does_not_grant_admin_tool() -> None:
     assert decision.reason != "ifc_declassification_approved"
 
 
+@pytest.mark.parametrize("trigger", ["user_message", "shell_job_complete", "poller"])
+def test_repo_test_post_ingest_veto_refuses_every_trigger(trigger: str) -> None:
+    auth = _tainted_admin_operator_write_auth()
+    if trigger == "poller":
+        service = build_trigger_service_principal(
+            canonical="poller:github-activity", trigger="poller", profile="github",
+            tier=CapabilityTier.CODE_EXECUTION, capabilities=("repo_test",),
+            creation_path="test",
+        )
+        auth = _service_auth(service, auth.ifc_labels)
+    auth = replace(auth, trigger=trigger, ifc_state=InformationFlowState(auth.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        "repo_test", "owner/repo#pull/7", auth.ifc_labels, auth, enforce=False,
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert decision.enforcement_enabled is True
+    assert decision.would_block is True
+    assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert "channel" in decision.refusal_detail
+    for guidance in ("pr_diff/repo_diff", "pr_checks", "fresh turn", "approve_sink_once"):
+        assert guidance in decision.refusal_detail
+
+
+def test_repo_test_refusal_preserves_author_attestation_context() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    state.record_author_attestation_unavailable()
+    auth = replace(auth, ifc_state=state)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", "owner/repo#pull/7", auth.ifc_labels, auth, enforce=False,
+    )
+    assert not decision.allowed
+    assert "GitHub author attestation was unavailable" in decision.refusal_detail
+    assert "not a measured non-collaborator verdict" in decision.refusal_detail
+
+
+def test_repo_test_shadow_veto_spends_only_exact_one_time_grant() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    auth = replace(auth, ifc_state=state)
+    target = "owner/repo#pull/7"
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="forge", destination=target,
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    other = SinkGate.check_sink_flow(
+        "repo_test", "owner/repo#pull/8", auth.ifc_labels, auth, enforce=False,
+    )
+    first = SinkGate.check_sink_flow(
+        "repo_test", target, auth.ifc_labels, auth, enforce=False,
+    )
+    second = SinkGate.check_sink_flow(
+        "repo_test", target, auth.ifc_labels, auth, enforce=False,
+    )
+    assert not other.allowed and other.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert first.allowed and first.reason == "ifc_declassification_approved"
+    assert not second.allowed and not second.is_shadow_decision
+    assert not state.consume_sink_approval(
+        current=auth.ifc_labels, sink_category="forge", destination=target,
+        canonical_principal=auth.canonical_principal, shadow=False,
+    )
+
+
+def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    auth = replace(auth, ifc_state=state)
+    target = "owner/repo#pull/7"
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="forge", destination=target,
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    missing = SinkGate.check_sink_flow("repo_test", target, None, auth, enforce=False)
+    assert not missing.allowed and not missing.is_shadow_decision
+    assert missing.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert SinkGate.check_sink_flow(
+        "repo_test", target, auth.ifc_labels, auth, enforce=False,
+    ).reason == "ifc_declassification_approved"
+
+
+@pytest.mark.parametrize("integrity,effect", [
+    ("trusted", "active_ingest"), ("untrusted", "informational"),
+])
+def test_repo_test_clean_repository_turn_retains_original_decision(
+    integrity: str, effect: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    auth = _trusted_operator_write_auth(admin=True)
+    repository_source = replace(
+        _repository_result_labels("owner/repo", 7, scope.observed_head_sha).sources[0],
+        integrity=integrity, integrity_effect=effect,
+    )
+    labels = auth.ifc_labels.with_source(repository_source)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    target = f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"
+    kwargs = dict(enforce=False, repo_pr_action_scope=scope)
+    decision = SinkGate.check_sink_flow("repo_test", target, labels, auth, **kwargs)
+    with monkeypatch.context() as disabled:
+        disabled.setattr(access_control, "_turn_has_untrusted_active_ingest", lambda *_: False)
+        original = SinkGate.check_sink_flow("repo_test", target, labels, auth, **kwargs)
+    assert decision == original
+    assert decision.allowed is True
+
+
+def test_repo_test_enforced_decisions_match_path_without_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(auth.ifc_labels))
+    for target in ("owner/repo#pull/7", "owner/repo#pull/8"):
+        kwargs = dict(enforce=True, repo_pr_action_scope=_review_state(
+            "owner/repo", 7, "fix", "/srv/repo",
+        ).action_scope)
+        decision = SinkGate.check_sink_flow(
+            "repo_test", target, auth.ifc_labels, auth, **kwargs,
+        )
+        with monkeypatch.context() as disabled:
+            disabled.setattr(access_control, "_turn_has_untrusted_active_ingest", lambda *_: False)
+            original = SinkGate.check_sink_flow(
+                "repo_test", target, auth.ifc_labels, auth, **kwargs,
+            )
+        assert decision == original
+
+
 @pytest.mark.parametrize("trigger", ["poller", "scheduled_tick"])
 def test_post_ingest_shell_trigger_without_trusted_service_is_not_exempt(trigger):
     auth = _tainted_admin_operator_write_auth()
