@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import shlex
+import threading
 import traceback
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -34,6 +36,12 @@ if TYPE_CHECKING:
     from .identities import IdentityResolver
 
 log = logging.getLogger(__name__)
+
+# Console hints are process-wide, even if the server replaces a Dispatcher.
+# Bound memory under raids; recently denied authors retain suppression.
+_DENIAL_HINTS_LIMIT = 1024
+_denial_hints_seen: collections.OrderedDict[tuple[str, str | None], None] = collections.OrderedDict()
+_denial_hints_lock = threading.Lock()
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
 RelevanceCheck = Callable[[AgentEvent], Awaitable[bool | None]]
@@ -402,6 +410,33 @@ class Dispatcher:
             enforcement_enabled=self._config.access_control_enforced,
             intake_gate=True,
         )
+        if event.trigger == "user_message":
+            # Console-only and best-effort: a broken log handler must not
+            # turn an intake denial into an admitted message.
+            try:
+                key = (source, event.author_id)
+                with _denial_hints_lock:
+                    if key in _denial_hints_seen:
+                        _denial_hints_seen.move_to_end(key)
+                    else:
+                        canonical = decision.canonical_author
+                        command = (
+                            "mimir identities approve-pairing "
+                            f"{shlex.quote(canonical)} --home {shlex.quote(str(self._config.home))}"
+                            if canonical else "unavailable (missing author identity)"
+                        )
+                        log.warning(
+                            "Inbound message denied: source=%s raw_author_handle=%r "
+                            "author_id=%r canonical_identity=%r reason=%s; "
+                            "approve with: %r (for your own account, add --admin)",
+                            source or "unknown", event.author, event.author_id,
+                            canonical, decision.denial_reason, command,
+                        )
+                        _denial_hints_seen[key] = None
+                        while len(_denial_hints_seen) > _DENIAL_HINTS_LIMIT:
+                            _denial_hints_seen.popitem(last=False)
+            except Exception:  # noqa: BLE001 — logging cannot bypass the intake gate
+                pass
         is_dm = self._is_dm_channel(event.channel_id)
         if is_dm:
             await log_event(

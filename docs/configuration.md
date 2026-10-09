@@ -205,15 +205,21 @@ Use only read-only verbs: **never declare** `gog gmail send`, `acli jira workite
 create/transition`, or another mutating command. This is an explicit chat grant,
 not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
 executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
-`payload_args`, and interpreter/script entries are rejected. A malformed grant
+`payload_args`, interpreter/script entries, and `gh` (including paths or symlinks
+resolving to `gh`) are rejected. Any subcommand token with basename `gh` is
+also rejected, including behind exec wrappers such as `nice` or `timeout`.
+All these basename comparisons are case-insensitive (`gh`, `GH`, and `Gh`).
+At execution the same refusal covers every argv element, before environment
+construction or identity handling, and names the offending argument. This
+fail-closed rule also refuses literal search arguments such as
+`chainlink issue search gh`. GitHub access from operator chat after untrusted
+ingest goes through a fresh untainted turn or the forge tools. A malformed grant
 rejects the document at load. The agent cannot write `scheduler.yaml` with file
 tools, even on an untainted admin turn. Scheduled turns continue to use their
 own job declarations. The executable runs as server-bound argv, in a server-
 selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
-baseline; it never receives the whole process environment. For declared `gh`,
-`GITHUB_TOKEN` must be named in the command's `pass_env`, not merely the shell
-baseline (`GH_*` overrides remain rejected by the declaration parser). Its config directory is isolated
-from `$HOME/.config/gh` and its identity is confirmed before execution.
+baseline; it never receives the whole process environment. `GH_*` overrides
+remain rejected by the declaration parser.
 
 Each subcommand prefix admits **every deeper verb**. Declare full read-only leaf
 paths such as `[jira, workitem, search]`, never `[jira, workitem]`. This grant
@@ -724,6 +730,7 @@ by the core proposals helper that verifies social-outbox merge approval.
 | `MIMIR_GITHUB_PRELOAD_REVIEW_SKILL` | bool | off | Preload the review-skill body into review-needed prompts. |
 | `MIMIR_GITHUB_REVIEW_SKILL_PATH` | path | `""` | Path to the review-skill file preloaded when the above is on. |
 | `MIMIR_GITHUB_SELF_LOGIN` | str | `""` | GitHub login to self-filter from poller events. |
+| `MIMIR_GITHUB_TRUSTED_BOT_LOGINS` | csv exact logins | `""` (none) | Operator action: explicitly trust PR authors that are GitHub bots/apps, e.g. `dependabot[bot]`. Case-insensitive exact match only; other bots remain untrusted. Set only for bot identities whose repository output you intend to attest. |
 | `MIMIR_GITHUB_REPOS` | str | unset | Non-secret repository selector available to pollers that explicitly forward it; the bundled GitHub poller uses `GITHUB_REPOS`. |
 
 ## Bridges (credentials)

@@ -61,7 +61,8 @@ def test_gmail_poller_grants_file_reads_and_only_gog_shell_command() -> None:
             "exec": "bash",
             "path": "/usr/bin/bash",
             "script": "/mimir-home/skills/gmail-poller/scripts/run-gog.sh",
-            "options": ["--account", "--max", "--json", "--no-input"],
+            "options": ["--account", "--max", "--json", "--no-input", "--full"],
+            "pass_env": ["GOG_ACCOUNT", "GOG_KEYRING_PASSWORD"],
         }
     ]
 

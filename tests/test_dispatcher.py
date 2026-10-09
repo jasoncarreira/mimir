@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1520,6 +1521,121 @@ async def test_public_unknown_sender_gets_pairing_hook_without_public_send(
     assert pairing[0][0].channel_id == "slack-C1"
     assert pairing[0][1] == "unknown_author"
     assert "slack-C1" not in disp._queues
+
+
+@pytest.mark.asyncio
+async def test_intake_denial_warns_once_per_source_and_author_with_approval_command(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    resolver = _resolver(tmp_path, "people: []\n")
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    sent = AsyncMock()
+    disp.set_notice_sender(sent)
+    event = AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hello",
+        author="discord-1907001", author_id="1907001", source="discord",
+    )
+    with caplog.at_level("WARNING", logger="mimir.dispatcher"):
+        assert await disp.enqueue(event) is False
+        assert await disp.enqueue(event) is False
+        # The limit is per process, not per Dispatcher instance.
+        another = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+        assert await another.enqueue(event) is False
+        assert await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="slack-C1", content="hello",
+            author="slack-1907001", author_id="1907001", source="slack",
+        )) is False
+    warnings = [r.message for r in caplog.records if r.name == "mimir.dispatcher" and
+                r.message.startswith("Inbound message denied:")]
+    assert len(warnings) == 2
+    assert "source=discord" in warnings[0]
+    assert "raw_author_handle='discord-1907001'" in warnings[0]
+    assert "author_id='1907001'" in warnings[0]
+    assert "canonical_identity='discord-1907001'" in warnings[0]
+    assert "reason=unknown_author" in warnings[0]
+    assert f"mimir identities approve-pairing discord-1907001 --home {tmp_path}" in warnings[0]
+    assert "--admin" in warnings[0]
+    assert "source=slack" in warnings[1]
+    sent.assert_not_awaited()
+    assert disp._queues == {}
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["inbound_event_denied"] * 4
+
+
+@pytest.mark.asyncio
+async def test_intake_denial_hints_use_bounded_lru(tmp_path: Path, monkeypatch, caplog):
+    from collections import OrderedDict
+
+    import mimir.dispatcher as dispatcher
+
+    # The cache is the subject of this test: own a small cache and restore it.
+    cache = OrderedDict()
+    monkeypatch.setattr(dispatcher, "_denial_hints_seen", cache)
+    monkeypatch.setattr(dispatcher, "_DENIAL_HINTS_LIMIT", 3)
+    disp = Dispatcher(
+        _make_config(tmp_path, access_control_enforced=True),
+        resolver=_resolver(tmp_path, "people: []\n"),
+    )
+
+    async def deny(author_id: str) -> None:
+        assert await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="discord-C1", content="hello",
+            author=f"discord-{author_id}", author_id=author_id, source="discord",
+        )) is False
+        assert len(cache) <= 3
+
+    with caplog.at_level("WARNING", logger="mimir.dispatcher"):
+        for author_id in ("1", "2", "3", "1", "4"):
+            await deny(author_id)
+        # Repeated denial refreshes recency without logging again.
+        assert list(cache) == [("discord", "3"), ("discord", "1"), ("discord", "4")]
+        await deny("2")  # evicted author receives a new hint
+    warnings = [r.message for r in caplog.records if r.name == "mimir.dispatcher" and
+                r.message.startswith("Inbound message denied:")]
+    assert len(warnings) == 5
+    assert list(cache) == [("discord", "1"), ("discord", "4"), ("discord", "2")]
+
+
+@pytest.mark.asyncio
+async def test_intake_denial_hint_escapes_raw_handle(tmp_path: Path, caplog):
+    disp = Dispatcher(
+        _make_config(tmp_path, access_control_enforced=True),
+        resolver=_resolver(tmp_path, "people: []\n"),
+    )
+    raw_handle = "stranger\nFORGED warning\r\t"
+    with caplog.at_level("WARNING", logger="mimir.dispatcher"):
+        assert await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="discord-C1", content="hello",
+            author=raw_handle, author_id="1907003", source="discord",
+        )) is False
+    warnings = [r.message for r in caplog.records if r.name == "mimir.dispatcher" and
+                r.message.startswith("Inbound message denied:")]
+    assert len(warnings) == 1
+    assert f"raw_author_handle={raw_handle!r}" in warnings[0]
+    assert f"canonical_identity={raw_handle!r}" in warnings[0]
+    assert "\n" not in warnings[0]
+    assert "\r" not in warnings[0]
+    assert "\t" not in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_intake_warning_failure_still_denies(tmp_path: Path, monkeypatch):
+    disp = Dispatcher(
+        _make_config(tmp_path, access_control_enforced=True),
+        resolver=_resolver(tmp_path, "people: []\n"),
+    )
+
+    def broken_warning(*args, **kwargs):
+        raise RuntimeError("console failed")
+
+    monkeypatch.setattr("mimir.dispatcher.log.warning", broken_warning)
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hello",
+        author="discord-1907002", author_id="1907002", source="discord",
+    )) is False
+    assert disp._queues == {}
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["inbound_event_denied"]
 
 
 class _FakePairingChannels:
