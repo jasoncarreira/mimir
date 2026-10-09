@@ -2190,11 +2190,48 @@ def test_github_author_trust_is_server_attested_and_fail_closed(
     pytest.param("acme/widget", "alice/other", id="invalid-author"),
 ])
 def test_github_author_validation_is_false_not_unavailable(monkeypatch, repo, author):
+    monkeypatch.delenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", raising=False)
     api = Mock(side_effect=AssertionError("invalid identity must not reach GitHub"))
     monkeypatch.setattr("mimir.pollers._github_api_attestation", api)
 
     assert _github_author_is_trusted(repo, author, "token") is False
     api.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("allowlist", "author", "expected"),
+    [
+        ("dependabot[bot]", "dependabot[bot]", True),
+        ("dependabot[bot]", "DEPENDABOT[BOT]", True),
+        (None, "dependabot[bot]", False),
+        ("dependabot[bot]", "renovate[bot]", False),
+        ("dependabot[bot]", "dependabot-preview[bot]", False),
+        ("dependabot[bot]", "xdependabot[bot]", False),
+    ],
+)
+def test_github_author_trusts_only_exact_operator_bot_logins_without_http(
+    monkeypatch: pytest.MonkeyPatch, allowlist: str | None, author: str, expected: bool,
+) -> None:
+    if allowlist is None:
+        monkeypatch.delenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", allowlist)
+    transport = Mock(side_effect=AssertionError("bot login must not reach GitHub"))
+    monkeypatch.setattr("mimir.pollers.urllib.request.urlopen", transport)
+
+    assert _github_author_is_trusted("acme/widget", author, "token") is expected
+    transport.assert_not_called()
+
+
+def test_github_author_allowlist_does_not_trust_invalid_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    transport = Mock(side_effect=AssertionError("invalid repo must not reach GitHub"))
+    monkeypatch.setattr("mimir.pollers.urllib.request.urlopen", transport)
+
+    assert _github_author_is_trusted("acme/", "dependabot[bot]", "token") is False
+    transport.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["os-error", "url-error", "timeout", "invalid-json", "budget"])
@@ -7101,6 +7138,31 @@ async def test_worklink_parent_env_effort_reaches_poller_dispatched_leaf_work_sp
 
 
 # ─── chainlink #82 sub #83/#85: pass_env passthrough mechanism ─────────
+
+
+@pytest.mark.asyncio
+async def test_shipped_github_poller_forwards_operator_bot_allowlist(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "MIMIR_GITHUB_TRUSTED_BOT_LOGINS"
+    monkeypatch.setenv(key, "dependabot[bot]")
+    monkeypatch.setenv("GITHUB_REPOS", "acme/widget")
+    skill_dir = tmp_path / "skills" / "github-poller"
+    skill_dir.mkdir(parents=True)
+    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    shutil.copy(manifest, skill_dir / "pollers.json")
+    probe = tmp_path / "poller-env.txt"
+    _install_script(skill_dir, "probe.py", (
+        "import os\n"
+        f"from pathlib import Path\nPath({str(probe)!r}).write_text("
+        f"os.environ.get({key!r}, '<missing>'))\n"
+    ))
+    [cfg] = discover_pollers(tmp_path / "skills")
+    assert key in cfg.pass_env
+
+    await run_poller(replace(cfg, command=f"{sys.executable} probe.py"), enqueue=_CapturingEnqueue())
+
+    assert probe.read_text() == "dependabot[bot]"
 
 
 def test_discover_pollers_parses_pass_env_list(tmp_path: Path) -> None:

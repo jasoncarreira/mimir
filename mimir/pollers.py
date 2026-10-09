@@ -96,6 +96,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .billing import Priority, normalize_priority
+from .config import trusted_github_bot_logins
 from .access_control import (
     BOUNDED_PROFILE_CAPABILITIES,
     CapabilityTier,
@@ -575,7 +576,7 @@ def _github_api_attestation(
 def _github_author_is_trusted(
     repo: Any, author: Any, token: str, *, timeout: float | None = None,
 ) -> bool | None:
-    """Resolve collaborator/org trust from GitHub, never from poller claims.
+    """Resolve collaborator/org or operator-allowlisted bot trust, never from poller claims.
 
     ``None`` means the server attestation was unavailable and is retryable. It
     must not be persisted as an untrusted verdict. ``timeout`` bounds each of the
@@ -587,6 +588,8 @@ def _github_author_is_trusted(
     parts = repo.split("/")
     if len(parts) != 2 or not all(parts):
         return False
+    if author.casefold() in trusted_github_bot_logins():
+        return True
     allowed = frozenset(
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.",
     )
