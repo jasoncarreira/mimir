@@ -15234,6 +15234,120 @@ def test_autonomous_worklink_requires_trusted_turn_and_spawn_stays_blocked(
     assert spawn.reason == "ifc_label_blocked:spawn"
 
 
+@pytest.mark.parametrize("tool_name", ["worklink_run", "worklink_resume"])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("route", ["service", "operator"])
+def test_worklink_build_tools_refuse_untrusted_ingest_on_both_routes(
+    tool_name: str, enforce: bool, route: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("WORKLINK_REPO", str(repo))
+    if route == "service":
+        service = ServicePrincipal(
+            canonical="poller:worklink-ready-queue", trigger="poller",
+            capabilities=("worklink_run", "worklink_resume"),
+            readable_domains=("filesystem",), sink_destinations=("worklink",),
+            sink_policies=tuple(
+                ServiceSinkPolicy(name, "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO")
+                for name in ("worklink_run", "worklink_resume")
+            ),
+            capability_tier=CapabilityTier.CODE_EXECUTION,
+        )
+        clean = _service_auth(service, InformationFlowLabels())
+    else:
+        clean = _write_auth(admin=True)
+
+    source = SourceLabel(
+        principal="external", domain="filesystem", resource_id="poller-state",
+        bridge_instance="filesystem", sensitivity="internal",
+        authorized_principals=frozenset({clean.canonical_principal}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    tainted_labels = clean.ifc_labels.with_source(source)
+    # A stale fallback must not hide the server-owned live taint.
+    tainted = replace(clean, ifc_state=InformationFlowState(labels=tainted_labels))
+    registry = ToolRegistry()
+    for auth, should_allow in ((clean, True), (tainted, False)):
+        decision = registry.authorize_tool(
+            tool_name, auth, enforce=enforce, target_channel=str(repo),
+        )
+        assert decision.allowed is should_allow, (route, tool_name, enforce, decision.reason)
+        if not should_allow:
+            assert decision.is_shadow_decision is False
+            assert decision.enforcement_enabled is True
+            assert decision.reason == (
+                "ifc_label_blocked:spawn" if enforce
+                else "worklink_build_blocked_by_untrusted_ingest"
+            )
+            assert "protected_tool / filesystem" in decision.refusal_detail
+            assert "cannot be started or resumed" in decision.refusal_detail
+            assert "operator" in decision.refusal_detail
+            assert "mimir worklink run" in decision.refusal_detail
+            assert "mimir worklink resume" in decision.refusal_detail
+
+    # Exercise the sink gate itself, including the generic SPAWN route without
+    # the registry's preliminary admin/capability decision.
+    direct = SinkGate.check_sink_flow(
+        tool_name, str(repo), clean.ifc_labels, tainted, enforce=enforce,
+    )
+    assert direct.allowed is False
+    assert direct.is_shadow_decision is False
+    assert direct.reason == (
+        "ifc_label_blocked:spawn" if enforce
+        else "worklink_build_blocked_by_untrusted_ingest"
+    )
+
+
+def test_worklink_build_veto_does_not_catch_informational_untrusted_sources(
+    tmp_path: Path,
+) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    source = replace(
+        auth.ifc_labels.sources[0], integrity="untrusted",
+        integrity_effect="informational",
+    )
+    labels = replace(auth.ifc_labels, sources=(source,))
+    for name in ("worklink_run", "worklink_resume"):
+        decision = ToolRegistry().authorize_tool(
+            name, replace(auth, ifc_labels=labels), enforce=False,
+            target_channel=str(tmp_path),
+        )
+        assert decision.allowed is True, decision.reason
+        assert decision.reason != "worklink_build_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("tool_name", ["worklink_run", "worklink_resume"])
+@pytest.mark.parametrize("principal", ["nonadmin", "undeclared_service"])
+def test_worklink_build_veto_cannot_be_skipped_by_shadow_admin_or_capability_denial(
+    tool_name: str, principal: str, tmp_path: Path,
+) -> None:
+    tainted_labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="external", domain="filesystem", resource_id="poller-state",
+        bridge_instance="filesystem", sensitivity="internal",
+        authorized_principals=frozenset({"alice"}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    ))
+    if principal == "nonadmin":
+        auth = replace(_write_auth(), ifc_labels=tainted_labels)
+    else:
+        service = build_trigger_service_principal(
+            canonical="poller:without-build-capability", trigger="poller",
+            profile="custom", tier=CapabilityTier.SCOPE_CONTAINED,
+            capabilities=("read_file",), creation_path="test",
+        )
+        auth = _service_auth(service, tainted_labels)
+    decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=False, target_channel=str(tmp_path),
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert decision.reason == "worklink_build_blocked_by_untrusted_ingest"
+
+
 def test_admin_write_and_code_tool_authority_is_unchanged(tmp_path: Path) -> None:
     registry = ToolRegistry()
     for operation in ("write_file", "edit_file", "worklink_run", "spawn_open_code"):

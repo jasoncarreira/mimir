@@ -6079,6 +6079,45 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
     )
 
 
+_WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
+
+
+def _worklink_build_denial(
+    tool_name: str, service: ServicePrincipal | None, auth_context: Any,
+    ifc_labels: Any, *, enforce: bool,
+) -> "ToolAuthorization":
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    source_name = (
+        f"{source.source_kind} / {source.domain}" if source is not None
+        else "unknown untrusted source"
+    )
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason=(
+            "ifc_label_blocked:spawn" if enforce
+            else "worklink_build_blocked_by_untrusted_ingest"
+        ),
+        service_principal=service, required_tier=AccessTier.ADMIN,
+        enforcement_enabled=True, would_block=True,
+        refusal_detail=(
+            f"Untrusted active ingest from {source_name} is present in this turn. "
+            "Builds cannot be "
+            "started or resumed from a turn that has read untrusted content. Ask the "
+            "operator to arm the leaf for ready-queue dispatch, or to run "
+            "`mimir worklink run` / `mimir worklink resume` from the CLI."
+        ),
+    )
+
+
 def _same_channel_authority(
     source: Any,
     triggering_bridge_instance: str | None,
@@ -6671,6 +6710,19 @@ class SinkGate:
         service = get_trusted_service_from_auth_context(auth_context)
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
+        # The service code-execution tier and the generic SPAWN sink both shadow
+        # their IFC denials. Veto each route before either can return a shadow
+        # allow (or a missing-destination/label shadow allow).
+        if (service is not None and tool_name in _WORKLINK_BUILD_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return _worklink_build_denial(
+                tool_name, service, auth_context, ifc_labels, enforce=enforce,
+            )
+        if (service is None and tool_name in _WORKLINK_BUILD_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return _worklink_build_denial(
+                tool_name, service, auth_context, ifc_labels, enforce=enforce,
+            )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
