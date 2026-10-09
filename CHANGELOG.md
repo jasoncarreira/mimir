@@ -8,6 +8,120 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [0.9.7] — 2026-10-09
+
+- **Operator action (#1872):** Generic shell execution after untrusted active
+  ingest is refused on interactive and continuation turns for every shell-process
+  tool, even with IFC enforcement off. Use a bounded or declared command,
+  `read_file`/`glob`/`grep` for reads, or `open_proposal` for repo edits. An
+  operator can clear ingest taint, start a fresh turn, or grant one exact shell
+  call with `approve_sink_once` / `request_operator_approval`.
+
+- Support the MCP Python SDK 2.x (`mcp>=2.3,<3`) with snake_case result
+  models and real stdio contract tests. This fixes the silent tool-discovery
+  failure for configured MCP servers on installs that resolved mcp 2.x (#1891).
+  A dedicated lifecycle task owns SDK contexts so production shutdown can
+  be requested from a different task without leaking the server subprocess.
+
+- Deliver substantive autonomous `send_message` briefs after stripping a trailing skip-list stop sentence, while continuing to block narration (#1892).
+
+- **Operator action (#1893):** After untrusted ingest, schedule writes and edits to
+  live scheduler, prompt, poller override, core memory, index and skill instruction
+  files are refused even with IFC enforcement in shadow mode. Propose the change
+  with `open_proposal` / `submit_proposal` for operator merge instead. Poller reload
+  and edits inside proposal worktrees remain available. `list_schedules` now
+  preserves trusted turn integrity.
+
+- **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
+  `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
+  bounded argv with scrubbed environment and value-free audit events; job grants
+  remain job-scoped. Mutating verbs must not be declared. Read queries can bring
+  sensitive data into the still-tainted turn; outbound sink checks remain in force.
+
+- Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).
+
+- **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
+  active ingest even in shadow mode, for service and operator turns alike. Ask
+  the operator to arm the leaf for server-side ready-queue dispatch or run the
+  Worklink CLI from a clean operator context.
+
+- After untrusted ingest, admitted Chainlink calls through declared service or
+  request-bound operator command paths cannot change `worklink:*` labels, create
+  armed issues, or update armed issues even in shadow mode (#1897). Bounded
+  unarmed issue filing and comments remain available; the operator must review
+  an unarmed description before applying `worklink:ready`. Attached
+  `-l=worklink:ready` labels are normalized like Clap. The veto classifies the
+  admitted execution argv (the operator binding or service-profile parser), so
+  quoted literal `? * [ ] { }` in titles and descriptions cannot skip it.
+  Admitted Chainlink argv outside the built-in classifier fail closed on tainted
+  turns (including end-of-options `--`), except known read-only issue queries.
+  This also refuses unclassified unarmed mutations; use a canonical unarmed
+  command or comment instead. Unknown service commands remain subject to the
+  existing exact-argv profile gate, without a substring veto on read-only
+  diagnostics. The shell-wide post-ingest veto is described above (#1872).
+  Clean turns are unchanged; this gate does not provide filesystem confinement
+  for other tools or broaden any declared-command profile.
+
+- ACP queue and dispatcher no longer depend on the SDK's private `acp.task`
+  internals; the SDK remains pinned to `agent-client-protocol==0.12.0` (#1898).
+
+- Hold genuine OpenCode quota failures until the Codex reset (or one-hour fallback), without charging an attempt; escalate after four consecutive holds (#1899).
+
+- Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
+  (#1900). The release adds concept/name drift review instructions, an audited
+  operator `sync-base` recovery for eligible parked runs, and remediation-slice
+  path amendments. Worklink continues to tolerate additive factory state fields.
+
+- Collect per-change changelog fragments into versioned release notes, avoiding
+  competing edits to the Unreleased section (#1901).
+
+- **Authz (#1904):** Refuse GitHub CLI declarations in `operator_shell_commands`
+  at load and save, including aliases and symlinks; refuse operator-declared `gh`
+  before environment construction, credentials, or identity handling at execution.
+  Basename checks are case-insensitive, including wrapper arguments and paths.
+  The execution refusal names the offending argument (including literal `gh`
+  search arguments). Use a fresh untainted turn or forge tools for GitHub access
+  after untrusted ingest.
+
+- **IFC (#1905):** `memory_query` and `memory_get` now preserve SAGA's
+  server-reported per-atom integrity. Trusted reads no longer taint the turn;
+  absent or invalid provenance remains untrusted active ingest.
+
+- **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
+
+- **Intake (#1907):** Start Discord typing only after admission, preserving
+  an authorized turn's hold when another message is refused or fails. Print
+  escaped console pairing hints with a bounded, process-wide 1024-author LRU.
+
+- **SAGA (#1908):** Session-end prompts list tools from the session-boundary
+  capability set and limit verification to known atom and turn IDs; claims
+  needing file reads are tagged for later verification.
+
+- **Gmail poller (#1909):** Pass the declared agent command its gog account and keyring environment, permit read-only message and thread gets, and enforce gog's `--readonly` and `--gmail-no-send` flags using the pinned `/usr/local/bin/gog`. The wrapper supplies the declared account so documented commands need no shell expansion. Installed homes must refresh their copy of `<home>/skills/gmail-poller` to pick up this fix.
+
+- Clarify that `repo_merge` is the default PR base-update path; reserve
+  `repo_rebase` guidance for history-rewrite event turns (#1910).
+
+- Make repository refusals actionable (#1911): `pr_file_content` distinguishes
+  paths missing at the scoped head from non-files, and `repo_commit` names
+  bounded, escaped out-of-scope staged paths with a recovery hint.
+
+- **Own-PR provenance (#1912):** Attested checkout, Git operations, server-posted
+  comments, review requests and constrained status metadata retain trusted
+  exact-scope labels across protected-base merges and patch-identical rebases.
+  Replayed non-server authors require the server committer and an original
+  attested whitespace-preserving patch match, consumed once per original commit,
+  never a display-name/login match. Replay checks fail closed above 500 original
+  commits or on Git without `patch-id --verbatim` support. Operators may set
+  `MIMIR_GITHUB_TRUSTED_BOT_LOGINS=dependabot[bot]` to attest that exact bot;
+  the default trusts no bots. CI logs remain untrusted.
+
+- Refuse `repo_test` after untrusted content is read, even with access-control enforcement off; review the diff or CI instead, or request a one-time operator grant (#1913).
+
+- Honor operator-allowlisted GitHub bot authors on github-poller payloads as well as forge reads (#1914).
+
+- **Codex Plus adapter:** require `langchain-codex-plus>=0.0.12`. Since 2026-10-06, Codex has delivered parallel tool calls' arguments only in the final `.done` frames, and 0.0.11 turned 70-85% of parallel batches into empty-argument calls ("Tool argument validation failed"). 0.0.12 reconciles arguments from the final frames. `langchain-claude-code-mimir` is already at its latest (`>=0.1.3`).
+
 ## [0.9.6] — 2026-10-08
 
 **Fixed:**
