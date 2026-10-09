@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import re
-import statistics
 import time
 
 import pytest
@@ -136,9 +135,11 @@ def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
         assert redaction.redact_text(text) == text
 
     samples: dict[int, list[float]] = {size: [] for size in texts}
-    for trial in range(5):
-        # Alternate order and take medians to reduce sensitivity to transient
-        # runner noise. Time only redaction, not input construction or assertions.
+    for trial in range(7):
+        # Alternate order and take the minimum: interference from other processes
+        # (concurrent builds, xdist neighbours) only ever adds time, so the
+        # fastest sample is the least-noisy estimate of the real cost. Time only
+        # redaction, not input construction or assertions.
         sizes = list(texts) if trial % 2 == 0 else list(reversed(texts))
         for size in sizes:
             start = time.process_time()
@@ -147,8 +148,8 @@ def test_repeated_key_candidates_have_bounded_cost(fragment: str) -> None:
             assert result == texts[size]
             samples[size].append(elapsed)
 
-    t_1x = statistics.median(samples[65536])
-    t_4x = statistics.median(samples[262144])
+    t_1x = min(samples[65536])
+    t_4x = min(samples[262144])
     # Across this 4x size span, linear and quadratic work grow ~4x and ~16x.
     # Their geometric midpoint (8x) tolerates up to 2x multiplicative noise in
     # either direction while still discriminating the two complexity classes.
