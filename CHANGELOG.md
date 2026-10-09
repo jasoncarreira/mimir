@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
+  (#1900). The release adds concept/name drift review instructions, an audited
+  operator `sync-base` recovery for eligible parked runs, and remediation-slice
+  path amendments. Worklink continues to tolerate additive factory state fields.
+
 - **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
   `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
   bounded argv with scrubbed environment and value-free audit events; job grants

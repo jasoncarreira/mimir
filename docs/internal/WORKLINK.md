@@ -56,8 +56,8 @@ The in-mimir integrated-epic runner — brief → `work-decomposer` → `decompo
 `integration-validator` → one final draft PR — **was removed in #830** after the
 epic #783 arc concluded (every failure was distribution tax in that layer).
 
-Epics are built by `feature-factory@0.10.11` through the lockstep
-`opencode-feature-factory@0.10.11` adapter. OpenCode's `/feature` workflow owns
+Epics are built by `feature-factory@0.10.14` through the lockstep
+`opencode-feature-factory@0.10.14` adapter. OpenCode's `/feature` workflow owns
 factory transitions. Worklink owns the outer Chainlink claim, isolated attempt
 checkout, OpenCode process, restart record, status observation, repository tests,
 and final PR identity verification.
@@ -118,7 +118,7 @@ executor together by rebuilding the executor image before enabling this layout.
   rather than one being preferred, and a missing `GITHUB_TOKEN` fails naming that
   variable - in both cases without disclosing values.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
-  Worklink admits the launcher only after package/adapter 0.10.11 verification and
+  Worklink admits the launcher only after package/adapter 0.10.14 verification and
   all 16 nonmutating structural command probes. Status is read with `status
   <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
   session; lock actions use `lock <run-id> <claim|steal|release> --session
@@ -537,7 +537,7 @@ require touching the orchestrator.
 | Adapter | Invocation sketch | Notes |
 |---|---|---|
 | `opencode` | `opencode run --dir <checkout> -- <prompt>` | Sole coding backend for leaf issues; provider and model are selected by opencode configuration/arguments. |
-| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.10.11 controls. |
+| `feature_factory` | `opencode run ... --command feature " --autonomous --max-retries 5 <issue>"` | Epic adapter with Worklink-supervised OpenCode and absolute 0.10.14 controls. |
 
 Selection is config, not code (§7): per repo / label / issue-type, with
 a per-category default. The executor consults `Caps` rather than
@@ -1068,13 +1068,24 @@ Current slice-1 recovery is manual:
   the recovered commits with an explicit force-with-lease operation. Remove the
   stranded checkout only after publication is independently verified.
 - **Parked factory epic:** when factory ownership is the cause, run the factory's
-  `amend-paths` recovery first, then relaunch the epic normally. From 0.10.11 the
-  factory amends paths in-band on a running run, so this recovery is needed only
+  `amend-paths` recovery first, then relaunch the epic normally. The factory
+  amends paths in-band on a running run, so this recovery is needed only
   when the run parked anyway. Worklink verifies the retained sandbox and resumes
   it in place with the retained session. A
   verification mismatch applies `worklink:blocked` and reports the sandbox; it
   does not claim a fresh attempt. Discarding the record requires the explicit
   `mimir worklink archive-factory-run <issue-id>` operator action.
+- **Parked factory epic needing a PR-base fix:** after the fix lands on the PR
+  base, the operator can merge that base into the parked run's integration branch
+  and admit the merge with `factory sync-base <run> --merge-commit <sha> --reason
+  <text>` before relaunching. This is an operator action, not a Worklink control.
+  The merge must be between slices, before integration testing, have exactly two
+  parents (the recorded integration tip and a PR-base commit strictly advancing
+  the branch point), match a clean automatic `git merge-tree` result, and change
+  bytes. Conflicts, hand edits, stale or off-base second parents, and no-op
+  merges are refused; failed bootstrap or verify remains recorded and refuses.
+  For cases `sync-base` refuses, preserve the sandbox and relaunch a new run to
+  move the base; never rebase a factory sandbox.
 - **Factory sandbox cleanup:** treat `.factory/<run-id>`, its plan, artifacts, and
   reviews like unpublished commits. Worklink does not sweep a parked, completed,
   failed, or unresumed factory sandbox. Removal is permitted only after the
