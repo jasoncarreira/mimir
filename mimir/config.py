@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
@@ -35,6 +35,15 @@ from .model_registry import DEFAULT_MODEL_SPEC
 
 
 log = logging.getLogger(__name__)
+
+_SCOPE_KEYS = (
+    "ALLOWED_CHANNELS", "IGNORED_CHANNELS", "REQUIRE_MENTION",
+    "FREE_RESPONSE_CHANNELS", "ALLOW_BOTS", "ALLOWED_BOT_IDS",
+)
+_SCOPE_ENV_KEYS = frozenset(
+    f"MIMIR_{platform}_{key}"
+    for platform in ("DISCORD", "SLACK") for key in _SCOPE_KEYS
+) | {"MIMIR_CHANNEL_SCOPE_FILE"}
 
 
 def _env(name: str, default: str = "") -> str:
@@ -65,12 +74,15 @@ def _load_home_dotenv(home: Path) -> list[str]:
     if not env_path.is_file():
         return []
 
-    before = set(os.environ)
-    load_dotenv(env_path, override=False)
+    values = dotenv_values(env_path)
+    for key in sorted(values.keys() & _SCOPE_ENV_KEYS):
+        log.warning("ignoring operator-only scope key %s in %s", key, env_path)
     loaded = sorted(
-        key for key in set(os.environ) - before
-        if os.environ.get(key, "") != ""
+        key for key, value in values.items()
+        if key not in _SCOPE_ENV_KEYS and value and key not in os.environ
     )
+    for key in loaded:
+        os.environ[key] = values[key]  # type: ignore[assignment]
     if loaded:
         log.info(
             "loaded %s env default(s) from %s: %s",
@@ -79,6 +91,115 @@ def _load_home_dotenv(home: Path) -> list[str]:
             ", ".join(loaded),
         )
     return loaded
+
+
+def _protected_channel_scope_file(path: Path, home: Path) -> Path:
+    """Resolve links and reject any target writable by this process or under home."""
+    resolved = path.resolve(strict=True)
+    if resolved.is_relative_to(home.resolve()):
+        raise ValueError("scope file resolves under MIMIR_HOME")
+    if not resolved.is_file():
+        raise ValueError("scope path is not a regular file")
+    for node in (resolved, *resolved.parents):
+        if os.access(node, os.W_OK):
+            raise ValueError(f"scope file or ancestor is writable: {node}")
+    return resolved
+
+
+def _scope_ids(raw: object, platform: str, *, yaml_list: bool = False) -> frozenset[str]:
+    if yaml_list:
+        if not isinstance(raw, list):
+            raise ValueError(f"{platform} channel/author ids must be a YAML list")
+        entries = raw
+    else:
+        entries = str(raw or "").split(",")
+    result = set()
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(f"{platform} ids must be nonempty strings")
+        value = entry.strip()
+        prefix = f"{platform}-"
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+        if not value or value.startswith(("discord-", "slack-", "dm-")) or value == "*":
+            raise ValueError(f"invalid {platform} id")
+        result.add(prefix + value)
+    return frozenset(result)
+
+
+def _parse_channel_scope(platform: str, values: dict[str, object], *, from_file: bool):
+    from .bridges.channel_scope import ChannelScope
+
+    if from_file:
+        for key in ("allowed_channels", "ignored_channels", "free_response_channels", "allowed_bot_ids"):
+            if key in values and not isinstance(values[key], list):
+                raise ValueError(f"{platform} {key} must be a YAML list")
+
+    def ids(key: str) -> frozenset[str]:
+        raw = values.get(key)
+        if raw is None or raw == "":
+            return frozenset()
+        return _scope_ids(raw, platform, yaml_list=from_file)
+
+    allowed_raw = values.get("allowed_channels")
+    allowed = (
+        None if allowed_raw is None or allowed_raw == "*"
+        else ids("allowed_channels")
+    )
+    bot_mode = values.get("allow_bots", "none")
+    if bot_mode not in ("none", "mentions", "all"):
+        raise ValueError(f"{platform} allow_bots must be none, mentions, or all")
+    require = values.get("require_mention", False)
+    if from_file:
+        if not isinstance(require, bool):
+            raise ValueError(f"{platform} require_mention must be a boolean")
+    else:
+        require = _env_bool(f"MIMIR_{platform.upper()}_REQUIRE_MENTION", False)
+    return ChannelScope(
+        allowed=allowed, ignored=ids("ignored_channels"), require_mention=require,
+        free_response=ids("free_response_channels"), allow_bots=bot_mode,
+        allowed_bot_ids=ids("allowed_bot_ids"),
+    )
+
+
+def load_channel_scopes(home: Path) -> dict[str, object]:
+    """Read operator-only process env or a protected file, once at bridge startup.
+
+    Raises ValueError/OSError on *any* bad source; callers must not register
+    either bridge when loading fails.
+    """
+    import yaml
+
+    configured = os.environ.get("MIMIR_CHANNEL_SCOPE_FILE")
+    default_path = Path("/etc/mimir/channel-scope.yaml")
+    path = Path(configured) if configured is not None else default_path
+    use_file = configured is not None or default_path.exists()
+    if use_file:
+        conflicts = sorted(_SCOPE_ENV_KEYS.intersection(os.environ) - {"MIMIR_CHANNEL_SCOPE_FILE"})
+        if conflicts:
+            raise ValueError("scope file conflicts with " + ", ".join(conflicts))
+        resolved = _protected_channel_scope_file(path, home)
+        try:
+            document = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, UnicodeError) as exc:
+            raise ValueError("invalid scope YAML") from exc
+        if not isinstance(document, dict) or set(document) - {"discord", "slack"}:
+            raise ValueError("scope file must contain only discord and slack sections")
+        sections = {}
+        valid = {key.lower() for key in _SCOPE_KEYS}
+        for platform in ("discord", "slack"):
+            section = document.get(platform, {})
+            if not isinstance(section, dict) or set(section) - valid:
+                raise ValueError(f"invalid {platform} scope keys")
+            sections[platform] = _parse_channel_scope(platform, section, from_file=True)
+        return sections
+    return {
+        platform: _parse_channel_scope(platform, {
+            key.lower(): os.environ[f"MIMIR_{platform.upper()}_{key}"]
+            for key in _SCOPE_KEYS if f"MIMIR_{platform.upper()}_{key}" in os.environ
+        }, from_file=False)
+        for platform in ("discord", "slack")
+    }
 
 
 def model_spec_at_call_time(home: Path | None = None) -> str:

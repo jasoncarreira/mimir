@@ -24,7 +24,8 @@ their own skill subprocesses.
 - **Process environment wins.** Anything exported into the process (your shell,
   a Docker `compose.env`, a systemd unit) takes precedence.
 - **`<MIMIR_HOME>/.env` supplies defaults** for anything not already in the
-  process environment. It's loaded once at startup; the process env overrides it.
+  process environment, except channel scope keys (operator-only). It's loaded
+  once at startup; the process env overrides it.
 - **Unset optional flags fall back to the defaults below.**
 
 To confirm what a running agent actually resolved, read `Config.from_env()` or
@@ -33,6 +34,72 @@ the startup banner — not the `.env` file, since the process env can override i
 Almost everything here is optional. The only things a minimal deployment needs
 are an auth path (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / a gateway) and,
 for anything non-loopback, `MIMIR_WEB_HOST` + `MIMIR_API_KEY`.
+
+## Channel scope (Discord and Slack)
+
+Configure the bridge, rather than telling mimir in chat to stay in one channel:
+chat instructions are not enforced. For **only channel X**, set
+`MIMIR_DISCORD_ALLOWED_CHANNELS=<id>` (or the Slack equivalent); add
+`MIMIR_DISCORD_REQUIRE_MENTION=true` to require a direct mention there. Threads
+inherit their parent channel's policy. Scope is checked before intake, pairing,
+profile lookups, and attachment downloads. DMs bypass channel lists and mention
+requirements, retaining their existing identity/pairing gate.
+
+Each of the following has a `MIMIR_DISCORD_` and a `MIMIR_SLACK_` form:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_CHANNEL_SCOPE_FILE` | path | `/etc/mimir/channel-scope.yaml` if present | Protected YAML source for both bridges. Conflicts with platform scope environment keys reject both bridges. |
+
+| Suffix | Default | Meaning |
+|---|---|---|
+| `ALLOWED_CHANNELS` | `*` | Comma-separated channel ids; unset or `*` allows all; an empty value allows none. |
+| `IGNORED_CHANNELS` | empty | Excluded channel ids; wins over allowed, mentions, and free-response. |
+| `REQUIRE_MENTION` | `false` | Require a direct bot mention in non-DM channels. Discord replies to the bot's message count too. |
+| `FREE_RESPONSE_CHANNELS` | empty | Channel ids exempt from require-mention. |
+| `ALLOW_BOTS` | `none` | `none` drops other bots, `mentions` allows directly mentioning bots, `all` allows other bots (subject to mention requirements). Unknown values reject startup. |
+| `ALLOWED_BOT_IDS` | empty | Bot author ids always admitted after channel allow/ignore checks, even without a mention. |
+
+Lists accept bare platform ids (`123`, `C0123`) or prefixed ids
+(`discord-123`, `slack-C0123`); use comma-separated values in process env.
+The order is: own-message filter; DM bypass of channel/mention rules; ignored;
+allowed; bot-author rule; require-mention unless free-response. Every rejected
+message produces one content-free `channel_scope_dropped` event with `platform`,
+`channel_id`, `parent_channel_id`, `reason`, and `author_kind`.
+
+For protected file configuration set `MIMIR_CHANNEL_SCOPE_FILE` to a YAML file,
+or place it at `/etc/mimir/channel-scope.yaml` (auto-loaded if present):
+
+```yaml
+discord:
+  allowed_channels: ["123"]
+  ignored_channels: ["456"]
+  require_mention: true
+  free_response_channels: ["789"]
+  allow_bots: none
+  allowed_bot_ids: []
+slack:
+  allowed_channels: ["C0123"]
+  ignored_channels: []
+  require_mention: false
+  free_response_channels: []
+  allow_bots: none
+  allowed_bot_ids: []
+```
+
+File lists are YAML lists. A missing `allowed_channels` means all; an empty list
+means none. The resolved file (including symlink targets) and **every ancestor
+directory up to `/`** must be non-writable by the running process, and the file
+must not be under `MIMIR_HOME`. An unreadable, writable, or invalid file, or
+mixing a file with any platform scope env key, rejects the configuration and
+prevents **both** chat bridges from starting; the failure emits
+`channel_scope_config_rejected` without file contents. A configured file is the
+only scope source; otherwise process env applies, then defaults. Scope keys in
+`<MIMIR_HOME>/.env` are ignored with a key-name-only warning: the running agent
+can write that file. Scope is loaded once at bridge startup, never from chat or
+tools. On mimirbot, bake the file into the image as `root:root 0644` under
+`/etc/mimir/`, or bind-mount it read-only from the host; for simple setups use
+host-side `compose.env` process environment values.
 
 ## Feature flags that ship off by default
 
