@@ -50,6 +50,7 @@ from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._chunking import chunk_message
 from ._emoji import resolve_for_slack
 from ._history import ChannelMessage
+from ._mentions import neutralize_slack_blocks, neutralize_slack_broadcasts
 from ._seen_ids import SeenIdCache
 from .base import Bridge, MessageUpdate, SendResult
 
@@ -500,11 +501,13 @@ class SlackBridge(Bridge):
         upload_count = 0
         try:
             for chunk in chunks:
-                kwargs: dict[str, Any] = {"channel": slack_channel, "text": chunk}
+                kwargs: dict[str, Any] = {
+                    "channel": slack_channel, "text": neutralize_slack_broadcasts(chunk),
+                }
                 if reply_to_message_id:
                     kwargs["thread_ts"] = reply_to_message_id
                 if blocks is not None and sent_count == 0:
-                    kwargs["blocks"] = blocks
+                    kwargs["blocks"] = neutralize_slack_blocks(blocks)
                 resp = await self._app.client.chat_postMessage(**kwargs)
                 self._capture_own_bot_id_from_response(resp)
                 last_id = resp.get("ts") or last_id
@@ -581,10 +584,10 @@ class SlackBridge(Bridge):
         kwargs: dict[str, Any] = {
             "channel": slack_channel,
             "ts": message_id,
-            "text": update.text or "",
+            "text": neutralize_slack_broadcasts(update.text or ""),
         }
         if update.blocks is not None:
-            kwargs["blocks"] = update.blocks
+            kwargs["blocks"] = neutralize_slack_blocks(update.blocks)
         try:
             resp = await self._app.client.chat_update(**kwargs)
         except SlackApiError as exc:

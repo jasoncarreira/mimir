@@ -624,6 +624,49 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
     assert dm_task is not None and dm_task.done()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert_channel", ["discord-ops", "slack-ops"])
+@pytest.mark.parametrize("display,cleaned", [
+    ("@everyone <@&123> [x](https://evil)", "everyone &123 xhttps://evil"),
+    ("<!channel> <!subteam^S123|@devs>", "!channel !subteam^S123|devs"),
+])
+async def test_pairing_operator_alert_neutralizes_sender_display_name(
+    monkeypatch: pytest.MonkeyPatch, alert_channel: str, display: str, cleaned: str,
+) -> None:
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(
+        SimpleNamespace(operator_alert_channel=alert_channel,
+                        pairing_operator_digest_delay_seconds=60.0), channels,
+    )
+    try:
+        await notifier.notify_operator(
+            canonical="discord-123", display=display,
+            platform="discord", channel_id="discord-1", delivery="dm",
+        )
+        await notifier.flush_operator_alerts()
+        channels.send.assert_awaited_once()
+        assert channels.send.await_args.args[0] == alert_channel
+        alert = channels.send.await_args.args[1]
+        assert "@everyone" not in alert and "<@&" not in alert and "](" not in alert
+        assert "<!channel" not in alert and "<!subteam" not in alert
+        assert f"discord-123 ({cleaned}; discord; DM)" in alert
+        assert "mimir identities approve-pairing discord-123" in alert
+    finally:
+        await notifier.aclose()
+
+
+def test_neutralize_display_name_removes_controls_collapses_spaces_and_caps_length():
+    from mimir.bridges._mentions import neutralize_display_name
+
+    assert neutralize_display_name("  A\x00\n  B\t @here  ") == "A B here"
+    assert neutralize_display_name("Z" * 90) == "Z" * 64
+
+
 @dataclass
 class _ServerControl:
     events: list[str] = field(default_factory=list)

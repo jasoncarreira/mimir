@@ -17,6 +17,7 @@ from tests.timing import HANG_GUARD_SECONDS
 pytest.importorskip("slack_bolt")
 
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
+from mimir.bridges._mentions import neutralize_slack_broadcasts
 from mimir.bridges.slack import (
     SLACK_MESSAGE_CHAR_LIMIT,
     SlackBridge,
@@ -321,6 +322,38 @@ async def test_send_can_post_threaded_block_kit_panel(bridge_with_fake_app):
     assert sent[0]["blocks"] == blocks
 
 
+def test_neutralize_slack_broadcasts_keeps_single_user_channels_and_links():
+    ordinary = "build passed for PR #2319 — see <https://github.com/x/y/pull/1|PR>"
+    assert neutralize_slack_broadcasts(ordinary) == ordinary
+    assert neutralize_slack_broadcasts("<@U123> <#C123|general> <https://example.com|link>") == (
+        "<@U123> <#C123|general> <https://example.com|link>"
+    )
+    assert neutralize_slack_broadcasts("<!here|<!subteam^S123>>") == "@here"
+
+
+@pytest.mark.asyncio
+async def test_send_neutralizes_slack_broadcasts_in_text_and_nested_blocks(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+    text = "hi <!channel> and <!here|here> and <!everyone> and <!subteam^S123|@devs>"
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "<!here> <@U123>"},
+               "fields": [{"type": "plain_text", "text": "<!SUBTEAM^S123|@devs>"}]}]
+    assert (await bridge.send("slack-C01ABC", text, blocks=blocks)).sent
+    assert sent[0]["text"] == "hi @channel and @here and @everyone and @subteam"
+    assert sent[0]["blocks"][0]["text"]["text"] == "@here <@U123>"
+    assert sent[0]["blocks"][0]["fields"][0]["text"] == "@subteam"
+    assert blocks[0]["text"]["text"] == "<!here> <@U123>"  # caller's payload is not mutated
+    assert "link_names" not in sent[0]
+
+
+@pytest.mark.asyncio
+async def test_send_slack_ordinary_text_is_unchanged(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+    ordinary = "build passed for PR #2319 — see <https://github.com/x/y/pull/1|PR>"
+    assert (await bridge.send("slack-C01ABC", ordinary)).sent
+    assert sent[0]["text"] == ordinary
+    assert "link_names" not in sent[0]
+
+
 @pytest.mark.asyncio
 async def test_send_missing_attachment_returns_failure(bridge_with_fake_app, tmp_path: Path):
     bridge, _, _ = bridge_with_fake_app
@@ -396,6 +429,27 @@ async def test_edit_message_calls_chat_update_with_blocks(bridge_with_fake_app):
             "blocks": blocks,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_edit_neutralizes_slack_broadcasts_in_text_and_blocks(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+    blocks = [{"type": "actions", "elements": [
+        {"type": "button", "text": {"type": "plain_text", "text": "<!channel|channel>"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "<!subteam^S123> <!HERE>"}},
+    ]}]
+    result = await bridge.edit_message("slack-C01ABC", "123.001", MessageUpdate(
+        text="<!everyone> <!here|here> <@U123> <#C123|general> <https://example.com|link>",
+        blocks=blocks,
+    ))
+    assert result.sent
+    updated = bridge._app._updates[0]
+    assert updated["text"] == (
+        "@everyone @here <@U123> <#C123|general> <https://example.com|link>"
+    )
+    assert updated["blocks"][0]["elements"][0]["text"]["text"] == "@channel"
+    assert updated["blocks"][0]["elements"][1]["text"]["text"] == "@subteam @here"
+    assert "link_names" not in updated
 
 
 @pytest.mark.asyncio
