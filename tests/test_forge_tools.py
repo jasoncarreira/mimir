@@ -155,9 +155,146 @@ async def test_attested_server_projections_keep_exact_scope(
         )
         source, = labels.sources
         assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
-        assert source.integrity == (
-            "trusted" if verdict is True and tool_name != "pr_job_log" else "untrusted"
+        assert source.integrity == ("trusted" if verdict is True else "untrusted")
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("read_tool", [pr_metadata, pr_files, pr_diff, pr_file_content])
+@pytest.mark.parametrize("verified", [True, False])
+def test_attested_pr_read_after_push_preserves_exact_head_for_repo_test(
+    monkeypatch, read_tool, verified,
+):
+    import uuid
+
+    from mimir.repo_tools import _record_verified_push
+
+    old_head = uuid.uuid4().hex + "0" * 8
+    new_head = uuid.uuid4().hex + "0" * 8
+    scope = _scope(RepoPRAction.INSPECT, head_sha=old_head)
+    runtime = _runtime(scope)
+    client = FakeForge()
+    monkeypatch.setattr(client, "get_pull_request", lambda _: PullRequestProjection(
+        17, "Title", "open", "author", False, "main", "change",
+        new_head, True, "created", "updated",
+    ))
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
+    if verified:
+        _record_verified_push(scope, old_head, new_head)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = read_tool.func(
+                "owner/repo", 17,
+                **({"path": "src/app.py"} if read_tool is pr_file_content else {}),
+                runtime=runtime,
+            )
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        labels = access_control.classify_protected_result(
+            read_tool.name, {"repository": "owner/repo", "pull_request": 17},
+            runtime.context,
+            access_control.ToolAuthorization(
+                tool_name=read_tool.name, decision="resource_scoped", allowed=True,
+                repo_pr_action_scope=scope,
+            ), result=result, provenance=provenance,
         )
+        assert labels.sources[0].resource_id == f"owner/repo#pull/17@{new_head if verified else old_head}"
+        assert labels.has_untrusted_active_ingest is not verified
+        runtime.context.ifc_state.merge(labels)
+        assert runtime.context.ifc_state.has_untrusted_active_ingest() is not verified
+        decision = access_control.SinkGate.check_sink_flow(
+            "repo_test", f"owner/repo#pull/17@{old_head}:{scope.scope_id}",
+            labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
+        )
+        assert decision.allowed is verified
+        if not verified:
+            assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("boundary", ["missing_lineage", "missing_verified_push", "wrong_repository"])
+def test_verified_push_result_requires_turn_lineage_and_exact_resource(
+    monkeypatch, boundary,
+):
+    import uuid
+
+    from mimir.repo_tools import _record_verified_push
+    from mimir.tools.forge import _publish_author_attestation
+
+    old_head = uuid.uuid4().hex + "0" * 8
+    new_head = uuid.uuid4().hex + "0" * 8
+    scope = _scope(RepoPRAction.INSPECT, head_sha=old_head)
+    runtime = _runtime(scope)
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: True, raising=False)
+    if boundary != "missing_verified_push":
+        _record_verified_push(scope, old_head, new_head)
+    if boundary != "missing_lineage":
+        runtime.context.ifc_state.record_own_push("owner/repo", 17, old_head)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            _publish_author_attestation(
+                runtime, scope, ("author",), "pr_file_content", head_sha=new_head,
+            )
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        if boundary == "wrong_repository":
+            provenance = replace(provenance, sources=(replace(
+                provenance.sources[0], resource_id=f"other/repo#pull/17@{new_head}",
+            ),))
+        labels = access_control.classify_protected_result(
+            "pr_file_content", {"repository": "owner/repo", "pull_request": 17},
+            runtime.context,
+            access_control.ToolAuthorization(
+                tool_name="pr_file_content", decision="resource_scoped", allowed=True,
+                repo_pr_action_scope=scope,
+            ), result="file contents", provenance=provenance,
+        )
+        assert labels.sources[0].integrity == "untrusted"
+        assert labels.has_untrusted_active_ingest
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("verdict", [True, False, None])
+def test_job_log_attestation_controls_repo_test(monkeypatch, verdict):
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
+    monkeypatch.setattr(client, "get_job_log", lambda *_: "redacted excerpt", raising=False)
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = pr_job_log.func("owner/repo", 17, 123, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        assert result == "redacted excerpt"
+        labels = access_control.classify_protected_result(
+            "pr_job_log", {"repository": "owner/repo", "pull_request": 17, "job_id": 123},
+            runtime.context,
+            access_control.ToolAuthorization(
+                tool_name="pr_job_log", decision="resource_scoped", allowed=True,
+                repo_pr_action_scope=scope,
+            ), result=result, provenance=provenance,
+        )
+        assert labels.sources[0].resource_id == f"owner/repo#pull/17@{scope.observed_head_sha}"
+        assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+        runtime.context.ifc_state.merge(labels)
+        assert runtime.context.ifc_state.has_untrusted_active_ingest() is (verdict is not True)
+        decision = access_control.SinkGate.check_sink_flow(
+            "repo_test", f"owner/repo#pull/17@{scope.observed_head_sha}:{scope.scope_id}",
+            labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
+        )
+        assert decision.allowed is (verdict is True)
+        if verdict is not True:
+            assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 

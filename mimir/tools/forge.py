@@ -864,9 +864,9 @@ def _publish_author_attestation(
     Missing actors/adapters and unavailable attestation fail closed for this
     result. Only definitive verdicts enter the turn-local cache; no PR-level
     verdict is persisted. Contained ``repo_test`` output is a function of the
-    attested checked-in checkout and inherits its lease attestation. CI logs,
-    checks, and forge mutation output are not author text; their bounded server
-    projections have separate provenance rules.
+    attested checked-in checkout and inherits its lease attestation. Scoped CI
+    job logs inherit the PR author verdict; checks and forge mutation output
+    have separate provenance rules.
     """
     from ..access_control import publish_protected_result
     from ..models import SourceLabel
@@ -1105,7 +1105,7 @@ def pr_job_log(
     run_id: StrictInt | None = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
-    """Read an untrusted, redacted bounded excerpt from one scoped failing CI job."""
+    """Read a redacted bounded CI job excerpt; trusted only for an attested PR."""
     _repository(repository)
     for name, value in (("pull_request", pull_request), ("job_id", job_id), ("run_id", run_id)):
         if name == "run_id" and value is None:
@@ -1133,7 +1133,12 @@ def pr_job_log(
     ):
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
-    return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
+    client = _client(scope)
+    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id))
+    if callable(getattr(client, "author_is_trusted", None)):
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        _publish_author_attestation(runtime, scope, authors, "pr_job_log", head_sha=head_sha)
+    return excerpt
 
 
 @tool
