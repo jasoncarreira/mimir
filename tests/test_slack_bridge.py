@@ -84,6 +84,19 @@ def test_is_dm_channel_mpim_via_channel_type():
     assert _is_dm_channel("C01ABC", "channel") is False
 
 
+@pytest.mark.parametrize("channel,kind,private", [("D123", "im", True), ("G123", "mpim", False)])
+def test_pairing_codes_follow_slack_one_to_one_classification(tmp_path, channel, kind, private):
+    from mimir.identities_populator import request_pairing_with_code
+    import yaml
+
+    channel_id = _slack_channel_to_id(channel, kind)
+    _, code = request_pairing_with_code(tmp_path, "slack-U1", "slack",
+                                       channel_id=channel_id, is_dm=_is_dm_channel(channel, kind))
+    assert bool(code) is private
+    pairing = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]
+    assert ("code_hash" in pairing) is private
+
+
 def test_slack_channel_to_id_mpim():
     """MPIMs (group DMs) route through dm-slack- so the privacy filter
     treats them as DMs even though the Slack channel id starts with G."""

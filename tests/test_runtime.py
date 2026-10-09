@@ -1101,7 +1101,7 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         author_id="U123",
         author_display="Alice",
         source="slack",
-        channel_id="dm-alice",
+        channel_id="dm-slack-D123",
     )
     await dispatcher._on_event(inbound)
     assert ("resolve_dm", "U123") in events
@@ -1115,12 +1115,12 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         "canonical": "alice-canonical",
         "display": "Alice",
         "platform": "slack",
-        "channel_id": "dm-alice",
+        "channel_id": "dm-slack-D123",
         "delivery": "dm",
     }) in events
     assert ("reply_dm", {
         "canonical": "alice-canonical",
-        "dm_channel_id": "dm-alice",
+        "dm_channel_id": "dm-slack-D123",
         "code": "ABCDEFGH",
     }) in events
     assert resolver.reload_count == 2
@@ -1185,7 +1185,9 @@ async def test_runtime_denied_dm_issues_private_code_only(
 
     class Channels(_Channels):
         async def send(self, channel_id, text, *, final=True):
+            from mimir.bridges.base import SendResult
             sent.append((channel_id, text))
+            return SendResult(sent=True)
 
     channels = Channels()
     cfg = replace(Config.from_env(), home=tmp_path, operator_alert_channel="dm-slack-OPS",
@@ -1241,6 +1243,15 @@ async def test_runtime_denied_dm_issues_private_code_only(
             await adapters.dispatcher._on_pairing_required(capped, decision)
             assert len(yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"]) == 1
             assert "pairing_pending_cap_reached" in event_path.read_text()
+            group_channel = "dm-slack-G123" if platform == "slack" else "discord-456"
+            group = SimpleNamespace(**{**vars(inbound), "channel_id": group_channel,
+                                      "extra": {"channel_conversation_type": "multi_user"}})
+            await adapters.dispatcher._on_pairing_required(group, decision)
+            await notifier._dm_reply_queue.join()
+            assert not any(destination == group_channel for destination, _ in sent)
+            group_person = yaml.safe_load(refreshed)["people"][0]
+            # Existing private code is not rotated by shared-channel traffic.
+            assert yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]["code_hash"] == group_person["pairing"]["code_hash"]
     finally:
         await notifier.aclose()
         await bundle.aclose()

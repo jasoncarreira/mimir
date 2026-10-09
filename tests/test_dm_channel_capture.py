@@ -510,3 +510,92 @@ def test_pairing_code_cli_and_mutual_exclusion(tmp_path, capsys):
     _, third = request_pairing_with_code(tmp_path, "slack-U3", "slack", channel_id="dm-slack-D3", is_dm=True)
     assert run("slack-U3") == 0  # canonical form bypasses code lockout
     assert third not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("platform,channel", [
+    ("slack", "dm-slack-G123"), ("discord", "discord-123"),
+    ("slack", "slack-C123"), ("discord", "dm-unknown"),
+])
+def test_shared_channels_never_mint_pairing_codes(tmp_path, platform, channel):
+    _, code = request_pairing_with_code(tmp_path, f"{platform}-1", platform,
+                                       channel_id=channel, is_dm=True)
+    assert code is None
+    assert "code_hash" not in _read(tmp_path)["people"][0]["pairing"]
+
+
+def test_status_only_pairing_never_consumes_a_code(tmp_path):
+    request_pairing_status(tmp_path, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+    assert "code_hash" not in _read(tmp_path)["people"][0]["pairing"]
+    assert request_pairing_with_code(tmp_path, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)[1]
+
+
+def test_delivery_cleanup_cannot_erase_a_newer_code(tmp_path, monkeypatch):
+    clock = _clock(monkeypatch)
+    kwargs = dict(channel_id="dm-slack-D1", is_dm=True)
+    _, first = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    clock.current += timedelta(minutes=10)
+    _, second = request_pairing_with_code(tmp_path, "slack-U1", "slack", **kwargs)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", first, failed=True)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", first)
+    assert approve_pairing_code(tmp_path, second)
+    assert not _pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", second)
+
+
+@pytest.mark.parametrize("operation", ["mint", "guess"])
+def test_identity_transactions_serialize_across_processes(tmp_path, operation):
+    import subprocess
+    import sys
+    import select
+
+    request_pairing_with_code(tmp_path, "slack-U0", "slack", channel_id="dm-slack-D0", is_dm=True)
+    script = '''
+import sys
+from pathlib import Path
+from mimir import identities_populator as pop
+home, operation, actor = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+original = pop._load_yaml
+def load(path):
+    result = original(path)
+    print("loaded", flush=True)
+    if actor == "1":
+        sys.stdin.readline()
+    return result
+pop._load_yaml = load
+print("started", flush=True)
+if operation == "mint":
+    pop.request_pairing_with_code(home, "slack-U" + actor, "slack",
+                                 channel_id="dm-slack-D" + actor, is_dm=True)
+else:
+    pop.approve_pairing_code(home, "ZZZZZZZZ")
+'''
+    first = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), operation, "1"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    second = None
+    try:
+        assert select.select([first.stdout], [], [], 15)[0]
+        assert first.stdout.readline().strip() == b"started"
+        assert select.select([first.stdout], [], [], 15)[0]
+        assert first.stdout.readline().strip() == b"loaded"
+        second = subprocess.Popen([sys.executable, "-c", script, str(tmp_path), operation, "2"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        assert select.select([second.stdout], [], [], 15)[0]
+        assert second.stdout.readline().strip() == b"started"
+        # The second process cannot load a stale snapshot while the first
+        # transaction is paused after reading but before writing.
+        assert not select.select([second.stdout], [], [], 0.2)[0]
+        _, error = first.communicate(b"continue\n", timeout=15)
+        assert first.returncode == 0, error
+        output, error = second.communicate(timeout=15)
+        assert second.returncode == 0, error
+        assert output.strip() == b"loaded"
+        if operation == "mint":
+            assert {p["canonical"] for p in _read(tmp_path)["people"]} == {"slack-U0", "slack-U1", "slack-U2"}
+            assert all("code_hash" in p["pairing"] for p in _read(tmp_path)["people"])
+        else:
+            state = json.loads((tmp_path / "state" / "pairing_lockout.json").read_text())
+            assert state["failed_attempts"] == 2
+    finally:
+        for child in (first, second):
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)

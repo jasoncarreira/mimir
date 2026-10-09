@@ -480,7 +480,12 @@ async def create_agent_runtime(
                 author = (event.author or "").strip()
                 platform = (event.source or "").strip()
                 channel_id = (event.channel_id or "").strip()
-                is_dm = channel_id.startswith("dm-")
+                from .identities_populator import is_private_pairing_dm
+
+                is_dm = is_private_pairing_dm(platform, channel_id)
+                extra = getattr(event, "extra", None) or {}
+                if extra.get("channel_conversation_type") == "multi_user":
+                    is_dm = False
                 if not (
                     author
                     and platform in ("slack", "discord")
@@ -499,6 +504,7 @@ async def create_agent_runtime(
                     author_display=event.author_display,
                     is_dm=is_dm,
                     max_pending=config.pairing_pending_max,
+                    mint_code=getattr(config, "pairing_dm_auto_reply_enabled", True),
                 )
                 delivery = "dm" if is_dm else "public_shared_channel"
                 if status == "capped":

@@ -105,6 +105,19 @@ def test_channel_to_id_dm():
     assert _channel_to_id(ch) == "dm-discord-99"
 
 
+@pytest.mark.parametrize("kind,private", [("private", True), ("group", False)])
+def test_pairing_codes_follow_discord_one_to_one_classification(tmp_path, kind, private):
+    from mimir.identities_populator import request_pairing_with_code
+    import yaml
+
+    channel = _fake_channel(id=99, type_name=kind)
+    _, code = request_pairing_with_code(tmp_path, "discord-1", "discord",
+        channel_id=_channel_to_id(channel), is_dm=_channel_conversation_type(channel) == "dm")
+    assert bool(code) is private
+    pairing = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]
+    assert ("code_hash" in pairing) is private
+
+
 def test_channel_id_to_int_round_trip():
     assert _channel_id_to_int("discord-42") == 42
     assert _channel_id_to_int("dm-discord-7") == 7

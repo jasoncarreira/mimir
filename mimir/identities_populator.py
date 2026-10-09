@@ -43,6 +43,7 @@ import os
 import secrets
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
@@ -56,6 +57,16 @@ log = logging.getLogger(__name__)
 
 PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 _PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def is_private_pairing_dm(platform: str, channel_id: str) -> bool:
+    """Pairing is narrower than the cross-channel privacy filter (no MPIMs)."""
+    if platform == "slack":
+        tail = channel_id.removeprefix("dm-slack-")
+        return channel_id.startswith("dm-slack-D") and tail.isalnum()
+    if platform == "discord":
+        return channel_id.startswith("dm-discord-") and channel_id[11:].isdigit()
+    return False
 
 
 class PairingCodeLockedError(ValueError):
@@ -203,22 +214,42 @@ def _find_person(
     return None
 
 
-# All in-process writers of ``state/identities.yaml`` share this lock so the
-# read → mutate → write is atomic across the live first-contact DM capture
-# (``capture_dm_channel``) and the scheduled populator (``merge_into_yaml``) —
-# otherwise they lost-update each other. Unique temp files (below) additionally
-# remove the shared-``.tmp`` rename race. RLock in case a future caller nests;
-# today neither writer calls the other.
+# One lock protects identities AND the approval lockout across server/CLI
+# processes. Lock a stable sibling inode: the data files are atomically replaced.
 _IDENTITIES_WRITE_LOCK = threading.RLock()
+_IDENTITIES_HELD_LOCKS = threading.local()
 
 
 def _serialized_identities_write(fn):
-    """Hold ``_IDENTITIES_WRITE_LOCK`` for the whole call — decorate every
-    function that does a read-modify-write of ``state/identities.yaml``."""
+    """Serialize the entire read-modify-write transaction, including nested calls."""
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
+        import fcntl
+
+        home = Path(args[0] if args else kwargs["home"]).resolve()
         with _IDENTITIES_WRITE_LOCK:
-            return fn(*args, **kwargs)
+            held = getattr(_IDENTITIES_HELD_LOCKS, "paths", set())
+            if home in held:
+                return fn(*args, **kwargs)
+            state_dir = home / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(state_dir / "identities.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as lock:
+                deadline = time.monotonic() + 10.0
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("identity state write lock unavailable")
+                        time.sleep(0.01)
+                _IDENTITIES_HELD_LOCKS.paths = held | {home}
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _IDENTITIES_HELD_LOCKS.paths = held
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return _wrapper
 
 
@@ -607,6 +638,7 @@ def request_pairing_status(
     status, _ = request_pairing_with_code(
         home, author, platform, channel_id=channel_id,
         author_display=author_display, is_dm=is_dm, max_pending=max_pending,
+        mint_code=False,
     )
     return status
 
@@ -621,8 +653,9 @@ def request_pairing_with_code(
     author_display: str | None = None,
     is_dm: bool = False,
     max_pending: int | None = None,
+    mint_code: bool = True,
 ) -> tuple[PairingRequestStatus, str | None]:
-    """Persist a pending pairing; expose plaintext only on a DM mint edge."""
+    """Persist a pending pairing; expose plaintext only on a private DM mint edge."""
     author = (author or "").strip()
     platform = (platform or "").strip()
     channel_id = (channel_id or "").strip()
@@ -724,7 +757,7 @@ def request_pairing_with_code(
         match["pairing"] = pairing
 
     code = None
-    if is_dm:
+    if is_dm and mint_code and is_private_pairing_dm(platform, channel_id):
         now = datetime.now(timezone.utc)
         expires = _pairing_time(pairing.get("code_expires_at"))
         active = (expires is not None and expires > now
@@ -745,6 +778,30 @@ def request_pairing_with_code(
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
     return "changed", code
+
+
+@_serialized_identities_write
+def prepare_pairing_code_delivery(home: Path, author: str, code: str, *, failed: bool = False) -> bool:
+    """Refresh TTL at dequeue, or invalidate a failed send without erasing a newer code."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    person = _find_person(doc.get("people") or [], author)
+    pairing = person.get("pairing") if person else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    try:
+        salt = bytes.fromhex(pairing["code_salt"])
+        digest = hashlib.sha256(salt + code.encode("ascii")).hexdigest()
+        if not secrets.compare_digest(digest, pairing["code_hash"]):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if failed:
+        _clear_pairing_code(pairing)
+    else:
+        pairing["code_expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
 
 
 @_serialized_identities_write

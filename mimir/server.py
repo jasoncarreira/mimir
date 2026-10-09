@@ -286,7 +286,10 @@ class _PairingNotifier:
             return
         canonical = canonical.strip()
         dm_channel_id = dm_channel_id.strip()
-        if not canonical or not dm_channel_id.startswith("dm-") or not code:
+        from .identities_populator import is_private_pairing_dm
+
+        platform = "slack" if dm_channel_id.startswith("dm-slack-") else "discord"
+        if not canonical or not is_private_pairing_dm(platform, dm_channel_id) or not code:
             return
         key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
         if key in self._dm_reply_sent:
@@ -303,15 +306,28 @@ class _PairingNotifier:
         )
         while not self._dm_reply_queue.empty():
             canonical, dm_channel_id, code = await self._dm_reply_queue.get()
+            from .identities_populator import prepare_pairing_code_delivery
+
+            key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
+            delivered = False
             try:
+                # Queue wait must not consume the sender's one-hour TTL. Drop
+                # superseded/approved codes instead of sending unusable plaintext.
+                if not await asyncio.to_thread(
+                    prepare_pairing_code_delivery, self._config.home, canonical, code,
+                ):
+                    continue
                 template = self._config.pairing_dm_auto_reply_text
                 text = (template.replace("{code}", code) if "{code}" in template
                         else f"{template}\nPairing code: `{code}`")
-                await self._channels.send(
+                result = await self._channels.send(
                     dm_channel_id,
                     text,
                     final=True,
                 )
+                if not result.sent:
+                    raise RuntimeError("pairing delivery unsuccessful")
+                delivered = True
                 await log_event(
                     "pairing_dm_auto_reply_sent",
                     author=canonical,
@@ -325,7 +341,18 @@ class _PairingNotifier:
                     channel_id=dm_channel_id,
                 )
             finally:
-                self._dm_reply_queue.task_done()
+                try:
+                    if not delivered:
+                        self._dm_reply_sent.discard(key)
+                        try:
+                            await asyncio.to_thread(
+                                prepare_pairing_code_delivery, self._config.home, canonical, code,
+                                failed=True,
+                            )
+                        except Exception:
+                            log.debug("pairing delivery cleanup unavailable")
+                finally:
+                    self._dm_reply_queue.task_done()
             if interval and not self._dm_reply_queue.empty():
                 await asyncio.sleep(interval)
 

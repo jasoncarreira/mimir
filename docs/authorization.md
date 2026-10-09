@@ -481,10 +481,15 @@ boundary.
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
 
-An unknown Discord or Slack DM sender receives a one-time pairing code (valid for
-one hour). Ask the sender for the code and run `mimir identities approve-pairing
---code <CODE>`; codes are issued at most once per ten minutes per person. Five
-wrong codes lock code approval for one hour. The existing
+An unknown sender in a **1:1** Discord DM or Slack IM receives a one-time
+pairing code (valid for one hour). Group DMs, including Slack MPIMs, never
+receive codes. Ask the sender for the code and run `mimir identities approve-pairing
+--code <CODE>`; codes are issued at most once per ten minutes per person, except
+that a failed send permits immediate reissue on the sender's next message.
+Queued codes get a fresh one-hour TTL immediately before delivery; superseded
+codes are not sent. Identity changes and the approval lockout share a sibling
+file lock across the server and CLI processes. Five wrong codes lock code
+approval for one hour. The existing
 `mimir identities approve-pairing <identity>` remains available independently of
 the lockout. Add `--admin` for both `user` and `admin`. The identities populator
 may add aliases and metadata but preserves operator-managed access fields.
