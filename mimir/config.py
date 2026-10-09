@@ -1181,7 +1181,6 @@ class Config:
     acp_journal_ttl_days: int = 7
     # Per-process cap for concurrent web-chat SSE subscribers.
     chat_stream_max_subscribers: int = 8
-    github_trusted_bot_logins: frozenset[str] = field(default_factory=trusted_github_bot_logins)
 
     @classmethod
     def from_env(cls) -> "Config":

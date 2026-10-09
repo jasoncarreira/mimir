@@ -37,7 +37,7 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}")
 _REVIEWER = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 _BOT_LOGIN = re.compile(r"[A-Za-z0-9-]{1,39}\[bot\]", re.I)
 _DIAGNOSTIC_LOGIN = re.compile(r"(?:[A-Za-z0-9_.-]{1,100}|[A-Za-z0-9-]{1,39}\[bot\])", re.I)
-_CHECK_NAME = re.compile(r"[A-Za-z0-9 _./:()\[\]-]{1,100}")
+_CHECK_NAME = re.compile(r"[A-Za-z0-9 _./()\[\]-]{1,64}")
 _CHECK_STATUSES = frozenset({"queued", "in_progress", "completed", "waiting", "pending", "requested"})
 _CHECK_CONCLUSIONS = frozenset({
     "success", "failure", "neutral", "cancelled", "skipped", "timed_out",

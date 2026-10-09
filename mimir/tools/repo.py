@@ -326,10 +326,10 @@ def repo_checkout(
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
     client = _client(scope)
-    from .forge import _author_verdict
+    from .forge import _BOT_LOGIN, _author_verdict
 
     if callable(getattr(client, "author_is_trusted", None)) or (
-        isinstance(scope.pull_request_author, str) and scope.pull_request_author.endswith("[bot]")
+        isinstance(scope.pull_request_author, str) and _BOT_LOGIN.fullmatch(scope.pull_request_author)
     ):
         authors, _ = _call(lambda: _pr_content_authors(client, scope))
         if authors == (scope.pull_request_author,) and scope.pull_request_author:

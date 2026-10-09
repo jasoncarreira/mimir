@@ -605,6 +605,7 @@ def test_checkout_records_native_author_trust_for_file_reads(
 @pytest.mark.parametrize("allowlist,author,trusted", [
     ("", "dependabot[bot]", False),
     ("DePeNdAbOt[bot]", "dependabot[bot]", True),
+    ("dependabot[bot]", "DEPENDABOT[BOT]", True),
     ("dependabot[bot]", "renovate[bot]", False),
 ])
 def test_checkout_bot_attestation_requires_exact_operator_login(
@@ -631,11 +632,9 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
         7, "Title", "open", "author", False, "main", "change",
         "a" * 40, True, "created", "updated",
     ), author=author)
-    def unexpected_attestation(*_):
-        pytest.fail("bot must not be sent to collaborator API")
-
+    # No collaborator adapter: the mixed-case bot path must still attest.
     monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(
-        get_pull_request=lambda _: metadata, author_is_trusted=unexpected_attestation,
+        get_pull_request=lambda _: metadata,
     ))
     token = begin_protected_result_capture()
     try:
@@ -680,9 +679,13 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
     monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
     auth, original, lease, target, _ = _real_attested_lease(tmp_path)
     subprocess.run(["git", "-C", str(lease.path), "branch", "-m", "main"], check=True)
-    # Start an independently observed protected base with a different author.
-    subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "--orphan", "base"], check=True)
-    subprocess.run(["git", "-C", str(lease.path), "rm", "-qrf", "."], check=True)
+    # A real fork: the attested range contains a human display name, not
+    # the verified forge login. Replay must rely on the original patch only.
+    common = original.observed_head_sha
+    attested = _git_commit(lease.path, target, "feature", "Jason Carreira", "Jason Carreira")
+    original = replace(original, observed_head_sha=attested)
+    object.__setattr__(lease, "head_sha", attested)
+    subprocess.run(["git", "-C", str(lease.path), "checkout", "-qb", "base", common], check=True)
     base_file = lease.path / "base.txt"
     base = _git_commit(lease.path, base_file, "base", "outsider", "outsider")
     subprocess.run(["git", "-C", str(lease.path), "checkout", "-q", "main"], check=True)
@@ -691,13 +694,12 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
                         "-c", "user.email=noreply@mimir-agent.local", "merge", "-q",
                         "--allow-unrelated-histories", "--no-ff", "base", "-m", "merge base"], check=True)
     else:
-        # Rebase the attested root commit onto the observed base, preserving its
-        # collaborator author while Git uses the server committer identity.
+        # Preserve the human display name while the server is the committer.
         subprocess.run(["git", "-C", str(lease.path),
                         "-c", f"user.name={DEFAULT_USER_NAME}",
                         "-c", "user.email=noreply@mimir-agent.local", "rebase", "-q",
-                        "--onto", "base", "--root", "main"], check=True)
-        auth.ifc_state.repository_author_trust.resolve("owner/repo", "collaborator", lambda: True)
+                        "--onto", "base", common, "main"], check=True)
+        auth.ifc_state.repository_author_trust.resolve("owner/repo", "jasoncarreira", lambda: True)
     scope = replace(original, destination_ref="refs/heads/main", observed_base_sha=base)
     object.__setattr__(lease, "scope_id", scope.scope_id)
     object.__setattr__(lease, "base_sha", base)
@@ -733,9 +735,25 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
         lease.path, "main", original.observed_head_sha, head,
         scope=unprotected, lease=lease, ifc_state=auth.ifc_state,
     )
+    if operation == "rebase":
+        # A conflict-resolution edit is not a patch-identical replay, even with
+        # the original human author and the server committer.
+        target.write_text("altered replay\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
+        subprocess.run(["git", "-C", str(lease.path), "-c", f"user.name={DEFAULT_USER_NAME}",
+                        "-c", "user.email=noreply@mimir-agent.local", "commit", "-q",
+                        "--amend", "--no-edit"], check=True)
+        altered = subprocess.run(["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
+                                 capture_output=True, text=True).stdout.strip()
+        assert not access_control_module._lease_head_is_author_attested(
+            lease.path, "main", original.observed_head_sha, altered,
+            scope=scope, lease=lease, ifc_state=auth.ifc_state,
+        )
+        subprocess.run(["git", "-C", str(lease.path), "reset", "-q", "--hard", head], check=True)
+    auth.ifc_state.repository_author_trust.resolve("owner/repo", "jasoncarreira", lambda: True)
     for author, committer in (
         ("outsider", "outsider"), ("collaborator", "outsider"),
-        ("uncached", DEFAULT_USER_NAME),
+        ("uncached", DEFAULT_USER_NAME), ("jasoncarreira", DEFAULT_USER_NAME),
     ):
         bad_head = _git_commit(lease.path, target, author + committer, author, committer)
         assert not access_control_module._lease_head_is_author_attested(

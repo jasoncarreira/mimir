@@ -10240,10 +10240,29 @@ def _lease_head_is_author_attested(
 ) -> bool:
     """Verify HEAD against the attested head and the observed protected base."""
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
-    from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
+    from .repo_tools import (
+        _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS,
+        _sanitized_git_env, hardened_git_command,
+    )
 
     def run(*arguments: str):
         return hardened_git_command(path, arguments, timeout=5)
+
+    def patch_id(commit: str) -> str | None:
+        # Read only immutable objects with hardened Git; patch-id receives the
+        # bounded diff on stdin, never a shell pipeline or checkout config.
+        diff = run("show", "--format=", "--root", "--no-ext-diff", "--no-textconv", commit, "--")
+        if diff.returncode != 0 or diff.timed_out or diff.output_limited:
+            return None
+        result = subprocess.run(
+            [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--stable"],
+            input=diff.stdout, capture_output=True, text=True, timeout=5,
+            env=_sanitized_git_env(),
+        )
+        fields = result.stdout.split()
+        if result.returncode != 0 or len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+            return None
+        return fields[0]
 
     try:
         actual_state = observed_state or _observed_checkout_state(path)
@@ -10264,22 +10283,51 @@ def _lease_head_is_author_attested(
         if not head_ancestor and not base_ancestor:
             return False
         commits = run(
-            "log", "-z", "--format=%an%x00%ae%x00%cn%x00%ce",
-            current_head, "--not", expected_head, *( (base,) if base_ancestor else () ), "--",
+            "log", "-z", "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce",
+            current_head, "--not", expected_head, *((base,) if base_ancestor else ()), "--",
         )
-        if commits.returncode != 0:
+        if commits.returncode != 0 or commits.timed_out or commits.output_limited:
             return False
-        fields = [field for field in commits.stdout.split("\x00") if field]
-        return len(fields) % 4 == 0 and all(
-            fields[index + 2:index + 4] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]
-            and (
-                fields[index:index + 2] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]
-                or ifc_state is not None and ifc_state.repository_author_trust.trusted(
-                    scope.canonical_repo, fields[index],
-                )
-            )
-            for index in range(0, len(fields), 4)
-        )
+        fields = commits.stdout.split("\x00")
+        if fields[-1] != "":
+            return False
+        fields.pop()
+        if len(fields) % 6:
+            return False
+        original_patches: set[str] | None = None
+        for index in range(0, len(fields), 6):
+            commit, parents, author, email, committer, committer_email = fields[index:index + 6]
+            if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                return False
+            if len(parents.split()) > 1:
+                # Only a server-authored merge of the exact protected base may
+                # introduce another ancestry. Never accept arbitrary side merges.
+                if not base_ancestor or [author, email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                    return False
+                if any(parent != base and run("merge-base", "--is-ancestor", expected_head, parent).returncode != 0
+                       for parent in parents.split()):
+                    return False
+                continue
+            if [author, email] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
+                continue
+            if not base_ancestor:
+                return False
+            if original_patches is None:
+                merge_base = run("merge-base", expected_head, base)
+                if merge_base.returncode != 0:
+                    return False
+                original = run("rev-list", "--no-merges", f"{merge_base.stdout.strip()}..{expected_head}", "--")
+                if original.returncode != 0 or original.timed_out or original.output_limited:
+                    return False
+                original_patches = set()
+                for original_commit in original.stdout.splitlines():
+                    original_patch = patch_id(original_commit)
+                    if original_patch is not None:
+                        original_patches.add(original_patch)
+            replayed_patch = patch_id(commit)
+            if replayed_patch is None or replayed_patch not in original_patches:
+                return False
+        return True
     except (OSError, subprocess.SubprocessError):
         return False
 

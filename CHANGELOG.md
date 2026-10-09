@@ -6,12 +6,6 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-- **Own-PR provenance (#1912):** Attested PR checkout, Git operations, server-posted
-  comments, review requests and constrained status metadata now retain trusted
-  exact-scope labels across protected-base merges/rebases. Operators may set
-  `MIMIR_GITHUB_TRUSTED_BOT_LOGINS=dependabot[bot]` to attest that exact bot
-  identity; the default trusts no bots. CI logs remain untrusted.
-
 - Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
   (#1900). The release adds concept/name drift review instructions, an audited
   operator `sync-base` recovery for eligible parked runs, and remediation-slice
