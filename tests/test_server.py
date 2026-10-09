@@ -35,6 +35,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -1811,7 +1812,7 @@ async def test_notification_finishing_during_cleanup_preserves_clean_marker(
     monkeypatch.setattr(mimir.liveness, "write_session_marker", write_session_marker)
 
     await _run_startup(app)
-    await asyncio.wait_for(notify_started.wait(), timeout=1.0)
+    await asyncio.wait_for(notify_started.wait(), timeout=HANG_GUARD_SECONDS)
     await _run_cleanup(app)
 
     marker = mimir.liveness.read_session_marker(tmp_path)

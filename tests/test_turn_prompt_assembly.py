@@ -23,6 +23,7 @@ import inspect
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter
 from dataclasses import replace
@@ -219,13 +220,35 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
     delay = 0.1
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def enter():
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+
+    def exit():
+        nonlocal active
+        with lock:
+            active -= 1
 
     def slow_sync(*_args, **_kwargs):
-        time.sleep(delay)
+        enter()
+        try:
+            time.sleep(delay)
+        finally:
+            exit()
         return None
 
     async def slow_async(**_kwargs):
-        await asyncio.sleep(delay)
+        enter()
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            exit()
         return None
 
     monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
@@ -238,11 +261,8 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     monkeypatch.setattr(agent, "_assemble_self_state_block", slow_sync)
     monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", slow_sync)
 
-    started = time.monotonic()
     await agent._build_turn_prompt(ctx, event, saga_block=None)
-    elapsed = time.monotonic() - started
-
-    assert elapsed < delay * 3, f"independent loaders took {elapsed:.3f}s"
+    assert peak >= 2, "independent loaders never overlapped"
 
 
 @pytest.mark.asyncio

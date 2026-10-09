@@ -9,6 +9,7 @@ import weakref
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 import mimir.acp.journal as journal_module
 from mimir.acp.journal import JournalCache, SessionJournal, _line, _with_sequence
@@ -537,7 +538,7 @@ async def test_cancelled_reader_holds_lock_until_worker_finishes(
     replay = asyncio.create_task(journal.send_replay())
     live = None
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         replay.cancel()
         await asyncio.sleep(0)
         replay.cancel()

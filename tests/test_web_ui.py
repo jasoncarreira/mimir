@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from yarl import URL
@@ -1826,7 +1827,7 @@ def _sse_data_items(text: str) -> list[dict]:
     return items
 
 
-async def _read_sse_data(resp, *, timeout: float = 2.0) -> dict:
+async def _read_sse_data(resp, *, timeout: float = HANG_GUARD_SECONDS) -> dict:
     while True:
         line = await asyncio.wait_for(resp.content.readline(), timeout=timeout)
         assert line, "SSE stream closed before data"
@@ -2444,7 +2445,7 @@ async def test_sse_releases_slot_under_repeated_cancellation(
     monkeypatch.setattr(web.StreamResponse, "prepare", blocked_prepare)
     task = asyncio.create_task(handler(request))
     try:
-        await asyncio.wait_for(preparing.wait(), timeout=2)
+        await asyncio.wait_for(preparing.wait(), timeout=HANG_GUARD_SECONDS)
         async with lock:
             task.cancel()
             # The original cleanup suspends on the held lock here, so another

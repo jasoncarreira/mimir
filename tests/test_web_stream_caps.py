@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
@@ -55,28 +56,28 @@ async def test_stream_caps_isolate_identities_and_release(tmp_path, monkeypatch,
         alice = request("alice", "alice-key-1", "web-alice")
         first = asyncio.create_task(handler(alice))
         tasks.append(first)
-        assert await asyncio.wait_for(prepared.get(), 2) is alice
+        assert await asyncio.wait_for(prepared.get(), HANG_GUARD_SECONDS) is alice
         for _ in range(7):
             tab = request("alice", "alice-key-1", "web-alice")
             tasks.append(asyncio.create_task(handler(tab)))
-            assert await asyncio.wait_for(prepared.get(), 2) is tab
+            assert await asyncio.wait_for(prepared.get(), HANG_GUARD_SECONDS) is tab
         bob = request("bob", "bob-key", "web-bob")
         tasks.append(asyncio.create_task(handler(bob)))
-        assert await asyncio.wait_for(prepared.get(), 2) is bob
+        assert await asyncio.wait_for(prepared.get(), HANG_GUARD_SECONDS) is bob
 
         # Admin channel selection must not provide extra quota buckets.
         again = request("alice", "alice-key-2", "web-other" if admin else "web-alice")
-        denied = await asyncio.wait_for(handler(again), 2)
+        denied = await asyncio.wait_for(handler(again), HANG_GUARD_SECONDS)
         assert denied.status == 429
         if release == "cancel":
             first.cancel()
         else:
             alice["disconnect"].set()
-        await asyncio.wait_for(first, 2)
+        await asyncio.wait_for(first, HANG_GUARD_SECONDS)
 
         tasks.append(asyncio.create_task(handler(again)))
-        assert await asyncio.wait_for(prepared.get(), 2) is again
-        denied = await asyncio.wait_for(handler(again), 2)
+        assert await asyncio.wait_for(prepared.get(), HANG_GUARD_SECONDS) is again
+        denied = await asyncio.wait_for(handler(again), HANG_GUARD_SECONDS)
         assert denied.status == 429
     finally:
         for task in tasks:

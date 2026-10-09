@@ -1103,7 +1103,9 @@ async def test_dispatcher_stop_timeout_cancels_active_runners(
     await started.wait()
     monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
 
-    await asyncio.wait_for(dispatcher.stop(), 0.1)
+    started_at = asyncio.get_running_loop().time()
+    await asyncio.wait_for(dispatcher.stop(), 10)
+    assert asyncio.get_running_loop().time() - started_at < 5
 
     assert cancelled.is_set()
     assert not dispatcher._runner_tasks
