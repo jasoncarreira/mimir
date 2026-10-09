@@ -35,6 +35,31 @@ class _Notifier:
             self.events.append(("reply_dm", kwargs))
 
 
+@pytest.mark.asyncio
+async def test_runtime_pairing_callback_rechecks_policy_before_writing(tmp_path, monkeypatch):
+    import mimir.identities_populator as pop
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    called = []
+    monkeypatch.setattr(pop, "request_pairing_with_code", lambda *a, **k: called.append((a, k)))
+    resolver = SimpleNamespace(reload=lambda: 0,
+        unknown_sender_mode=lambda platform, delivery: "ignore")
+    core = runtime.CoreServices(identity_resolver=resolver, aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db", chat_skill_registry=object())
+    adapters = _adapters(events)
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), core, adapters)
+    try:
+        event = SimpleNamespace(author="slack-U1", author_id="U1", author_display="Unknown",
+            source="slack", channel_id="dm-slack-D1", extra={})
+        decision = SimpleNamespace(canonical_author="slack-U1", denial_reason="unknown_author")
+        await adapters.dispatcher._on_pairing_required(event, decision)
+        assert called == []
+        assert not (tmp_path / "state" / "identities.yaml").exists()
+    finally:
+        await bundle.aclose()
+
+
 class _Dispatcher:
     def __init__(self, events: list[tuple[str, Any]]) -> None:
         self.events = events
@@ -44,6 +69,7 @@ class _Dispatcher:
         self._notice_sender = None
         self._on_event = None
         self._on_pairing_required = None
+        self._on_unknown_sender = None
 
     def set_run_turn(self, value: Any) -> None:
         self._run_turn = value
@@ -68,6 +94,10 @@ class _Dispatcher:
     def set_on_pairing_required(self, value: Any) -> None:
         self._on_pairing_required = value
         self.events.append(("pairing", value))
+
+    def set_on_unknown_sender(self, value: Any) -> None:
+        self._on_unknown_sender = value
+        self.events.append(("unknown_sender", value))
 
     def is_channel_busy(self, channel_id: str) -> bool:
         return channel_id == "busy"
@@ -119,6 +149,7 @@ def _core(tmp_path: Path) -> runtime.CoreServices:
     resolver = SimpleNamespace(
         reload=lambda: 0,
         dm_channel=lambda author, platform: None,
+        unknown_sender_mode=lambda platform, delivery: "pair",
     )
     return runtime.CoreServices(
         identity_resolver=resolver,
@@ -1014,6 +1045,9 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         def dm_channel(self, author: str, platform: str) -> None:
             return None
 
+        def unknown_sender_mode(self, platform: str, delivery: str) -> str:
+            return "pair"
+
     class Bridge:
         async def resolve_dm_channel(self, author_id: str) -> str:
             events.append(("resolve_dm", author_id))
@@ -1077,7 +1111,7 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         kind
         for kind, value in events
         if value is not None
-        and kind in {"channel_idle", "inject", "notice_sender", "event", "pairing", "session_idle", "session_busy"}
+        and kind in {"channel_idle", "inject", "notice_sender", "event", "pairing", "unknown_sender", "session_idle", "session_busy"}
     ]
     assert bindings == [
         "channel_idle",
@@ -1085,6 +1119,7 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         "notice_sender",
         "event",
         "pairing",
+        "unknown_sender",
         "session_idle",
         "session_busy",
     ]

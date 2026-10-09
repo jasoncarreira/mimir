@@ -52,6 +52,7 @@ NoticeSender = Callable[[str, str], Awaitable["SendResult"]]
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
 PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
+UnknownSenderObserver = Callable[[AgentEvent, AccessDecision, str], Awaitable[None]]
 ChannelIdleCallback = Callable[[str], None]
 ChannelDrainedCallback = Callable[[str], None]
 # Inbound user-message admission is fail-closed for bridge/external sources.
@@ -120,6 +121,7 @@ class Dispatcher:
         # (the asyncio strong-ref gotcha, chainlink #118).
         self._on_event: EventObserver | None = None
         self._on_pairing_required: PairingObserver | None = None
+        self._on_unknown_sender: UnknownSenderObserver | None = None
         self._on_channel_idle: ChannelIdleCallback | None = None
         self._on_channel_drained: ChannelDrainedCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
@@ -205,6 +207,9 @@ class Dispatcher:
         ``enqueue``. It is best-effort and cannot queue a normal agent turn.
         """
         self._on_pairing_required = on_pairing_required
+
+    def set_on_unknown_sender(self, observer: UnknownSenderObserver | None) -> None:
+        self._on_unknown_sender = observer
 
     def set_on_channel_idle(
         self, on_channel_idle: ChannelIdleCallback | None
@@ -437,7 +442,26 @@ class Dispatcher:
                             _denial_hints_seen.popitem(last=False)
             except Exception:  # noqa: BLE001 — logging cannot bypass the intake gate
                 pass
-        is_dm = self._is_dm_channel(event.channel_id)
+        is_dm = (self._is_dm_channel(event.channel_id)
+                 and event.extra.get("channel_conversation_type") != "multi_user"
+                 and not event.channel_id.startswith("dm-slack-G"))
+        delivery = "dm" if is_dm else "channel"
+        mode = (self._identity_resolver.unknown_sender_mode(source, delivery)
+                if self._identity_resolver is not None else
+                "ignore" if source == "email" else "pair")
+        if mode != "pair":
+            await log_event(
+                "inbound_unknown_sender_ignored" if mode == "ignore" else "inbound_unknown_sender_declined",
+                source=source or "unknown", channel_id=event.channel_id,
+                author_id=event.author_id, canonical_author=decision.canonical_author,
+                delivery=delivery,
+            )
+            if self._on_unknown_sender is not None:
+                try:
+                    await self._on_unknown_sender(event, decision, mode)
+                except Exception:  # noqa: BLE001 — denial stays closed
+                    log.debug("unknown-sender observer failed", exc_info=True)
+            return False
         if is_dm:
             await log_event(
                 "inbound_pairing_required",
@@ -450,22 +474,6 @@ class Dispatcher:
                 status=decision.status.value,
                 delivery="dm",
             )
-        elif self._unauthorized_behavior() == "prompt-to-pair":
-            await log_event(
-                "inbound_pairing_prompted",
-                source=source or "unknown",
-                channel_id=event.channel_id,
-                author=decision.author,
-                author_id=event.author_id,
-                canonical_author=decision.canonical_author,
-                reason=decision.denial_reason,
-                status=decision.status.value,
-                delivery="public_shared_channel",
-            )
-        # Pairing capture is intentionally independent of
-        # unauthorized_user_behavior. That config only controls whether mimir
-        # sends a public-channel prompt; the operator still needs visibility
-        # into unknown public/DM contacts so they can approve legitimate users.
         if self._on_pairing_required is not None:
             try:
                 await self._on_pairing_required(event, decision)
@@ -476,12 +484,6 @@ class Dispatcher:
     @staticmethod
     def _is_dm_channel(channel_id: str) -> bool:
         return channel_id.startswith("dm-")
-
-    def _unauthorized_behavior(self) -> str:
-        behavior = (
-            getattr(self._config, "unauthorized_user_behavior", "ignore") or "ignore"
-        ).strip().lower()
-        return behavior if behavior in {"ignore", "prompt-to-pair"} else "ignore"
 
     def drain_startup_user_messages(self, channel_id: str | None) -> list[AgentEvent]:
         """Remove startup-queued same-channel user messages for the turn that

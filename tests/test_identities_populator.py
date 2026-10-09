@@ -905,3 +905,25 @@ async def test_populate_all_dry_run_does_not_write(tmp_path: Path):
     )
     assert counts["people_added"] == 1
     assert not _state_yaml(tmp_path).is_file()
+@pytest.mark.parametrize("writer", ["request", "approve", "web_key", "merge"])
+def test_intake_survives_every_identities_writer(tmp_path, writer):
+    import yaml
+    from mimir import identities_populator as pop
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    path = state / "identities.yaml"
+    intake = {"unknown_senders": {"default": {"dm": "pair", "channel": "ignore"},
+                                  "discord": {"dm": "decline"}}, "decline_text": "No thanks"}
+    path.write_text(yaml.safe_dump({"people": [{"canonical": "slack-U1", "aliases": ["slack-U1"],
+                                             "pairing": {"status": "pending"}}],
+                                   "channels": [], "intake": intake}))
+    if writer == "request":
+        pop.request_pairing_status(tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True)
+    elif writer == "approve":
+        assert pop.approve_pairing(tmp_path, "slack-U1")
+    elif writer == "web_key":
+        pop.issue_web_key(tmp_path, "slack-U1", key_factory=lambda: "test-secret")
+    else:
+        pop.merge_into_yaml(tmp_path, people=[{"canonical": "slack-U3", "aliases": ["slack-U3"]}], channels=[])
+    assert yaml.safe_load(path.read_text())["intake"] == intake

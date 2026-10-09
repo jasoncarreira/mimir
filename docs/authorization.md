@@ -496,9 +496,35 @@ may add aliases and metadata but preserves operator-managed access fields.
 
 ### Denied-user handling
 
+#### Unknown senders
+
+The operator can edit `state/identities.yaml` alongside `people:` and `channels:`:
+
+```yaml
+intake:
+  unknown_senders:
+    default: {dm: pair, channel: pair}
+    discord: {dm: pair, channel: ignore}
+    slack: {dm: decline, channel: decline}
+  decline_text: "Sorry, I only talk to approved users."
+```
+
+Missing settings default to `pair` for both deliveries. `pair` records a pending
+request, notifies the operator, and sends a pairing code only in a 1:1 DM; it
+never replies in a public channel. `ignore` records no pairing and sends no
+reply, but adds one digest notice per sender per process. `decline` records no
+pairing and sends the fixed refusal at most once per sender per process, paced
+by the global DM auto-reply worker. In public channels Discord sends a private
+DM and Slack sends an ephemeral message visible only to that user. Delivery
+failures never cause a public response. Email always ignores denials. The file
+hot-reloads; malformed settings fall back to the defaults without changing
+roles. These three options correspond to Hermes' `unauthorized_dm_behavior`
+`pair`, `ignore`, and `decline`; they only handle denials, never grant access.
+
+Only the operator can change this file; model file tools cannot write it.
+
 | Setting | Default | Authorization effect |
 |---|---|---|
-| `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | `ignore` | Controls the additional `inbound_pairing_prompted` event for an enforced public/shared-channel denial. Every enforced denial may still be recorded as a pending pairing and notify the operator; denied turns are never enqueued. No public reply is sent by this setting. |
 | `MIMIR_PAIRING_PENDING_MAX` | `100` | Caps newly recorded pending identities. `0` rejects new pending identities; a negative value disables the cap. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | `1.0` | Coalesces operator pairing notifications; clamped to zero or greater. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
