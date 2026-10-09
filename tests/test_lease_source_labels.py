@@ -784,6 +784,122 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
         assert labels.sources[0].integrity == "trusted"
 
 
+def _replay_test_repo(tmp_path: Path):
+    """A real attested patch with a whitespace-sensitive statement addition."""
+    from dataclasses import replace
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    _, original, lease, target, _ = _real_attested_lease(tmp_path)
+    path = lease.path
+    subprocess.run(["git", "-C", str(path), "branch", "-m", "main"], check=True)
+
+    def git(*args):
+        return subprocess.run([
+            "git", "-C", str(path), "-c", f"user.name={DEFAULT_USER_NAME}",
+            "-c", f"user.email={DEFAULT_USER_EMAIL}", *args,
+        ], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(content, author="Jason Carreira"):
+        target.write_text(content, encoding="utf-8")
+        git("add", "work.py")
+        git("commit", "-qm", "statement", "--author", f"{author} <{author.replace(' ', '')}@example.test>")
+        return git("rev-parse", "HEAD")
+
+    common_text = "if enabled:\n    preserve_everything()\n"
+    patch_text = common_text + "    delete_everything()\n"
+    common = commit(common_text)
+    attested = commit(patch_text)
+    git("checkout", "-qb", "base", common)
+    (path / "base.txt").write_text("protected base\n", encoding="utf-8")
+    git("add", "base.txt")
+    git("commit", "-qm", "protected base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    scope = replace(original, observed_head_sha=attested,
+                    observed_base_sha=base, destination_ref="refs/heads/main")
+    lease.base_sha = base
+    return path, target, common, attested, scope, lease, git, commit, common_text, patch_text
+
+
+def test_replay_indentation_semantic_change_is_untrusted(tmp_path, _self_login):
+    path, target, common, attested, scope, lease, git, _, _, patch_text = _replay_test_repo(tmp_path)
+    git("rebase", "-q", "--onto", "base", common, "main")
+    replay = git("rev-parse", "HEAD")
+    assert _self_login(path, "main", attested, replay, scope=scope, lease=lease)
+    # Same tokens, but the destructive call is now unconditional. Stable
+    # patch-id accepts this; verbatim must reject it.
+    altered_text = patch_text.replace("    delete_everything()", "delete_everything()")
+    target.write_text(altered_text, encoding="utf-8")
+    git("add", "work.py")
+    git("commit", "-q", "--amend", "--no-edit")
+    assert not _self_login(path, "main", attested, git("rev-parse", "HEAD"),
+                           scope=scope, lease=lease)
+
+
+@pytest.mark.parametrize("original_copies, trusted", [(1, False), (2, True)])
+def test_replayed_patch_consumes_one_original_match(tmp_path, _self_login, original_copies, trusted):
+    from dataclasses import replace
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    path, _, _, attested, scope, lease, git, commit, common_text, patch_text = _replay_test_repo(tmp_path)
+    if original_copies == 2:
+        # Two genuine occurrences in the attested range must remain usable.
+        commit(common_text, DEFAULT_USER_NAME)
+        attested = commit(patch_text)
+        scope = replace(scope, observed_head_sha=attested)
+    git("reset", "-q", "--hard", "base")
+    git("cherry-pick", attested)
+    first_replay = git("rev-parse", "HEAD")
+    assert _self_login(path, "main", attested, first_replay, scope=scope, lease=lease)
+    git("revert", "--no-commit", first_replay)
+    # This intermediary is server-authored, not another attested replay.
+    git("commit", "-qm", "server revert", "--author", f"{DEFAULT_USER_NAME} <{DEFAULT_USER_EMAIL}>")
+    git("cherry-pick", attested)
+    assert _self_login(path, "main", attested, git("rev-parse", "HEAD"),
+                       scope=scope, lease=lease) is trusted
+
+
+@pytest.mark.parametrize("count, trusted", [(500, True), (501, False)])
+def test_original_patch_range_budget_fails_before_patch_subprocesses(monkeypatch, _self_login, count, trusted):
+    from mimir import repo_tools
+    from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+
+    head, base, replay, original = (c * 40 for c in "abcd")
+    calls = []
+
+    def run(_path, arguments, **_kwargs):
+        calls.append(arguments)
+        if arguments[0] == "log":
+            output = "\x00".join([replay, base, "Jason Carreira", "human@example.test",
+                                   DEFAULT_USER_NAME, DEFAULT_USER_EMAIL, ""])
+        elif arguments[0] == "merge-base":
+            output = original + "\n"
+        elif arguments[0] == "rev-list":
+            assert "--max-count=501" in arguments
+            output = (head + "\n") * count
+        elif arguments[0] == "show":
+            output = "immutable diff"
+        else:
+            pytest.fail(f"unexpected Git command: {arguments}")
+        return SimpleNamespace(returncode=0, stdout=output, timed_out=False, output_limited=False)
+
+    patch_calls = []
+
+    def patch_run(argv, **kwargs):
+        assert argv[-2:] == ["patch-id", "--verbatim"]
+        patch_calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=f"{'f' * 40} {'0' * 40}\n")
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", run)
+    monkeypatch.setattr(access_control_module.subprocess, "run", patch_run)
+    scope = SimpleNamespace(observed_base_sha=base, destination_ref="refs/heads/main")
+    lease = SimpleNamespace(base_sha=base)
+    assert _self_login(Path("/unused"), "main", head, replay, observed_state=("main", replay),
+                       scope=scope, lease=lease) is trusted
+    assert len(patch_calls) == (501 if trusted else 0)
+    assert sum(args[0] == "show" for args in calls) == (501 if trusted else 0)
+
+
 @pytest.mark.parametrize("author", ["collaborator", "mimir-bot"])
 def test_lease_without_recorded_verdict_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, author: str,

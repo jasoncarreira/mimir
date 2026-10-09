@@ -10333,6 +10333,8 @@ def _lease_head_is_author_attested(
     ifc_state: Any = None,
 ) -> bool:
     """Verify HEAD against the attested head and the observed protected base."""
+    from collections import Counter
+
     from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
     from .repo_tools import (
         _BASE_CONFIG, _DEFAULT_GIT, _PROTECTED_BRANCH_REFS,
@@ -10345,11 +10347,13 @@ def _lease_head_is_author_attested(
     def patch_id(commit: str) -> str | None:
         # Read only immutable objects with hardened Git; patch-id receives the
         # bounded diff on stdin, never a shell pipeline or checkout config.
+        # --stable discards whitespace (including semantic Python indentation).
+        # Require --verbatim; unsupported Git versions fail closed.
         diff = run("show", "--format=", "--root", "--no-ext-diff", "--no-textconv", commit, "--")
         if diff.returncode != 0 or diff.timed_out or diff.output_limited:
             return None
         result = subprocess.run(
-            [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--stable"],
+            [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
             input=diff.stdout, capture_output=True, text=True, timeout=5,
             env=_sanitized_git_env(),
         )
@@ -10388,7 +10392,7 @@ def _lease_head_is_author_attested(
         fields.pop()
         if len(fields) % 6:
             return False
-        original_patches: set[str] | None = None
+        original_patches: Counter[str] | None = None
         for index in range(0, len(fields), 6):
             commit, parents, author, email, committer, committer_email = fields[index:index + 6]
             if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
@@ -10410,17 +10414,24 @@ def _lease_head_is_author_attested(
                 merge_base = run("merge-base", expected_head, base)
                 if merge_base.returncode != 0:
                     return False
-                original = run("rev-list", "--no-merges", f"{merge_base.stdout.strip()}..{expected_head}", "--")
+                # Read one beyond the budget so oversized ranges fail closed
+                # before any per-commit show/patch-id subprocess is launched.
+                original = run("rev-list", "--no-merges", "--max-count=501",
+                               f"{merge_base.stdout.strip()}..{expected_head}", "--")
                 if original.returncode != 0 or original.timed_out or original.output_limited:
                     return False
-                original_patches = set()
-                for original_commit in original.stdout.splitlines():
+                original_commits = original.stdout.splitlines()
+                if len(original_commits) > 500:
+                    return False
+                original_patches = Counter()
+                for original_commit in original_commits:
                     original_patch = patch_id(original_commit)
                     if original_patch is not None:
-                        original_patches.add(original_patch)
+                        original_patches[original_patch] += 1
             replayed_patch = patch_id(commit)
-            if replayed_patch is None or replayed_patch not in original_patches:
+            if replayed_patch is None or original_patches[replayed_patch] <= 0:
                 return False
+            original_patches[replayed_patch] -= 1
         return True
     except (OSError, subprocess.SubprocessError):
         return False
