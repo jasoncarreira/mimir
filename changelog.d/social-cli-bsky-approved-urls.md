@@ -1,0 +1,1 @@
+- **social-cli skill:** the `social-cli-notifications` and `social-cli-feed` pollers grant `approved_urls: ["https://public.api.bsky.app/"]` (Bluesky's public read-only API), so their routine `fetch_url` reads are an approved destination for the egress veto (#1903). Installed homes pick this up with `mimir skills update social-cli --apply`.

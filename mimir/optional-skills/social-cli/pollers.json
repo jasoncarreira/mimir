@@ -8,6 +8,7 @@
       "authority": {
         "profile": "research",
         "tier": "scoped-with-provenance",
+        "approved_urls": ["https://public.api.bsky.app/"],
         "saga_full_corpus_read": true,
         "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"],
@@ -34,6 +35,7 @@
       "authority": {
         "profile": "research",
         "tier": "scoped-with-provenance",
+        "approved_urls": ["https://public.api.bsky.app/"],
         "saga_full_corpus_read": true,
         "capabilities": ["read_file", "grep", "glob", "write_file", "edit_file", "open_proposal", "submit_proposal", "abandon_proposal"],
         "scoped_roots": ["state"],
