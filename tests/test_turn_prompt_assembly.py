@@ -210,6 +210,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
 async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Rendezvous needs six default-executor threads: run with at least two CPUs."""
     agent = _make_agent(tmp_path)
     agent._config.feedback_limit_per_polarity = 1
     event = AgentEvent(

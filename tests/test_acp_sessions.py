@@ -1055,7 +1055,10 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                 elif ending == "replace":
                     agent.on_connect(Client())
                     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
-                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), HANG_GUARD_SECONDS)
+                    # Exercise the patched 0.01s retirement grace, not just
+                    # eventual cleanup: both a 20s sleep and the unpatched 2s
+                    # default must exceed this response guard.
+                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 1.0)
                 else:
                     if ending == "shutdown":
                         await transport.incoming.put(None)
@@ -1716,7 +1719,9 @@ async def test_detach_waits_for_prompt_before_reloading(
             assert agent._sessions[session_id] is state
             assert not active.completed.is_set()
             release.set()
-        await asyncio.wait_for(loading, HANG_GUARD_SECONDS)
+        # Even after the model is released, a regressed 20s cancel-grace
+        # sleep must not pass. The configured grace here is zero (2s default).
+        await asyncio.wait_for(loading, 1.0)
         second = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="second")])
         assert maximum == 1, "two turns ran concurrently on the same session"
         assert active.completed.is_set()
@@ -3624,7 +3629,9 @@ async def test_cancel_timeout_dirties_execution_and_requires_fresh_load(
 
     transition = None
     try:
-        await agent._cancel_active(active, transport=False)
+        # The 0.01s grace must fire before the unpatched 2s default (or a
+        # 20s regression); subsequent released-model cleanup is not timed.
+        await asyncio.wait_for(agent._cancel_active(active, transport=False), 1.0)
         await resisted.wait()
         assert state.dirty is True
         assert not active.completed.is_set()
