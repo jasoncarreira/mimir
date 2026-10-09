@@ -17,6 +17,7 @@ import { createWebSession, deleteWebSession, restoreWebSession } from "./api";
 import { useBootstrap } from "./api/bootstrap";
 import { ChatRoute } from "./ChatRoute";
 import { useChatStore } from "./chatStore";
+import { clearChunkReloadMarkerAfterStart, isChunkLoadError, reloadOnceForStaleChunk } from "./chunkReload";
 import { ChainlinkBoardRoute } from "./routes/ChainlinkBoardRoute";
 import type { WebBootstrapData } from "./api/generated/contracts";
 import { getDashboardSurfaces, visibleSurfaces, type DashboardSurface } from "./dashboardExtensions";
@@ -55,17 +56,21 @@ interface AppErrorBoundaryProps {
 
 interface AppErrorBoundaryState {
   error: Error | null;
+  reloadRequested: boolean;
 }
 
 export class AppErrorBoundary extends React.Component<AppErrorBoundaryProps, AppErrorBoundaryState> {
-  state: AppErrorBoundaryState = { error: null };
+  state: AppErrorBoundaryState = { error: null, reloadRequested: false };
 
-  static getDerivedStateFromError(error: Error): AppErrorBoundaryState {
+  static getDerivedStateFromError(error: Error): Partial<AppErrorBoundaryState> {
     return { error };
   }
 
   componentDidCatch(error: Error) {
     console.error("Dashboard render failed", error);
+    if (isChunkLoadError(error) && reloadOnceForStaleChunk()) {
+      this.setState({ reloadRequested: true });
+    }
   }
 
   render() {
@@ -74,11 +79,26 @@ export class AppErrorBoundary extends React.Component<AppErrorBoundaryProps, App
         <div className="ui-state ui-state--error" role="alert">
           <h1>{this.props.title}</h1>
           <p>{this.state.error.message || "An unexpected render error occurred."}</p>
+          {isChunkLoadError(this.state.error) && !this.state.reloadRequested ? (
+            <>
+              <p>The dashboard was updated — reload to get the new version.</p>
+              <Button onClick={() => window.location.reload()}>Reload</Button>
+            </>
+          ) : null}
         </div>
       );
     }
     return this.props.children;
   }
+}
+
+window.addEventListener("vite:preloadError", (event) => {
+  if (reloadOnceForStaleChunk()) event.preventDefault();
+});
+
+function ChunkReloadStarted() {
+  React.useEffect(clearChunkReloadMarkerAfterStart, []);
+  return null;
 }
 
 const LazyWikiRoute = React.lazy(async () => {
@@ -903,6 +923,7 @@ if (root) {
             <BrowserRouter basename={appBasename()}>
               <RoutedLiveEventsProvider>
                 <AppFrame />
+                <ChunkReloadStarted />
               </RoutedLiveEventsProvider>
             </BrowserRouter>
           </SkinProvider>
