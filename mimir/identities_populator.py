@@ -274,6 +274,79 @@ def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
         raise
 
 
+def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
+    """Keep CLI parse errors actionable while using the shared YAML loader."""
+    try:
+        doc, header = _load_yaml(yaml_path)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"identities.yaml parse failed: {exc}") from exc
+    if not isinstance(doc.get("people"), list):
+        doc["people"] = []
+    return doc, header
+
+
+@_serialized_identities_write
+def add_identity_alias(
+    home: Path, canonical: str, alias: str,
+    display_name: str | None = None, notes: str | None = None,
+) -> None:
+    """Add an operator alias in one locked read-modify-write transaction."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc["people"]
+    for entry in people:
+        for existing_alias in entry.get("aliases") or []:
+            if existing_alias == alias and entry.get("canonical") != canonical:
+                raise ValueError(
+                    f"alias {alias!r} already maps to canonical "
+                    f"{entry.get('canonical')!r}; remove it first or use a "
+                    f"different alias"
+                )
+
+    target = next((e for e in people if e.get("canonical") == canonical), None)
+    if target is None:
+        target = {"canonical": canonical, "aliases": []}
+        people.append(target)
+    if display_name:
+        target["display_name"] = display_name
+    if notes:
+        target["notes"] = notes
+    aliases = target.setdefault("aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+    _atomic_write_identities(yaml_path, header, doc)
+
+
+@_serialized_identities_write
+def remove_identity(home: Path, alias: str | None, canonical: str | None) -> str | None:
+    """Remove a canonical or alias, returning the CLI's result message."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc.get("people") or []
+    if canonical:
+        before = len(people)
+        people[:] = [p for p in people if p.get("canonical") != canonical]
+        if len(people) == before:
+            return f"(no identity with canonical {canonical!r})"
+        doc["people"] = people
+        _atomic_write_identities(yaml_path, header, doc)
+        return f"removed identity: {canonical}"
+    if alias:
+        for entry in people:
+            aliases = entry.get("aliases") or []
+            if alias in aliases:
+                aliases.remove(alias)
+                if not aliases:
+                    canonical = entry.get("canonical")
+                    people[:] = [p for p in people if p is not entry]
+                    _atomic_write_identities(yaml_path, header, doc)
+                    return f"removed alias: {alias} (and {canonical}: no aliases remained)"
+                _atomic_write_identities(yaml_path, header, doc)
+                return f"removed alias: {alias} (from {entry.get('canonical')})"
+        return f"(alias {alias!r} not found)"
+    return None
+
+
 def _default_web_key() -> str:
     """A URL-safe random web API key (~256 bits). Shown once, never stored raw."""
     return secrets.token_urlsafe(32)
