@@ -38,7 +38,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # Console hints are process-wide, even if the server replaces a Dispatcher.
-_denial_hints_seen: set[tuple[str, str | None]] = set()
+# Bound memory under raids; recently denied authors retain suppression.
+_DENIAL_HINTS_LIMIT = 1024
+_denial_hints_seen: collections.OrderedDict[tuple[str, str | None], None] = collections.OrderedDict()
 _denial_hints_lock = threading.Lock()
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
@@ -414,7 +416,9 @@ class Dispatcher:
             try:
                 key = (source, event.author_id)
                 with _denial_hints_lock:
-                    if key not in _denial_hints_seen:
+                    if key in _denial_hints_seen:
+                        _denial_hints_seen.move_to_end(key)
+                    else:
                         canonical = decision.canonical_author
                         command = (
                             "mimir identities approve-pairing "
@@ -422,13 +426,15 @@ class Dispatcher:
                             if canonical else "unavailable (missing author identity)"
                         )
                         log.warning(
-                            "Inbound message denied: source=%s raw_author_handle=%s "
-                            "author_id=%s canonical_identity=%s reason=%s; "
-                            "approve with: %s (for your own account, add --admin)",
+                            "Inbound message denied: source=%s raw_author_handle=%r "
+                            "author_id=%r canonical_identity=%r reason=%s; "
+                            "approve with: %r (for your own account, add --admin)",
                             source or "unknown", event.author, event.author_id,
                             canonical, decision.denial_reason, command,
                         )
-                        _denial_hints_seen.add(key)
+                        _denial_hints_seen[key] = None
+                        while len(_denial_hints_seen) > _DENIAL_HINTS_LIMIT:
+                            _denial_hints_seen.popitem(last=False)
             except Exception:  # noqa: BLE001 — logging cannot bypass the intake gate
                 pass
         is_dm = self._is_dm_channel(event.channel_id)

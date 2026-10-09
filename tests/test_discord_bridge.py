@@ -1495,10 +1495,8 @@ async def test_on_message_skips_oversized_attachments(
 
 
 @pytest.mark.asyncio
-async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
-    """Inbound messages should trigger the typing indicator. The bridge
-    fires it as a background task so enqueue isn't blocked — verify the
-    ``channel.typing()`` context manager got entered."""
+async def test_on_message_fires_typing_after_enqueue(bridge_with_fake_client):
+    """Accepted inbound messages start typing only after admission."""
     import asyncio
 
     import discord
@@ -1506,6 +1504,14 @@ async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
     bridge, enqueued, _ = bridge_with_fake_client
     channel_obj = bridge._client._channels[1]  # type: ignore[attr-defined]
     channel_obj.typing = lambda: _FakeTyping(channel_obj)
+    original_enqueue = bridge.enqueue
+
+    async def enqueue(event: AgentEvent) -> bool:
+        assert "discord-1" not in bridge._typing_tasks
+        assert getattr(channel_obj, "typing_aenter_calls", 0) == 0
+        return await original_enqueue(event)
+
+    bridge.enqueue = enqueue
 
     channel = SimpleNamespace(
         id=1,
@@ -1534,16 +1540,20 @@ async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [False, RuntimeError("enqueue failed")])
-async def test_on_message_stops_typing_when_enqueue_not_admitted(
-    bridge_with_fake_client, failure,
+@pytest.mark.parametrize("existing_hold", [False, True])
+async def test_on_message_preserves_typing_when_enqueue_not_admitted(
+    bridge_with_fake_client, failure, existing_hold,
 ):
     bridge, _, sent = bridge_with_fake_client
     channel = bridge._client._channels[1]
     channel.typing = lambda: _FakeTyping(channel)
-    release = asyncio.Event()
+    hold = None
+    if existing_hold:
+        await bridge.send_typing_indicator("discord-1")
+        assert await _wait_for(lambda: getattr(channel, "typing_aenter_calls", 0) == 1)
+        hold = bridge._typing_tasks["discord-1"]
 
     async def enqueue(event: AgentEvent) -> bool:
-        await release.wait()
         if isinstance(failure, Exception):
             raise failure
         return False
@@ -1553,23 +1563,26 @@ async def test_on_message_stops_typing_when_enqueue_not_admitted(
         id=1907001, author=SimpleNamespace(id=1907, bot=False, display_name="New user"),
         channel=_fake_channel(id=1), content="hello", attachments=[],
     )
-    incoming = asyncio.create_task(bridge._on_message(message))
     try:
-        assert await _wait_for(lambda: getattr(channel, "typing_aenter_calls", 0) == 1)
-        assert "discord-1" in bridge._typing_tasks
+        if isinstance(failure, Exception):
+            with pytest.raises(RuntimeError, match="enqueue failed"):
+                await bridge._on_message(message)
+        else:
+            await bridge._on_message(message)
+        # Let any incorrectly scheduled late trigger run before asserting.
+        await asyncio.sleep(0.03)
+        if existing_hold:
+            assert bridge._typing_tasks["discord-1"] is hold
+            assert not hold.done()
+        else:
+            assert "discord-1" not in bridge._typing_tasks
+        assert getattr(channel, "typing_aenter_calls", 0) == int(existing_hold)
+        assert getattr(channel, "typing_aexit_calls", 0) == 0
+        assert "1907001" not in bridge._inbound_claims
+        assert "1907001" not in bridge._seen_ids
+        assert sent == []
     finally:
-        release.set()
-    if isinstance(failure, Exception):
-        with pytest.raises(RuntimeError, match="enqueue failed"):
-            await incoming
-    else:
-        await incoming
-    assert "discord-1" not in bridge._typing_tasks
-    assert await _wait_for(lambda: getattr(channel, "typing_aexit_calls", 0) == 1)
-    # A late trigger or lingering hold would issue another typing POST.
-    await asyncio.sleep(0.03)
-    assert channel.typing_aenter_calls == 1
-    assert sent == []
+        await bridge.cancel_typing("discord-1")
 
 
 # ─── fetch_history ──────────────────────────────────────────────────

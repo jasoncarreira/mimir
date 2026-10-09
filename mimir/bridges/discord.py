@@ -1004,19 +1004,15 @@ class DiscordBridge(Bridge):
                     event.attachment_names.append(str(target))
             if attachment_urls:
                 event.extra["inbound_attachment_urls"] = attachment_urls
-        # Start the hold before enqueue so the dots can appear while the
-        # agent spins up. This coroutine only schedules the actual typing
-        # task; awaiting it here prevents a late trigger from racing with
-        # cancellation if admission fails.
-        await self.send_typing_indicator(channel_id)
         try:
             accepted = await self.enqueue(event)
         except BaseException:
-            await self.cancel_typing(channel_id)
             self._release_inbound_claim(source_id)
             raise
-        if not accepted:
-            await self.cancel_typing(channel_id)
+        # Admission must precede touching the channel's typing hold: a
+        # refused message must not replace or cancel an authorized turn's hold.
+        if accepted:
+            await self.send_typing_indicator(channel_id)
         if source_id:
             self._inbound_claims.discard(source_id)
             if not accepted:

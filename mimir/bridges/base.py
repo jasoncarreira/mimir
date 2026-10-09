@@ -167,9 +167,9 @@ class Bridge(ABC):
         Bridges that hold the indicator for longer than the platform's
         single-trigger TTL (Discord auto-refreshes ~9s) MUST cancel
         the hold from ``send()`` and ``cancel_typing()`` so the dots
-        stop when work is done. If typing starts before inbound admission,
-        the bridge MUST also cancel the hold when enqueue refuses the event
-        or raises — see DiscordBridge."""
+        stop when work is done. Start inbound typing only after enqueue
+        accepts the event; refusal or failure must not touch a hold belonging
+        to an already-running authorized turn — see DiscordBridge."""
         return None
 
     async def cancel_typing(self, channel_id: str) -> None:

@@ -6,9 +6,9 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
-- **Intake (#1907):** Cancel Discord typing when inbound admission refuses or
-  fails, and print a once-per-author console hint with the pairing approval
-  command for denied user messages.
+- **Intake (#1907):** Start Discord typing only after admission, preserving
+  an authorized turn's hold when another message is refused or fails. Print
+  escaped console pairing hints with a bounded, process-wide 1024-author LRU.
 
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
