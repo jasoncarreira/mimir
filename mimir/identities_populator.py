@@ -169,15 +169,13 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       write. If that ever becomes load-bearing, the right escalation
       is ``ruamel.yaml`` round-trip mode (carries inline comments) —
       a new dependency, deferred until a real use case shows up.
-    - Treats missing / unparseable / non-mapping files as empty so a
-      fresh deployment starts clean.
+    - Only a missing file is treated as empty. Read errors propagate so
+      every transaction aborts rather than replacing unreadable state.
+      Invalid YAML also aborts the transaction.
     """
-    if not path.is_file():
-        return {}, ""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("identities.yaml read failed: %s — treating as empty", exc)
+    except FileNotFoundError:
         return {}, ""
     try:
         doc = yaml.safe_load(text) or {}

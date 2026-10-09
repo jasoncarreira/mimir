@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import select
 import subprocess
 import sys
@@ -21,13 +22,94 @@ def _people(home: Path) -> list[dict]:
     return yaml.safe_load((home / "state" / "identities.yaml").read_text())["people"]
 
 
+@pytest.mark.parametrize("operation", ["add", "remove:canonical", "remove:alias", "populator"])
+def test_unreadable_identities_abort_without_replacing_state(tmp_path, monkeypatch, operation):
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    original = (
+        "# Preserve roles, aliases and intake on every read failure.\n"
+        "people:\n- canonical: alice\n  aliases: [slack-U1]\n"
+        "  access: {roles: [admin]}\n- canonical: bob\n  aliases: [slack-U2]\n"
+        "intake: {policy: pairing}\n"
+    ).encode()
+    path.write_bytes(original)
+    read_text = Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError("identities read denied")
+        return read_text(self, *args, **kwargs)
+
+    # Inject the OS read failure so this also proves the root-runner case.
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    with pytest.raises(PermissionError, match="identities read denied"):
+        if operation == "add":
+            identity_cmd._identities_add_cmd(tmp_path, "eve", "slack-U3", None, None)
+        elif operation == "remove:canonical":
+            identity_cmd._identities_remove_cmd(tmp_path, None, "alice")
+        elif operation == "remove:alias":
+            identity_cmd._identities_remove_cmd(tmp_path, "slack-U1", None)
+        else:
+            pop.capture_dm_channel(tmp_path, "slack-U1", "slack", "dm-slack-D1")
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(".identities-*.tmp"))
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses mode-000 read permissions")
+@pytest.mark.parametrize("operation", ["add", "remove:canonical", "remove:alias", "populator"])
+def test_mode_000_identities_preserved(tmp_path, operation):
+    pop.add_identity_alias(tmp_path, "alice", "slack-U1")
+    pop.add_identity_alias(tmp_path, "bob", "slack-U2")
+    path = tmp_path / "state" / "identities.yaml"
+    original = path.read_bytes()
+    path.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            if operation == "add":
+                pop.add_identity_alias(tmp_path, "eve", "slack-U3")
+            elif operation == "remove:canonical":
+                pop.remove_identity(tmp_path, None, "alice")
+            elif operation == "remove:alias":
+                pop.remove_identity(tmp_path, "slack-U1", None)
+            else:
+                pop.capture_dm_channel(tmp_path, "slack-U1", "slack", "dm-slack-D1")
+    finally:
+        path.chmod(0o600)
+    assert path.read_bytes() == original
+
+
+def test_identity_loader_does_not_treat_a_directory_as_missing(tmp_path):
+    path = tmp_path / "identities.yaml"
+    path.mkdir()
+    with pytest.raises(IsADirectoryError):
+        pop._load_yaml(path)
+
+
 _CLI_SCRIPT = """
 import sys
 from pathlib import Path
+import fcntl
 from mimir.cli import main
+from mimir.commands import identities as identity_cmd
 from mimir import identities_populator as pop
 
 home, actor, operation = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+if sys.argv[4] == 'unlocked':
+    pop.add_identity_alias = pop.add_identity_alias.__wrapped__
+    identity_cmd.add_identity_alias = pop.add_identity_alias
+
+original_flock = fcntl.flock
+reported = False
+def flock(fd, flags):
+    global reported
+    try:
+        return original_flock(fd, flags)
+    except BlockingIOError:
+        if not reported:
+            print('blocked', flush=True)
+            reported = True
+        raise
+fcntl.flock = flock
 original = pop._load_yaml
 def load(path):
     result = original(path)
@@ -50,15 +132,25 @@ else:
 
 @pytest.mark.parametrize("operation", ["add", "remove:canonical", "remove:alias_last", "remove:alias_keep", "two-adds"])
 def test_cli_transactions_serialize_across_processes(tmp_path: Path, operation: str) -> None:
-    # Both children load the same identities file. B must not read until A's
-    # transaction commits, including the last-alias and surviving-alias branches.
-    pop.add_identity_alias(tmp_path, "alice", "slack-U1")
+    _assert_transactions_serialize(tmp_path, operation)
+
+
+def test_two_adds_regression_kills_removed_lock_mutation(tmp_path):
+    with pytest.raises(AssertionError, match="B loaded before A committed"):
+        _assert_transactions_serialize(tmp_path, "two-adds", unlocked=True)
+
+
+def _assert_transactions_serialize(tmp_path: Path, operation: str, *, unlocked=False) -> None:
+    # Observe a real failed nonblocking flock, not CLI startup or a short sleep.
+    # A's alias must be new so lost updates cannot pass as an idempotent no-op.
+    pop.add_identity_alias(tmp_path, "alice", "slack-U0" if operation in {"add", "two-adds"} else "slack-U1")
     if operation == "remove:alias_keep":
         pop.add_identity_alias(tmp_path, "alice", "discord-1")
 
     def spawn(actor: str) -> subprocess.Popen:
         return subprocess.Popen(
-            [sys.executable, "-c", _CLI_SCRIPT, str(tmp_path), actor, operation],
+            [sys.executable, "-c", _CLI_SCRIPT, str(tmp_path), actor, operation,
+             "unlocked" if unlocked else "locked"],
             stdin=subprocess.PIPE if actor == "A" else None,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
         )
@@ -73,7 +165,8 @@ def test_cli_transactions_serialize_across_processes(tmp_path: Path, operation: 
         second = spawn("B")
         assert select.select([second.stdout], [], [], 15)[0]
         assert second.stdout.readline().strip() == b"started"
-        assert not select.select([second.stdout], [], [], 0.2)[0], "B loaded before A committed"
+        assert select.select([second.stdout], [], [], 15)[0], "B never reached the transaction"
+        assert second.stdout.readline().strip() == b"blocked", "B loaded before A committed"
         _, error = first.communicate(b"continue\n", timeout=15)
         assert first.returncode == 0, error
         output, error = second.communicate(timeout=15)
@@ -81,7 +174,7 @@ def test_cli_transactions_serialize_across_processes(tmp_path: Path, operation: 
         assert b"loaded" in output
         people = _people(tmp_path)
         if operation == "two-adds":
-            assert {a for p in people for a in p["aliases"]} == {"slack-U1", "slack-U3"}
+            assert {a for p in people for a in p["aliases"]} == {"slack-U0", "slack-U1", "slack-U3"}
         else:
             assert any(p.get("dm_channels", {}).get("slack") == "dm-slack-D2" for p in people)
             if operation == "add":
@@ -142,9 +235,45 @@ _ALLOWED = {
     },
     "commands/setup.py": {"_seed_identities"},
 }
+# Inventory readers too: a new module must be reviewed even when the path
+# flows through constants, f-strings, attributes or arbitrary helper calls.
+_IDENTITY_MODULES = {
+    "agent.py", "commands/identities.py", "commands/setup.py", "config.py",
+    "history.py", "identities.py", "identities_populator.py", "index_skip.py",
+    "read_policy.py", "readonly_backend.py", "saga/synthesize.py",
+    "scaffold_docker.py", "scheduler.py", "server.py",
+}
 _SINKS = {"write_text", "write_bytes", "open", "rename", "replace", "unlink",
           "safe_dump", "_atomic_write_identities", "_write_if_missing",
-          "write_framework_file", "publish_framework_files", "link"}
+          "write_framework_file", "publish_framework_files", "link",
+          "move", "copy", "copy2", "copyfile"}
+
+
+def _identity_module_inventory(root: Path) -> set[str]:
+    return {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if "identities.yaml" in path.read_text(encoding="utf-8")
+    }
+
+
+def test_identity_module_inventory_requires_explicit_review():
+    root = Path(__file__).resolve().parents[1] / "mimir"
+    assert _identity_module_inventory(root) == _IDENTITY_MODULES
+
+
+@pytest.mark.parametrize("source", [
+    '_IDS = "identities.yaml"\ndef writer():\n    open(_IDS, "w")',
+    '_IDS = Path("state") / "identities.yaml"\ndef writer():\n    _IDS.write_text("lost")',
+    'def writer(home):\n    open(f"{home}/state/identities.yaml", "w")',
+    'def writer(home):\n    shutil.move("tmp", home / "identities.yaml")',
+    'def writer(home):\n    helper(home / "identities.yaml")',
+    'class Writer:\n    path = Path("identities.yaml")\n    def write(self):\n        self.path.write_text("lost")',
+])
+def test_module_inventory_catches_indirect_identity_paths(tmp_path, source):
+    (tmp_path / "new_writer.py").write_text(source, encoding="utf-8")
+    assert _identity_module_inventory(tmp_path) == {"new_writer.py"}
+    assert not _identity_module_inventory(tmp_path) <= _IDENTITY_MODULES
 
 
 def _identity_writes(source: str) -> list[tuple[str, int]]:
@@ -202,6 +331,14 @@ def unrelated(home):
     (Path(home) / "state" / "identities.yaml").write_text("lost")
 '''
     assert _identity_writes(source) == [("unrelated", 4)]
+
+
+@pytest.mark.parametrize("sink", ["move", "copy", "copy2", "copyfile"])
+def test_identity_writer_scan_reports_shutil_sinks(sink):
+    source = f'''\ndef unrelated(home):
+    shutil.{sink}("tmp", home / "identities.yaml")
+'''
+    assert _identity_writes(source) == [("unrelated", 3)]
 
 
 def test_cli_uses_shared_unique_temp_writer_only():
