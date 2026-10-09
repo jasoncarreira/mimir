@@ -23,6 +23,7 @@ import inspect
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter
 from dataclasses import replace
@@ -209,6 +210,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
 async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Rendezvous needs six default-executor threads: run with at least two CPUs."""
     agent = _make_agent(tmp_path)
     agent._config.feedback_limit_per_polarity = 1
     event = AgentEvent(
@@ -218,14 +220,38 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     )
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
-    delay = 0.1
+    from tests.timing import HANG_GUARD_SECONDS
+
+    lock = threading.Lock()
+    all_entered = threading.Event()
+    entered = 0
+    completed = 0
+
+    def enter():
+        nonlocal entered
+        with lock:
+            entered += 1
+            if entered == 7:
+                all_entered.set()
+
+    def complete():
+        nonlocal completed
+        with lock:
+            completed += 1
 
     def slow_sync(*_args, **_kwargs):
-        time.sleep(delay)
+        enter()
+        # No loader can return before all seven have entered. Gathering just
+        # a subset then awaiting the rest serially cannot pass this rendezvous.
+        assert all_entered.wait(2 * HANG_GUARD_SECONDS)
+        complete()
         return None
 
     async def slow_async(**_kwargs):
-        await asyncio.sleep(delay)
+        enter()
+        while not all_entered.is_set():
+            await asyncio.sleep(0)
+        complete()
         return None
 
     monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
@@ -238,11 +264,14 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     monkeypatch.setattr(agent, "_assemble_self_state_block", slow_sync)
     monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", slow_sync)
 
-    started = time.monotonic()
-    await agent._build_turn_prompt(ctx, event, saga_block=None)
-    elapsed = time.monotonic() - started
-
-    assert elapsed < delay * 3, f"independent loaders took {elapsed:.3f}s"
+    try:
+        await asyncio.wait_for(
+            agent._build_turn_prompt(ctx, event, saga_block=None), HANG_GUARD_SECONDS,
+        )
+        assert entered == completed == 7
+    finally:
+        # Release executor threads even when a serialisation mutation fails.
+        all_entered.set()
 
 
 @pytest.mark.asyncio

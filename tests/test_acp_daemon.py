@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.acp import sdk
 from mimir.acp.daemon import (
@@ -292,6 +293,7 @@ async def test_clean_close_allows_immediate_reconnect(
     home = _short_home()
     daemon = AcpDaemon(_bundle(home))
     monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_RETIRE_TIMEOUT", 60.0)
 
     async def run_until_eof(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -314,8 +316,8 @@ async def test_clean_close_allows_immediate_reconnect(
     second_reader, second_writer = await asyncio.open_unix_connection(
         str(daemon.socket_path)
     )
-    # Silence could also mean admission is still waiting on the retiring peer.
-    assert await asyncio.wait_for(second_reader.readline(), 0.05) == b"admitted\n"
+    # The cleanly closed peer retires without waiting out the 60s fence.
+    assert await asyncio.wait_for(second_reader.readline(), 10) == b"admitted\n"
 
     second_writer.close()
     await second_writer.wait_closed()
@@ -367,12 +369,12 @@ async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
         b'"params":{"methodId":"mimir-web-key"}}\n'
     )
     await first_writer.drain()
-    assert json.loads(await asyncio.wait_for(first_reader.readline(), 0.5))["result"] == {}
+    assert json.loads(await asyncio.wait_for(first_reader.readline(), HANG_GUARD_SECONDS))["result"] == {}
     first_writer.write(
         b'{"jsonrpc":"2.0","id":2,"method":"_hold","params":{}}\n'
     )
     await first_writer.drain()
-    await asyncio.wait_for(handler_started.wait(), 0.5)
+    await asyncio.wait_for(handler_started.wait(), HANG_GUARD_SECONDS)
     first_peer_task = next(iter(daemon._peers)).task
 
     concurrent_reader, concurrent_writer = await connect()
@@ -380,7 +382,7 @@ async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
         b'{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}\n'
     )
     await concurrent_writer.drain()
-    refusal = json.loads(await asyncio.wait_for(concurrent_reader.readline(), 1.5))
+    refusal = json.loads(await asyncio.wait_for(concurrent_reader.readline(), HANG_GUARD_SECONDS))
     assert refusal["error"]["code"] == -32001
     assert refusal["id"] is None
     assert "result" not in refusal
@@ -389,11 +391,13 @@ async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
     first_socket.setsockopt(
         socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
     )
+    started_retirement = asyncio.get_running_loop().time()
     first_writer.transport.abort()
 
-    await asyncio.wait_for(transport_dead.wait(), 0.5)
-    _, pending = await asyncio.wait({first_peer_task}, timeout=2.0)
+    await asyncio.wait_for(transport_dead.wait(), HANG_GUARD_SECONDS)
+    _, pending = await asyncio.wait({first_peer_task}, timeout=HANG_GUARD_SECONDS)
     assert not pending, "reset peer did not retire promptly"
+    assert asyncio.get_running_loop().time() - started_retirement < 5  # vs. 30s drain
 
     replacement_reader, replacement_writer = await connect()
     replacement_writer.write(
@@ -402,7 +406,7 @@ async def test_tcp_reset_retires_inflight_peer_and_allows_prompt_reconnect(
     )
     await replacement_writer.drain()
     replacement = json.loads(
-        await asyncio.wait_for(replacement_reader.readline(), 2.0)
+        await asyncio.wait_for(replacement_reader.readline(), HANG_GUARD_SECONDS)
     )
     assert replacement == {"jsonrpc": "2.0", "id": 3, "result": {}}
     assert transport_dead.is_set()
@@ -453,9 +457,9 @@ async def test_eof_retires_write_only_inflight_peer_before_dispatcher_drain(
 
     daemon._agent = Agent()
     monkeypatch.setattr("mimir.acp.daemon._peer_uid", lambda sock: os.getuid())
-    # This is only a failure bound: the fixed path must beat it rather than wait
-    # for dispatcher drain, while the production 30 second window stays intact.
-    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.2)
+    # A dead transport must retire without waiting for dispatcher drain.
+    # Set a long drain window so a regression cannot masquerade as prompt cleanup.
+    monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 15.0)
     server = await asyncio.start_server(daemon._admit_peer, "127.0.0.1", 0)
     address = server.sockets[0].getsockname()
     reader, writer = await asyncio.open_connection(*address)
@@ -464,16 +468,18 @@ async def test_eof_retires_write_only_inflight_peer_before_dispatcher_drain(
         b'"params":{"methodId":"mimir-web-key"}}\n'
     )
     await writer.drain()
-    assert json.loads(await asyncio.wait_for(reader.readline(), 0.5))["result"] == {}
+    assert json.loads(await asyncio.wait_for(reader.readline(), HANG_GUARD_SECONDS))["result"] == {}
     writer.write(b'{"jsonrpc":"2.0","id":2,"method":"_hold","params":{}}\n')
     await writer.drain()
-    await asyncio.wait_for(update_sent.wait(), 0.5)
-    update = json.loads(await asyncio.wait_for(reader.readline(), 0.5))
+    await asyncio.wait_for(update_sent.wait(), HANG_GUARD_SECONDS)
+    update = json.loads(await asyncio.wait_for(reader.readline(), HANG_GUARD_SECONDS))
     assert update["method"] == "session/update"
 
     writer.close()
     await writer.wait_closed()
-    await asyncio.wait_for(transport_dead.wait(), 0.05)
+    started_retirement = asyncio.get_running_loop().time()
+    await asyncio.wait_for(transport_dead.wait(), HANG_GUARD_SECONDS)
+    assert asyncio.get_running_loop().time() - started_retirement < 5  # vs. 30s default
 
     server.close()
     await server.wait_closed()
@@ -765,11 +771,12 @@ async def test_transport_dead_peer_skips_watchdog_drain_timeout(
             await asyncio.Event().wait()
 
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_WATCHDOG_INTERVAL", 0.0)
-    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 1.0)
+    # A dead peer must cancel the blocked drain, not wait for its timeout.
+    monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_DRAIN_TIMEOUT", 60.0)
     watchdog = asyncio.create_task(daemon._watch_peer(BlockedWriter(), peer))
-    await asyncio.wait_for(drain_started.wait(), 0.1)
+    await asyncio.wait_for(drain_started.wait(), HANG_GUARD_SECONDS)
     peer.mark_transport_dead()
-    await asyncio.wait_for(watchdog, 0.1)
+    await asyncio.wait_for(watchdog, 10)
     shutil.rmtree(home)
 
 
@@ -953,7 +960,9 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     turn = asyncio.create_task(unrelated_turn())
     with pytest.raises(AcpDaemonError, match="authentication timed out"):
         await asyncio.wait_for(
-            daemon._run_peer(asyncio.StreamReader(), writer), 0.1
+            # Below the unpatched 1s abort and 2s cancel budgets; setup
+            # does no disk/network IO and all configured budgets are <=0.02s.
+            daemon._run_peer(asyncio.StreamReader(), writer), 0.5
         )
     await turn
     assert aborted.is_set()
@@ -1125,7 +1134,7 @@ async def test_resistant_close_does_not_pin_a_cancelled_runner(
 
     runner = await _spawn_stdio_runner(_Writer())
     try:
-        await asyncio.wait_for(entered.wait(), 1.0)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         runner.cancel()
         # asyncio.wait rather than wait_for: it neither re-cancels nor raises on
         # timeout, so an unbounded close shows up as a pending task and a clean
@@ -1168,7 +1177,7 @@ async def test_resistant_close_still_lets_the_daemon_retire_the_generation(
     writer = _Writer()
     runner = await _spawn_stdio_runner(writer)
     try:
-        await asyncio.wait_for(entered.wait(), 1.0)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         # No AcpDaemonError: a self-bounding runner satisfies the cancel
         # contract. An unbounded one makes _finish_runner abort and then raise.
         finish = asyncio.create_task(daemon._finish_runner(runner, writer))
@@ -1221,7 +1230,7 @@ async def test_second_peer_is_refused_while_an_old_close_is_still_pending(
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), 1.0)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         runner.cancel()
         _, pending = await asyncio.wait({runner}, timeout=0.5)
         assert not pending, "runner did not resolve within the bound"
@@ -1328,7 +1337,7 @@ async def test_an_abandoned_close_that_honours_cancellation_returns_capacity(
         await asyncio.Event().wait()
 
     task = asyncio.create_task(stops_on_cancel())
-    await asyncio.wait_for(started.wait(), 1.0)
+    await asyncio.wait_for(started.wait(), HANG_GUARD_SECONDS)
     daemon._record_abandoned_close(task)
     assert daemon._unretired_generations() == 1
 
@@ -1385,7 +1394,7 @@ async def test_close_that_raises_on_forced_cancel_still_fences_admission(
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), 1.0)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         runner.cancel()
         _, pending = await asyncio.wait({runner}, timeout=0.5)
         assert not pending, "runner did not resolve within the bound"
@@ -1455,7 +1464,7 @@ async def test_close_that_raises_in_the_first_grace_interval_fences_admission(
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), 1.0)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         runner.cancel()
         _, pending = await asyncio.wait({runner}, timeout=2.0)
         assert not pending, "runner did not resolve"
@@ -1506,7 +1515,7 @@ async def test_close_failure_surfaced_by_the_shield_fences_admission(
                 response_writer=_Writer(),
                 on_close_abandoned=daemon._record_abandoned_close,
             ),
-            2.0,
+            HANG_GUARD_SECONDS,
         )
 
     assert daemon._unretired_generations() >= 1

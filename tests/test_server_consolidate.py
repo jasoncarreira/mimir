@@ -22,6 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.server import _ConsolidateGuard, _handle_consolidate
+from tests.timing import HANG_GUARD_SECONDS
 
 
 class _StubSagaClient:
@@ -35,9 +36,11 @@ class _StubSagaClient:
         self.calls: list[dict[str, Any]] = []
         self._result = result if result is not None else {"ok": True}
         self._gate = gate
+        self.entered = asyncio.Event()
 
     async def consolidate(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(kwargs)
+        self.entered.set()
         if self._gate is not None:
             await self._gate.wait()
         return self._result
@@ -166,9 +169,7 @@ async def test_consolidate_concurrent_call_returns_429() -> None:
         first = asyncio.create_task(
             client.post("/api/memory/consolidate", json={})
         )
-        # Give the handler a chance to set _consolidate_inflight before
-        # the second request lands.
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(stub.entered.wait(), HANG_GUARD_SECONDS)
 
         second = await client.post("/api/memory/consolidate", json={})
         assert second.status == 429

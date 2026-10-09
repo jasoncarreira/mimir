@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.acp.agent import ConnectionState, MimirAcpAgent
 from mimir.acp.host import _FrameDelivery, close_protocol_writer
@@ -2655,7 +2656,7 @@ async def test_daemon_eof_retires_generation_before_client_grace(
         assert shell.returncode is not None
         assert worker.returncode is not None
         client_reader.feed_eof()
-        await asyncio.wait_for(running, 5)
+        await asyncio.wait_for(running, HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -2742,12 +2743,12 @@ async def test_daemon_eof_quiesces_inflight_allow_session_response(
     running = asyncio.create_task(
         run_router(client_reader, client_writer, daemon_reader, daemon_writer, "secret")
     )
-    await asyncio.wait_for(daemon_writer.entered.wait(), 5)
+    await asyncio.wait_for(daemon_writer.entered.wait(), HANG_GUARD_SECONDS)
     daemon_reader.feed_eof()
-    await asyncio.wait_for(daemon_writer.cancelled.wait(), 5)
+    await asyncio.wait_for(daemon_writer.cancelled.wait(), HANG_GUARD_SECONDS)
     assert not running.done()
     client_reader.feed_eof()
-    await asyncio.wait_for(running, 5)
+    await asyncio.wait_for(running, HANG_GUARD_SECONDS)
     _assert_generation_empty(router)
     daemon_writer.release.set()
     await asyncio.sleep(0)
@@ -2807,9 +2808,9 @@ async def test_close_cancels_inflight_allow_session_response_before_clearing_gra
         "id": "permission",
         "result": {"outcome": {"outcome": "selected", "optionId": "allow_session"}},
     }))
-    await asyncio.wait_for(daemon_writer.entered.wait(), 5)
+    await asyncio.wait_for(daemon_writer.entered.wait(), HANG_GUARD_SECONDS)
 
-    await asyncio.wait_for(router.close(), 5)
+    await asyncio.wait_for(router.close(), HANG_GUARD_SECONDS)
     assert daemon_writer.cancelled.is_set()
     assert routing.cancelled()
     assert router._close_complete is True
@@ -2878,14 +2879,14 @@ async def test_daemon_eof_quiesces_inflight_session_transition(
     running = asyncio.create_task(
         run_router(client_reader, client_writer, daemon_reader, daemon_writer, "secret")
     )
-    await asyncio.wait_for(transition_entered.wait(), 5)
+    await asyncio.wait_for(transition_entered.wait(), HANG_GUARD_SECONDS)
     daemon_reader.feed_eof()
     async with asyncio.timeout(5):
         while not router._close_complete:
             await asyncio.sleep(0)
     assert not running.done()
     client_reader.feed_eof()
-    await asyncio.wait_for(running, 5)
+    await asyncio.wait_for(running, HANG_GUARD_SECONDS)
     _assert_generation_empty(router)
     transition_release.set()
     await asyncio.sleep(0)

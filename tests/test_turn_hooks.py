@@ -23,6 +23,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.turn_hooks import CommitmentExtractionHook, TurnHook, fire_hooks
 
@@ -307,7 +308,7 @@ async def test_extraction_replay_offloaded_and_write_timeout_propagates(tmp_path
     record = SimpleNamespace(integrity="trusted", output="x" * 5000)
     task = asyncio.create_task(CommitmentExtractionHook(store).finalize(ctx, None, record))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
         assert not task.done()
     finally:
         release.set()

@@ -11,6 +11,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.event_logger import (
     FEEDBACK_EVENT_VERSION,
@@ -302,7 +303,7 @@ async def test_async_log_stamps_before_lock_and_worker_delay(
         assert not submitted.is_set()
         now = "2026-09-12T10:01:00+00:00"
         lock.release()
-        await asyncio.wait_for(submitted.wait(), timeout=2)
+        await asyncio.wait_for(submitted.wait(), timeout=HANG_GUARD_SECONDS)
         assert not path.exists()
         now = "2026-09-12T10:02:00+00:00"
     finally:

@@ -148,8 +148,6 @@ async def test_index_contention_keeps_timer_responsive(client, monkeypatch, path
         assert before_release is (not old_behavior)
         if old_behavior:
             assert elapsed > 0.15
-        else:
-            assert elapsed <= 0.15
         assert len(removed) == 2
     finally:
         start.set()

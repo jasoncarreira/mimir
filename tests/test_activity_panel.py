@@ -17,6 +17,7 @@ from mimir.bridges.base import Bridge, MessageUpdate, SendResult
 from mimir.models import AuthContext, InformationFlowLabels, SourceLabel, TurnInteractivity
 from mimir.channel_registry import ChannelRegistry
 from mimir.turn_event_bus import TurnEventBus
+from tests.timing import HANG_GUARD_SECONDS
 
 
 class FakeSlackBridge(Bridge):
@@ -689,7 +690,7 @@ async def test_panel_auto_deletes_after_real_reply():
     await panel.handle_event(
         {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
     )
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(panel._delete_tasks["t1"], HANG_GUARD_SECONDS)
 
     assert bridge.edits[-1].text == "✓ Reply posted"
     assert bridge.deletes == [("slack-C01", "panel-1")]
@@ -773,9 +774,9 @@ async def test_panel_stop_while_run_finishes_in_flight_event(monkeypatch):
                 "channel_id": "slack-C01", "trigger": "user_message",
             }
         )
-        await asyncio.wait_for(send_entered.wait(), timeout=1.0)
+        await asyncio.wait_for(send_entered.wait(), timeout=HANG_GUARD_SECONDS)
         assert not run_task.done()
-        await asyncio.wait_for(panel.stop(), timeout=1.0)
+        await asyncio.wait_for(panel.stop(), timeout=HANG_GUARD_SECONDS)
 
         assert send_finished.is_set()
         assert len(bridge.sends) == 2
@@ -818,7 +819,7 @@ async def test_panel_delete_failure_leaves_compact_done_state(caplog):
         await panel.handle_event(
             {"type": "turn", "phase": "end", "turn_id": "t1", "channel_id": "slack-C01"}
         )
-        await asyncio.sleep(0.01)
+        await asyncio.wait_for(panel._delete_tasks["t1"], HANG_GUARD_SECONDS)
 
     assert bridge.edits[-1].text == "✓ Reply posted"
     assert bridge.deletes == [("slack-C01", "panel-1")]
@@ -1160,5 +1161,5 @@ async def test_panel_evicts_model_after_turn_end():
     await panel.handle_event(
         {"type": "turn", "phase": "end", "turn_id": "t2", "channel_id": "slack-C01"}
     )
-    await asyncio.sleep(0.01)
+    await asyncio.wait_for(panel._delete_tasks["t2"], HANG_GUARD_SECONDS)
     assert "t2" not in panel._models

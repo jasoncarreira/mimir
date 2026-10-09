@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from langchain.agents.middleware import ToolCallRequest
 from langchain.tools import ToolRuntime
 from langgraph.runtime import Runtime
@@ -1396,7 +1397,7 @@ async def test_user_turn_saga_query_overlaps_prompt_loaders(
         trigger="user_message", channel_id="ch-overlap", content="remember this",
         extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
     )
-    await asyncio.wait_for(agent.run_turn(event), timeout=2)
+    await asyncio.wait_for(agent.run_turn(event), timeout=HANG_GUARD_SECONDS)
 
     prompt = fake_agent.invocations[0]["state"]["messages"][0].content
     assert prompt.index("## Possibly relevant memories") < prompt.index("## Today's date")
@@ -5400,7 +5401,7 @@ async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
 
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="first")
     task = asyncio.create_task(agent.run_turn(event))
-    await asyncio.wait_for(fake_saga.started.wait(), timeout=1.0)
+    await asyncio.wait_for(fake_saga.started.wait(), timeout=HANG_GUARD_SECONDS)
 
     assert _mti.inject_message(
         "ch-1",
@@ -5408,7 +5409,7 @@ async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
     ) == "injected"
 
     fake_saga.release.set()
-    record = await asyncio.wait_for(task, timeout=2.0)
+    record = await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS)
 
     assert record.injected_inputs
     assert "during setup" in record.injected_inputs[0]["text"]
@@ -5465,7 +5466,7 @@ async def test_run_turn_drains_startup_queued_followups(tmp_path: Path, author):
         assert q.qsize() == 1
         assert q.get_nowait().author == author
         q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 async def test_run_turn_does_not_drain_startup_followups_for_non_user_turn(

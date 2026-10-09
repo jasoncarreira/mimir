@@ -1103,7 +1103,9 @@ async def test_dispatcher_stop_timeout_cancels_active_runners(
     await started.wait()
     monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
 
-    await asyncio.wait_for(dispatcher.stop(), 0.1)
+    # Timeout enforcement is the contract, not a loose hang guard. This
+    # beats both the 30s default and a 1000x (10s) short-budget regression.
+    await asyncio.wait_for(dispatcher.stop(), 2.0)
 
     assert cancelled.is_set()
     assert not dispatcher._runner_tasks
