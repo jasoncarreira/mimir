@@ -606,7 +606,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
         channel_id="dm-alice",
         delivery="dm",
     )
-    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-alice")
+    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-alice", code="ABCDEF23")
     await asyncio.sleep(0)
     operator_task = notifier._operator_task
     dm_task = notifier._dm_reply_task

@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, fields
@@ -388,7 +389,7 @@ def test_runtime_public_two_phase_api() -> None:
         "(self, *, platform: 'str', channel_id: 'str', delivery: 'str') -> 'None'"
     )
     assert str(inspect.signature(runtime.PairingNotifier.maybe_reply_dm)) == (
-        "(self, *, canonical: 'str', dm_channel_id: 'str') -> 'None'"
+        "(self, *, canonical: 'str', dm_channel_id: 'str', code: 'str') -> 'None'"
     )
     assert get_origin(runtime.BackgroundTaskSpawner).__name__ == "Callable"
     spawner_args = get_args(runtime.BackgroundTaskSpawner)
@@ -1033,14 +1034,14 @@ async def test_dispatcher_and_session_callback_parity_and_order(
         events.append(("capture_dm", (args, kwargs)))
         return True
 
-    def request(*args: Any, **kwargs: Any) -> str:
+    def request(*args: Any, **kwargs: Any) -> tuple[str, str]:
         events.append(("request_pairing", (args, kwargs)))
-        return "changed"
+        return "changed", "ABCDEFGH"
 
     monkeypatch.setattr(runtime.asyncio, "to_thread", direct_to_thread)
     monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
     monkeypatch.setattr(mimir.identities_populator, "capture_dm_channel", capture)
-    monkeypatch.setattr(mimir.identities_populator, "request_pairing_status", request)
+    monkeypatch.setattr(mimir.identities_populator, "request_pairing_with_code", request)
     monkeypatch.setattr(
         mimir.access_control,
         "builtin_trigger_service_principal",
@@ -1120,6 +1121,7 @@ async def test_dispatcher_and_session_callback_parity_and_order(
     assert ("reply_dm", {
         "canonical": "alice-canonical",
         "dm_channel_id": "dm-alice",
+        "code": "ABCDEFGH",
     }) in events
     assert resolver.reload_count == 2
 
@@ -1148,6 +1150,100 @@ async def test_dispatcher_and_session_callback_parity_and_order(
     assert bundle.sessions.is_busy("idle") is False
 
     await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,author,channel", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_runtime_denied_dm_issues_private_code_only(
+    tmp_path, monkeypatch, caplog, platform, author, channel,
+):
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+    from mimir.config import Config
+    from mimir.event_logger import EventLogger
+    from mimir.server import _PairingNotifier
+    import mimir.event_logger
+    import mimir.server
+    import mimir.identities_populator
+    import yaml
+
+    events = []
+    _patch_factory(monkeypatch, events)
+
+    class Clock(datetime):
+        current = datetime(2026, 10, 9, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(mimir.identities_populator, "datetime", Clock)
+    sent = []
+
+    class Channels(_Channels):
+        async def send(self, channel_id, text, *, final=True):
+            sent.append((channel_id, text))
+
+    channels = Channels()
+    cfg = replace(Config.from_env(), home=tmp_path, operator_alert_channel="dm-slack-OPS",
+                  pairing_operator_digest_delay_seconds=0,
+                  pairing_dm_auto_reply_interval_seconds=0)
+    notifier = _PairingNotifier(cfg, channels)
+    event_path = tmp_path / "logs" / "events.jsonl"
+    logger = EventLogger(event_path, "pairing-test")
+    monkeypatch.setattr(mimir.event_logger, "log_event", logger.log)
+    monkeypatch.setattr(mimir.server, "log_event", logger.log)
+    adapters = replace(_adapters(events), channels=channels, pairing_notifier=notifier)
+    config = _config(tmp_path)
+    config.operator_alert_channel = "dm-slack-OPS"
+    config.pairing_pending_max = 1
+    bundle = await runtime.create_agent_runtime(config, _core(tmp_path), adapters)
+    inbound = SimpleNamespace(author=author, author_id="123", author_display="Lookalike",
+                              source=platform, channel_id=channel)
+    decision = SimpleNamespace(canonical_author=author, denial_reason="unknown_author")
+    try:
+        with caplog.at_level("DEBUG"):
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            dm = [text for destination, text in sent if destination == channel]
+            assert len(dm) == 1
+            code = re.search(r"`([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8})`", dm[0]).group(1)
+            person = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]
+            assert person["pairing"]["status"] == "pending"
+            assert all(field in person["pairing"] for field in ("code_hash", "code_salt", "code_expires_at"))
+            assert code not in (tmp_path / "state" / "identities.yaml").read_text()
+            assert code not in event_path.read_text()
+            assert code not in caplog.text
+            assert code not in "\n".join(text for destination, text in sent if destination == "dm-slack-OPS")
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            assert len([text for destination, text in sent if destination == channel]) == 1
+            first_hash = person["pairing"]["code_hash"]
+            Clock.current += timedelta(minutes=10)
+            await adapters.dispatcher._on_pairing_required(inbound, decision)
+            await notifier._dm_reply_queue.join()
+            dm = [text for destination, text in sent if destination == channel]
+            assert len(dm) == 2
+            second_code = re.search(r"`([ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8})`", dm[1]).group(1)
+            assert second_code != code
+            refreshed = (tmp_path / "state" / "identities.yaml").read_text()
+            assert yaml.safe_load(refreshed)["people"][0]["pairing"]["code_hash"] != first_hash
+            assert second_code not in refreshed + event_path.read_text() + caplog.text
+            assert second_code not in "\n".join(text for destination, text in sent if destination == "dm-slack-OPS")
+            public = SimpleNamespace(**{**vars(inbound), "channel_id": f"{platform}-C1"})
+            await adapters.dispatcher._on_pairing_required(public, decision)
+            await notifier._dm_reply_queue.join()
+            assert len([text for destination, text in sent if destination == channel]) == 2
+            capped = SimpleNamespace(**{**vars(inbound), "author": f"{platform}-other"})
+            await adapters.dispatcher._on_pairing_required(capped, decision)
+            assert len(yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"]) == 1
+            assert "pairing_pending_cap_reached" in event_path.read_text()
+    finally:
+        await notifier.aclose()
+        await bundle.aclose()
 
 
 @pytest.mark.asyncio

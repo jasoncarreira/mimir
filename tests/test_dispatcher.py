@@ -1676,17 +1676,20 @@ async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
     for i in range(5):
         assert f"mimir identities approve-pairing slack-U{i}" in operator_sends[0][1]
 
-    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
-    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0")
-    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="slack-C1")
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF23")
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF23")
+    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="slack-C1", code="ABCDEF23")
     await notifier._dm_reply_queue.join()
 
     dm_sends = [s for s in channels.sent if s[0] == "dm-slack-D0"]
     public_sends = [s for s in channels.sent if s[0] == "slack-C1"]
     assert dm_sends == [
-        ("dm-slack-D0", "Request forwarded to operator; no access until approved.")
+        ("dm-slack-D0", cfg.pairing_dm_auto_reply_text.replace("{code}", "ABCDEF23"))
     ]
     assert public_sends == []
+    await notifier.maybe_reply_dm(canonical="slack-U0", dm_channel_id="dm-slack-D0", code="ABCDEF24")
+    await notifier._dm_reply_queue.join()
+    assert len([s for s in channels.sent if s[0] == "dm-slack-D0"]) == 2
 
 
 @pytest.mark.asyncio
@@ -1715,6 +1718,35 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "Pairing pending cap reached" in channels.sent[0][1]
     assert "max=1" in channels.sent[0][1]
     assert "slack-C1" in channels.sent[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("template,expected", [
+    ("Wait for approval", "Wait for approval\nPairing code: `ABCDEF23`"),
+    ("Code {code} — keep it private", "Code ABCDEF23 — keep it private"),
+])
+async def test_pairing_dm_custom_template_always_includes_code(tmp_path, template, expected):
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_text=template,
+        pairing_dm_auto_reply_interval_seconds=0), channels)
+    try:
+        await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code="ABCDEF23")
+        await notifier._dm_reply_queue.join()
+        assert channels.sent == [("dm-slack-D1", expected)]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_dm_reply_can_be_disabled(tmp_path):
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_enabled=False), channels)
+    await notifier.maybe_reply_dm(canonical="slack-U1", dm_channel_id="dm-slack-D1", code="ABCDEF23")
+    await notifier._dm_reply_queue.join()
+    assert channels.sent == []
+    await notifier.aclose()
 
 
 def _arm_authenticated_injection(disp, tmp_path):

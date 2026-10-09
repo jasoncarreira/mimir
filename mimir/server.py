@@ -11,6 +11,7 @@ indexer, SAGA client, session manager, scheduler.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -144,8 +145,8 @@ class _PairingNotifier:
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
         self._operator_cap_notified = False
-        self._dm_reply_sent: set[str] = set()
-        self._dm_reply_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._dm_reply_sent: set[tuple[str, str]] = set()
+        self._dm_reply_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
 
     async def aclose(self) -> None:
@@ -280,17 +281,18 @@ class _PairingNotifier:
             await asyncio.sleep(delay)
         await self.flush_operator_alerts()
 
-    async def maybe_reply_dm(self, *, canonical: str, dm_channel_id: str) -> None:
+    async def maybe_reply_dm(self, *, canonical: str, dm_channel_id: str, code: str) -> None:
         if not self._config.pairing_dm_auto_reply_enabled:
             return
         canonical = canonical.strip()
         dm_channel_id = dm_channel_id.strip()
-        if not canonical or not dm_channel_id.startswith("dm-"):
+        if not canonical or not dm_channel_id.startswith("dm-") or not code:
             return
-        if canonical in self._dm_reply_sent:
+        key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
+        if key in self._dm_reply_sent:
             return
-        self._dm_reply_sent.add(canonical)
-        await self._dm_reply_queue.put((canonical, dm_channel_id))
+        self._dm_reply_sent.add(key)
+        await self._dm_reply_queue.put((canonical, dm_channel_id, code))
         if self._dm_reply_task is None or self._dm_reply_task.done():
             self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
 
@@ -300,11 +302,14 @@ class _PairingNotifier:
             float(self._config.pairing_dm_auto_reply_interval_seconds or 0.0),
         )
         while not self._dm_reply_queue.empty():
-            canonical, dm_channel_id = await self._dm_reply_queue.get()
+            canonical, dm_channel_id, code = await self._dm_reply_queue.get()
             try:
+                template = self._config.pairing_dm_auto_reply_text
+                text = (template.replace("{code}", code) if "{code}" in template
+                        else f"{template}\nPairing code: `{code}`")
                 await self._channels.send(
                     dm_channel_id,
-                    self._config.pairing_dm_auto_reply_text,
+                    text,
                     final=True,
                 )
                 await log_event(
@@ -312,13 +317,12 @@ class _PairingNotifier:
                     author=canonical,
                     channel_id=dm_channel_id,
                 )
-            except Exception as exc:  # noqa: BLE001 — best-effort notification
-                log.debug("pairing DM auto-reply failed", exc_info=True)
+            except Exception:  # noqa: BLE001 — bridge errors may echo the code
+                log.debug("pairing DM auto-reply failed")
                 await log_event(
                     "pairing_dm_auto_reply_failed",
                     author=canonical,
                     channel_id=dm_channel_id,
-                    error=str(exc)[:500],
                 )
             finally:
                 self._dm_reply_queue.task_done()

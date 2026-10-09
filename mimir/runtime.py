@@ -123,6 +123,7 @@ class PairingNotifier(Protocol):
         *,
         canonical: str,
         dm_channel_id: str,
+        code: str,
     ) -> None: ...
 
 
@@ -487,10 +488,10 @@ async def create_agent_runtime(
                 ):
                     return
                 from .event_logger import log_event
-                from .identities_populator import request_pairing_status
+                from .identities_populator import request_pairing_with_code
 
-                status = await asyncio.to_thread(
-                    request_pairing_status,
+                status, code = await asyncio.to_thread(
+                    request_pairing_with_code,
                     config.home,
                     author,
                     platform,
@@ -532,6 +533,7 @@ async def create_agent_runtime(
                     platform=platform,
                     delivery=delivery,
                     reason=getattr(decision, "denial_reason", None),
+                    code_issued=code is not None,
                 )
                 if is_dm:
                     await log_event(
@@ -543,6 +545,7 @@ async def create_agent_runtime(
                         platform=platform,
                         dm_channel=channel_id,
                         reason=getattr(decision, "denial_reason", None),
+                        code_issued=code is not None,
                     )
                 await adapters.pairing_notifier.notify_operator(
                     canonical=canonical,
@@ -551,13 +554,14 @@ async def create_agent_runtime(
                     channel_id=channel_id,
                     delivery=delivery,
                 )
-                if is_dm:
+                if is_dm and code is not None:
                     await adapters.pairing_notifier.maybe_reply_dm(
                         canonical=canonical,
                         dm_channel_id=channel_id,
+                        code=code,
                     )
             except Exception:
-                log.debug("dm-pairing request failed", exc_info=True)
+                log.debug("dm-pairing request failed")
 
         async def on_session_idle(session: Any) -> None:
             from .event_logger import log_event

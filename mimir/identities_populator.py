@@ -36,12 +36,14 @@ same way fetch_history does.
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import logging
 import os
 import secrets
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
@@ -53,6 +55,52 @@ from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
 log = logging.getLogger(__name__)
 
 PairingRequestStatus = Literal["changed", "unchanged", "capped"]
+_PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+class PairingCodeLockedError(ValueError):
+    """Code approval is locked; canonical-id approval remains available."""
+
+
+def _pairing_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    except ValueError:
+        return None
+
+
+def _clear_pairing_code(pairing: dict[str, Any]) -> None:
+    for key in ("code_hash", "code_salt", "code_expires_at"):
+        pairing.pop(key, None)
+
+
+def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
+    changed = False
+    access = match.get("access")
+    if not isinstance(access, dict):
+        access = {}
+    if access.get("roles") != roles:
+        access["roles"] = roles
+        match["access"] = access
+        changed = True
+    pairing = match.get("pairing")
+    if isinstance(pairing, dict):
+        if pairing.get("status") != "approved":
+            pairing["status"] = "approved"
+            pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+        if any(key in pairing for key in ("code_hash", "code_salt", "code_expires_at")):
+            _clear_pairing_code(pairing)
+            changed = True
+    return changed
+
+
+def _clean_roles(roles: Iterable[str]) -> list[str]:
+    return [role.strip() for role in roles
+            if isinstance(role, str) and role.strip() in {"user", "admin"}]
 
 
 class LastWebKeyError(ValueError):
@@ -556,12 +604,31 @@ def request_pairing_status(
     distinguish "unchanged duplicate" from "new contact dropped because the
     pending cap is full", so this status API keeps that signal observable.
     """
+    status, _ = request_pairing_with_code(
+        home, author, platform, channel_id=channel_id,
+        author_display=author_display, is_dm=is_dm, max_pending=max_pending,
+    )
+    return status
+
+
+@_serialized_identities_write
+def request_pairing_with_code(
+    home: Path,
+    author: str,
+    platform: str,
+    *,
+    channel_id: str,
+    author_display: str | None = None,
+    is_dm: bool = False,
+    max_pending: int | None = None,
+) -> tuple[PairingRequestStatus, str | None]:
+    """Persist a pending pairing; expose plaintext only on a DM mint edge."""
     author = (author or "").strip()
     platform = (platform or "").strip()
     channel_id = (channel_id or "").strip()
     display = (author_display or "").strip()
     if not (author and platform and channel_id):
-        return "unchanged"
+        return "unchanged", None
 
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
@@ -581,7 +648,7 @@ def request_pairing_status(
                 if isinstance(pairing, dict) and pairing.get("status") == "pending":
                     pending_count += 1
             if pending_count >= max_pending:
-                return "capped"
+                return "capped", None
         match = {"canonical": author, "aliases": [author]}
         if display:
             match["display_name"] = display
@@ -624,8 +691,8 @@ def request_pairing_status(
         if changed:
             doc["people"] = people
             _atomic_write_identities(yaml_path, header, doc)
-            return "changed"
-        return "unchanged"
+            return "changed", None
+        return "unchanged", None
 
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
@@ -656,11 +723,28 @@ def request_pairing_status(
                 changed = True
         match["pairing"] = pairing
 
+    code = None
+    if is_dm:
+        now = datetime.now(timezone.utc)
+        expires = _pairing_time(pairing.get("code_expires_at"))
+        active = (expires is not None and expires > now
+                  and isinstance(pairing.get("code_hash"), str)
+                  and isinstance(pairing.get("code_salt"), str))
+        # The expiration is exactly one hour after minting. A missing or
+        # malformed code is reissued rather than stranding the sender.
+        if not active or now >= expires - timedelta(minutes=50):
+            code = "".join(secrets.choice(_PAIRING_ALPHABET) for _ in range(8))
+            salt = secrets.token_bytes(16)
+            pairing["code_hash"] = hashlib.sha256(salt + code.encode("ascii")).hexdigest()
+            pairing["code_salt"] = salt.hex()
+            pairing["code_expires_at"] = (now + timedelta(hours=1)).isoformat()
+            changed = True
+
     if not changed:
-        return "unchanged"
+        return "unchanged", None
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
-    return "changed"
+    return "changed", code
 
 
 @_serialized_identities_write
@@ -677,11 +761,7 @@ def approve_pairing(
     aliases, DM channels, and other operator-authored fields are preserved.
     """
     key = (author_or_canonical or "").strip()
-    clean_roles = [
-        role.strip()
-        for role in roles
-        if isinstance(role, str) and role.strip() in {"user", "admin"}
-    ]
+    clean_roles = _clean_roles(roles)
     if not key or not clean_roles:
         return False
 
@@ -694,27 +774,90 @@ def approve_pairing(
     if match is None:
         return False
 
-    changed = False
-    access = match.get("access")
-    if not isinstance(access, dict):
-        access = {}
-    if access.get("roles") != clean_roles:
-        access["roles"] = clean_roles
-        match["access"] = access
-        changed = True
-
-    pairing = match.get("pairing")
-    if isinstance(pairing, dict) and pairing.get("status") != "approved":
-        pairing["status"] = "approved"
-        pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
-        match["pairing"] = pairing
-        changed = True
-
-    if not changed:
+    if not _approve_entry(match, clean_roles):
         return False
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
     return True
+
+
+def _write_pairing_lockout(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=".pairing-lockout-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+        os.replace(name, path)
+    except BaseException:
+        os.unlink(name)
+        raise
+
+
+@_serialized_identities_write
+def approve_pairing_code(
+    home: Path, code: str, *, roles: Iterable[str] = ("user",),
+) -> bool:
+    """Approve a pending unexpired code; wrong guesses share a durable lockout."""
+    lock_path = home / "state" / "pairing_lockout.json"
+    try:
+        state = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {}
+        if not isinstance(state, dict):
+            raise ValueError("invalid lockout state")
+        failures = state.get("failed_attempts", 0)
+        if type(failures) is not int or failures < 0:
+            raise ValueError("invalid lockout state")
+        locked = _pairing_time(state.get("locked_until"))
+        if state.get("locked_until") and locked is None:
+            raise ValueError("invalid lockout state")
+    except (OSError, ValueError) as exc:
+        raise PairingCodeLockedError("pairing code approval locked (lockout state unavailable)") from exc
+
+    now = datetime.now(timezone.utc)
+    if locked and now < locked:
+        raise PairingCodeLockedError("pairing code approval locked; try again later")
+    if locked:
+        failures = 0
+
+    normalized = "".join(code.split()).upper() if isinstance(code, str) else ""
+    clean_roles = _clean_roles(roles)
+    match = None
+    if len(normalized) == 8 and all(char in _PAIRING_ALPHABET for char in normalized) and clean_roles:
+        yaml_path = home / "state" / "identities.yaml"
+        doc, header = _load_yaml(yaml_path)
+        people = doc.get("people")
+        if isinstance(people, list):
+            for person in people:
+                if not isinstance(person, dict):
+                    continue
+                pairing = person.get("pairing")
+                if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+                    continue
+                expires = _pairing_time(pairing.get("code_expires_at"))
+                if expires is None or expires <= now:
+                    continue
+                try:
+                    salt = bytes.fromhex(pairing["code_salt"])
+                    stored = pairing["code_hash"]
+                    if len(salt) != 16 or not isinstance(stored, str) or len(stored) != 64:
+                        continue
+                    digest = hashlib.sha256(salt + normalized.encode("ascii")).hexdigest()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if secrets.compare_digest(digest, stored):
+                    match = person
+                    break
+    if match is not None:
+        _approve_entry(match, clean_roles)
+        _atomic_write_identities(yaml_path, header, doc)
+        _write_pairing_lockout(lock_path, {"failed_attempts": 0, "locked_until": None})
+        return True
+
+    failures += 1
+    _write_pairing_lockout(lock_path, {
+        "failed_attempts": failures,
+        "locked_until": (now + timedelta(hours=1)).isoformat() if failures >= 5 else None,
+    })
+    return False
 
 
 @_serialized_identities_write

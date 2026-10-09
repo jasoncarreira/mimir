@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from ..identities import WEB_KEY_ALIAS_PREFIX, IdentityResolver, web_key_labels
-from ..identities_populator import approve_pairing
+from ..identities_populator import approve_pairing, approve_pairing_code
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +174,14 @@ def _identities_resolve_cmd(home: Path, author: str) -> None:
 
 
 def _identities_approve_pairing_cmd(
-    home: Path, identity: str, roles: list[str]
+    home: Path, identity: str | None, roles: list[str], *, code: str | None = None,
 ) -> None:
+    if code is not None:
+        if not approve_pairing_code(home, code, roles=roles):
+            raise ValueError("invalid or expired pairing code")
+        print(f"approved pairing by code ({', '.join(roles)})")
+        return
+    assert identity is not None
     if not approve_pairing(home, identity, roles=roles):
         raise ValueError(
             f"no pending identity found for {identity!r}, or it is already approved"
@@ -285,8 +291,10 @@ def add_argparse(sub: "argparse._SubParsersAction") -> argparse.ArgumentParser:
     id_approve_p.add_argument("--home", type=Path, default=Path.cwd())
     id_approve_p.add_argument(
         "identity",
+        nargs="?",
         help="Canonical id or alias to approve (e.g. 'slack-U05ALICE').",
     )
+    id_approve_p.add_argument("--code", help="One-time code received by the DM sender.")
     id_approve_p.add_argument(
         "--admin",
         action="store_true",
@@ -354,8 +362,10 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         elif args.identities_action == "resolve":
             _identities_resolve_cmd(home, args.author)
         elif args.identities_action == "approve-pairing":
+            if (args.identity is None) == (args.code is None):
+                raise ValueError("supply either an identity or --code, but not both")
             roles = ["user", "admin"] if args.admin else ["user"]
-            _identities_approve_pairing_cmd(home, args.identity, roles)
+            _identities_approve_pairing_cmd(home, args.identity, roles, code=args.code)
         elif args.identities_action == "issue-key":
             roles = ["user", "admin"] if args.admin else None
             _identities_issue_key_cmd(

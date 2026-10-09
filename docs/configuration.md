@@ -332,9 +332,9 @@ authenticate transport only; they do not create a named requester.
 | `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |
 | `MIMIR_PAIRING_PENDING_MAX` | int | `100` | Max pending pairing requests retained. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | float | `1.0` | Coalesce window for operator pairing-notification digests. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `false` | Enable fixed-text DM auto-reply to unpaired users. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `true` | Send a one-time pairing code to unpaired DM users. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | float | `30.0` | Global rate limit between DM auto-replies. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | str | `Request forwarded to operator; no access until approved.` | The fixed DM auto-reply text. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | str | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is {code} (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM reply template; `{code}` is replaced, or a code line is appended if absent. |
 
 ## Spawn (subagent) controls
 
