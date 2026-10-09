@@ -198,9 +198,10 @@ state, labels, assignees, draft status) remain unsupported: use
 ## Updating a PR with its base
 
 Default to `repo_merge` to update a PR branch with its observed base in any
-PR-remediation scope. If there are conflicts, inspect with `repo_unmerged`,
-resolve and `repo_stage` the paths, commit, then `repo_push`. Use `repo_rebase`
-only on history-rewrite turns (`heartbeat_pr_maintenance`,
+PR-remediation scope. If it merges cleanly, the merge commit already exists;
+next call `repo_push`. On conflicts: `repo_unmerged`, resolve, `repo_stage`,
+then `repo_commit` listing every staged path (the merge stages auto-merged
+files too), then `repo_push`. Use `repo_rebase` only on history-rewrite turns (`heartbeat_pr_maintenance`,
 `pr_changes_requested_stale`, `pr_ci_failure`, `pr_mergeability_rebase`,
 `pr_mergeability_conflicting`) where the poller prompt asks for it; use
 `repo_merge` elsewhere.

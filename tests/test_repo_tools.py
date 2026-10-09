@@ -98,9 +98,16 @@ def test_repo_merge_description_is_default_base_update_path():
     description = repo_merge.description
     assert "default way to update a PR branch with its base" in description
     assert "every PR-remediation scope" in description
-    for tool_name in ("repo_unmerged", "repo_stage", "repo_push"):
-        assert tool_name in description
-    assert "commit" in description
+    description = " ".join(description.split())
+    assert (
+        "If it merges cleanly, the merge commit already exists; next call repo_push."
+        in description
+    )
+    assert (
+        "On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing "
+        "every staged path (the merge stages auto-merged files too), then repo_push."
+        in description
+    )
 
 
 @pytest.mark.parametrize("error", [PermissionError, ProcessLookupError, OSError],

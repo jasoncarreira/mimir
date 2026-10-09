@@ -536,9 +536,10 @@ def repo_merge(
 ) -> dict[str, Any]:
     """The default way to update a PR branch with its base in every PR-remediation scope.
 
-    Merge the immutable observed base into the bound checkout. For conflicts,
-    inspect with repo_unmerged, resolve and repo_stage the paths, commit, then
-    repo_push.
+    Merge the immutable observed base into the bound checkout. If it merges
+    cleanly, the merge commit already exists; next call repo_push.
+    On conflicts: repo_unmerged, resolve, repo_stage, then repo_commit listing
+    every staged path (the merge stages auto-merged files too), then repo_push.
     """
     return _execute(runtime, repository, pull_request, GitMerge())
 
