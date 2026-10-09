@@ -402,7 +402,7 @@ Review criteria:
   the builder skips this item): on a Keychain-logged-in Mac, the check returns True.
 
 Worklink notes:
-- Scope: mimir/providers.py, tests/test_providers.py, docs/credentials.md, CHANGELOG.md
+- Scope: mimir/providers.py, tests/test_providers.py, docs/credentials.md, changelog.d/<issue-id>.md
 - Out of scope: the usage poller's credentials-file requirement
 - Suggested test command: uv run pytest -q tests/test_providers.py
 ```
@@ -458,7 +458,11 @@ If the head moves while CI runs, start again from step 4. Stale approvals are di
 **7. Close the leaf.** Only after the PR shows `MERGED`, run `chainlink issue close <id>`. Then re-read any leaves that depended on it, and rebase sibling PRs that touch the same files.
 
 **8. Release** (on your go-ahead).
-1. Open one release PR that bumps the version and moves `[Unreleased]` in the CHANGELOG.
+1. Open one release PR that bumps the version and runs
+   `python scripts/changelog_collect.py X.Y.Z --date YYYY-MM-DD` to collect
+   `changelog.d/` into the versioned `CHANGELOG.md` section (including any
+   legacy `[Unreleased]` entries). Change PRs add a bullet in
+   `changelog.d/<issue-id>.md`, not in `[Unreleased]`.
 2. Once it's approved, green and merged, tag `vX.Y.Z` on the merge commit.
 3. Approve the `pypi` environment.
 4. Confirm the package is live with a fresh install.
