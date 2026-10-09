@@ -203,15 +203,15 @@ Use only read-only verbs: **never declare** `gog gmail send`, `acli jira workite
 create/transition`, or another mutating command. This is an explicit chat grant,
 not the union of jobs' `shell_commands`. Entries require a pinned, non-agent-writable
 executable, nonempty subcommand prefixes, and an option allowlist. `external_send`,
-`payload_args`, and interpreter/script entries are rejected. A malformed grant
+`payload_args`, interpreter/script entries, and `gh` (including paths or symlinks
+resolving to `gh`) are rejected. GitHub access from operator chat after untrusted
+ingest goes through a fresh untainted turn or the forge tools. A malformed grant
 rejects the document at load. The agent cannot write `scheduler.yaml` with file
 tools, even on an untainted admin turn. Scheduled turns continue to use their
 own job declarations. The executable runs as server-bound argv, in a server-
 selected `<MIMIR_HOME>` cwd (ignoring model cwd), with only its `pass_env` and the scrubbed `MIMIR_SHELL_PASS_ENV`
-baseline; it never receives the whole process environment. For declared `gh`,
-`GITHUB_TOKEN` must be named in the command's `pass_env`, not merely the shell
-baseline (`GH_*` overrides remain rejected by the declaration parser). Its config directory is isolated
-from `$HOME/.config/gh` and its identity is confirmed before execution.
+baseline; it never receives the whole process environment. `GH_*` overrides
+remain rejected by the declaration parser.
 
 Each subcommand prefix admits **every deeper verb**. Declare full read-only leaf
 paths such as `[jira, workitem, search]`, never `[jira, workitem]`. This grant

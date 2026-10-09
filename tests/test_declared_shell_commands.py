@@ -74,6 +74,82 @@ def test_operator_declaration_refuses_base_parser_valid_script(home: Path):
         access_control.parse_operator_shell_commands([entry], writable_roots=(home / "scratch",))
 
 
+@pytest.mark.parametrize("kind,entry_name", [
+    ("exec", "gh"), ("path", "alias"), ("symlink", "alias"),
+    ("named_symlink", "alias"),
+])
+def test_operator_declaration_refuses_gh_by_name_path_and_resolved_target(
+    tmp_path: Path, kind: str, entry_name: str,
+) -> None:
+    gh = tmp_path / "gh"
+    alias = tmp_path / "alias"
+    if kind == "named_symlink":
+        alias.write_text("#!/bin/sh\nexit 0\n")
+        alias.chmod(0o755)
+        gh.symlink_to(alias)
+    else:
+        gh.write_text("#!/bin/sh\nexit 0\n")
+        gh.chmod(0o755)
+        if kind == "symlink":
+            alias.symlink_to(gh)
+        else:
+            alias.write_text("#!/bin/sh\nexit 0\n")
+            alias.chmod(0o755)
+    entry = {
+        "exec": entry_name,
+        "path": str(alias if kind in {"exec", "symlink"} else gh),
+        "subcommands": [["issue", "list"]],
+    }
+    # These are otherwise valid job declarations; only operator chat refuses gh.
+    assert len(parse_declared_shell_commands([entry])) == 1
+    pattern = rf"operator_shell_commands\['{entry_name}'\]: gh cannot be declared"
+    with pytest.raises(ValueError, match=pattern) as caught:
+        access_control.parse_operator_shell_commands([entry])
+    assert "fresh untainted turn or the forge tools" in str(caught.value)
+
+
+def test_operator_declaration_non_gh_commands_still_match(tmp_path: Path) -> None:
+    entries = []
+    for name, subcommand in (("gog", ["gmail", "search"]),
+                             ("acli", ["jira", "workitem", "search"]),
+                             ("chainlink", ["issue", "show"])):
+        executable = tmp_path / name
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        entries.append({"exec": name, "path": str(executable),
+                        "subcommands": [subcommand]})
+    commands = access_control.parse_operator_shell_commands(entries)
+    assert commands == parse_declared_shell_commands(entries)
+    for entry in entries:
+        command = " ".join((entry["exec"], *entry["subcommands"][0], "query"))
+        argv = parse_service_shell_argv(command, "maintenance", declared=commands)
+        assert argv == [entry["path"], *entry["subcommands"][0], "query"]
+
+
+def test_scheduler_refuses_gh_operator_grants_on_load_and_save(tmp_path: Path) -> None:
+    import yaml
+    from mimir.scheduler import load_jobs, load_operator_shell_commands, write_jobs
+
+    gh = tmp_path / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n")
+    gh.chmod(0o755)
+    path = tmp_path / "scheduler.yaml"
+    document = {"jobs": [{"name": "read", "prompt": "read", "cron": "0 * * * *"}],
+                "operator_shell_commands": [{"exec": "gh", "path": str(gh),
+                                             "subcommands": [["issue", "list"]]}]}
+    text = yaml.safe_dump(document)
+    path.write_text(text)
+    jobs, rejections = load_jobs(path)
+    assert jobs == []
+    assert len(rejections) == 1 and rejections[0]["scope"] == "document"
+    assert "operator_shell_commands['gh']: gh cannot be declared" in rejections[0]["reason"]
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        load_operator_shell_commands(path)
+    with pytest.raises(ValueError, match="gh cannot be declared"):
+        write_jobs(path, [])
+    assert path.read_text() == text
+
+
 def test_scheduler_unknown_document_key_refuses_jobs_and_chat_grants(tmp_path: Path):
     import yaml
     from mimir.scheduler import load_jobs_from_text, load_operator_shell_commands

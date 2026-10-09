@@ -2361,6 +2361,15 @@ def parse_operator_shell_commands(
     for entry in raw or ():
         if not isinstance(entry, dict):
             raise ValueError("operator_shell_commands entries must be mappings")
+        raw_path = entry.get("path")
+        if (entry.get("exec") == "gh"
+                or isinstance(raw_path, str) and raw_path
+                and (Path(raw_path).name == "gh" or Path(raw_path).resolve().name == "gh")):
+            raise ValueError(
+                f"operator_shell_commands[{entry.get('exec')!r}]: gh cannot be declared; "
+                "GitHub access from operator chat after untrusted ingest goes through "
+                "a fresh untainted turn or the forge tools"
+            )
         for key in ("external_send", "payload_args", "script"):
             if key in entry and (key != "external_send" or entry[key] is True):
                 raise ValueError(

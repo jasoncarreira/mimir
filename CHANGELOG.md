@@ -6,6 +6,11 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Authz (#1904):** Refuse GitHub CLI declarations in `operator_shell_commands`
+  at load and save, including aliases and symlinks; refuse operator-declared `gh`
+  before credential or identity handling if it reaches execution. Use a fresh
+  untainted turn or forge tools for GitHub access after untrusted ingest.
+
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
   the operator to arm the leaf for server-side ready-queue dispatch or run the

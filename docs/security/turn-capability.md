@@ -192,9 +192,10 @@ send/create/transition verbs. Untainted admin shell and scheduled service shell
 keep their existing independent authority. Prefixes admit all deeper verbs;
 use full read-only leaf paths (`[jira, workitem, search]` rather than
 `[jira, workitem]`). Authenticated admin ACP `user_message` turns intentionally
-qualify; chat completion/continuation events do not. Declared `gh` retains config
-isolation and identity confirmation, and receives GitHub credentials only through
-its explicit `pass_env`, never implicit executable grants or the shell baseline.
+qualify; chat completion/continuation events do not. `gh` cannot be declared in
+`operator_shell_commands`, including under another name or through a symlink.
+GitHub access after untrusted ingest requires a fresh untainted operator turn or
+the forge tools.
 
 Arm 2 uses the existing `scheduler_read_only` profile. It does not use
 `repo_review`: repository-sensitive commands in that profile depend on immutable
