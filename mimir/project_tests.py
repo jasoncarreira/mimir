@@ -81,6 +81,46 @@ _PERMISSION_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_PYTEST_NODE_ID = re.compile(r"[A-Za-z0-9_./:\[\]=,+-]{1,256}", re.ASCII)
+_PYTEST_SUMMARY_HEADER = re.compile(r"^=+ short test summary info =+$")
+_PYTEST_SECTION_END = re.compile(r"^=+ .+ =+$")
+_PYTEST_COUNTS = re.compile(r"\b(\d+) (failed|errors?|passed|skipped)\b")
+_PYTEST_FINAL_LINE = re.compile(r"^=+ (.+) =+$")
+
+
+def pytest_failure_summary(stdout: bytes) -> dict[str, object]:
+    """Extract only numeric counts and bounded node ids from captured pytest output."""
+    lines = stdout.decode("utf-8", errors="replace").splitlines()
+    failing: list[str] = []
+    dropped = 0
+    # Only the LAST short summary section is authoritative. A printed imitation
+    # elsewhere in the run cannot add ids unless it is inside that section.
+    starts = [i for i, line in enumerate(lines) if _PYTEST_SUMMARY_HEADER.fullmatch(line)]
+    if starts:
+        for line in lines[starts[-1] + 1:]:
+            if _PYTEST_SECTION_END.fullmatch(line):
+                break
+            if line.startswith(("FAILED ", "ERROR ")):
+                # Pytest may append ' - reason'; never parse the reason as an id.
+                candidate = line.split(" ", 1)[1].split(" - ", 1)[0]
+                if _PYTEST_NODE_ID.fullmatch(candidate) is None:
+                    dropped += 1
+                elif len(failing) < 50:
+                    failing.append(candidate)
+                else:
+                    dropped += 1
+    counts: dict[str, int | None] = dict.fromkeys(("failed", "errors", "passed", "skipped"))
+    for line in reversed(lines):
+        match = _PYTEST_FINAL_LINE.fullmatch(line)
+        if match is None:
+            continue
+        found = _PYTEST_COUNTS.findall(match[1])
+        if found:
+            for amount, kind in found:
+                if len(amount) <= 9:
+                    counts["errors" if kind in {"error", "errors"} else kind] = int(amount)
+            break
+    return {**counts, "failing": failing, "failing_dropped": dropped}
 
 
 class ProjectTestRefusal(RuntimeError):
@@ -96,10 +136,12 @@ class ProjectTestRefusal(RuntimeError):
         message: str,
         *,
         execution_started: bool = True,
+        fixed_message: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.execution_started = execution_started
+        self.fixed_message = fixed_message
 
 
 @dataclass(frozen=True)
@@ -129,6 +171,7 @@ class ProjectTestResult:
     stdout_path: str = ""
     stderr_path: str = ""
     suite: str = "default"
+    failure_summary: dict[str, object] | None = None
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -579,7 +622,8 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 exc.code,
                 str(exc),
-                execution_started=True,
+                execution_started=exc.execution_started,
+                fixed_message=exc.fixed_message,
             ) from exc
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
@@ -609,6 +653,7 @@ class RepoProjectTests:
                 "test_snapshot_credentials_refused",
                 "project test snapshot contains credential-like material",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
         except SnapshotEmbeddedRepository as exc:
             # Distinct from the generic branch below on purpose: this one is an
@@ -625,6 +670,7 @@ class RepoProjectTests:
                 "test_snapshot_embedded_repository",
                 "project test snapshot source contains an embedded Git repository",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
         except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
             await safe_log_event(
@@ -637,6 +683,7 @@ class RepoProjectTests:
                 "test_snapshot_unavailable",
                 "project test snapshot is unavailable",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
 
         identifier = str(uuid.uuid4())
@@ -676,11 +723,13 @@ class RepoProjectTests:
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             raise ProjectTestRefusal(
                 "test_config_invalid",
                 "project test command or environment contains a controller path",
                 execution_started=True,
+                fixed_message=True,
             )
         result: CollectedExecutionResult | None = None
         try:
@@ -735,6 +784,7 @@ class RepoProjectTests:
                     "test_containment_unavailable",
                     "contained project test execution is unavailable",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             if result.exit_code not in {None, 0}:
                 diagnostic = _permission_diagnostic_from_error(result.stderr)
@@ -765,6 +815,7 @@ class RepoProjectTests:
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             finally:
                 if result is None or not result.timed_out:
@@ -808,6 +859,7 @@ class RepoProjectTests:
                 False, code, result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
+                failure_summary=(pytest_failure_summary(result.stdout) if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
         if not retained and not selectors and is_default:
@@ -818,6 +870,7 @@ class RepoProjectTests:
                     "inactive_checkout",
                     "the checkout has no current HEAD",
                     execution_started=True,
+                    fixed_message=True,
                 )
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(

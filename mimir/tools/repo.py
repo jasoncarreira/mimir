@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +50,26 @@ _GIT_BINDING_REFUSAL_CODES = frozenset({
 _REPOSITORY_AUTHORIZATION_REFUSED = "repository_authorization_refused"
 _REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
 _REPOSITORY_GIT_FAILED = "repository_git_failed"
+_FIXED_TEST_REFUSALS = {
+    "test_snapshot_unavailable": frozenset({"project test snapshot is unavailable"}),
+    "test_containment_unavailable": frozenset({"contained project test execution is unavailable"}),
+    "test_snapshot_cleanup_failed": frozenset({"project test snapshot cleanup failed"}),
+    "test_config_invalid": frozenset({
+        "project test command is invalid", "invalid env unset directive",
+        "test runner is missing",
+        "project test command or environment contains a controller path",
+    }),
+    "test_snapshot_credentials_refused": frozenset({
+        "project test snapshot contains credential-like material",
+    }),
+    "test_snapshot_embedded_repository": frozenset({
+        "project test snapshot source contains an embedded Git repository",
+    }),
+    "inactive_checkout": frozenset({"the checkout has no current HEAD"}),
+}
+_SUMMARY_SELECTOR = re.compile(r"[A-Za-z0-9._/,:+=-]{1,256}", re.ASCII)
+_SUMMARY_SUITE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)
+_SUMMARY_HEAD = re.compile(r"[0-9a-f]{40,64}", re.ASCII)
 
 
 def _tool_refusal(
@@ -398,6 +419,7 @@ async def repo_test(
     selectors: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
     suite: str | None = None,
+    include_output: bool = False,
 ) -> dict[str, Any]:
     """Run configured tests in a contained repository snapshot.
 
@@ -424,6 +446,7 @@ async def repo_test(
                         selectors, suite=suite,
                     )
                 )
+                result.pop("failure_summary", None)
                 result = _retained_result(runtime, retained, result)
                 result["remediation_guidance"] = _remediation_test_guidance(
                     result["code"], scoped=bool(selectors),
@@ -433,13 +456,40 @@ async def repo_test(
         result = asdict(
             await RepoProjectTests(state).execute(selectors, suite=suite)
         )
+        failure_summary = result.pop("failure_summary", None)
         _publish_attested_lease_result(runtime, state)
+        if (
+            result["code"] == "tests_failed" and not include_output
+            and failure_summary is not None
+            and type(result["returncode"]) is int and result["returncode"] != 0
+            and _SUMMARY_SUITE.fullmatch(result["suite"]) is not None
+            and _SUMMARY_HEAD.fullmatch(state.action_scope.observed_head_sha) is not None
+            and isinstance(selectors, tuple)
+            and len(selectors) <= 32
+            and all(isinstance(item, str) and _SUMMARY_SELECTOR.fullmatch(item) for item in selectors)
+        ):
+            return {
+                "ok": False, "code": "tests_failed", "exit_code": result["returncode"],
+                "suite": result["suite"], "selectors": list(selectors),
+                "summary": {**failure_summary, "head": state.action_scope.observed_head_sha},
+                "remediation_guidance": (
+                    "The summary lists failing node ids. Prefer reading the lease's test source "
+                    "and rerunning selected ids. include_output=true reveals raw output, "
+                    "marks the turn untrusted, and blocks further repo_test runs this turn."
+                ),
+            }
         result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
         return result
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
         code = getattr(exc, "code", "project_test_failed")
         message = f"project test rejected ({code}): {exc}"
         message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
+        if (
+            isinstance(exc, ProjectTestRefusal)
+            and exc.fixed_message
+            and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
+        ):
+            raise ToolPolicyRefusal(message) from exc
         raise _tool_refusal(
             message,
             exc,

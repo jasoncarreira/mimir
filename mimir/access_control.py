@@ -10899,6 +10899,52 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
+def _bounded_repo_test_failure(result: Any, expected_head: str) -> bool:
+    """Only the output-free, structured completed-failure envelope is attestable."""
+    from langchain_core.messages import ToolMessage
+
+    if isinstance(result, ToolMessage):
+        result = result.content
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return False
+    if not isinstance(result, dict) or set(result) != {
+        "ok", "code", "exit_code", "suite", "selectors", "summary",
+        "remediation_guidance",
+    }:
+        return False
+    summary = result["summary"]
+    return (
+        result["ok"] is False and result["code"] == "tests_failed"
+        and type(result["exit_code"]) is int
+        and isinstance(summary, dict)
+        and set(summary) == {"failed", "errors", "passed", "skipped", "failing", "failing_dropped", "head"}
+        and all(value is None or type(value) is int and value >= 0
+                for value in (summary[key] for key in ("failed", "errors", "passed", "skipped")))
+        and type(summary["failing_dropped"]) is int and summary["failing_dropped"] >= 0
+        and isinstance(summary["failing"], list) and len(summary["failing"]) <= 50
+        and all(isinstance(node, str) and re.fullmatch(r"[A-Za-z0-9_./:\[\]=,+-]{1,256}", node, re.ASCII)
+                for node in summary["failing"])
+        and isinstance(summary["head"], str)
+        and summary["head"] == expected_head
+        and re.fullmatch(r"[0-9a-f]{40,64}", summary["head"], re.ASCII)
+        and isinstance(result["suite"], str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", result["suite"], re.ASCII)
+        and isinstance(result["selectors"], list)
+        and len(result["selectors"]) <= 32
+        and all(isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9._/,:+=-]{1,256}", item, re.ASCII)
+                for item in result["selectors"])
+        and isinstance(result["remediation_guidance"], str)
+        and result["remediation_guidance"] == (
+            "The summary lists failing node ids. Prefer reading the lease's test source "
+            "and rerunning selected ids. include_output=true reveals raw output, "
+            "marks the turn untrusted, and blocks further repo_test runs this turn."
+        )
+    )
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -11032,7 +11078,12 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        if not failed and provenance is not None and provenance.sources:
+        if (
+            (not failed or tool_name == "repo_test" and _bounded_repo_test_failure(
+                result, scope.observed_head_sha,
+            ))
+            and provenance is not None and provenance.sources
+        ):
             if all(
                 item.domain == source.domain
                 and item.domain_qualifier == source.domain_qualifier

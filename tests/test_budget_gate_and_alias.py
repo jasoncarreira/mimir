@@ -6646,7 +6646,8 @@ async def test_real_repo_test_payload_error_detection(monkeypatch, ok):
     monkeypatch.setattr(repo_module, "_state", lambda *_args: object())
     monkeypatch.setattr(repo_module.RepoProjectTests, "execute", AsyncMock(return_value=producer))
     payload = await repo_module.repo_test.coroutine(repository="owner/repo", pull_request=1)
-    assert {field.name for field in fields(producer)} < payload.keys()
+    assert {field.name for field in fields(producer)} - {"failure_summary"} < payload.keys()
+    assert "failure_summary" not in payload
     assert payload["remediation_guidance"]
     message = ToolMessage(content=json.dumps(payload), tool_call_id="real-repo-test", status="success")
     assert _result_is_error("repo_test", message) is (not ok)

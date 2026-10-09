@@ -2662,6 +2662,32 @@ def test_project_test_missing_selector_has_named_non_disclosing_refusal(
     assert str(root) not in str(refusal.value)
 
 
+def test_pytest_failure_summary_is_bounded_and_uses_last_section_only():
+    from mimir.project_tests import pytest_failure_summary
+
+    ids = "".join(f"FAILED tests/test_a.py::test_{i} - reason\n" for i in range(55))
+    output = (
+        "FAILED injected text with spaces\n"
+        "=== short test summary info ===\nFAILED tests/old.py::test_old\n"
+        "=== 1 failed in 0.01s ===\n"
+        "=== short test summary info ===\n"
+        "FAILED tests/bad.py::test_<inject> - reason\n"
+        f"ERROR {'a' * 257} - reason\n"
+        "FAILED injected text with spaces\n" + ids +
+        "=== 55 failed, 1 error, 2 passed, 3 skipped in 0.2s ===\n"
+    ).encode()
+    summary = pytest_failure_summary(output)
+    assert summary == {
+        "failed": 55, "errors": 1, "passed": 2, "skipped": 3,
+        "failing": [f"tests/test_a.py::test_{i}" for i in range(50)],
+        "failing_dropped": 8,
+    }
+    assert pytest_failure_summary(b"FAILED tests/printed.py::test_x\nfrontend failed\n") == {
+        "failed": None, "errors": None, "passed": None, "skipped": None,
+        "failing": [], "failing_dropped": 0,
+    }
+
+
 def test_project_test_symlink_selector_is_refused_before_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2805,7 +2831,7 @@ async def test_public_repo_test_credential_fault_persists_no_sensitive_material(
     finally:
         event_logger._logger = previous_logger
 
-    assert not isinstance(refusal.value, ToolPolicyRefusal)
+    assert isinstance(refusal.value, ToolPolicyRefusal)
     persisted_events = event_path.read_bytes()
     event_records = [json.loads(line) for line in persisted_events.splitlines()]
     assert [(record["type"], record["reason_code"]) for record in event_records] == [
