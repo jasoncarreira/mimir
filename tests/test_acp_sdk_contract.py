@@ -1003,7 +1003,14 @@ async def test_dispatcher_stop_is_bounded_when_queue_drain_stalls(
     await queue.publish(WireTask(TaskKind.REQUEST, {"method": "stalled"}))
     monkeypatch.setattr(sdk, "DISPATCHER_STOP_TIMEOUT", 0.01)
 
-    await asyncio.wait_for(dispatcher.stop(), 0.1)
+    # The bound under test is DISPATCHER_STOP_TIMEOUT (patched to 0.01s; 30s in
+    # production). The outer wait_for is only a hang guard, so size it loose:
+    # a tight 0.1s made this a latency assertion that failed on a loaded macOS
+    # runner (#2313 CI). Elapsed well under the production default still
+    # proves stop() honours the patched bound instead of waiting on the drain.
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(dispatcher.stop(), 10)
+    assert asyncio.get_running_loop().time() - started < 5
 
     assert stalled.cancelled()
     assert queue._queue.qsize() == 2
