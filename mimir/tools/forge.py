@@ -786,6 +786,12 @@ def _call(operation: Any) -> Any:
     except ForgeError as exc:
         from ..forge.github import GitHubIdentityVerificationError
 
+        from ..forge.client import ForgeReadUnavailable
+
+        if isinstance(exc, ForgeReadUnavailable):
+            # A typed, fixed diagnostic contains no third-party content. Do
+            # not extend this exemption to arbitrary adapter error strings.
+            raise ToolPolicyRefusal(str(exc)) from exc
         if isinstance(exc, GitHubIdentityVerificationError):
             _latch_github_identity_degraded(exc)
             raise ToolException(
@@ -816,28 +822,19 @@ def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str,
 
 
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
-    """Publish only a server-owned projection of an already attested PR."""
-    from ..access_control import publish_protected_result
-    from ..models import SourceLabel
+    """Independently attest a validated server-owned projection at its scope.
 
-    context = getattr(runtime, "context", None)
-    if context is None or context.ifc_state is None or not (
-        context.ifc_state.pr_checkout_author_trust.get(scope.scope_id) is True
-        or (bool(scope.pull_request_author) and context.ifc_state.repository_author_trust.trusted(
-            scope.canonical_repo, scope.pull_request_author,
-        ))
-    ):
+    Never depend on another parallel read warming the author cache. These
+    bounded projections belong to the authorized scope, not a later live head;
+    _pr_content_authors still rejects an unrelated live-head change.
+    """
+    client = _client(scope)
+    if not callable(getattr(client, "author_is_trusted", None)):
         return
-    principal = context.canonical_principal
-    if context.is_service and principal:
-        principal = f"service:{principal}"
-    publish_protected_result((SourceLabel(
-        principal=principal, domain="repository",
-        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
-        bridge_instance="forge", sensitivity="internal",
-        authorized_principals=frozenset({principal}) if principal else frozenset(),
-        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
-    ),))
+    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+    _publish_author_attestation(
+        runtime, scope, authors, "forge_projection", head_sha=scope.observed_head_sha,
+    )
 
 
 def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
@@ -1136,8 +1133,11 @@ def pr_job_log(
     client = _client(scope)
     excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id))
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
-        _publish_author_attestation(runtime, scope, authors, "pr_job_log", head_sha=head_sha)
+        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        # get_job_log independently pins job/run metadata to this exact head.
+        _publish_author_attestation(
+            runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
+        )
     return excerpt
 
 

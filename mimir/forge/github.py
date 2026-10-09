@@ -788,7 +788,9 @@ class GitHubForgeClient:
         ):
             raise ForgeError("run is outside the scoped repository/run/head")
         if run.get("status") != "completed":
-            raise ForgeError("run is still in progress; retry after completion")
+            from .client import ForgeReadUnavailable
+
+            raise ForgeReadUnavailable()
         if job.get("status") != "completed" or job.get("conclusion") not in {
             "failure", "timed_out", "startup_failure", "action_required", "cancelled",
         }:

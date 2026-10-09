@@ -11032,32 +11032,6 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        # PR text read after an exact verified own push is bound to the new
-        # head, while the authorization still names the original scoped head.
-        # Keep the new head in the label; unrelated heads must not borrow it.
-        if (
-            tool_name in {"pr_metadata", "pr_files", "pr_diff", "pr_file_content"}
-            and not failed and provenance is not None and provenance.sources
-            and getattr(auth_context, "ifc_state", None) is not None
-            and scope.observed_head_sha in auth_context.ifc_state.own_push_lineage().get(
-                (scope.canonical_repo, scope.pr_number), frozenset(),
-            )
-        ):
-            from .repo_tools import was_verified_push
-
-            resource_ids = {item.resource_id for item in provenance.sources}
-            if len(resource_ids) == 1:
-                resource_id = next(iter(resource_ids))
-                prefix = f"{scope.canonical_repo}#pull/{scope.pr_number}@"
-                if resource_id.startswith(prefix):
-                    head = resource_id[len(prefix):]
-                    if (
-                        re.fullmatch(r"[0-9a-fA-F]{40}", head)
-                        and was_verified_push(
-                            scope.canonical_repo, scope.pr_number, scope.observed_head_sha, head,
-                        )
-                    ):
-                        source = replace(source, resource_id=resource_id)
         if not failed and provenance is not None and provenance.sources:
             if all(
                 item.domain == source.domain

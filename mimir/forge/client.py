@@ -14,6 +14,13 @@ class ForgeError(RuntimeError):
     """A normalized forge operation failure safe to expose to a tool caller."""
 
 
+class ForgeReadUnavailable(ForgeError):
+    """A fixed server diagnostic raised without exposing forge content."""
+
+    def __init__(self) -> None:
+        super().__init__("run is still in progress; retry after completion")
+
+
 class ForgeResponseTooLarge(ForgeError):
     """A forge response exceeded the closed tool's configured bound."""
 
