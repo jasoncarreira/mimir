@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -61,7 +60,7 @@ def test_chainlink_cli_fetch_uses_scoped_auth_git_and_bounded_retry() -> None:
 
 
 def test_chainlink_cli_cargo_invocations_have_no_token_environment() -> None:
-    """Lint both metadata and install, not just the fetch/build step names."""
+    """Lint manifest discovery and install, not just the step names."""
     workflow = _workflow()
     job = workflow["jobs"]["chainlink-cli-audit"]
     build = _step("Install pinned Chainlink CLI")
@@ -69,7 +68,8 @@ def test_chainlink_cli_cargo_invocations_have_no_token_environment() -> None:
         assert not set(AUTH_KEYS).intersection(layer.get("env", {}))
     script = build["run"]
     assert "unset " + " ".join(AUTH_KEYS) in script
-    assert script.index("unset ") < script.index("cargo metadata") < script.index("cargo install")
+    assert script.index("unset ") < script.index('python - "$source_root"') < script.index("cargo install")
+    assert "cargo metadata" not in script
     assert 'cargo install --path "$crate_path" --locked --root "$RUNNER_TEMP/chainlink"' in script
     assert "--git" not in script
     assert "github.token" not in script
@@ -160,30 +160,40 @@ def test_chainlink_cli_fetch_retries_then_checks_actual_checkout_sha(tmp_path: P
     assert "secret-test-token" not in result.stdout + result.stderr + calls
 
 
+def _manifest(crate: Path, name: str) -> None:
+    crate.mkdir(parents=True, exist_ok=True)
+    (crate / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "1.0.0"\n')
+
+
+@pytest.mark.parametrize("layout", ["root", "nested", "workspace"])
 @pytest.mark.parametrize("mode", ["success", "retry", "exhausted"])
-def test_chainlink_cli_build_unsets_auth_before_any_cargo_subprocess(tmp_path: Path, mode: str) -> None:
+def test_chainlink_cli_build_unsets_auth_before_any_cargo_subprocess(tmp_path: Path, mode: str, layout: str) -> None:
     env = _environment(tmp_path)
     commands = tmp_path / "commands"
-    crate = tmp_path / "chainlink-source" / "crates" / "chainlink-tracker"
+    source = tmp_path / "chainlink-source"
+    crate = source if layout == "root" else source / "crates" / "chainlink-tracker"
+    _manifest(crate, "chainlink-tracker")
+    if layout == "workspace":
+        (source / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/chainlink-tracker"]\n')
+    elif layout == "nested":
+        assert not (source / "Cargo.toml").exists()
+    _manifest(source / "other-crate", "unrelated")
     _command(commands, "cargo", '''
 # Simulate dependency build scripts: all inherited credentials must be absent.
 for key in GITHUB_TOKEN GH_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
   if printenv "$key" >/dev/null; then echo "credential reached cargo" >&2; exit 97; fi
 done
 printf 'cargo %s\\n' "$*" >> "$CALLS"
-if [ "$1" = metadata ]; then
-  printf '%s\\n' "$CRATE_JSON"
-  exit 0
-fi
+test "$1" = install
+test "$2" = --path
+test -f "$3/Cargo.toml"
 if [ "$MODE" = exhausted ]; then exit 1; fi
 if [ "$MODE" = retry ] && [ "$(grep -c '^cargo install' "$CALLS")" -lt 3 ]; then exit 1; fi
 ''')
     step = _step("Install pinned Chainlink CLI")
     env.update(step.get("env", {}))
     env.update({key: "secret-test-token" for key in AUTH_KEYS})
-    env.update(MODE=mode, CRATE_JSON=json.dumps({"packages": [
-        {"name": "chainlink-tracker", "manifest_path": str(crate / "Cargo.toml")},
-    ]}))
+    env.update(MODE=mode)
     result = _run(step, env)
     assert result.returncode == (1 if mode == "exhausted" else 0), result.stderr
     calls = (tmp_path / "calls").read_text()
@@ -198,4 +208,30 @@ if [ "$MODE" = retry ] && [ "$(grep -c '^cargo install' "$CALLS")" -lt 3 ]; then
         assert not github_path.exists()
     else:
         assert github_path.read_text() == f"{tmp_path}/chainlink/bin\n"
+
+
+@pytest.mark.parametrize("layout, message", [
+    ("missing", "found 0"),
+    ("duplicate", "found 2"),
+    ("symlink", "manifest escapes the source checkout"),
+])
+def test_chainlink_cli_build_rejects_invalid_manifest_layout_before_cargo(
+    tmp_path: Path, layout: str, message: str,
+) -> None:
+    env = _environment(tmp_path)
+    source = tmp_path / "chainlink-source"
+    _manifest(source / "unrelated", "unrelated")
+    if layout == "duplicate":
+        _manifest(source / "one", "chainlink-tracker")
+        _manifest(source / "two", "chainlink-tracker")
+    elif layout == "symlink":
+        outside = tmp_path / "outside"
+        _manifest(outside, "chainlink-tracker")
+        (source / "Cargo.toml").symlink_to(outside / "Cargo.toml")
+    _command(tmp_path / "commands", "cargo", 'echo "cargo invoked" >> "$CALLS"\nexit 97\n')
+    result = _run(_step("Install pinned Chainlink CLI"), env)
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not (tmp_path / "calls").exists()
+    assert not (tmp_path / "github-path").exists()
 

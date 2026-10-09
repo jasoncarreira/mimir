@@ -315,7 +315,28 @@ jobs:
           # Defense in depth: no authentication reaches third-party build scripts.
           unset GITHUB_TOKEN GH_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
           source_root="$RUNNER_TEMP/chainlink-source"
-          crate_path="$(cargo metadata --manifest-path "$source_root/Cargo.toml" --no-deps --format-version 1 | python -c 'import json, pathlib, sys; data = json.load(sys.stdin); print(pathlib.Path(next(p["manifest_path"] for p in data["packages"] if p["name"] == "chainlink-tracker")).parent)')"
+          # The pinned repository need not have a root Cargo.toml. Locate the
+          # named package from its manifests without invoking Cargo or assuming
+          # an upstream directory layout; ambiguity fails before any build.
+          crate_path="$(python - "$source_root" <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          root = pathlib.Path(sys.argv[1]).resolve()
+          matches = []
+          for manifest in sorted(root.rglob("Cargo.toml")):
+              if manifest.is_symlink() or not manifest.resolve().is_relative_to(root):
+                  raise SystemExit("::error::Chainlink manifest escapes the source checkout")
+              with manifest.open("rb") as stream:
+                  data = tomllib.load(stream)
+              if data.get("package", {}).get("name") == "chainlink-tracker":
+                  matches.append(manifest.parent)
+          if len(matches) != 1:
+              raise SystemExit(f"::error::Expected exactly one chainlink-tracker manifest, found {len(matches)}")
+          print(matches[0])
+          PY
+          )"
           for attempt in 1 2 3; do
             if cargo install --path "$crate_path" --locked --root "$RUNNER_TEMP/chainlink"; then
               echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
