@@ -471,7 +471,9 @@ def _out_of_scope_paths_message(paths: set[str]) -> str:
     """Bound index path names and escape controls before adding them to a refusal."""
     if not paths:
         return "nothing staged"
-    shown = _validated_paths(tuple(sorted(paths)[:10]), required=False)
+    # These names come from the index, not from a requested Git operation.
+    # Render them as data without changing the dirty_out_of_scope refusal code.
+    shown = sorted(paths)[:10]
     names = ", ".join(repr(path) for path in shown)
     more = len(paths) - len(shown)
     return f"{names} … and {more} more" if more else names

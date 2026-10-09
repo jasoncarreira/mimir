@@ -412,45 +412,42 @@ def test_commit_pre_staged_paths_are_sorted_and_capped(repo_tools) -> None:
     assert "extra-10.txt" not in message and "extra-11.txt" not in message
 
 
-def test_commit_refuses_out_of_scope_path_staged_during_stage(repo_tools, monkeypatch) -> None:
+@pytest.mark.parametrize("stray_name", ["late.txt", "-flag.py", ":late.txt", "dir\\file.py"])
+def test_commit_refuses_out_of_scope_path_staged_during_stage(repo_tools, monkeypatch, stray_name) -> None:
     _origin, _source, _scope, state, tools = repo_tools
     lease = state.checkout_lease
     (lease.path / "tracked.txt").write_text("wanted\n", encoding="utf-8")
-    (lease.path / "late.txt").write_text("extra\n", encoding="utf-8")
+    (lease.path / stray_name).write_text("extra\n", encoding="utf-8")
     stage = tools._stage
 
     def stage_with_extra(paths):
         stage(paths)
-        _git(lease.path, "add", "--", "late.txt")
+        _git(lease.path, "add", "--", f":(literal){stray_name}")
 
     monkeypatch.setattr(tools, "_stage", stage_with_extra)
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitCommit(("tracked.txt",), "scoped"))
     assert refusal.value.code == "dirty_out_of_scope"
-    assert "staged paths do not match the explicit commit scope: 'late.txt'" in str(refusal.value)
+    assert f"staged paths do not match the explicit commit scope: {stray_name!r}" in str(refusal.value)
     assert "include them in `paths`, or unstage them" in str(refusal.value)
 
 
-def test_commit_escapes_controls_and_rejects_invalid_staged_names(repo_tools) -> None:
+@pytest.mark.parametrize("stray_name", [
+    "line\nbreak.txt", "ansi\x1b[31m.txt", "-unsafe.txt", ":unsafe.txt", "dir\\file.py",
+])
+def test_commit_escapes_stray_names_without_changing_refusal_code(repo_tools, stray_name) -> None:
     _origin, _source, _scope, state, tools = repo_tools
     lease = state.checkout_lease
-    control_name = "line\nbreak.txt"
-    (lease.path / control_name).write_text("staged\n", encoding="utf-8")
-    _git(lease.path, "add", "--", control_name)
+    (lease.path / stray_name).write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", f":(literal){stray_name}")
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitCommit(("tracked.txt",), "scoped"))
     assert refusal.value.code == "dirty_out_of_scope"
-    assert repr(control_name) in str(refusal.value)
-    assert control_name not in str(refusal.value)
-    _git(lease.path, "reset", "--", control_name)
-
-    invalid_name = "-unsafe.txt"
-    (lease.path / invalid_name).write_text("staged\n", encoding="utf-8")
-    _git(lease.path, "add", "--", invalid_name)
-    with pytest.raises(GitRefusal) as refusal:
-        tools.execute(GitCommit(("tracked.txt",), "scoped"))
-    assert refusal.value.code == "invalid_path"
-    assert invalid_name not in str(refusal.value)
+    message = str(refusal.value)
+    assert repr(stray_name) in message
+    assert "include them in `paths`, or unstage them" in message
+    assert "\n" not in message and "\x1b" not in message
+    assert _git(lease.path, "diff", "--cached", "--name-only", "-z") == stray_name + "\x00"
 
 
 @pytest.mark.parametrize("paths", [(), ("-A",), ("../escape",), ("/tmp/escape",), (":(glob)*",)])
