@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- Make repository refusals actionable (#1911): `pr_file_content` distinguishes
+  paths missing at the scoped head from non-files, and `repo_commit` names
+  bounded, escaped out-of-scope staged paths with a recovery hint.
+
 - Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
   (#1900). The release adds concept/name drift review instructions, an audited
   operator `sync-base` recovery for eligible parked runs, and remediation-slice

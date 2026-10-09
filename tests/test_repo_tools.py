@@ -392,7 +392,65 @@ def test_commit_refuses_pre_staged_out_of_scope_paths(repo_tools) -> None:
         tools.execute(GitCommit(("tracked.txt",), "scoped"))
 
     assert refusal.value.code == "dirty_out_of_scope"
+    assert "'outside.txt'" in str(refusal.value)
+    assert "include them in `paths`, or unstage them" in str(refusal.value)
     assert _git(lease.path, "diff", "--cached", "--name-only") == "outside.txt"
+
+
+def test_commit_pre_staged_paths_are_sorted_and_capped(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    for index in range(12):
+        (lease.path / f"extra-{index:02}.txt").write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", *[f"extra-{index:02}.txt" for index in range(12)])
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    message = str(refusal.value)
+    assert message.index("'extra-00.txt'") < message.index("'extra-09.txt'")
+    assert "'extra-09.txt' … and 2 more" in message
+    assert "extra-10.txt" not in message and "extra-11.txt" not in message
+
+
+def test_commit_refuses_out_of_scope_path_staged_during_stage(repo_tools, monkeypatch) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("wanted\n", encoding="utf-8")
+    (lease.path / "late.txt").write_text("extra\n", encoding="utf-8")
+    stage = tools._stage
+
+    def stage_with_extra(paths):
+        stage(paths)
+        _git(lease.path, "add", "--", "late.txt")
+
+    monkeypatch.setattr(tools, "_stage", stage_with_extra)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    assert "staged paths do not match the explicit commit scope: 'late.txt'" in str(refusal.value)
+    assert "include them in `paths`, or unstage them" in str(refusal.value)
+
+
+def test_commit_escapes_controls_and_rejects_invalid_staged_names(repo_tools) -> None:
+    _origin, _source, _scope, state, tools = repo_tools
+    lease = state.checkout_lease
+    control_name = "line\nbreak.txt"
+    (lease.path / control_name).write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", control_name)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "dirty_out_of_scope"
+    assert repr(control_name) in str(refusal.value)
+    assert control_name not in str(refusal.value)
+    _git(lease.path, "reset", "--", control_name)
+
+    invalid_name = "-unsafe.txt"
+    (lease.path / invalid_name).write_text("staged\n", encoding="utf-8")
+    _git(lease.path, "add", "--", invalid_name)
+    with pytest.raises(GitRefusal) as refusal:
+        tools.execute(GitCommit(("tracked.txt",), "scoped"))
+    assert refusal.value.code == "invalid_path"
+    assert invalid_name not in str(refusal.value)
 
 
 @pytest.mark.parametrize("paths", [(), ("-A",), ("../escape",), ("/tmp/escape",), (":(glob)*",)])
@@ -1752,6 +1810,7 @@ def test_commit_requires_at_least_one_matching_staged_change(repo_tools) -> None
     with pytest.raises(GitRefusal) as refusal:
         tools.execute(GitCommit(("tracked.txt",), "empty commit refused"))
     assert refusal.value.code == "dirty_out_of_scope"
+    assert "nothing staged" in str(refusal.value)
 
 
 @pytest.mark.parametrize("change", ["origin", "head"])
