@@ -718,8 +718,11 @@ def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, 
     message = "run is still in progress" if target == "run" and field == "status" else None
     if target == "job" and field in {"status", "conclusion"}:
         message = "^job is not a completed failing job$"
-    with pytest.raises(ForgeError, match=message):
+    from mimir.forge.client import ForgeReadUnavailable
+
+    with pytest.raises(ForgeError, match=message) as raised:
         GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert isinstance(raised.value, ForgeReadUnavailable) is (target == "run" and field == "status")
 
 
 @pytest.mark.parametrize("job_id,run_id", [

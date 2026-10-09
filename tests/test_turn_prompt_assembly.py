@@ -2198,8 +2198,9 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("producer", "mimir/pollers.py", "run_poller", "SourceLabel"): 1,
         ("producer", "mimir/prompt_sources.py", "prompt_source_label", "SourceLabel"): 1,
         # Native forge reads publish exact-PR/head author-attested provenance.
-            ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
-            ("producer", "mimir/tools/forge.py", "_publish_trusted_projection", "SourceLabel"): 1,
+        # _publish_trusted_projection delegates to this producer; it no longer
+        # constructs a separate SourceLabel after a cached author verdict.
+        ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
         # Retained remediation results preserve their exact factory authority.
         ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
         # PR checkout reads inherit exact-scope author attestation.

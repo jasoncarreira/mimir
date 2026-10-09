@@ -786,6 +786,12 @@ def _call(operation: Any) -> Any:
     except ForgeError as exc:
         from ..forge.github import GitHubIdentityVerificationError
 
+        from ..forge.client import ForgeReadUnavailable
+
+        if isinstance(exc, ForgeReadUnavailable):
+            # A typed, fixed diagnostic contains no third-party content. Do
+            # not extend this exemption to arbitrary adapter error strings.
+            raise ToolPolicyRefusal(str(exc)) from exc
         if isinstance(exc, GitHubIdentityVerificationError):
             _latch_github_identity_degraded(exc)
             raise ToolException(
@@ -816,28 +822,32 @@ def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str,
 
 
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
-    """Publish only a server-owned projection of an already attested PR."""
-    from ..access_control import publish_protected_result
-    from ..models import SourceLabel
+    """Independently attest a validated server-owned projection at its scope.
 
-    context = getattr(runtime, "context", None)
-    if context is None or context.ifc_state is None or not (
-        context.ifc_state.pr_checkout_author_trust.get(scope.scope_id) is True
-        or (bool(scope.pull_request_author) and context.ifc_state.repository_author_trust.trusted(
-            scope.canonical_repo, scope.pull_request_author,
-        ))
-    ):
+    Never depend on another parallel read warming the author cache. These
+    bounded projections belong to the authorized scope, not a later live head;
+    _pr_content_authors still rejects an unrelated live-head change.
+    """
+    client = _client(scope)
+    if not callable(getattr(client, "author_is_trusted", None)):
         return
-    principal = context.canonical_principal
-    if context.is_service and principal:
-        principal = f"service:{principal}"
-    publish_protected_result((SourceLabel(
-        principal=principal, domain="repository",
-        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
-        bridge_instance="forge", sensitivity="internal",
-        authorized_principals=frozenset({principal}) if principal else frozenset(),
-        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
-    ),))
+    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+    _publish_author_attestation(
+        runtime, scope, authors, "forge_projection", head_sha=scope.observed_head_sha,
+    )
+
+
+def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
+    """Best-effort attestation must not turn a completed write into a retry.
+
+    On adapter/read failure publish no trusted provenance: result classification
+    retains its default untrusted label. Never reuse cached trust as a fallback.
+    """
+    try:
+        _publish_trusted_projection(runtime, scope)
+    except (ForgeError, ToolException):
+        # Do not expose arbitrary adapter error text after the write succeeded.
+        log.warning("forge write completed; result attestation unavailable")
 
 
 def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
@@ -864,9 +874,9 @@ def _publish_author_attestation(
     Missing actors/adapters and unavailable attestation fail closed for this
     result. Only definitive verdicts enter the turn-local cache; no PR-level
     verdict is persisted. Contained ``repo_test`` output is a function of the
-    attested checked-in checkout and inherits its lease attestation. CI logs,
-    checks, and forge mutation output are not author text; their bounded server
-    projections have separate provenance rules.
+    attested checked-in checkout and inherits its lease attestation. Scoped CI
+    job logs inherit the PR author verdict; checks and forge mutation output
+    have separate provenance rules.
     """
     from ..access_control import publish_protected_result
     from ..models import SourceLabel
@@ -1105,7 +1115,7 @@ def pr_job_log(
     run_id: StrictInt | None = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
-    """Read an untrusted, redacted bounded excerpt from one scoped failing CI job."""
+    """Read a redacted bounded CI job excerpt; trusted only for an attested PR."""
     _repository(repository)
     for name, value in (("pull_request", pull_request), ("job_id", job_id), ("run_id", run_id)):
         if name == "run_id" and value is None:
@@ -1133,7 +1143,15 @@ def pr_job_log(
     ):
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
-    return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
+    client = _client(scope)
+    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id))
+    if callable(getattr(client, "author_is_trusted", None)):
+        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        # get_job_log independently pins job/run metadata to this exact head.
+        _publish_author_attestation(
+            runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
+        )
+    return excerpt
 
 
 @tool
@@ -1263,7 +1281,7 @@ def pr_submit_review(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).submit_review(scope, verdict, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1287,7 +1305,7 @@ def pr_inline_review_comment(
     result = asdict(_call(lambda: _client(scope).add_inline_review_comment(
         scope, path=safe_path, line=line, body=safe_body,
     )))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1302,7 +1320,7 @@ def pr_comment(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1317,7 +1335,7 @@ def pr_edit_body(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 
 
