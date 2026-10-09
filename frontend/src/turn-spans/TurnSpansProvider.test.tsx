@@ -50,6 +50,7 @@ afterEach(() => {
   cleanup();
   bus.onEvent = undefined;
   bus.onError = undefined;
+  useUiState.setState({ apiKeyRejected: false, sessionCookiePending: false, sessionCookieMissing: false });
   vi.useRealTimers();
 });
 
@@ -61,9 +62,15 @@ describe("TurnSpansProvider character decay (#583)", () => {
       </TurnSpansProvider>
     );
 
-    act(() => bus.onError?.(new SseResponseError(403)));
+    act(() => bus.onError?.(new SseResponseError(401)));
 
     expect(useUiState.getState().apiKeyRejected).toBe(true);
+  });
+
+  it("does not request re-authentication for forbidden turn streams", () => {
+    render(<TurnSpansProvider channel="web-x"><Probe /></TurnSpansProvider>);
+    act(() => bus.onError?.(new SseResponseError(403)));
+    expect(useUiState.getState().apiKeyRejected).toBe(false);
   });
 
   it("decays active → idle after 30s, then → bored after 3 min", () => {

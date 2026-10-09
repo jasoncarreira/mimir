@@ -310,8 +310,9 @@ def test_declared_environment_is_bound_to_exact_argv(tmp_path, monkeypatch, over
 
 
 @pytest.mark.parametrize("overlay", [False, True])
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
 def test_operator_declared_gh_refused_before_identity_or_credentials(
-    tmp_path, monkeypatch, overlay,
+    tmp_path, monkeypatch, overlay, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
     from mimir.tools import forge as forge_tools
@@ -319,11 +320,11 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
 
     # Construct a binding via the job parser to exercise execution even if a
     # malformed/stale operator declaration somehow survives load validation.
-    executable = tmp_path / "gh"
+    executable = tmp_path / gh_name
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
     declarations = parse_declared_shell_commands([{
-        "exec": "gh", "path": str(executable), "subcommands": [["issue", "list"]],
+        "exec": gh_name, "path": str(executable), "subcommands": [["issue", "list"]],
         "pass_env": ["GITHUB_TOKEN"],
     }])
     monkeypatch.setenv("GITHUB_TOKEN", "explicit-test-token")
@@ -335,7 +336,7 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
     monkeypatch.setattr("mimir.event_logger.log_event_sync", lambda *a, **kw: None)
     argv = [str(executable), "issue", "list"]
     token = _shell_env.bind_direct_exec_argv(
-        argv, command="gh issue list", declared=declarations, operator_declared=True,
+        argv, command=f"{gh_name} issue list", declared=declarations, operator_declared=True,
     )
     try:
         assert _shell_env.direct_exec_pass_env(argv) == ("GITHUB_TOKEN",)
@@ -353,14 +354,18 @@ def test_operator_declared_gh_refused_before_identity_or_credentials(
     ("timeout", ["5", "gh"], ["5", "gh", "pr", "view", "5"]),
     ("nice", ["timeout"], ["timeout", "5", "/usr/bin/gh", "pr", "view"]),
     ("timeout", ["5"], ["5", "/usr/bin/../bin/gh", "pr", "view"]),
+    ("chainlink", ["issue", "search"], ["issue", "search", "gh"]),
 ])
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
 def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
-    tmp_path, monkeypatch, overlay, wrapper, prefix, args,
+    tmp_path, monkeypatch, overlay, wrapper, prefix, args, gh_name,
 ):
     from mimir.access_control import parse_declared_shell_commands
     from mimir.tools import forge as forge_tools
     from mimir.tools.refusals import ToolPolicyRefusal
 
+    prefix = [token.replace("gh", gh_name) for token in prefix]
+    args = [token.replace("gh", gh_name) for token in args]
     executable = tmp_path / wrapper
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
@@ -385,8 +390,10 @@ def test_operator_declared_wrapped_gh_refused_before_env_or_identity(
     )
     try:
         assert _shell_env.direct_exec_pass_env(argv) == ("GITHUB_TOKEN",)
-        with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused"):
+        with pytest.raises(ToolPolicyRefusal, match="operator-declared gh is refused") as caught:
             direct_exec_env_overlay(argv) if overlay else direct_exec_env(argv)
+        index = next(i for i, value in enumerate(argv) if Path(value).name == gh_name)
+        assert f"argv[{index}]={argv[index]!r}" in str(caught.value)
         assert env_builds == []
         assert checks == []
         assert not forge_tools.github_identity_is_degraded()

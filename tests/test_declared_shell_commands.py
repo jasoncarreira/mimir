@@ -78,10 +78,13 @@ def test_operator_declaration_refuses_base_parser_valid_script(home: Path):
     ("exec", "gh"), ("path", "alias"), ("symlink", "alias"),
     ("named_symlink", "alias"),
 ])
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
 def test_operator_declaration_refuses_gh_by_name_path_and_resolved_target(
-    tmp_path: Path, kind: str, entry_name: str,
+    tmp_path: Path, kind: str, entry_name: str, gh_name: str,
 ) -> None:
-    gh = tmp_path / "gh"
+    if kind == "exec":
+        entry_name = gh_name
+    gh = tmp_path / gh_name
     alias = tmp_path / "alias"
     if kind == "named_symlink":
         alias.write_text("#!/bin/sh\nexit 0\n")
@@ -114,7 +117,10 @@ def test_operator_declaration_refuses_gh_by_name_path_and_resolved_target(
     ("taskset", ["1"]), ("flock", ["lock"]),
     ("nice", ["timeout", "5"]),
 ])
-@pytest.mark.parametrize("gh_token", ["gh", "/usr/bin/gh", "/usr/bin/../bin/gh"])
+@pytest.mark.parametrize("gh_token", [
+    "gh", "GH", "Gh", "/usr/bin/gh", "/usr/bin/GH", "/usr/bin/Gh",
+    "./gh", "./GH", "./Gh", "/usr/bin/../bin/gh", "/usr/bin/../bin/GH",
+])
 def test_operator_declaration_refuses_wrapped_gh_at_any_depth(
     tmp_path: Path, wrapper: str, prefix: list[str], gh_token: str,
 ) -> None:
@@ -147,23 +153,26 @@ def test_operator_declaration_non_gh_commands_still_match(tmp_path: Path) -> Non
         assert argv == [entry["path"], *entry["subcommands"][0], "query"]
 
 
-def test_scheduler_refuses_gh_operator_grants_on_load_and_save(tmp_path: Path) -> None:
+@pytest.mark.parametrize("gh_name", ["gh", "GH", "Gh"])
+def test_scheduler_refuses_gh_operator_grants_on_load_and_save(
+    tmp_path: Path, gh_name: str,
+) -> None:
     import yaml
     from mimir.scheduler import load_jobs, load_operator_shell_commands, write_jobs
 
-    gh = tmp_path / "gh"
+    gh = tmp_path / gh_name
     gh.write_text("#!/bin/sh\nexit 0\n")
     gh.chmod(0o755)
     path = tmp_path / "scheduler.yaml"
     document = {"jobs": [{"name": "read", "prompt": "read", "cron": "0 * * * *"}],
-                "operator_shell_commands": [{"exec": "gh", "path": str(gh),
+                "operator_shell_commands": [{"exec": gh_name, "path": str(gh),
                                              "subcommands": [["issue", "list"]]}]}
     text = yaml.safe_dump(document)
     path.write_text(text)
     jobs, rejections = load_jobs(path)
     assert jobs == []
     assert len(rejections) == 1 and rejections[0]["scope"] == "document"
-    assert "operator_shell_commands['gh']: gh cannot be declared" in rejections[0]["reason"]
+    assert f"operator_shell_commands[{gh_name!r}]: gh cannot be declared" in rejections[0]["reason"]
     with pytest.raises(ValueError, match="gh cannot be declared"):
         load_operator_shell_commands(path)
     with pytest.raises(ValueError, match="gh cannot be declared"):

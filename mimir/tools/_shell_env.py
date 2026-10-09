@@ -286,13 +286,19 @@ def direct_exec_env(argv: list[str] | None = None) -> dict[str, str]:
     for non-declared service commands.
     """
     binding = _DIRECT_EXEC_ARGV.get()
-    if (binding is not None and binding.operator_declared
-            and any(Path(token).name == "gh" for token in argv or ())):
-        from .refusals import ToolPolicyRefusal
-
-        raise ToolPolicyRefusal(
-            "operator-declared gh is refused; use a fresh untainted turn or the forge tools"
+    if binding is not None and binding.operator_declared:
+        offending = next(
+            ((index, token) for index, token in enumerate(argv or ())
+             if Path(token).name.casefold() == "gh"), None,
         )
+        if offending is not None:
+            from .refusals import ToolPolicyRefusal
+
+            index, token = offending
+            raise ToolPolicyRefusal(
+                f"operator-declared gh is refused: argv[{index}]={token!r}; "
+                "use a fresh untainted turn or the forge tools"
+            )
     env = _minimal_direct_exec_env()
     if binding is not None and binding.operator_declared and binding.argv == tuple(argv or ()):
         # The interactive shell's explicitly configured pass-through is a
