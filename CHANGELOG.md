@@ -10,6 +10,20 @@ All notable changes will land here. Format loosely follows
   an authorized turn's hold when another message is refused or fails. Print
   escaped console pairing hints with a bounded, process-wide 1024-author LRU.
 
+- **Operator action (#1872):** Generic shell execution after untrusted active
+  ingest is refused on interactive and continuation turns for every shell-process
+  tool, even with IFC enforcement off. Use a bounded or declared command,
+  `read_file`/`glob`/`grep` for reads, or `open_proposal` for repo edits. An
+  operator can clear ingest taint, start a fresh turn, or grant one exact shell
+  call with `approve_sink_once` / `request_operator_approval`.
+
+- Upgrade both feature-factory packages and their exact adapter pins to 0.10.14
+  (#1900). The release adds concept/name drift review instructions, an audited
+  operator `sync-base` recovery for eligible parked runs, and remediation-slice
+  path amendments. Worklink continues to tolerate additive factory state fields.
+
+- **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
+
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
   the operator to arm the leaf for server-side ready-queue dispatch or run the
@@ -35,11 +49,7 @@ All notable changes will land here. Format loosely follows
   This also refuses unclassified unarmed mutations; use a canonical unarmed
   command or comment instead. Unknown service commands remain subject to the
   existing exact-argv profile gate, without a substring veto on read-only
-  diagnostics. Generic `shell_exec`/`bash_async` behavior and
-  explicit one-time operator sink approvals are unchanged. Open shell execution
-  is not covered by this arming veto: runtime-built names, encoded payloads,
-  indirect execution and direct tracker SQLite writes cannot be confined by
-  argv inspection. A shell-wide post-ingest policy remains separate (#1872).
+  diagnostics. The shell-wide post-ingest veto is described above (#1872).
   Clean turns are unchanged; this gate does not provide filesystem confinement
   for other tools or broaden any declared-command profile.
 - Record an operator-stopped Worklink leaf as terminal evidence, disarm its labels without a dispatch incident or charged attempt, and restrict OpenCode authentication failures to provider error evidence (#1895).

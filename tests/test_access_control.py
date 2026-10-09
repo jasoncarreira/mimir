@@ -60,6 +60,7 @@ from mimir.models import (
     TurnInteractivity,
 )
 from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
+from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
 @pytest.fixture(autouse=True)
@@ -5315,6 +5316,145 @@ def _tainted_admin_operator_write_auth() -> AuthContext:
     return replace(auth, ifc_labels=auth.ifc_labels.with_source(untrusted))
 
 
+_POST_INGEST_SHELL_TOOLS = frozenset({
+    "Bash", "aexecute", "bash", "bash_async", "bash_exec", "execute",
+    "hands_python", "hands_shell", "shell", "shell_exec",
+})
+
+
+def test_post_ingest_shell_tools_match_descriptors() -> None:
+    assert _POST_INGEST_SHELL_TOOLS == access_control.SHELL_PROCESS_TOOL_NAMES
+    assert _POST_INGEST_SHELL_TOOLS == frozenset(
+        name for name, descriptor in TOOL_DESCRIPTORS.items()
+        if descriptor.sink_category is SinkCategory.SHELL_PROCESS
+    )
+
+
+@pytest.mark.parametrize("tool_name", sorted(_POST_INGEST_SHELL_TOOLS))
+@pytest.mark.parametrize("trigger", ["user_message", "shell_job_complete"])
+def test_generic_shell_post_ingest_veto_in_shadow_on_every_turn(tool_name, trigger):
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, trigger=trigger, ifc_state=InformationFlowState(auth.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        tool_name, "printf hello", auth.ifc_labels, auth, enforce=False,
+    )
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
+    assert decision.reason == "ifc_label_blocked:shell_process"
+    for guidance in ("untrusted active ingest", "declared or bounded", "read_file/glob/grep",
+                     "open_proposal", "fresh turn", "approve_sink_once", "request_operator_approval"):
+        assert guidance in decision.refusal_detail
+    registry_decision = ToolRegistry().authorize_tool(
+        tool_name, auth, enforce=False, target_channel="printf hello",
+    )
+    assert not registry_decision.allowed and not registry_decision.is_shadow_decision
+
+
+@pytest.mark.parametrize("tool_name", sorted(_POST_INGEST_SHELL_TOOLS))
+def test_clean_shell_keeps_shadow_decision(tool_name):
+    auth = _trusted_operator_write_auth(admin=True)
+    auth = replace(auth, ifc_state=InformationFlowState(auth.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        tool_name, "printf hello", auth.ifc_labels, auth, enforce=False,
+    )
+    assert decision.allowed is True
+    assert decision.reason == "ifc_allowed"
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async", "execute", "hands_shell", "hands_python"])
+def test_post_ingest_enforced_shell_decision_is_unchanged(tool_name):
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(auth.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        tool_name, "printf hello", auth.ifc_labels, auth, enforce=True,
+    )
+    assert (decision.allowed, decision.is_shadow_decision, decision.reason,
+            decision.refusal_detail) == (False, False, "ifc_label_blocked:shell_process", None)
+
+
+def test_post_ingest_generic_shell_refusal_preserves_attestation_context() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    state.record_author_attestation_unavailable()
+    auth = replace(auth, ifc_state=state, trigger="shell_job_complete")
+    for tool_name in ("bash_async", "execute", "hands_python"):
+        decision = SinkGate.check_sink_flow(
+            tool_name, "printf hello", auth.ifc_labels, auth, enforce=False,
+        )
+        assert not decision.allowed
+        assert "GitHub author attestation was unavailable" in decision.refusal_detail
+        assert "not a measured non-collaborator verdict" in decision.refusal_detail
+
+
+@pytest.mark.parametrize("tool_name", ["shell_exec", "bash_async", "execute"])
+def test_post_ingest_shell_one_time_approval_is_spent(tool_name):
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    auth = replace(auth, ifc_state=state)
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="shell_process",
+        destination="printf hello", canonical_principal=auth.canonical_principal,
+        lifetime_seconds=30, durable_audit=lambda *_: True,
+    )
+    first = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
+    second = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
+    assert first.allowed and first.reason == "ifc_declassification_approved"
+    assert not second.allowed and not second.is_shadow_decision
+
+
+def test_post_ingest_shell_approval_does_not_grant_admin_tool() -> None:
+    auth = _tainted_admin_operator_write_auth()
+    state = InformationFlowState(auth.ifc_labels)
+    auth = replace(auth, roles=("user",), trigger="shell_job_complete", ifc_state=state)
+    assert state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="shell_process",
+        destination="printf hello", canonical_principal=auth.canonical_principal,
+        lifetime_seconds=30, durable_audit=lambda *_: True,
+    )
+    decision = ToolRegistry().authorize_tool(
+        "shell_exec", auth, enforce=False, target_channel="printf hello",
+    )
+    assert decision.reason != "ifc_declassification_approved"
+
+
+@pytest.mark.parametrize("trigger", ["poller", "scheduled_tick"])
+def test_post_ingest_shell_trigger_without_trusted_service_is_not_exempt(trigger):
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, trigger=trigger, ifc_state=InformationFlowState(auth.ifc_labels))
+    decision = SinkGate.check_sink_flow(
+        "bash_async", "printf hello", auth.ifc_labels, auth, enforce=False,
+    )
+    assert not decision.allowed and not decision.is_shadow_decision
+    assert decision.reason == "ifc_label_blocked:shell_process"
+
+
+def test_post_ingest_operator_binding_is_request_bound_in_shadow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    maintenance_pinned_executables: dict[str, Path],
+) -> None:
+    _home, root, _outside = _operator_confinement_tree(tmp_path, monkeypatch)
+    auth = _tainted_admin_operator_write_auth()
+    command = "chainlink issue show 1337 --json"
+    request = object()
+    binding = _operator_chainlink_binding(
+        command, request=request, auth=auth, root=root,
+    )
+    kwargs = dict(
+        enforce=False, operator_shell_binding=binding,
+        tool_call_id="call-arm2", requested_cwd=str(root),
+    )
+    admitted = SinkGate.check_sink_flow(
+        "shell_exec", command, auth.ifc_labels, auth,
+        operator_shell_request_identity=request, **kwargs,
+    )
+    refused = SinkGate.check_sink_flow(
+        "shell_exec", command, auth.ifc_labels, auth,
+        operator_shell_request_identity=object(), **kwargs,
+    )
+    assert admitted.allowed
+    assert not refused.allowed and not refused.is_shadow_decision
+
+
 @pytest.mark.parametrize(
     ("case", "auth_factory", "allowed"),
     [
@@ -6207,9 +6347,14 @@ async def test_shadow_shell_target_masks_argv_before_truncation(
         captured.append((kind, fields))
 
     monkeypatch.setattr("mimir.event_logger.log_event", capture)
-    shadow = registry.authorize_tool(
-        "shell_exec", auth, enforce=False, target_channel=command,
-        arguments={"command": command},
+    # Exercise audit rendering directly: a post-ingest generic shell is now a
+    # hard veto, and therefore has no runtime shadow event to render.
+    registry._emit_shadow_decision(
+        access_control.ToolAuthorization(
+            tool_name="shell_exec", decision=OperationDecision.ADMIN_REQUIRED,
+            allowed=True, reason="ifc_label_blocked:shell_process", would_block=True,
+        ), auth_context=auth, target=command, requested_target=command,
+        sink_category=SinkCategory.SHELL_PROCESS,
     )
     enforced = registry.authorize_tool(
         "shell_exec", auth, enforce=True, target_channel=command,
@@ -6218,7 +6363,6 @@ async def test_shadow_shell_target_masks_argv_before_truncation(
     await asyncio.sleep(0)
 
     assert not enforced.allowed
-    assert shadow.allowed
     assert len(captured) == 1
     kind, fields = captured[0]
     assert kind == "shadow_tool_decision"
@@ -7467,7 +7611,6 @@ async def test_admin_required_shadow_denial_marks_targetless_request_explicitly(
 @pytest.mark.parametrize(
     ("tool_name", "target", "reason"),
     [
-        ("shell_exec", "printf test", "ifc_label_blocked:shell_process"),
         ("write_file", "/tmp/result.txt", "ifc_label_blocked:file"),
         ("send_message", "slack-C2", "ifc_label_blocked:same_channel"),
         ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn"),
@@ -14233,7 +14376,7 @@ def test_tainted_unrecognized_chainlink_shell_is_not_admitted_by_service_profile
         "$(printf chain%s link) issue label 5 $(printf work%s link):ready",
         "echo Y2hhaW5saW5rIGlzc3VlIGxhYmVsIDUgd29ya2xpbms6cmVhZHk= | base64 -d | sh",
         "C=chain; L=link; $C$L issue label 5 work${L}:ready",
-        # Generic-shell policy is outside #1897: these retain shadow behavior.
+        # #1872 refuses even non-Chainlink commands on the generic shell.
         "python -c 'print(1)'",
         "sh helper.sh",
         "pwd",
@@ -14243,7 +14386,7 @@ def test_tainted_unrecognized_chainlink_shell_is_not_admitted_by_service_profile
         "chainlink issue update 5 -d changed",
     ],
 )
-def test_tainted_generic_shell_shadow_policy_is_unchanged(
+def test_tainted_generic_shell_shadow_is_hard_refused(
     tool_name: str, command: str,
 ) -> None:
     registry = ToolRegistry()
@@ -14251,22 +14394,17 @@ def test_tainted_generic_shell_shadow_policy_is_unchanged(
         tool_name, _tainted_admin_operator_write_auth(),
         enforce=False, target_channel=command,
     )
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert decision.is_shadow_decision is False
     assert decision.reason != "chainlink_armed_work_blocked_by_untrusted_ingest"
     auth = _tainted_admin_operator_write_auth()
     sink = SinkGate.check_sink_flow(
         tool_name, command, auth.ifc_labels, auth, enforce=False,
     )
-    assert sink.allowed is True
-    mutation = command.startswith((
-        "chainlink issue create", "chainlink issue label", "chainlink issue update",
-    ))
-    assert sink.reason == (
-        "chainlink_mutation_blocked_by_untrusted_ingest" if mutation
-        else "ifc_label_blocked:shell_process"
-    )
-    assert sink.enforcement_enabled is False
-    assert sink.is_shadow_decision is True
+    assert sink.allowed is False
+    assert sink.reason == "ifc_label_blocked:shell_process"
+    assert sink.enforcement_enabled is True
+    assert sink.is_shadow_decision is False
     assert sink.would_block is True
     clean = registry.authorize_tool(
         tool_name, _trusted_operator_write_auth(admin=True),
@@ -17517,6 +17655,41 @@ def test_stale_or_forged_hands_authorization_keeps_untrusted_ingest_veto(
 
     assert decision.allowed is False
     assert decision.reason == "ifc_label_blocked:shell_process"
+
+
+def test_client_authorized_hands_shell_keeps_shadow_exemption() -> None:
+    from mimir.tools.client_provider import (
+        issue_client_authorized_host_execution,
+        reset_turn_capability_context,
+        set_turn_capability_context,
+    )
+
+    auth = _tainted_admin_operator_write_auth()
+    auth = replace(auth, ifc_state=InformationFlowState(labels=auth.ifc_labels))
+    request = object()
+    token = set_turn_capability_context(
+        _capability_for_broker(_ImmediatePermissionBroker(object())),
+    )
+    try:
+        marker = issue_client_authorized_host_execution(
+            request_identity=request, auth_context_identity=auth,
+            wrapper_name="hands_shell", tainted=True,
+        )
+        assert marker is not None
+        allowed = SinkGate.check_sink_flow(
+            "hands_shell", "printf hands", auth.ifc_labels, auth,
+            enforce=False, client_authorized_host_execution=marker,
+            request_identity=request,
+        )
+        refused = SinkGate.check_sink_flow(
+            "hands_shell", "printf hands", auth.ifc_labels, auth,
+            enforce=False, client_authorized_host_execution=marker,
+            request_identity=object(),
+        )
+    finally:
+        reset_turn_capability_context(token)
+    assert allowed.allowed
+    assert not refused.allowed and not refused.is_shadow_decision
 
 
 def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
