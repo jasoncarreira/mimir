@@ -5409,7 +5409,40 @@ def _trigger_service_read_target_is_allowed(
             service, lexical_root, lexical_relative,
         ):
             return False
-        resolved = candidate.resolve(strict=True)
+        missing_target = False
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Admit an ordinary file-not-found only for a bounded file read.
+            # Directory/search and shell scopes retain strict resolution.
+            if (
+                service.authority_profile != "github"
+                or shell_roots
+                or tool_name not in {"read_file", "aread"}
+                or is_memory_read_path(candidate)
+                or _has_protected_read_name(candidate)
+                or is_operator_secret_read_path(candidate)
+            ):
+                return False
+            resolved_root = lexical_root.resolve(strict=True)
+            ancestor = candidate.parent
+            while True:
+                try:
+                    resolved_ancestor = ancestor.resolve(strict=True)
+                    break
+                except FileNotFoundError:
+                    if ancestor == ancestor.parent:
+                        return False
+                    ancestor = ancestor.parent
+            if not resolved_ancestor.is_relative_to(resolved_root):
+                return False
+            resolved = candidate.resolve(strict=False)
+            if (
+                not resolved.is_relative_to(resolved_root)
+                or is_memory_read_path(resolved)
+            ):
+                return False
+            missing_target = True
         if service.authority_profile == "github":
             resolved.relative_to(lexical_root.resolve(strict=True))
         # Infrastructure roots are created lazily on first use. A missing
@@ -5451,6 +5484,8 @@ def _trigger_service_read_target_is_allowed(
                 return False
             if tool_name not in {"read_file", "aread"} and not resolved.is_dir():
                 return False
+    if missing_target:
+        return True
     return not (
         tool_name in {"read_file", "aread"}
         and (not resolved.is_file() or file_contains_secret(resolved))

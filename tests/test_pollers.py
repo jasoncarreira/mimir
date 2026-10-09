@@ -1045,8 +1045,9 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
     assert denied.reason == "admin_required"
 
 
+@pytest.mark.parametrize("enforce", [True, False])
 def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool,
 ) -> None:
     from mimir._context import reset_current_turn, set_current_turn
     from mimir.read_policy import is_current_service_scoped_read_path
@@ -1067,6 +1068,7 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
     outside.mkdir()
     (state / "escape").symlink_to(outside, target_is_directory=True)
     (state / "broken-escape").symlink_to(outside / "missing.json")
+    (state / "memory-alias").symlink_to(home / "memory", target_is_directory=True)
     monkeypatch.setenv("MIMIR_HOME", str(home))
     manifest = (
         Path(__file__).parents[1] / "mimir" / "optional-skills"
@@ -1083,7 +1085,7 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
     context = create_auth_context(AgentEvent(
         trigger="poller", channel_id=service.canonical,
         service_principal=service.canonical, service_authority=service,
-    ), enforce=True, ifc_labels=InformationFlowLabels())
+    ), enforce=enforce, ifc_labels=InformationFlowLabels())
     hard_denials = []
     monkeypatch.setattr(
         "mimir.tools.budget_gate._emit_event_sync",
@@ -1091,15 +1093,38 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
     )
     token = set_current_turn(SimpleNamespace(turn_id="worklink-incident-read", auth_context=context))
     try:
+        registry = ToolRegistry()
         backend = WriteGuardBackend(home, ["state"])
+        decision = registry.authorize_tool(
+            "read_file", context, enforce=enforce,
+            arguments={"file_path": str(evidence)},
+        )
+        assert decision.allowed and not decision.would_block, decision.reason
         result = backend.read(str(evidence))
         assert result.error is None
         assert "test_red" in result.file_data["content"]
-        missing = runs / "missing" / "record.json"
-        assert is_current_service_scoped_read_path(missing)
-        result = backend.read(str(missing))
-        assert result.error == f"File '{missing}' not found"
+        for missing in (runs / "1918.json", runs / "missing" / "record.json"):
+            assert is_current_service_scoped_read_path(missing)
+            for file_path in (str(missing), str(missing.relative_to(home))):
+                decision = registry.authorize_tool(
+                    "read_file", context, enforce=enforce,
+                    arguments={"file_path": file_path},
+                )
+                assert decision.allowed, (file_path, decision.reason)
+                assert not decision.would_block, (file_path, decision.reason)
+                assert decision.reason is None
+            result = backend.read(str(missing))
+            assert result.error == f"File '{missing}' not found"
         assert hard_denials == []
+
+        # Non-strict resolution returns inside state, but the first existing
+        # ancestor resolves outside it. Both checks are necessary.
+        return_inside = (
+            state / "escape" / "missing" / ".." / ".."
+            / "home" / "state" / "runs" / "x.json"
+        )
+        assert return_inside.resolve(strict=False).is_relative_to(state)
+        assert not is_current_service_scoped_read_path(return_inside)
 
         denied = {
             outside / "missing.json": "service_scoped_read_boundary",
@@ -1112,6 +1137,18 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
         assert not is_current_service_scoped_read_path(state / ".." / "outside.json")
         assert not is_current_service_scoped_read_path(state / "escape" / "missing.json")
         assert not is_current_service_scoped_read_path(state / "broken-escape")
+        for path in (
+            *denied, state / "broken-escape", return_inside,
+            other_channel.parent / "missing.md",
+            state / "memory-alias" / "channels" / "other" / "missing.md",
+        ):
+            decision = registry.authorize_tool(
+                "read_file", context, enforce=enforce,
+                arguments={"file_path": str(path)},
+            )
+            assert decision.allowed is (not enforce), path
+            assert decision.would_block, path
+            assert decision.reason == "read_scope", path
         for path, reason in denied.items():
             result = backend.read(str(path))
             expected = "Read denied: unresolved path" if reason == "unresolved_read_target" else f"Read denied: {reason}."
