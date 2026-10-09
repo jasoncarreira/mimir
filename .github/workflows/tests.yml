@@ -273,12 +273,11 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
-      - name: Install pinned Chainlink CLI
+      - name: Fetch pinned Chainlink source
         # Keep this tag in sync with mimir/skills/chainlink/dockerfile.fragment.
-        # The expected commit is recorded here; fail closed if the tag moves.
+        # Only trusted git commands receive the read-only token, never Cargo.
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
           GIT_TERMINAL_PROMPT: "0"
           GIT_CONFIG_COUNT: "1"
           GIT_CONFIG_KEY_0: credential.https://github.com.helper
@@ -286,20 +285,41 @@ jobs:
         run: |
           set -euo pipefail
           expected_sha=0e830bf230fdade13b148a99a1a3c19bfbd33b98
+          source_root="$RUNNER_TEMP/chainlink-source"
+          git init "$source_root"
           for attempt in 1 2 3; do
             if resolved="$(git ls-remote --exit-code https://x-access-token@github.com/dollspace-gay/chainlink.git refs/tags/chainlink-1.6.0)"; then
               if [[ "$resolved" != "$expected_sha"$'\t'refs/tags/chainlink-1.6.0 ]]; then
                 echo "::error::Chainlink tag chainlink-1.6.0 no longer resolves to the pinned commit"
                 exit 1
               fi
-              if cargo install \
-                --git https://x-access-token@github.com/dollspace-gay/chainlink.git \
-                --tag chainlink-1.6.0 \
-                --root "$RUNNER_TEMP/chainlink" \
-                chainlink-tracker; then
-                echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
+              if git -C "$source_root" fetch --depth=1 https://x-access-token@github.com/dollspace-gay/chainlink.git refs/tags/chainlink-1.6.0; then
+                if [[ "$(git -C "$source_root" rev-parse FETCH_HEAD)" != "$expected_sha" ]]; then
+                  echo "::error::Fetched Chainlink source does not match the pinned commit"
+                  exit 1
+                fi
+                git -C "$source_root" checkout --detach "$expected_sha"
                 exit 0
               fi
+            fi
+            if (( attempt == 3 )); then
+              echo "::error::Pinned Chainlink source fetch failed after 3 attempts"
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
+
+      - name: Install pinned Chainlink CLI
+        run: |
+          set -euo pipefail
+          # Defense in depth: no authentication reaches third-party build scripts.
+          unset GITHUB_TOKEN GH_TOKEN GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          source_root="$RUNNER_TEMP/chainlink-source"
+          crate_path="$(cargo metadata --manifest-path "$source_root/Cargo.toml" --no-deps --format-version 1 | python -c 'import json, pathlib, sys; data = json.load(sys.stdin); print(pathlib.Path(next(p["manifest_path"] for p in data["packages"] if p["name"] == "chainlink-tracker")).parent)')"
+          for attempt in 1 2 3; do
+            if cargo install --path "$crate_path" --locked --root "$RUNNER_TEMP/chainlink"; then
+              echo "$RUNNER_TEMP/chainlink/bin" >> "$GITHUB_PATH"
+              exit 0
             fi
             if (( attempt == 3 )); then
               echo "::error::Pinned Chainlink CLI install failed after 3 attempts"
