@@ -8,6 +8,10 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [0.9.8] — 2026-10-09
+
+- Fix false scheduler-wedge alarms and preserve mapping-form scheduler.yaml when merging new default jobs (#1915).
+
 ## [0.9.7] — 2026-10-09
 
 - **Operator action (#1872):** Generic shell execution after untrusted active
