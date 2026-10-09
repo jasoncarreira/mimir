@@ -10,6 +10,13 @@ All notable changes will land here. Format loosely follows
   server-reported per-atom integrity. Trusted reads no longer taint the turn;
   absent or invalid provenance remains untrusted active ingest.
 
+- **Web sign-in (#1906):** Set the session cookie's `Secure` flag from HTTPS rather than the Host name, allowing sign-in over plain HTTP on non-loopback hosts. Distinguish a missing post-sign-in cookie from a rejected key and keep 403 stream errors out of re-authentication.
+
+- **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
+  active ingest even in shadow mode, for service and operator turns alike. Ask
+  the operator to arm the leaf for server-side ready-queue dispatch or run the
+  Worklink CLI from a clean operator context.
+
 - **Authz (#1894):** Operator-owned `scheduler.yaml` can explicitly list read-only
   `operator_shell_commands` for tainted admin chat turns. Commands run as pinned,
   bounded argv with scrubbed environment and value-free audit events; job grants

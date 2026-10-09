@@ -658,9 +658,9 @@ async def _web_session_post(request: web.Request) -> web.Response:
     if not key or not (master or (identity is not None and identity.access.is_authorized)):
         return web.json_response({"error": "unauthorized"}, status=401)
     response = web.json_response({"ok": True})
-    authority = _request_authority(request)
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
     response.set_cookie(_WEB_SESSION_COOKIE, key, httponly=True, samesite="Strict",
-                        secure=authority is None or authority[0] not in _LOOPBACK_HOSTS, path="/")
+                        secure=request.secure or forwarded_proto == "https", path="/")
     return response
 
 

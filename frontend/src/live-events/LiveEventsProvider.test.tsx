@@ -4,8 +4,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { LiveEventsProvider, LiveEventsWarning, useLiveEvents } from "./LiveEventsProvider";
 import { LogReadWarning } from "../LogReadWarning";
+import { useUiState } from "../uiState";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  useUiState.setState({ apiKeyRejected: false, sessionCookiePending: false, sessionCookieMissing: false });
+});
 
 describe("log read warnings", () => {
   it.each(["Turns", "Events"] as const)("uses fixed copy and ErrorState styling for %s", (log) => {
@@ -101,5 +105,22 @@ describe("LiveEventsProvider stream gating", () => {
 
     expect(await screen.findByText("reauthenticate")).toBeTruthy();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a 401 on the first stream connect as a lost post-sign-in cookie", async () => {
+    useUiState.getState().setSessionCookiePending();
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 401 }));
+    render(<LiveEventsProvider fetchImpl={fetchImpl as typeof fetch}><StatusProbe /></LiveEventsProvider>);
+
+    expect(await screen.findByText("reauthenticate")).toBeTruthy();
+    expect(useUiState.getState().sessionCookieMissing).toBe(true);
+  });
+
+  it("keeps a forbidden stream in the error view instead of requesting re-authentication", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 403 }));
+    render(<LiveEventsProvider fetchImpl={fetchImpl as typeof fetch}><StatusProbe /></LiveEventsProvider>);
+
+    expect(await screen.findByText("error")).toBeTruthy();
+    expect(useUiState.getState().apiKeyRejected).toBe(false);
   });
 });
