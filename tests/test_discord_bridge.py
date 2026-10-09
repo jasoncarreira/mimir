@@ -1529,6 +1529,47 @@ async def test_on_message_fires_typing_before_enqueue(bridge_with_fake_client):
         await asyncio.sleep(0)
     assert getattr(channel_obj, "typing_aenter_calls", 0) >= 1
     assert len(enqueued) == 1
+    await bridge.cancel_typing("discord-1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, RuntimeError("enqueue failed")])
+async def test_on_message_stops_typing_when_enqueue_not_admitted(
+    bridge_with_fake_client, failure,
+):
+    bridge, _, sent = bridge_with_fake_client
+    channel = bridge._client._channels[1]
+    channel.typing = lambda: _FakeTyping(channel)
+    release = asyncio.Event()
+
+    async def enqueue(event: AgentEvent) -> bool:
+        await release.wait()
+        if isinstance(failure, Exception):
+            raise failure
+        return False
+
+    bridge.enqueue = enqueue
+    message = SimpleNamespace(
+        id=1907001, author=SimpleNamespace(id=1907, bot=False, display_name="New user"),
+        channel=_fake_channel(id=1), content="hello", attachments=[],
+    )
+    incoming = asyncio.create_task(bridge._on_message(message))
+    try:
+        assert await _wait_for(lambda: getattr(channel, "typing_aenter_calls", 0) == 1)
+        assert "discord-1" in bridge._typing_tasks
+    finally:
+        release.set()
+    if isinstance(failure, Exception):
+        with pytest.raises(RuntimeError, match="enqueue failed"):
+            await incoming
+    else:
+        await incoming
+    assert "discord-1" not in bridge._typing_tasks
+    assert await _wait_for(lambda: getattr(channel, "typing_aexit_calls", 0) == 1)
+    # A late trigger or lingering hold would issue another typing POST.
+    await asyncio.sleep(0.03)
+    assert channel.typing_aenter_calls == 1
+    assert sent == []
 
 
 # ─── fetch_history ──────────────────────────────────────────────────

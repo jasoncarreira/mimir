@@ -6,6 +6,10 @@ All notable changes will land here. Format loosely follows
 
 ## [Unreleased]
 
+- **Intake (#1907):** Cancel Discord typing when inbound admission refuses or
+  fails, and print a once-per-author console hint with the pairing approval
+  command for denied user messages.
+
 - **Worklink (#1896):** Refuse `worklink_run` and `worklink_resume` after untrusted
   active ingest even in shadow mode, for service and operator turns alike. Ask
   the operator to arm the leaf for server-side ready-queue dispatch or run the

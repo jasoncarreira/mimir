@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import shlex
+import threading
 import traceback
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -34,6 +36,10 @@ if TYPE_CHECKING:
     from .identities import IdentityResolver
 
 log = logging.getLogger(__name__)
+
+# Console hints are process-wide, even if the server replaces a Dispatcher.
+_denial_hints_seen: set[tuple[str, str | None]] = set()
+_denial_hints_lock = threading.Lock()
 
 TurnRunner = Callable[[AgentEvent], Awaitable[object]]
 RelevanceCheck = Callable[[AgentEvent], Awaitable[bool | None]]
@@ -402,6 +408,29 @@ class Dispatcher:
             enforcement_enabled=self._config.access_control_enforced,
             intake_gate=True,
         )
+        if event.trigger == "user_message":
+            # Console-only and best-effort: a broken log handler must not
+            # turn an intake denial into an admitted message.
+            try:
+                key = (source, event.author_id)
+                with _denial_hints_lock:
+                    if key not in _denial_hints_seen:
+                        canonical = decision.canonical_author
+                        command = (
+                            "mimir identities approve-pairing "
+                            f"{shlex.quote(canonical)} --home {shlex.quote(str(self._config.home))}"
+                            if canonical else "unavailable (missing author identity)"
+                        )
+                        log.warning(
+                            "Inbound message denied: source=%s raw_author_handle=%s "
+                            "author_id=%s canonical_identity=%s reason=%s; "
+                            "approve with: %s (for your own account, add --admin)",
+                            source or "unknown", event.author, event.author_id,
+                            canonical, decision.denial_reason, command,
+                        )
+                        _denial_hints_seen.add(key)
+            except Exception:  # noqa: BLE001 — logging cannot bypass the intake gate
+                pass
         is_dm = self._is_dm_channel(event.channel_id)
         if is_dm:
             await log_event(

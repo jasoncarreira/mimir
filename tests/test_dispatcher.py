@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from textwrap import dedent
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1520,6 +1521,65 @@ async def test_public_unknown_sender_gets_pairing_hook_without_public_send(
     assert pairing[0][0].channel_id == "slack-C1"
     assert pairing[0][1] == "unknown_author"
     assert "slack-C1" not in disp._queues
+
+
+@pytest.mark.asyncio
+async def test_intake_denial_warns_once_per_source_and_author_with_approval_command(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+):
+    resolver = _resolver(tmp_path, "people: []\n")
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    sent = AsyncMock()
+    disp.set_notice_sender(sent)
+    event = AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hello",
+        author="discord-1907001", author_id="1907001", source="discord",
+    )
+    with caplog.at_level("WARNING", logger="mimir.dispatcher"):
+        assert await disp.enqueue(event) is False
+        assert await disp.enqueue(event) is False
+        # The limit is per process, not per Dispatcher instance.
+        another = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+        assert await another.enqueue(event) is False
+        assert await disp.enqueue(AgentEvent(
+            trigger="user_message", channel_id="slack-C1", content="hello",
+            author="slack-1907001", author_id="1907001", source="slack",
+        )) is False
+    warnings = [r.message for r in caplog.records if r.name == "mimir.dispatcher" and
+                r.message.startswith("Inbound message denied:")]
+    assert len(warnings) == 2
+    assert "source=discord" in warnings[0]
+    assert "raw_author_handle=discord-1907001" in warnings[0]
+    assert "author_id=1907001" in warnings[0]
+    assert "canonical_identity=discord-1907001" in warnings[0]
+    assert "reason=unknown_author" in warnings[0]
+    assert f"mimir identities approve-pairing discord-1907001 --home {tmp_path}" in warnings[0]
+    assert "--admin" in warnings[0]
+    assert "source=slack" in warnings[1]
+    sent.assert_not_awaited()
+    assert disp._queues == {}
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["inbound_event_denied"] * 4
+
+
+@pytest.mark.asyncio
+async def test_intake_warning_failure_still_denies(tmp_path: Path, monkeypatch):
+    disp = Dispatcher(
+        _make_config(tmp_path, access_control_enforced=True),
+        resolver=_resolver(tmp_path, "people: []\n"),
+    )
+
+    def broken_warning(*args, **kwargs):
+        raise RuntimeError("console failed")
+
+    monkeypatch.setattr("mimir.dispatcher.log.warning", broken_warning)
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id="discord-C1", content="hello",
+        author="discord-1907002", author_id="1907002", source="discord",
+    )) is False
+    assert disp._queues == {}
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["inbound_event_denied"]
 
 
 class _FakePairingChannels:
