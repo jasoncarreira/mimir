@@ -31,12 +31,21 @@ beforeEach(() => {
   }));
 });
 
-const { routeFailures, whoami, wikiRouteLoads, liveEventsState } = vi.hoisted(() => ({
+const { routeFailures, whoami, wikiRouteLoads, liveEventsState, reloadSpy } = vi.hoisted(() => ({
   routeFailures: { chat: false },
   whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() },
   wikiRouteLoads: { count: 0 },
-  liveEventsState: { status: "idle", lastEvent: null as unknown }
+  liveEventsState: { status: "idle", lastEvent: null as unknown },
+  reloadSpy: vi.fn()
 }));
+
+vi.mock("./chunkReload", async (original) => {
+  const real = await original<typeof import("./chunkReload")>();
+  return {
+    ...real,
+    reloadOnceForStaleChunk: () => real.reloadOnceForStaleChunk(reloadSpy)
+  };
+});
 
 // whoami reflects the *current* stored key, exactly as the real client would:
 // admin when a key is present, anonymous (non-admin) when not.
@@ -143,7 +152,7 @@ vi.mock("./routes/AdminRoute", async (original) => {
 });
 
 // Imported after mocks are registered.
-const { AppFrame, resetBrowserSessionStateForApiKeyChange } = await import("./main");
+const { AppErrorBoundary, AppFrame, resetBrowserSessionStateForApiKeyChange } = await import("./main");
 const { useChatStore } = await import("./chatStore");
 const { useUiState } = await import("./uiState");
 
@@ -163,6 +172,7 @@ function renderApp(initialEntries = ["/"]) {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  window.sessionStorage.clear();
   sessionKey = "";
   vi.unstubAllGlobals();
   window.history.replaceState(null, "", "/");
@@ -184,6 +194,45 @@ afterEach(() => {
   routeFailures.chat = false;
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("stale chunk recovery in the dashboard", () => {
+  function brokenRoute(message: string) {
+    function BrokenRoute(): ReactNode { throw new Error(message); }
+    return render(<AppErrorBoundary title="Wiki could not be rendered"><BrokenRoute /></AppErrorBoundary>);
+  }
+
+  it("reloads once on a chunk failure and offers manual recovery after that", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const first = brokenRoute("Failed to fetch dynamically imported module: /app/assets/WikiRoute-old.js");
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    first.unmount();
+    brokenRoute("error loading dynamically imported module");
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("alert").textContent).toContain("The dashboard was updated — reload to get the new version.");
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+  });
+
+  it("does not reload or show a Reload action for an ordinary render failure", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    brokenRoute("chat route exploded");
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent).toContain("chat route exploded");
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+  });
+
+  it("prevents Vite's preload error when it can reload once", () => {
+    const preload = new Event("vite:preloadError", { cancelable: true });
+    Object.assign(preload, { payload: new TypeError("Failed to fetch dynamically imported module") });
+    window.dispatchEvent(preload);
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(preload.defaultPrevented).toBe(true);
+
+    const repeated = new Event("vite:preloadError", { cancelable: true });
+    window.dispatchEvent(repeated);
+    expect(reloadSpy).toHaveBeenCalledTimes(1);
+    expect(repeated.defaultPrevented).toBe(false);
+  });
 });
 
 describe("protected deep links await initial identity (#1547)", () => {

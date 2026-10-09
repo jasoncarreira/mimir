@@ -1446,6 +1446,11 @@ def register_routes(
         if requested.is_file():
             headers = _no_store_headers() if requested.name == "index.html" else None
             return web.FileResponse(requested, headers=headers)
+        if rel.split("/", 1)[0] == "assets":
+            return web.Response(
+                text="not found", status=404, content_type="text/plain",
+                headers=_no_store_headers(),
+            )
         return web.FileResponse(root / "index.html", headers=_no_store_headers())
 
     async def web_auth_js(_request: web.Request) -> web.Response:
