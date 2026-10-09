@@ -219,36 +219,38 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     )
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
-    delay = 0.1
+    from tests.timing import HANG_GUARD_SECONDS
+
     lock = threading.Lock()
-    active = 0
-    peak = 0
+    all_entered = threading.Event()
+    entered = 0
+    completed = 0
 
     def enter():
-        nonlocal active, peak
+        nonlocal entered
         with lock:
-            active += 1
-            peak = max(peak, active)
+            entered += 1
+            if entered == 7:
+                all_entered.set()
 
-    def exit():
-        nonlocal active
+    def complete():
+        nonlocal completed
         with lock:
-            active -= 1
+            completed += 1
 
     def slow_sync(*_args, **_kwargs):
         enter()
-        try:
-            time.sleep(delay)
-        finally:
-            exit()
+        # No loader can return before all seven have entered. Gathering just
+        # a subset then awaiting the rest serially cannot pass this rendezvous.
+        assert all_entered.wait(2 * HANG_GUARD_SECONDS)
+        complete()
         return None
 
     async def slow_async(**_kwargs):
         enter()
-        try:
-            await asyncio.sleep(delay)
-        finally:
-            exit()
+        while not all_entered.is_set():
+            await asyncio.sleep(0)
+        complete()
         return None
 
     monkeypatch.setattr("mimir.core_blocks.load_channel_memory", lambda *_args: None)
@@ -261,8 +263,14 @@ async def test_prompt_loaders_overlap_instead_of_adding_their_delays(
     monkeypatch.setattr(agent, "_assemble_self_state_block", slow_sync)
     monkeypatch.setattr("mimir.skill_resolver.find_skill_for_channel", slow_sync)
 
-    await agent._build_turn_prompt(ctx, event, saga_block=None)
-    assert peak >= 2, "independent loaders never overlapped"
+    try:
+        await asyncio.wait_for(
+            agent._build_turn_prompt(ctx, event, saga_block=None), HANG_GUARD_SECONDS,
+        )
+        assert entered == completed == 7
+    finally:
+        # Release executor threads even when a serialisation mutation fails.
+        all_entered.set()
 
 
 @pytest.mark.asyncio

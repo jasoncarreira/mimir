@@ -64,7 +64,9 @@ async def call(timeout=0.02):
 @pytest.mark.parametrize("stage", ["connect", "query", "response"])
 async def test_hung_sdk_times_out_and_restores_capacity(claude, stage):
     claude.stage = stage
-    assert await asyncio.wait_for(call(), HANG_GUARD_SECONDS) == ""
+    # Timeout behaviour is the contract: 2s is below both the 30s default
+    # and a 1000x regression of the configured 0.02s budget.
+    assert await asyncio.wait_for(call(), 2.0) == ""
     assert claude.entered.is_set()
     assert claude.clients[0].closed
     assert claude.pool.size == 0
@@ -80,7 +82,9 @@ async def test_hung_sdk_times_out_and_restores_capacity(claude, stage):
 @pytest.mark.asyncio
 async def test_acquire_deadline_does_not_discard_borrowed_runner(claude):
     borrowed = await claude.pool.acquire()
-    assert await asyncio.wait_for(call(), HANG_GUARD_SECONDS) == ""
+    # Timeout behaviour is the contract: 2s is below both the 30s default
+    # and a 1000x regression of the configured 0.02s budget.
+    assert await asyncio.wait_for(call(), 2.0) == ""
     assert claude.pool.size == 1
     assert claude.clients == []
     await claude.pool.release(borrowed)
@@ -149,7 +153,8 @@ async def test_discard_restores_capacity_even_when_close_hangs(claude, cancel_cl
         with pytest.raises(asyncio.CancelledError):
             await task
     else:
-        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+        # Must honour discard's 0.02s timeout, not a 20s/30s fallback.
+        await asyncio.wait_for(task, 2.0)
     assert claude.pool.size == 0
     assert claude.pool._idle == []
     claude.stage = None

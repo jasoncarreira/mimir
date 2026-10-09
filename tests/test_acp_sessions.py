@@ -1469,9 +1469,10 @@ async def test_transport_death_releases_prompt_blocked_on_update_delivery(
     await blocked.wait()
     active = agent._active_prompts[session_id]
 
-    await agent.on_transport_closed(generation)
+    # Honour the patched 0.01s close bound, not the unpatched 2s default.
+    await asyncio.wait_for(agent.on_transport_closed(generation), 1.0)
     with pytest.raises(sdk.RequestError, match="Internal error"):
-        await asyncio.wait_for(prompting, HANG_GUARD_SECONDS)
+        await asyncio.wait_for(prompting, 1.0)
 
     assert active.completed.is_set()
     assert active.dispatcher._worker is None
@@ -1760,6 +1761,9 @@ async def test_stalled_turn_detach_refuses_within_bound(
     release = asyncio.Event()
     monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", 0.01)
     monkeypatch.setattr(agent_module, "ACP_SESSION_DETACH_GRACE_SECONDS", 0.01)
+    # This test exercises the patched grace, not merely eventual refusal.
+    # Keep response guards below the unpatched 2s cancel/detach budgets.
+    refusal_guard = 1.0
 
     async def turn(event: Any, **kwargs: Any) -> None:
         entered.set()
@@ -1815,7 +1819,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
         active = state.active_prompt
         assert active is not None
         if already_cancelling:
-            await agent.cancel(session_id)
+            await asyncio.wait_for(agent.cancel(session_id), refusal_guard)
         if route == "revalidate":
             async def invalid_tools(candidate: SessionState) -> None:
                 raise agent_module.ProviderSchemaError("missing")
@@ -1829,7 +1833,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 if task.get_coro().__name__ == "_revalidate_provider"
             )
             with pytest.raises(sdk.RequestError, match="retry session/load"):
-                await asyncio.wait_for(asyncio.shield(revalidating), HANG_GUARD_SECONDS)
+                await asyncio.wait_for(asyncio.shield(revalidating), refusal_guard)
 
         # Repeated wire requests must receive the specific refusal and return
         # their dispatcher slots, even though the model remains stalled.
@@ -1844,7 +1848,7 @@ async def test_stalled_turn_detach_refuses_within_bound(
                 "jsonrpc": "2.0", "id": request_id, "method": "session/load",
                 "params": {"sessionId": session_id, "cwd": "/two"},
             })
-            response = await asyncio.wait_for(transport.outgoing.get(), HANG_GUARD_SECONDS)
+            response = await asyncio.wait_for(transport.outgoing.get(), refusal_guard)
             assert response["id"] == request_id
             assert response["error"]["code"] == -32003
             assert "retry session/load" in response["error"]["message"]
@@ -1961,9 +1965,10 @@ async def test_stalled_read_peer_prompt_then_load_is_bounded(
         # Shield so a missing production bound fails here by TimeoutError,
         # rather than test cancellation accidentally rescuing the handler.
         with pytest.raises(sdk.RequestError):
-            await asyncio.wait_for(asyncio.shield(loading), HANG_GUARD_SECONDS)
+            # Delivery's configured 0.1s budget must beat its 2s default.
+            await asyncio.wait_for(asyncio.shield(loading), 1.0)
         with pytest.raises(sdk.RequestError):
-            await asyncio.wait_for(asyncio.shield(prompting), HANG_GUARD_SECONDS)
+            await asyncio.wait_for(asyncio.shield(prompting), 1.0)
         await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), HANG_GUARD_SECONDS)
         assert connection.transport_dead and active.transport_dead
         assert active.completed.is_set()

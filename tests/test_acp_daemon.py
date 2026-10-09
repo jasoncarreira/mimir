@@ -960,7 +960,9 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     turn = asyncio.create_task(unrelated_turn())
     with pytest.raises(AcpDaemonError, match="authentication timed out"):
         await asyncio.wait_for(
-            daemon._run_peer(asyncio.StreamReader(), writer), HANG_GUARD_SECONDS
+            # Below the unpatched 1s abort and 2s cancel budgets; setup
+            # does no disk/network IO and all configured budgets are <=0.02s.
+            daemon._run_peer(asyncio.StreamReader(), writer), 0.5
         )
     await turn
     assert aborted.is_set()

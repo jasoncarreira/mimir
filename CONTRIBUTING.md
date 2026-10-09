@@ -102,8 +102,13 @@ the coupling instead of removing it.
 
 ### Timing in tests
 
-Outer `asyncio.wait_for` timeouts on expected results are loose hang guards,
-not latency requirements. Await tasks or signals owned by the component instead
+Outer `asyncio.wait_for` timeouts on expected results are normally loose hang
+guards, not latency requirements. Exception: when the behaviour under test is
+that a configured short timeout fires, keep the assertion guard well below the
+unpatched default and any slow regression path, or patch that slow path far
+above the guard. Never widen those guards mechanically: eventual completion
+alone does not prove that the configured timeout was honoured.
+Await tasks or signals owned by the component instead
 of sleeping before an assertion. Prove overlap and ordering by observing entry,
 exit, and state transitions rather than comparing wall-clock times. Where a
 timing sample is necessary, use the minimum, not the median, of samples.

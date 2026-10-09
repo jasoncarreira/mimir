@@ -2243,7 +2243,9 @@ async def test_scope_permission_timeout_and_late_answer_fail_closed(
         daemon.data.clear()
         task = await start_scope_permission(router, connection_id, 13, "/outside", monkeypatch, unconfined=unconfined)
         request, = messages(client)
-        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+        # The configured 0.01s permission expiry must beat a 10s regression
+        # and the unpatched default, not merely expire eventually.
+        await asyncio.wait_for(task, 2.0)
         assert messages(daemon)[-1]["result"] == {"approved": False}
         await router.route_client({
             "jsonrpc": "2.0", "id": request["id"],
