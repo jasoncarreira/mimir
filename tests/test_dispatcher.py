@@ -1753,16 +1753,47 @@ async def test_pairing_dm_reply_can_be_disabled(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("channel", ["dm-slack-G123", "discord-123", "slack-C123"])
-async def test_pairing_notifier_refuses_shared_destination(tmp_path, channel):
+@pytest.mark.parametrize("platform,author,private_channel,shared_channel", [
+    ("slack", "slack-U123", "dm-slack-D123", "dm-slack-G123"),
+    ("discord", "discord-123", "dm-discord-123", "discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123", "slack-C123"),
+])
+async def test_pairing_notifier_refuses_shared_destination(
+    tmp_path, platform, author, private_channel, shared_channel,
+):
+    from mimir.identities_populator import (
+        prepare_pairing_code_delivery, request_pairing_with_code,
+    )
+
+    # A real deliverable code keeps the worker's hash gate from masking a
+    # missing destination guard in maybe_reply_dm.
+    status, code = request_pairing_with_code(
+        tmp_path, author, platform, channel_id=private_channel, is_dm=True,
+    )
+    assert status == "changed"
+    assert code is not None
+    assert prepare_pairing_code_delivery(tmp_path, author, code) is True
     channels = _FakePairingChannels()
     notifier = _PairingNotifier(replace(_make_config(tmp_path),
         pairing_dm_auto_reply_enabled=True, pairing_dm_auto_reply_interval_seconds=0), channels)
     try:
-        await notifier.maybe_reply_dm(canonical="unknown", dm_channel_id=channel, code="ABCDEF23")
+        await notifier.maybe_reply_dm(
+            canonical=author, dm_channel_id=shared_channel, code=code,
+        )
         await notifier._dm_reply_queue.join()
         assert not channels.sent
         assert not notifier._dm_reply_sent
+        # Refusal must not consume or invalidate the valid private code.
+        assert prepare_pairing_code_delivery(tmp_path, author, code) is True
+        await notifier.maybe_reply_dm(
+            canonical=author, dm_channel_id=private_channel, code=code,
+        )
+        await notifier._dm_reply_queue.join()
+        assert channels.sent == [(
+            private_channel,
+            notifier._config.pairing_dm_auto_reply_text.replace("{code}", code),
+        )]
+        assert notifier._dm_reply_sent
     finally:
         await notifier.aclose()
 

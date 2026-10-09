@@ -1157,6 +1157,72 @@ async def test_dispatcher_and_session_callback_parity_and_order(
     ("discord", "discord-123", "dm-discord-123"),
     ("slack", "slack-U123", "dm-slack-D123"),
 ])
+async def test_runtime_pairing_multi_user_metadata_overrides_private_channel(
+    tmp_path, monkeypatch, platform, author, channel,
+):
+    from dataclasses import replace
+
+    import yaml
+    import mimir.event_logger
+    import mimir.identities_populator
+
+    events: list[tuple[str, Any]] = []
+    _patch_factory(monkeypatch, events)
+    requests = []
+    real_request = mimir.identities_populator.request_pairing_with_code
+
+    def request(*args, **kwargs):
+        requests.append(kwargs.copy())
+        return real_request(*args, **kwargs)
+
+    async def log_event(name, **kwargs):
+        events.append(("log_event", (name, kwargs)))
+
+    monkeypatch.setattr(mimir.identities_populator, "request_pairing_with_code", request)
+    monkeypatch.setattr(mimir.event_logger, "log_event", log_event)
+    adapters = replace(_adapters(events), pairing_notifier=_Notifier(events))
+    bundle = await runtime.create_agent_runtime(_config(tmp_path), _core(tmp_path), adapters)
+    inbound = SimpleNamespace(
+        author=author, author_id="123", author_display="Unknown",
+        source=platform, channel_id=channel,
+        extra={"channel_conversation_type": "multi_user"},
+    )
+    decision = SimpleNamespace(canonical_author=author, denial_reason="unknown_author")
+    try:
+        # Deliberately use a private-looking ID: the lower-level mint gate
+        # accepts it, so only runtime's metadata backstop can reject it.
+        assert mimir.identities_populator.is_private_pairing_dm(platform, channel)
+        await adapters.dispatcher._on_pairing_required(inbound, decision)
+        assert len(requests) == 1
+        assert requests[0]["is_dm"] is False
+        person = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]
+        assert person["pairing"]["status"] == "pending"
+        assert person["pairing"]["delivery"] == "public_shared_channel"
+        assert "code_hash" not in person["pairing"]
+        assert not any(kind == "reply_dm" for kind, _ in events)
+        assert [value[1]["code_issued"] for kind, value in events
+                if kind == "log_event" and value[0] == "pairing_requested"] == [False]
+
+        # Positive control: the same ID without multi-user metadata can mint
+        # and reach the notifier. No notifier destination check masks runtime.
+        inbound.extra = {}
+        await adapters.dispatcher._on_pairing_required(inbound, decision)
+        assert len(requests) == 2
+        assert requests[1]["is_dm"] is True
+        replies = [value for kind, value in events if kind == "reply_dm"]
+        assert len(replies) == 1
+        assert replies[0]["canonical"] == author
+        assert replies[0]["dm_channel_id"] == channel
+        assert replies[0]["code"]
+    finally:
+        await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,author,channel", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
 async def test_runtime_denied_dm_issues_private_code_only(
     tmp_path, monkeypatch, caplog, platform, author, channel,
 ):
