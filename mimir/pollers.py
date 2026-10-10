@@ -2340,6 +2340,7 @@ async def run_poller(
     enqueue: Callable[..., Awaitable[bool]],
     timeout: float = POLLER_TIMEOUT_SECONDS,
     home: Path | None = None,
+    operator_notice: Callable[[str], Awaitable[None]] | None = None,
 ) -> int:
     """Run one poller subprocess; parse its stdout JSONL; enqueue
     each emitted event. Returns the count of events successfully
@@ -2909,6 +2910,7 @@ async def run_poller(
     else:
         per_item_cap = None
     signals_emitted = len(delivery_barriers_accepted)
+    outsider_notices: list[str] = []
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -2987,6 +2989,22 @@ async def run_poller(
                         "signal", "poller", "prompt", "event_type", "delivery_barrier",
                     )
                 }
+            if signal_name in {
+                "github_outsider_issue_withheld",
+                "pr_auto_review_skipped_untrusted_author",
+            }:
+                from .github_withhold import sanitize_login, sanitize_url
+
+                repo = payload.get("repo")
+                number = payload.get("number")
+                payload = {
+                    "repo": repo if isinstance(repo, str) and sanitize_url(
+                        f"https://github.com/{repo}/issues/1", repo,
+                    ) else None,
+                    "number": number if type(number) is int and number > 0 else None,
+                    "author": sanitize_login(payload.get("author")),
+                    "url": sanitize_url(payload.get("url"), repo),
+                }
             try:
                 # Same ordering rule as the mid-run barrier: the receipt durably
                 # acknowledges this signal, so the signal must be durable first.
@@ -3001,6 +3019,21 @@ async def run_poller(
                     _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
                 )
                 signals_emitted += 1
+                if signal_name in {
+                    "github_outsider_issue_withheld",
+                    "pr_auto_review_skipped_untrusted_author",
+                }:
+                    from .bridges._mentions import neutralize_display_name
+                    from .github_withhold import sanitize_login, sanitize_url
+
+                    repo = payload.get("repo")
+                    url = sanitize_url(payload.get("url"), repo)
+                    if url:
+                        login = neutralize_display_name(
+                            sanitize_login(payload.get("author")),
+                        )
+                        kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+                        outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")
             except Exception as exc:  # noqa: BLE001
                 # log_event should be best-effort but defend against
                 # an unexpected payload shape (non-string keys, etc.)
@@ -3287,6 +3320,11 @@ async def run_poller(
     # Operator queries reading ``events_emitted`` for "how many items
     # came in?" should switch to ``items_collected``; queries asking
     # "how many turns will this fire?" stay on ``events_emitted``.
+    if outsider_notices and operator_notice is not None and not timed_out:
+        try:
+            await operator_notice("\n".join(outsider_notices))
+        except Exception:
+            log.warning("poller outsider operator notice delivery failed", exc_info=True)
     await log_event(
         "poller_timeout" if timed_out else "poller_complete",
         poller=poller.name,

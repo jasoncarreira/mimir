@@ -1959,6 +1959,49 @@ class _CapturingEnqueue:
 
 
 @pytest.mark.asyncio
+async def test_outsider_signals_form_mention_safe_operator_digest_without_body(
+    tmp_path: Path, home: Path,
+) -> None:
+    from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+for kind, number, login in [
+    ('github_outsider_issue_withheld', 7, '@everyone'),
+    ('pr_auto_review_skipped_untrusted_author', 8, 'outsider'),
+]:
+    print(json.dumps({{'poller': 'github-activity', 'signal': kind,
+        'repo': 'acme/widget', 'number': number, 'author': login,
+        'url': f'https://github.com/acme/widget/issues/{{number}}',
+        'body': {OUTSIDER_MARKER!r}}}))
+""")
+    cfg = PollerConfig(
+        name="github-activity", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    delivered = []
+
+    async def send(text):
+        delivered.append(text)
+
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
+    assert enq.events == []
+    assert len(delivered) == 1
+    assert delivered[0].splitlines() == [
+        "Outsider issue withheld: invalid-login https://github.com/acme/widget/issues/7",
+        "Outsider PR withheld: outsider https://github.com/acme/widget/issues/8",
+    ]
+    assert_marker_absent(delivered, _read_events(home))
+    signals = [item for item in _read_events(home) if item["type"] in {
+        "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",
+    }]
+    assert len(signals) == 2
+    assert all("body" not in signal for signal in signals)
+
+
+@pytest.mark.asyncio
 async def test_run_poller_emits_events_for_each_jsonl_line(
     tmp_path: Path, home: Path,
 ) -> None:

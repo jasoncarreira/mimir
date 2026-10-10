@@ -107,7 +107,7 @@ def test_open_pr_comment_still_emits_when_it_is_the_only_signal(
     assert captured_emits[0]["number"] == 42
 
 
-def test_pr_parent_lookup_failure_fails_open(
+def test_pr_parent_lookup_failure_waits_for_attestation(
     monkeypatch: pytest.MonkeyPatch,
     captured_emits: list[dict],
 ) -> None:
@@ -122,10 +122,14 @@ def test_pr_parent_lookup_failure_fails_open(
 
     monkeypatch.setattr(poller, "_gh_api", fake_api)
 
-    count = poller._check_issue_comments("o/r", SINCE, "t", "mimir-carreira")
+    budget = poller.TickBudget()
+    count = poller._check_issue_comments(
+        "o/r", SINCE, "t", "mimir-carreira", tick_budget=budget,
+    )
 
-    assert count == 1
-    assert captured_emits[0]["event_type"] == "issue_comment"
+    assert count == 0
+    assert captured_emits == []
+    assert budget.hard_truncated
 
 
 def test_issue_comment_is_not_suppressed_even_when_issue_is_closed(
