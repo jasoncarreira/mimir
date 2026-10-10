@@ -1245,7 +1245,8 @@ def _emit_pr_synchronize(
     related_comment: str = "",
     trust_cache: dict | None = None,
     tick_budget: TickBudget | None = None,
-) -> bool:
+) -> bool | None:
+    """Return None only when a real commit author's attestation is unavailable."""
     compare = _gh_api(
         f"repos/{repo}/compare/{previous_head}...{current_head}", token,
     )
@@ -1254,29 +1255,47 @@ def _emit_pr_synchronize(
     if isinstance(compare, dict):
         commits = compare.get("commits") or []
         total_commits = compare.get("ahead_by") or len(commits)
+    trusted_commits = []
+    withheld_count = 0
     for commit in commits:
         user = commit.get("author") or commit.get("committer") or {}
-        kept, _ = _partition_activity(
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login:
+            # Unlinked commit emails are permanently unattributable, not a
+            # retryable API failure. Never send an empty login to attestation.
+            withheld_count += 1
+            continue
+        kept, withheld = _partition_activity(
             repo, token, [dict(commit, user=user)], "comment", "",
             trust_cache, tick_budget, "push_commit_trust", since_window=False,
         )
-        if not kept:
-            return False
+        if any(item.reason == "attestation_unavailable" for item in withheld):
+            return None
+        if kept:
+            trusted_commits.append(commit)
+        else:
+            withheld_count += 1
     head_commit = commits[-1] if commits else {}
     push_author = None
-    for user in (head_commit.get("committer"), head_commit.get("author")):
-        login = user.get("login") if isinstance(user, dict) else None
-        if isinstance(login, str) and login and login != "web-flow":
-            push_author = login
-            break
+    if trusted_commits and trusted_commits[-1] is head_commit:
+        for user in (head_commit.get("committer"), head_commit.get("author")):
+            login = user.get("login") if isinstance(user, dict) else None
+            if isinstance(login, str) and login and login != "web-flow":
+                push_author = sanitize_login(login)
+                break
     if total_commits and commits:
         subjects = [
             (commit.get("commit") or {}).get("message", "").split("\n")[0][:72]
-            for commit in commits[:3]
+            for commit in trusted_commits[:3]
         ]
         bullets = "\n".join(f"  • {subject}" for subject in subjects if subject)
-        remaining = total_commits - sum(1 for subject in subjects if subject)
+        remaining = total_commits - withheld_count - sum(1 for subject in subjects if subject)
         commit_block = f"{total_commits} commit(s):\n{bullets}"
+        if withheld_count:
+            commit_block += (
+                f"\n  • {withheld_count} commit subject(s) withheld "
+                "(non-collaborator or unattributable)"
+            )
         if remaining > 0:
             commit_block += f"\n  • … ({remaining} more)"
     else:
@@ -1851,7 +1870,9 @@ def _check_pr_pushes(
                 if emitted:
                     count += 1
                     review_needed_pr_numbers.add(key)
-                new_heads[key] = current_sha if emitted else prev_sha
+                # A normal non-emit (already reviewed) is settled. Only a
+                # missing attestation for a real login needs another tick.
+                new_heads[key] = prev_sha if emitted is None else current_sha
             else:
                 new_heads[key] = current_sha
 

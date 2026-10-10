@@ -3019,7 +3019,7 @@ async def run_poller(
                     _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
                 )
                 signals_emitted += 1
-                if signal_name in {
+                if poller.name in {"github-activity", "github-ci-watch"} and signal_name in {
                     "github_outsider_issue_withheld",
                     "pr_auto_review_skipped_untrusted_author",
                 }:

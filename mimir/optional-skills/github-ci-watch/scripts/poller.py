@@ -292,7 +292,8 @@ def _check_repo(repo: str, seen: dict[str, dict]) -> None:
 
         # pull_request_target runs execute on the protected branch while using
         # outsider PR input. The branch selector alone does not exclude them.
-        if run.get("event") not in {"push", "schedule", "workflow_dispatch"}:
+        # dynamic covers repository-owned Dependabot/Dependency Graph runs.
+        if run.get("event") not in {"push", "schedule", "workflow_dispatch", "dynamic"}:
             continue
 
         if conclusion == "cancelled" and classify_cancelled_run(run, runs) in {

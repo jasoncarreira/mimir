@@ -1959,8 +1959,9 @@ class _CapturingEnqueue:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("poller_name", ["github-activity", "github-ci-watch", "unrelated-poller"])
 async def test_outsider_signals_form_mention_safe_operator_digest_without_body(
-    tmp_path: Path, home: Path,
+    tmp_path: Path, home: Path, poller_name: str,
 ) -> None:
     from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
 
@@ -1976,8 +1977,10 @@ for kind, number, login in [
         'url': f'https://github.com/acme/widget/issues/{{number}}',
         'body': {OUTSIDER_MARKER!r}}}))
 """)
+    # The subprocess claims github-activity even for the unrelated poller;
+    # only the configured poller identity may enable operator delivery.
     cfg = PollerConfig(
-        name="github-activity", command=f"{sys.executable} poller.py",
+        name=poller_name, command=f"{sys.executable} poller.py",
         cron="* * * * *", env={}, skill_dir=skill_dir,
     )
     delivered = []
@@ -1988,11 +1991,14 @@ for kind, number, login in [
     enq = _CapturingEnqueue()
     assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
     assert enq.events == []
-    assert len(delivered) == 1
-    assert delivered[0].splitlines() == [
-        "Outsider issue withheld: invalid-login https://github.com/acme/widget/issues/7",
-        "Outsider PR withheld: outsider https://github.com/acme/widget/issues/8",
-    ]
+    if poller_name == "unrelated-poller":
+        assert delivered == []
+    else:
+        assert len(delivered) == 1
+        assert delivered[0].splitlines() == [
+            "Outsider issue withheld: invalid-login https://github.com/acme/widget/issues/7",
+            "Outsider PR withheld: outsider https://github.com/acme/widget/issues/8",
+        ]
     assert_marker_absent(delivered, _read_events(home))
     signals = [item for item in _read_events(home) if item["type"] in {
         "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",

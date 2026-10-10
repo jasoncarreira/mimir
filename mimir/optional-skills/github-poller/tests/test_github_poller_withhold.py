@@ -176,21 +176,128 @@ def test_outsider_requested_pr_and_ci_are_silent(monkeypatch, capsys, trust):
     assert_marker_absent(records)
 
 
-def test_outsider_push_commit_is_deferred_without_losing_head(monkeypatch, capsys, trust):
+@pytest.mark.parametrize("user", [None, {}, {"login": ""},
+                                     {"login": "outsider"}, {"login": "github-actions[bot]"}])
+def test_mixed_push_withholds_subjects_but_emits_and_advances(
+    monkeypatch, capsys, trust, user,
+):
+    commits = [
+        {"author": {"login": "trusted"}, "commit": {"message": "Legitimate fix\nDetails"}},
+        {"author": user, "committer": None, "commit": {"message": OUTSIDER_MARKER}},
+    ]
+    compare_calls = []
+
+    def verdict(repo, author, token):
+        assert author  # An empty login must never make an attestation API call.
+        trust.append(author)
+        return author == "trusted"
+
+    monkeypatch.setattr(poller, "_github_author_is_trusted", verdict)
+
     def api(endpoint, token):
         if "/compare/" in endpoint:
-            return {"ahead_by": 1, "commits": [{
-                "user": {"login": "outsider"}, "author": {"login": "outsider"},
-                "commit": {"message": OUTSIDER_MARKER},
-            }]}
+            compare_calls.append(endpoint)
+            return {"ahead_by": 2, "commits": commits}
         return [_pr()]
 
     monkeypatch.setattr(poller, "_gh_api", api)
+    count, heads, _ = poller._check_pr_pushes(REPO, "token", "", {"8": "old-head"})
+    assert count == 1 and heads == {"8": "a" * 40}
+    record = json.loads(capsys.readouterr().out)
+    assert record["event_type"] == "pr_synchronize"
+    assert "2 commit(s):" in record["prompt"]
+    assert "Legitimate fix" in record["prompt"]
+    assert "1 commit subject(s) withheld" in record["prompt"]
+    assert "(1 more)" not in record["prompt"]
+    assert record["author"] is None
+    assert_marker_absent(record, heads)
+    count, next_heads, _ = poller._check_pr_pushes(REPO, "token", "", heads)
+    assert count == 0 and next_heads == heads
+    assert capsys.readouterr().out == ""
+    assert len(compare_calls) == 1
+    assert "" not in trust
+
+
+def test_null_login_only_push_emits_withheld_count_without_attestation(monkeypatch, capsys):
+    monkeypatch.setattr(poller, "_github_author_is_trusted",
+                        lambda *args: pytest.fail("empty login attested"))
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
+                        {"ahead_by": 1, "commits": [{"author": None, "committer": None,
+                            "commit": {"message": OUTSIDER_MARKER}}]}
+                        if "/compare/" in endpoint else [_pr()])
+    count, heads, _ = poller._check_pr_pushes(REPO, "token", "", {"8": "old-head"})
+    assert count == 1 and heads == {"8": "a" * 40}
+    record = json.loads(capsys.readouterr().out)
+    assert "1 commit subject(s) withheld" in record["prompt"]
+    assert_marker_absent(record)
+
+
+def test_push_real_login_unavailable_holds_then_recovers(monkeypatch, capsys):
+    cache = {}
+    calls = []
+    available = False
+
+    def verdict(repo, author, token):
+        calls.append(author)
+        assert author == "trusted"
+        return True if available else None
+
+    monkeypatch.setattr(poller, "_github_author_is_trusted", verdict)
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
+                        {"ahead_by": 1, "commits": [{"author": {"login": "trusted"},
+                            "commit": {"message": "Recovered fix"}}]}
+                        if "/compare/" in endpoint else [_pr()])
     count, heads, _ = poller._check_pr_pushes(
-        REPO, "token", "", {"8": "old-head"},
+        REPO, "token", "", {"8": "old-head"}, trust_cache=cache,
     )
     assert count == 0 and heads == {"8": "old-head"}
-    assert_marker_absent(capsys.readouterr().out, heads)
+    assert (REPO, "trusted") not in cache
+    assert capsys.readouterr().out == ""
+    available = True
+    count, heads, _ = poller._check_pr_pushes(REPO, "token", "", heads, trust_cache=cache)
+    assert count == 1 and heads == {"8": "a" * 40}
+    assert "Recovered fix" in json.loads(capsys.readouterr().out)["prompt"]
+    assert calls == ["trusted", "trusted"]
+
+
+def test_already_reviewed_push_advances_without_repeated_compare_or_review(monkeypatch, capsys):
+    comparisons, reviews = [], []
+
+    def api(endpoint, token):
+        if "/compare/" in endpoint:
+            comparisons.append(endpoint)
+            return {"ahead_by": 1, "commits": []}
+        return [_pr()]
+
+    def reviewed(*args, **kwargs):
+        reviews.append(args)
+        return True
+
+    monkeypatch.setattr(poller, "_gh_api", api)
+    monkeypatch.setattr(poller, "_has_current_head_review", reviewed)
+    count, heads, _ = poller._check_pr_pushes(REPO, "token", "mimir", {"8": "old-head"})
+    assert count == 0 and heads == {"8": "a" * 40}
+    count, next_heads, _ = poller._check_pr_pushes(REPO, "token", "mimir", heads)
+    assert count == 0 and next_heads == heads
+    assert len(comparisons) == len(reviews) == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_trusted_commit_push_prompt_is_unchanged(monkeypatch, trust):
+    events = []
+    commits = [{"author": {"login": "trusted"}, "committer": {"login": "trusted"},
+                "commit": {"message": f"Fix {i}\nDetails"}} for i in range(4)]
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
+                        {"ahead_by": 4, "commits": commits}
+                        if "/compare/" in endpoint else [_pr()])
+    monkeypatch.setattr(poller, "_emit", lambda prompt, **extras: events.append(prompt))
+    count, heads, _ = poller._check_pr_pushes(REPO, "token", "", {"8": "old-head"})
+    assert count == 1 and heads == {"8": "a" * 40}
+    assert events == [
+        "PR #8 updated on acme/widget: Trusted PR (by @trusted)\n"
+        "4 commit(s):\n  • Fix 0\n  • Fix 1\n  • Fix 2\n  • … (1 more)\n"
+        "Previous head: old-head, new head: aaaaaaaa\nhttps://github.com/acme/widget/pull/8"
+    ]
 
 
 def test_outsider_blocking_review_cannot_enter_own_pr_reminder(
