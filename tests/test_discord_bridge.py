@@ -977,11 +977,10 @@ async def test_on_message_skips_self(bridge_with_fake_client):
 
 @pytest.mark.asyncio
 async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
-    """A non-self bot message is dropped unless ``respond_to_bots=True``."""
+    """A non-self bot message is dropped unless channel scope sets ``allow_bots="all"``."""
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client
-    bridge.respond_to_bots = False
 
     channel = SimpleNamespace(
         id=1, type=getattr(discord.ChannelType, "text", None), name="g"
@@ -993,7 +992,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
     await bridge._on_message(msg)
     assert enqueued == []
 
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
     await bridge._on_message(msg)
     assert len(enqueued) == 1
     assert enqueued[0].author_id == "999"

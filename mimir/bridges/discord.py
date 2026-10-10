@@ -43,6 +43,7 @@ from ._emoji import resolve_for_discord
 from ._history import ChannelMessage
 from ._seen_ids import SeenIdCache
 from .base import Bridge, MessageUpdate, SendResult
+from .channel_scope import ChannelScope, admit as scope_admit
 
 log = logging.getLogger(__name__)
 
@@ -237,8 +238,8 @@ class DiscordBridge(Bridge):
         token: discord-py bot token (DISCORD_TOKEN env var).
         enqueue: dispatcher's enqueue coroutine.
         admit: optional side-effect-free dispatcher intake author gate.
-        respond_to_bots: if True, on_message accepts bot-authored messages
-            (useful for inter-bot collaboration). Default False — humans only.
+        channel_scope: operator-configured inbound policy; default admits all
+            human messages, matching the historical behavior.
         attachments_dir: when set, inbound message attachments are
             downloaded under
             ``<dir>/discord/<channel_id>/<msg_id>/<ts>-<uuid>-<name>``
@@ -251,7 +252,7 @@ class DiscordBridge(Bridge):
 
     token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
-    respond_to_bots: bool = False
+    channel_scope: ChannelScope = field(default_factory=ChannelScope)
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
@@ -883,7 +884,34 @@ class DiscordBridge(Bridge):
         ):
             return
         author_is_bot = bool(getattr(message.author, "bot", False))
-        if author_is_bot and not self.respond_to_bots:
+        channel = message.channel
+        channel_id = _channel_to_id(channel)
+        conv_type = _channel_conversation_type(channel)
+        thread_types = {
+            getattr(discord.ChannelType, name, None)
+            for name in ("public_thread", "private_thread", "news_thread")
+        }
+        parent_id = getattr(channel, "parent_id", None) if getattr(channel, "type", None) in thread_types - {None} else None
+        parent_channel_id = f"discord-{parent_id}" if parent_id is not None else None
+        own_id = getattr(client_user, "id", None)
+        reference = getattr(message, "reference", None)
+        resolved = getattr(reference, "resolved", None)
+        mentioned = own_id is not None and (
+            any(getattr(user, "id", None) == own_id for user in (getattr(message, "mentions", None) or []))
+            or getattr(getattr(resolved, "author", None), "id", None) == own_id
+        )
+        admitted, reason = scope_admit(
+            self.channel_scope, channel_id=channel_id,
+            parent_channel_id=parent_channel_id, is_dm=conv_type == "dm",
+            mentioned=mentioned, author_is_bot=author_is_bot,
+            author_id=f"discord-{getattr(message.author, 'id', '')}",
+        )
+        if not admitted:
+            await _safe_log_event(
+                "channel_scope_dropped", platform="discord", channel_id=channel_id,
+                parent_channel_id=parent_channel_id, reason=reason,
+                author_kind="bot" if author_is_bot else "human",
+            )
             return
 
         # chainlink #232: dedup before any work — Discord's resume
@@ -907,9 +935,6 @@ class DiscordBridge(Bridge):
         if source_id:
             self._inbound_claims.add(source_id)
 
-        channel = message.channel
-        channel_id = _channel_to_id(channel)
-        conv_type = _channel_conversation_type(channel)
         visibility = _channel_visibility(channel, conv_type)
         channel_name = (
             str(getattr(channel, "name", "")).strip() or None
@@ -938,7 +963,6 @@ class DiscordBridge(Bridge):
         # Platform-prefixed stable id is the matching key for cross-channel
         # / cross-platform pull (FUTURE_WORK §6.1).
         author_key = f"discord-{author_id}" if author_id else None
-        reference = getattr(message, "reference", None)
         reply_id = getattr(reference, "message_id", None)
 
         event = AgentEvent(
