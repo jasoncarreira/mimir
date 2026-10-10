@@ -20,6 +20,7 @@ from mimir.scratch_janitor import (
     sweep_scratch_roots,
 )
 from mimir.scheduler import Scheduler
+from mimir.access_control import ensure_turn_scratch
 
 
 def _age(path: Path, days: float, *, now: float) -> None:
@@ -57,6 +58,18 @@ def test_old_dir_removed_fresh_dir_kept(tmp_path: Path):
     assert result.kept == 1
     assert result.bytes_reclaimed >= 1024
     assert result.errors == ()
+
+
+def test_created_turn_scratch_is_swept_after_ttl(tmp_path: Path):
+    now = time.time()
+    turn = ensure_turn_scratch(tmp_path, "old-turn")
+    assert turn is not None
+    (turn / "note.txt").write_text("ephemeral")
+    for path in (turn / "note.txt", turn, turn.parent):
+        _age(path, 2, now=now)
+    result = sweep_scratch_roots(tmp_path, now=now)
+    assert "scratch/turns" in result.removed
+    assert not turn.exists()
 
 
 def test_nested_fresh_file_keeps_stale_looking_dir(tmp_path: Path):

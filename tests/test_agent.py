@@ -1118,6 +1118,76 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_turn_creates_scratch_before_model_and_advertises_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str,
+) -> None:
+    from mimir._context import get_current_turn
+    from mimir.access_control import current_turn_scratch_root
+
+    turn_id = "scratch-first-write"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+
+    class ScratchModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            path = tmp_path / "home" / "scratch" / "turns" / turn_id
+            assert current_turn_scratch_root() == path
+            assert get_current_turn().turn_scratch_path == path
+            assert path.stat().st_mode & 0o777 == 0o700
+            assert f"Use `{path}/`" in state["messages"][0].content
+            subprocess.run(
+                [sys.executable, "-c", "import tempfile,sys; tempfile.mkstemp(dir=sys.argv[1])", str(path)],
+                check=True,
+            )
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = ScratchModel([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    assert not (agent._config.home / "scratch").exists()
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id=turn_id)
+    assert record.error is None
+    assert len(model.invocations) == 1
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_turn_refuses_preplanted_scratch_without_advertising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str, component: str,
+) -> None:
+    from mimir.access_control import current_turn_scratch_root
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    class RefusalModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            assert current_turn_scratch_root() is None
+            assert "## Current turn scratch" not in state["messages"][0].content
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = RefusalModel([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    link = {"scratch": home / "scratch", "turns": home / "scratch" / "turns",
+            "turn": home / "scratch" / "turns" / "refused-turn"}[component]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link.symlink_to(outside, target_is_directory=True)
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id="refused-turn")
+    assert record.error is None
+    assert list(outside.iterdir()) == []
+    assert len(model.invocations) == 1
+
+
 @pytest.mark.parametrize("decision", ["approve", "decline"])
 @pytest.mark.parametrize("reply_style,request_count", [("named", 1), ("bare", 1), ("bare", 2)])
 async def test_update_reply_after_requesting_turn_ends_never_invokes_model(

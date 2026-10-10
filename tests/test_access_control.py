@@ -399,6 +399,7 @@ def test_turn_can_write_and_read_its_own_scratch_workspace(
     service = access_control.builtin_trigger_service_principal("heartbeat", home)
     auth = _service_auth(service, InformationFlowLabels())
     target = home / "scratch" / "turns" / "heartbeat-turn" / "result.json"
+    assert access_control.ensure_turn_scratch(home, "heartbeat-turn") == target.parent
     token = set_current_turn(SimpleNamespace(
         turn_id="heartbeat-turn", auth_context=auth,
     ))
@@ -421,6 +422,109 @@ def test_turn_can_write_and_read_its_own_scratch_workspace(
         assert backend.read(str(target)).file_data["content"] == '{"ok": true}\n'
     finally:
         reset_current_turn(token)
+
+
+@pytest.mark.parametrize("turn_id", ["..", "a/b", ""])
+def test_turn_scratch_rejects_invalid_id(tmp_path, monkeypatch, turn_id):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert access_control.ensure_turn_scratch(tmp_path, turn_id) is None
+    assert not (tmp_path / "scratch").exists()
+    token = set_current_turn(SimpleNamespace(turn_id=turn_id))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+def test_turn_scratch_refuses_symlinks_at_every_component(tmp_path, monkeypatch, component):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = {"scratch": home / "scratch",
+            "turns": home / "scratch" / "turns",
+            "turn": home / "scratch" / "turns" / "one"}[component]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert access_control.ensure_turn_scratch(home, "one") is None
+    assert list(outside.iterdir()) == []
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=None))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+def test_turn_scratch_creation_reuse_and_refused_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    path = access_control.ensure_turn_scratch(tmp_path, "one")
+    assert path == tmp_path / "scratch" / "turns" / "one"
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_uid == os.getuid()
+    assert access_control.ensure_turn_scratch(tmp_path, "one") == path
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=None))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=path))
+    try:
+        assert access_control.current_turn_scratch_root() == path
+        path.rmdir()
+        path.symlink_to(tmp_path)
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+def test_turn_scratch_root_lookup_never_creates_missing_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    token = set_current_turn(SimpleNamespace(turn_id="not-started"))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+        assert not (tmp_path / "scratch").exists()
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+def test_turn_scratch_refuses_non_directory(tmp_path, component):
+    entry = {"scratch": tmp_path / "scratch",
+             "turns": tmp_path / "scratch" / "turns",
+             "turn": tmp_path / "scratch" / "turns" / "one"}[component]
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("keep")
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert entry.read_text() == "keep"
+
+
+def test_turn_scratch_refuses_other_owner_and_reuses_owned_directory(tmp_path, monkeypatch):
+    path = tmp_path / "scratch" / "turns" / "one"
+    path.mkdir(parents=True, mode=0o755)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") == path
+    monkeypatch.setattr(access_control.os, "getuid", lambda: path.stat().st_uid + 1)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+
+
+def test_turn_scratch_refuses_component_replaced_between_stat_and_open(tmp_path, monkeypatch):
+    path = access_control.ensure_turn_scratch(tmp_path, "one")
+    assert path is not None
+    original_open = os.open
+    replaced = False
+
+    def replace_on_open(name, flags, *args, **kwargs):
+        nonlocal replaced
+        if name == "one" and not replaced:
+            replaced = True
+            path.rename(path.with_name("previous"))
+            path.mkdir(mode=0o700)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(access_control.os, "open", replace_on_open)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert replaced
 
 
 def test_interactive_turn_is_scoped_to_its_own_scratch_workspace(
@@ -8062,6 +8166,7 @@ def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
+    assert access_control.ensure_turn_scratch(home, "scheduler-turn") is not None
     token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
     try:
         for target in (
@@ -8231,6 +8336,7 @@ def test_static_service_write_git_metadata_exception_is_scratch_only(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
+    assert access_control.ensure_turn_scratch(home, "scheduler-turn") is not None
     token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
     try:
         allowed = registry.authorize_tool(

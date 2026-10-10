@@ -864,18 +864,91 @@ def _upgrade_proposals_root() -> Path | None:
     return (Path(home).resolve() / "scratch" / "proposals").resolve()
 
 
+def _valid_turn_scratch_id(turn_id: object) -> bool:
+    return (
+        isinstance(turn_id, str)
+        and bool(turn_id)
+        and "\x00" not in turn_id
+        and Path(turn_id).name == turn_id
+        and turn_id not in {".", ".."}
+    )
+
+
+def _turn_scratch_path(home: Path, turn_id: object, *, create: bool) -> Path | None:
+    """Check each component relative to an opened directory, without following links.
+
+    The descriptor walk also prevents a replaced parent between lstat and mkdir
+    from redirecting creation through a symlink.
+    """
+    if not _valid_turn_scratch_id(turn_id):
+        return None
+    root = Path(home).resolve()
+    fd = None
+    component = "home"
+    index = -1
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for index, component in enumerate(("scratch", "turns", turn_id)):
+            try:
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass  # Another turn may have created it; validate below.
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or (
+                index == 2 and st.st_uid != os.getuid()
+            ):
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=unsafe_entry",
+                                "turn" if index == 2 else component)
+                return None
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            opened = os.fstat(next_fd)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                os.close(next_fd)
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=changed_entry",
+                                "turn" if index == 2 else component)
+                return None
+            os.close(fd)
+            fd = next_fd
+        return root / "scratch" / "turns" / turn_id
+    except (OSError, RuntimeError) as exc:
+        if create:
+            log.warning("turn_scratch_refused component=%s reason=%s",
+                        "turn" if index == 2 else component,
+                        type(exc).__name__)
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def ensure_turn_scratch(home: Path, turn_id: str) -> Path | None:
+    """Create (or reuse) this turn's private scratch directory, or refuse it."""
+    return _turn_scratch_path(home, turn_id, create=True)
+
+
 def current_turn_scratch_root() -> Path | None:
     """Return the active turn's server-owned ordinary scratch workspace."""
     from ._context import get_current_turn
 
     home = os.environ.get("MIMIR_HOME", "").strip()
-    turn_id = getattr(get_current_turn(), "turn_id", None)
-    if not home or not isinstance(turn_id, str) or not turn_id:
+    ctx = get_current_turn()
+    turn_id = getattr(ctx, "turn_id", None)
+    if not home:
         return None
-    component = Path(turn_id)
-    if component.name != turn_id or turn_id in {".", ".."}:
+    # An explicitly refused turn cannot acquire the root later via another
+    # caller's mkdir; the current filesystem entry must still be safe as well.
+    path = _turn_scratch_path(Path(home), turn_id, create=False)
+    if ctx is not None and hasattr(ctx, "turn_scratch_path") and path != ctx.turn_scratch_path:
         return None
-    return (Path(home).resolve() / "scratch" / "turns" / turn_id).resolve()
+    return path
 
 
 def worklink_retained_checkout_root() -> Path:

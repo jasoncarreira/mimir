@@ -37,6 +37,7 @@ from mimir.access_control import (
     ChannelResourceAdapter,
     SinkGate,
     build_scheduled_tick_service_principal,
+    ensure_turn_scratch,
 )
 from mimir.agent import (
     Agent,
@@ -151,6 +152,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
     )
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
     auth = ctx.auth_context
     blocks = {
         name: _domain_block(name.upper(), name)
@@ -820,6 +822,7 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
         ifc_labels=_session_labels("ch-3"),
     )
     ctx = _make_ctx(event, saga_session_id="sess-xyz")
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
     turn_prompt, recent = await agent._build_turn_prompt(
         ctx, event, saga_block=None,
     )
