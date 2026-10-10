@@ -3811,7 +3811,7 @@ async def test_operator_read_then_review_preserves_ifc_boundaries(
         assert read.status == "error"
         assert read.content == (
             "pull request withheld: its author is not a repository collaborator; "
-            "the operator has been notified"
+            "the item was withheld and logged"
         )
         assert attacker_text not in read.content
         assert context.server_discovered_pr_states.resolve("owner/repo", 17) is None

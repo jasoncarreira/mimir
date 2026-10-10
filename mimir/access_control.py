@@ -1444,7 +1444,7 @@ def _repo_pr_scope_resolution(
             pass
         return RepoPRScopeResolution(refusal_reason=(
             "pull request withheld: its author is not a repository collaborator; "
-            "the operator has been notified"
+            "the item was withheld and logged"
         ))
     if is_remediation and principal != self_login:
         return RepoPRScopeResolution(

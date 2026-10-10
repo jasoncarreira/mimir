@@ -10063,7 +10063,7 @@ def test_outsider_pr_scope_requires_exact_attestation(
             assert resolution.scope is None
             assert resolution.refusal_reason == (
                 "pull request withheld: its author is not a repository collaborator; "
-                "the operator has been notified"
+                "the item was withheld and logged"
             )
         else:
             assert access_control.create_server_discovered_heartbeat_scope(
