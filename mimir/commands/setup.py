@@ -13,12 +13,14 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 from pathlib import Path
 from textwrap import dedent
 
 import yaml
 from dotenv import dotenv_values
 
+from ..identities_populator import _serialized_identities_write
 from ..skill_defs import seed_skills
 from ..subagent_defs import seed_subagent_defs
 from ..memory_templates import (
@@ -614,6 +616,37 @@ def _write_if_missing(path: Path, content: str, *, home: Path | None = None) -> 
     return True
 
 
+@_serialized_identities_write
+def _seed_identities(home: Path, content: str) -> bool:
+    """Publish the starter file only if absent, under the server's write lock.
+
+    A unique temporary file and an exclusive hard link make publication both
+    atomic for readers and conditional even if another creator bypasses the lock.
+    """
+    from ..access_control import publish_framework_files
+
+    path = home / "state" / "identities.yaml"
+    if path.exists():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = content.encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=".identities-seed-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+
+        def publish() -> None:
+            os.link(tmp_name, path, follow_symlinks=False)
+
+        try:
+            publish_framework_files(home, {path: body}, publish)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        os.unlink(tmp_name)
+
+
 def _ensure_env_secure(path: Path) -> None:
     """Tighten ``path`` to 0o600 (owner read-write only).
 
@@ -882,7 +915,7 @@ def setup_home(
         files_created.append("state/wiki/index.md")
     if _write_if_missing(home / "state" / "wiki" / "log.md", DEFAULT_WIKI_LOG_MD, home=home):
         files_created.append("state/wiki/log.md")
-    if _write_if_missing(home / "state" / "identities.yaml", DEFAULT_IDENTITIES_YAML, home=home):
+    if _seed_identities(home, DEFAULT_IDENTITIES_YAML):
         files_created.append("state/identities.yaml")
     if _write_if_missing(
         home / "state" / "heartbeat-backlog.md", DEFAULT_HEARTBEAT_BACKLOG, home=home

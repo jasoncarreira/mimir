@@ -52,6 +52,7 @@ import yaml
 
 from .event_logger import log_event, log_event_sync
 from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
+from .approval_requests import mint_id
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +60,12 @@ PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 _PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def is_private_pairing_dm(platform: str, channel_id: str) -> bool:
+def is_private_pairing_dm(
+    platform: str, channel_id: str, *, conversation_type: str | None = None,
+) -> bool:
     """Pairing is narrower than the cross-channel privacy filter (no MPIMs)."""
+    if conversation_type == "multi_user":
+        return False
     if platform == "slack":
         tail = channel_id.removeprefix("dm-slack-")
         return channel_id.startswith("dm-slack-D") and tail.isalnum()
@@ -99,6 +104,8 @@ def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
         changed = True
     pairing = match.get("pairing")
     if isinstance(pairing, dict):
+        if pairing.pop("request_id", None) is not None:
+            changed = True
         if pairing.get("status") != "approved":
             pairing["status"] = "approved"
             pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
@@ -152,8 +159,8 @@ def _extract_header(text: str) -> str:
 def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
     """Read identities.yaml; return ``(doc, header_text)``.
 
-    ``doc`` is the parsed YAML mapping (empty dict for missing /
-    non-mapping files). ``header_text`` is the leading comment block —
+    ``doc`` is the parsed YAML mapping (empty dict for a missing file or
+    a null/empty document). ``header_text`` is the leading comment block —
     every line from the start of the file through the last consecutive
     comment / blank line before the first document content. The header
     is preserved verbatim and prepended on write back, so the
@@ -169,27 +176,35 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       write. If that ever becomes load-bearing, the right escalation
       is ``ruamel.yaml`` round-trip mode (carries inline comments) —
       a new dependency, deferred until a real use case shows up.
-    - Treats missing / unparseable / non-mapping files as empty so a
-      fresh deployment starts clean.
+    - A missing file or a null/empty document is treated as empty;
+      a null ``people`` field is normalized to an empty list. Read errors
+      propagate so every transaction aborts rather than replacing unreadable
+      state. Invalid YAML, a non-null non-mapping root, or a non-null
+      non-list ``people`` field also aborts before any writer can reset state.
     """
-    if not path.is_file():
-        return {}, ""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("identities.yaml read failed: %s — treating as empty", exc)
+    except FileNotFoundError:
         return {}, ""
     try:
-        doc = yaml.safe_load(text) or {}
+        doc = yaml.safe_load(text)
     except yaml.YAMLError:
         log.warning("identities.yaml parse failed — refusing to overwrite")
-        # Returning a sentinel telling the caller to abort (preserve the
-        # operator's broken-but-recoverable file rather than nuke it).
+        # Preserve the operator's broken-but-recoverable file, not an empty
+        # substitute that a later transaction could publish over it.
         raise
-    header = _extract_header(text)
+    # PyYAML uses None for empty/comment-only documents and explicit null.
+    # Do not use a truthiness fallback: false, zero and [] are still invalid.
+    if doc is None:
+        doc = {}
     if not isinstance(doc, dict):
-        return {}, header
-    return doc, header
+        raise ValueError("identities.yaml root must be a mapping — refusing to overwrite")
+    if "people" in doc:
+        if doc["people"] is None:
+            doc["people"] = []
+        elif not isinstance(doc["people"], list):
+            raise ValueError("identities.yaml people must be a list — refusing to overwrite")
+    return doc, _extract_header(text)
 
 
 def _strip_value(v: Any) -> Any:
@@ -272,6 +287,80 @@ def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
+    """Keep CLI parse errors actionable while using the shared YAML loader."""
+    try:
+        doc, header = _load_yaml(yaml_path)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"identities.yaml parse failed: {exc}") from exc
+    # The shared loader validates existing fields and normalizes null people.
+    # Initialize an absent field, including the fresh, missing-file case.
+    doc.setdefault("people", [])
+    return doc, header
+
+
+@_serialized_identities_write
+def add_identity_alias(
+    home: Path, canonical: str, alias: str,
+    display_name: str | None = None, notes: str | None = None,
+) -> None:
+    """Add an operator alias in one locked read-modify-write transaction."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc["people"]
+    for entry in people:
+        for existing_alias in entry.get("aliases") or []:
+            if existing_alias == alias and entry.get("canonical") != canonical:
+                raise ValueError(
+                    f"alias {alias!r} already maps to canonical "
+                    f"{entry.get('canonical')!r}; remove it first or use a "
+                    f"different alias"
+                )
+
+    target = next((e for e in people if e.get("canonical") == canonical), None)
+    if target is None:
+        target = {"canonical": canonical, "aliases": []}
+        people.append(target)
+    if display_name:
+        target["display_name"] = display_name
+    if notes:
+        target["notes"] = notes
+    aliases = target.setdefault("aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+    _atomic_write_identities(yaml_path, header, doc)
+
+
+@_serialized_identities_write
+def remove_identity(home: Path, alias: str | None, canonical: str | None) -> str | None:
+    """Remove a canonical or alias, returning the CLI's result message."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc.get("people") or []
+    if canonical:
+        before = len(people)
+        people[:] = [p for p in people if p.get("canonical") != canonical]
+        if len(people) == before:
+            return f"(no identity with canonical {canonical!r})"
+        doc["people"] = people
+        _atomic_write_identities(yaml_path, header, doc)
+        return f"removed identity: {canonical}"
+    if alias:
+        for entry in people:
+            aliases = entry.get("aliases") or []
+            if alias in aliases:
+                aliases.remove(alias)
+                if not aliases:
+                    canonical = entry.get("canonical")
+                    people[:] = [p for p in people if p is not entry]
+                    _atomic_write_identities(yaml_path, header, doc)
+                    return f"removed alias: {alias} (and {canonical}: no aliases remained)"
+                _atomic_write_identities(yaml_path, header, doc)
+                return f"removed alias: {alias} (from {entry.get('canonical')})"
+        return f"(alias {alias!r} not found)"
+    return None
 
 
 def _default_web_key() -> str:
@@ -730,6 +819,10 @@ def request_pairing_with_code(
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
         pairing = {}
+    if pairing.get("status") == "rejected":
+        # Rejection is durable until an operator explicitly approves or removes
+        # this identity. In particular, never mint another DM code on contact.
+        return "unchanged", None
     requested_at = datetime.now(timezone.utc).isoformat()
     pending = {
         "status": "pending",
@@ -742,10 +835,24 @@ def request_pairing_with_code(
     if is_dm:
         pending["dm_channel"] = channel_id
     if pairing.get("status") != "pending":
+        existing_ids = frozenset(
+            p["pairing"]["request_id"] for p in people
+            if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+            and isinstance(p["pairing"].get("request_id"), str)
+        )
+        pending["request_id"] = mint_id("pair", excluded=existing_ids)
         pairing.update(pending)
         match["pairing"] = pairing
         changed = True
     else:
+        if not isinstance(pairing.get("request_id"), str):
+            existing_ids = frozenset(
+                p["pairing"]["request_id"] for p in people
+                if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+                and isinstance(p["pairing"].get("request_id"), str)
+            )
+            pairing["request_id"] = mint_id("pair", excluded=existing_ids)
+            changed = True
         # Keep the first requested_at for audit stability; refresh only facts
         # that can be corrected by the bridge layer.
         for key in ("platform", "author", "channel", "delivery", "dm_channel"):
@@ -810,6 +917,8 @@ def approve_pairing(
     author_or_canonical: str,
     *,
     roles: Iterable[str] = ("user",),
+    pending_only: bool = False,
+    request_id: str | None = None,
 ) -> bool:
     """Approve a pending identity by granting canonical-level access roles.
 
@@ -830,10 +939,34 @@ def approve_pairing(
     match = _find_person(people, key)
     if match is None:
         return False
+    pairing = match.get("pairing")
+    if pending_only and (not isinstance(pairing, dict) or pairing.get("status") != "pending"):
+        return False
+    if request_id is not None and (not isinstance(pairing, dict) or pairing.get("request_id") != request_id):
+        return False
 
     if not _approve_entry(match, clean_roles):
         return False
     doc["people"] = people
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
+
+
+@_serialized_identities_write
+def reject_pairing(home: Path, canonical: str, *, request_id: str | None = None) -> bool:
+    """Reject a pending pairing without granting roles or reopening on contact."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    match = _find_person(doc.get("people") or [], canonical.strip())
+    pairing = match.get("pairing") if match else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    if request_id is not None and pairing.get("request_id") != request_id:
+        return False
+    pairing["status"] = "rejected"
+    pairing["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    pairing.pop("request_id", None)
+    _clear_pairing_code(pairing)
     _atomic_write_identities(yaml_path, header, doc)
     return True
 

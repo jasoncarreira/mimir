@@ -214,6 +214,22 @@ class Identity:
     # reach this person directly without the operator pre-configuring it.
     dm_channels: dict[str, str] = field(default_factory=dict)
     web_key_labels: dict[str, str] = field(default_factory=dict)
+    pairing: PairingView | None = None
+
+
+@dataclass(frozen=True)
+class PairingView:
+    """Public metadata only: no code or private channel data crosses this boundary."""
+
+    status: str | None
+    platform: str | None
+    delivery: str | None
+    requested_at: str | None
+    request_id: str | None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {key: getattr(self, key) for key in
+                ("status", "platform", "delivery", "requested_at", "request_id")}
 
 
 @dataclass
@@ -449,6 +465,11 @@ class IdentityResolver:
                 notes = None
 
             access = self._parse_access(raw.get("access"), canonical)
+            raw_pairing = raw.get("pairing")
+            pairing = PairingView(**{
+                key: raw_pairing.get(key) if isinstance(raw_pairing.get(key), str) else None
+                for key in ("status", "platform", "delivery", "requested_at", "request_id")
+            }) if isinstance(raw_pairing, dict) else None
 
             raw_prefs = raw.get("prefs") or {}
             prefs: dict[str, object] = raw_prefs if isinstance(raw_prefs, dict) else {}
@@ -486,6 +507,7 @@ class IdentityResolver:
                 prefs=dict(prefs),
                 dm_channels=dm_channels,
                 web_key_labels=web_key_labels(aliases, raw.get("web_key_labels")),
+                pairing=pairing,
             )
             if display_name:
                 display_names[canonical] = display_name

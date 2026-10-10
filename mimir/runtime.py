@@ -482,10 +482,11 @@ async def create_agent_runtime(
                 channel_id = (event.channel_id or "").strip()
                 from .identities_populator import is_private_pairing_dm
 
-                is_dm = is_private_pairing_dm(platform, channel_id)
                 extra = getattr(event, "extra", None) or {}
-                if extra.get("channel_conversation_type") == "multi_user":
-                    is_dm = False
+                is_dm = is_private_pairing_dm(
+                    platform, channel_id,
+                    conversation_type=extra.get("channel_conversation_type"),
+                )
                 if not (
                     author
                     and platform in ("slack", "discord")
@@ -529,6 +530,10 @@ async def create_agent_runtime(
                 if status != "changed":
                     return
                 await asyncio.to_thread(core.identity_resolver.reload)
+                from .pairing_approval import sync_pending as sync_pairings
+                await asyncio.to_thread(
+                    sync_pairings, config.home, config.operator_alert_channel, core.identity_resolver,
+                )
                 canonical = (
                     getattr(decision, "canonical_author", None) or author
                 ).strip()
@@ -574,9 +579,12 @@ async def create_agent_runtime(
         async def on_unknown_sender(event: Any, decision: Any, mode: str) -> None:
             canonical = getattr(decision, "canonical_author", None) or event.author or ""
             platform = (event.source or "").strip().lower()
-            delivery = ("dm" if event.channel_id.startswith("dm-")
-                        and event.extra.get("channel_conversation_type") != "multi_user"
-                        and not event.channel_id.startswith("dm-slack-G") else "channel")
+            from .identities_populator import is_private_pairing_dm
+
+            delivery = "dm" if is_private_pairing_dm(
+                platform, event.channel_id,
+                conversation_type=event.extra.get("channel_conversation_type"),
+            ) else "channel"
             if mode == "ignore":
                 await adapters.pairing_notifier.notify_ignored(
                     canonical=canonical, platform=platform, delivery=delivery,

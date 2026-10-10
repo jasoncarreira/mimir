@@ -15,6 +15,12 @@ def _raise_unless_missing(
         raise error
 
 
-def rmtree_missing_ok(path: str | os.PathLike[str] | bytes | os.PathLike[bytes]) -> None:
+def rmtree_missing_ok(
+    path: str | os.PathLike[str] | bytes | os.PathLike[bytes],
+    *, dir_fd: int | None = None,
+) -> None:
     """Remove a tree while tolerating entries removed concurrently."""
-    shutil.rmtree(path, onerror=_raise_unless_missing)
+    shutil.rmtree(
+        path, onerror=_raise_unless_missing,
+        **({"dir_fd": dir_fd} if dir_fd is not None else {}),
+    )

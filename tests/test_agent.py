@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from langchain.agents.middleware import ToolCallRequest
 from langchain.tools import ToolRuntime
 from langgraph.runtime import Runtime
@@ -1117,6 +1118,111 @@ def _build_agent(tmp_path: Path, *,
     return a
 
 
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_turn_creates_scratch_before_model_and_advertises_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str,
+) -> None:
+    from mimir._context import get_current_turn
+    from mimir.access_control import current_turn_scratch_root
+
+    turn_id = "scratch-first-write"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+
+    class ScratchModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            path = tmp_path / "home" / "scratch" / "turns" / turn_id
+            assert current_turn_scratch_root() == path
+            assert get_current_turn().turn_scratch_path == path
+            assert path.stat().st_mode & 0o777 == 0o700
+            assert f"Use `{path}/`" in state["messages"][0].content
+            subprocess.run(
+                [sys.executable, "-c", "import tempfile,sys; tempfile.mkstemp(dir=sys.argv[1])", str(path)],
+                check=True,
+            )
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = ScratchModel([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    assert not (agent._config.home / "scratch").exists()
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id=turn_id)
+    assert record.error is None
+    assert len(model.invocations) == 1
+
+
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_reused_scratch_protected_during_setup(tmp_path, monkeypatch, trigger):
+    import time
+    import mimir.agent as agent_module
+    from mimir.scratch_janitor import sweep_scratch_roots
+
+    turn_id = "reused-old-turn"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    model = _FakeAgent([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    turn = agent._config.home / "scratch" / "turns" / turn_id
+    turn.mkdir(parents=True)
+    turn.chmod(0o755)
+    old = time.time() - 5 * 86400
+    os.utime(turn, (old, old))
+    original = agent_module.ensure_turn_scratch
+    inspections = []
+
+    def sweep_during_ensure(home, requested_id):
+        result = sweep_scratch_roots(home)
+        assert result.protected == (f"scratch/turns/{turn_id}",)
+        assert turn.exists()
+        inspections.append(result)
+        return original(home, requested_id)
+
+    monkeypatch.setattr(agent_module, "ensure_turn_scratch", sweep_during_ensure)
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id=turn_id)
+    assert record.error is None
+    assert len(model.invocations) == 1
+    assert len(inspections) == 1
+    assert turn.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_turn_refuses_preplanted_scratch_without_advertising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trigger: str, component: str,
+) -> None:
+    from mimir.access_control import current_turn_scratch_root
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    class RefusalModel(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            assert current_turn_scratch_root() is None
+            assert "## Current turn scratch" not in state["messages"][0].content
+            async for chunk in super().astream(
+                state, config=config, context=context, stream_mode=stream_mode,
+            ):
+                yield chunk
+
+    model = RefusalModel([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    link = {"scratch": home / "scratch", "turns": home / "scratch" / "turns",
+            "turn": home / "scratch" / "turns" / "refused-turn"}[component]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link.symlink_to(outside, target_is_directory=True)
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id="refused-turn")
+    assert record.error is None
+    assert list(outside.iterdir()) == []
+    assert len(model.invocations) == 1
+
+
 @pytest.mark.parametrize("decision", ["approve", "decline"])
 @pytest.mark.parametrize("reply_style,request_count", [("named", 1), ("bare", 1), ("bare", 2)])
 async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
@@ -1230,10 +1336,64 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
 
 
 @pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_pairing_reply_bypasses_model_and_reloads_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+):
+    import threading
+
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir import approval_requests, pairing_approval
+
+    model = _FakeAgent([AIMessage(content="model must not handle pairing")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    channel = f"discord-pair-ops-{tmp_path.name}"
+    agent._config.operator_alert_channel = channel
+    identity = _resolver(home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    agent._identity_resolver = identity
+    request_pairing_with_code(home, "discord-123", "discord", channel_id="dm-discord-123", is_dm=True)
+    identity.reload()
+    request_id = identity.identity("discord-123").pairing.request_id
+    loop_thread = threading.get_ident()
+    sync_threads = []
+    original_sync = pairing_approval.sync_pending
+
+    def checked_sync(*args, **kwargs):
+        sync_threads.append(threading.get_ident())
+        assert sync_threads[-1] != loop_thread, "pairing sync ran on the event loop"
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(pairing_approval, "sync_pending", checked_sync)
+    notices = []
+
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+
+    agent._dispatcher = SimpleNamespace(_send_approval_notice=send_notice)
+    monkeypatch.setattr("mimir.agent._initialize_ifc_labels", lambda *args, **kwargs: pytest.fail("pairing entered model turn"))
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"{decision} {request_id}",
+    ))
+    assert record.kind == "operator_approval"
+    assert sync_threads, "agent reply did not synchronize pending pairings"
+    assert notices == [(channel, record.output)]
+    assert identity.identity("discord-123").pairing.status == ("approved" if decision == "approve" else "rejected")
+    assert identity.access_metadata("discord-123").roles == (("user",) if decision == "approve" else ())
+    assert request_id not in {entry.approval_id for entry in approval_requests.pending(channel)}
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
 async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
 ):
     from mimir import approval_requests
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir.pairing_approval import sync_pending as sync_pairings
 
     channel = f"discord-op-e2e-{tmp_path.name}"
     model = _FakeAgent([AIMessage(content="live-turn path")])
@@ -1243,6 +1403,14 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     aliases: [discord-99]
     access: {roles: [admin]}
 """)
+
+    agent._config.operator_alert_channel = channel
+    request_pairing_with_code(
+        agent._config.home, "discord-123", "discord",
+        channel_id="dm-discord-123", is_dm=True,
+    )
+    sync_pairings(agent._config.home, channel, agent._identity_resolver)
+    pair_id = agent._identity_resolver.identity("discord-123").pairing.request_id
 
     def unexpected_resolution(*args):
         pytest.fail("turn-bound request resolved by standalone pre-turn path")
@@ -1259,9 +1427,10 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
         ))
         assert result.error is None
         assert len(model.invocations) == 1
-        assert approval_requests.pending(channel) == (entry,)
+        assert {e.approval_id for e in approval_requests.pending(channel)} == {entry.approval_id, pair_id}
     finally:
         approval_requests.cancel(entry.approval_id)
+        approval_requests.cancel(pair_id)
 
 
 def test_agent_audience_provider_reuses_message_buffer_identity_resolver(
@@ -1396,7 +1565,7 @@ async def test_user_turn_saga_query_overlaps_prompt_loaders(
         trigger="user_message", channel_id="ch-overlap", content="remember this",
         extra={"event_ts_iso": "2026-09-25T12:00:00Z"},
     )
-    await asyncio.wait_for(agent.run_turn(event), timeout=2)
+    await asyncio.wait_for(agent.run_turn(event), timeout=HANG_GUARD_SECONDS)
 
     prompt = fake_agent.invocations[0]["state"]["messages"][0].content
     assert prompt.index("## Possibly relevant memories") < prompt.index("## Today's date")
@@ -5400,7 +5569,7 @@ async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
 
     event = AgentEvent(trigger="user_message", channel_id="ch-1", content="first")
     task = asyncio.create_task(agent.run_turn(event))
-    await asyncio.wait_for(fake_saga.started.wait(), timeout=1.0)
+    await asyncio.wait_for(fake_saga.started.wait(), timeout=HANG_GUARD_SECONDS)
 
     assert _mti.inject_message(
         "ch-1",
@@ -5408,7 +5577,7 @@ async def test_run_turn_arms_injection_before_saga_setup(tmp_path: Path):
     ) == "injected"
 
     fake_saga.release.set()
-    record = await asyncio.wait_for(task, timeout=2.0)
+    record = await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS)
 
     assert record.injected_inputs
     assert "during setup" in record.injected_inputs[0]["text"]
@@ -5465,7 +5634,7 @@ async def test_run_turn_drains_startup_queued_followups(tmp_path: Path, author):
         assert q.qsize() == 1
         assert q.get_nowait().author == author
         q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 async def test_run_turn_does_not_drain_startup_followups_for_non_user_turn(

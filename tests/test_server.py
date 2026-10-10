@@ -35,6 +35,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -623,6 +624,104 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
     assert dm_task is not None and dm_task.done()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert_channel", ["discord-ops", "slack-ops"])
+@pytest.mark.parametrize("display,cleaned", [
+    ("@everyone <@&123> [x](https://evil)", "everyone &123 xhttps://evil"),
+    ("<!channel> <!subteam^S123|@devs>", "!channel !subteam^S123|devs"),
+    ("Alice\u202ediscord-999\u202c\u200b", "Alicediscord-999"),
+])
+async def test_pairing_operator_alert_neutralizes_sender_display_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alert_channel: str, display: str, cleaned: str,
+) -> None:
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(
+        SimpleNamespace(home=tmp_path, operator_alert_channel=alert_channel,
+                        pairing_operator_digest_delay_seconds=60.0), channels,
+    )
+    try:
+        await notifier.notify_operator(
+            canonical="discord-123", display=display,
+            platform="discord", channel_id="discord-1", delivery="dm",
+        )
+        await notifier.flush_operator_alerts()
+        channels.send.assert_awaited_once()
+        assert channels.send.await_args.args[0] == alert_channel
+        alert = channels.send.await_args.args[1]
+        assert "@everyone" not in alert and "<@&" not in alert and "](" not in alert
+        assert "<!channel" not in alert and "<!subteam" not in alert
+        assert f"discord-123 ({cleaned}; discord; DM)" in alert
+        assert "mimir identities approve-pairing discord-123" in alert
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_alert_constructs_and_reloads_resolver_off_loop(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    loop_thread = threading.get_ident()
+    operations = []
+
+    class Resolver:
+        def __init__(self, home):
+            assert home == tmp_path
+            assert threading.get_ident() != loop_thread
+            operations.append("construct")
+
+        def reload(self):
+            assert threading.get_ident() != loop_thread
+            operations.append("reload")
+
+        def identity(self, canonical):
+            return SimpleNamespace(pairing=SimpleNamespace(request_id="pair-abcd"))
+
+    monkeypatch.setattr("mimir.identities.IdentityResolver", Resolver)
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(SimpleNamespace(
+        home=tmp_path, operator_alert_channel="discord-ops",
+        pairing_operator_digest_delay_seconds=60.0,
+    ), channels)
+    try:
+        await notifier.notify_operator(canonical="discord-123", display="Alice",
+                                       platform="discord", channel_id="discord-1", delivery="dm")
+        await notifier.flush_operator_alerts()
+        assert operations == ["construct", "reload"]
+        assert "approve pair-abcd" in channels.send.await_args.args[1]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.parametrize("codepoint", [
+    0x00AD, 0x061C, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+    0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF,
+])
+def test_neutralize_display_name_strips_bidi_and_format_characters(codepoint):
+    import unicodedata
+    from mimir.bridges._mentions import neutralize_display_name
+
+    char = chr(codepoint)
+    assert unicodedata.category(char) == "Cf"
+    assert neutralize_display_name(f"Alice{char}discord-999") == "Alicediscord-999"
+
+
+def test_neutralize_display_name_removes_controls_collapses_spaces_and_caps_length():
+    from mimir.bridges._mentions import neutralize_display_name
+
+    assert neutralize_display_name("  A\x00\n  B\t @here  ") == "A B here"
+    assert neutralize_display_name("Z" * 90) == "Z" * 64
+
+
 @dataclass
 class _ServerControl:
     events: list[str] = field(default_factory=list)
@@ -831,11 +930,15 @@ def _controlled_server_app(
             app.router.add_get("/chat/stream", ok)
 
     class DiscordBridge:
+        name = "discord"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("discord")
 
     class SlackBridge:
+        name = "slack"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("slack")
@@ -1242,6 +1345,46 @@ def test_optional_feedback_bridges_receive_core_identity_resolver(
     for bridge in optional_bridges:
         assert bridge.kwargs["enqueue"] == app["dispatcher"].enqueue
         assert bridge.kwargs["admit"] == app["dispatcher"].intake_admits
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platforms,enforced,open_bridge,alert_channel,expected", [
+    (("discord",), True, False, "", True),
+    (("slack",), False, False, "", True),
+    (("discord", "slack"), True, False, "", True),
+    (("discord", "slack"), False, True, "", False),
+    ((), True, False, "", False),
+    (("discord", "slack"), True, False, "ops", False),
+])
+async def test_startup_warns_only_for_enforced_pairing_without_alert_channel(
+    tmp_path, monkeypatch, caplog, platforms, enforced, open_bridge, alert_channel, expected,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true" if enforced else "false")
+    monkeypatch.setenv("MIMIR_OPEN_BRIDGE", "true" if open_bridge else "false")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", alert_channel)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(optional_bridges=True),
+    )
+    app["channels"]._bridges = [
+        bridge for bridge in app["channels"].bridges()
+        if getattr(bridge, "name", None) not in ("discord", "slack")
+        or bridge.name in platforms
+    ]
+    try:
+        with caplog.at_level("WARNING", logger="mimir.server"):
+            await _run_startup(app)
+        warnings = [record.message for record in caplog.records
+                    if record.name == "mimir.server" and "Pairing requests from new users" in record.message]
+        events = [fields for kind, fields in control.event_payloads
+                  if kind == "pairing_alert_channel_missing"]
+        assert len(warnings) == len(events) == int(expected)
+        if expected:
+            assert "MIMIR_OPERATOR_ALERT_CHANNEL" in warnings[0]
+            assert "/app/admin/users" in warnings[0]
+            assert "mimir identities list" in warnings[0]
+            assert events == [{"platforms": sorted(platforms)}]
+    finally:
+        await _run_cleanup(app)
 
 
 def test_route_and_hook_parity_with_runtime_proxies(
@@ -1812,7 +1955,7 @@ async def test_notification_finishing_during_cleanup_preserves_clean_marker(
     monkeypatch.setattr(mimir.liveness, "write_session_marker", write_session_marker)
 
     await _run_startup(app)
-    await asyncio.wait_for(notify_started.wait(), timeout=1.0)
+    await asyncio.wait_for(notify_started.wait(), timeout=HANG_GUARD_SECONDS)
     await _run_cleanup(app)
 
     marker = mimir.liveness.read_session_marker(tmp_path)

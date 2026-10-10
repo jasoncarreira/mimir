@@ -31,6 +31,7 @@ from mimir.models import AgentEvent, SessionACL
 from mimir.saga.ownership import is_user_accessible
 from mimir.web_contracts import validate_api_envelope, validate_live_event
 from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, WORKLINK_HINT_EXTRA_KEYS
+from tests.timing import HANG_GUARD_SECONDS, wait_until
 
 
 class StubChatSkillRegistry:
@@ -736,14 +737,14 @@ async def test_send_fans_out_to_authenticated_subscribers(authed_bridge_app):
         assert resp.content_type == "text/event-stream"
         assert resp.headers["X-Accel-Buffering"] == "no"
 
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: len(bridge._subscribers) == 1)
         await bridge.send("web-other", "not for this user")
         result = await bridge.send("web-foo", "hello there")
         assert result.sent is True
 
-        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         while chunk and not chunk.startswith(b"data:"):
-            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         assert chunk.startswith(b"data: ")
         payload = json.loads(chunk[len(b"data: "):].strip())
         validate_live_event(payload)
@@ -771,7 +772,7 @@ async def test_chat_stream_rejects_when_subscriber_cap_reached(authed_bridge_app
     async with TestClient(TestServer(a)) as client:
         resp1 = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
         assert resp1.status == 200
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: len(bridge._subscribers) == 1)
         assert len(bridge._subscribers) == 1
 
         resp2 = await client.get("/chat/stream", headers={"X-API-Key": "stream-secret"})
@@ -809,11 +810,11 @@ async def test_stream_auth_uses_header_not_query_param(authed_bridge_app):
         assert resp.status == 200
         assert resp.content_type == "text/event-stream"
 
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: len(bridge._subscribers) == 1)
         await bridge.send("web-foo", "header authed")
-        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         while chunk and not chunk.startswith(b"data:"):
-            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         payload = json.loads(chunk[len(b"data: "):].strip())
         assert payload["text"] == "header authed"
 
@@ -843,12 +844,12 @@ async def test_react_emits_event(tmp_path):
 
     async with TestClient(TestServer(a)) as client:
         resp = await client.get("/chat/stream")
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: len(bridge._subscribers) == 1)
         ok = await bridge.react("web-x", "msg-1", "👍")
         assert ok is True
-        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         while chunk and not chunk.startswith(b"data:"):
-            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         payload = json.loads(chunk[len(b"data: "):].strip())
         validate_live_event(payload)
         assert payload["kind"] == "chat.reaction"
@@ -1182,9 +1183,9 @@ async def test_authenticated_stream_only_receives_own_web_channel(tmp_path):
 
         await bridge.send("web-bob", "bob secret")
         await bridge.send("web-alice", "alice visible")
-        chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         while chunk and not chunk.startswith(b"data:"):
-            chunk = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+            chunk = await asyncio.wait_for(resp.content.readline(), timeout=HANG_GUARD_SECONDS)
         payload = json.loads(chunk[len(b"data: "):].strip())
 
     assert payload["channel_id"] == "web-alice"

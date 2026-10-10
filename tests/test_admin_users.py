@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir import web_ui
+from mimir.dispatcher import Dispatcher
+from mimir.models import AgentEvent
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.identities_populator import issue_web_key
+from mimir.identities_populator import request_pairing_with_code
 from mimir.server import _make_auth_middleware
 
 MASTER = "master-secret"
@@ -52,12 +56,68 @@ async def test_admin_users_routes_require_admin(tmp_path: Path) -> None:
                              json={"canonical": "bob"})).status == 403
         assert (await c.post("/api/v1/admin/users/revoke", headers={"X-API-Key": user_key},
                              json={"canonical": "alice"})).status == 403
+        for action in ("approve", "reject"):
+            assert (await c.post(f"/api/v1/admin/users/pairing/{action}",
+                                 headers={"X-API-Key": user_key},
+                                 json={"canonical": "alice", "role": "user"})).status == 403
         # no key → 401
         assert (await c.get("/api/v1/admin/users")).status == 401
         # admin user → 200
         assert (await c.get("/api/v1/admin/users", headers={"X-API-Key": admin_key})).status == 200
         # master key (admin) → 200
         assert (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).status == 200
+
+
+async def test_pairing_routes_sanitize_approve_reject_and_reload(tmp_path: Path) -> None:
+    for platform, author, dm in (("discord", "discord-123", "dm-discord-123"),
+                                 ("slack", "slack-U1", "dm-slack-D1")):
+        status, code = request_pairing_with_code(
+            tmp_path, author, platform, channel_id=dm, is_dm=True,
+        )
+        assert status == "changed" and code
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        listing = _data(await (await c.get("/api/v1/admin/users", headers={"X-API-Key": MASTER})).json())
+        blob = json.dumps(listing)
+        assert all(secret not in blob for secret in ("code_hash", "code_salt", "code_expires_at", code))
+        for person in listing["users"]:
+            assert set(person["pairing"]) == {"status", "platform", "delivery", "requested_at", "request_id"}
+            assert person["pairing"]["request_id"].startswith("pair-")
+        resolver = c.server.app["identity_resolver"]
+        dispatcher = object.__new__(Dispatcher)
+        dispatcher._identity_resolver = resolver
+        dispatcher._config = SimpleNamespace(access_control_enforced=True, open_bridge=False)
+        for author, role, expected in (("discord-123", "user", ("user",)),
+                                       ("slack-U1", "admin", ("user", "admin"))):
+            event = AgentEvent(trigger="user_message", source=author.split("-")[0],
+                               author=author, channel_id="public", content="hello")
+            assert not dispatcher.intake_admits(event)
+            assert not resolver.is_authorized(author)
+            response = await c.post("/api/v1/admin/users/pairing/approve",
+                                    headers={"X-API-Key": MASTER}, json={"canonical": author, "role": role})
+            assert response.status == 200
+            assert resolver.access_metadata(author).roles == expected
+            assert dispatcher.intake_admits(event)
+            assert resolver.identity(author).pairing.request_id is None
+            assert (await c.post("/api/v1/admin/users/pairing/approve",
+                                 headers={"X-API-Key": MASTER},
+                                 json={"canonical": author, "role": "admin"})).status == 404
+            assert resolver.access_metadata(author).roles == expected
+
+    request_pairing_with_code(tmp_path, "discord-456", "discord", channel_id="dm-discord-456", is_dm=True)
+    async with TestClient(TestServer(_app(tmp_path))) as c:
+        response = await c.post("/api/v1/admin/users/pairing/reject",
+                                headers={"X-API-Key": MASTER}, json={"canonical": "discord-456"})
+        assert response.status == 200
+        ident = c.server.app["identity_resolver"].identity("discord-456")
+        assert ident.pairing.status == "rejected" and ident.pairing.request_id is None
+        assert not ident.access.roles
+        assert (await c.post("/api/v1/admin/users/pairing/reject",
+                             headers={"X-API-Key": MASTER},
+                             json={"canonical": "discord-456"})).status == 404
+        before = (tmp_path / "state" / "identities.yaml").read_bytes()
+        assert request_pairing_with_code(tmp_path, "discord-456", "discord",
+                                         channel_id="dm-discord-456", is_dm=True) == ("unchanged", None)
+        assert (tmp_path / "state" / "identities.yaml").read_bytes() == before
 
 
 async def test_list_never_returns_key_material(tmp_path: Path) -> None:

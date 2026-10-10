@@ -55,6 +55,7 @@ from mimir.pollers import (
     _github_author_is_trusted,
     _github_content_author,
     _github_framework_trigger_is_trusted,
+    _drop_superseded_github_framework_items,
     _github_recovery_relevance_check,
     _kill_process_group,
     _parse_poller_authority,
@@ -65,6 +66,52 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
+
+
+def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.repo_tools import _record_verified_push, was_verified_push
+    from mimir.models import InformationFlowState
+
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
+    old, pushed = "a" * 40, "c" * 40
+    scope = RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="owner/repo", canonical_root="/unused",
+        canonical_origin="https://github.com/owner/repo.git", principal="mimir-bot",
+        event_type="pr_ci_failure", allowed_operations=frozenset({RepoPRAction.INSPECT.value}),
+        pr_number=987654, head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/issue-987654", observed_head_sha=old,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    item = {"event_type": "pr_ci_failure", "repo": scope.canonical_repo,
+            "number": scope.pr_number, "head_sha": old}
+    batch = [{"prompt": "stale", "extras": item}]
+    assert _drop_superseded_github_framework_items(batch) == batch
+    # Simulates record_own_push after a push that verified the remote contains
+    # the new HEAD and proved the previous head an ancestor.
+    ifc = InformationFlowState()
+    ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
+    _record_verified_push(scope, old, pushed, fast_forward=True)
+    assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
+    assert _drop_superseded_github_framework_items(batch) == []
+    current = {**item, "head_sha": pushed}
+    assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
+
+    monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
+    event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                       extra={"items": [item]})
+    service = SimpleNamespace(authority_profile="github")
+    assert access_control._repo_review_state_from_event(event, service) is None
+    assert events == [
+        ("github_stale_trigger_dropped", {
+            "stage": stage, "reason": "superseded_by_verified_own_push",
+        }) for stage in ("poller_fire", "scope_binding")
+    ]
+
+
 from mimir.access_control import (
     CapabilityTier,
     SinkGate,
@@ -1909,6 +1956,99 @@ class _CapturingEnqueue:
     async def __call__(self, event: AgentEvent) -> bool:
         self.events.append(event)
         return self.accept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("poller_name", ["github-activity", "github-ci-watch", "unrelated-poller"])
+async def test_outsider_signals_form_mention_safe_operator_digest_without_body(
+    tmp_path: Path, home: Path, poller_name: str,
+) -> None:
+    from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+for kind, number, login in [
+    ('github_outsider_issue_withheld', 7, '@everyone'),
+    ('pr_auto_review_skipped_untrusted_author', 8, 'outsider'),
+]:
+    print(json.dumps({{'poller': 'github-activity', 'signal': kind,
+        'repo': 'acme/widget', 'number': number, 'author': login,
+        'url': f'https://github.com/acme/widget/issues/{{number}}',
+        'body': {OUTSIDER_MARKER!r}}}))
+""")
+    # The subprocess claims github-activity even for the unrelated poller;
+    # only the configured poller identity may enable operator delivery.
+    cfg = PollerConfig(
+        name=poller_name, command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    delivered = []
+
+    async def send(text):
+        delivered.append(text)
+
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
+    assert enq.events == []
+    if poller_name == "unrelated-poller":
+        assert delivered == []
+    else:
+        assert len(delivered) == 1
+        assert delivered[0].splitlines() == [
+            "Outsider issue withheld: invalid-login https://github.com/acme/widget/issues/7",
+            "Outsider PR withheld: outsider https://github.com/acme/widget/issues/8",
+        ]
+    assert_marker_absent(delivered, _read_events(home))
+    signals = [item for item in _read_events(home) if item["type"] in {
+        "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",
+    }]
+    assert len(signals) == 2
+    assert all("body" not in signal for signal in signals)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_name", [
+    "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",
+])
+@pytest.mark.parametrize("unsafe_url", [
+    "https://github.com/foreign/repo/issues/7",
+    "javascript:alert(1)",
+])
+async def test_outsider_notice_rejects_foreign_and_javascript_urls(
+    tmp_path: Path, home: Path, signal_name: str, unsafe_url: str,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{'signal': {signal_name!r}, 'repo': 'acme/widget',
+    'number': 7, 'author': 'outsider', 'url': {unsafe_url!r}}}))
+print(json.dumps({{'signal': {signal_name!r}, 'repo': 'acme/widget',
+    'number': 8, 'author': 'outsider',
+    'url': 'https://github.com/acme/widget/issues/8'}}))
+""")
+    cfg = PollerConfig(
+        name="github-activity", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    delivered = []
+
+    async def send(text):
+        delivered.append(text)
+
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
+    assert enq.events == []
+    kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+    assert delivered == [
+        f"Outsider {kind} withheld: outsider https://github.com/acme/widget/issues/8",
+    ]
+    assert all(unsafe_url not in text for text in delivered)
+    signals = [item for item in _read_events(home) if item["type"] == signal_name]
+    assert len(signals) == 2
+    assert signals[0]["url"] is None
+    assert signals[1]["url"] == "https://github.com/acme/widget/issues/8"
+    assert unsafe_url not in json.dumps(signals)
 
 
 @pytest.mark.asyncio

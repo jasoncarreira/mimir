@@ -18,6 +18,7 @@ from mimir import web_ui
 from mimir.server import (_is_admin_required, _make_auth_middleware,
                           _web_session_post, _web_session_get, _web_session_delete)
 from mimir.web_ui import _whoami_payload, web_gate_active
+from tests.timing import HANG_GUARD_SECONDS
 
 
 def test_legacy_dashboard_auth_exchanges_and_deletes_stored_key():
@@ -700,7 +701,7 @@ async def test_user_live_events_endpoint_filters_every_poll_to_own_channel(
 
     async def read_data(response) -> dict:
         while True:
-            line = await asyncio.wait_for(response.content.readline(), timeout=2)
+            line = await asyncio.wait_for(response.content.readline(), timeout=HANG_GUARD_SECONDS)
             assert line, "live-events stream ended before another event arrived"
             if line.startswith(b"data: "):
                 return json.loads(line.removeprefix(b"data: "))

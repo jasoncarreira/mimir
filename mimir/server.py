@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .background_tasks import cancel_background_tasks, spawn_background
+from .bridges._mentions import neutralize_display_name
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
@@ -145,6 +146,7 @@ class _PairingNotifier:
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
         self._ignored_notified: set[str] = set()
+        self._operator_unrouted: set[str] = set()
         self._operator_cap_notified = False
         self._dm_reply_sent: set[tuple[str, str]] = set()
         self._decline_sent: set[str] = set()
@@ -189,12 +191,18 @@ class _PairingNotifier:
             return
         alert_channel = (self._config.operator_alert_channel or "").strip()
         if not alert_channel:
+            if canonical not in self._operator_unrouted:
+                self._operator_unrouted.add(canonical)
+                await log_event(
+                    "pairing_alert_unrouted", canonical=canonical,
+                    platform=platform, delivery=delivery,
+                )
             return
         self._operator_notified.add(canonical)
         self._operator_pending.append(
             {
                 "canonical": canonical,
-                "display": display.strip() or canonical,
+                "display": neutralize_display_name(display) or canonical,
                 "platform": platform.strip() or "unknown",
                 "channel_id": channel_id.strip(),
                 "delivery": delivery,
@@ -217,7 +225,14 @@ class _PairingNotifier:
         if not self._operator_pending:
             return
         pending, self._operator_pending = self._operator_pending, []
-        lines = ["Pairing approval needed:"]
+        lines = ["Unknown sender intake:"]
+        from .identities import IdentityResolver
+        def load_resolver():
+            resolver = IdentityResolver(self._config.home)
+            resolver.reload()
+            return resolver
+
+        resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
             if "ignored" in item:
                 lines.append(
@@ -226,11 +241,23 @@ class _PairingNotifier:
                 )
                 continue
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
+            identity = resolver.identity(item["canonical"])
+            request_id = identity.pairing.request_id if identity and identity.pairing else None
             lines.append(
                 "- "
-                f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
-                f"- approve: mimir identities approve-pairing {item['canonical']}"
+                f"{item['canonical']} ({item['display']}; {item['platform']}; {where})"
             )
+            if request_id:
+                lines.append(f"  reply: approve {request_id} / decline {request_id}")
+            lines.append("  dashboard: /app/admin/users")
+            if item["delivery"] == "dm":
+                lines.append("  cli: mimir identities approve-pairing --code <the code they received>, "
+                             f"or mimir identities approve-pairing {item['canonical']}")
+                lines.append(
+                    "  They were sent a pairing code; ask them for it to confirm it's really them."
+                )
+            else:
+                lines.append(f"  cli: mimir identities approve-pairing {item['canonical']}")
         try:
             await self._channels.send(
                 self._config.operator_alert_channel,
@@ -268,7 +295,8 @@ class _PairingNotifier:
             "Pairing pending cap reached: new unknown contacts are being "
             f"dropped without pending entries (max={self._config.pairing_pending_max}). "
             f"Latest dropped contact came from {platform or 'unknown'} via {where}. "
-            "Clear/approve pending pairings or raise MIMIR_PAIRING_PENDING_MAX."
+            "Clear/approve pending pairings at /app/admin/users or raise "
+            "MIMIR_PAIRING_PENDING_MAX."
         )
         try:
             await self._channels.send(alert_channel, text, final=True)
@@ -325,9 +353,13 @@ class _PairingNotifier:
         if not canonical or canonical in self._decline_sent:
             return
         # Refuse ambiguous/forged destinations before the send worker sees them.
+        from .identities_populator import is_private_pairing_dm
+
         if platform not in {"discord", "slack"} or not author_id or not (
-            channel_id.startswith(f"dm-{platform}-") if delivery == "dm"
-            else channel_id.startswith(f"{platform}-")
+            is_private_pairing_dm(platform, channel_id) if delivery == "dm"
+            else channel_id.startswith(f"{platform}-") or (
+                platform == "slack" and channel_id.startswith(("dm-slack-G", "dm-slack-C", "dm-slack-D"))
+            )
         ):
             await log_event(
                 "inbound_decline_failed", source=platform, channel_id=channel_id,
@@ -343,7 +375,9 @@ class _PairingNotifier:
     async def _send_decline(self, item: tuple[str, ...]) -> None:
         _, canonical, platform, delivery, channel_id, author_id, text = item
         # Literal operator text, never interpreted as a platform mention.
-        text = text.replace("@", "@\u200b") if platform == "discord" else text.replace("<", "&lt;")
+        from .bridges._mentions import neutralize_decline_text
+
+        text = neutralize_decline_text(platform, text)
         reason = "delivery_failed"
         try:
             if delivery == "dm":
@@ -1444,11 +1478,17 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
+    async def github_outsider_notice(text: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if channel:
+            await channels.send(channel, text, final=True)
+
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
         home=config.home,
         scheduler_tz=config.scheduler_tz,
+        operator_notice=github_outsider_notice,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:
@@ -1474,15 +1514,27 @@ def build_app(config: Config) -> web.Application:
     # paths under attachments/outbound/ — created lazily on first use.
     attachments_inbound = config.home / "attachments" / "inbound"
 
+    # A rejected operator policy disables BOTH chat bridges. Never fall back
+    # to unrestricted intake for either one after a configuration error.
+    from .config import load_channel_scopes
+    try:
+        channel_scopes = load_channel_scopes(config.home)
+    except (ValueError, OSError, RuntimeError) as exc:
+        scope_path = os.environ.get("MIMIR_CHANNEL_SCOPE_FILE", "/etc/mimir/channel-scope.yaml")
+        log.error("channel scope rejected at %s: %s", scope_path, exc)
+        log_event_sync("channel_scope_config_rejected", path=scope_path, reason=str(exc))
+        channel_scopes = None
+
     # DiscordBridge — opt-in via DISCORD_TOKEN. Import is deferred so absent
     # discord-py doesn't crash deployments that don't use Discord.
-    if config.discord_token:
+    if config.discord_token and channel_scopes is not None:
         try:
             from .bridges.discord import DiscordBridge
 
             channels.register(
                 DiscordBridge(
                     token=config.discord_token,
+                    channel_scope=channel_scopes["discord"],
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
                     attachments_dir=attachments_inbound,
@@ -1500,13 +1552,14 @@ def build_app(config: Config) -> web.Application:
     # SlackBridge — opt-in via SLACK_BOT_TOKEN + SLACK_APP_TOKEN. Both required
     # because we use Socket Mode (no public webhook needed). Same deferred-
     # import pattern as Discord.
-    if config.slack_bot_token and config.slack_app_token:
+    if config.slack_bot_token and config.slack_app_token and channel_scopes is not None:
         try:
             from .bridges.slack import SlackBridge
 
             channels.register(
                 SlackBridge(
                     bot_token=config.slack_bot_token,
+                    channel_scope=channel_scopes["slack"],
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
@@ -1521,7 +1574,7 @@ def build_app(config: Config) -> web.Application:
                 "skipping SlackBridge. Install with `pip install mimir[slack]`.",
                 exc,
             )
-    elif config.slack_bot_token or config.slack_app_token:
+    elif channel_scopes is not None and (config.slack_bot_token or config.slack_app_token):
         log.warning(
             "Slack tokens partially configured (bot=%s, app=%s) — both required for "
             "Socket Mode. Skipping SlackBridge.",
@@ -1823,6 +1876,21 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         startup_state.phase = "bridge_connect"
         startup_state.bridges_connect_attempted = True
+        pairing_platforms = sorted({
+            bridge.name for bridge in channels.bridges()
+            if getattr(bridge, "name", None) in ("discord", "slack")
+        })
+        if (
+            (config.access_control_enforced or not config.open_bridge)
+            and pairing_platforms
+            and not (config.operator_alert_channel or "").strip()
+        ):
+            log.warning(
+                "Pairing requests from new users will not be surfaced: set "
+                "MIMIR_OPERATOR_ALERT_CHANNEL; review pending requests at "
+                "/app/admin/users or with mimir identities list."
+            )
+            await log_event("pairing_alert_channel_missing", platforms=pairing_platforms)
         await channels.connect_all()
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).

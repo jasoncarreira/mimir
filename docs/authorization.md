@@ -445,6 +445,28 @@ fetch adapter, and every redirect hop must independently be an exact approved or
 approved-and-ingested URL. `http://` URLs, userinfo, and explicit ports do not
 populate the set. A new turn starts with an empty set.
 
+### Egress veto shadow telemetry (#1903)
+
+After untrusted active ingest, the proposed egress veto is measured **only**:
+`fetch_url` outside verbatim-ingest URLs and approved fetch URLs (including poller
+`approved_urls`), `web_search` outside its fixed URL, `webhook`/`http_request`
+outside `MIMIR_EGRESS_APPROVED_URLS`, and cross-channel/DM `send_message` carrying
+private-source labels without a sink approval or declassification. Same-channel
+replies and clean turns do not generate a would-block. This telemetry does not
+refuse a call or change any existing shadow/enforced decision.
+
+Each `egress_veto_would_block` event includes the tool, sink category, trigger,
+service principal/poller, destination **host only** for URLs, missed exemption,
+reason, untrusted source metadata and whether the actual decision allowed it.
+The `origin` field distinguishes model `tool_call` egress from `harness` delivery;
+opaque repository source IDs retain their `#pull/N@sha` attribution. Destination
+hosts are IDNA-normalised, falling back to the raw host on encoding errors.
+To review counts by tool, host, trigger/poller, reason and origin without writing
+to the agent home, run `mimir stats --home <home> --egress-shadow` (optionally
+`--since 2026-10-09T00:00:00Z`). Historical events without an origin are grouped
+under `origin=-`; `--since` without `--egress-shadow` is an error. Arming an actual
+veto requires a separate operator decision.
+
 ### Ingest acknowledgement
 
 `clear_ingest_taint` is a model tool for an authenticated, non-service admin on
@@ -494,6 +516,24 @@ approval for one hour. The existing
 the lockout. Add `--admin` for both `user` and `admin`. The identities populator
 may add aliases and metadata but preserves operator-managed access fields.
 
+Admins can also review pending Discord and Slack pairings in the admin Users page:
+Approve grants `user`, Grant admin requires confirmation and grants `user` plus
+`admin`, and Reject blocks subsequent contact from reopening the pairing. The
+page shows the request ID and metadata, never the DM code or its hash. When an
+operator alert channel is configured, an authenticated admin may reply there
+with `approve pair-xxxx` or `decline pair-xxxx`; chat approval grants `user`
+only. IDs expire after seven days for chat replies, but the page and CLI still
+work. No model tool can approve or reject pairings.
+
+Pairing digests in the operator alert channel list the request ID for chat
+approval, `/app/admin/users` for dashboard review, and CLI approval by canonical
+identity (or, for 1:1 DMs, by the code supplied privately by the sender). The
+digest never includes the code. When intake is enforced (`MIMIR_ACCESS_CONTROL_ENFORCED`
+or `MIMIR_OPEN_BRIDGE=false`) and a Discord or Slack bridge is enabled, configure
+`MIMIR_OPERATOR_ALERT_CHANNEL` so pending requests are surfaced. Without it, the
+server warns at startup and logs each new pending request as unrouted; review
+pending identities at `/app/admin/users` or with `mimir identities list`.
+
 ### Denied-user handling
 
 #### Unknown senders
@@ -530,7 +570,7 @@ Only the operator can change this file; model file tools cannot write it.
 | `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | `30.0` | Global DM response interval, clamped to zero or greater. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is \`{code}\` (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM response template; `{code}` is replaced, or a code line is appended if absent. |
-| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message; enforced Discord/Slack intake warns at startup. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | empty | Enables identity alias/metadata discovery. It does not grant roles. |
 
 ### HTTP identity and transport

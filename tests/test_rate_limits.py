@@ -553,8 +553,11 @@ def test_render_omits_status_when_allowed():
     assert "20% used" in line
 
 
-def test_render_humanizes_resets_in_minutes_or_hours():
-    now = int(time.time())
+def test_render_humanizes_resets_in_minutes_or_hours(monkeypatch):
+    # Expected fragments sit exactly on minute/hour boundaries. Both fixture
+    # construction and rendering must share a clock, even across a slow CI tick.
+    now = 1_000_000
+    monkeypatch.setattr("mimir.rate_limits.time.time", lambda: now)
     cases = [
         (now + 30, "in 30s"),
         (now + 90, "in 1m"),

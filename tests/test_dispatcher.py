@@ -18,6 +18,7 @@ from mimir.identities import IdentityResolver
 from mimir.models import AgentEvent
 from mimir.server import _PairingNotifier
 from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
+from tests.timing import HANG_GUARD_SECONDS, wait_until
 
 
 def _make_config(home: Path, **overrides) -> Config:
@@ -103,7 +104,7 @@ async def test_event_observer_failure_is_observed(tmp_path: Path, monkeypatch):
         completed = asyncio.Event()
         tasks[0].add_done_callback(lambda task: completed.set())
         release.set()
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=HANG_GUARD_SECONDS)
         assert not disp._bg_tasks
         assert failures == [("background_task_failed", {
             "name": "dispatcher-event-observer",
@@ -131,12 +132,12 @@ async def test_drain_cancels_retained_event_observer(tmp_path: Path, retire_work
     await disp.enqueue(AgentEvent(
         channel_id="c1", source="api", trigger="user_message", content="hello",
     ))
-    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     tasks = tuple(disp._bg_tasks)
     try:
         if retire_workers:
             await asyncio.wait_for(
-                asyncio.gather(*disp._workers.values()), timeout=3,
+                asyncio.gather(*disp._workers.values()), timeout=HANG_GUARD_SECONDS,
             )
             assert not disp._workers
         await disp.drain(timeout=1)
@@ -357,7 +358,7 @@ async def test_separate_channels_run_concurrently(tmp_path: Path):
     await started.wait()
     # slow channel is parked; a different channel must still progress
     await disp.enqueue(AgentEvent(trigger="x", channel_id="fast", content="0"))
-    await asyncio.wait_for(second_started.wait(), timeout=1.0)
+    await asyncio.wait_for(second_started.wait(), timeout=HANG_GUARD_SECONDS)
     assert finished == ["fast"]
     release.set()
     await disp.drain()
@@ -410,7 +411,7 @@ async def test_event_enqueued_during_worker_retire_is_not_stranded(
     # Buggy version strands "raced" → drain()'s queue.join() hangs; guard it
     # so the test fails on the assertion rather than hanging the suite.
     try:
-        await asyncio.wait_for(disp.drain(), timeout=3.0)
+        await asyncio.wait_for(disp.drain(), timeout=HANG_GUARD_SECONDS)
     except asyncio.TimeoutError:
         pass
 
@@ -649,7 +650,7 @@ async def test_drain_completes_when_run_turn_is_cancelled(tmp_path: Path):
     )
     # Bound the drain so the deadlock-shape test fails fast rather than
     # hanging the test runner.
-    await asyncio.wait_for(disp.drain(), timeout=2.0)
+    await asyncio.wait_for(disp.drain(), timeout=HANG_GUARD_SECONDS)
     assert cancelled_count == 1
 
 
@@ -791,7 +792,7 @@ class TestSchedulerTickSerialization:
             ))
             # User turn proceeds even though scheduler is holding the
             # scheduler-tick lock.
-            await asyncio.wait_for(user_started.wait(), timeout=1.0)
+            await asyncio.wait_for(user_started.wait(), timeout=HANG_GUARD_SECONDS)
             assert completed == ["user"]
         finally:
             release_scheduler.set()
@@ -853,13 +854,13 @@ class TestSchedulerTickSerialization:
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-1", content="", source="api",
         ))
-        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        await asyncio.wait_for(first_started.wait(), timeout=HANG_GUARD_SECONDS)
         await disp.enqueue(AgentEvent(
             trigger="user_message", channel_id="discord-2", content="", source="api",
         ))
         # Second user_message proceeds in parallel — no scheduler-tick
         # mutex constrains it.
-        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        await asyncio.wait_for(second_started.wait(), timeout=HANG_GUARD_SECONDS)
         assert completed == ["c2"]
         release.set()
         await disp.drain()
@@ -886,8 +887,8 @@ async def test_drain_does_not_purge_dict_entries_for_busy_channels(
     )
     # Worker is parked in runner — closed flag not yet set.
     drain_task = asyncio.create_task(disp.drain())
-    # Brief yield to ensure drain started.
-    await asyncio.sleep(0.02)
+    # Observe the drain's own closed flag before checking its queues.
+    await wait_until(lambda: disp._closed)
     # Channel is still tracked while drain is waiting.
     assert "c-busy" in disp._queues
     release.set()
@@ -1648,6 +1649,131 @@ class _FakePairingChannels:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id,is_dm", [
+    ("discord", "discord-123", "dm-discord-123", True),
+    ("slack", "slack-U123", "dm-slack-D123", True),
+    ("discord", "discord-123", "discord-C123", False),
+    ("slack", "slack-U123", "slack-C123", False),
+])
+async def test_pairing_digest_lists_approval_paths_without_exposing_code(
+    tmp_path, monkeypatch, platform, canonical, channel_id, is_dm,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    status, code = request_pairing_with_code(
+        tmp_path, canonical, platform, channel_id=channel_id,
+        author_display="New user", is_dm=is_dm,
+    )
+    assert status == "changed"
+    assert (code is not None) == is_dm
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    request_id = resolver.identity(canonical).pairing.request_id
+    stored_secrets = ()
+    if is_dm:
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        operator_alert_channel="ops", pairing_operator_digest_delay_seconds=60), channels)
+    try:
+        await notifier.notify_operator(
+            canonical=canonical, display="New user", platform=platform,
+            channel_id=channel_id, delivery="dm" if is_dm else "public_shared_channel",
+        )
+        if code is not None:
+            # Even if future wiring supplies a code to the digest queue, it stays private.
+            notifier._operator_pending[0]["code"] = code
+        await notifier.flush_operator_alerts()
+        assert len(channels.sent) == 1
+        digest = channels.sent[0][1]
+        assert digest.index(f"{canonical} (New user; {platform};") < digest.index(
+            f"reply: approve {request_id} / decline {request_id}"
+        ) < digest.index("dashboard: /app/admin/users") < digest.index(
+            f"cli: mimir identities approve-pairing"
+        )
+        assert f"mimir identities approve-pairing {canonical}" in digest
+        for value in stored_secrets:
+            assert value not in digest
+        if is_dm:
+            assert "; DM)" in digest
+            assert "mimir identities approve-pairing --code <the code they received>" in digest
+            assert "They were sent a pairing code; ask them for it to confirm it's really them." in digest
+            assert code not in digest
+        else:
+            assert f"; {channel_id})" in digest
+            assert "--code" not in digest
+            assert "ask them for it" not in digest
+        assert events == [("pairing_operator_alert_sent", {"count": 1, "channel_id": "ops"})]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_pairing_without_alert_channel_records_unrouted_once_per_canonical(
+    tmp_path, monkeypatch, platform, canonical, channel_id,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path), operator_alert_channel=""), channels)
+    try:
+        status, code = request_pairing_with_code(
+            tmp_path, canonical, platform, channel_id=channel_id, is_dm=True,
+        )
+        assert status == "changed" and code
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (code, pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+        for _ in range(2):
+            await notifier.notify_operator(
+                canonical=canonical, display=canonical, platform=platform,
+                channel_id=channel_id, delivery="dm",
+            )
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        assert resolver.identity(canonical).pairing.status == "pending"
+        assert channels.sent == []
+        unrouted = [(kind, fields) for kind, fields in events
+                    if kind == "pairing_alert_unrouted"]
+        assert unrouted
+        for value in stored_secrets:
+            assert value not in json.dumps(unrouted)
+        assert events == [("pairing_alert_unrouted", {
+            "canonical": canonical, "platform": platform, "delivery": "dm",
+        })]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
     tmp_path: Path, monkeypatch,
 ):
@@ -1670,7 +1796,8 @@ async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
             channel_id=f"slack-C{i}",
             delivery="public_shared_channel",
         )
-    await asyncio.sleep(0.05)
+    assert notifier._operator_task is not None
+    await asyncio.wait_for(notifier._operator_task, HANG_GUARD_SECONDS)
 
     operator_sends = [s for s in channels.sent if s[0] == "dm-slack-OPS"]
     assert len(operator_sends) == 1
@@ -1719,6 +1846,7 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "Pairing pending cap reached" in channels.sent[0][1]
     assert "max=1" in channels.sent[0][1]
     assert "slack-C1" in channels.sent[0][1]
+    assert "/app/admin/users" in channels.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -1950,7 +2078,30 @@ async def test_startup_principal_boundary_preserves_fifo(tmp_path, author):
     assert [queue.get_nowait(), queue.get_nowait()] == events[1:]
     queue.task_done()
     queue.task_done()
-    await asyncio.wait_for(queue.join(), timeout=1)
+    await asyncio.wait_for(queue.join(), timeout=HANG_GUARD_SECONDS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["c1", "c2"])
+async def test_pairing_sync_is_operator_channel_only_and_offloaded(tmp_path, monkeypatch, channel):
+    import threading
+
+    disp = Dispatcher(replace(_inj_config(tmp_path, ("c",)), operator_alert_channel="c1"))
+    disp._in_flight.add(channel)
+    _arm_authenticated_injection(disp, tmp_path)
+    loop_thread = threading.get_ident()
+    calls = []
+
+    def sync(home, operator_channel, resolver):
+        assert threading.get_ident() != loop_thread
+        calls.append((home, operator_channel, resolver))
+
+    monkeypatch.setattr("mimir.pairing_approval.sync_pending", sync)
+    monkeypatch.setattr("mimir.mid_turn_injection.inject_authenticated_message", lambda *args: "injected")
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id=channel, content="follow-up", author="alice",
+    ))
+    assert calls == ([(tmp_path, "c1", disp._identity_resolver)] if channel == "c1" else [])
 
 
 @pytest.mark.asyncio
@@ -2043,7 +2194,7 @@ async def test_leftover_injection_reroutes_ahead_of_later_queued_event(tmp_path:
 
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), runner)
     await disp.enqueue(AgentEvent(trigger="user_message", channel_id="c1", content="turn1"))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     assert "c1" in disp._in_flight
 
     # Two follow-ups arrive mid-turn and are accepted as injections, but the
@@ -2185,7 +2336,7 @@ async def test_drain_startup_user_messages_drains_contiguous_user_prefix(tmp_pat
 
     assert [e.content for e in drained] == ["follow-1", "follow-2"]
     assert q.qsize() == 0
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 @pytest.mark.asyncio
@@ -2206,7 +2357,7 @@ async def test_drain_startup_user_messages_stops_at_non_user_boundary(tmp_path: 
     assert [q.get_nowait().content, q.get_nowait().content] == ["react", "follow-2"]
     q.task_done()
     q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 # ─── chainlink #384: force_new_turn (deferred messages) ──────────────
@@ -2250,7 +2401,7 @@ async def test_drain_startup_treats_force_new_turn_as_boundary(tmp_path: Path):
     assert [q.get_nowait().content, q.get_nowait().content] == ["deferred", "behind"]
     q.task_done()
     q.task_done()
-    await asyncio.wait_for(q.join(), timeout=1.0)
+    await asyncio.wait_for(q.join(), timeout=HANG_GUARD_SECONDS)
 
 
 # ─── chainlink #510: bounded graceful drain ──────────────────────────
@@ -2271,7 +2422,7 @@ async def test_drain_timeout_cancels_slow_inflight_turn(tmp_path: Path):
 
     disp = Dispatcher(cfg, runner)
     await disp.enqueue(AgentEvent(trigger="x", channel_id="c1", content="slow"))
-    await asyncio.wait_for(started.wait(), timeout=2)  # ensure it's in-flight
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)  # ensure it's in-flight
 
     # This outer bound is a hang guard, not a latency assertion. Cancellation
     # state below witnesses that the dispatcher's 0.2s timeout fired.
@@ -2481,7 +2632,7 @@ intake:
     class Bridge:
         async def resolve_dm_channel(self, author_id):
             resolved.append(author_id)
-            return "dm-discord-D1"
+            return "dm-discord-101"
 
         async def send_ephemeral(self, channel_id, user_id, text):
             ephemeral.append((channel_id, user_id, text))
@@ -2511,7 +2662,7 @@ intake:
 
     disp.set_on_pairing_required(lambda event, decision: _record_pairing(pairing, event))
     disp.set_on_unknown_sender(on_unknown)
-    channel = f"dm-{platform}-D1" if delivery == "dm" else f"{platform}-C1"
+    channel = ("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1"
     event = AgentEvent(trigger="user_message", source=platform, channel_id=channel,
                        author=f"{platform}-U1", author_id="U1", author_display="PRIVATE DISPLAY",
                        content="PRIVATE CONTENT")
@@ -2534,7 +2685,7 @@ intake:
                 assert ephemeral == [(channel, "U1", "Fixed refusal")]
                 assert sends == []
             else:
-                assert sends == [(channel if delivery == "dm" else "dm-discord-D1", "Fixed refusal")]
+                assert sends == [(channel if delivery == "dm" else "dm-discord-101", "Fixed refusal")]
                 assert resolved == (["U1"] if delivery == "channel" else [])
     finally:
         await notifier.aclose()
@@ -2576,7 +2727,7 @@ async def test_decline_failure_stays_private_and_denied(tmp_path, monkeypatch, p
             text=resolver.decline_text())
     disp.set_on_unknown_sender(on_unknown)
     event = AgentEvent(trigger="user_message", source=platform,
-        channel_id=f"dm-{platform}-D1" if delivery == "dm" else f"{platform}-C1",
+        channel_id=("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1",
         author=f"{platform}-U1", author_id="U1", content="do not log me")
     try:
         assert not disp.intake_admits(event)
@@ -2648,7 +2799,7 @@ async def test_decline_interval_survives_worker_restart(tmp_path):
     try:
         for name in ("discord-U1", "discord-U2"):
             await notifier.maybe_decline(canonical=name, platform="discord", delivery="dm",
-                channel_id="dm-discord-D1", author_id=name, text="Fixed refusal")
+                channel_id="dm-discord-101", author_id=name, text="Fixed refusal")
             await notifier._dm_reply_queue.join()  # force a worker restart
         assert len(starts) == 2
         assert starts[1] - starts[0] >= 0.045

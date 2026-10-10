@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
@@ -81,6 +84,163 @@ _PERMISSION_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_PYTEST_NODE_ID = re.compile(r"[A-Za-z0-9_./:\[\]=,+-]{1,256}", re.ASCII)
+_PYTEST_SUMMARY_HEADER = re.compile(r"^=+ short test summary info =+$")
+_PYTEST_SECTION_END = re.compile(r"^=+ .+ =+$")
+_PYTEST_COUNTS = re.compile(r"\b(\d+) (failed|errors?|passed|skipped)\b")
+_PYTEST_FINAL_LINE = re.compile(r"^=+ (.+) =+$")
+_PYTEST_QUIET_FINAL = re.compile(
+    r"(?:\d+ (?:failed|errors?|passed|skipped|deselected|xfailed|xpassed|warnings?)"
+    r"(?:, )?)+ in \d+(?:\.\d+)?s(?: \([^\r\n]*\))?"
+)
+_PYTEST_FAILING_BYTES = 4_096
+
+
+def pytest_node_inventory(root: Path) -> frozenset[str]:
+    """Read definitions from controller-owned source, never importing test code.
+
+    No symlink or hidden/cache tree is followed. Resource limits fail closed;
+    unsupported dynamic test definitions are omitted rather than trusted.
+    """
+    nodes: set[str] = set()
+    entries = 0
+    total_bytes = 0
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return frozenset()
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.')
+                             and d not in {'node_modules', '__pycache__', 'venv', 'site-packages'}
+                             and not (Path(directory) / d).is_symlink())
+            entries += len(dirs) + len(files)
+            if entries > 100_000:
+                return frozenset()
+            for name in sorted(files):
+                if not (name.startswith('test_') or name.endswith('_test.py')) or not name.endswith('.py'):
+                    continue
+                path = Path(directory) / name
+                if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+                    continue
+                size = path.stat().st_size
+                total_bytes += size
+                if size > 2_000_000 or total_bytes > 64_000_000:
+                    return frozenset()
+                relative = path.relative_to(root).as_posix()
+                try:
+                    tree = ast.parse(path.read_bytes())
+                except (SyntaxError, ValueError, UnicodeError, MemoryError, RecursionError):
+                    # A parse bomb (deep nesting) must not crash repo_test; its
+                    # definitions are simply never trusted.
+                    continue
+                for definition in tree.body:
+                    if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)) and definition.name.startswith('test'):
+                        nodes.add(f'{relative}::{definition.name}')
+                    elif isinstance(definition, ast.ClassDef) and definition.name.startswith('Test'):
+                        for method in definition.body:
+                            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) and method.name.startswith('test'):
+                                nodes.add(f'{relative}::{definition.name}::{method.name}')
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(nodes)
+
+
+_NODE_INVENTORY_CACHE_SIZE = 32
+_NODE_INVENTORIES: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
+
+
+def _inventory_key(root: Path, scope_id: str) -> tuple[str, str]:
+    # Normalise so the runner's resolved root and the classifier's lease path
+    # always agree; a mismatch would silently make every failure untrusted.
+    return (str(Path(root).resolve()), scope_id)
+
+
+def remember_node_inventory(root: Path, scope_id: str, inventory: frozenset[str]) -> None:
+    """Record the inventory captured before a run for the result classifier."""
+    try:
+        key = _inventory_key(root, scope_id)
+    except (OSError, RuntimeError):
+        return
+    _NODE_INVENTORIES[key] = inventory
+    _NODE_INVENTORIES.move_to_end(key)
+    while len(_NODE_INVENTORIES) > _NODE_INVENTORY_CACHE_SIZE:
+        _NODE_INVENTORIES.popitem(last=False)
+
+
+def recorded_node_inventory(root: Path, scope_id: str) -> frozenset[str] | None:
+    """Return the pre-run inventory, or ``None`` when no run recorded one.
+
+    ``None`` is distinct from an empty inventory: a miss must make the whole
+    result untrusted, including a summary whose ``failing`` list is empty.
+    """
+    try:
+        key = _inventory_key(root, scope_id)
+    except (OSError, RuntimeError):
+        # e.g. a symlink loop planted out of band: fail closed, never crash
+        # result classification.
+        return None
+    return _NODE_INVENTORIES.get(key)
+
+
+def validated_pytest_node(candidate: str, inventory: frozenset[str]) -> str | None:
+    """Remove parameter prose; only return a real leased-source definition."""
+    if _PYTEST_NODE_ID.fullmatch(candidate) is None:
+        return None
+    base, bracket, parameter = candidate.partition('[')
+    if bracket and (not parameter.endswith(']') or len(parameter[:-1]) > 64
+                    or '[' in parameter or ']' in parameter[:-1]):
+        return None
+    if base not in inventory:
+        return None
+    return base
+
+
+def pytest_failure_summary(
+    stdout: bytes, inventory: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Extract numeric observations and source-validated ids from untrusted output.
+
+    A plugin may forge sections/counts, so section position is not an attestation.
+    Only source definitions cross the boundary; counts remain observations.
+    """
+    lines = stdout.decode("utf-8", errors="replace").splitlines()
+    failing: list[str] = []
+    dropped = 0
+    # Read the last section, but validate every id against pre-execution source.
+    failing_bytes = 0
+    starts = [i for i, line in enumerate(lines) if _PYTEST_SUMMARY_HEADER.fullmatch(line)]
+    if starts:
+        for line in lines[starts[-1] + 1:]:
+            if _PYTEST_SECTION_END.fullmatch(line):
+                break
+            if line.startswith(("FAILED ", "ERROR ")):
+                # Pytest may append ' - reason'; never parse the reason as an id.
+                candidate = line.split(" ", 1)[1].split(" - ", 1)[0]
+                node = validated_pytest_node(candidate, inventory)
+                if node is None:
+                    dropped += 1
+                elif node in failing:
+                    continue
+                elif len(failing) < 50 and failing_bytes + len(node) <= _PYTEST_FAILING_BYTES:
+                    failing.append(node)
+                    failing_bytes += len(node)
+                else:
+                    dropped += 1
+    counts: dict[str, int | None] = dict.fromkeys(("failed", "errors", "passed", "skipped"))
+    for line in reversed(lines):
+        match = _PYTEST_FINAL_LINE.fullmatch(line)
+        if match is not None:
+            text = match[1]
+        elif _PYTEST_QUIET_FINAL.fullmatch(line):
+            text = line
+        else:
+            continue
+        found = _PYTEST_COUNTS.findall(text)
+        if found:
+            for amount, kind in found:
+                if len(amount) <= 9:
+                    counts["errors" if kind in {"error", "errors"} else kind] = int(amount)
+            break
+    return {**counts, "failing": failing, "failing_dropped": dropped}
 
 
 class ProjectTestRefusal(RuntimeError):
@@ -96,10 +256,12 @@ class ProjectTestRefusal(RuntimeError):
         message: str,
         *,
         execution_started: bool = True,
+        fixed_message: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.execution_started = execution_started
+        self.fixed_message = fixed_message
 
 
 @dataclass(frozen=True)
@@ -129,6 +291,7 @@ class ProjectTestResult:
     stdout_path: str = ""
     stderr_path: str = ""
     suite: str = "default"
+    failure_summary: dict[str, object] | None = None
 
 
 ContainedRunner = Callable[..., Awaitable[CollectedExecutionResult]]
@@ -579,8 +742,12 @@ class RepoProjectTests:
             raise ProjectTestRefusal(
                 exc.code,
                 str(exc),
-                execution_started=True,
+                execution_started=exc.execution_started,
+                fixed_message=exc.fixed_message,
             ) from exc
+        # Capture controller source before any worker/plugin can execute.
+        node_inventory = await asyncio.to_thread(pytest_node_inventory, root)
+        remember_node_inventory(root, scope.scope_id, node_inventory)
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
             source_paths=(os.environ.get("MIMIR_HOME", ""),),
@@ -609,6 +776,7 @@ class RepoProjectTests:
                 "test_snapshot_credentials_refused",
                 "project test snapshot contains credential-like material",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
         except SnapshotEmbeddedRepository as exc:
             # Distinct from the generic branch below on purpose: this one is an
@@ -625,6 +793,7 @@ class RepoProjectTests:
                 "test_snapshot_embedded_repository",
                 "project test snapshot source contains an embedded Git repository",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
         except (ContainedSnapshotError, OSError, RuntimeError, ValueError) as exc:
             await safe_log_event(
@@ -637,6 +806,7 @@ class RepoProjectTests:
                 "test_snapshot_unavailable",
                 "project test snapshot is unavailable",
                 execution_started=True,
+                fixed_message=True,
             ) from exc
 
         identifier = str(uuid.uuid4())
@@ -676,11 +846,13 @@ class RepoProjectTests:
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             raise ProjectTestRefusal(
                 "test_config_invalid",
                 "project test command or environment contains a controller path",
                 execution_started=True,
+                fixed_message=True,
             )
         result: CollectedExecutionResult | None = None
         try:
@@ -735,6 +907,7 @@ class RepoProjectTests:
                     "test_containment_unavailable",
                     "contained project test execution is unavailable",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             if result.exit_code not in {None, 0}:
                 diagnostic = _permission_diagnostic_from_error(result.stderr)
@@ -765,6 +938,7 @@ class RepoProjectTests:
                     "test_snapshot_cleanup_failed",
                     "project test snapshot cleanup failed",
                     execution_started=True,
+                    fixed_message=True,
                 ) from exc
             finally:
                 if result is None or not result.timed_out:
@@ -808,6 +982,7 @@ class RepoProjectTests:
                 False, code, result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
+                failure_summary=(pytest_failure_summary(result.stdout, node_inventory) if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
         if not retained and not selectors and is_default:
@@ -818,6 +993,7 @@ class RepoProjectTests:
                     "inactive_checkout",
                     "the checkout has no current HEAD",
                     execution_started=True,
+                    fixed_message=True,
                 )
             self._state.record_full_test(scope.scope_id, head)
         return ProjectTestResult(

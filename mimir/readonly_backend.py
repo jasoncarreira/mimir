@@ -1775,7 +1775,37 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
             self.grep, pattern, path, glob, before_context, after_context,
         )
 
+    def _git_metadata_write_denied(self, file_path: str) -> bool:
+        """Git metadata is controller-owned, even in shadow enforcement mode.
+
+        Check both the request and its resolved destination so a worktree
+        symlink cannot make lease integrity records model-writable. This also
+        protects .git pointer files and routes rooted inside a Git directory.
+        """
+        root = str(self.cwd).rstrip("/")
+        key = file_path
+        if key == root or key.startswith(root + "/"):
+            key = key[len(root):]
+        lexical = self.cwd / key.lstrip("/")
+        denied = ".git" in lexical.parts
+        try:
+            denied = denied or ".git" in lexical.resolve(strict=False).parts
+        except (OSError, RuntimeError, ValueError):
+            # Existing path-confinement guards own unresolved/outside paths.
+            # Do not mislabel their refusals as Git metadata violations.
+            pass
+        if denied:
+            from .tools.budget_gate import _emit_hard_boundary_denied
+
+            _emit_hard_boundary_denied(
+                tool="filesystem_write", boundary="git_metadata",
+                reason="git_metadata_readonly", target=file_path,
+            )
+        return denied
+
     def write(self, file_path: str, content: str) -> WriteResult:
+        if self._git_metadata_write_denied(file_path):
+            return WriteResult(error="Write denied: git_metadata_readonly")
         result = _exclusive_write(self.cwd, file_path, content)
         if result is _WRITE_COLLISION:
             return WriteResult(error=_WRITE_COLLISION)
@@ -1787,6 +1817,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         return await asyncio.to_thread(self.write, file_path, content)
 
     def replace(self, file_path: str, content: str) -> WriteResult:
+        if self._git_metadata_write_denied(file_path):
+            return WriteResult(error="Write denied: git_metadata_readonly")
         return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes)
 
     async def areplace(self, file_path: str, content: str) -> WriteResult:
@@ -1799,6 +1831,8 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
+        if self._git_metadata_write_denied(file_path):
+            return EditResult(error="Edit denied: git_metadata_readonly")
         try:
             return super().edit(file_path, old_string, new_string, replace_all)
         except ValueError as e:
@@ -1811,7 +1845,15 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
-        return await super().aedit(file_path, old_string, new_string, replace_all)
+        return await asyncio.to_thread(self.edit, file_path, old_string, new_string, replace_all)
+
+    def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        if any(self._git_metadata_write_denied(path) for path, _ in files):
+            return [FileUploadResponse(path=path, error="permission_denied") for path, _ in files]
+        return super().upload_files(files)
+
+    async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
+        return await asyncio.to_thread(self.upload_files, files)
 
 
 def _normalize_writable_dir(name: str) -> str | None:

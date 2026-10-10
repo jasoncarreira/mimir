@@ -905,6 +905,8 @@ async def test_populate_all_dry_run_does_not_write(tmp_path: Path):
     )
     assert counts["people_added"] == 1
     assert not _state_yaml(tmp_path).is_file()
+
+
 @pytest.mark.parametrize("writer", ["request", "approve", "web_key", "merge"])
 def test_intake_survives_every_identities_writer(tmp_path, writer):
     import yaml

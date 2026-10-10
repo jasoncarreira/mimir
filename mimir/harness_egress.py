@@ -64,6 +64,7 @@ def harness_sink_allowed(
         ifc_labels,
         auth_context,
         enforce=enforcement_enabled,
+        origin="harness",
     )
     if decision.allowed and not decision.is_shadow_decision:
         return True

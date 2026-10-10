@@ -36,28 +36,186 @@ class _Notifier:
 
 
 @pytest.mark.asyncio
-async def test_runtime_pairing_callback_rechecks_policy_before_writing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("channel,conversation_type", [
+    ("dm-slack-D1", None), ("dm-slack-D1", "multi_user"),
+    ("dm-slack-C1", "multi_user"),
+])
+async def test_runtime_pairing_callback_rechecks_policy_before_writing(
+    tmp_path, monkeypatch, channel, conversation_type,
+):
     import mimir.identities_populator as pop
 
     events: list[tuple[str, Any]] = []
     _patch_factory(monkeypatch, events)
     called = []
     monkeypatch.setattr(pop, "request_pairing_with_code", lambda *a, **k: called.append((a, k)))
-    resolver = SimpleNamespace(reload=lambda: 0,
-        unknown_sender_mode=lambda platform, delivery: "ignore")
+    deliveries = []
+    def policy(platform, delivery):
+        deliveries.append(delivery)
+        return "ignore"
+
+    resolver = SimpleNamespace(reload=lambda: 0, unknown_sender_mode=policy)
     core = runtime.CoreServices(identity_resolver=resolver, aliases_loaded=0,
         saga_db_path=tmp_path / ".mimir" / "saga.db", chat_skill_registry=object())
     adapters = _adapters(events)
     bundle = await runtime.create_agent_runtime(_config(tmp_path), core, adapters)
     try:
         event = SimpleNamespace(author="slack-U1", author_id="U1", author_display="Unknown",
-            source="slack", channel_id="dm-slack-D1", extra={})
+            source="slack", channel_id=channel,
+            extra={"channel_conversation_type": conversation_type})
         decision = SimpleNamespace(canonical_author="slack-U1", denial_reason="unknown_author")
         await adapters.dispatcher._on_pairing_required(event, decision)
+        assert deliveries == ["channel" if conversation_type == "multi_user" else "dm"]
         assert called == []
         assert not (tmp_path / "state" / "identities.yaml").exists()
     finally:
         await bundle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,channel,conversation_type", [
+    ("discord", "dm-discord-101", None),
+    ("discord", "discord-201", None),
+    ("slack", "dm-slack-D1", None),
+    ("slack", "slack-C1", None),
+    ("slack", "dm-slack-G1", "multi_user"),
+    ("slack", "dm-slack-C1", "multi_user"),
+    ("slack", "dm-slack-D1", "multi_user"),
+])
+@pytest.mark.parametrize("mode", ["ignore", "decline"])
+async def test_factory_unknown_sender_real_delivery(
+    tmp_path, monkeypatch, platform, channel, conversation_type, mode,
+):
+    """Keep factory callbacks, dispatcher, notifier and bridge delivery real."""
+    from dataclasses import replace
+    from unittest.mock import AsyncMock, Mock
+
+    import yaml
+    from mimir.bridges.discord import DiscordBridge, _ALLOWED_MENTIONS
+    from mimir.bridges.slack import SlackBridge
+    from mimir.channel_registry import ChannelRegistry
+    from mimir.config import Config
+    from mimir.dispatcher import Dispatcher
+    from mimir.identities import IdentityResolver
+    from mimir.models import AgentEvent
+    from mimir.server import _PairingNotifier
+
+    events = []
+    _patch_factory(monkeypatch, events)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    cfg = replace(Config.from_env(), operator_alert_channel="slack-COPS",
+                  access_control_enforced=True, coding_enabled=False,
+                  pairing_operator_digest_delay_seconds=3600,
+                  pairing_dm_auto_reply_interval_seconds=0)
+    refusal = "No @everyone @here <@123> <!channel> <!here> <@U1>"
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    path = state / "identities.yaml"
+    path.write_text(yaml.safe_dump({"people": [], "intake": {
+        "unknown_senders": {platform: {
+            "dm": "pair" if conversation_type == "multi_user" else mode,
+            "channel": mode,
+        }},
+        "decline_text": refusal,
+    }}))
+    original = path.read_bytes()
+    import mimir.event_logger as event_logger
+
+    monkeypatch.setattr(event_logger, "_logger", None)
+    event_logger.init_logger(tmp_path / "logs" / "events.jsonl", "test-intake")
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    dispatcher = Dispatcher(cfg, resolver=resolver)
+    channels = ChannelRegistry()
+    slack = SlackBridge(bot_token="x", app_token="x", enqueue=dispatcher.enqueue)
+    post = AsyncMock(return_value={"ok": True, "ts": "1"})
+    ephemeral = AsyncMock(return_value={"ok": True})
+    slack._app = SimpleNamespace(client=SimpleNamespace(
+        chat_postMessage=post, chat_postEphemeral=ephemeral))
+    discord = DiscordBridge(token="x", enqueue=dispatcher.enqueue)
+    dm_send = AsyncMock(return_value=SimpleNamespace(id=1))
+    public_send = AsyncMock(return_value=SimpleNamespace(id=2))
+    dm = SimpleNamespace(id=101, send=dm_send)
+    user = SimpleNamespace(dm_channel=None, create_dm=AsyncMock(return_value=dm))
+    discord._client = SimpleNamespace(
+        is_closed=lambda: False,
+        get_channel=lambda cid: dm if cid == 101 else SimpleNamespace(send=public_send),
+        get_user=Mock(return_value=user),
+    )
+    channels.register(slack)
+    channels.register(discord)
+    notifier = _PairingNotifier(cfg, channels)
+    core = runtime.CoreServices(identity_resolver=resolver, aliases_loaded=0,
+        saga_db_path=tmp_path / ".mimir" / "saga.db", chat_skill_registry=object())
+    adapters = replace(_adapters(events), dispatcher=dispatcher,
+                       channels=channels, pairing_notifier=notifier)
+    bundle = await runtime.create_agent_runtime(cfg, core, adapters)
+    author_id = "123" if platform == "discord" else "U1"
+    event = AgentEvent(trigger="user_message", source=platform, channel_id=channel,
+        author=f"{platform}-{author_id}", author_id=author_id,
+        author_display="PRIVATE DISPLAY", content="PRIVATE CONTENT",
+        extra={"channel_conversation_type": conversation_type})
+    try:
+        assert not dispatcher.intake_admits(event)
+        assert not await dispatcher.enqueue(event)
+        assert not await dispatcher.enqueue(event)
+        await asyncio.wait_for(notifier._dm_reply_queue.join(), timeout=5)
+        await notifier.flush_operator_alerts()
+        assert dispatcher._queues == {}
+        assert not any(kind == "run" for kind, _ in events)
+        assert path.read_bytes() == original
+        public_send.assert_not_awaited()
+        if mode == "ignore":
+            dm_send.assert_not_awaited()
+            ephemeral.assert_not_awaited()
+            post.assert_awaited_once()
+            payload = post.await_args.kwargs
+            assert payload["channel"] == "COPS"
+            assert payload["text"].startswith("Unknown sender intake:")
+            assert payload["text"].count("ignored unknown sender") == 1
+            assert "PRIVATE" not in payload["text"]
+        elif platform == "discord":
+            post.assert_not_awaited()
+            ephemeral.assert_not_awaited()
+            dm_send.assert_awaited_once()
+            text = dm_send.await_args.args[0]
+            assert "@everyone" not in text and "@here" not in text and "<@123>" not in text
+            mentions = dm_send.await_args.kwargs["allowed_mentions"]
+            assert mentions is _ALLOWED_MENTIONS
+            assert not mentions.everyone and not mentions.roles
+            # Individual mentions are disabled by the fixed-text sanitizer;
+            # the shared bridge policy deliberately allows normal user mentions.
+            assert user.create_dm.await_count == (0 if channel.startswith("dm-") else 1)
+        else:
+            dm_send.assert_not_awaited()
+            if channel == "dm-slack-D1" and conversation_type != "multi_user":
+                post.assert_awaited_once()
+                ephemeral.assert_not_awaited()
+                payload = post.await_args.kwargs
+                assert payload["channel"] == "D1"
+            else:
+                post.assert_not_awaited()
+                ephemeral.assert_awaited_once()
+                payload = ephemeral.await_args.kwargs
+                assert payload["channel"] == channel.removeprefix("dm-slack-").removeprefix("slack-")
+                assert payload["user"] == "U1"
+            assert "<!channel>" not in payload["text"] and "<!here>" not in payload["text"]
+            assert "<@U1>" not in payload["text"]
+            assert "@channel" in payload["text"] and "&lt;@U1>" in payload["text"]
+    finally:
+        await notifier.aclose()
+        await bundle.aclose()
+
+
+@pytest.mark.parametrize("platform,channel", [
+    ("slack", "dm-slack-C1"), ("slack", "dm-slack-D1"),
+    ("discord", "dm-discord-101"),
+])
+def test_private_pairing_dm_multi_user_override(platform, channel):
+    from mimir.identities_populator import is_private_pairing_dm
+
+    assert not is_private_pairing_dm(platform, channel, conversation_type="multi_user")
+    assert is_private_pairing_dm(platform, channel) == (channel != "dm-slack-C1")
 
 
 class _Dispatcher:
