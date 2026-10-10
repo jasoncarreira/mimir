@@ -153,7 +153,7 @@ async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Pa
         "tool_id": "tool-1", "server_config_id": "server-1",
         "original_tool_name": "search", "display_name": "mcp_docs_search",
         "config_digest": "config-a", "schema_digest": "schema-a",
-        "classification": "", "policy_version": "", "result_integrity": "untrusted",
+        "classification": "", "policy_version": "",
         "argument_egress": "taint_gated", "is_tombstoned": False,
     }})
     app = web.Application()
@@ -167,15 +167,18 @@ async def test_admin_mcp_api_lists_updates_bound_policy_and_removes(tmp_path: Pa
         assert (await listed.json())["data"]["servers"][0]["tools"][0]["classification"] == ""
 
         updated = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
-            "classification": "open", "result_integrity": "trusted",
+            "classification": "open",
             "argument_egress": "allowed", "config_digest": "config-a",
             "schema_digest": "schema-a",
         })
         assert updated.status == 200
-        assert (await updated.json())["data"]["restart_required"] is True
+        policy_data = (await updated.json())["data"]
+        assert policy_data["restart_required"] is True
+        assert "result_integrity" not in policy_data["tool"]
+        assert "result_integrity" not in store.load()["tool-1"]
 
         conflict = await client.put("/api/v1/admin/mcp/tools/tool-1/policy", json={
-            "classification": "open", "result_integrity": "trusted",
+            "classification": "open",
             "argument_egress": "allowed", "config_digest": "stale",
             "schema_digest": "schema-a",
         })
@@ -309,6 +312,41 @@ async def test_admin_mcp_persists_after_successful_discovery(
     ).load_server_records()
     assert next(iter(records.values()))["command"] == "valid-mcp"
     assert start_servers.await_args.kwargs == {"fail_fast": True}
+
+
+@pytest.mark.asyncio
+async def test_admin_mcp_discovery_and_tombstones_never_write_result_integrity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from mimir.mcp_client import MCPManager, MCPPolicyStore, MCPProvenance
+
+    async def discover(_manager, configs, **_kwargs):
+        provenance = MCPProvenance.create(configs[0], "search", {})
+        return [SimpleNamespace(name="mcp_docs_search", mcp_provenance=provenance)]
+
+    monkeypatch.setattr(MCPManager, "start_servers", discover)
+    app = web.Application()
+    web_ui.register_routes(app, turns_log=tmp_path / "turns", events_log=tmp_path / "events", home=tmp_path)
+    store = MCPPolicyStore(tmp_path / "state" / "mcp-policy.json")
+    async with TestClient(TestServer(app)) as client:
+        created = await client.post("/api/v1/admin/mcp/servers", json={"name": "docs", "command": "docs-mcp"})
+        assert created.status == 200
+        server = (await created.json())["data"]["servers"][0]
+        [tool] = server["tools"]
+        assert "result_integrity" not in tool
+        assert tool["classification"] == "admin_required"
+        # A disappeared tool is retained as a tombstone during rediscovery.
+        store.save({**store.load(), "gone": {**tool, "tool_id": "gone", "original_tool_name": "gone"}})
+        updated = await client.put(f"/api/v1/admin/mcp/servers/{server['server_config_id']}", json=server)
+        assert updated.status == 200
+        assert store.load()["gone"]["is_tombstoned"] is True
+        assert all("result_integrity" not in record for record in store.load().values())
+        removed = await client.delete(f"/api/v1/admin/mcp/servers/{server['server_config_id']}")
+        assert removed.status == 200
+        assert all(record["is_tombstoned"] for record in store.load().values())
+        assert all("result_integrity" not in record for record in store.load().values())
 
 
 def test_dashboard_extension_registry_sorts_hides_and_validates_scope():

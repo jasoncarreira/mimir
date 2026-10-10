@@ -50,27 +50,27 @@ def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) ->
         "tool_id": "tool-1", "server_config_id": "server-1",
         "original_tool_name": "search", "config_digest": "config-a",
         "schema_digest": "schema-a", "is_tombstoned": False,
-        "classification": "", "result_integrity": "untrusted",
+        "classification": "",
         "argument_egress": "taint_gated",
     }})
 
     approved = store.update_tool_policy(
         "tool-1",
         classification="open",
-        result_integrity="trusted",
         argument_egress="allowed",
         expected_config_digest="config-a",
         expected_schema_digest="schema-a",
     )
     assert approved["policy_version"] == "ui-v1"
+    assert "result_integrity" not in approved
     configs = MCPManager._apply_stored_policies(store.load_server_configs(), store.load())
-    assert configs[0].tool_policies[0].result_integrity == "trusted"
+    assert configs[0].tool_policies[0].argument_egress == "allowed"
+    assert not hasattr(configs[0].tool_policies[0], "result_integrity")
 
     with pytest.raises(RuntimeError, match="provenance changed"):
         store.update_tool_policy(
             "tool-1",
             classification="open",
-            result_integrity="trusted",
             argument_egress="allowed",
             expected_config_digest="stale",
             expected_schema_digest="schema-a",
@@ -78,7 +78,7 @@ def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) ->
     assert store.remove_server("server-1") is True
     tombstone = store.load()["tool-1"]
     assert tombstone["is_tombstoned"] is True
-    assert tombstone["result_integrity"] == "untrusted"
+    assert "result_integrity" not in tombstone
     assert tombstone["argument_egress"] == "taint_gated"
 
 
@@ -195,22 +195,50 @@ class TestMCPServerConfigFromDict:
                     {
                         **common,
                         "tool_name": "bad",
-                        "result_integrity": "from-response",
-                        "argument_egress": "allowed",
+                        "argument_egress": "from-response",
                     },
                     {
                         **common,
                         "tool_name": "good",
-                        "result_integrity": "trusted",
+                        # Legacy response-integrity fields no longer confer or revoke trust.
+                        "result_integrity": "untrusted",
                         "argument_egress": "allowed",
                     },
                 ],
             })
 
         assert [policy.tool_name for policy in cfg.tool_policies] == ["good"]
-        assert cfg.tool_policies[0].result_integrity == "trusted"
         assert cfg.tool_policies[0].argument_egress == "allowed"
-        assert "invalid MCP result_integrity" in caplog.text
+        assert not hasattr(cfg.tool_policies[0], "result_integrity")
+        assert "invalid MCP argument_egress" in caplog.text
+
+
+@pytest.mark.parametrize("key", ["result_integrity", "resultIntegrity"])
+def test_retired_result_integrity_warns_once_per_server_without_values(
+    key: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    common = {
+        "classification": "open", "adapter_name": "adapter", "adapter_version": "1",
+        "approval_version": "approval", "policy_version": "policy",
+        "config_digest": "config", "schema_digest": "schema",
+        "argument_egress": "allowed",
+    }
+    with caplog.at_level("WARNING"):
+        configs = parse_mcp_server_configs([
+            {"name": name, "command": "x", "tool_policies": [
+                {**common, "tool_name": "first", key: "untrusted"},
+                {**common, "tool_name": "second", key: "private-retired-value"},
+            ]}
+            for name in ("docs", "search")
+        ])
+    warnings = [record.message for record in caplog.records if "retired" in record.message]
+    assert len(warnings) == 2
+    assert "MCP server docs:" in warnings[0]
+    assert "MCP server search:" in warnings[1]
+    assert all("result_integrity" in message for message in warnings)
+    assert "private-retired-value" not in caplog.text
+    assert all(len(config.tool_policies) == 2 for config in configs)
+    assert all(not hasattr(policy, "result_integrity") for config in configs for policy in config.tool_policies)
 
 
 # ─── parse_mcp_server_configs ──────────────────────────────────────
@@ -812,6 +840,9 @@ class TestMCPProvenance:
             input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
         )
         assert original.is_tombstoned is False
+        assert original.with_drift_detection(
+            config, "search", {"type": "object", "properties": {"q": {"type": "string"}}},
+        ).result_integrity == "trusted"
 
         drifted = original.with_drift_detection(
             config=config,
@@ -819,6 +850,10 @@ class TestMCPProvenance:
             input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
         )
         assert drifted.is_tombstoned is True
+        assert drifted.result_integrity == "untrusted"
+        assert drifted.with_drift_detection(
+            config, "search", {"type": "object", "properties": {"query": {"type": "string"}}},
+        ).is_tombstoned is True
 
     def test_provenance_name_change_triggers_tombstone(self) -> None:
         from mimir.mcp_client import MCPServerConfig, MCPProvenance
@@ -835,6 +870,7 @@ class TestMCPProvenance:
             input_schema={},
         )
         assert drifted.is_tombstoned is True
+        assert drifted.result_integrity == "untrusted"
 
     def test_secret_rotation_is_stable_but_reference_and_key_changes_drift(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -1623,7 +1659,6 @@ class TestProductionMCPPolicyWiring:
     def _config(
         *,
         schema: dict | None = None,
-        result_integrity: str = "untrusted",
         argument_egress: str = "taint_gated",
     ) -> MCPServerConfig:
         from mimir.mcp_client import _canonical_config_digest, _schema_digest
@@ -1662,10 +1697,82 @@ class TestProductionMCPPolicyWiring:
                 "policy_version": "policy-v1",
                 "config_digest": _canonical_config_digest(base),
                 "schema_digest": _schema_digest(schema),
-                "result_integrity": result_integrity,
                 "argument_egress": argument_egress,
             }],
         })
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", [
+        "valid", "name", "config", "schema", "policy", "tombstoned", "undeclared",
+    ])
+    async def test_configured_result_trust_requires_current_tool_identity(
+        self, case: str,
+    ) -> None:
+        from contextlib import AsyncExitStack
+        from mimir.access_control import ToolRegistry, classify_protected_result
+        from mimir.mcp_client import (
+            MCPConnection, clear_mcp_adapter_registry, get_tool_provenance,
+            register_configured_mcp_adapters,
+        )
+        from mimir.models import AuthContext, InformationFlowLabels
+
+        config = self._config()
+        if case == "undeclared":
+            config = replace(config, tool_policies=())
+        elif case == "config":
+            config.command = "changed-command"
+        elif case == "policy":
+            config.policy_version = "new-policy"
+        schema = {
+            "type": "object", "properties": {
+                "owner": {"type": "string"}, "repository": {"type": "string"},
+            }, "required": ["owner", "repository"],
+        }
+        if case == "schema":
+            schema["required"] = ["repository"]
+
+        class Session:
+            async def list_tools(self):  # type: ignore[no-untyped-def]
+                tool = type("Tool", (), {
+                    "name": "get_repository", "description": "", "input_schema": schema,
+                })()
+                return type("Result", (), {"tools": [tool]})()
+
+        clear_mcp_adapter_registry()
+        register_configured_mcp_adapters([config])
+        [tool] = await MCPConnection(config, Session(), AsyncExitStack()).discover_tools()
+        provenance = get_tool_provenance(tool)
+        assert provenance is not None
+        if case == "undeclared":
+            assert provenance.result_integrity == "trusted"
+        if case == "name":
+            object.__setattr__(tool, "mcp_provenance", replace(
+                provenance, original_tool_name="renamed",
+            ))
+        elif case == "tombstoned":
+            object.__setattr__(tool, "mcp_provenance", replace(
+                provenance, is_tombstoned=True,
+            ))
+        context = AuthContext(
+            principal="alice", canonical_principal="alice", roles=("user",),
+            event_ingress="bridge", trigger="user_message", channel_id="ch-1",
+            interactivity=None, enforcement_enabled=True,
+        )
+        authorization = ToolRegistry().authorize_tool(
+            tool.name, context, enforce=True, mcp_tool=tool,
+            arguments={"owner": "alice", "repository": "repo-1"},
+            ifc_labels=InformationFlowLabels(),
+        )
+        labels = classify_protected_result(
+            tool.name, {}, context, authorization, result="repository contents",
+        )
+        assert labels is not None
+        assert authorization.allowed is (case == "valid")
+        assert {source.integrity for source in labels.sources} == {
+            "trusted" if case == "valid" else "untrusted"
+        }
+        assert labels.has_untrusted_active_ingest is (case != "valid")
+        clear_mcp_adapter_registry()
 
     @pytest.mark.asyncio
     async def test_manager_applies_policy_and_preserves_identity_on_restart(
@@ -1713,7 +1820,7 @@ class TestProductionMCPPolicyWiring:
         assert first_provenance.server_config_id == "github-production"
         assert second_provenance.server_config_id == first_provenance.server_config_id
         assert first_provenance.classification == "resource_scoped"
-        assert first_provenance.result_integrity == "untrusted"
+        assert first_provenance.result_integrity == "trusted"
         assert first_provenance.argument_egress == "taint_gated"
         assert first_provenance.is_tombstoned is False
         assert getattr(first[0], "mcp_provenance") is first_provenance
@@ -1757,17 +1864,9 @@ class TestProductionMCPPolicyWiring:
         assert validate_mcp_policy(tools)[0]["reason"] == "drift"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("result_integrity", "argument_egress"),
-        [
-            ("trusted", "allowed"),
-            ("trusted", "taint_gated"),
-            ("untrusted", "allowed"),
-            ("untrusted", "taint_gated"),
-        ],
-    )
-    async def test_discovery_preserves_all_posture_combinations(
-        self, result_integrity: str, argument_egress: str,
+    @pytest.mark.parametrize("argument_egress", ["allowed", "taint_gated"])
+    async def test_discovery_trusts_results_independently_of_argument_egress(
+        self, argument_egress: str,
     ) -> None:
         from contextlib import AsyncExitStack
         from mimir.mcp_client import MCPConnection, get_tool_provenance
@@ -1793,7 +1892,6 @@ class TestProductionMCPPolicyWiring:
         tools = await MCPConnection(
             self._config(
                 schema=schema,
-                result_integrity=result_integrity,
                 argument_egress=argument_egress,
             ),
             Session(),
@@ -1803,7 +1901,7 @@ class TestProductionMCPPolicyWiring:
 
         assert provenance is not None
         assert provenance.is_tombstoned is False
-        assert provenance.result_integrity == result_integrity
+        assert provenance.result_integrity == "trusted"
         assert provenance.argument_egress == argument_egress
 
     @pytest.mark.asyncio
@@ -1821,7 +1919,6 @@ class TestProductionMCPPolicyWiring:
         }
         config = self._config(
             schema=schema,
-            result_integrity="trusted",
             argument_egress="allowed",
         )
         config.command = "drifted-command"

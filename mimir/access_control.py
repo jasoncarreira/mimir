@@ -9032,6 +9032,11 @@ class MCPResourceAdapter:
         )
 
         provenance = get_tool_provenance(tool) if tool is not None else None
+        if provenance is not None and (
+            tool_name != getattr(tool, "name", None)
+            or tool_name != f"mcp_{provenance.endpoint_identity}_{provenance.original_tool_name}"
+        ):
+            provenance = None
         decision = OperationDecision.ADMIN_REQUIRED
         reason = "mcp_missing_provenance"
         validated_result: MCPAuthorizationResult | None = None
@@ -11595,14 +11600,13 @@ def classify_protected_result(
         resources = authorization.protected_source_resources
         if resources == ():
             # Direction describes the call, not its remote-controlled response.
-            # With no read resource, attribute output to the tool itself; only
-            # the reviewed result_integrity grant can make that output trusted.
+            # With no read resource, attribute output to the configured tool itself.
             resources = (f"mcp-tool:{tool_name}",)
         principal = getattr(auth_context, "canonical_principal", None)
         labels = InformationFlowLabels()
         integrity = (
             "trusted"
-            if not failed and authorization.result_integrity == "trusted"
+            if not failed and resources is not None and authorization.result_integrity == "trusted"
             else "untrusted"
         )
         unresolved = f"<unresolved-resource:mcp:{tool_name}>"

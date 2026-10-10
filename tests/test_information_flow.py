@@ -2625,8 +2625,8 @@ def test_cross_turn_ifc_guards_use_and_update_only_exact_request_carrier() -> No
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("first_direction", ["source", "sink"])
-async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution(
-    first_direction: str,
+async def test_mcp_configured_result_stays_clean_and_untrusted_ingest_gates_sinks(
+    first_direction: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mimir.mcp_client import (
         MCPAuthorizationResult,
@@ -2638,6 +2638,7 @@ async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution
     )
     from mimir.tools.budget_gate import BudgetGateMiddleware
 
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     config = MCPServerConfig(name="external", command="x", args=[])
     tools = {}
     for direction in ("source", "sink", "both"):
@@ -2667,8 +2668,14 @@ async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution
             input_schema={}, session=object(), provenance=provenance,
         )
 
-    labels = InformationFlowLabels()
-    auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="user-1", domain="channel", resource_id="slack-C1",
+        bridge_instance="slack", sensitivity="private",
+        authorized_principals=frozenset({"user-1"}),
+        integrity="trusted", integrity_effect="active_ingest",
+    ))
+    auth = replace(_auth(roles=("admin",)), ifc_labels=labels,
+                   ifc_state=InformationFlowState(labels=labels))
     middleware = BudgetGateMiddleware()
     source_calls = 0
 
@@ -2697,7 +2704,27 @@ async def test_mcp_source_taints_after_execution_and_sinks_gate_before_execution
         source_result = await middleware.awrap_tool_call(request(first_direction), source_handler)
         assert source_calls == 1
         assert source_result.status != "error"
+        assert auth.ifc_state.has_untrusted_active_ingest(labels) is False
+        write_target = str(tmp_path / "memory" / "core" / "policy.md")
+        write_arguments = {"file_path": write_target}
+        clean_write = ToolRegistry().authorize_tool(
+            "write_file", auth, enforce=True, target_channel=write_target,
+            arguments=write_arguments, ifc_labels=auth.ifc_state.current(labels),
+        )
+        assert clean_write.allowed is True, (clean_write.reason, clean_write.refusal_detail)
+        assert ToolRegistry().authorize_tool(
+            tools["sink"].name, auth, enforce=True, mcp_tool=tools["sink"],
+            arguments={}, ifc_labels=auth.ifc_state.current(labels),
+        ).allowed is True
+
+        # A separate untrusted source still gates MCP argument egress.
+        auth.ifc_state.merge(_labels(), fallback=labels)
         assert auth.ifc_state.has_untrusted_active_ingest(labels) is True
+        tainted_write = ToolRegistry().authorize_tool(
+            "write_file", auth, enforce=True, target_channel=write_target,
+            arguments=write_arguments, ifc_labels=auth.ifc_state.current(labels),
+        )
+        assert tainted_write.allowed is False
 
         for direction in ("sink", "both"):
             authorization = ToolRegistry().authorize_tool(
@@ -3684,7 +3711,8 @@ def test_mcp_result_integrity_comes_only_from_authorization_context(
 
 
 @pytest.mark.parametrize("resources", [("search-index",), (), None])
-def test_failed_trusted_mcp_result_remains_untrusted(resources) -> None:
+@pytest.mark.parametrize("failed", [False, True])
+def test_failed_or_unresolved_trusted_mcp_result_remains_untrusted(resources, failed) -> None:
     authorization = ToolAuthorization(
         tool_name="mcp_search_query",
         decision=OperationDecision.OPEN,
@@ -3694,11 +3722,13 @@ def test_failed_trusted_mcp_result_remains_untrusted(resources) -> None:
     )
 
     labels = classify_protected_result(
-        "mcp_search_query", {}, _auth(), authorization, failed=True,
+        "mcp_search_query", {}, _auth(), authorization, failed=failed,
     )
 
     assert labels is not None
-    assert next(iter(labels.sources)).integrity == "untrusted"
+    assert next(iter(labels.sources)).integrity == (
+        "untrusted" if failed or resources is None else "trusted"
+    )
 
 
 def test_hands_read_result_uses_authorization_provenance() -> None:

@@ -217,6 +217,7 @@ class MCPProvenance:
             config_digest=_canonical_config_digest(config),
             schema_digest=_schema_digest(input_schema),
             original_tool_name=tool_name,
+            result_integrity="trusted",
         )
 
     def with_drift_detection(
@@ -258,9 +259,12 @@ class MCPProvenance:
             adapter_version=self.adapter_version,
             approval_version=self.approval_version,
             policy_version=self.policy_version,
-            result_integrity="untrusted",
+            result_integrity=(
+                "untrusted" if self.is_tombstoned or name_changed or config_changed or schema_changed
+                else self.result_integrity
+            ),
             argument_egress="taint_gated",
-            is_tombstoned=name_changed or config_changed or schema_changed,
+            is_tombstoned=self.is_tombstoned or name_changed or config_changed or schema_changed,
         )
 
 
@@ -285,7 +289,7 @@ def _expand_env_refs(value: str) -> str:
 
 @dataclass(frozen=True)
 class MCPToolPolicy:
-    """Operator approval and IFC grants bound to discovery provenance."""
+    """Operator approval and argument-egress grant bound to discovery provenance."""
 
     tool_name: str
     classification: str
@@ -295,7 +299,6 @@ class MCPToolPolicy:
     policy_version: str
     config_digest: str
     schema_digest: str
-    result_integrity: str = "untrusted"
     argument_egress: str = "taint_gated"
 
     @classmethod
@@ -315,9 +318,6 @@ class MCPToolPolicy:
             policy_version=value("policy_version", "policyVersion"),
             config_digest=value("config_digest", "configDigest"),
             schema_digest=value("schema_digest", "schemaDigest"),
-            result_integrity=(
-                value("result_integrity", "resultIntegrity") or "untrusted"
-            ).lower(),
             argument_egress=(
                 value("argument_egress", "argumentEgress") or "taint_gated"
             ).lower(),
@@ -336,10 +336,6 @@ class MCPToolPolicy:
             raise ValueError("MCP tool policy requires all provenance and version fields")
         if policy.classification not in {"open", "resource_scoped", "admin_required"}:
             raise ValueError(f"invalid MCP classification: {policy.classification}")
-        if policy.result_integrity not in {"trusted", "untrusted"}:
-            raise ValueError(
-                f"invalid MCP result_integrity: {policy.result_integrity}"
-            )
         if policy.argument_egress not in {"allowed", "taint_gated"}:
             raise ValueError(
                 f"invalid MCP argument_egress: {policy.argument_egress}"
@@ -469,6 +465,16 @@ class MCPServerConfig:
         ) if isinstance(raw_adapters, list) else ()
         tool_policies: list[MCPToolPolicy] = []
         if isinstance(raw_policies, list):
+            if any(
+                isinstance(item, dict)
+                and ("result_integrity" in item or "resultIntegrity" in item)
+                for item in raw_policies
+            ):
+                log.warning(
+                    "MCP server %s: retired tool_policies key result_integrity "
+                    "(resultIntegrity) is ignored; configuring a server now trusts "
+                    "successful results by default", name,
+                )
             for item in raw_policies:
                 if not isinstance(item, dict):
                     log.warning("Ignoring invalid non-object MCP tool policy for %s", name)
@@ -562,9 +568,7 @@ class MCPConnection:
                     adapter_version=policy.adapter_version,
                     approval_version=policy.approval_version,
                     policy_version=policy.policy_version,
-                    result_integrity=(
-                        policy.result_integrity if identity_matches else "untrusted"
-                    ),
+                    result_integrity="trusted" if identity_matches else "untrusted",
                     argument_egress=(
                         policy.argument_egress if identity_matches else "taint_gated"
                     ),
@@ -654,7 +658,6 @@ class MCPPolicyStore:
                 if record.get("server_config_id") == server_id:
                     record["is_tombstoned"] = True
                     record["classification"] = ""
-                    record["result_integrity"] = "untrusted"
                     record["argument_egress"] = "taint_gated"
             atomic_write_json(self.path, document)
             return removed
@@ -664,15 +667,12 @@ class MCPPolicyStore:
         tool_id: str,
         *,
         classification: str,
-        result_integrity: str,
         argument_egress: str,
         expected_config_digest: str,
         expected_schema_digest: str,
     ) -> dict[str, Any]:
         if classification not in {"open", "resource_scoped", "admin_required"}:
             raise ValueError("invalid authorization tier")
-        if result_integrity not in {"trusted", "untrusted"}:
-            raise ValueError("invalid result_integrity")
         if argument_egress not in {"allowed", "taint_gated"}:
             raise ValueError("invalid argument_egress")
         with _MCP_POLICY_STORE_LOCK:
@@ -697,7 +697,6 @@ class MCPPolicyStore:
                 "adapter_version": "1",
                 "approval_version": str(uuid.uuid4()),
                 "policy_version": policy_version,
-                "result_integrity": result_integrity,
                 "argument_egress": argument_egress,
             })
             atomic_write_json(self.path, document)
@@ -719,7 +718,6 @@ def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[
         "adapter_version": provenance.adapter_version,
         "approval_version": provenance.approval_version,
         "policy_version": provenance.policy_version,
-        "result_integrity": provenance.result_integrity,
         "argument_egress": provenance.argument_egress,
         "is_tombstoned": provenance.is_tombstoned,
     }

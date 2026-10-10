@@ -368,7 +368,6 @@ export interface AdminConfigData {
 }
 
 export type MCPAuthorizationTier = "open" | "resource_scoped" | "admin_required";
-export type MCPResultIntegrity = "trusted" | "untrusted";
 export type MCPArgumentEgress = "allowed" | "taint_gated";
 
 export interface MCPToolRecord {
@@ -379,7 +378,6 @@ export interface MCPToolRecord {
   config_digest: string;
   schema_digest: string;
   classification: MCPAuthorizationTier | "";
-  result_integrity: MCPResultIntegrity;
   argument_egress: MCPArgumentEgress;
   policy_version: string;
   is_tombstoned: boolean;
