@@ -1150,7 +1150,11 @@ def _partition_activity(
     projected = [dict(item, kind=kind, repository=repo) for item in items]
 
     def verdict(author: str) -> bool | None:
-        if isinstance(author, str) and me and author == me:
+        # Deleted/unlinked users cannot become attributable on a later tick.
+        # Withhold them without spending API budget or holding the watermark.
+        if not isinstance(author, str) or not author:
+            return False
+        if me and author == me:
             return True
         if pr_author:
             item = projected[0]
@@ -1368,7 +1372,7 @@ def _check_issues(
     for issue in data:
         if issue.get("pull_request"):
             continue  # PRs handled by _check_prs
-        if me and issue.get("user", {}).get("login") == me:
+        if me and (issue.get("user") or {}).get("login") == me:
             continue
         if (issue.get("created_at", "") or "") <= since:
             continue
@@ -1388,7 +1392,7 @@ def _check_issues(
                     surfaced_outsiders.add(key)
                     count += 1
             continue
-        author = issue.get("user", {}).get("login", "unknown")
+        author = (issue.get("user") or {}).get("login", "unknown")
         number = issue.get("number")
         title = issue.get("title", "")
         url = issue.get("html_url", "")
@@ -1432,11 +1436,11 @@ def _check_prs(
     review_context = review_context if review_context is not None else {}
     count = 0
     for pr in data:
-        if me and pr.get("user", {}).get("login") == me:
+        if me and (pr.get("user") or {}).get("login") == me:
             continue
         if (pr.get("created_at", "") or "") <= since:
             continue
-        author = pr.get("user", {}).get("login", "unknown")
+        author = (pr.get("user") or {}).get("login", "unknown")
         number = pr.get("number")
         if not isinstance(number, int):
             continue
@@ -1504,7 +1508,7 @@ def _collect_issue_comment_context(
     context: dict[str, str] = {}
     omitted: dict[str, list[str]] = {}
     for comment in data:
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
@@ -1524,7 +1528,7 @@ def _collect_issue_comment_context(
                         f"{item.author} {item.html_url or ''}".strip()
                     )
             continue
-        author = comment.get("user", {}).get("login", "unknown")
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         rendered = f"@{author}: {body}\n{url}"
         if issue_num in context:
@@ -1580,7 +1584,7 @@ def _check_issue_comments(
     for comment in data:
         if _hard_stop(tick_budget, "issue_comments"):
             break
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
@@ -1590,7 +1594,7 @@ def _check_issue_comments(
         )
         if not kept:
             continue
-        author = comment.get("user", {}).get("login", "unknown")
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
         issue_url = comment.get("issue_url", "")
@@ -1675,7 +1679,7 @@ def _check_pr_review_comments(
         return 0
     count = 0
     for comment in data:
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
@@ -1685,7 +1689,7 @@ def _check_pr_review_comments(
         )
         if not kept:
             continue
-        author = comment.get("user", {}).get("login", "unknown")
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
         pr_url = comment.get("pull_request_url", "")
@@ -1815,7 +1819,7 @@ def _check_pr_pushes(
         # NOTE: this filter does NOT apply to review-request detection
         # below — the agent CAN be added as a reviewer to a PR it
         # authored (rare, but legal) and we'd want to surface that.
-        pr_author = pr.get("user", {}).get("login")
+        pr_author = (pr.get("user") or {}).get("login")
         number = pr.get("number")
         if not number:
             continue
@@ -3440,7 +3444,7 @@ def _check_pr_reviews(
                 break
             continue
         for review in reviews:
-            if me and review.get("user", {}).get("login") == me:
+            if me and (review.get("user") or {}).get("login") == me:
                 continue
             submitted = review.get("submitted_at", "") or ""
             if not submitted or submitted <= since:
@@ -3454,7 +3458,7 @@ def _check_pr_reviews(
             )
             if not kept:
                 continue
-            reviewer_login = review.get("user", {}).get("login", "unknown")
+            reviewer_login = (review.get("user") or {}).get("login", "unknown")
             body = _truncate(review.get("body") or "")
             url = review.get("html_url", "")
             pr_title = pr.get("title", "")

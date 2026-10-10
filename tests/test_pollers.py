@@ -2008,6 +2008,50 @@ for kind, number, login in [
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("signal_name", [
+    "github_outsider_issue_withheld", "pr_auto_review_skipped_untrusted_author",
+])
+@pytest.mark.parametrize("unsafe_url", [
+    "https://github.com/foreign/repo/issues/7",
+    "javascript:alert(1)",
+])
+async def test_outsider_notice_rejects_foreign_and_javascript_urls(
+    tmp_path: Path, home: Path, signal_name: str, unsafe_url: str,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    _install_script(skill_dir, "poller.py", f"""
+import json
+print(json.dumps({{'signal': {signal_name!r}, 'repo': 'acme/widget',
+    'number': 7, 'author': 'outsider', 'url': {unsafe_url!r}}}))
+print(json.dumps({{'signal': {signal_name!r}, 'repo': 'acme/widget',
+    'number': 8, 'author': 'outsider',
+    'url': 'https://github.com/acme/widget/issues/8'}}))
+""")
+    cfg = PollerConfig(
+        name="github-activity", command=f"{sys.executable} poller.py",
+        cron="* * * * *", env={}, skill_dir=skill_dir,
+    )
+    delivered = []
+
+    async def send(text):
+        delivered.append(text)
+
+    enq = _CapturingEnqueue()
+    assert await run_poller(cfg, enqueue=enq, operator_notice=send) == 0
+    assert enq.events == []
+    kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+    assert delivered == [
+        f"Outsider {kind} withheld: outsider https://github.com/acme/widget/issues/8",
+    ]
+    assert all(unsafe_url not in text for text in delivered)
+    signals = [item for item in _read_events(home) if item["type"] == signal_name]
+    assert len(signals) == 2
+    assert signals[0]["url"] is None
+    assert signals[1]["url"] == "https://github.com/acme/widget/issues/8"
+    assert unsafe_url not in json.dumps(signals)
+
+
+@pytest.mark.asyncio
 async def test_run_poller_emits_events_for_each_jsonl_line(
     tmp_path: Path, home: Path,
 ) -> None:

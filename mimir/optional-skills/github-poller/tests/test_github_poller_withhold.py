@@ -109,6 +109,91 @@ def test_outsider_child_events_never_emit_prompt(monkeypatch, capsys, trust, sur
     assert not capsys.readouterr().out
 
 
+@pytest.mark.parametrize("user", [None, {}, {"login": ""}, {"login": None}])
+@pytest.mark.parametrize("pr_author", [False, True])
+def test_unattributable_partition_never_attests_or_holds_window(monkeypatch, user, pr_author):
+    def unexpected(*args, **kwargs):
+        pytest.fail("unattributable author attested")
+
+    monkeypatch.setattr(poller, "_github_author_is_trusted", unexpected)
+    monkeypatch.setattr(poller, "_pr_author_is_trusted", unexpected)
+    budget, cache = poller.TickBudget(hard_deadline_seconds=0), {}
+    kept, withheld = poller._partition_activity(
+        REPO, "token", [dict(_comment(), user=user, number=8)],
+        "pull_request" if pr_author else "comment", "mimir", cache,
+        budget, "null_user_probe", pr_author=pr_author,
+    )
+    assert kept == [] and len(withheld) == 1
+    assert withheld[0].reason == "non_collaborator"
+    assert not budget.hard_truncated and cache == {}
+    assert_marker_absent(withheld)
+
+
+@pytest.mark.parametrize("surface", ["issue", "pr", "issue_comment", "pr_context", "review_comment", "review"])
+def test_null_user_activity_withholds_without_attestation_or_window_hold(monkeypatch, capsys, surface):
+    pr = _pr()
+    child = dict(_comment(), user=None, submitted_at=STAMP, state="CHANGES_REQUESTED")
+
+    def api(endpoint, token):
+        if endpoint.endswith("/pulls/8"):
+            return pr
+        if endpoint.endswith("/pulls/8/reviews") or "/comments?" in endpoint:
+            return [child]
+        if "/issues?" in endpoint:
+            return [dict(_issue(), user=None)]
+        if "/pulls?" in endpoint:
+            return [dict(pr, user=None)] if surface == "pr" else [pr]
+        return []
+
+    monkeypatch.setattr(poller, "_gh_api", api)
+    monkeypatch.setattr(poller, "_github_author_is_trusted",
+                        lambda *args: pytest.fail("null-user author attested"))
+    budget = poller.TickBudget()
+    if surface == "issue":
+        poller._check_issues(REPO, SINCE, "token", "mimir",
+                             surfaced_outsiders=set(), tick_budget=budget)
+    elif surface == "pr":
+        poller._check_prs(REPO, SINCE, "token", "mimir",
+                          surfaced_untrusted=set(), tick_budget=budget)
+    elif surface == "issue_comment":
+        poller._check_issue_comments(REPO, SINCE, "token", "mimir", tick_budget=budget)
+    elif surface == "pr_context":
+        _, context = poller._collect_issue_comment_context(
+            REPO, SINCE, "token", "mimir", tick_budget=budget,
+        )
+        assert "1 comment(s) by non-collaborators withheld" in context["8"]
+        assert_marker_absent(context)
+    elif surface == "review_comment":
+        poller._check_pr_review_comments(REPO, SINCE, "token", "mimir", tick_budget=budget)
+    else:
+        poller._check_pr_reviews(REPO, SINCE, "token", "mimir", tick_budget=budget)
+    output = capsys.readouterr().out
+    assert_marker_absent(output)
+    assert not any("prompt" in json.loads(line) for line in output.splitlines())
+    assert not budget.hard_truncated
+
+
+def test_null_user_comment_advances_since_watermark_across_ticks(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(poller, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(poller, "CURSOR_FILE", tmp_path / "cursor.json")
+    monkeypatch.setattr(poller, "_resolve_token", lambda: "token")
+    monkeypatch.setenv("GITHUB_REPOS", REPO)
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "mimir")
+    poller._save_cursor({"last_checked": SINCE})
+    stamps = iter(["2026-10-10T00:00:00Z", "2026-10-11T00:00:00Z"])
+    monkeypatch.setattr(poller, "_utc_now_iso", lambda: next(stamps))
+    monkeypatch.setattr(poller, "_github_author_is_trusted",
+                        lambda *args: pytest.fail("null-user author attested"))
+    monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
+                        [dict(_comment(), user=None)] if "/issues/comments?" in endpoint else [])
+    for expected in ["2026-10-10T00:00:00Z", "2026-10-11T00:00:00Z"]:
+        poller.main()
+        assert json.loads(poller.CURSOR_FILE.read_text())["last_checked"] == expected
+        output = capsys.readouterr().out
+        assert_marker_absent(output, poller.CURSOR_FILE)
+        assert not any("prompt" in json.loads(line) for line in output.splitlines())
+
+
 def test_mixed_pr_context_keeps_trusted_prose_only(monkeypatch, capsys, trust):
     trusted = dict(_comment("trusted"), body="legitimate review note")
     monkeypatch.setattr(poller, "_gh_api", lambda endpoint, token:
