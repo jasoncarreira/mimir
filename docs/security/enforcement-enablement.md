@@ -194,11 +194,11 @@ Two **independent** inputs decide what a turn may do:
        assembled from server-owned state are trusted informational. Resolved paths
        and framework constructors are the evidence; caller metadata, model output,
        and model-supplied parameters cannot choose these labels.
-   - **An operator-configured MCP tool** → use that exact tool policy's explicit
-     `result_integrity` grant. `trusted` vouches for successful returned content;
-     `untrusted` retains untrusted active ingest. Server locality, transport,
-     display name, operation labels such as “read-only,” model arguments, and MCP
-     response fields are not trust signals.
+   - **An operator-configured MCP tool** → successful results from the configured
+     server enter as trusted active ingest. Configuring the server is the trust
+     grant; do not configure servers that relay outside content. Identity drift,
+     failed calls, and unresolved resources remain untrusted. Display name,
+     model arguments, and MCP response fields are not trust signals.
    - **A GitHub poller's framework-authored remediation trigger** → trusted only
      for the closed remediation event set and only after the server re-fetches the
      open PR and matches its number, URL, configured self author, repository,
@@ -615,13 +615,11 @@ that exception accepts the query channel rather than claiming it does not exist.
 
 #### Operator-owned MCP trust posture
 
-Configuring an MCP server authorizes Mimir to connect to that server. It does
-not implicitly widen every tool the server advertises. Each `tool_policies`
-entry has two independent IFC grants:
+Configuring an MCP server trusts successful results from its tools by default;
+no per-tool result-integrity grant is needed. Do not configure servers that relay
+outside content. A `tool_policies` entry can still approve the tool's
+classification and control argument egress:
 
-- `result_integrity: trusted | untrusted` controls successful result ingestion.
-  `trusted` enters IFC as trusted content; `untrusted` enters as untrusted
-  `active_ingest`.
 - `argument_egress: allowed | taint_gated` controls model-composed arguments to
   that exact tool. `allowed` keeps the tool callable after untrusted active
   ingest, including operator-approved search/read query channels.
@@ -644,22 +642,20 @@ For example:
     "policy_version": "policy-v3",
     "config_digest": "<digest of this immutable server configuration>",
     "schema_digest": "<digest of the approved search input schema>",
-    "result_integrity": "untrusted",
     "argument_egress": "allowed"
   }]
 }
 ```
 
-These values are operator grants and may deliberately trade isolation for
-capability. They are resolved during discovery and carried through the
+The argument-egress grant is resolved during discovery and carried through the
 server-authored authorization decision; result classification and sink
-enforcement do not look them up again by mutable/display name. Widening remains
+enforcement do not look it up again by mutable/display name. Egress widening remains
 bound to the immutable `server_config_id` and derived tool identity, canonical
 config digest, input-schema digest, and policy version. A new, renamed,
 undeclared, schema/config-drifted, tombstoned, or invalid tool cannot inherit a
-grant from another tool. Omitted posture fields use the bootstrap defaults
-`result_integrity=untrusted` and `argument_egress=taint_gated`; an invalid tool
-policy entry is ignored without disabling valid sibling entries on the same
+grant from another tool. Such results, failed calls, and unresolved resources
+remain untrusted. Omitted `argument_egress` defaults to `taint_gated`; an invalid
+tool policy entry is ignored without disabling valid sibling entries on the same
 configured server.
 
 The taint continues to gate *code/shell/action* sinks in all cases. By trigger:
