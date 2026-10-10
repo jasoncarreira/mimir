@@ -168,7 +168,7 @@ def test_admin_agent_upload_cannot_replace_scheduler(home: Path, monkeypatch: py
     "write", "edit", "replace", "awrite", "aedit", "areplace", "upload_files", "aupload_files",
 ])
 @pytest.mark.asyncio
-async def test_tainted_file_tools_veto_each_live_instruction_surface(
+async def test_server_backend_taint_does_not_change_instruction_surface_policy(
     home: Path, monkeypatch: pytest.MonkeyPatch, relative: str, operation: str, absolute: bool,
 ) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(home))
@@ -197,12 +197,22 @@ async def test_tainted_file_tools_veto_each_live_instruction_surface(
             result = getattr(backend, operation)(spelling, *args)
         if operation.startswith("a"):
             result = await result
+        # This shared backend also serves server-owned offload/persistence.
+        # Taint refusal belongs to ToolRegistry/BudgetGate, not this layer.
+        observed_error = result[0].error if "upload" in operation else result.error
+        observed_content = path.read_text(encoding="utf-8")
+        observed_denials = [d["op"] for d in backend.drain_denials()]
+        path.write_text("original", encoding="utf-8")
+        auth.ifc_state = InformationFlowState(labels=InformationFlowLabels())
         if "upload" in operation:
-            assert result[0].error == "permission_denied"
+            control = getattr(backend, operation)([(spelling, b"changed")])
         else:
-            assert "open_proposal/submit_proposal" in result.error
-        assert any("scheduled_instruction_veto" in d["op"] for d in backend.drain_denials())
-        assert path.read_text(encoding="utf-8") == "original"
+            control = getattr(backend, operation)(spelling, *args)
+        if operation.startswith("a"):
+            control = await control
+        assert observed_error == (control[0].error if "upload" in operation else control.error)
+        assert path.read_text(encoding="utf-8") == observed_content
+        assert observed_denials == [d["op"] for d in backend.drain_denials()]
     finally:
         reset_current_turn(token)
 
@@ -274,7 +284,8 @@ async def test_tainted_looping_symlink_backend_fails_closed(
         if "upload" in operation:
             assert result[0].error == "permission_denied"
         else:
-            assert "open_proposal/submit_proposal" in result.error
+            assert result.error
+        # The unconditional scheduler guard also refuses indeterminate targets.
         assert any("scheduled_instruction_veto" in d["op"] for d in backend.drain_denials())
         assert loop.is_symlink()
         assert loop.readlink() == loop
@@ -282,7 +293,7 @@ async def test_tainted_looping_symlink_backend_fails_closed(
         reset_current_turn(token)
 
 
-def test_tainted_upload_cannot_install_live_instructions(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_upload_keeps_prompt_guard_and_ordinary_persistence(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MIMIR_HOME", str(home))
     labels = InformationFlowLabels(sources=(SourceLabel(
         principal="external", domain="web", resource_id="page", bridge_instance="web",
@@ -294,15 +305,19 @@ def test_tainted_upload_cannot_install_live_instructions(home: Path, monkeypatch
     token = set_current_turn(SimpleNamespace(turn_id="tainted-upload", auth_context=auth,
                                              ifc_labels=InformationFlowLabels()))
     try:
-        backend = WriteGuardBackend(home, ["state", "prompts"])
+        backend = WriteGuardBackend(home, ["state"])
         result = backend.upload_files([
             ("/prompts/heartbeat.md", b"instruction"),
             ("/state/ordinary.md", b"ordinary"),
         ])
+        # Ordinary writable-root restrictions reject the entire mixed batch.
         assert all(item.error == "permission_denied" for item in result)
         assert not (home / "prompts" / "heartbeat.md").exists()
         assert not (home / "state" / "ordinary.md").exists()
-        assert any(d["op"] == "upload_scheduled_instruction_veto" for d in backend.drain_denials())
+        # Server-owned persistence alone is not vetoed by calling-turn taint.
+        assert backend.upload_files([("/state/ordinary.md", b"ordinary")])[0].error is None
+        assert (home / "state" / "ordinary.md").read_bytes() == b"ordinary"
+        assert not any("scheduled_instruction_veto" in d["op"] for d in backend.drain_denials())
     finally:
         reset_current_turn(token)
 
@@ -352,7 +367,10 @@ def test_clean_instruction_write_and_tainted_proposal_checkout_writes(
             backend = WriteGuardBackend(root, ["prompts", "memory", "skills"],
                                         enforce_core_memory_readonly=False)
             backend._writable_roots.append(root)
-            assert backend.replace(relative, "text").error is None
+            result = backend.replace(relative, "text")
+            # Model tool authorization rejects tainted code leases; direct
+            # backend callers retain ordinary policy irrespective of taint.
+            assert result.error is None
     finally:
         reset_current_turn(token)
 
@@ -1074,6 +1092,8 @@ class TestWriteGuardBackend:
             interactivity=None,
             is_service=True,
             enforcement_enabled=True,
+            ifc_labels=InformationFlowLabels(),
+            ifc_state=InformationFlowState(InformationFlowLabels()),
         )
         content = "offloaded service result " * 10
 
@@ -3532,6 +3552,8 @@ class TestFileToolRouter:
             principal="u", canonical_principal="u", roles=("user",),
             event_ingress=None, trigger="user_message", channel_id="c",
             interactivity=None, enforcement_enabled=True,
+            ifc_labels=InformationFlowLabels(),
+            ifc_state=InformationFlowState(InformationFlowLabels()),
         )
         token = set_current_turn(SimpleNamespace(turn_id="outside-roots", auth_context=auth))
         try:

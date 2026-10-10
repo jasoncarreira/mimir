@@ -1734,6 +1734,9 @@ def discover_pollers(
     seen_names: dict[str, Path] = {}
 
     for pollers_file in sorted(skills_dir.rglob("pollers.json")):
+        from ._paths import live_loader_path_allowed
+        if not live_loader_path_allowed(pollers_file):
+            continue
         # Skip manifests under hidden directories (observed live
         # 2026-06-11): ``skill_install`` keeps full pre-update snapshots
         # at ``<skill>/.pre-update-backup/<ts>/`` — INCLUDING the

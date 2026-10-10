@@ -924,5 +924,9 @@ async def test_external_read_taints_the_same_retained_turn_and_blocks_every_effe
             ifc_labels=tainted,
         )
         assert decision.allowed is False
-        assert decision.reason.startswith("ifc_label_blocked:"), (name, decision.reason)
+        if name == "worklink_resume":
+            assert decision.reason.startswith("ifc_label_blocked:"), (name, decision.reason)
+        else:
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
+            assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
     assert not (case.sandbox / "blocked.txt").exists()

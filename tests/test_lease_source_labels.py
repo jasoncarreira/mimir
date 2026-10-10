@@ -490,7 +490,7 @@ async def test_repo_test_red_run_remediation_sequence(
     )
     assert decision.allowed is second_allowed
     if not second_allowed:
-        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.asyncio
@@ -865,7 +865,11 @@ def test_failed_git_operation_keeps_only_attested_origin(
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     )
     assert decision.allowed is verdict
-    assert len(events) == (1 if verdict else 0)
+    assert len(events) == 1
+    if not verdict:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control_module._TAINTED_WRITE_REFUSAL
+        assert events == [("write_blocked_by_untrusted_ingest", {"tool": "repo_test"})]
     assert "distinctive" not in str(events)
 
 
@@ -2008,7 +2012,8 @@ def test_lease_repository_sources_only_flow_to_their_own_forge_scope(
         repo_pr_action_scope=mixed_auth.repo_pr_action_scope,
     )
     assert mixed_decision.allowed is False
-    assert mixed_decision.reason == "ifc_label_blocked:forge"
+    assert mixed_decision.reason == "write_blocked_by_untrusted_ingest"
+    assert mixed_decision.refusal_detail == access_control_module._TAINTED_WRITE_REFUSAL
 
     other = _auth(labels, repository="other/repo")
     other_decision = SinkGate.check_sink_flow(

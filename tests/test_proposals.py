@@ -424,7 +424,7 @@ def test_social_pr_title_body_and_submission_commit(home, rolling_forge):
     result = finalize_proposal(home, lane="poller", poller=scope, title="Agent summary",
                                rationale="Review this", open_pr=_opener(calls))
     assert result.ok
-    assert calls[0]["title"] == "[social outbox:social-cli-feed] rolling outbox"
+    assert calls[0]["title"] == "[untrusted-origin] [social outbox:social-cli-feed] rolling outbox"
     assert "at://did:plc:public/post" in calls[0]["body"]
     assert "Submission title: Agent summary" in calls[0]["body"]
     commit_message = _git("log", "-1", "--format=%B", f"origin/{result.branch}", cwd=home).stdout
@@ -1659,7 +1659,7 @@ def test_poller_submit_attribution_and_live_wiki_untouched(wiki_home: Path, poll
     calls = []
     result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="findings", rationale="model claim", open_pr=_opener(calls))
     assert result.ok and result.pushed
-    assert calls[0]["title"] == "[research poller:research_feed-v2] https://paper.test/42 [REDACTED]: findings"
+    assert calls[0]["title"] == "[untrusted-origin] [research poller:research_feed-v2] https://paper.test/42 [REDACTED]: findings"
     body = calls[0]["body"]
     assert "Untrusted-ingest source (not verified):" in body
     assert "Trusted origin_ref: feed:item:9" in body
@@ -1721,8 +1721,8 @@ def test_poller_symlink_surface(wiki_home: Path, poller: PollerProposalScope, st
         link.unlink()
         link.write_text("safe replacement\n")
     result = finalize_proposal(wiki_home, lane="poller", poller=poller, title="t", rationale="r", open_pr=_opener([]))
-    if target == "paper.md":
-        assert result.ok
+    if target == "paper.md" and staged:
+        assert result.ok  # git add replaced the staged link with the regular file.
     else:
         assert result.reason == "outside_surface" and not result.pushed
 

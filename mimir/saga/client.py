@@ -522,6 +522,7 @@ class SagaStore:
         *,
         session_id: str | None,
         reference_date=None,
+        auth_context: Any = None,
     ) -> None:
         """Record query() retrieval access events under the write lock.
 
@@ -538,6 +539,8 @@ class SagaStore:
         ]
         with self._db_lock:
             with self._write_lock:
+                # Retrieval statistics are server-owned read bookkeeping.
+                # Explicit model mutations are vetoed at the tool boundary.
                 conn = self._ensure_conn()
                 # Best-effort + ownership-guarded. Access stats are
                 # non-essential reinforcement — a failure here must NOT fail the
@@ -1197,6 +1200,7 @@ class SagaStore:
             [atom["id"] for atom in payload["observations"] + payload["raws"]],
             session_id=session_id,
             reference_date=reference_date,
+            auth_context=auth_context,
         ))
         return payload
 

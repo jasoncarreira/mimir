@@ -787,6 +787,38 @@ access. See the
 [`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
 default, supported command syntax, and non-Python examples.
 
+### Always-on post-ingest code and live-state vetoes
+
+Regardless of the enforcement switch or trigger, untrusted active ingest blocks
+model tool calls that directly write code or live state (#1937): `repo_stage`,
+`repo_commit`, `repo_merge`, `repo_rebase`, `repo_revert`, `repo_push`, `repo_test`,
+`hands_edit`, `hands_shell`, `hands_python`, and SAGA mutation tools. File writes
+(including async variants) are blocked except to resolved descendants of
+`MIMIR_HOME/scratch/`; symlinks or traversal into live state are not exempt.
+A clean attested checkout does not override this turn-level decision, including
+retained Worklink remediation. ACP hands calls refuse before requesting client
+permission; this change does not clear taint or alter the proxy grant cache.
+
+The write veto has no grant path: model-callable `approve_declassification`
+retains its egress-only meaning and cannot unlock file writes, repository
+publication or `repo_test`. Neither exact-destination nor category approvals
+bypass this veto. Operator-only unlocking is a separate follow-up (#1942);
+until then, use a proposal or ask for a fresh clean turn. Reads, discard/abort
+operations, forge text tools and `send_message` retain their independent
+authorization decisions.
+
+Use scratch and gated operator-reviewed proposals (`open_proposal`,
+`submit_proposal`, or `memory_propose`) instead of live writes. Untrusted-origin
+proposal PRs carry an `[untrusted-origin]` title prefix and a fixed review note,
+must never auto-merge, and submission checks the whole staged index for changes
+outside the permitted surfaces, including code/config. Live loaders reject
+scratch-backed sources, even through aliases; automatic semantic persistence
+must not bypass gated tools.
+
+The veto is enforced at the model tool-call boundary, not on shared server
+persistence backends. Continuation sidecars, summarization offload, retrieval
+statistics and audit logs remain functional after untrusted ingest.
+
 ### Contained repository-code execution
 
 `repo_test` runs its configured command in a disposable snapshot of the active

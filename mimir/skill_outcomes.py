@@ -215,6 +215,9 @@ def load_skill_success_criteria(home: Path) -> dict[str, SkillSuccessCriteria]:
         if not src.is_dir():
             continue
         for skill_md in src.glob("*/SKILL.md"):
+            from ._paths import live_loader_path_allowed
+            if not live_loader_path_allowed(skill_md, home):
+                continue
             try:
                 criteria = _parse_criteria_from_skill_md(skill_md)
             except (OSError, yaml.YAMLError) as exc:

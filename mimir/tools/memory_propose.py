@@ -42,7 +42,14 @@ async def memory_propose(
     from .._context import get_current_turn
 
     turn = get_current_turn()
-    if turn is None or turn.auth_context is not auth:
+    live_auth = getattr(turn, "auth_context", None)
+    if (turn is None or not isinstance(live_auth, AuthContext)
+            or live_auth.ifc_state is not auth.ifc_state
+            or live_auth.canonical_principal != auth.canonical_principal
+            or live_auth.principal != auth.principal
+            or live_auth.origin_ref != auth.origin_ref
+            or live_auth.channel_id != auth.channel_id
+            or live_auth.origin_trigger != auth.origin_trigger):
         return "memory_propose refused: missing authoritative turn id"
     home = os.environ.get("MIMIR_HOME", "").strip()
     if not home:

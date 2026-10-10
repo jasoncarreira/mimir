@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 from langchain.tools import ToolRuntime
 
-from mimir import _context
+from mimir import _context, access_control as ac
 from mimir.access_control import (
     CapabilityTier, SAGA_TAINT_REFUSAL, build_trigger_service_principal,
     create_auth_context, get_tool_registry, saga_mutation_taint_refusal,
@@ -350,7 +350,10 @@ def test_tainted_proposal_records_every_field_without_mutating_saga(proposal_tur
     assert conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall() == before_tables
 
 
-def test_research_poller_memory_store_refusal_offers_proposal_on_tainted_turn(proposal_turn):
+@pytest.mark.parametrize("enforce", [False, True])
+def test_research_poller_memory_store_refusal_offers_proposal_on_tainted_turn(
+    proposal_turn, enforce,
+):
     env = proposal_turn
     registry = get_tool_registry()
     proposal = registry.authorize_tool(
@@ -358,12 +361,11 @@ def test_research_poller_memory_store_refusal_offers_proposal_on_tainted_turn(pr
     )
     assert proposal.allowed
     store = registry.authorize_tool(
-        "memory_store", env.auth, enforce=True, ifc_labels=env.labels,
+        "memory_store", env.auth, enforce=enforce, ifc_labels=env.labels,
     )
-    assert not store.allowed and store.reason == "saga_mutation_blocked_by_tainted_turn"
-    assert store.refusal_detail == (
-        SAGA_TAINT_REFUSAL + " Or propose it for operator review with memory_propose."
-    )
+    assert not store.allowed and store.reason == "write_blocked_by_untrusted_ingest"
+    assert store.enforcement_enabled and not store.is_shadow_decision
+    assert store.refusal_detail == ac._TAINTED_WRITE_REFUSAL
     assert "queued" in env.call(content="Research poller fact")
     record, = _records(env.home)
     assert record["proposed_by"] == "poller:papers"

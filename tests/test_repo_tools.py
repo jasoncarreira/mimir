@@ -297,6 +297,39 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
+def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(tmp_path: Path) -> None:
+    import inspect
+
+    from mimir import access_control
+    from mimir.access_control import SinkGate
+    from mimir.models import SourceLabel
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    assert lease is not None and lease.head_sha == scope.observed_head_sha
+    auth = _lineage_turn(scope, state)
+    assert access_control._attested_pr_checkout_lease(auth, scope, lease)
+    outsider = SourceLabel(
+        principal="outsider", domain="repository", resource_id="outside-comment",
+        bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = auth.ifc_labels.with_source(outsider)
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    auth = replace(auth, ifc_labels=labels)
+    assert access_control._attested_pr_checkout_lease(auth, scope, lease)
+    for name in ("repo_commit", "repo_push"):
+        decision = SinkGate.check_sink_flow(
+            name, "owner/repo#pull/7", labels, auth,
+            enforce=False, repo_pr_action_scope=scope,
+        )
+        assert not decision.allowed and decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    # Checkout-content attestation cannot
+    # share the commit/push tool set: the model's decision itself is tainted.
+    assert "_REPO_PUBLISH_TOOLS" not in inspect.getsource(access_control._attested_pr_checkout_lease)
+
+
 @pytest.mark.parametrize("lineage", [
     "clean", "tainted", "tainted_flip", "tainted_base", "missing", "unrecorded", "corrupt",
 ])
@@ -417,7 +450,7 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     )
     assert decision.allowed is trusted
     if not trusted:
-        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 def test_rebase_cannot_clean_up_tainted_local_commit(tmp_path: Path) -> None:

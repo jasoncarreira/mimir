@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.tools import ToolException
 
+from mimir import access_control
 from mimir.access_control import (
     ServicePrincipal,
     SinkGate,
@@ -152,7 +153,8 @@ def test_repo_enforcement_state_preserves_explicit_flag() -> None:
     ) is True
 
 
-def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow() -> None:
+@pytest.mark.parametrize("enforce", [False, True])
+def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow(enforce: bool) -> None:
     scope = _scope(RepoPRAction.INSPECT, RepoPRAction.TEST)
     context = _auth(scope)
     source = SourceLabel(
@@ -173,13 +175,13 @@ def test_repo_test_registry_vetoes_untrusted_checkout_even_in_shadow() -> None:
         service_authority=replace(context.service_authority, capabilities=("repo_test",)),
     )
     decision = ToolRegistry().authorize_tool(
-        "repo_test", context, enforce=False,
+        "repo_test", context, enforce=enforce,
         arguments={"repository": "owner/repo", "pull_request": 7},
     )
     assert decision.allowed is False
     assert decision.is_shadow_decision is False
-    assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
-    assert "protected_tool / repository" in decision.refusal_detail
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 @pytest.mark.asyncio

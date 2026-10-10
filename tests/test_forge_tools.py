@@ -303,7 +303,7 @@ def test_first_projection_attests_without_metadata_warmup(monkeypatch, verdict, 
         )
         assert decision.allowed is (verdict is True)
         if verdict is not True:
-            assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 
@@ -363,7 +363,7 @@ def test_successful_write_survives_failed_attestation_without_trust(
             labels, runtime.context, enforce=False, repo_pr_action_scope=scope,
         )
         assert not decision.allowed
-        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 
@@ -422,7 +422,7 @@ def test_checks_and_job_log_after_push_keep_scoped_labels_and_repo_test_decision
             )
             assert decision.allowed is expected_trust
             if not expected_trust:
-                assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+                assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 
@@ -527,7 +527,7 @@ def test_job_log_attestation_controls_repo_test(monkeypatch, verdict):
         )
         assert decision.allowed is (verdict is True)
         if verdict is not True:
-            assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
     finally:
         set_forge_client(None)
 
