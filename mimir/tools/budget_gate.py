@@ -2706,6 +2706,7 @@ def _execute_declassification_action(
         sink_category=arguments.get("sink_category"),
         destination=arguments.get("destination"),
         reason=arguments.get("reason"),
+        tool_name=arguments.get("tool_name"),
     )
     content = (
         "One-use declassification approved for the exact destination."

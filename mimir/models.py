@@ -808,8 +808,9 @@ class InformationFlowState:
         canonical_principal: str,
         lifetime_seconds: float,
         durable_audit: Any,
+        tool_name: str | None = None,
     ) -> bool:
-        """Durably audit and install one capability for the exact live carrier."""
+        """Durably audit and install one capability for the exact live carrier/tool."""
         with self._lock:
             current = self.labels if self.labels is not None else fallback
             if not isinstance(current, InformationFlowLabels) or not current.labels:
@@ -827,6 +828,7 @@ class InformationFlowState:
                 sources=current.sources,
                 issued_at=issued_at,
                 expires_at=expires_at,
+                tool_name=tool_name,
             )
             self._shadow_declassification_used = False
             return True
@@ -840,6 +842,8 @@ class InformationFlowState:
         canonical_principal: str,
         turn_id: str | None = None,
         shadow: bool = False,
+        tool_name: str | None = None,
+        require_tool: bool = False,
     ) -> bool:
         """Admit a capability, accounting shadow one-shot use without spending it."""
         with self._lock:
@@ -852,6 +856,8 @@ class InformationFlowState:
                 else:
                     matches = (
                         capability.sink_category == sink_category
+                        and (not require_tool or capability.tool_name is not None)
+                        and (capability.tool_name is None or capability.tool_name == tool_name)
                         and capability.destination == destination
                         and capability.canonical_principal == canonical_principal
                         and isinstance(live, InformationFlowLabels)
@@ -867,7 +873,8 @@ class InformationFlowState:
                         return True
             category_capability = self._sink_category_capabilities.get(sink_category)
             return bool(
-                turn_id is not None
+                not require_tool
+                and turn_id is not None
                 and category_capability is not None
                 and category_capability.turn_id == turn_id
                 and category_capability.canonical_principal == canonical_principal
@@ -915,6 +922,7 @@ class DeclassificationCapability:
     sources: tuple[SourceLabel, ...]
     issued_at: float
     expires_at: float
+    tool_name: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sources", _dedup_source_labels(self.sources))

@@ -284,7 +284,8 @@ def load_template(name: str, default: str, prompts_dir: Path | None) -> str:
     if prompts_dir is None:
         return default
     candidate = prompts_dir / f"{name}.md"
-    if candidate.is_file():
+    from ._paths import live_loader_path_allowed
+    if candidate.is_file() and live_loader_path_allowed(candidate):
         try:
             return candidate.read_text(encoding="utf-8")
         except OSError as exc:

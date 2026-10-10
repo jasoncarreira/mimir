@@ -401,6 +401,10 @@ class IdentityResolver:
                 )
             return len(self._alias_map)
 
+        from ._paths import live_loader_path_allowed
+        if not live_loader_path_allowed(self._yaml_path):
+            self._web_gate_latched = True
+            return len(self._alias_map)
         try:
             text = self._yaml_path.read_text(encoding="utf-8")
         except OSError as exc:

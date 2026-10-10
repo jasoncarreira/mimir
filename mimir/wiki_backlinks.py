@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from ._paths import live_loader_path_allowed
 from .event_logger import init_logger, log_event
 
 
@@ -112,9 +113,11 @@ def find_pages(wiki_dir: Path) -> dict[str, Path]:
     to handle stem collisions.
     """
     pages: dict[str, Path] = {}
-    if not wiki_dir.is_dir():
+    if not live_loader_path_allowed(wiki_dir) or not wiki_dir.is_dir():
         return pages
     for md in sorted(wiki_dir.rglob("*.md")):
+        if not live_loader_path_allowed(md) or not md.is_file():
+            continue
         if md.name in _META_FILENAMES:
             continue
         rel = md.relative_to(wiki_dir)
@@ -145,9 +148,11 @@ def find_slug_collisions(wiki_dir: Path) -> dict[str, list[Path]]:
     ``foo.md`` pages, even if backlink accounting now handles it.
     """
     by_slug: dict[str, list[Path]] = {}
-    if not wiki_dir.is_dir():
+    if not live_loader_path_allowed(wiki_dir) or not wiki_dir.is_dir():
         return {}
     for md in sorted(wiki_dir.rglob("*.md")):
+        if not live_loader_path_allowed(md) or not md.is_file():
+            continue
         if md.name in _META_FILENAMES:
             continue
         by_slug.setdefault(md.stem, []).append(md.relative_to(wiki_dir))
@@ -256,6 +261,8 @@ def build_graph(wiki_dir: Path) -> BacklinksGraph:
 
     for source_path, rel_path in pages_paths.items():
         full_path = wiki_dir / rel_path
+        if not live_loader_path_allowed(full_path):
+            continue
         try:
             text = full_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -515,7 +522,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def _scan_and_write_reports(home: Path) -> tuple[BacklinksGraph, str]:
     """Perform the complete synchronous scan/render/write job off-loop."""
     wiki_dir = home / "state" / "wiki"
-    if not wiki_dir.is_dir():
+    if not live_loader_path_allowed(wiki_dir) or not wiki_dir.is_dir():
         raise FileNotFoundError(f"no wiki at {wiki_dir}")
 
     graph = build_graph(wiki_dir)

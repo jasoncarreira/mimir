@@ -2605,6 +2605,9 @@ async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_
         ),
         fake_saga=None,
     )
+    agent._identity_resolver = _resolver(
+        agent._config.home, "people:\n  - canonical: jason\n    access: {roles: [user]}\n",
+    )
     finalized: list[str] = []
     import threading
     from unittest.mock import Mock
@@ -2647,9 +2650,10 @@ async def test_budget_continuation_timeout_logs_failure_and_still_runs_finalize_
     try:
         record = await agent.run_turn(
             AgentEvent(
-                trigger="scheduled_tick",
+                trigger="user_message",
                 channel_id="ops",
                 content="generic worklink follow-up",
+                author="jason", source="discord",
                 source_id="budget-timeout-src",
             )
         )
@@ -5806,6 +5810,9 @@ async def test_finalize_timeout_normalizes_nonpositive_values(tmp_path: Path, mo
     import asyncio
     monkeypatch.setenv("MIMIR_POST_TURN_TIMEOUT_SECONDS", str(configured))
     agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="ok")]), fake_saga=None)
+    agent._identity_resolver = _resolver(
+        agent._config.home, "people:\n  - canonical: jason\n    access: {roles: [user]}\n",
+    )
     finalized = []
     timeouts = []
     original_wait_for = asyncio.wait_for
@@ -5821,7 +5828,9 @@ async def test_finalize_timeout_normalizes_nonpositive_values(tmp_path: Path, mo
 
     monkeypatch.setattr(asyncio, "wait_for", capture_wait_for)
     agent._hooks.append(FinalizeHook())
-    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-1", content="hi"))
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi", author="jason", source="discord",
+    ))
     assert finalized == [record.turn_id]
     assert timeouts == [configured if configured > 0 else 180]
 
@@ -5837,18 +5846,39 @@ async def test_run_turn_bounds_hung_finalize_hook(tmp_path: Path, monkeypatch):
     fake_agent = _FakeAgent(response_messages=[AIMessage(content="ok")])
     agent = _build_agent(tmp_path, fake_agent=fake_agent, fake_saga=None)
 
+    agent._identity_resolver = _resolver(
+        agent._config.home, "people:\n  - canonical: jason\n    access: {roles: [user]}\n",
+    )
+
     class _HangFinalizeHook:
         async def finalize(self, ctx, event, record):
             await asyncio.Event().wait()  # never returns
 
     agent._hooks.append(_HangFinalizeHook())
-    event = AgentEvent(trigger="user_message", channel_id="ch-1", content="hi")
+    event = AgentEvent(
+        trigger="user_message", channel_id="ch-1", content="hi", author="jason", source="discord",
+    )
 
     # Must return well under the guard despite the hung hook (would hang forever
     # pre-fix). The TurnRecord is still produced (written before finalize).
     record = await asyncio.wait_for(agent.run_turn(event), timeout=15.0)
     assert record is not None
     assert record.output == "ok"
+
+
+async def test_tainted_turn_skips_finalize_hooks(tmp_path: Path):
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="ok")]), fake_saga=None)
+    finalized = []
+
+    class FinalizeHook:
+        async def finalize(self, ctx, event, record):
+            finalized.append(record.turn_id)
+
+    agent._hooks.append(FinalizeHook())
+    # Missing authenticated author makes the inbound event active untrusted ingest.
+    record = await agent.run_turn(AgentEvent(trigger="user_message", channel_id="ch-1", content="hi"))
+    assert record.output == "ok"
+    assert finalized == []
 
 
 async def test_run_turn_setup_phase_exception_releases_cleanup(tmp_path: Path):

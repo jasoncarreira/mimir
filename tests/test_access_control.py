@@ -5680,10 +5680,14 @@ def test_generic_shell_post_ingest_veto_in_shadow_on_every_turn(tool_name, trigg
     )
     assert decision.allowed is False
     assert decision.is_shadow_decision is False
-    assert decision.reason == "ifc_label_blocked:shell_process"
-    for guidance in ("untrusted active ingest", "declared or bounded", "read_file/glob/grep",
-                     "open_proposal", "fresh turn", "approve_sink_once", "request_operator_approval"):
-        assert guidance in decision.refusal_detail
+    if tool_name in {"hands_shell", "hands_python"}:
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    else:
+        assert decision.reason == "ifc_label_blocked:shell_process"
+        for guidance in ("untrusted active ingest", "declared or bounded", "read_file/glob/grep",
+                         "open_proposal", "fresh turn", "approve_sink_once", "request_operator_approval"):
+            assert guidance in decision.refusal_detail
     registry_decision = ToolRegistry().authorize_tool(
         tool_name, auth, enforce=False, target_channel="printf hello",
     )
@@ -5708,8 +5712,9 @@ def test_post_ingest_enforced_shell_decision_is_unchanged(tool_name):
     decision = SinkGate.check_sink_flow(
         tool_name, "printf hello", auth.ifc_labels, auth, enforce=True,
     )
+    expected = ("write_blocked_by_untrusted_ingest", access_control._TAINTED_WRITE_REFUSAL) if tool_name in {"hands_shell", "hands_python"} else ("ifc_label_blocked:shell_process", None)
     assert (decision.allowed, decision.is_shadow_decision, decision.reason,
-            decision.refusal_detail) == (False, False, "ifc_label_blocked:shell_process", None)
+            decision.refusal_detail) == (False, False, *expected)
 
 
 def test_post_ingest_generic_shell_refusal_preserves_attestation_context() -> None:
@@ -5717,7 +5722,7 @@ def test_post_ingest_generic_shell_refusal_preserves_attestation_context() -> No
     state = InformationFlowState(auth.ifc_labels)
     state.record_author_attestation_unavailable()
     auth = replace(auth, ifc_state=state, trigger="shell_job_complete")
-    for tool_name in ("bash_async", "execute", "hands_python"):
+    for tool_name in ("bash_async", "execute"):
         decision = SinkGate.check_sink_flow(
             tool_name, "printf hello", auth.ifc_labels, auth, enforce=False,
         )
@@ -5734,7 +5739,7 @@ def test_post_ingest_shell_one_time_approval_is_spent(tool_name):
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="shell_process",
         destination="printf hello", canonical_principal=auth.canonical_principal,
-        lifetime_seconds=30, durable_audit=lambda *_: True,
+        lifetime_seconds=30, durable_audit=lambda *_: True, tool_name=tool_name,
     )
     first = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
     second = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
@@ -5775,10 +5780,8 @@ def test_repo_test_post_ingest_veto_refuses_every_trigger(trigger: str) -> None:
     assert decision.is_shadow_decision is False
     assert decision.enforcement_enabled is True
     assert decision.would_block is True
-    assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
-    assert "channel" in decision.refusal_detail
-    for guidance in ("pr_diff/repo_diff", "pr_checks", "fresh turn", "approve_sink_once"):
-        assert guidance in decision.refusal_detail
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 def test_repo_test_refusal_preserves_author_attestation_context() -> None:
@@ -5790,8 +5793,7 @@ def test_repo_test_refusal_preserves_author_attestation_context() -> None:
         "repo_test", "owner/repo#pull/7", auth.ifc_labels, auth, enforce=False,
     )
     assert not decision.allowed
-    assert "GitHub author attestation was unavailable" in decision.refusal_detail
-    assert "not a measured non-collaborator verdict" in decision.refusal_detail
+    assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 def test_repo_test_shadow_veto_spends_only_exact_one_time_grant() -> None:
@@ -5802,18 +5804,24 @@ def test_repo_test_shadow_veto_spends_only_exact_one_time_grant() -> None:
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True,
+        durable_audit=lambda *_: True, tool_name="repo_test",
     )
     other = SinkGate.check_sink_flow(
         "repo_test", "owner/repo#pull/8", auth.ifc_labels, auth, enforce=False,
     )
+    wrong_tool = SinkGate.check_sink_flow(
+        "repo_push", target, auth.ifc_labels, auth, enforce=False,
+    )
+    assert not wrong_tool.allowed and not wrong_tool.is_shadow_decision
+    assert wrong_tool.reason == "write_blocked_by_untrusted_ingest"
+    assert wrong_tool.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
     first = SinkGate.check_sink_flow(
         "repo_test", target, auth.ifc_labels, auth, enforce=False,
     )
     second = SinkGate.check_sink_flow(
         "repo_test", target, auth.ifc_labels, auth, enforce=False,
     )
-    assert not other.allowed and other.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert not other.allowed and other.reason == "write_blocked_by_untrusted_ingest"
     assert first.allowed and first.reason == "ifc_declassification_approved"
     assert not second.allowed and not second.is_shadow_decision
     assert not state.consume_sink_approval(
@@ -5830,11 +5838,11 @@ def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True,
+        durable_audit=lambda *_: True, tool_name="repo_test",
     )
     missing = SinkGate.check_sink_flow("repo_test", target, None, auth, enforce=False)
     assert not missing.allowed and not missing.is_shadow_decision
-    assert missing.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert missing.reason == "write_blocked_by_untrusted_ingest"
     assert SinkGate.check_sink_flow(
         "repo_test", target, auth.ifc_labels, auth, enforce=False,
     ).reason == "ifc_declassification_approved"
@@ -5872,10 +5880,10 @@ def test_repo_publish_outsider_veto_and_original_enforced_denial(tool_name: str)
     assert not shadow.allowed and not shadow.is_shadow_decision
     assert shadow.decision == OperationDecision.ADMIN_REQUIRED
     assert shadow.required_tier == access_control.AccessTier.ADMIN and shadow.would_block
-    assert shadow.reason == "repo_publish_blocked_by_untrusted_ingest"
-    assert shadow.refusal_detail == access_control._REPO_PUBLISH_INGEST_REFUSAL
+    assert shadow.reason == "write_blocked_by_untrusted_ingest"
+    assert shadow.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
     assert not enforced.allowed
-    assert enforced.reason == "ifc_label_blocked:forge"
+    assert enforced.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("enforce", [False, True])
@@ -5920,7 +5928,7 @@ def test_trusted_repository_and_attested_ci_output_do_not_veto(tool_name: str) -
 
 
 @pytest.mark.parametrize("tool_name", (
-    "repo_stage", "repo_merge_abort", "repo_rebase_abort", "repo_revert_abort",
+    "repo_merge_abort", "repo_rebase_abort", "repo_revert_abort",
     "repo_cleanup", "repo_checkout", "repo_status", "repo_diff", "repo_unmerged",
 ))
 def test_repo_nonpublishing_tools_keep_original_decision(
@@ -5947,16 +5955,16 @@ def test_repo_publish_one_time_grant_is_consumed(tool_name: str) -> None:
     assert auth.ifc_state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True,
+        durable_audit=lambda *_: True, tool_name=tool_name,
     )
     def check(destination: str):
         return SinkGate.check_sink_flow(
             tool_name, destination, auth.ifc_labels, auth,
             enforce=False, repo_pr_action_scope=scope,
         )
-    assert check("owner/repo#pull/8").reason == "repo_publish_blocked_by_untrusted_ingest"
+    assert check("owner/repo#pull/8").reason == "write_blocked_by_untrusted_ingest"
     assert check(target).reason == "ifc_declassification_approved"
-    assert check(target).reason == "repo_publish_blocked_by_untrusted_ingest"
+    assert check(target).reason == "write_blocked_by_untrusted_ingest"
 
 
 def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5971,13 +5979,10 @@ def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: 
             tool_name, "owner/repo#pull/7/private-path-marker", auth.ifc_labels, auth,
             enforce=False, repo_pr_action_scope=scope,
         )
-        assert decision.refusal_detail == access_control._REPO_PUBLISH_INGEST_REFUSAL
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
         assert not hasattr(decision, "ifc_labels")
         assert decision.protected_source_resources is None
-        assert events[-1] == ("repo_publish_blocked_by_untrusted_ingest", {
-            "tool": tool_name, "scope_id": scope.scope_id,
-            "domain": "github", "source_kind": "protected_tool",
-        })
+        assert events[-1] == ("write_blocked_by_untrusted_ingest", {"tool": tool_name})
         for marker in ("outsider-comment-marker", "private-path-marker", "secret-commit-message"):
             assert marker not in decision.refusal_detail
             assert marker not in str(events[-1])
@@ -6007,24 +6012,15 @@ def test_repo_test_clean_repository_turn_retains_original_decision(
     assert decision.allowed is True
 
 
-def test_repo_test_enforced_decisions_match_path_without_veto(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_repo_test_enforced_veto_is_uniform() -> None:
     auth = _tainted_admin_operator_write_auth()
     auth = replace(auth, ifc_state=InformationFlowState(auth.ifc_labels))
     for target in ("owner/repo#pull/7", "owner/repo#pull/8"):
-        kwargs = dict(enforce=True, repo_pr_action_scope=_review_state(
-            "owner/repo", 7, "fix", "/srv/repo",
-        ).action_scope)
         decision = SinkGate.check_sink_flow(
-            "repo_test", target, auth.ifc_labels, auth, **kwargs,
+            "repo_test", target, auth.ifc_labels, auth, enforce=True,
         )
-        with monkeypatch.context() as disabled:
-            disabled.setattr(access_control, "_turn_has_untrusted_active_ingest", lambda *_: False)
-            original = SinkGate.check_sink_flow(
-                "repo_test", target, auth.ifc_labels, auth, **kwargs,
-            )
-        assert decision == original
+        assert not decision.allowed
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("trigger", ["poller", "scheduled_tick"])
@@ -6170,19 +6166,21 @@ def test_skill_writes_require_an_untainted_admin_operator_turn(
     )
 
     assert decision.allowed is allowed, case
-    assert decision.reason == (None if allowed else "skill_write_requires_admin_operator"), case
+    expected_reason = (
+        None if allowed else "write_blocked_by_untrusted_ingest"
+        if case == "tainted_admin_operator" else "skill_write_requires_admin_operator"
+    )
+    assert decision.reason == expected_reason, case
     assert decision.refusal_detail == (
         None if allowed else
-        access_control._SCHEDULE_WRITE_REFUSAL if case == "tainted_admin_operator" else
+        access_control._TAINTED_WRITE_REFUSAL if case == "tainted_admin_operator" else
         "writes under skills/ require an untainted admin operator turn"
     )
     compatibility_decision = ToolRegistry().authorize_tool(
         "edit_file", auth, enforce=False, target_channel=target,
     )
     assert compatibility_decision.allowed is allowed, case
-    assert compatibility_decision.reason == (
-        None if allowed else "skill_write_requires_admin_operator"
-    )
+    assert compatibility_decision.reason == expected_reason
     assert compatibility_decision.is_shadow_decision is False
     assert compatibility_decision.would_block is not allowed
 
@@ -8280,7 +8278,7 @@ async def test_admin_required_shadow_denial_marks_targetless_request_explicitly(
 @pytest.mark.parametrize(
     ("tool_name", "target", "reason"),
     [
-        ("write_file", "/tmp/result.txt", "ifc_label_blocked:file"),
+        ("write_file", "/tmp/result.txt", "write_blocked_by_untrusted_ingest"),
         ("send_message", "slack-C2", "ifc_label_blocked:same_channel"),
         ("spawn_open_code", "/tmp/worktree", "ifc_label_blocked:spawn"),
     ],
@@ -8320,12 +8318,30 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     async def capture(_kind: str, **fields: object) -> None:
         captured.append(fields)
 
+    hard_events = []
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr("mimir.event_logger.log_event", capture)
+        monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                            lambda kind, **fields: hard_events.append((kind, fields)))
         shadow = registry.authorize_tool(
             tool_name, auth, enforce=False, target_channel=target, ifc_labels=labels,
         )
         await asyncio.sleep(0)
+
+    if tool_name == "write_file":
+        # The always-on write veto emits only fixed safe metadata, not a shadow
+        # census with an outside-content source or destination identifier.
+        assert not shadow.allowed and not shadow.is_shadow_decision
+        assert shadow.reason == reason
+        assert shadow.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+        assert hard_events == [(reason, {"tool": tool_name})]
+        assert captured == []
+        for enforce in (False, True):
+            denied = SinkGate.check_sink_flow(tool_name, target, labels, auth, enforce=enforce)
+            assert not denied.allowed and not denied.is_shadow_decision
+            assert denied.reason == reason
+            assert denied.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+        return
 
     events = [event for event in captured if event["reason"] == reason]
     assert len(events) == 1
@@ -8343,16 +8359,19 @@ async def test_ifc_shadow_denial_records_one_bounded_redacted_causing_source(
     }
     assert "secret-value" not in repr(event)
     assert len(event["ifc_source"]["resource_id"]) == 1024
-    assert shadow.allowed is True
+    assert shadow.allowed is (tool_name != "write_file")
     shadow_sink = SinkGate.check_sink_flow(
         tool_name, target, labels, auth, enforce=False,
     )
     enforced_sink = SinkGate.check_sink_flow(
         tool_name, target, labels, auth, enforce=True,
     )
-    assert shadow_sink.allowed is True
+    assert shadow_sink.allowed is (tool_name != "write_file")
     assert enforced_sink.allowed is False
     assert shadow_sink.reason == enforced_sink.reason == reason
+    if tool_name == "write_file":
+        assert not shadow_sink.is_shadow_decision
+        assert shadow_sink.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 @pytest.mark.asyncio
@@ -9926,16 +9945,25 @@ def test_repo_test_admits_self_trigger_only_and_refuses_monotonic_taint(
         )
 
     clean_decision = decision(clean)
-    assert clean_decision.allowed is True, clean_decision.reason
+    assert clean_decision.allowed is False
+    assert clean_decision.reason == "write_blocked_by_untrusted_ingest"
+    assert clean_decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    trusted = replace(clean, sources=tuple(
+        replace(source, integrity="trusted") if source.domain == "repository" else source
+        for source in clean.sources
+    ))
+    assert decision(trusted).allowed is True
     assert (lease_source.integrity, lease_source.integrity_effect) == (
         "trusted", "informational",
     )
     lease_decision = decision(after_lease_read)
-    assert lease_decision.allowed is True, lease_decision.reason
+    assert lease_decision.allowed is False
+    assert lease_decision.reason == "write_blocked_by_untrusted_ingest"
     for labels in (untrusted_only, mixed):
         blocked = decision(labels)
         assert blocked.allowed is False
-        assert blocked.reason == "ifc_label_blocked:forge"
+        assert blocked.reason == "write_blocked_by_untrusted_ingest"
+        assert blocked.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
     for source in (
         untrusted_page,
@@ -10648,7 +10676,11 @@ def test_authorized_tainted_edit_and_shell_results_reply_only_to_originating_acp
             sink_name, target, labels, auth, enforce=True, sink_category=category,
         )
         assert denied.allowed is False, (sink_name, denied.reason)
-        assert denied.reason == f"ifc_label_blocked:{category.value}"
+        if sink_name in {"write_file", "hands_edit", "hands_shell"}:
+            assert denied.reason == "write_blocked_by_untrusted_ingest"
+            assert denied.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+        else:
+            assert denied.reason == f"ifc_label_blocked:{category.value}"
 
 
 @pytest.mark.parametrize("tool_name", ["hands_read", "hands_edit", "hands_shell", "hands_python", "read_file"])
@@ -10913,7 +10945,7 @@ def test_verified_push_lineage_allows_exact_pr_through_registry(tool_name) -> No
     old = scope.observed_head_sha
     labels = _trusted_operator_write_auth(admin=True).ifc_labels.with_source(
         replace(_repository_result_labels("owner/repo", 17, old).sources[0],
-                integrity_effect=IntegrityEffect.ACTIVE_INGEST)
+                integrity="trusted", integrity_effect=IntegrityEffect.ACTIVE_INGEST)
     )
     auth = replace(_trusted_operator_write_auth(admin=True), ifc_labels=labels,
                    repo_review_state=state, repo_pr_action_scope=scope,
@@ -13606,7 +13638,8 @@ def test_operator_binding_genuine_match_and_sink_is_shell_only(
     assert shell.allowed is True
     assert shell.reason == "ifc_allowed"
     assert file.allowed is False
-    assert file.reason == "ifc_label_blocked:file"
+    assert file.reason == "write_blocked_by_untrusted_ingest"
+    assert file.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 @pytest.mark.parametrize(
@@ -18248,7 +18281,7 @@ async def test_public_sync_permission_result_is_audited(
 
 
 @pytest.mark.asyncio
-async def test_tainted_turn_refuses_shell_exec_but_reaches_hands_shell_permission() -> None:
+async def test_tainted_turn_refuses_native_and_hands_shell_before_permission() -> None:
     from langchain_core.messages import ToolMessage
     from mimir.models import InformationFlowState
     from mimir.tools.budget_gate import BudgetGateMiddleware
@@ -18268,9 +18301,7 @@ async def test_tainted_turn_refuses_shell_exec_but_reaches_hands_shell_permissio
         hands.tool_call["args"] = {"command": "printf hands"}
         hands_result = await middleware.awrap_tool_call(
             hands,
-            lambda request: asyncio.sleep(
-                0, result=ToolMessage(content="hands", tool_call_id=request.tool_call["id"]),
-            ),
+            lambda _request: pytest.fail("tainted hands shell executed"),
         )
     finally:
         reset_turn_capability_context(token)
@@ -18279,10 +18310,10 @@ async def test_tainted_turn_refuses_shell_exec_but_reaches_hands_shell_permissio
     assert str(native_result.content).startswith(
         "shell_exec was refused before execution (ifc_label_blocked:shell_process)"
     )
-    assert hands_result.content == "hands"
-    assert len(broker.calls) == 1
-    assert broker.calls[0].host_execution.operation == "client_authorized_host_execution"
-    assert broker.calls[0].host_execution.tainted is True
+    assert hands_result.status == "error"
+    assert "write_blocked_by_untrusted_ingest" in str(hands_result.content)
+    assert access_control._TAINTED_WRITE_REFUSAL in str(hands_result.content)
+    assert broker.calls == []
 
 
 @pytest.mark.asyncio
@@ -18383,10 +18414,11 @@ def test_stale_or_forged_hands_authorization_keeps_untrusted_ingest_veto(
         reset_turn_capability_context(token)
 
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:shell_process"
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
-def test_client_authorized_hands_shell_keeps_shadow_exemption() -> None:
+def test_client_authorized_hands_shell_cannot_bypass_shadow_veto() -> None:
     from mimir.tools.client_provider import (
         issue_client_authorized_host_execution,
         reset_turn_capability_context,
@@ -18417,8 +18449,10 @@ def test_client_authorized_hands_shell_keeps_shadow_exemption() -> None:
         )
     finally:
         reset_turn_capability_context(token)
-    assert allowed.allowed
-    assert not refused.allowed and not refused.is_shadow_decision
+    for decision in (allowed, refused):
+        assert not decision.allowed and not decision.is_shadow_decision
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
 def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
@@ -18503,6 +18537,12 @@ def test_non_hands_native_sink_inventory_keeps_untrusted_ingest_veto(
             if name in display_tools
             else (True, "memory_proposal_queue")
             if name == "memory_propose"
+            else (False, "write_blocked_by_untrusted_ingest")
+            if name in {"memory_store", "saga_record_skill_learning", "saga_feedback",
+                        "saga_mark_contributions", "saga_forget", "saga_end_session",
+                        "write_file", "edit_file", "replace_file", "repo_stage",
+                        "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
+                        "repo_push", "repo_test"}
             else (False, "saga_mutation_blocked_by_tainted_turn")
             if name in saga_tools
             else (False, "egress_destination_not_approved")

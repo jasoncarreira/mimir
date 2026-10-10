@@ -352,7 +352,11 @@ def test_clean_instruction_write_and_tainted_proposal_checkout_writes(
             backend = WriteGuardBackend(root, ["prompts", "memory", "skills"],
                                         enforce_core_memory_readonly=False)
             backend._writable_roots.append(root)
-            assert backend.replace(relative, "text").error is None
+            result = backend.replace(relative, "text")
+            if root == proposal:
+                assert result.error is None
+            else:
+                assert result.error is not None  # Code leases are not scratch.
     finally:
         reset_current_turn(token)
 
@@ -1074,6 +1078,8 @@ class TestWriteGuardBackend:
             interactivity=None,
             is_service=True,
             enforcement_enabled=True,
+            ifc_labels=InformationFlowLabels(),
+            ifc_state=InformationFlowState(InformationFlowLabels()),
         )
         content = "offloaded service result " * 10
 
@@ -3532,6 +3538,8 @@ class TestFileToolRouter:
             principal="u", canonical_principal="u", roles=("user",),
             event_ingress=None, trigger="user_message", channel_id="c",
             interactivity=None, enforcement_enabled=True,
+            ifc_labels=InformationFlowLabels(),
+            ifc_state=InformationFlowState(InformationFlowLabels()),
         )
         token = set_current_turn(SimpleNamespace(turn_id="outside-roots", auth_context=auth))
         try:

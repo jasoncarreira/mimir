@@ -79,6 +79,22 @@ def resolve_within_roots(roots: list[Path], raw_path: str) -> Path:
     )
 
 
+def live_loader_path_allowed(path: Path, home: Path | None = None) -> bool:
+    """Never load live instructions/config/state from scratch, even via aliases."""
+    try:
+        configured = os.environ.get("MIMIR_HOME", "").strip()
+        roots = [Path(home)] if home is not None else ([Path(configured)] if configured else [])
+        # A loader with an explicitly supplied isolated home must not depend on
+        # the deployment env; detect its lexical scratch ancestor as well.
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve()
+        if "scratch" in lexical.parts or "scratch" in resolved.parts:
+            return False
+        return not any(resolved.is_relative_to(root.resolve() / "scratch") for root in roots)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def claude_code_persisted_output_root() -> Path:
     """Return Claude Code's persisted-output parent dir.
 

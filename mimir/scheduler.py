@@ -510,6 +510,9 @@ def load_jobs(
     writable_roots: tuple[Path, ...] = (),
 ) -> tuple[list[SchedulerJob], list[dict[str, Any]]]:
     """Read scheduler.yaml, returning accepted jobs and named rejections."""
+    from ._paths import live_loader_path_allowed
+    if not live_loader_path_allowed(path):
+        return [], [{"reason": "scratch-backed scheduler configuration refused"}]
     if not path.is_file():
         return [], []
     return load_jobs_from_text(
@@ -523,7 +526,8 @@ def load_operator_shell_commands(
     path: Path, *, writable_roots: tuple[Path, ...] = (),
 ) -> tuple["DeclaredShellCommand", ...]:
     """Read operator-owned grants at call time; malformed edits fail closed."""
-    if not path.exists():
+    from ._paths import live_loader_path_allowed
+    if not live_loader_path_allowed(path) or not path.exists():
         return ()
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or not isinstance(raw.get("jobs"), list):
@@ -584,6 +588,9 @@ def _resolve_prompt_file(home: Path | None, prompt_file: str) -> Path | None:
     must be a plain file/dir, not a symlink.
     """
     if not home or not prompt_file or not prompt_file.strip():
+        return None
+    from ._paths import live_loader_path_allowed
+    if not live_loader_path_allowed(home / "prompts"):
         return None
     root = (home / "prompts").resolve()
     raw_candidate = root / prompt_file.strip().lstrip("/")

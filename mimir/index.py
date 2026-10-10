@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._paths import live_loader_path_allowed
 from .core_blocks import _prompt_file_is_trusted, describe_file, read_text_lossy
 from .index_skip import deployment_index_skip_entries, is_index_skipped
 
@@ -94,11 +95,11 @@ class IndexEntry:
 
 
 def _walk_tree(root: Path, exclude_names: set[str]) -> list[Path]:
-    if not root.is_dir():
+    if not live_loader_path_allowed(root) or not root.is_dir():
         return []
     out: list[Path] = []
     for path in root.rglob("*.md"):
-        if not path.is_file():
+        if not live_loader_path_allowed(path) or not path.is_file():
             continue
         if path.name in exclude_names:
             continue
@@ -112,6 +113,8 @@ def _walk_tree(root: Path, exclude_names: set[str]) -> list[Path]:
 def _build_entries(root: Path, files: list[Path]) -> list[IndexEntry]:
     entries: list[IndexEntry] = []
     for path in files:
+        if not live_loader_path_allowed(path):
+            continue
         try:
             text = read_text_lossy(path)
         except OSError:
@@ -253,6 +256,8 @@ def build_wiki_index(home: Path) -> str:
         # rather than section-relative.
         entries: list[IndexEntry] = []
         for path in files:
+            if not live_loader_path_allowed(path, home):
+                continue
             try:
                 text = read_text_lossy(path)
             except OSError:
@@ -273,7 +278,11 @@ def build_state_index(home: Path) -> str:
     file in INDEX.md while the indexer skips it is a misleading promise
     to the agent."""
     state_root = home / "state"
-    deployment_entries = deployment_index_skip_entries(home)
+    deployment_entries = (
+        deployment_index_skip_entries(home)
+        if live_loader_path_allowed(home / ".mimir" / "index-skip.txt", home)
+        else ()
+    )
     files = _walk_tree(state_root, exclude_names={"INDEX.md"})
     files = [
         p for p in files
@@ -339,7 +348,7 @@ class IndexGenerator:
         generation.  Silent on errors — catalog drift is recoverable; a
         write failure here must not crash the index flush."""
         catalog_path = self._home / "memory" / "skills-catalog.md"
-        if not catalog_path.parent.is_dir():
+        if not live_loader_path_allowed(catalog_path, self._home) or not catalog_path.parent.is_dir():
             return
         from .skill_catalog import generate as _gen_catalog  # local import: keeps cli callers thin
         try:
@@ -392,7 +401,11 @@ class IndexGenerator:
     def read_memory_index(self) -> str:
         """Return a trusted index; regenerate from filtered sources if unusable."""
         path = self._home / "memory" / "INDEX.md"
-        if path.is_file() and _prompt_file_is_trusted(self._home, path):
+        if (
+            live_loader_path_allowed(path, self._home)
+            and path.is_file()
+            and _prompt_file_is_trusted(self._home, path)
+        ):
             try:
                 return read_text_lossy(path)
             except OSError:

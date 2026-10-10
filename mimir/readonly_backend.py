@@ -2207,7 +2207,7 @@ class WriteGuardBackend:
 
     def _is_tainted_instruction_write(self, file_path: str) -> bool:
         from ._context import get_current_turn
-        from .access_control import _live_instruction_surface, _turn_has_untrusted_active_ingest
+        from .access_control import tainted_file_write_target, _turn_has_untrusted_active_ingest
 
         turn = get_current_turn()
         if turn is None:
@@ -2217,13 +2217,10 @@ class WriteGuardBackend:
             # Setup and legacy in-process callers have no authorization carrier.
             return False
         configured_home = os.environ.get("MIMIR_HOME", "").strip()
-        if configured_home and self._root != Path(configured_home).resolve():
-            return False
-        # Resolve the lexical spelling as well as symlinks before classifying.
-        # The ordinary writable-root guard still rejects traversal attempts.
+        # Resolve backend virtual paths before applying the universal scratch exception.
         candidate = self._root / self._canonicalize_path(file_path).lstrip("/")
         return (
-            _live_instruction_surface(self._root, candidate)
+            tainted_file_write_target(str(candidate), home=Path(configured_home) if configured_home else self._root)
             and _turn_has_untrusted_active_ingest(auth, getattr(turn, "ifc_labels", None))
         )
 
