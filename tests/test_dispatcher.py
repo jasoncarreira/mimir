@@ -1671,6 +1671,15 @@ async def test_pairing_digest_lists_approval_paths_without_exposing_code(
     resolver = IdentityResolver(tmp_path)
     resolver.reload()
     request_id = resolver.identity(canonical).pairing.request_id
+    stored_secrets = ()
+    if is_dm:
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
     events = []
 
     async def record_event(kind, **fields):
@@ -1697,7 +1706,8 @@ async def test_pairing_digest_lists_approval_paths_without_exposing_code(
             f"cli: mimir identities approve-pairing"
         )
         assert f"mimir identities approve-pairing {canonical}" in digest
-        assert "code_hash" not in digest and "code_salt" not in digest
+        for value in stored_secrets:
+            assert value not in digest
         if is_dm:
             assert "; DM)" in digest
             assert "mimir identities approve-pairing --code <the code they received>" in digest
@@ -1736,6 +1746,13 @@ async def test_pairing_without_alert_channel_records_unrouted_once_per_canonical
             tmp_path, canonical, platform, channel_id=channel_id, is_dm=True,
         )
         assert status == "changed" and code
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (code, pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
         for _ in range(2):
             await notifier.notify_operator(
                 canonical=canonical, display=canonical, platform=platform,
@@ -1745,6 +1762,11 @@ async def test_pairing_without_alert_channel_records_unrouted_once_per_canonical
         resolver.reload()
         assert resolver.identity(canonical).pairing.status == "pending"
         assert channels.sent == []
+        unrouted = [(kind, fields) for kind, fields in events
+                    if kind == "pairing_alert_unrouted"]
+        assert unrouted
+        for value in stored_secrets:
+            assert value not in json.dumps(unrouted)
         assert events == [("pairing_alert_unrouted", {
             "canonical": canonical, "platform": platform, "delivery": "dm",
         })]
