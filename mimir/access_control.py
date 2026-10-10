@@ -11198,7 +11198,13 @@ def classify_protected_result(
             if (getattr(review_state, "action_scope", None) == scope
                     and getattr(lease, "is_active", False)
                     and getattr(lease, "scope_id", None) == scope.scope_id
-                    and getattr(lease, "head_sha", None) == scope.observed_head_sha):
+                    and (
+                        getattr(lease, "head_sha", None) == scope.observed_head_sha
+                        # #1934: a lease advanced by clean-lineage commits or a
+                        # verified rebase stays attested; its failed runs must
+                        # stay trusted too, or fix-and-rerun stalls again.
+                        or _attested_pr_checkout_lease(auth_context, scope, lease)
+                    )):
                 lease_root = Path(lease.path)
         if (
             (not failed or tool_name == "repo_test" and lease_root is not None and _bounded_repo_test_failure(

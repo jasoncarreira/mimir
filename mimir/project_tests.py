@@ -156,7 +156,10 @@ def _inventory_key(root: Path, scope_id: str) -> tuple[str, str]:
 
 def remember_node_inventory(root: Path, scope_id: str, inventory: frozenset[str]) -> None:
     """Record the inventory captured before a run for the result classifier."""
-    key = _inventory_key(root, scope_id)
+    try:
+        key = _inventory_key(root, scope_id)
+    except (OSError, RuntimeError):
+        return
     _NODE_INVENTORIES[key] = inventory
     _NODE_INVENTORIES.move_to_end(key)
     while len(_NODE_INVENTORIES) > _NODE_INVENTORY_CACHE_SIZE:
@@ -169,7 +172,13 @@ def recorded_node_inventory(root: Path, scope_id: str) -> frozenset[str] | None:
     ``None`` is distinct from an empty inventory: a miss must make the whole
     result untrusted, including a summary whose ``failing`` list is empty.
     """
-    return _NODE_INVENTORIES.get(_inventory_key(root, scope_id))
+    try:
+        key = _inventory_key(root, scope_id)
+    except (OSError, RuntimeError):
+        # e.g. a symlink loop planted out of band: fail closed, never crash
+        # result classification.
+        return None
+    return _NODE_INVENTORIES.get(key)
 
 
 def validated_pytest_node(candidate: str, inventory: frozenset[str]) -> str | None:
