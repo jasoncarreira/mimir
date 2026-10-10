@@ -23,6 +23,7 @@ from langchain_core.tools.base import create_schema_from_function
 from pydantic import StrictInt
 
 from ..forge import ForgeClient, ForgeError, IssueTarget, PullRequestProjection, ReviewVerdict
+from ..github_withhold import WithheldItem, partition, placeholder, sanitize_login, sanitize_url, summarise
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
@@ -394,8 +395,14 @@ def resolve_review_state_for_context(
                     latest[review.author] = state
             if "CHANGES_REQUESTED" in latest.values():
                 review_state = "CHANGES_REQUESTED"
+    verdict = (
+        True if snapshot.author == self_login else
+        _author_verdict(context, snapshot.repo, snapshot.author, client)
+        if isinstance(snapshot.author, str) and snapshot.author else None
+    )
     resolution = resolve_server_discovered_review_scope(
         snapshot.repo, snapshot, review_state=review_state,
+        pr_author_is_trusted=verdict,
     )
     scope = resolution.scope
     if (
@@ -831,23 +838,59 @@ def _call(operation: Any, *, runtime: ToolRuntime[AuthContext] | None = None,
         raise ToolException(str(exc)) from exc
 
 
-def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str, client: Any) -> bool | None:
+def _author_verdict(context: AuthContext, repo: str | RepoPRActionScope, author: str, client: Any) -> bool | None:
     from ..config import trusted_github_bot_logins
 
+    repository = repo.canonical_repo if isinstance(repo, RepoPRActionScope) else repo
+    if not isinstance(author, str) or not author or context.ifc_state is None:
+        return None
     attest = getattr(client, "author_is_trusted", None)
     if _BOT_LOGIN.fullmatch(author):
         # A bot is trusted only by exact operator designation; never ask the
         # collaborator API to upgrade an unlisted app identity.
         return context.ifc_state.repository_author_trust.resolve(
-            scope.canonical_repo, author,
+            repository, author,
             lambda: author.casefold() in trusted_github_bot_logins(),
         )
     if not callable(attest):
         return None
     return context.ifc_state.repository_author_trust.resolve(
-        scope.canonical_repo, author,
-        lambda: attest(scope.canonical_repo, author),
+        repository, author,
+        lambda: attest(repository, author),
     )
+
+
+def _withheld_event(tool: str, kind: str, reason: str, count: int = 1) -> None:
+    from ..event_logger import log_event_sync
+
+    try:
+        log_event_sync("github_content_withheld", tool=tool, kind=kind, count=count, reason=reason)
+    except RuntimeError:
+        pass
+
+
+def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope,
+                     items: Any, tool: str) -> list[dict[str, Any]]:
+    client = _client(scope)
+    context = runtime.context
+    projected = [dict(asdict(item), kind=(
+        "review" if tool == "pr_reviews" else
+        "review_comment" if item.path is not None else "comment"
+    ), repository=scope.canonical_repo) for item in items]
+    kept, withheld = partition(
+        projected, lambda item: item["author"],
+        lambda author: _author_verdict(context, scope, author, client),
+    )
+    _publish_author_attestation(runtime, scope, tuple(item["author"] for item in kept), tool)
+    for item in withheld:
+        _withheld_event(tool, item.kind, item.reason)
+    result = [{key: value for key, value in item.items() if key not in {"kind", "repository"}}
+              for item in kept]
+    if len(withheld) > 20:
+        result.append(summarise(withheld))
+    else:
+        result.extend(placeholder(item) for item in withheld)
+    return result
 
 
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
@@ -1056,7 +1099,49 @@ def pr_list(
             repo, query=query, state=state, base=base, head=head, limit=limit,
             author=author, merged_since=since,
         ))
-    return [asdict(item) for item in items]
+    context = getattr(runtime, "context", None)
+    if context is None or context.ifc_state is None:
+        # Direct invocations have no turn cache; still attest before projecting.
+        def verdict_for(author: str) -> bool | None:
+            from ..config import trusted_github_bot_logins
+
+            if not isinstance(author, str) or not author:
+                return None
+            if _BOT_LOGIN.fullmatch(author):
+                return author.casefold() in trusted_github_bot_logins()
+            attest = getattr(client, "author_is_trusted", None)
+            return attest(repo, author) if callable(attest) else None
+    else:
+        verdict_for = lambda author: _author_verdict(context, repo, author, client)
+    result = []
+    trusted = True
+    for item in items:
+        verdict = verdict_for(item.author)
+        if verdict is True:
+            result.append(asdict(item))
+            continue
+        trusted = False
+        reason = ("attestation_unavailable" if verdict is None else
+                  "bot_not_allowlisted" if item.author.endswith("[bot]") else "non_collaborator")
+        result.append({"number": item.number, **placeholder(WithheldItem(
+            "pull_request", sanitize_login(item.author), None,
+            sanitize_url(item.url, repo), reason,
+        ))})
+        _withheld_event("pr_list", "pull_request", reason)
+    if trusted and context is not None:
+        from ..access_control import publish_protected_result
+        from ..models import SourceLabel
+
+        principal = context.canonical_principal
+        if context.is_service and principal:
+            principal = f"service:{principal}"
+        publish_protected_result((SourceLabel(
+            principal=principal, domain="repository", resource_id=f"{repo.lower()}#pulls",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+        ),))
+    return result
 
 
 @tool
@@ -1338,8 +1423,7 @@ def pr_reviews(
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_reviews(scope), runtime=runtime, scope=scope)
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_reviews")
-    return [asdict(item) for item in items]
+    return _withhold_thread(runtime, scope, items, "pr_reviews")
 
 
 @tool
@@ -1351,8 +1435,7 @@ def pr_comments(
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_comments(scope), runtime=runtime, scope=scope)
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_comments")
-    return [asdict(item) for item in items]
+    return _withhold_thread(runtime, scope, items, "pr_comments")
 
 
 @tool

@@ -1211,7 +1211,10 @@ def _review_requested(pr: dict, me: str) -> bool:
     )
 
 
-def _pr_scope_fields(pr: dict, repo: str) -> dict[str, object]:
+def _pr_scope_fields(
+    pr: dict, repo: str, *, token: str = "", me: str = "",
+    trust_cache: dict | None = None, tick_budget: TickBudget | None = None,
+) -> dict[str, object]:
     """The PR head/base snapshot the framework needs to issue a PR scope.
 
     Without every one of these fields mimir/access_control.py refuses to issue
@@ -1225,7 +1228,16 @@ def _pr_scope_fields(pr: dict, repo: str) -> dict[str, object]:
     head = pr.get("head") or {}
     base = pr.get("base") or {}
     head_repo = ((head.get("repo") or {}).get("full_name") or "")
+    author = (pr.get("user") or {}).get("login")
+    verdict = (
+        True if me and author == me else
+        _pr_author_is_trusted(repo, pr.get("number"), pr.get("html_url", ""),
+                              token, trust_cache if trust_cache is not None else {},
+                              tick_budget=tick_budget)
+        if token and type(pr.get("number")) is int else None
+    )
     return {
+        "pr_author_is_trusted": verdict,
         "head_repo": head_repo or None,
         "head_remote": "origin" if head_repo.lower() == repo.lower() else "source",
         "head_ref": head.get("ref"),
@@ -1321,8 +1333,10 @@ def _emit_pr_synchronize(
         previous_head=previous_head,
         new_head=current_head,
         author=push_author,
+        pr_author=(pr.get("user") or {}).get("login") if pr is not None else None,
         **(
-            _pr_scope_fields(pr, repo) if pr is not None
+            _pr_scope_fields(pr, repo, token=token, me=reviewer,
+                             trust_cache=trust_cache, tick_budget=tick_budget) if pr is not None
             else {"head_sha": current_head}
         ),
         related_comment=related_comment,
@@ -1477,7 +1491,8 @@ def _check_prs(
             number=number,
             url=url,
             author=author,
-            **_pr_scope_fields(pr, repo),
+            **_pr_scope_fields(pr, repo, token=token, me=me,
+                               trust_cache=trust_cache, tick_budget=tick_budget),
             related_comment=review_context.get(str(number), ""),
         )
         if emitted:
@@ -2166,7 +2181,7 @@ def _emit_pr_review_needed(
             extras["author"] = (pr.get("user") or {}).get("login")
             extras["number"] = pr.get("number")
             extras["pr_state"] = pr.get("state")
-            extras.update(_pr_scope_fields(pr, repo))
+            extras.update(_pr_scope_fields(pr, repo, token=token, me=reviewer))
     if reviewed is None and reviewer:
         head_sha = extras.get("head_sha") or extras.get("new_head")
         if not head_sha and isinstance(repo, str) and number is not None:
@@ -3488,7 +3503,8 @@ def _check_pr_reviews(
                   author=(pr.get("user") or {}).get("login"),
                   actor=reviewer_login, reviewer=reviewer_login,
                   pr_state=pr.get("state") or "open",
-                  **_pr_scope_fields(pr, repo))
+                   **_pr_scope_fields(pr, repo, token=token, me=me,
+                                      trust_cache=trust_cache, tick_budget=tick_budget))
             count += 1
     return count
 

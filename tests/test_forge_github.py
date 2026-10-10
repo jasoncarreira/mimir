@@ -391,6 +391,7 @@ def test_pr_search_projects_items_and_paginates_on_fixed_host():
 
 def test_pr_list_search_tool_reaches_url_encoded_api_query(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setattr(GitHubForgeClient, "author_is_trusted", lambda *_: True)
     session = Session([Response({"items": [_search_row(1445, merged=True)]})])
     set_forge_client(GitHubForgeClient(session=session))
     try:
