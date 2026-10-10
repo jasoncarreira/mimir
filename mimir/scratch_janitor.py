@@ -31,8 +31,10 @@ Safety properties:
 from __future__ import annotations
 
 import os
+import stat
 import time
 from contextlib import nullcontext
+from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -253,6 +255,68 @@ def _resolve_root(home: Path, name: str) -> Path | None:
     return candidate
 
 
+def _directory_identities(home: Path, parent: Path) -> dict[Path, tuple[int, int]]:
+    """Snapshot the real parent chain before enumerating retention candidates."""
+    identities: dict[Path, tuple[int, int]] = {}
+    parts = parent.relative_to(home).parts
+    paths = [home, *(home.joinpath(*parts[:i]) for i in range(1, len(parts) + 1))]
+    for path in paths:
+        st = path.lstat()
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"unsafe scratch container: {path.name}")
+        identities[path] = (st.st_dev, st.st_ino)
+    return identities
+
+
+def _quarantine_turn_entry(
+    home: Path, entry: Path, identities: dict[Path, tuple[int, int]],
+    expected: os.stat_result,
+) -> tuple[str, int]:
+    """Detach one candidate atomically; caller holds the admission lock.
+
+    Walk the snapshotted container chain with O_NOFOLLOW. Rename using the
+    opened parent fd, so replacing any pathname cannot redirect the operation.
+    The returned scratch fd also anchors deletion after the lock is released.
+    """
+    fds: dict[Path, int] = {}
+    try:
+        for path, identity in identities.items():
+            fd = os.open(
+                path if path == home else path.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                **({} if path == home else {"dir_fd": fds[path.parent]}),
+            )
+            fds[path] = fd
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != identity:
+                raise OSError(f"scratch container changed: {path.name}")
+        parent_fd = fds[entry.parent]
+        current = os.stat(entry.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+            raise OSError(f"scratch entry changed: {entry.name}")
+        scratch_fd = fds[home / "scratch"]
+        trash = f".janitor-trash-{uuid4().hex}"
+        os.rename(entry.name, trash, src_dir_fd=parent_fd, dst_dir_fd=scratch_fd)
+        return trash, os.dup(scratch_fd)
+    finally:
+        for fd in fds.values():
+            os.close(fd)
+
+
+def _remove_quarantined_entry(name: str, scratch_fd: int) -> None:
+    """Potentially slow recursive deletion, never under the lifecycle lock."""
+    try:
+        st = os.stat(name, dir_fd=scratch_fd, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            rmtree_missing_ok(name, dir_fd=scratch_fd)
+        else:
+            os.unlink(name, dir_fd=scratch_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(scratch_fd)
+
+
 def sweep_scratch_roots(
     home: Path,
     *,
@@ -282,7 +346,19 @@ def sweep_scratch_roots(
         root = _resolve_root(home, name)
         if root is None:
             continue
+        # Do not let resolution of a custom turns root hide a symlinked
+        # container. Default-root enumeration also validates the chain below.
+        turns_root = home / "scratch" / "turns"
+        requested_root = home / name
+        if (requested_root == turns_root or turns_root in requested_root.parents) and root != requested_root:
+            errors.append(f"{name}: unsafe scratch container")
+            continue
         try:
+            root_identities = (
+                _directory_identities(home, root)
+                if root == home / "scratch" or turns_root == root or turns_root in root.parents
+                else None
+            )
             entries = sorted(root.iterdir())
         except OSError as exc:
             errors.append(f"{name}: {exc}")
@@ -290,17 +366,19 @@ def sweep_scratch_roots(
         # The turns container is not one retention unit: a fresh turn must not
         # pin every older workspace. Keep the container and sweep each child
         # with the same newest-mtime/TTL rules as other top-level entries.
-        candidates: list[Path] = []
+        candidates: list[tuple[Path, dict[Path, tuple[int, int]] | None]] = []
         for entry in entries:
-            if entry == home / "scratch" / "turns" and not entry.is_symlink() and entry.is_dir():
+            if entry == turns_root and not entry.is_symlink() and entry.is_dir():
                 try:
-                    candidates.extend(sorted(entry.iterdir()))
+                    identities = _directory_identities(home, entry)
+                    candidates.extend((child, identities) for child in sorted(entry.iterdir()))
                 except OSError as exc:
                     errors.append(f"scratch/turns: {exc}")
             else:
-                candidates.append(entry)
-        for entry in candidates:
+                candidates.append((entry, root_identities))
+        for entry, identities in candidates:
             try:
+                expected = entry.lstat()
                 if _entry_is_protected(entry, protected_paths):
                     kept += 1
                     protected_entries.append(str(entry.relative_to(home)))
@@ -327,15 +405,25 @@ def sweep_scratch_roots(
                     else turn_scratch_eviction_guard(entry) if touches_turns
                     else nullcontext(True)
                 )
+                quarantine = None
                 with guard as idle:
                     if not idle:
                         kept += 1
                         protected_entries.append(str(entry.relative_to(home)))
                         continue
-                    if entry.is_symlink() or not entry.is_dir():
+                    if touches_turns:
+                        if identities is None:
+                            raise OSError("missing scratch container identity")
+                        # Only validation + atomic rename holds the lock. A
+                        # subsequent turn may safely recreate the original dir
+                        # while the worker deletes this detached trash tree.
+                        quarantine = _quarantine_turn_entry(home, entry, identities, expected)
+                    elif entry.is_symlink() or not entry.is_dir():
                         entry.unlink(missing_ok=True)
                     else:
                         rmtree_missing_ok(entry)
+                if quarantine is not None:
+                    _remove_quarantined_entry(*quarantine)
                 removed.append(str(entry.relative_to(home)))
                 reclaimed += size
             except OSError as exc:

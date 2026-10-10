@@ -90,7 +90,8 @@ def turn_scratch_eviction_guard(entry: Path) -> Iterator[bool]:
     """Keep live turn workspaces intact, serialized with turn admission.
 
     Include ancestors/descendants so custom janitor roots cannot remove a live
-    workspace as a unit or delete its contents individually.
+    workspace as a unit or delete its contents individually. Hold this guard
+    only through atomic quarantine, never through recursive trash deletion.
     """
     with _turn_lifecycle_lock:
         paths = (

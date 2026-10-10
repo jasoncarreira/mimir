@@ -6,7 +6,7 @@ import os
 import time
 import asyncio
 from types import SimpleNamespace
-from threading import Event
+from threading import Event, Thread
 from pathlib import Path
 
 import pytest
@@ -163,6 +163,144 @@ def test_symlink_turns_container_never_traversed(tmp_path):
     result = sweep_scratch_roots(tmp_path, now=now)
     assert result.removed == ("scratch/turns",)
     assert target.exists()
+
+
+def test_turn_admission_and_reset_do_not_wait_for_recursive_deletion(tmp_path, monkeypatch):
+    from mimir import scratch_janitor
+    from mimir._context import set_current_turn, reset_current_turn
+
+    now = time.time()
+    turn = _make_tree(tmp_path / "scratch" / "turns", "reused", days=5, now=now)
+    deleting = Event()
+    lifecycle_done = Event()
+    release_delete = Event()
+    original = scratch_janitor.rmtree_missing_ok
+    failures = []
+    results = []
+
+    def paused_delete(path, **kwargs):
+        assert not turn.exists()  # Detached before deletion begins.
+        assert str(path).startswith(".janitor-trash-")
+        assert "dir_fd" in kwargs
+        deleting.set()
+        assert release_delete.wait(5)
+        original(path, **kwargs)
+
+    def sweep():
+        try:
+            results.append(sweep_scratch_roots(tmp_path, now=now))
+        except BaseException as exc:
+            failures.append(exc)
+
+    def admit():
+        token = set_current_turn(SimpleNamespace(turn_id="reused", turn_scratch_path=turn))
+        try:
+            assert ensure_turn_scratch(tmp_path, "reused") == turn
+            (turn / "new.txt").write_text("new workspace")
+        finally:
+            reset_current_turn(token)
+        lifecycle_done.set()
+
+    monkeypatch.setattr(scratch_janitor, "rmtree_missing_ok", paused_delete)
+    worker = Thread(target=sweep)
+    admission = Thread(target=admit)
+    worker.start()
+    try:
+        assert deleting.wait(5)
+        admission.start()
+        # Both admission and teardown must finish WHILE deletion is paused.
+        assert lifecycle_done.wait(2)
+        assert not release_delete.is_set()
+    finally:
+        release_delete.set()
+        worker.join(5)
+        if admission.ident is not None:
+            admission.join(5)
+    assert not worker.is_alive() and not admission.is_alive()
+    assert failures == []
+    assert results[0].errors == ()
+    assert results[0].removed == ("scratch/turns/reused",)
+    assert (turn / "new.txt").read_text() == "new workspace"
+
+
+@pytest.mark.parametrize("roots", [("scratch",), ("scratch/turns",)])
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_turn_container_replaced_after_age_check_is_refused(tmp_path, monkeypatch, roots, replacement):
+    from mimir import scratch_janitor
+
+    now = time.time()
+    turns = tmp_path / "scratch" / "turns"
+    old = _make_tree(turns, "old", days=5, now=now)
+    outside = tmp_path / "outside"
+    victim = _make_tree(outside, "old", days=5, now=now)
+    original = scratch_janitor._tree_newest_mtime_and_size
+
+    def swap_after_inspection(path, cutoff):
+        result = original(path, cutoff)
+        if path == old:
+            turns.rename(turns.with_name("original-turns"))
+            if replacement == "symlink":
+                turns.symlink_to(outside)
+            else:
+                turns.mkdir()
+                (turns / "old").mkdir()
+        return result
+
+    monkeypatch.setattr(scratch_janitor, "_tree_newest_mtime_and_size", swap_after_inspection)
+    result = sweep_scratch_roots(tmp_path, roots=roots, now=now)
+    assert result.removed == ()
+    assert result.errors
+    assert victim.is_dir()
+    assert (turns.with_name("original-turns") / "old").is_dir()
+    assert (turns / "old").is_dir()
+
+
+def test_turn_container_swapped_at_rename_cannot_redirect_deletion(tmp_path, monkeypatch):
+    from mimir import scratch_janitor
+
+    now = time.time()
+    turns = tmp_path / "scratch" / "turns"
+    _make_tree(turns, "old", days=5, now=now)
+    victim = _make_tree(tmp_path / "outside", "old", days=5, now=now)
+    original = os.rename
+    swaps = []
+
+    def swap_at_rename(src, dst, **kwargs):
+        if Path(src).name == "old":
+            original(turns, turns.with_name("original-turns"))
+            turns.symlink_to(victim.parent)
+            swaps.append(True)
+        return original(src, dst, **kwargs)
+
+    monkeypatch.setattr(scratch_janitor.os, "rename", swap_at_rename)
+    result = sweep_scratch_roots(tmp_path, now=now)
+    assert swaps == [True]
+    assert result.errors == ()
+    assert result.removed == ("scratch/turns/old",)
+    assert victim.is_dir()
+    assert not (turns.with_name("original-turns") / "old").exists()
+
+
+def test_failed_trash_deletion_is_retried_on_later_sweep(tmp_path, monkeypatch):
+    from mimir import scratch_janitor
+
+    now = time.time()
+    turn = _make_tree(tmp_path / "scratch" / "turns", "old", days=5, now=now)
+    original = scratch_janitor.rmtree_missing_ok
+
+    def refuse_delete(path, **kwargs):
+        raise PermissionError("deletion interrupted")
+
+    monkeypatch.setattr(scratch_janitor, "rmtree_missing_ok", refuse_delete)
+    first = sweep_scratch_roots(tmp_path, now=now)
+    assert first.errors and not turn.exists()
+    trash = list((tmp_path / "scratch").glob(".janitor-trash-*"))
+    assert len(trash) == 1
+    monkeypatch.setattr(scratch_janitor, "rmtree_missing_ok", original)
+    second = sweep_scratch_roots(tmp_path, now=now + 2 * 86400)
+    assert second.removed == (str(trash[0].relative_to(tmp_path)),)
+    assert second.errors == ()
+    assert not trash[0].exists()
 
 
 def test_nested_fresh_file_keeps_stale_looking_dir(tmp_path: Path):
