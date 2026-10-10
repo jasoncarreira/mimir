@@ -556,7 +556,26 @@ def is_current_service_scoped_read_path(path: Path) -> bool:
                 (root for root in roots if path.is_relative_to(root)),
                 key=lambda root: len(root.parts),
             )
-            if not path.resolve(strict=True).is_relative_to(root.resolve(strict=True)):
+            resolved_root = root.resolve(strict=True)
+            try:
+                resolved = path.resolve(strict=True)
+            except FileNotFoundError:
+                # Only missing targets beneath an existing, in-root ancestor
+                # may reach the backend's ordinary not-found result. In
+                # particular, a symlinked ancestor must not escape this root.
+                ancestor = path.parent
+                while True:
+                    try:
+                        resolved_ancestor = ancestor.resolve(strict=True)
+                        break
+                    except FileNotFoundError:
+                        if ancestor == ancestor.parent:
+                            return False
+                        ancestor = ancestor.parent
+                if not resolved_ancestor.is_relative_to(resolved_root):
+                    return False
+                resolved = path.resolve(strict=False)
+            if not resolved.is_relative_to(resolved_root):
                 return False
             return not is_memory_read_path(path) or is_memory_read_path_allowed(path, auth_context)
         except (OSError, RuntimeError, ValueError):

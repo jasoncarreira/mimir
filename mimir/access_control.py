@@ -5541,7 +5541,36 @@ def _trigger_service_read_target_is_allowed(
             service, lexical_root, lexical_relative,
         ):
             return False
-        resolved = candidate.resolve(strict=True)
+        missing_target = False
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Admit an ordinary file-not-found only for a bounded file read.
+            # Directory/search and shell scopes retain strict resolution.
+            if (
+                service.authority_profile != "github"
+                or shell_roots
+                or tool_name not in {"read_file", "aread"}
+            ):
+                return False
+            resolved_root = lexical_root.resolve(strict=True)
+            ancestor = candidate.parent
+            while True:
+                try:
+                    resolved_ancestor = ancestor.resolve(strict=True)
+                    break
+                except FileNotFoundError:
+                    if ancestor == ancestor.parent:
+                        return False
+                    ancestor = ancestor.parent
+            if not resolved_ancestor.is_relative_to(resolved_root):
+                return False
+            resolved = candidate.resolve(strict=False)
+            # The common checks below enforce resolved-root containment and
+            # protected names; only missing memory needs a separate rejection.
+            if is_memory_read_path(resolved):
+                return False
+            missing_target = True
         if service.authority_profile == "github":
             resolved.relative_to(lexical_root.resolve(strict=True))
         # Infrastructure roots are created lazily on first use. A missing
@@ -5560,12 +5589,12 @@ def _trigger_service_read_target_is_allowed(
     resolved_is_artifact = artifact_root is not None and root == artifact_root
     if resolved_is_artifact:
         return True
+    # _has_protected_read_name includes exact operator-configured secret
+    # paths, even when absent; do not duplicate that policy check here.
     if (
         _is_service_protected_read_path(service, root, relative)
         or _has_protected_read_name(resolved)
     ):
-        return False
-    if is_operator_secret_read_path(resolved):
         return False
     if home:
         home_root = Path(home).resolve()
@@ -5583,6 +5612,8 @@ def _trigger_service_read_target_is_allowed(
                 return False
             if tool_name not in {"read_file", "aread"} and not resolved.is_dir():
                 return False
+    if missing_target:
+        return True
     return not (
         tool_name in {"read_file", "aread"}
         and (not resolved.is_file() or file_contains_secret(resolved))

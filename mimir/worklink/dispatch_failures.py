@@ -38,6 +38,31 @@ def dispatch_failure_state_dir(home: Path) -> Path:
     return home / "state" / "pollers" / POLLER_NAME
 
 
+def _find_latest_evidence_file_for_issue(home: Path, issue_id: int) -> tuple[Path, dict] | None:
+    """Find the highest-numbered readable evidence file for an issue."""
+    evidence_dir = home / "state" / "worklink" / "evidence"
+    if not evidence_dir.exists():
+        return None
+
+    prefix = f"{issue_id}-"
+    latest_evidence: tuple[Path, dict] | None = None
+    latest_attempt = -1
+    for file in evidence_dir.iterdir():
+        if not file.name.startswith(prefix) or not file.name.endswith(".json"):
+            continue
+        try:
+            attempt = int(file.name[len(prefix):-5])
+        except ValueError:
+            continue
+        if attempt > latest_attempt:
+            try:
+                latest_evidence = (file, json.loads(file.read_text(encoding="utf-8")))
+                latest_attempt = attempt
+            except (json.JSONDecodeError, OSError):
+                continue
+    return latest_evidence
+
+
 def terminal_error(value: BaseException | str) -> str:
     """Return one bounded, scrubbed terminal line suitable for durable output."""
     if isinstance(value, BaseException):
@@ -735,6 +760,15 @@ def pending_failure_alerts(
                     home / "state" / "worklink" / "factory-runs"
                     / f"{entry.get('run_id') or f'chainlink-{issue_id}'}.json"
                 )
+                attempt = entry.get("attempt")
+                attempted_evidence = (
+                    home / "state" / "worklink" / "evidence" / f"{issue_id}-{attempt}.json"
+                    if type(attempt) is int and attempt > 0 else None
+                )
+                evidence = attempted_evidence if attempted_evidence is not None and attempted_evidence.is_file() else None
+                if evidence is None:
+                    latest = _find_latest_evidence_file_for_issue(home, issue_id)
+                    evidence = latest[0] if latest is not None else None
                 alerts.append({
                     "prompt": (
                         f"Worklink incident for issue {issue_id}. Captured output can be stale or "
@@ -747,11 +781,13 @@ def pending_failure_alerts(
                         "is uncertain or recovery is unavailable, unauthorized, unsafe, impossible, "
                         "or has already failed, call operator_alert with the identifier, reason, log "
                         "and preserved-work pointers, and the precise blocker. Do not claim recovery "
-                        "without current evidence.\n\n"
+                        "without current evidence. Read the evidence file first: it holds the gate's "
+                        "counts, failing and flaky test ids, and redacted output summary.\n\n"
                         f"Reason: {entry.get('terminal_error')}\n"
                         f"Ledger: {state_dir / STATE_FILE}\n"
-                        f"Retained leaf record: {leaf_record}\n"
-                        f"Retained factory record: {factory_record}\n"
+                        f"Evidence: {evidence or '(none)'}\n"
+                        f"Retained leaf record: {leaf_record}{'' if leaf_record.is_file() else ' (absent)'}\n"
+                        f"Retained factory record: {factory_record}{'' if factory_record.is_file() else ' (absent)'}\n"
                         f"Log: {entry.get('log_path') or '(none)'}\n"
                         f"Transcript: {entry.get('transcript_path') or '(none)'}\n"
                         f"Work: {entry.get('work_path') or entry.get('preserved_ref') or '(none)'}"
@@ -759,6 +795,7 @@ def pending_failure_alerts(
                     "source_id": delivery_key,
                     "issue_id": issue_id,
                     "attempt": entry.get("attempt"),
+                    "evidence": str(evidence) if evidence is not None else None,
                     "attempt_consumed": entry.get("attempt_consumed"),
                     "exit_status": entry.get("exit_status"),
                     "terminal_error": entry.get("terminal_error"),

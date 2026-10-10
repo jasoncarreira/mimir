@@ -1092,6 +1092,312 @@ def test_github_activity_observed_operations_are_admitted_when_enforced(
     assert denied.reason == "admin_required"
 
 
+@pytest.mark.parametrize("enforce", [True, False])
+def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.read_policy import is_current_service_scoped_read_path
+    from mimir.readonly_backend import WriteGuardBackend
+
+    home = (tmp_path / "home").resolve()
+    state = home / "state"
+    runs = state / "worklink" / "runs"
+    evidence = state / "worklink" / "evidence" / "1918-1.json"
+    runs.mkdir(parents=True)
+    (state / "pollers" / "worklink-ready-queue").mkdir(parents=True)
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"failing_test_ids": ["test_red"]}', encoding="utf-8")
+    other_channel = home / "memory" / "channels" / "other" / "private.md"
+    other_channel.parent.mkdir(parents=True)
+    other_channel.write_text("private\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (state / "escape").symlink_to(outside, target_is_directory=True)
+    (state / "broken-escape").symlink_to(outside / "missing.json")
+    (state / "memory-alias").symlink_to(home / "memory", target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    manifest = (
+        Path(__file__).parents[1] / "mimir" / "optional-skills"
+        / "chainlink-orchestrator" / "pollers.json"
+    )
+    entry = next(
+        item for item in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if item["name"] == "worklink-ready-queue"
+    )
+    service = _parse_poller_authority(
+        entry["authority"], name=entry["name"], persist_dir=state / "pollers" / entry["name"],
+        state_root=state / "pollers", manifest_path=manifest,
+    )
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=enforce, ifc_labels=InformationFlowLabels())
+    hard_denials = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_event_sync",
+        lambda kind, **fields: hard_denials.append((kind, fields)),
+    )
+    token = set_current_turn(SimpleNamespace(turn_id="worklink-incident-read", auth_context=context))
+    try:
+        registry = ToolRegistry()
+        backend = WriteGuardBackend(home, ["state"])
+        decision = registry.authorize_tool(
+            "read_file", context, enforce=enforce,
+            arguments={"file_path": str(evidence)},
+        )
+        assert decision.allowed and not decision.would_block, decision.reason
+        result = backend.read(str(evidence))
+        assert result.error is None
+        assert "test_red" in result.file_data["content"]
+        for missing in (runs / "1918.json", runs / "missing" / "record.json"):
+            assert is_current_service_scoped_read_path(missing)
+            for file_path in (str(missing), str(missing.relative_to(home))):
+                decision = registry.authorize_tool(
+                    "read_file", context, enforce=enforce,
+                    arguments={"file_path": file_path},
+                )
+                assert decision.allowed, (file_path, decision.reason)
+                assert not decision.would_block, (file_path, decision.reason)
+                assert decision.reason is None
+            result = backend.read(str(missing))
+            assert result.error == f"File '{missing}' not found"
+        assert hard_denials == []
+
+        # Grant every search tool explicitly so missing-path denial cannot be
+        # satisfied vacuously by a missing capability (the manifest omits glob).
+        search_service = replace(
+            service, capabilities=(*service.capabilities, "glob"),
+        )
+        search_context = replace(context, service_authority=search_service)
+        for tool_name, extra in (
+            ("ls", {}), ("glob", {"pattern": "*.json"}),
+            ("grep", {"pattern": "test_red"}),
+        ):
+            existing = registry.authorize_tool(
+                tool_name, search_context, enforce=enforce,
+                arguments={"path": str(runs), **extra},
+            )
+            assert existing.allowed and not existing.would_block, existing.reason
+            missing = registry.authorize_tool(
+                tool_name, search_context, enforce=enforce,
+                arguments={"path": str(runs / "absent"), **extra},
+            )
+            assert missing.allowed is (not enforce), (tool_name, missing.reason)
+            assert missing.would_block and missing.reason == "read_scope"
+
+        # Scratch avoids the generic non-GitHub state-read fallback, so this
+        # specifically exercises the authority-profile missing-target guard.
+        scratch = home / "scratch" / "incident"
+        scratch.mkdir(parents=True)
+        scratch_existing = scratch / "record.json"
+        scratch_existing.write_text("{}\n", encoding="utf-8")
+        non_github_service = replace(
+            service, authority_profile="introspection",
+            filesystem_read_roots=(str(scratch),),
+        )
+        non_github_context = replace(context, service_authority=non_github_service)
+        existing = registry.authorize_tool(
+            "read_file", non_github_context, enforce=enforce,
+            arguments={"file_path": str(scratch_existing)},
+        )
+        assert existing.allowed and not existing.would_block, existing.reason
+        missing = registry.authorize_tool(
+            "read_file", non_github_context, enforce=enforce,
+            arguments={"file_path": str(scratch / "absent.json")},
+        )
+        assert missing.allowed is (not enforce), missing.reason
+        assert missing.would_block and missing.reason == "read_scope"
+
+        # repo_review admits only Git, so grant the bounded read-only shell
+        # profile in this fixture to reach filesystem operand preflight. It
+        # resolves strictly before calling the predicate; test both layers so
+        # preflight cannot mask deletion of the shell_roots guard.
+        shell_service = replace(
+            service, sink_policies=tuple(
+                replace(policy, destination="scheduler_read_only")
+                if policy.operation == "shell_exec" else policy
+                for policy in service.sink_policies
+            ),
+        )
+        shell_context = replace(context, service_authority=shell_service)
+        existing_shell = registry.authorize_tool(
+            "shell_exec", shell_context, enforce=True,
+            target_channel=f"wc {evidence}", arguments={"cwd": str(state)},
+        )
+        assert existing_shell.allowed and not existing_shell.would_block, existing_shell.reason
+        missing_shell = registry.authorize_tool(
+            "shell_exec", shell_context, enforce=True,
+            target_channel=f"wc {runs / 'absent.json'}", arguments={"cwd": str(state)},
+        )
+        # Authorization admits argv shape only; the execution binder owns
+        # operand resolution once the authoritative cwd is available.
+        assert missing_shell.allowed and not missing_shell.would_block, missing_shell.reason
+        argv, detail, rule = access_control.parse_service_shell_argv_with_diagnostics(
+            f"wc {runs / 'absent.json'}", "scheduler_read_only",
+            service=shell_service, auth_context=shell_context, read_cwd=state,
+        )
+        assert argv is None and "could not be resolved" in detail, detail
+        assert rule is access_control.ServiceShellBindingRule.READ_OPERAND_POLICY
+        argv, detail, rule = access_control.parse_service_shell_argv_with_diagnostics(
+            f"wc {evidence}", "scheduler_read_only",
+            service=shell_service, auth_context=shell_context, read_cwd=state,
+        )
+        assert argv is not None and not detail and rule is None, detail
+        predicate = access_control._trigger_service_read_target_is_allowed
+        assert predicate(
+            service, "read_file", {"file_path": str(evidence)},
+            auth_context=context, shell_roots=True,
+        )
+        assert not predicate(
+            service, "read_file", {"file_path": str(runs / "absent.json")},
+            auth_context=context, shell_roots=True,
+        )
+
+        # Use the physical memory root, not the entire home: the latter would
+        # remap an absolute input as a backend virtual path underneath home.
+        memory_service = replace(service, filesystem_read_roots=(str(home / "memory"),))
+        assert not predicate(
+            memory_service, "read_file",
+            {"file_path": str(other_channel.parent / "missing.md")},
+            auth_context=replace(context, service_authority=memory_service),
+        )
+
+        # Non-strict resolution returns inside state, but the first existing
+        # ancestor resolves outside it. Both checks are necessary.
+        return_inside = (
+            state / "escape" / "missing" / ".." / ".."
+            / "home" / "state" / "runs" / "x.json"
+        )
+        assert return_inside.resolve(strict=False).is_relative_to(state)
+        assert not is_current_service_scoped_read_path(return_inside)
+
+        denied = {
+            outside / "missing.json": "service_scoped_read_boundary",
+            state / ".." / "outside.json": "unresolved_read_target",
+            state / "escape" / "missing.json": "unresolved_read_target",
+            state / "identities.yaml": "protected_name_match",
+            other_channel: "service_scoped_read_boundary",
+        }
+        assert not is_current_service_scoped_read_path(outside / "missing.json")
+        assert not is_current_service_scoped_read_path(state / ".." / "outside.json")
+        assert not is_current_service_scoped_read_path(state / "escape" / "missing.json")
+        assert not is_current_service_scoped_read_path(state / "broken-escape")
+        for path in (
+            *denied, state / "broken-escape", return_inside,
+            other_channel.parent / "missing.md",
+            state / "memory-alias" / "channels" / "other" / "missing.md",
+        ):
+            decision = registry.authorize_tool(
+                "read_file", context, enforce=enforce,
+                arguments={"file_path": str(path)},
+            )
+            assert decision.allowed is (not enforce), path
+            assert decision.would_block, path
+            assert decision.reason == "read_scope", path
+        for path, reason in denied.items():
+            result = backend.read(str(path))
+            expected = "Read denied: unresolved path" if reason == "unresolved_read_target" else f"Read denied: {reason}."
+            assert result.error is not None and expected in result.error, path
+        assert len(hard_denials) == len(denied)
+        assert all(
+            kind == "hard_boundary_denied"
+            and fields["reason"] == denied[Path(fields["target"])]
+            for kind, fields in hard_denials
+        )
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.fixture
+def worklink_incident_github_read_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+):
+    home = (tmp_path / "home").resolve()
+    state = home / "state"
+    scratch = home / "scratch"
+    (state / "sub").mkdir(parents=True)
+    (state / "pollers" / "worklink-ready-queue").mkdir(parents=True)
+    scratch.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_MCP_SERVERS_PATH", raising=False)
+    manifest = (
+        Path(__file__).parents[1] / "mimir" / "optional-skills"
+        / "chainlink-orchestrator" / "pollers.json"
+    )
+    entry = next(
+        item for item in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if item["name"] == "worklink-ready-queue"
+    )
+    service = _parse_poller_authority(
+        entry["authority"], name=entry["name"], persist_dir=state / "pollers" / entry["name"],
+        state_root=state / "pollers", manifest_path=manifest,
+    )
+    # Shared scratch itself is deliberately stripped from static grants; use
+    # an explicit child root so the sibling is genuinely admitted.
+    (scratch / "incident").mkdir()
+    service = replace(service, filesystem_read_roots=(str(state), str(scratch / "incident")))
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=request.getfixturevalue("enforce"), ifc_labels=InformationFlowLabels())
+    return home, service, context
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_worklink_incident_missing_read_cannot_escape_into_sibling_root(
+    worklink_incident_github_read_context, enforce: bool,
+) -> None:
+    home, service, context = worklink_incident_github_read_context
+    predicate = access_control._trigger_service_read_target_is_allowed
+    registry = ToolRegistry()
+    missing = home / "scratch" / "incident" / "x.json"
+    escape = (
+        home / "state" / "sub" / "missing" / ".." / ".." / ".."
+        / "scratch" / "incident" / "x.json"
+    )
+    assert not missing.exists()
+    assert escape.resolve(strict=False) == missing
+    # The first existing ancestor is in state, and the resolved target is in
+    # another granted root. Only selected-lexical-root containment rejects it.
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed and not decision.would_block, decision.reason
+    for file_path in (str(escape), str(escape.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert not predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed is (not enforce), decision.reason
+        assert decision.would_block and decision.reason == "read_scope"
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_worklink_incident_missing_operator_secret_is_denied(
+    worklink_incident_github_read_context, monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    home, service, context = worklink_incident_github_read_context
+    missing = home / "state" / "sub" / "record.json"
+    assert not missing.exists()
+    predicate = access_control._trigger_service_read_target_is_allowed
+    registry = ToolRegistry()
+    # This ordinary basename is admitted until configured as an exact secret;
+    # the shared protected-path helper enforces the configured-secret policy.
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed and not decision.would_block, decision.reason
+    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(missing))
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert not predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed is (not enforce), decision.reason
+        assert decision.would_block and decision.reason == "read_scope"
+
+
 def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -46,6 +46,7 @@ from .claims import (
 )
 from .checkout import prune_attempt_checkouts, report_foreign_owned_git_objects
 from .control import _claim_mutex
+from .dispatch_failures import _find_latest_evidence_file_for_issue
 from .factory_state import (
     LIVE_CONTROLLER_PHASES,
     RETAINED_CONTROLLER_PHASES,
@@ -529,37 +530,6 @@ def _check_pr_merged_via_gh_runner(
         merged_at=merged_at,
         merge_commit_sha=merge_commit_sha,
     )
-
-
-def _find_latest_evidence_file_for_issue(home: Path, issue_id: int) -> tuple[Path, dict] | None:
-    """Find the latest evidence file for an issue.
-
-    Scans evidence directory for files matching <issue_id>-*.json and returns
-    the path and content of the one with the highest attempt number.
-    """
-    evidence_dir = home / "state" / "worklink" / "evidence"
-    if not evidence_dir.exists():
-        return None
-
-    prefix = f"{issue_id}-"
-    latest_evidence: tuple[Path, dict] | None = None
-    latest_attempt = -1
-
-    for file in evidence_dir.iterdir():
-        if not file.name.startswith(prefix) or not file.name.endswith(".json"):
-            continue
-        try:
-            attempt = int(file.name[len(prefix):-5])
-        except ValueError:
-            continue
-        if attempt > latest_attempt:
-            try:
-                latest_evidence = (file, json.loads(file.read_text(encoding="utf-8")))
-                latest_attempt = attempt
-            except (json.JSONDecodeError, OSError):
-                continue
-
-    return latest_evidence
 
 
 def _find_latest_evidence_for_issue(home: Path, issue_id: int) -> dict | None:
