@@ -6404,9 +6404,9 @@ def tainted_file_write_target(raw_path: Any, home: Path | None = None) -> bool:
             return True
         if not isinstance(raw_path, str) or not raw_path.strip():
             return True
-        candidate = Path(raw_path)
-        if not candidate.is_absolute():
-            candidate = root / candidate
+        candidate = _resolve_file_tool_target(raw_path, home=root)
+        if candidate is None:
+            return True
         resolved = candidate.resolve(strict=False)
         return not (resolved != scratch and resolved.is_relative_to(scratch))
     except (ValueError, OSError, RuntimeError):
@@ -9980,7 +9980,11 @@ class ToolRegistry:
         if (tool_name in _TAINTED_FILE_WRITE_TOOLS
                 and tainted_file_write_target(raw_write_target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            return finish(_tainted_write_denial(tool_name))
+            approved = _post_ingest_one_time_grant(
+                tool_name, raw_write_target, SinkCategory.FILE, ifc_labels,
+                auth_context, get_trusted_service_from_auth_context(auth_context),
+            )
+            return finish(approved or _tainted_write_denial(tool_name))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if tool_name in {"write_file", "edit_file", "replace_file"}:

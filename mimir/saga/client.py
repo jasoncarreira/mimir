@@ -522,6 +522,7 @@ class SagaStore:
         *,
         session_id: str | None,
         reference_date=None,
+        auth_context: Any = None,
     ) -> None:
         """Record query() retrieval access events under the write lock.
 
@@ -538,6 +539,11 @@ class SagaStore:
         ]
         with self._db_lock:
             with self._write_lock:
+                from ..access_control import _turn_has_untrusted_active_ingest
+                if auth_context is not None and _turn_has_untrusted_active_ingest(
+                    auth_context, getattr(auth_context, "ifc_labels", None),
+                ):
+                    return
                 conn = self._ensure_conn()
                 # Best-effort + ownership-guarded. Access stats are
                 # non-essential reinforcement — a failure here must NOT fail the
@@ -1197,6 +1203,7 @@ class SagaStore:
             [atom["id"] for atom in payload["observations"] + payload["raws"]],
             session_id=session_id,
             reference_date=reference_date,
+            auth_context=auth_context,
         ))
         return payload
 

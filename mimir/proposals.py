@@ -355,6 +355,8 @@ def _ensure_scratch_ignored(home: Path) -> str | None:
         for line in existing.splitlines()
     ):
         return None
+    if _untrusted_proposal_turn():
+        return "scratch ignore requires trusted operator setup before opening a proposal"
     try:
         with gitignore.open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):

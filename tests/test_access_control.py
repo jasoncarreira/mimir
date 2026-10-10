@@ -18311,8 +18311,7 @@ async def test_tainted_turn_refuses_native_and_hands_shell_before_permission() -
         "shell_exec was refused before execution (ifc_label_blocked:shell_process)"
     )
     assert hands_result.status == "error"
-    assert "write_blocked_by_untrusted_ingest" in str(hands_result.content)
-    assert access_control._TAINTED_WRITE_REFUSAL in str(hands_result.content)
+    assert hands_result.content == access_control._TAINTED_WRITE_REFUSAL
     assert broker.calls == []
 
 

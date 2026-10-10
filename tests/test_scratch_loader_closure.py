@@ -127,7 +127,14 @@ def test_content_loaders_exclude_scratch(
     else:
         indexer = Indexer(home, embedder=HashEmbedder(), db_path=tmp_path / "index.db")
         indexer.init_schema()
-        assert indexer._sweep_sync()["added"] == int(expected)
+        # Search indexes both memory/ and state/: a live alias exposes the
+        # canonical memory target as well as the state alias, unlike scratch.
+        expected_paths = {"state/sentinel.md"} if expected else set()
+        if shape in {"live-root", "live-leaf"}:
+            expected_paths.add("memory/live-target/sentinel.md")
+        assert indexer._sweep_sync()["added"] == len(expected_paths)
+        with indexer._connect() as conn:
+            assert {row[0] for row in conn.execute("SELECT path FROM files")} == expected_paths
         assert indexer._reindex_sync("state/sentinel.md") == expected
         assert bool(indexer._search_sync("sentinel", [0.0] * 16, "all", 5, 50)) == expected
 
