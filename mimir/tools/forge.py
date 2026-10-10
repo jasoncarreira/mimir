@@ -1168,6 +1168,7 @@ def pr_spec(
 ) -> dict[str, Any]:
     """Read the armed Chainlink spec of record bound by Worklink evidence to this PR."""
     scope = _scope(runtime, repository, pull_request)
+    from ..worklink.autonomy import chainlink_bin
     from ..worklink.continuation import issue_bound_to_pr
     from ..access_control import publish_protected_result
     from ..models import SourceLabel
@@ -1192,7 +1193,7 @@ def pr_spec(
     try:
         with tempfile.TemporaryFile() as output:
             result = subprocess.run(
-                ["chainlink", "issue", "show", str(issue_id), "--json"],
+                [chainlink_bin(), "issue", "show", str(issue_id), "--json"],
                 cwd=home, stdout=output, stderr=subprocess.DEVNULL, timeout=5, check=False,
             )
             if result.returncode != 0 or output.tell() > 131_072:

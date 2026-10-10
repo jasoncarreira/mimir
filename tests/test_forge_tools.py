@@ -1228,9 +1228,14 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
     )
 
 
-def test_pr_spec_uses_only_evidence_and_projects_armed_description(tmp_path, monkeypatch):
+@pytest.mark.parametrize("binary_override", [None, "/opt/custom/bin/chainlink"])
+def test_pr_spec_uses_only_evidence_and_projects_armed_description(tmp_path, monkeypatch, binary_override):
     from mimir.worklink.continuation import issue_bound_to_pr
 
+    if binary_override is None:
+        monkeypatch.delenv("CHAINLINK_BIN", raising=False)
+    else:
+        monkeypatch.setenv("CHAINLINK_BIN", binary_override)
     root = tmp_path / "state" / "worklink" / "evidence"
     root.mkdir(parents=True)
     (root / "42-build.json").write_text(json.dumps({
@@ -1259,7 +1264,7 @@ def test_pr_spec_uses_only_evidence_and_projects_armed_description(tmp_path, mon
         "id": 42, "title": "Issue B", "status": "open",
         "labels": ["worklink:ready"], "description": "trusted spec",
     }
-    assert calls == [["chainlink", "issue", "show", "42", "--json"]]
+    assert calls == [[binary_override or "chainlink", "issue", "show", "42", "--json"]]
     payload["labels"] = ["todo"]
     assert pr_spec.func("owner/repo", 17, runtime=runtime) == {"error": "spec_not_armed"}
     (root / "43-build.json").write_text(json.dumps({
