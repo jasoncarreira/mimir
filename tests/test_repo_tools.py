@@ -273,6 +273,198 @@ def _repo_scope_and_state(
     return origin, source, scope, state
 
 
+def _lineage_turn(scope, state, *, tainted=False):
+    from mimir.models import (
+        AuthContext, InformationFlowLabels, InformationFlowState, SourceLabel,
+        TurnInteractivity,
+    )
+
+    labels = InformationFlowLabels()
+    if tainted:
+        labels = labels.with_source(SourceLabel(
+            principal="outside", domain="web", resource_id="untrusted-instruction",
+            bridge_instance="web", sensitivity="public", integrity="untrusted",
+            integrity_effect="active_ingest",
+        ))
+    ifc = InformationFlowState(labels=labels)
+    ifc.pr_checkout_author_trust[scope.scope_id] = True
+    return AuthContext(
+        principal="mimir-bot", canonical_principal="mimir-bot", roles=("user",),
+        event_ingress=None, trigger="poller", channel_id="channel-1",
+        interactivity=TurnInteractivity.NON_INTERACTIVE,
+        enforcement_enabled=not tainted, ifc_labels=labels, ifc_state=ifc,
+        repo_pr_action_scope=scope, repo_review_state=state,
+    )
+
+
+@pytest.mark.parametrize("lineage", ["clean", "tainted", "missing", "unrecorded", "corrupt"])
+def test_resumed_local_commit_requires_clean_producing_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lineage: str,
+) -> None:
+    from mimir import access_control
+    from mimir.models import InformationFlowLabels
+    from mimir.pr_checkout_lease import _METADATA
+    from mimir.tools.repo import _publish_attested_lease_result
+
+    _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
+    turn1 = _lineage_turn(scope, first, tainted=lineage == "tainted")
+    lease = first.checkout_lease
+    (lease.path / "tracked.txt").write_text("local remediation\n")
+    RepoGitTools(first, auth_context=turn1, enforce=False).execute(
+        GitCommit(("tracked.txt",), "local fix"),
+    )
+    head = _git(lease.path, "rev-parse", "HEAD")
+    assert first.git_expected_head == head
+    assert lease.head_sha == head != scope.observed_head_sha
+    if lineage in {"missing", "unrecorded", "corrupt"}:
+        record = json.loads((lease.path / _METADATA).read_text())
+        record["lineage"] = (
+            None if lineage == "missing" else {} if lineage == "unrecorded"
+            else {head: "trusted"}
+        )
+        (lease.path / _METADATA).write_text(json.dumps(record))
+    # Turn 1 did not push: a failed/refused test leaves the PR remote pinned.
+    assert _git(_origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
+    second = RepoReviewState(scope)
+    turn2 = _lineage_turn(scope, second)
+    from mimir.tools import forge as forge_module, repo as repo_module
+    monkeypatch.setattr(forge_module, "remediation_checkout_preflight", lambda *_: (second, None))
+    monkeypatch.setattr(forge_module, "_client", lambda _: SimpleNamespace(
+        author_is_trusted=lambda *_: True,
+    ))
+    monkeypatch.setattr(forge_module, "_pr_content_authors", lambda *_: ((scope.principal,), None))
+    monkeypatch.setattr(forge_module, "_author_verdict", lambda *_: True)
+    from mimir.access_control import (
+        SinkGate, ToolAuthorization, begin_protected_result_capture,
+        classify_protected_result, end_protected_result_capture, protected_result_source,
+    )
+    token = begin_protected_result_capture()
+    try:
+        checkout = repo_module.repo_checkout.func(
+            "owner/repo", 7, runtime=SimpleNamespace(context=turn2),
+        )
+    finally:
+        checkout_provenance = end_protected_result_capture(token)
+    resumed = second.checkout_lease
+    assert checkout["status"] == "resumed" and checkout["candidate_commits"] == (head,)
+    assert resumed.head_sha == head
+    assert second.git_expected_head == head
+    trusted = lineage == "clean"
+    assert access_control._attested_pr_checkout_lease(turn2, scope, resumed) is trusted
+    checkout_labels = classify_protected_result(
+        "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, turn2,
+        ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=checkout,
+        provenance=checkout_provenance,
+    )
+    assert checkout_labels.sources[0].resource_id == (
+        f"owner/repo#pull/7@{scope.observed_head_sha}"
+    )
+    assert checkout_labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+    turn2.ifc_state.merge(checkout_labels)
+    file_source = protected_result_source(
+        turn2, principal="filesystem", domain="filesystem",
+        resource_id=str(resumed.path / "tracked.txt"), bridge_instance="filesystem",
+    )
+    assert (file_source.domain, file_source.integrity) == (
+        ("repository", "trusted") if trusted else ("filesystem", "untrusted")
+    )
+    for name, result in (("repo_status", GitStatus()), ("repo_diff", GitDiff())):
+        token = begin_protected_result_capture()
+        try:
+            RepoGitTools(second).execute(result)
+            _publish_attested_lease_result(SimpleNamespace(context=turn2), second)
+        finally:
+            provenance = end_protected_result_capture(token)
+        labels = classify_protected_result(
+            name, {"repository": "owner/repo", "pull_request": 7}, turn2,
+            ToolAuthorization(tool_name=name, decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope), result="ok", provenance=provenance,
+        )
+        assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+        turn2.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        turn2.ifc_state.current(InformationFlowLabels()), turn2,
+        enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is trusted
+    if not trusted:
+        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+
+
+def test_rebase_cannot_clean_up_tainted_local_commit(tmp_path: Path) -> None:
+    from mimir import access_control
+    from mimir.pr_checkout_lease import _METADATA
+
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("tainted fix\n")
+    RepoGitTools(state, auth_context=_lineage_turn(scope, state, tainted=True),
+                 enforce=False).execute(GitCommit(("tracked.txt",), "tainted fix"))
+    _git(source, "checkout", "-q", "main")
+    (source / "base-change.txt").write_text("base update\n")
+    _git(source, "add", "base-change.txt")
+    _git(source, "commit", "-qm", "base update")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    clean = _lineage_turn(scope, state)
+    RepoGitTools(state, auth_context=clean).execute(GitRebase())
+    head = state.git_expected_head
+    lineage = json.loads((lease.path / _METADATA).read_text())["lineage"]
+    assert lineage[head] is False
+    assert not access_control._attested_pr_checkout_lease(clean, scope, lease)
+
+
+def test_rebase_onto_live_advanced_protected_base_stays_attested(tmp_path: Path) -> None:
+    from mimir import access_control
+
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    turn = _lineage_turn(scope, state)
+    _git(source, "checkout", "-q", "main")
+    (source / "new-base.txt").write_text("advanced base\n")
+    _git(source, "add", "new-base.txt")
+    _git(source, "commit", "-qm", "move main")
+    advanced = _git(source, "rev-parse", "HEAD")
+    _git(source, "push", "-q", "origin", "HEAD:main")
+    assert scope.observed_base_sha != advanced
+    RepoGitTools(state, auth_context=turn).execute(GitRebase())
+    lease = state.checkout_lease
+    assert lease.base_sha == lease.verified_base_sha == advanced
+    assert access_control._attested_pr_checkout_lease(turn, scope, lease)
+    from mimir.pr_checkout_lease import _METADATA
+    record = json.loads((lease.path / _METADATA).read_text())
+    record["verified_base_sha"] = scope.observed_base_sha
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    assert not access_control._attested_pr_checkout_lease(turn, scope, lease)
+    record["verified_base_sha"] = advanced
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    (lease.path / "foreign.txt").write_text("foreign edit\n")
+    _git(lease.path, "add", "foreign.txt")
+    _git(lease.path, "-c", "user.name=outsider", "-c", "user.email=outside@example.test",
+         "commit", "-qm", "foreign commit")
+    foreign = _git(lease.path, "rev-parse", "HEAD")
+    state.record_git_head(scope.scope_id, foreign)
+    record["lineage"][foreign] = True
+    record["head_sha"] = foreign
+    object.__setattr__(lease, "head_sha", foreign)
+    (lease.path / _METADATA).write_text(json.dumps(record))
+    assert not access_control._attested_pr_checkout_lease(turn, scope, lease)
+
+
+def test_fresh_lease_revert_refreshes_head_and_keeps_clean_lineage(tmp_path: Path) -> None:
+    from mimir import access_control
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    turn = _lineage_turn(scope, state)
+    tools = RepoGitTools(state, auth_context=turn)
+    tools.execute(GitRevert(scope.observed_head_sha))
+    lease = state.checkout_lease
+    assert state.git_expected_head == _git(lease.path, "rev-parse", "HEAD")
+    assert access_control._attested_pr_checkout_lease(turn, scope, lease)
+
+
 @pytest.fixture
 def repo_tools(tmp_path: Path) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState, RepoGitTools]:
     origin, source, scope, state = _repo_scope_and_state(tmp_path)
@@ -1347,7 +1539,8 @@ def test_push_refuses_when_successful_command_leaves_remote_unchanged(repo_tools
     assert observed in str(refusal.value)
     assert f"local commit {expected} remains unpushed" in str(refusal.value)
     assert _git(origin, "rev-parse", scope.destination_ref) == observed
-    assert scope.observed_head_sha == lease.head_sha == observed
+    assert scope.observed_head_sha == observed
+    assert lease.head_sha == expected
 
 
 def test_push_succeeds_if_remote_advances_on_top_before_verification(repo_tools) -> None:
@@ -1397,6 +1590,8 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     state = RepoReviewState(https_scope)
     state.attach_checkout_lease(lease)
     state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
+    from mimir.pr_checkout_lease import _METADATA, _metadata
+    (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)) + "\n")
     (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     token = "never-expose-this-token"
     monkeypatch.setenv("GITHUB_TOKEN", token)
@@ -3612,7 +3807,7 @@ def test_repo_wrapper_failure_classes_have_distinct_stable_codes(
         monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
 
         class FailingRepoGitTools:
-            def __init__(self, review_state, *, enforce=True):
+            def __init__(self, review_state, *, enforce=True, auth_context=None):
                 self.review_state = review_state
                 self.execution_started = False
 
@@ -3638,7 +3833,7 @@ def test_repo_wrapper_git_stderr_redacts_embedded_remote_credential(
     secret_url = "https://agent:super-secret-password@example.invalid/owner/repo.git"
 
     class FailingRepoGitTools:
-        def __init__(self, review_state, *, enforce=True):
+        def __init__(self, review_state, *, enforce=True, auth_context=None):
             self.review_state = review_state
             self.execution_started = False
 

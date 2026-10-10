@@ -1497,6 +1497,16 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
     for item in items:
         if not isinstance(item, dict):
             continue
+        if item.get("event_type") in {
+            "pr_changes_requested_stale", "pr_ci_failure",
+            "pr_mergeability_rebase", "pr_mergeability_conflicting",
+        } and isinstance(item.get("repo"), str) and type(item.get("number")) is int and isinstance(item.get("head_sha"), str):
+            from .repo_tools import was_superseded_by_own_push
+
+            if was_superseded_by_own_push(item["repo"], item["number"], item["head_sha"]):
+                # A queued event may outlive the poller fire that generated it.
+                # Never issue a stale authority even when it was already queued.
+                continue
         scope = _repo_pr_scope(
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
             repo=item.get("repo"),
@@ -10298,8 +10308,6 @@ def _attested_pr_checkout_lease(
         or getattr(scope, "canonical_repo", "").lower()
         != getattr(lease, "canonical_repo", "").lower()
         or getattr(scope, "pr_number", None) != getattr(lease, "pr_number", None)
-        or getattr(scope, "observed_head_sha", "").lower()
-        != getattr(lease, "head_sha", "").lower()
         or not getattr(lease, "is_active", False)
     ):
         return False
@@ -10316,10 +10324,28 @@ def _attested_pr_checkout_lease(
         if registry is not None
         else getattr(auth_context, "repo_review_state", None)
     )
-    if review_state is None or getattr(review_state, "checkout_lease", None) is not lease:
+    attached = getattr(review_state, "checkout_lease", None)
+    if (
+        attached is not lease
+        and getattr(review_state, "git_expected_head", None) == expected_head
+        and getattr(lease, "head_sha", "").lower() == expected_head
+    ):
+        # A file read reconstructs the same lease from metadata. With no local
+        # HEAD advance, the immutable observed commit still suffices; the real
+        # checkout/branch are inspected by the author-attestation predicate.
+        return _lease_head_is_author_attested(
+            path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
+        )
+    if review_state is None or attached is None or any(
+        getattr(attached, key, None) != getattr(lease, key, None) for key in (
+            "path", "scope_id", "head_sha", "base_sha", "recovery_id",
+            "canonical_origin", "owner", "verified_base_sha",
+        )
+    ):
         # Synthetic callers without the runtime's RepoReviewState do not get the
         # cache, but still fail closed against the immutable attested head.
-        return _lease_head_is_author_attested(
+        return getattr(lease, "head_sha", "").lower() == expected_head and _lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
             scope=scope, lease=lease, ifc_state=ifc_state,
         )
@@ -10335,6 +10361,10 @@ def _attested_pr_checkout_lease(
         # tools. Never reuse a verdict unless the real branch and HEAD still
         # match the server's recorded state.
         return False
+    if (observed_head != expected_head or getattr(lease, "head_sha", "").lower() != expected_head) and not _lease_has_clean_lineage(
+        path, lease, scope, expected_head, observed_head,
+    ):
+        return False
     return review_state.author_attestation_verdict(
         observed_head,
         lambda: _lease_head_is_author_attested(
@@ -10342,6 +10372,57 @@ def _attested_pr_checkout_lease(
             observed_state=observed_state,
             scope=scope, lease=lease, ifc_state=ifc_state,
         ),
+    )
+
+
+def _lease_has_clean_lineage(
+    path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
+) -> bool:
+    """Check every local commit against the atomically recorded producing turns."""
+    from .pr_checkout_lease import _METADATA, _recorded_lineage, _recorded_verified_base
+    from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
+
+    try:
+        raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
+        if current_head != getattr(lease, "head_sha", "").lower():
+            return False
+        if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+            "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
+        )):
+            return False
+        lineage = _recorded_lineage(raw)
+        if lineage is None:
+            return False
+        base = getattr(lease, "base_sha", "").lower()
+        verified_base = _recorded_verified_base(raw)
+        protected = (
+            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
+            and (base == verified_base or base == getattr(scope, "observed_base_sha", "").lower())
+        )
+        if protected and base != getattr(scope, "observed_base_sha", "").lower():
+            ancestor = hardened_git_command(
+                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base), timeout=5,
+            )
+            if ancestor.returncode != 0 or ancestor.timed_out or ancestor.output_limited:
+                return False
+        result = hardened_git_command(
+            path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
+                   *((base,) if protected else ()), "--"), timeout=5,
+        )
+        if result.returncode != 0 or result.timed_out or result.output_limited:
+            return False
+        commits = result.stdout.splitlines()
+        return bool(commits) and len(commits) <= 500 and all(
+            lineage.get(commit) is True for commit in commits
+        )
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
+def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> bool:
+    return (
+        getattr(scope, "destination_ref", None) in protected_refs
+        or f"refs/heads/{getattr(scope, 'base_ref', '')}" in protected_refs
     )
 
 
@@ -10426,10 +10507,19 @@ def _lease_head_is_author_attested(
             return True
         base = getattr(scope, "observed_base_sha", "").lower()
         protected_base = (
-            getattr(scope, "destination_ref", None) in _PROTECTED_BRANCH_REFS
+            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
             and len(base) == 40 and all(c in "0123456789abcdef" for c in base)
-            and base == getattr(lease, "base_sha", "").lower()
+            and (
+                base == getattr(lease, "base_sha", "").lower()
+                or (
+                    base == getattr(lease, "scope_base_sha", "").lower()
+                    and getattr(lease, "verified_base_sha", None) == getattr(lease, "base_sha", None)
+                    and run("merge-base", "--is-ancestor", base, lease.base_sha).returncode == 0
+                )
+            )
         )
+        if protected_base:
+            base = lease.base_sha.lower()
         head_ancestor = run("merge-base", "--is-ancestor", expected_head, current_head).returncode == 0
         base_ancestor = protected_base and run(
             "merge-base", "--is-ancestor", base, current_head,

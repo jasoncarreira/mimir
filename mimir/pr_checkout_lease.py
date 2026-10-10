@@ -119,6 +119,9 @@ class PRCheckoutLease:
     recovered: bool = False
     revoked: bool = False
     pr_number: int = 0
+    # A missing or malformed lineage is never evidence of a clean local commit.
+    lineage: dict[str, bool] | None = None
+    verified_base_sha: str | None = None
 
     @property
     def write_root(self) -> Path:
@@ -290,7 +293,27 @@ def _metadata(lease: PRCheckoutLease) -> dict[str, object]:
         "expires_at": lease.expires_at.isoformat(),
         "recovery_id": lease.recovery_id,
         "pr_number": lease.pr_number,
+        "lineage": lease.lineage,
+        "verified_base_sha": lease.verified_base_sha,
     }
+
+
+def _recorded_lineage(raw: dict[str, object]) -> dict[str, bool] | None:
+    value = raw.get("lineage")
+    if not isinstance(value, dict) or len(value) > 1000 or any(
+        not isinstance(sha, str) or len(sha) != 40
+        or any(c not in "0123456789abcdef" for c in sha)
+        or type(clean) is not bool for sha, clean in value.items()
+    ):
+        return None
+    return value
+
+
+def _recorded_verified_base(raw: dict[str, object]) -> str | None:
+    value = raw.get("verified_base_sha")
+    return value if isinstance(value, str) and len(value) == 40 and all(
+        c in "0123456789abcdef" for c in value
+    ) else None
 
 
 def _safe_lease_path(root: Path, path: Path, *, must_exist: bool) -> Path:
@@ -417,6 +440,8 @@ def create_pr_checkout_lease(
             expires_at=now + ttl,
             recovery_id=recovery_id,
             pr_number=scope.pr_number,
+            lineage={},
+            verified_base_sha=actual_base,
         )
         _run(
             runner,
@@ -479,7 +504,6 @@ def recover_pr_checkout_lease(
         "canonical_origin": scope.canonical_origin,
         "source_root": str(Path(scope.canonical_root).resolve(strict=True)),
         "scope_base_sha": scope.observed_base_sha,
-        "head_sha": scope.observed_head_sha,
         "destination_ref": scope.destination_ref,
         "owner": owner,
         "scope_id": scope.scope_id,
@@ -488,6 +512,11 @@ def recover_pr_checkout_lease(
     }
     if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
         raise RuntimeError("PR checkout lease recovery scope mismatch")
+    recorded_head = raw.get("head_sha")
+    if not isinstance(recorded_head, str) or len(recorded_head) != 40 or any(
+        c not in "0123456789abcdef" for c in recorded_head.lower()
+    ):
+        raise RuntimeError("PR checkout lease recovery metadata is invalid")
     if "pr_number" in raw and raw.get("pr_number") != scope.pr_number:
         raise RuntimeError("PR checkout lease recovery scope mismatch")
     base_sha = raw.get("base_sha")
@@ -501,6 +530,7 @@ def recover_pr_checkout_lease(
                 **expected,
                 "source_root": Path(str(expected["source_root"])),
                 "base_sha": base_sha.lower(),
+                "head_sha": recorded_head.lower(),
                 "path": path,
                 "lease_root": root,
             },
@@ -509,6 +539,8 @@ def recover_pr_checkout_lease(
             recovery_id=str(raw["recovery_id"]),
             recovered=True,
             pr_number=scope.pr_number,
+            lineage=_recorded_lineage(raw),
+            verified_base_sha=_recorded_verified_base(raw),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease recovery metadata is invalid") from exc
@@ -595,6 +627,8 @@ def _lease_from_recorded_metadata(path: Path, root: Path) -> PRCheckoutLease:
             expires_at=expires_at,
             recovery_id=str(raw["recovery_id"]),
             pr_number=int(raw.get("pr_number", 0)),
+            lineage=_recorded_lineage(raw),
+            verified_base_sha=_recorded_verified_base(raw),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("PR checkout lease reclamation metadata is invalid") from exc
@@ -978,12 +1012,16 @@ def _retained_candidate_head(
         "owner": owner,
         "scope_id": scope.scope_id,
         "destination_ref": scope.destination_ref,
-        "head_sha": scope.observed_head_sha,
         "path": str(path),
         "lease_root": str(root),
     }
     if not isinstance(raw, dict) or any(raw.get(key) != value for key, value in expected.items()):
         raise RuntimeError(f"PR checkout lease recovery scope mismatch at {path}")
+    recorded_head = raw.get("head_sha")
+    if not isinstance(recorded_head, str) or len(recorded_head) != 40 or any(
+        c not in "0123456789abcdef" for c in recorded_head.lower()
+    ):
+        raise RuntimeError("PR checkout lease recovery metadata is invalid")
     if "pr_number" in raw and raw.get("pr_number") != scope.pr_number:
         raise RuntimeError(f"PR checkout lease recovery scope mismatch at {path}")
     head = _run(
@@ -1033,7 +1071,15 @@ def _foreign_candidate_head(
     # Same-identity work must remain resumable even after rewriting its patches.
     # This grants no push authority; rebind freshly verifies the remote head and
     # publication must separately reconcile it. Keep stale-head cleanup below.
-    if lease.head_sha.lower() == observed_head:
+    published = runner([
+        "git", "-C", str(lease.path), "rev-parse", "--verify",
+        f"{PUBLISHED_HEAD_REF}^{{commit}}",
+    ])
+    if (lease.head_sha.lower() == observed_head or (
+        published.returncode == 0 and published.stdout.strip().lower() == observed_head
+        and isinstance(lease.lineage, dict)
+        and lease.head_sha.lower() in lease.lineage
+    )):
         return head, True
     if runner([
         "git", "-C", str(lease.path), "cat-file", "-e", f"{observed_head}^{{commit}}",
@@ -1123,11 +1169,13 @@ def _rebind_foreign_candidate(
         lease,
         scope_base_sha=scope.observed_base_sha.lower(),
         base_sha=actual_base,
-        head_sha=scope.observed_head_sha.lower(),
+        head_sha=(head if lease.head_sha.lower() == head else scope.observed_head_sha.lower()),
         scope_id=scope.scope_id,
         expires_at=datetime.now(UTC) + ttl,
         recovered=True,
         pr_number=scope.pr_number,
+        lineage=lease.lineage,
+        verified_base_sha=actual_base,
     )
     metadata_path = lease.path / _METADATA
     staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
