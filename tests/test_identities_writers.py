@@ -96,11 +96,11 @@ def test_malformed_yaml_aborts_identity_transactions(tmp_path, operation):
     ("scalar\n", "root must be a mapping"),
     ("0\n", "root must be a mapping"),
     ("false\n", "root must be a mapping"),
-    ("null\n", "root must be a mapping"),
-    ("", "root must be a mapping"),
+    ('""\n', "root must be a mapping"),
     ("people: {alice: {aliases: [slack-U1]}}\n", "people must be a list"),
     ("people: scalar\n", "people must be a list"),
-    ("people: null\n", "people must be a list"),
+    ('people: ""\n', "people must be a list"),
+    ("people: 0\n", "people must be a list"),
     ("people: false\n", "people must be a list"),
 ])
 def test_wrong_yaml_shape_aborts_identity_transactions(tmp_path, operation, document, message):
@@ -114,8 +114,50 @@ def test_wrong_yaml_shape_aborts_identity_transactions(tmp_path, operation, docu
     assert not list(path.parent.glob(".identities-*.tmp"))
 
 
-@pytest.mark.parametrize("document", [None, "{}\n", "intake: {policy: pairing}\n", "people: []\n"])
-def test_add_initializes_only_missing_people_in_valid_mapping(tmp_path, document):
+@pytest.mark.parametrize("document", [
+    "", "# my identities\n# nothing yet\n", "null\n",
+    "# my identities\npeople:\n", "# my identities\npeople: null\n",
+])
+@pytest.mark.parametrize("operation", _INVALID_STATE_OPERATIONS)
+def test_empty_identity_state_allows_transactions_and_preserves_header(tmp_path, document, operation):
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text(document, encoding="utf-8")
+    header = (
+        "# my identities\n# nothing yet\n" if "# nothing yet" in document
+        else "# my identities\n" if document.startswith("#") else ""
+    )
+    loaded, loaded_header = pop._load_yaml(path)
+    assert loaded == ({"people": []} if "people:" in document else {})
+    assert loaded_header == header
+
+    _edit_invalid_state(tmp_path, operation)
+
+    if operation.startswith("remove:"):
+        # Nothing to remove: success is a no-op, preserving even empty bytes.
+        assert path.read_text(encoding="utf-8") == document
+    else:
+        rewritten = path.read_text(encoding="utf-8")
+        assert rewritten.startswith(header)
+        people = yaml.safe_load(rewritten)["people"]
+        assert len(people) == 1
+        person = people[0]
+        if operation == "add":
+            assert person == {"canonical": "eve", "aliases": ["slack-U3"]}
+        elif operation == "capture":
+            assert person["dm_channels"] == {"slack": "dm-slack-D1"}
+        elif operation == "web-key":
+            assert person["canonical"] == "alice"
+            assert any(alias.startswith("webkey:") for alias in person["aliases"])
+        else:
+            assert person["aliases"] == ["slack-U1"]
+            assert person["pairing"]["code_hash"]
+    assert not list(path.parent.glob(".identities-*.tmp"))
+
+
+@pytest.mark.parametrize("document", [None, "{}\n", "intake: {policy: pairing}\n", "people: []\n",
+                                       "intake: {policy: pairing}\npeople: null\n"])
+def test_add_initializes_empty_people_in_valid_mapping(tmp_path, document):
     path = tmp_path / "state" / "identities.yaml"
     path.parent.mkdir()
     if document is not None:

@@ -152,8 +152,8 @@ def _extract_header(text: str) -> str:
 def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
     """Read identities.yaml; return ``(doc, header_text)``.
 
-    ``doc`` is the parsed YAML mapping (empty dict only for a missing
-    file). ``header_text`` is the leading comment block —
+    ``doc`` is the parsed YAML mapping (empty dict for a missing file or
+    a null/empty document). ``header_text`` is the leading comment block —
     every line from the start of the file through the last consecutive
     comment / blank line before the first document content. The header
     is preserved verbatim and prepended on write back, so the
@@ -169,10 +169,11 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       write. If that ever becomes load-bearing, the right escalation
       is ``ruamel.yaml`` round-trip mode (carries inline comments) —
       a new dependency, deferred until a real use case shows up.
-    - Only a missing file is treated as empty. Read errors propagate so
-      every transaction aborts rather than replacing unreadable state.
-      Invalid YAML, a non-mapping root, or a present non-list ``people``
-      field also aborts the transaction before any writer can reset state.
+    - A missing file or a null/empty document is treated as empty;
+      a null ``people`` field is normalized to an empty list. Read errors
+      propagate so every transaction aborts rather than replacing unreadable
+      state. Invalid YAML, a non-null non-mapping root, or a non-null
+      non-list ``people`` field also aborts before any writer can reset state.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -185,10 +186,17 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
         # Preserve the operator's broken-but-recoverable file, not an empty
         # substitute that a later transaction could publish over it.
         raise
+    # PyYAML uses None for empty/comment-only documents and explicit null.
+    # Do not use a truthiness fallback: false, zero and [] are still invalid.
+    if doc is None:
+        doc = {}
     if not isinstance(doc, dict):
         raise ValueError("identities.yaml root must be a mapping — refusing to overwrite")
-    if "people" in doc and not isinstance(doc["people"], list):
-        raise ValueError("identities.yaml people must be a list — refusing to overwrite")
+    if "people" in doc:
+        if doc["people"] is None:
+            doc["people"] = []
+        elif not isinstance(doc["people"], list):
+            raise ValueError("identities.yaml people must be a list — refusing to overwrite")
     return doc, _extract_header(text)
 
 
@@ -280,8 +288,8 @@ def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
         doc, header = _load_yaml(yaml_path)
     except yaml.YAMLError as exc:
         raise ValueError(f"identities.yaml parse failed: {exc}") from exc
-    # The shared loader validates any existing field; only an absent field
-    # may be initialized (including the fresh, missing-file case).
+    # The shared loader validates existing fields and normalizes null people.
+    # Initialize an absent field, including the fresh, missing-file case.
     doc.setdefault("people", [])
     return doc, header
 
