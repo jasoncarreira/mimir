@@ -539,11 +539,8 @@ class SagaStore:
         ]
         with self._db_lock:
             with self._write_lock:
-                from ..access_control import _turn_has_untrusted_active_ingest
-                if auth_context is not None and _turn_has_untrusted_active_ingest(
-                    auth_context, getattr(auth_context, "ifc_labels", None),
-                ):
-                    return
+                # Retrieval statistics are server-owned read bookkeeping.
+                # Explicit model mutations are vetoed at the tool boundary.
                 conn = self._ensure_conn()
                 # Best-effort + ownership-guarded. Access stats are
                 # non-essential reinforcement — a failure here must NOT fail the

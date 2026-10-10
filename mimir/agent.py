@@ -3554,9 +3554,8 @@ class Agent:
             **result_fields,
         )
         await self._turn_logger.write(record)
-        from .access_control import _turn_has_untrusted_active_ingest
-        if (ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event)
-                and not _turn_has_untrusted_active_ingest(ctx.auth_context, ctx.ifc_labels)):
+        # Continuation sidecars are server-owned bookkeeping, not model writes.
+        if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
                 try:

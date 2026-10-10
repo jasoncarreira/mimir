@@ -162,10 +162,7 @@ def maybe_create_worklink_budget_continuation(
     Chainlink context could be inferred.
     """
 
-    from ..access_control import _turn_has_untrusted_active_ingest
-    if (ctx.auth_context is not None
-            and _turn_has_untrusted_active_ingest(ctx.auth_context, ctx.ifc_labels)):
-        return None
+    # Server-owned continuation metadata is not a model tool-call write.
     if is_dispatch_failure_intervention(event):
         return None
     if not getattr(ctx, "tool_call_budget_exhausted", False):

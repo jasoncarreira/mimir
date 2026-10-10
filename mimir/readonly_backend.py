@@ -2205,24 +2205,8 @@ class WriteGuardBackend:
         "admin Users UI / web-key endpoints — not by editing this file."
     )
 
-    def _is_tainted_instruction_write(self, file_path: str) -> bool:
-        from ._context import get_current_turn
-        from .access_control import tainted_file_write_target, _turn_has_untrusted_active_ingest
-
-        turn = get_current_turn()
-        if turn is None:
-            return False
-        auth = getattr(turn, "auth_context", None)
-        if auth is None:
-            # Setup and legacy in-process callers have no authorization carrier.
-            return False
-        configured_home = os.environ.get("MIMIR_HOME", "").strip()
-        # Resolve backend virtual paths before applying the universal scratch exception.
-        candidate = self._root / self._canonicalize_path(file_path).lstrip("/")
-        return (
-            tainted_file_write_target(str(candidate), home=Path(configured_home) if configured_home else self._root)
-            and _turn_has_untrusted_active_ingest(auth, getattr(turn, "ifc_labels", None))
-        )
+    # The ingest veto belongs at the model tool-call boundary (BudgetGate and
+    # ToolRegistry), not here: summarization uses this same backend internally.
 
     def _is_scheduler_write(self, file_path: str) -> bool:
         configured_home = os.environ.get("MIMIR_HOME", "").strip()
@@ -2243,7 +2227,7 @@ class WriteGuardBackend:
         return ", ".join(f"{label}/" for label in self._writable_labels)
 
     def write(self, file_path: str, content: str) -> WriteResult:
-        if self._is_scheduler_write(file_path) or self._is_tainted_instruction_write(file_path):
+        if self._is_scheduler_write(file_path):
             self._record_denial("write_scheduled_instruction_veto", file_path)
             return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if not self._is_write_allowed(file_path):
@@ -2281,7 +2265,7 @@ class WriteGuardBackend:
         return await asyncio.to_thread(self.write, file_path, content)
 
     def replace(self, file_path: str, content: str) -> WriteResult:
-        if self._is_scheduler_write(file_path) or self._is_tainted_instruction_write(file_path):
+        if self._is_scheduler_write(file_path):
             self._record_denial("replace_scheduled_instruction_veto", file_path)
             return WriteResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if not self._is_write_allowed(file_path):
@@ -2311,7 +2295,7 @@ class WriteGuardBackend:
         new_string: str,
         replace_all: bool = False,
     ) -> EditResult:
-        if self._is_scheduler_write(file_path) or self._is_tainted_instruction_write(file_path):
+        if self._is_scheduler_write(file_path):
             self._record_denial("edit_scheduled_instruction_veto", file_path)
             return EditResult(error=self._SCHEDULED_INSTRUCTION_DENY_REASON)
         if self._fs._is_outside_root(file_path):
@@ -2362,7 +2346,7 @@ class WriteGuardBackend:
         # mixed response shape would be more surprising than failing
         # the batch cleanly.
         instruction_blocked = {p for p, _ in files
-                               if self._is_scheduler_write(p) or self._is_tainted_instruction_write(p)}
+                               if self._is_scheduler_write(p)}
         blocked_paths = {p for p, _ in files if not self._is_write_allowed(p)}
         core_blocked = {p for p, _ in files if self._is_core_memory_write_blocked(p)}
         identities_blocked = {p for p, _ in files if self._is_identities_write_blocked(p)}
