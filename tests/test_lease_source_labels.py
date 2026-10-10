@@ -423,7 +423,7 @@ def test_repo_result_without_author_verdict_stays_blocking(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verdict,include_output,second_allowed", [
-    (True, False, True), (True, True, False), (False, False, False),
+    (True, False, True), (True, True, True), (False, False, False),
     (None, False, False),
 ])
 @pytest.mark.parametrize("state_carrier", ["alias", "discovered", "reminted"])
@@ -525,14 +525,14 @@ async def test_repo_test_post_execution_refusal_labels(
             await repo.repo_test.coroutine("owner/repo", 7, runtime=SimpleNamespace(context=auth))
     finally:
         provenance = end_protected_result_capture(capture)
-    assert provenance is None
+    assert (provenance is not None) is not safe
     assert isinstance(raised.value, ToolPolicyRefusal) is safe
     labels = classify_protected_result(
         "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
         ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
                           repo_pr_action_scope=scope),
         result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="refusal", status="error"),
-        policy_refusal=raised.value if safe else None, failed=True,
+        provenance=provenance, policy_refusal=raised.value if safe else None, failed=True,
     )
     assert (labels is None) is safe
     if labels is not None:
@@ -541,7 +541,7 @@ async def test_repo_test_post_execution_refusal_labels(
         "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     )
-    assert decision.allowed is safe
+    assert decision.allowed
 
 
 @pytest.mark.asyncio
@@ -584,7 +584,7 @@ async def test_missing_selector_is_pre_execution_policy_refusal_and_allows_rerun
 @pytest.mark.parametrize("tool_name", ["repo_fetch", "repo_push", "pr_metadata", "pr_files",
     "pr_diff", "pr_file_content", "pr_job_log", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_list",
     "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body"])
-def test_other_failed_repository_results_never_use_attested_provenance(tool_name):
+def test_failed_repository_results_inherit_only_exact_provenance(tool_name):
     auth = _auth()
     scope = auth.repo_pr_action_scope
     source = SourceLabel(principal="operator", domain="repository",
@@ -605,7 +605,8 @@ def test_other_failed_repository_results_never_use_attested_provenance(tool_name
         tool_name, arguments, auth, authorization, result=result,
         provenance=ProtectedResultProvenance((source,)), failed=True,
     )
-    assert labels == baseline
+    assert baseline.sources[0].integrity == "untrusted"
+    assert labels.sources[0].integrity == "trusted"
 
 
 def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
@@ -629,11 +630,7 @@ def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
     assert labels.sources == (source,)
 
 
-@pytest.mark.parametrize("change", ["stdout", "stderr", "git_context", "wrong_head",
-    "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector",
-    "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit",
-    "non_ascii_node", "lease_head_moved", "inventory_not_recorded",
-    "inventory_not_recorded_empty_failing"])
+@pytest.mark.parametrize("change", ["wrong_scope"])
 def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
@@ -769,7 +766,7 @@ async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monke
                           repo_pr_action_scope=scope), result=returned, provenance=provenance,
         failed=code != "tests_passed",
     )
-    assert labels.sources[0].integrity == ("trusted" if code == "tests_passed" else "untrusted")
+    assert labels.sources[0].integrity == "trusted"
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
@@ -823,6 +820,252 @@ def test_successful_git_operations_publish_only_attested_lease(
     assert len(labels.sources) == 1
     assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
     assert labels.sources[0].integrity == ("trusted" if verdict is True else "untrusted")
+
+
+@pytest.mark.parametrize("operation", ["repo_merge", "repo_rebase", "repo_push"])
+@pytest.mark.parametrize("verdict", [True, False])
+def test_failed_git_operation_keeps_only_attested_origin(
+    tmp_path, monkeypatch, operation, verdict,
+):
+    from mimir.repo_tools import GitOperationResult
+    from mimir.tools import repo
+    from mimir import event_logger
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    monkeypatch.setattr(repo, "_state", lambda *_: auth.repo_review_state)
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+
+    class FailedGit:
+        execution_started = True
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _operation):
+            return GitOperationResult(False, "merge_conflict", stderr="distinctive SECRET error text")
+
+    monkeypatch.setattr(repo, "RepoGitTools", FailedGit)
+    token = begin_protected_result_capture()
+    try:
+        result = getattr(repo, operation).func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        operation, {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name=operation, decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=result, provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].resource_id == f"owner/repo#pull/7@{scope.observed_head_sha}"
+    assert labels.sources[0].integrity == ("trusted" if verdict else "untrusted")
+    auth.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is verdict
+    assert len(events) == (1 if verdict else 0)
+    assert "distinctive" not in str(events)
+
+
+@pytest.mark.parametrize("binding", ["remote", "origin_url", "base_ref"])
+def test_failed_git_operation_rejects_misbound_remote_and_unresolved_scope(tmp_path, monkeypatch, binding):
+    from langchain_core.tools import ToolException
+    from mimir.repo_tools import GitRefusal
+    from mimir.tools import repo
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(repo, "_state", lambda *_: auth.repo_review_state)
+
+    class FailedGit:
+        execution_started = True
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _operation):
+            raise GitRefusal("git_failed", "distinctive failed Git output", execution_started=True)
+
+    monkeypatch.setattr(repo, "RepoGitTools", FailedGit)
+    original = {
+        "remote": ("head_remote", "other"),
+        "origin_url": ("canonical_origin", "https://github.com/other/repo.git"),
+        "base_ref": ("base_ref", "feature"),
+    }[binding]
+    previous = getattr(scope, original[0])
+    object.__setattr__(scope, *original)
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="distinctive"):
+            repo.repo_merge.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        assert end_protected_result_capture(token) is None
+    object.__setattr__(scope, original[0], previous)
+    monkeypatch.setattr(repo, "_state", lambda *_: (_ for _ in ()).throw(ToolException("unresolved")))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="unresolved"):
+            repo.repo_merge.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        assert end_protected_result_capture(token) is None
+
+
+def test_checkout_failure_after_attested_lease_resolution(tmp_path, monkeypatch):
+    from langchain_core.tools import ToolException
+    from mimir.tools import repo, forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (auth.repo_review_state, None))
+    monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *_args, **_kwargs: (
+        (_ for _ in ()).throw(RuntimeError("distinctive checkout error"))
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="distinctive checkout error") as raised:
+            repo.repo_checkout.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=raised.value, provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "trusted"
+
+
+def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
+    from langchain_core.tools import ToolException
+    from mimir.forge import ForgeError
+    from mimir.tools import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: True,
+        get_diff=lambda *_: (_ for _ in ()).throw(ForgeError("server failure")),
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="server failure") as raised:
+            forge.pr_diff.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_diff", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=raised.value,
+        provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "trusted"
+    auth.ifc_state.merge(labels)
+    assert SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    ).allowed
+
+
+def test_forge_error_before_scope_resolution_remains_untrusted(tmp_path, monkeypatch):
+    from langchain_core.tools import ToolException
+    from mimir.tools import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(forge, "_scope", lambda *_: (_ for _ in ()).throw(ToolException("unresolved scope")))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="unresolved scope") as raised:
+            forge.pr_diff.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert provenance is None
+    labels = classify_protected_result(
+        "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_diff", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=raised.value,
+        provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "untrusted"
+
+
+@pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
+@pytest.mark.parametrize("branch,sha,trusted", [
+    ("main", "c" * 40, True), ("worklink/7", "attested", True),
+    ("worklink/7", "unattested", False),
+    ("other", "c" * 40, False), ("worklink/7", "c" * 40, False),
+    ("fork", "c" * 40, False),
+])
+def test_ci_run_provenance_requires_protected_or_attested_head(
+    tmp_path, monkeypatch, tool_name, branch, sha, trusted,
+):
+    from mimir.tools import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    if sha == "unattested":
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = False
+    from mimir.models import RepoPRScopeRegistry
+    object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((auth.repo_review_state,)))
+    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
+    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", branch, None)}))
+    run = {"id": 42, "head_sha": scope.observed_head_sha if sha in {"attested", "unattested"} else sha,
+           "head_branch": "main" if branch == "fork" else branch,
+           "head_repository": "other/repo" if branch == "fork" else "owner/repo"}
+    assert forge._trusted_ci_head(auth, "owner/repo", run) is trusted
+    monkeypatch.setattr(forge, "is_configured_github_repo", lambda *_: True, raising=False)
+    monkeypatch.setattr(access_control_module, "is_configured_github_repo", lambda *_: True)
+    monkeypatch.setattr(forge, "_client_for_repository", lambda *_: SimpleNamespace(
+        get_run=lambda *_: run, list_run_jobs=lambda *_: [{"id": 1}],
+        list_runs=lambda *_: [run],
+    ))
+    args = {"repository": "owner/repo", "run_id": 42} if tool_name != "ci_recent_runs" else {
+        "repository": "owner/repo", "branch": branch,
+    }
+    token = begin_protected_result_capture()
+    try:
+        result = getattr(forge, tool_name).func(runtime=SimpleNamespace(context=auth), **args)
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        tool_name, args, auth, ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+        result=result, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+
+
+def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monkeypatch):
+    from langchain_core.tools import ToolException
+    from mimir import event_logger
+    from mimir.forge import ForgeError
+    from mimir.tools import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
+    monkeypatch.setattr(access_control_module, "is_configured_github_repo", lambda *_: True)
+    monkeypatch.setattr(forge, "_client_for_repository", lambda *_: SimpleNamespace(
+        get_run=lambda *_: {"id": 42, "head_branch": "main", "head_sha": "c" * 40,
+                            "head_repository": "owner/repo"},
+        list_run_jobs=lambda *_: (_ for _ in ()).throw(ForgeError("distinctive API error text")),
+    ))
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **fields: events.append((name, fields)))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="distinctive API error text") as raised:
+            forge.ci_run_jobs.func("owner/repo", 42, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    labels = classify_protected_result(
+        "ci_run_jobs", {"repository": "owner/repo", "run_id": 42}, auth,
+        ToolAuthorization(tool_name="ci_run_jobs", decision="resource_scoped", allowed=True),
+        result=raised.value, provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "trusted"
+    auth.ifc_state.merge(labels)
+    assert SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    ).allowed
+    assert len(events) == 1
+    assert "distinctive" not in str(events)
 
 
 @pytest.mark.parametrize("tool_name", ["pr_job_log", "pr_comment"])

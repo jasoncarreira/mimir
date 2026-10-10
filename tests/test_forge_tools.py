@@ -1073,7 +1073,7 @@ async def test_author_provenance_cannot_clear_unknown_or_failed_results(monkeypa
             "pr_comments", {}, runtime.context, authorization,
             provenance=provenance, failed=case == "failed",
         )
-        assert labels.has_untrusted_active_ingest is (case != "empty")
+        assert labels.has_untrusted_active_ingest is (case not in {"empty", "failed"})
     finally:
         set_forge_client(None)
 
@@ -1381,11 +1381,11 @@ async def test_ci_run_jobs_binds_named_run_and_configured_repo(monkeypatch):
     assert await ci_run_jobs.coroutine("owner/repo", 42, runtime=runtime) == [
         {"id": 1, "name": "test", "failed_steps": []},
     ]
-    assert client.calls == [("run_jobs", "owner/repo", 42)]
+    assert client.calls == [("run", "owner/repo", 42), ("run_jobs", "owner/repo", 42)]
     for repo, run in [("owner/repo", 43), ("other/repo", 42), ("owner/repo", 0)]:
         with pytest.raises(ToolException):
             await ci_run_jobs.coroutine(repo, run, runtime=runtime)
-    assert client.calls == [("run_jobs", "owner/repo", 42)]
+    assert client.calls == [("run", "owner/repo", 42), ("run_jobs", "owner/repo", 42)]
 
 
 @pytest.mark.asyncio
