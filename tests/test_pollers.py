@@ -1117,6 +1117,105 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
             assert result.error == f"File '{missing}' not found"
         assert hard_denials == []
 
+        # Grant every search tool explicitly so missing-path denial cannot be
+        # satisfied vacuously by a missing capability (the manifest omits glob).
+        search_service = replace(
+            service, capabilities=(*service.capabilities, "glob"),
+        )
+        search_context = replace(context, service_authority=search_service)
+        for tool_name, extra in (
+            ("ls", {}), ("glob", {"pattern": "*.json"}),
+            ("grep", {"pattern": "test_red"}),
+        ):
+            existing = registry.authorize_tool(
+                tool_name, search_context, enforce=enforce,
+                arguments={"path": str(runs), **extra},
+            )
+            assert existing.allowed and not existing.would_block, existing.reason
+            missing = registry.authorize_tool(
+                tool_name, search_context, enforce=enforce,
+                arguments={"path": str(runs / "absent"), **extra},
+            )
+            assert missing.allowed is (not enforce), (tool_name, missing.reason)
+            assert missing.would_block and missing.reason == "read_scope"
+
+        # Scratch avoids the generic non-GitHub state-read fallback, so this
+        # specifically exercises the authority-profile missing-target guard.
+        scratch = home / "scratch" / "incident"
+        scratch.mkdir(parents=True)
+        scratch_existing = scratch / "record.json"
+        scratch_existing.write_text("{}\n", encoding="utf-8")
+        non_github_service = replace(
+            service, authority_profile="introspection",
+            filesystem_read_roots=(str(scratch),),
+        )
+        non_github_context = replace(context, service_authority=non_github_service)
+        existing = registry.authorize_tool(
+            "read_file", non_github_context, enforce=enforce,
+            arguments={"file_path": str(scratch_existing)},
+        )
+        assert existing.allowed and not existing.would_block, existing.reason
+        missing = registry.authorize_tool(
+            "read_file", non_github_context, enforce=enforce,
+            arguments={"file_path": str(scratch / "absent.json")},
+        )
+        assert missing.allowed is (not enforce), missing.reason
+        assert missing.would_block and missing.reason == "read_scope"
+
+        # repo_review admits only Git, so grant the bounded read-only shell
+        # profile in this fixture to reach filesystem operand preflight. It
+        # resolves strictly before calling the predicate; test both layers so
+        # preflight cannot mask deletion of the shell_roots guard.
+        shell_service = replace(
+            service, sink_policies=tuple(
+                replace(policy, destination="scheduler_read_only")
+                if policy.operation == "shell_exec" else policy
+                for policy in service.sink_policies
+            ),
+        )
+        shell_context = replace(context, service_authority=shell_service)
+        existing_shell = registry.authorize_tool(
+            "shell_exec", shell_context, enforce=True,
+            target_channel=f"wc {evidence}", arguments={"cwd": str(state)},
+        )
+        assert existing_shell.allowed and not existing_shell.would_block, existing_shell.reason
+        missing_shell = registry.authorize_tool(
+            "shell_exec", shell_context, enforce=True,
+            target_channel=f"wc {runs / 'absent.json'}", arguments={"cwd": str(state)},
+        )
+        # Authorization admits argv shape only; the execution binder owns
+        # operand resolution once the authoritative cwd is available.
+        assert missing_shell.allowed and not missing_shell.would_block, missing_shell.reason
+        argv, detail, rule = access_control.parse_service_shell_argv_with_diagnostics(
+            f"wc {runs / 'absent.json'}", "scheduler_read_only",
+            service=shell_service, auth_context=shell_context, read_cwd=state,
+        )
+        assert argv is None and "could not be resolved" in detail, detail
+        assert rule is access_control.ServiceShellBindingRule.READ_OPERAND_POLICY
+        argv, detail, rule = access_control.parse_service_shell_argv_with_diagnostics(
+            f"wc {evidence}", "scheduler_read_only",
+            service=shell_service, auth_context=shell_context, read_cwd=state,
+        )
+        assert argv is not None and not detail and rule is None, detail
+        predicate = access_control._trigger_service_read_target_is_allowed
+        assert predicate(
+            service, "read_file", {"file_path": str(evidence)},
+            auth_context=context, shell_roots=True,
+        )
+        assert not predicate(
+            service, "read_file", {"file_path": str(runs / "absent.json")},
+            auth_context=context, shell_roots=True,
+        )
+
+        # Use the physical memory root, not the entire home: the latter would
+        # remap an absolute input as a backend virtual path underneath home.
+        memory_service = replace(service, filesystem_read_roots=(str(home / "memory"),))
+        assert not predicate(
+            memory_service, "read_file",
+            {"file_path": str(other_channel.parent / "missing.md")},
+            auth_context=replace(context, service_authority=memory_service),
+        )
+
         # Non-strict resolution returns inside state, but the first existing
         # ancestor resolves outside it. Both checks are necessary.
         return_inside = (

@@ -5419,9 +5419,6 @@ def _trigger_service_read_target_is_allowed(
                 service.authority_profile != "github"
                 or shell_roots
                 or tool_name not in {"read_file", "aread"}
-                or is_memory_read_path(candidate)
-                or _has_protected_read_name(candidate)
-                or is_operator_secret_read_path(candidate)
             ):
                 return False
             resolved_root = lexical_root.resolve(strict=True)
@@ -5437,10 +5434,9 @@ def _trigger_service_read_target_is_allowed(
             if not resolved_ancestor.is_relative_to(resolved_root):
                 return False
             resolved = candidate.resolve(strict=False)
-            if (
-                not resolved.is_relative_to(resolved_root)
-                or is_memory_read_path(resolved)
-            ):
+            # The common checks below enforce resolved-root containment and
+            # protected names; only missing memory needs a separate rejection.
+            if is_memory_read_path(resolved):
                 return False
             missing_target = True
         if service.authority_profile == "github":
