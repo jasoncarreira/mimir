@@ -591,6 +591,9 @@ class InformationFlowState:
     pr_checkout_author_trust: dict[str, bool | None] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
+    _repo_test_sink_grants: set[str] = field(
+        default_factory=set, repr=False, compare=False, init=False,
+    )
     _own_push_lineage: dict[tuple[str, int], frozenset[str]] = field(
         default_factory=dict, repr=False, compare=False, init=False,
     )
@@ -617,6 +620,21 @@ class InformationFlowState:
     def current(self, fallback: InformationFlowLabels | None = None) -> InformationFlowLabels | None:
         with self._lock:
             return self.labels if self.labels is not None else fallback
+
+    def record_repo_test_sink_grant(self, tool_call_id: str | None) -> None:
+        """Bind a consumed one-time approval to its server-issued tool call."""
+        if isinstance(tool_call_id, str) and tool_call_id:
+            with self._lock:
+                self._repo_test_sink_grants.add(tool_call_id)
+
+    def consume_repo_test_sink_grant(self, tool_call_id: str | None) -> bool:
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return False
+        with self._lock:
+            if tool_call_id not in self._repo_test_sink_grants:
+                return False
+            self._repo_test_sink_grants.remove(tool_call_id)
+            return True
 
     def record_own_push(self, repository: str, pull_request: int, previous_head: str) -> None:
         """Remember a superseded head only after an exact verified publication."""

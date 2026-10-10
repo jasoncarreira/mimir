@@ -140,8 +140,11 @@ def _auth(
 
 def _real_attested_lease(tmp_path: Path):
     from mimir.git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
+    from mimir.pr_checkout_lease import _lease_trust_directory, _trust_key, _write_lease_trust
 
-    checkout = tmp_path / "checkout"
+    root = tmp_path / "leases"
+    root.mkdir()
+    checkout = root / "checkout"
     subprocess.run(
         ["git", "init", "-q", "-b", "worklink/7", str(checkout)], check=True,
     )
@@ -161,13 +164,15 @@ def _real_attested_lease(tmp_path: Path):
     lease = SimpleNamespace(
         path=checkout, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
         pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
-        is_active=True, base_sha=head,
+        is_active=True, base_sha=head, lease_root=root, recovery_id="a" * 32,
     )
     (checkout / ".git" / "mimir-pr-checkout-lease.json").write_text(json.dumps({
         "scope_id": scope.scope_id, "canonical_repo": scope.canonical_repo,
         "pr_number": scope.pr_number, "head_sha": head,
         "base_sha": lease.base_sha, "lineage": {},
     }))
+    _trust_key(_lease_trust_directory(root), create=True)
+    _write_lease_trust(lease, False, {})
     auth = _auth(scope=scope)
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
@@ -176,6 +181,7 @@ def _real_attested_lease(tmp_path: Path):
 
 
 def _record_clean_head(lease, *commits: str) -> None:
+    from mimir.pr_checkout_lease import _write_lease_trust
     if commits:
         lease.head_sha = subprocess.run(
             ["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
@@ -188,6 +194,7 @@ def _record_clean_head(lease, *commits: str) -> None:
     raw["base_sha"] = lease.base_sha
     raw["lineage"].update({commit: True for commit in commits})
     path.write_text(json.dumps(raw))
+    _write_lease_trust(lease, False, {commit: True for commit in commits})
 
 
 def test_attested_lease_head_accepts_only_server_identity_descendants(

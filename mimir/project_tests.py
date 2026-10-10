@@ -598,6 +598,8 @@ class RepoProjectTests:
                     bundle_provider=retained_factory_snapshot_bundle,
                 )
             checkout = self._checkout_factory(root, **checkout_arguments)
+        except ProjectTestRefusal:
+            raise
         except SnapshotCredentialsRefused as exc:
             await safe_log_event(
                 "repo_test_containment_refused",

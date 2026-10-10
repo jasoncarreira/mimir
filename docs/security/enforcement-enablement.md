@@ -249,6 +249,47 @@ results still add `protected_tool` repository provenance as untrusted
 `pr_submit_review` audits, but do not taint the turn; cross-PR/head repository
 provenance and execution-fault active ingest remain blocked.
 
+### `repo_test` checkout-content provenance (#1936)
+
+With IFC enforcement off, a turn that has read an untrusted active-ingest source
+may run `repo_test` only when the active, exact-scope lease is author-attested
+(at its scoped head or through clean recorded lineage) **and** its server-owned
+tainted-worktree marker is clear. The check judges the checkout that would run,
+not whether a comment or failed run tainted the turn. A refused turn retains
+the one-time operator sink approval path. The enforced IFC gate is unchanged.
+
+If injected text influences the model to edit the checkout, every file-tool
+write (including replace/upload), typed Git mutation (including index writes,
+conflicts and aborts), or write-capable service shell marks the lease *before*
+execution. `repo_test` then refuses it across turns; a clean turn committing
+those edits records `clean=False` in lineage. Only an explicit checkout reset
+that discards work and verifies a clean attested HEAD, or a lease reclaim/new
+lease, removes the marker. Merely reading untrusted text leaves the attested
+checkout unchanged and executes no code controlled by that text. The marker
+and individually HMAC'd lineage entries live outside `MIMIR_HOME` and every
+`MIMIR_FILE_TOOL_ROOTS` root, under `MIMIR_LEASE_TRUST_DIR` (default: sibling
+`.pr-lease-trust` beside the lease root). A missing/invalid record or an unsafe
+trust directory fails closed to the earlier turn-level refusal; the key is
+protected from file-tool reads. A tainted file/Git write that cannot persist
+its marker is refused before mutation. Lease `.git` metadata is not trust
+evidence.
+
+Other influence channels: selectors remain bounded (32 entries, 256 bytes
+each, 4096 total), ASCII-only relative existing non-symlink paths with a
+restricted alphabet and no leading `-`/`@`, traversal or argument injection.
+Suite selection accepts only declared suites; configuration and in-checkout
+test hooks/scripts are lease content covered by the marker. The runner uses
+server-fixed PATH, locale, CI and Git config variables and a fresh HOME, not
+turn-supplied environment. The `repo_review` shell profile is read-only Git
+inspection bound to declared argv; other service shell profiles conservatively
+mark active leases when tainted. The runner rechecks provenance under the
+server trust-store lock while copying the snapshot: a write after sink approval
+but before snapshot creation cannot enter the code that runs. Explicit one-time
+approval is bound to that tool call and consumed at snapshot creation.
+Dependency installs during a run can still
+download unauthenticated third-party packages over the network: they are not
+attested by this marker, the same residual risk as a clean turn's `repo_test`.
+
 Filesystem results from inside an active PR checkout lease use that lease's
 `repository` provenance only when both the controller-written record and the turn's
 PR scope bind the path to the same scope, repository, pull request, and head, and the

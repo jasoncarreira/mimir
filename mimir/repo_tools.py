@@ -28,7 +28,9 @@ from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
 from .pr_checkout_lease import (
-    PUBLISHED_HEAD_REF, _METADATA, _metadata, _recorded_lineage,
+    PUBLISHED_HEAD_REF, _METADATA, _lease_trust_lock, _metadata, _read_lease_trust,
+    mark_tainted_lease, record_lease_lineage,
+    _write_lease_trust,
 )
 from .redaction import redact_text
 
@@ -824,18 +826,16 @@ class RepoGitTools:
                 "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
             )):
                 raise ValueError("lease metadata identity mismatch")
-            lineage = _recorded_lineage(raw)
-            # Older leases are resumable but their unrecorded commits cannot be
-            # promoted into clean history by a later operation.
-            if lineage is None:
-                lineage = {}
+            trust = _read_lease_trust(lease)
+            # Only server-signed lineage can vouch for a rewritten parent.
+            lineage = trust[1].copy() if trust is not None else {}
             commits = self._command((
                 "rev-list", "--max-count=501", self._expected_head, "--not", previous,
                 *((verified_base or lease.base_sha,) if verified_base or lease.base_sha else ()), "--",
             )).stdout.splitlines()
             if len(commits) > 500 or (not commits and self._expected_head != (verified_base or lease.base_sha)):
                 raise ValueError("local commit range is missing or oversized")
-            clean = self._auth_context is not None and not _turn_has_untrusted_active_ingest(
+            clean = trust is not None and not trust[0] and self._auth_context is not None and not _turn_has_untrusted_active_ingest(
                 self._auth_context, None,
             )
             if rewrite and previous != self._scope.observed_head_sha.lower():
@@ -848,6 +848,8 @@ class RepoGitTools:
                 )
             for commit in commits:
                 lineage[commit] = lineage.get(commit, True) and clean
+            if trust is not None:
+                record_lease_lineage(lease, {commit: lineage[commit] for commit in commits})
             advanced = replace(
                 lease, lineage=lineage, head_sha=self._expected_head,
                 base_sha=verified_base or lease.base_sha,
@@ -1005,6 +1007,40 @@ class RepoGitTools:
         self._assert_checkout_identity()
         return root
 
+    def reset_to_attested_head(self) -> None:
+        """Discard retained work only on an explicit verified checkout reset."""
+        if self._retained or self._state is None:
+            raise GitRefusal("inactive_checkout", "reset requires an active PR lease")
+        lease = self._state.checkout_lease
+        with _lease_trust_lock(lease):
+            if _read_lease_trust(lease) is None:
+                raise GitRefusal("lineage_untrusted", "lease trust record is unavailable")
+            overrides = self._config_overrides()
+            self._command(("reset", "--hard", self._scope.observed_head_sha), overrides=overrides)
+            self._command(("clean", "-fdx"), overrides=overrides)
+            self._command(("checkout", "-B", self._scope.head_ref,
+                           self._scope.observed_head_sha), overrides=overrides)
+            branch = self._command(("symbolic-ref", "--quiet", "--short", "HEAD"),
+                                   overrides=overrides).stdout.strip()
+            head = self._command(("rev-parse", "--verify", "HEAD"),
+                                 overrides=overrides).stdout.strip().lower()
+            status = self._command(("status", "--porcelain=v1", "--untracked-files=all"),
+                                   overrides=overrides).stdout.strip()
+            if branch != self._scope.head_ref or head != self._scope.observed_head_sha.lower() or status:
+                raise GitRefusal("reset_unverified", "checkout reset is not clean at the attested head")
+            restored = replace(lease, head_sha=head, lineage={})
+            metadata_path = lease.path / _METADATA
+            staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                staging.write_text(json.dumps(_metadata(restored), sort_keys=True) + "\n", encoding="utf-8")
+                os.replace(staging, metadata_path)
+            finally:
+                staging.unlink(missing_ok=True)
+            _write_lease_trust(lease, False, {})
+            object.__setattr__(lease, "head_sha", head)
+            object.__setattr__(lease, "lineage", {})
+            self._state.record_git_head(self._scope.scope_id, head)
+
     def _stage(self, paths: tuple[str, ...]) -> None:
         unmerged = self._unmerged_paths()
         if unmerged and not set(paths).issubset(unmerged):
@@ -1033,6 +1069,24 @@ class RepoGitTools:
                 GitStage, GitMergeAbort, GitRebase, GitRebaseAbort, GitRevertAbort,
             ),
         ))
+
+        # Audit of mutating Git branches below: add/stage (also inside commit),
+        # commit, merge/abort, rebase/abort/continue, revert/abort. Fetch and
+        # push update only Git internals/remote refs, never runner content.
+        if not self._retained and isinstance(operation, (
+            GitStage, GitCommit, GitMerge, GitMergeAbort, GitRebase,
+            GitRebaseAbort, GitRevert, GitRevertAbort,
+        )) and self._auth_context is not None:
+            from .access_control import _turn_has_untrusted_active_ingest
+            if _turn_has_untrusted_active_ingest(self._auth_context, None):
+                try:
+                    mark_tainted_lease(self._state.checkout_lease)
+                except RuntimeError as exc:
+                    raise GitRefusal(
+                        "lease_trust_write_unavailable",
+                        "lease trust state could not be recorded before a tainted Git write",
+                        execution_started=False,
+                    ) from exc
 
         if isinstance(operation, GitFetch):
             self._require("repo_fetch", RepoPRAction.CHECKOUT)

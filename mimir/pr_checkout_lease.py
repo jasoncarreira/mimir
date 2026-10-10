@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 import uuid
 
 from ._rmtree import rmtree_missing_ok
@@ -34,6 +37,8 @@ _RECLAMATION_METADATA = ".git/mimir-pr-checkout-lease-reclamation.json"
 _RECOVERY_DIRECTORY = ".recovery"
 PUBLISHED_HEAD_REF = "refs/mimir/pr-checkout-lease/published"
 _LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
+_TRUST_DIR_ENV = "MIMIR_LEASE_TRUST_DIR"
+_TRUST_KEY = ".mimir-lease-trust-key"
 _CLEANUP_IDENTITY_FIELDS = (
     "canonical_repo",
     "canonical_origin",
@@ -199,6 +204,182 @@ def configured_pr_checkout_lease_root() -> Path:
     if root.is_symlink():
         raise RuntimeError("PR checkout lease root may not be a symlink")
     return root.resolve(strict=True)
+
+
+def _lease_trust_directory(root: Path) -> Path:
+    """Validate the server-only store, independently of IFC enforcement mode."""
+    directory = Path(os.environ.get(_TRUST_DIR_ENV) or root.parent / ".pr-lease-trust")
+    try:
+        if not directory.is_absolute() or directory.is_symlink():
+            raise ValueError("not an absolute non-symlink directory")
+        resolved = directory.resolve(strict=False)
+        roots = [root]
+        home = os.environ.get("MIMIR_HOME", "").strip()
+        if home:
+            roots.append(Path(home))
+        for entry in os.environ.get("MIMIR_FILE_TOOL_ROOTS", "").split(","):
+            if entry.strip():
+                roots.append(Path(entry.strip().rsplit(":", 1)[0]))
+        if any(resolved.is_relative_to(item.resolve(strict=False)) for item in roots):
+            raise ValueError("inside file-tool root or MIMIR_HOME")
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        details = directory.stat()
+        if (not directory.is_dir() or details.st_uid != os.geteuid()
+                or details.st_mode & 0o077 or not os.access(directory, os.W_OK | os.X_OK)):
+            raise ValueError("not protected and writable by server")
+        return directory.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        try:
+            from .event_logger import log_event_sync
+            log_event_sync("lease_trust_dir_rejected", reason=str(exc))
+        except Exception:
+            pass
+        raise RuntimeError("lease trust directory unavailable") from exc
+
+
+def is_lease_trust_path(path: Path) -> bool:
+    """Hard-deny file tools even if an operator misconfigures the store in a root."""
+    configured = os.environ.get(_TRUST_DIR_ENV, "").strip()
+    lease_root = os.environ.get(_LEASE_ROOT_ENV, "").strip()
+    if not configured and lease_root:
+        configured = str(Path(lease_root).parent / ".pr-lease-trust")
+    try:
+        return bool(configured) and path.resolve(strict=False).is_relative_to(
+            Path(configured).resolve(strict=False)
+        )
+    except (OSError, RuntimeError, ValueError):
+        return True  # ambiguous target is not evidence of a safe path
+
+
+def is_lease_trust_search_path(path: Path) -> bool:
+    """A recursive search may reach a trust dir even from its parent root."""
+    configured = os.environ.get(_TRUST_DIR_ENV, "").strip()
+    lease_root = os.environ.get(_LEASE_ROOT_ENV, "").strip()
+    if not configured and lease_root:
+        configured = str(Path(lease_root).parent / ".pr-lease-trust")
+    if not configured:
+        return False
+    try:
+        selected = path.resolve(strict=False)
+        trust = Path(configured).resolve(strict=False)
+        return selected.is_relative_to(trust) or trust.is_relative_to(selected)
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def _trust_record_path(lease: PRCheckoutLease) -> Path:
+    # recovery_id is minted by the server; never derive a filename from tool input.
+    if not isinstance(lease.recovery_id, str) or len(lease.recovery_id) != 32 or any(
+        c not in "0123456789abcdef" for c in lease.recovery_id
+    ):
+        raise RuntimeError("invalid lease trust identity")
+    return _lease_trust_directory(lease.lease_root) / f"{lease.recovery_id}.json"
+
+
+def _trust_key(directory: Path, *, create: bool = False) -> bytes:
+    path = directory / _TRUST_KEY
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600) if create else None
+    except FileExistsError:
+        fd = None
+    if fd is not None:
+        try:
+            os.write(fd, os.urandom(32))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    if path.is_symlink() or path.stat().st_mode & 0o077 or path.stat().st_uid != os.geteuid():
+        raise RuntimeError("lease trust key is not protected")
+    data = path.read_bytes()
+    if len(data) != 32:
+        raise RuntimeError("invalid lease trust key")
+    return data
+
+
+def _trust_mac(key: bytes, lease: PRCheckoutLease, item: str, value: bool) -> str:
+    payload = json.dumps((lease.recovery_id, lease.scope_id, item, value), separators=(",", ":"))
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def _read_lease_trust(lease: PRCheckoutLease) -> tuple[bool, dict[str, bool]] | None:
+    """Missing, modified and legacy in-checkout lineage are never trust evidence."""
+    try:
+        path = _trust_record_path(lease)
+        key = _trust_key(path.parent)
+        if path.is_symlink():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("lease_id") != lease.recovery_id or raw.get("scope_id") != lease.scope_id:
+            return None
+        marker = raw["marker"]
+        lineage = raw["lineage"]
+        if (type(marker["value"]) is not bool or not isinstance(lineage, dict)
+                or len(lineage) > 1000 or not hmac.compare_digest(
+                    marker["mac"], _trust_mac(key, lease, "tainted-worktree", marker["value"]),
+                )):
+            return None
+        checked = {}
+        for sha, entry in lineage.items():
+            if (not isinstance(sha, str) or len(sha) != 40
+                    or any(c not in "0123456789abcdef" for c in sha)
+                    or type(entry["value"]) is not bool
+                    or not hmac.compare_digest(entry["mac"], _trust_mac(key, lease, sha, entry["value"]))):
+                return None
+            checked[sha] = entry["value"]
+        return marker["value"], checked
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _write_lease_trust(lease: PRCheckoutLease, marker: bool, lineage: dict[str, bool]) -> None:
+    path = _trust_record_path(lease)
+    key = _trust_key(path.parent)
+    record = {
+        "lease_id": lease.recovery_id, "scope_id": lease.scope_id,
+        "marker": {"value": marker, "mac": _trust_mac(key, lease, "tainted-worktree", marker)},
+        "lineage": {sha: {"value": value, "mac": _trust_mac(key, lease, sha, value)}
+                    for sha, value in lineage.items()},
+    }
+    staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps(record, sort_keys=True) + "\n")
+        os.replace(staging, path)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+@contextmanager
+def _lease_trust_lock(lease: PRCheckoutLease) -> Iterator[None]:
+    directory = _lease_trust_directory(lease.lease_root)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def mark_tainted_lease(lease: PRCheckoutLease) -> None:
+    """Persist before a tainted write; failed writes may conservatively taint."""
+    with _lease_trust_lock(lease):
+        record = _read_lease_trust(lease)
+        if record is None:
+            raise RuntimeError("lease trust record unavailable")
+        _write_lease_trust(lease, True, record[1])
+
+
+def record_lease_lineage(lease: PRCheckoutLease, lineage: dict[str, bool]) -> None:
+    with _lease_trust_lock(lease):
+        record = _read_lease_trust(lease)
+        if record is None:
+            raise RuntimeError("lease trust record unavailable")
+        # Once false, no later operation may relabel a commit clean.
+        merged = {**record[1], **{sha: clean and record[1].get(sha, True)
+                                   and not record[0] for sha, clean in lineage.items()}}
+        _write_lease_trust(lease, record[0], merged)
 
 
 def active_pr_checkout_lease_for_path(path: str | Path) -> PRCheckoutLease | None:
@@ -464,6 +645,12 @@ def create_pr_checkout_lease(
             json.dumps(_metadata(lease), sort_keys=True) + "\n", encoding="utf-8",
         )
         os.replace(staging, path)
+        try:
+            _trust_key(_lease_trust_directory(root), create=True)
+            _write_lease_trust(lease, False, {})
+        except (OSError, RuntimeError):
+            # A rejected trust store retains the original turn-level veto.
+            pass
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -942,6 +1129,10 @@ def reclaim_expired_pr_checkout_leases(
                         )
                         recovery_bundle = _preserve_checkout_head(lease, head, runner)
                         rmtree_missing_ok(path)
+                        try:
+                            _trust_record_path(lease).unlink(missing_ok=True)
+                        except RuntimeError:
+                            pass
                         reclaimed = True
                         error = None
                     except (OSError, RuntimeError) as preservation_exc:
@@ -1177,6 +1368,7 @@ def _rebind_foreign_candidate(
         lineage=lease.lineage,
         verified_base_sha=actual_base,
     )
+    trust = _read_lease_trust(lease)
     metadata_path = lease.path / _METADATA
     staging = metadata_path.with_name(f".{metadata_path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1186,6 +1378,8 @@ def _rebind_foreign_candidate(
         os.replace(staging, metadata_path)
     finally:
         staging.unlink(missing_ok=True)
+    if trust is not None:
+        _write_lease_trust(rebound, trust[0], trust[1])
     if review_state is not None:
         review_state.attach_checkout_lease(rebound)
         review_state.record_git_head(scope.scope_id, head)
@@ -1542,6 +1736,10 @@ def cleanup_pr_checkout_lease(
             lease, head=head, dirty=bool(status), runner=runner,
         )
     rmtree_missing_ok(lease.path)
+    try:
+        _trust_record_path(lease).unlink(missing_ok=True)
+    except RuntimeError:
+        pass
     if review_state is not None:
         review_state.revoke_checkout_lease(lease)
     lease.revoke()

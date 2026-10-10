@@ -887,6 +887,11 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
     from mimir.turn_event_bus import TurnEventEmitter
 
     monkeypatch.setattr(agent_module, "ACP_GENERATION_RETIRE_GRACE_SECONDS", 0.01)
+    # This case tests withdrawal and prompt cleanup, not the production 2s
+    # dirty-session fallback. Under full-suite load that fallback can win the
+    # cancellation race before the owned prompt finishes; its short deadline
+    # is exercised separately below with an explicit patched grace period.
+    monkeypatch.setattr(agent_module, "ACP_PROMPT_CANCEL_GRACE_SECONDS", HANG_GUARD_SECONDS - 5)
 
     async def exercise(sync: bool) -> None:
         home = tmp_path / ("sync" if sync else "async")

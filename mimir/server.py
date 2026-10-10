@@ -1855,10 +1855,17 @@ def build_app(config: Config) -> web.Application:
         lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
         if lease_root_value:
             try:
-                from .pr_checkout_lease import configured_pr_checkout_lease_root
+                from .pr_checkout_lease import configured_pr_checkout_lease_root, _lease_trust_directory, _trust_key
 
+                lease_root = configured_pr_checkout_lease_root()
+                try:
+                    _trust_key(_lease_trust_directory(lease_root), create=True)
+                except (OSError, RuntimeError):
+                    # The reaper is independent; the provenance verdict will
+                    # fall back to the original turn-level repo_test veto.
+                    pass
                 scheduler.add_pr_checkout_lease_reaper_job(
-                    lease_root=configured_pr_checkout_lease_root(),
+                    lease_root=lease_root,
                     cron_expr=os.environ.get(
                         "MIMIR_PR_CHECKOUT_LEASE_REAPER_CRON", "*/15 * * * *",
                     ),

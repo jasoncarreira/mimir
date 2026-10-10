@@ -297,6 +297,657 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
+def _checkout_test_decision(scope, auth):
+    from mimir.access_control import SinkGate
+
+    return SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+        repo_review_state=auth.repo_review_state,
+    )
+
+
+@pytest.mark.parametrize("comment_domain", ["repository", "channel"])
+def test_tainted_read_can_test_attested_checkout_and_logs_only_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, comment_domain: str,
+) -> None:
+    from mimir import event_logger
+    from mimir.models import InformationFlowLabels, InformationFlowState
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    auth = _lineage_turn(scope, state, tainted=True)
+    comment = replace(
+        auth.ifc_labels.sources[0], domain=comment_domain,
+        bridge_instance="forge" if comment_domain == "repository" else "discord",
+        resource_id=(f"owner/repo#pull/7@{scope.observed_head_sha}"
+                     if comment_domain == "repository" else "pr-comment-channel"),
+    )
+    labels = InformationFlowLabels().with_source(comment)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **data: events.append((name, data)))
+    decision = _checkout_test_decision(scope, auth)
+    assert decision.allowed
+    lease = state.checkout_lease
+    assert ("repo_test_allowed_trusted_checkout", {
+        "lease_id": lease.recovery_id, "head": scope.observed_head_sha, "marker": False,
+    }) in events
+    for verdict in (False, None):
+        auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+        refused = _checkout_test_decision(scope, auth)
+        assert refused.reason == "repo_test_blocked_by_untrusted_ingest"
+        assert "lease_unattested" in refused.refusal_detail
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_enforced_repo_test_decision_ignores_checkout_relaxation(tmp_path: Path, marked: bool) -> None:
+    from mimir.access_control import SinkGate
+    from mimir.pr_checkout_lease import mark_tainted_lease
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    if marked:
+        mark_tainted_lease(state.checkout_lease)
+    auth = _lineage_turn(scope, state, tainted=True)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=True, repo_pr_action_scope=scope,
+        repo_review_state=state,
+    )
+    assert not decision.allowed
+    assert decision.reason == "ifc_label_blocked:forge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approved", [False, True])
+async def test_repo_test_snapshot_rechecks_marker_after_sink_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approved: bool,
+) -> None:
+    from mimir.access_control import SinkGate
+    from mimir import event_logger
+    from mimir.tools import repo as repo_module
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    auth = _lineage_turn(scope, state, tainted=True)
+    target = f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}"
+    call_id = "server-issued-repo-test-call"
+    if approved:
+        assert auth.ifc_state.approve_sink_once(
+            fallback=auth.ifc_labels, sink_category="forge", destination=target,
+            canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+            durable_audit=lambda *_: True,
+        )
+    else:
+        assert _checkout_test_decision(scope, auth).allowed
+
+    from mimir.pr_checkout_lease import mark_tainted_lease
+    mark_tainted_lease(state.checkout_lease)
+    if approved:
+        decision = SinkGate.check_sink_flow(
+            "repo_test", target, auth.ifc_labels, auth, enforce=False,
+            repo_pr_action_scope=scope, repo_review_state=state, tool_call_id=call_id,
+        )
+        assert decision.allowed and decision.reason == "ifc_declassification_approved"
+
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+    seen = []
+    monkeypatch.setattr("mimir.project_tests.create_repo_test_checkout", lambda root, **kwargs: seen.append(root))
+
+    class StubTests:
+        def __init__(self, _state, *, checkout_factory):
+            self._factory = checkout_factory
+
+        async def execute(self, *args, **kwargs):
+            self._factory(state.checkout_lease.path)
+            return ProjectTestResult(True, "tests_passed", 0)
+
+    monkeypatch.setattr(repo_module, "RepoProjectTests", StubTests)
+    runtime = SimpleNamespace(context=auth, tool_call_id=call_id)
+    if approved:
+        result = await repo_module.repo_test.coroutine("owner/repo", 7, runtime=runtime)
+        assert result["ok"] and seen == [state.checkout_lease.path]
+        assert not auth.ifc_state.consume_repo_test_sink_grant(call_id)
+    else:
+        with pytest.raises(ToolException, match="tainted_worktree"):
+            await repo_module.repo_test.coroutine("owner/repo", 7, runtime=runtime)
+        assert not seen
+
+
+@pytest.mark.asyncio
+async def test_actual_project_test_checkout_propagates_snapshot_provenance_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.pr_checkout_lease import mark_tainted_lease
+    from mimir.tools import repo as repo_module
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    auth = _lineage_turn(scope, state, tainted=True)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repo_module, "_state", lambda *_args: state)
+    assert _checkout_test_decision(scope, auth).allowed
+    mark_tainted_lease(state.checkout_lease)
+    with pytest.raises(ToolException, match="repo_test_blocked_by_untrusted_ingest.*tainted_worktree"):
+        await repo_module.repo_test.coroutine(
+            "owner/repo", 7, runtime=SimpleNamespace(context=auth, tool_call_id="unapproved"),
+            suite="python",
+        )
+
+
+@pytest.mark.parametrize("operation", [
+    "write_file", "edit_file", "replace_file", "stage", "commit", "merge",
+    "rebase", "revert", "merge_abort", "rebase_abort", "revert_abort",
+])
+def test_tainted_lease_write_path_marks_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str,
+) -> None:
+    from mimir import _context, event_logger
+    from mimir.pr_checkout_lease import _read_lease_trust
+    from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    auth = _lineage_turn(scope, state, tainted=True)
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    assert _checkout_test_decision(scope, auth).allowed
+    if operation in {"write_file", "edit_file", "replace_file"}:
+        home = tmp_path / "home"
+        home.mkdir()
+        router = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"]),
+            routes=build_file_tool_routes([(str(lease.lease_root), "rw")]),
+        )
+        monkeypatch.setattr(_context, "get_current_turn", lambda: SimpleNamespace(auth_context=auth))
+        path = str(lease.path / ("new.txt" if operation == "write_file" else "tracked.txt"))
+        result = (
+            router.write(path, "new\n") if operation == "write_file" else
+            router.edit(path, "pull request", "changed") if operation == "edit_file" else
+            router.replace(path, "changed\n")
+        )
+        assert result.error is None
+    else:
+        # Even a conflicting/failed mutation must mark before Git is attempted.
+        if operation in {"stage", "commit"}:
+            (lease.path / "tracked.txt").write_text("fix\n")
+        operations = {
+            "stage": GitStage(("tracked.txt",)),
+            "commit": GitCommit(("tracked.txt",), "fix"),
+            "merge": GitMerge(), "rebase": GitRebase(),
+            "revert": GitRevert(scope.observed_head_sha),
+            "merge_abort": GitMergeAbort(), "rebase_abort": GitRebaseAbort(),
+            "revert_abort": GitRevertAbort(),
+        }
+        try:
+            RepoGitTools(state, auth_context=auth, enforce=False).execute(operations[operation])
+        except GitRefusal:
+            pass
+    assert _read_lease_trust(lease)[0] is True
+    refused = _checkout_test_decision(scope, auth)
+    assert refused.reason == "repo_test_blocked_by_untrusted_ingest"
+    assert "tainted_worktree" in refused.refusal_detail
+    clean = _lineage_turn(scope, state)
+    assert _checkout_test_decision(scope, clean).reason == "repo_test_blocked_by_tainted_worktree"
+    next_tainted = _lineage_turn(scope, state, tainted=True)
+    assert "tainted_worktree" in _checkout_test_decision(scope, next_tainted).refusal_detail
+
+
+def test_signed_lease_marker_and_lineage_are_not_file_tool_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.pr_checkout_lease import _read_lease_trust, _trust_record_path
+    from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    path = _trust_record_path(lease)
+    monkeypatch.setenv("MIMIR_LEASE_TRUST_DIR", str(path.parent))
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    home = tmp_path / "home"
+    home.mkdir()
+    router = FileToolRouter(default=WriteGuardBackend(home, ["state"]), routes=build_file_tool_routes([
+        (str(lease.lease_root), "rw"), (str(path.parent), "rw"),
+    ]))
+    original = path.read_text()
+    assert router.read(str(path)).error
+    assert router.ls(str(path.parent)).error
+    assert router.grep("value", str(path.parent)).error
+    assert router.glob("*.json", str(path.parent)).error
+    assert router.edit(str(path), '"value": false', '"value": true').error
+    assert router.write(str(path.parent / "forged.json"), "{}\n").error
+    assert path.read_text() == original
+    record = json.loads(original)
+    record["marker"]["value"] = True
+    path.write_text(json.dumps(record))
+    assert _read_lease_trust(lease) is None
+    assert "lineage_untrusted" in _checkout_test_decision(scope, _lineage_turn(scope, state, tainted=True)).refusal_detail
+
+
+@pytest.mark.parametrize("location", ["file_root", "home"])
+def test_unsafe_trust_directory_disables_checkout_relaxation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, location: str,
+) -> None:
+    from mimir import event_logger
+    from mimir.pr_checkout_lease import _read_lease_trust
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    root = tmp_path / "file-root"
+    root.mkdir()
+    monkeypatch.setenv("MIMIR_FILE_TOOL_ROOTS", str(root) + ":rw")
+    trust_dir = (root / "trust" if location == "file_root" else home / "state" / "trust")
+    monkeypatch.setenv("MIMIR_LEASE_TRUST_DIR", str(trust_dir))
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda name, **data: events.append((name, data)))
+    assert _read_lease_trust(state.checkout_lease) is None
+    refused = _checkout_test_decision(scope, _lineage_turn(scope, state, tainted=True))
+    assert "lineage_untrusted" in refused.refusal_detail
+    assert any(name == "lease_trust_dir_rejected" for name, _ in events)
+    if location == "home":
+        from mimir.readonly_backend import WriteGuardBackend
+        backend = WriteGuardBackend(home, ["state"])
+        assert backend.write(str(trust_dir / "forged.json"), "{}\n").error
+        assert backend.edit(str(trust_dir / "forged.json"), "a", "b").error
+
+
+def test_later_clean_commit_cannot_launder_tainted_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
+    lease = first.checkout_lease
+    mark_tainted_lease(lease)
+    (lease.path / "tracked.txt").write_text("injected content\n")
+    later = RepoReviewState(scope)
+    later.attach_checkout_lease(lease)
+    clean = _lineage_turn(scope, later)
+    RepoGitTools(later, auth_context=clean, enforce=False).execute(GitCommit(("tracked.txt",), "fix"))
+    head = _git(lease.path, "rev-parse", "HEAD")
+    assert _read_lease_trust(lease)[1][head] is False
+    assert not _checkout_test_decision(scope, clean).allowed
+    next_turn = _lineage_turn(scope, later, tainted=True)
+    assert "tainted_worktree" in _checkout_test_decision(scope, next_turn).refusal_detail
+
+
+def test_signed_lineage_value_cannot_be_flipped_or_omitted(
+    tmp_path: Path,
+) -> None:
+    from mimir.pr_checkout_lease import _read_lease_trust, _trust_record_path
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    (lease.path / "tracked.txt").write_text("fix\n")
+    clean = _lineage_turn(scope, state)
+    RepoGitTools(state, auth_context=clean).execute(GitCommit(("tracked.txt",), "fix"))
+    head = state.git_expected_head
+    path = _trust_record_path(lease)
+    original = json.loads(path.read_text())
+    for edit in (lambda data: data["lineage"][head].update(value=False),
+                 lambda data: data["lineage"].pop(head)):
+        candidate = json.loads(json.dumps(original))
+        edit(candidate)
+        path.write_text(json.dumps(candidate))
+        checked = _read_lease_trust(lease)
+        assert checked is None or head not in checked[1]
+        tainted = _lineage_turn(scope, state, tainted=True)
+        assert "lineage_untrusted" in _checkout_test_decision(scope, tainted).refusal_detail
+    path.write_text(json.dumps(original))
+
+
+def test_verified_checkout_reset_clears_marker_only_at_clean_attested_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    mark_tainted_lease(lease)
+    (lease.path / "tracked.txt").write_text("injected content\n")
+    clean = _lineage_turn(scope, state)
+    assert not _checkout_test_decision(scope, clean).allowed
+    RepoGitTools(state, auth_context=clean, enforce=False).reset_to_attested_head()
+    assert _read_lease_trust(lease) == (False, {})
+    assert _git(lease.path, "status", "--porcelain") == ""
+    assert _checkout_test_decision(scope, _lineage_turn(scope, state, tainted=True)).allowed
+
+
+def test_checkout_reset_keeps_marker_if_git_clean_leaves_nested_repository(
+    tmp_path: Path,
+) -> None:
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    mark_tainted_lease(lease)
+    nested = lease.path / "untracked-repository"
+    subprocess.run(["git", "init", "-q", str(nested)], check=True)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).reset_to_attested_head()
+    assert refusal.value.code == "reset_unverified"
+    assert _read_lease_trust(lease)[0] is True
+
+
+@pytest.mark.parametrize("field", ["head", "branch"])
+def test_checkout_reset_requires_verified_attested_head_and_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str,
+) -> None:
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    mark_tainted_lease(lease)
+    original = RepoGitTools._command
+
+    def observed(self, arguments, **kwargs):
+        result = original(self, arguments, **kwargs)
+        if field == "head" and arguments[:2] == ("rev-parse", "--verify"):
+            return replace(result, stdout="f" * 40)
+        if field == "branch" and arguments[:2] == ("symbolic-ref", "--quiet"):
+            return replace(result, stdout="foreign")
+        return result
+
+    monkeypatch.setattr(RepoGitTools, "_command", observed)
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).reset_to_attested_head()
+    assert refusal.value.code == "reset_unverified"
+    assert _read_lease_trust(lease)[0] is True
+
+
+def test_repo_checkout_explicit_discard_clears_marked_resumed_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+    from mimir.tools import forge, repo
+
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda *_args, **_kwargs: None)
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "pull_request_author", scope.principal)
+    lease = state.checkout_lease
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+    mark_tainted_lease(lease)
+    (lease.path / "tracked.txt").write_text("tainted\n")
+    later = RepoReviewState(scope)
+    auth = _lineage_turn(scope, later, tainted=True)
+    monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (later, None))
+    monkeypatch.setattr(forge, "_client", lambda _: SimpleNamespace(author_is_trusted=lambda *_: True))
+    monkeypatch.setattr(forge, "_pr_content_authors", lambda *_: ((scope.principal,), None))
+    monkeypatch.setattr(forge, "_author_verdict", lambda *_: False)
+    with pytest.raises(ToolPolicyRefusal, match="requires author attestation"):
+        repo.repo_checkout.func(
+            "owner/repo", 7, runtime=SimpleNamespace(context=auth), discard_worktree=True,
+        )
+    assert _read_lease_trust(later.checkout_lease)[0] is True
+    monkeypatch.setattr(forge, "_author_verdict", lambda *_: True)
+    result = repo.repo_checkout.func(
+        "owner/repo", 7, runtime=SimpleNamespace(context=auth), discard_worktree=True,
+    )
+    assert result["path"] == str(lease.path)
+    assert _read_lease_trust(later.checkout_lease) == (False, {})
+    assert _checkout_test_decision(scope, auth).allowed
+
+
+def test_reclaim_and_new_lease_do_not_inherit_tainted_marker(
+    tmp_path: Path,
+) -> None:
+    from mimir.pr_checkout_lease import _read_lease_trust, mark_tainted_lease
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    mark_tainted_lease(lease)
+    assert cleanup_pr_checkout_lease(lease, review_state=state)
+    assert _read_lease_trust(lease) is None
+    fresh = create_pr_checkout_lease(
+        scope, owner=scope.principal, lease_root=lease.lease_root, review_state=state,
+    )
+    assert fresh.recovery_id != lease.recovery_id
+    assert _read_lease_trust(fresh) == (False, {})
+
+
+@pytest.mark.asyncio
+async def test_tainted_turn_cannot_choose_unknown_suite_or_supply_runner_env(
+    repo_tools, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = repo_tools[-2]
+    auth = _lineage_turn(state.action_scope, state, tainted=True)
+    assert auth.ifc_state.has_untrusted_active_ingest(auth.ifc_labels)
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.setenv("PYTHONPATH", "turn-supplied-injection")
+    monkeypatch.setenv("NODE_OPTIONS", "turn-supplied-injection")
+    with pytest.raises(ProjectTestRefusal) as denied:
+        _configured_command(state.action_scope.canonical_repo, (), suite="injected")
+    assert denied.value.code == "test_suite_selection_refused"
+    calls = []
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        calls.append((argv, env))
+        assert "turn-supplied-injection" not in repr(env)
+        assert not {"PYTHONPATH", "NODE_OPTIONS", "MIMIR_HOME"} & env.keys()
+        assert "HOME" not in env  # the executor supplies a fresh per-run HOME
+        assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        return CollectedExecutionResult(0, b"ok", b"", False, False, 0, 0)
+
+    issued = []
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_snapshot_checkout_factory(tmp_path, issued),
+    ).execute((), suite="python")
+    assert result.ok and len(calls) == 1
+
+
+@pytest.mark.parametrize("selector", [
+    "-p x", "--rootdir=/", "-o addopts=--pdb", "@args",
+    "tracked.txt::t --pdb", "../x", "/tmp/x", "link.py",
+])
+def test_tainted_turn_selectors_cannot_inject_runner_arguments(
+    tmp_path: Path, selector: str,
+) -> None:
+    from mimir.project_tests import _validated_selectors
+
+    (tmp_path / "tracked.txt").write_text("a\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "tracked.txt")
+    with pytest.raises(ProjectTestRefusal):
+        _validated_selectors(tmp_path, (selector,))
+
+
+def test_conflicted_merge_marks_lease_before_git_changes_index(tmp_path: Path) -> None:
+    from mimir.pr_checkout_lease import _METADATA, _metadata, _read_lease_trust
+
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    _git(source, "checkout", "-q", "main")
+    (source / "tracked.txt").write_text("base conflict\n")
+    _git(source, "add", "tracked.txt")
+    _git(source, "commit", "-qm", "base conflict")
+    base = _git(source, "rev-parse", "HEAD")
+    _git(lease.path, "fetch", "-q", str(source), "main")
+    object.__setattr__(lease, "base_sha", base)
+    (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)))
+    tainted = _lineage_turn(scope, state, tainted=True)
+    with pytest.raises(GitRefusal) as error:
+        RepoGitTools(state, auth_context=tainted, enforce=False).execute(GitMerge())
+    assert error.value.code == "merge_conflict"
+    assert _git(lease.path, "ls-files", "--unmerged")
+    assert _read_lease_trust(lease)[0] is True
+
+
+def test_lease_writer_inventory_requires_explicit_marker_for_new_git_operation() -> None:
+    import ast
+    import inspect
+    import textwrap
+    from mimir import repo_tools, readonly_backend
+
+    operations = {item.__name__ for item in repo_tools.GitOperation.__args__}
+    assert operations == {
+        "GitFetch", "GitStatus", "GitDiff", "GitUnmerged", "GitStage", "GitCommit",
+        "GitMerge", "GitMergeAbort", "GitRebase", "GitRebaseAbort", "GitRevert",
+        "GitRevertAbort", "GitPush",
+    }
+    mutators = {
+        "GitStage", "GitCommit", "GitMerge", "GitMergeAbort", "GitRebase",
+        "GitRebaseAbort", "GitRevert", "GitRevertAbort",
+    }
+    tree = ast.parse(textwrap.dedent(inspect.getsource(repo_tools.RepoGitTools.execute)))
+    marked = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == "mark_tainted_lease")
+    condition = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                     and marked in list(ast.walk(node)))
+    marked_names = {node.id for node in ast.walk(condition.test)
+                    if isinstance(node, ast.Name) and node.id.startswith("Git")}
+    assert marked_names == mutators
+    for name in ("write", "replace", "edit", "upload_files"):
+        method = getattr(readonly_backend._RootAwareFilesystemBackend, name)
+        body = ast.parse(textwrap.dedent(inspect.getsource(method)))
+        assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "_mark_tainted_lease_write"
+                   for node in ast.walk(body)), name
+
+
+def test_repo_test_snapshot_copy_stays_inside_provenance_lock() -> None:
+    """Static boundary check: no gap between revalidation and copy."""
+    import ast
+    import inspect
+    import textwrap
+    from mimir.tools import repo as repo_module
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(repo_module.repo_test.coroutine)))
+    locked = [node for node in ast.walk(tree) if isinstance(node, ast.With)
+              and any(isinstance(item.context_expr, ast.Call)
+                      and isinstance(item.context_expr.func, ast.Name)
+                      and item.context_expr.func.id == "_lease_trust_lock"
+                      for item in node.items)]
+    assert len(locked) == 1
+    invoked = {node.func.id for node in ast.walk(locked[0]) if isinstance(node, ast.Call)
+               and isinstance(node.func, ast.Name)}
+    assert {"checkout_content_trusted", "create_repo_test_checkout"} <= invoked
+
+
+def test_sink_gate_marks_tainted_file_target_even_without_router_turn_context(
+    tmp_path: Path,
+) -> None:
+    from mimir.access_control import SinkGate
+    from mimir.pr_checkout_lease import _read_lease_trust
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    auth = _lineage_turn(scope, state, tainted=True)
+    lease = state.checkout_lease
+    SinkGate.check_sink_flow(
+        "write_file", str(lease.path / "tracked.txt"), auth.ifc_labels, auth,
+        enforce=False, repo_review_state=state,
+    )
+    assert _read_lease_trust(lease)[0] is True
+
+
+def test_tainted_writes_fail_closed_when_marker_cannot_be_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import _context, pr_checkout_lease, repo_tools
+    from mimir.access_control import SinkGate
+    from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    auth = _lineage_turn(scope, state, tainted=True)
+    monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(lease.lease_root))
+
+    def unavailable(*_args):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(pr_checkout_lease, "mark_tainted_lease", unavailable)
+    monkeypatch.setattr(repo_tools, "mark_tainted_lease", unavailable)
+    target = str(lease.path / "new.txt")
+    decision = SinkGate.check_sink_flow(
+        "write_file", target, auth.ifc_labels, auth,
+        enforce=False, repo_review_state=state,
+    )
+    assert not decision.allowed and decision.reason == "lease_trust_write_unavailable"
+    home = tmp_path / "home"
+    home.mkdir()
+    router = FileToolRouter(
+        default=WriteGuardBackend(home, ["state"]),
+        routes=build_file_tool_routes([(str(lease.lease_root), "rw")]),
+    )
+    monkeypatch.setattr(_context, "get_current_turn", lambda: SimpleNamespace(auth_context=auth))
+    with pytest.raises(RuntimeError, match="storage unavailable"):
+        router.write(target, "injected\n")
+    assert not Path(target).exists()
+    (lease.path / "tracked.txt").write_text("fix\n")
+    with pytest.raises(GitRefusal) as refusal:
+        RepoGitTools(state, auth_context=auth, enforce=False).execute(GitStage(("tracked.txt",)))
+    assert refusal.value.code == "lease_trust_write_unavailable"
+    assert _git(lease.path, "diff", "--cached", "--name-only") == ""
+
+
+@pytest.mark.parametrize("profile,expected_mark", [("github", False), ("heartbeat", True)])
+def test_service_shell_profile_only_marks_when_not_read_only_repo_review(
+    tmp_path: Path, profile: str, expected_mark: bool,
+) -> None:
+    from mimir.access_control import SinkGate, build_trigger_service_principal, CapabilityTier
+    from mimir.pr_checkout_lease import _read_lease_trust
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity" if profile == "github" else "heartbeat",
+        trigger="poller" if profile == "github" else "scheduled_tick",
+        profile=profile, tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_job_output", "bash_jobs_list"), creation_path="test",
+    )
+    base = _lineage_turn(scope, state, tainted=True)
+    auth = replace(
+        base, principal=f"service:{service.canonical}",
+        canonical_principal=service.canonical, roles=("service",),
+        is_service=True, service_authority=service, trigger=service.trigger,
+    )
+    SinkGate.check_sink_flow(
+        "shell_exec", "git status", auth.ifc_labels, auth, enforce=False,
+        repo_review_state=state,
+    )
+    assert _read_lease_trust(state.checkout_lease)[0] is expected_mark
+
+
+def test_tainted_service_shell_refuses_when_marker_store_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import pr_checkout_lease
+    from mimir.access_control import SinkGate, build_trigger_service_principal, CapabilityTier
+
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    service = build_trigger_service_principal(
+        canonical="heartbeat", trigger="scheduled_tick", profile="heartbeat",
+        tier=CapabilityTier.CODE_EXECUTION,
+        capabilities=("shell_exec", "bash_job_output", "bash_jobs_list"), creation_path="test",
+    )
+    base = _lineage_turn(scope, state, tainted=True)
+    auth = replace(
+        base, principal="service:heartbeat", canonical_principal="heartbeat",
+        roles=("service",), is_service=True, service_authority=service,
+        trigger=service.trigger,
+    )
+
+    def unavailable(*_args):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(pr_checkout_lease, "mark_tainted_lease", unavailable)
+    decision = SinkGate.check_sink_flow(
+        "shell_exec", "git status", auth.ifc_labels, auth, enforce=False,
+        repo_review_state=state,
+    )
+    assert not decision.allowed and decision.reason == "lease_trust_write_unavailable"
+
+
 @pytest.mark.parametrize("lineage", [
     "clean", "tainted", "tainted_flip", "tainted_base", "missing", "unrecorded", "corrupt",
 ])
@@ -305,7 +956,7 @@ def test_resumed_local_commit_requires_clean_producing_turn(
 ) -> None:
     from mimir import access_control
     from mimir.models import InformationFlowLabels
-    from mimir.pr_checkout_lease import _METADATA
+    from mimir.pr_checkout_lease import _METADATA, _trust_record_path
     from mimir.tools.repo import _publish_attested_lease_result
 
     _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
@@ -342,12 +993,15 @@ def test_resumed_local_commit_requires_clean_producing_turn(
         assert "git_metadata_readonly" in result.error
         assert metadata_path.read_text() == before
     if lineage in {"missing", "unrecorded", "corrupt"}:
-        record = json.loads((lease.path / _METADATA).read_text())
-        record["lineage"] = (
-            None if lineage == "missing" else {} if lineage == "unrecorded"
-            else {head: "trusted"}
-        )
-        (lease.path / _METADATA).write_text(json.dumps(record))
+        record_path = _trust_record_path(lease)
+        record = json.loads(record_path.read_text())
+        if lineage == "missing":
+            record.pop("lineage")
+        elif lineage == "unrecorded":
+            record["lineage"].pop(head)
+        else:
+            record["lineage"][head]["value"] = "trusted"
+        record_path.write_text(json.dumps(record))
     # Turn 1 did not push: a failed/refused test leaves the PR remote pinned.
     assert _git(_origin, "rev-parse", scope.destination_ref) == scope.observed_head_sha
     second = RepoReviewState(scope)
@@ -1660,6 +2314,8 @@ def test_https_push_uses_invocation_scoped_auth_without_credential_leak(
     state.record_git_head(https_scope.scope_id, scope.observed_head_sha)
     from mimir.pr_checkout_lease import _METADATA, _metadata
     (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)) + "\n")
+    from mimir.pr_checkout_lease import _write_lease_trust
+    _write_lease_trust(lease, False, {})
     (lease.path / "push.txt").write_text("push me\n", encoding="utf-8")
     token = "never-expose-this-token"
     monkeypatch.setenv("GITHUB_TOKEN", token)

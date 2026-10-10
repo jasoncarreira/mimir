@@ -1593,6 +1593,13 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> ReadResult:
         if self._is_outside_root(file_path):
             return ReadResult(error=self._outside_root_msg(file_path, tool="read_file"))
+        from .pr_checkout_lease import is_lease_trust_path
+        try:
+            if is_lease_trust_path(self._resolve_path(file_path)):
+                return ReadResult(error="Read denied: server-owned lease trust record")
+        except (OSError, RuntimeError, ValueError, AttributeError, TypeError):
+            # Preserve the backend's existing invalid/outside-root diagnosis.
+            pass
         from .read_policy import non_admin_read_filter_enabled, protected_read_result_reason
 
         if non_admin_read_filter_enabled():
@@ -1696,6 +1703,12 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def ls(self, path: str) -> LsResult:
         if self._is_outside_root(path):
             return LsResult(error=self._outside_root_msg(path, tool="ls"))
+        from .pr_checkout_lease import is_lease_trust_path
+        try:
+            if is_lease_trust_path(self._resolve_path(path)):
+                return LsResult(error="List denied: server-owned lease trust directory")
+        except (OSError, RuntimeError, ValueError, AttributeError, TypeError):
+            pass
         try:
             result = super().ls(path)
         except ValueError as e:
@@ -1727,6 +1740,12 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         return await asyncio.to_thread(self.ls, path)
 
     def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        from .pr_checkout_lease import is_lease_trust_search_path
+        try:
+            if is_lease_trust_search_path(self._resolve_path(path or "/")):
+                return GlobResult(error="Search denied: server-owned lease trust directory", matches=[])
+        except (OSError, RuntimeError, ValueError, AttributeError, TypeError):
+            pass
         result = super().glob(pattern, path)
         if result.error is None:
             self._publish_read_paths([
@@ -1737,14 +1756,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         return result
 
     async def aglob(self, pattern: str, path: str | None = None) -> GlobResult:
-        result = await super().aglob(pattern, path)
-        if result.error is None:
-            self._publish_read_paths([
-                str(match.get("path"))
-                for match in result.matches or ()
-                if match.get("path")
-            ])
-        return result
+        return await asyncio.to_thread(self.glob, pattern, path)
 
     def grep(
         self,
@@ -1754,6 +1766,12 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         before_context: int = 0,
         after_context: int = 0,
     ) -> GrepResult:
+        from .pr_checkout_lease import is_lease_trust_search_path
+        try:
+            if is_lease_trust_search_path(self._resolve_path(path or "/")):
+                return GrepResult(error="Search denied: server-owned lease trust directory", matches=[])
+        except (OSError, RuntimeError, ValueError, AttributeError, TypeError):
+            pass
         result = super().grep(pattern, path, glob, before_context, after_context)
         if result.error is None:
             self._publish_read_paths([
@@ -1789,7 +1807,11 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
         lexical = self.cwd / key.lstrip("/")
         denied = ".git" in lexical.parts
         try:
-            denied = denied or ".git" in lexical.resolve(strict=False).parts
+            resolved = lexical.resolve(strict=False)
+            denied = denied or ".git" in resolved.parts
+            from .pr_checkout_lease import is_lease_trust_path
+            if is_lease_trust_path(resolved):
+                denied = True
         except (OSError, RuntimeError, ValueError):
             # Existing path-confinement guards own unresolved/outside paths.
             # Do not mislabel their refusals as Git metadata violations.
@@ -1806,6 +1828,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def write(self, file_path: str, content: str) -> WriteResult:
         if self._git_metadata_write_denied(file_path):
             return WriteResult(error="Write denied: git_metadata_readonly")
+        self._mark_tainted_lease_write(file_path)
         result = _exclusive_write(self.cwd, file_path, content)
         if result is _WRITE_COLLISION:
             return WriteResult(error=_WRITE_COLLISION)
@@ -1819,6 +1842,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def replace(self, file_path: str, content: str) -> WriteResult:
         if self._git_metadata_write_denied(file_path):
             return WriteResult(error="Write denied: git_metadata_readonly")
+        self._mark_tainted_lease_write(file_path)
         return _atomic_replace(self.cwd, file_path, content, self.max_file_size_bytes)
 
     async def areplace(self, file_path: str, content: str) -> WriteResult:
@@ -1833,6 +1857,7 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     ) -> EditResult:
         if self._git_metadata_write_denied(file_path):
             return EditResult(error="Edit denied: git_metadata_readonly")
+        self._mark_tainted_lease_write(file_path)
         try:
             return super().edit(file_path, old_string, new_string, replace_all)
         except ValueError as e:
@@ -1850,7 +1875,35 @@ class _RootAwareFilesystemBackend(_BoundedFilesystemBackend):
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         if any(self._git_metadata_write_denied(path) for path, _ in files):
             return [FileUploadResponse(path=path, error="permission_denied") for path, _ in files]
+        for path, _ in files:
+            self._mark_tainted_lease_write(path)
         return super().upload_files(files)
+
+    def _mark_tainted_lease_write(self, file_path: str) -> None:
+        from ._context import get_current_turn
+        from .access_control import _turn_has_untrusted_active_ingest
+        from .pr_checkout_lease import mark_tainted_lease
+
+        turn = get_current_turn()
+        auth = getattr(turn, "auth_context", None)
+        if auth is None or not _turn_has_untrusted_active_ingest(auth, None):
+            return
+        try:
+            key = file_path
+            root = str(self.cwd).rstrip("/")
+            if key == root or key.startswith(root + "/"):
+                key = key[len(root):]
+            target = (self.cwd / key.lstrip("/")).resolve(strict=False)
+            registry = getattr(auth, "repo_pr_scope_registry", None)
+            state = (registry.resolve_checkout_path(target) if registry is not None
+                     else getattr(auth, "repo_review_state", None))
+            lease = getattr(state, "checkout_lease", None)
+            if lease is None or not lease.is_active:
+                return
+            if target.is_relative_to(lease.path.resolve(strict=True)):
+                mark_tainted_lease(lease)
+        except (OSError, ValueError):
+            raise RuntimeError("lease write could not be classified") from None
 
     async def aupload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         return await asyncio.to_thread(self.upload_files, files)

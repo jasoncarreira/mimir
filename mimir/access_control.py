@@ -6142,7 +6142,7 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
 _WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
 
 
-def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
+def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any, reason: str = "lease_unattested") -> str:
     state = getattr(auth_context, "ifc_state", None)
     current = getattr(state, "current", None)
     try:
@@ -6158,12 +6158,21 @@ def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
         else "unknown untrusted source"
     )
     return (
-        f"repo_test cannot execute repository code after untrusted active ingest "
+        f"repo_test cannot execute repository code ({reason}) after untrusted active ingest "
         f"from {source_name}. Review the diff with pr_diff/repo_diff without "
         "executing it, rely on the PR's CI (pr_checks), or ask the operator for "
         "a fresh turn or a one-time approve_sink_once grant "
         "(request_operator_approval on an eligible operator turn)."
         + _author_attestation_note(auth_context)
+    )
+
+
+def _lease_trust_write_denial(tool_name: str) -> "ToolAuthorization":
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="lease_trust_write_unavailable",
+        required_tier=AccessTier.ADMIN, enforcement_enabled=True, would_block=True,
+        refusal_detail="Lease trust state could not be recorded before a tainted write",
     )
 
 
@@ -6790,6 +6799,37 @@ class SinkGate:
 
         sink_category = sink_category or get_sink_category(tool_name)
         service = get_trusted_service_from_auth_context(auth_context)
+        if tool_name in {"write_file", "edit_file", "replace_file"} and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+            review = repo_review_state or getattr(auth_context, "repo_review_state", None)
+            if isinstance(target, str) and _target_within_active_pr_checkout_lease(target, review):
+                from .pr_checkout_lease import mark_tainted_lease
+                try:
+                    mark_tainted_lease(review.checkout_lease)
+                except RuntimeError:
+                    if not enforce:
+                        return _lease_trust_write_denial(tool_name)
+        if (tool_name in SHELL_PROCESS_TOOL_NAMES and service is not None
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            policy = service.sink_policy_for(tool_name)
+            if policy is None or policy.destination != "repo_review":
+                # Declared argv may run scripts; without a read-only proof,
+                # conservatively mark any active lease before shell execution.
+                registry = getattr(auth_context, "repo_pr_scope_registry", None)
+                discovered = getattr(auth_context, "server_discovered_pr_states", None)
+                reviews = (
+                    repo_review_state, getattr(auth_context, "repo_review_state", None),
+                    *getattr(registry, "review_states", ()),
+                    *getattr(discovered, "review_states", ()),
+                )
+                from .pr_checkout_lease import mark_tainted_lease
+                for review in reviews:
+                    lease = getattr(review, "checkout_lease", None)
+                    if lease is not None and lease.is_active:
+                        try:
+                            mark_tainted_lease(lease)
+                        except RuntimeError:
+                            if not enforce:
+                                return _lease_trust_write_denial(tool_name)
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return _scheduled_write_denial(tool_name)
         # Both service and operator routes need a veto before any shadow allow.
@@ -6800,33 +6840,67 @@ class SinkGate:
             return _worklink_build_denial(
                 tool_name, service, auth_context, ifc_labels,
             )
-        # repo_test executes the scoped checkout, including edits from this turn.
-        # No trigger or service authority exempts a turn that read untrusted content.
+        # Injected text cannot change execution without changing the lease: every
+        # tainted write sets a persistent server-owned marker, so injected edits
+        # never execute through repo_test. Reading alone leaves the attested
+        # checkout intact. Selectors/suites are bounded, runner env is fixed;
+        # dependency installs retain the same network risk as a clean turn.
         # Keep the enforced path's existing decisions byte-identical.
-        if (not enforce and tool_name == "repo_test"
-                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            normalized = normalize_sink_destination(sink_category, target)
-            state = getattr(auth_context, "ifc_state", None)
-            principal = getattr(auth_context, "canonical_principal", None)
-            if (isinstance(ifc_labels, InformationFlowLabels)
-                    and normalized is not None and isinstance(principal, str)
-                    and state is not None and state.consume_sink_approval(
-                        current=ifc_labels, sink_category=sink_category.value,
-                        destination=normalized, canonical_principal=principal,
-                        shadow=False,
-                    )):
+        tainted_repo_test = (not enforce and tool_name == "repo_test" and
+                             _turn_has_untrusted_active_ingest(auth_context, ifc_labels))
+        if tainted_repo_test:
+            review = repo_review_state or getattr(auth_context, "repo_review_state", None)
+            trusted, provenance_reason = checkout_content_trusted(review, auth_context)
+            if trusted and getattr(review, "action_scope", None) is repo_pr_action_scope:
+                lease = review.checkout_lease
+                try:
+                    from .event_logger import log_event_sync
+                    log_event_sync(
+                        "repo_test_allowed_trusted_checkout", lease_id=lease.recovery_id,
+                        head=review.git_expected_head, marker=False,
+                    )
+                except Exception:
+                    log.exception("repo_test_trusted_checkout_log_failed")
+            else:
+                if trusted:
+                    provenance_reason = "lease_unattested"
+                normalized = normalize_sink_destination(sink_category, target)
+                state = getattr(auth_context, "ifc_state", None)
+                principal = getattr(auth_context, "canonical_principal", None)
+                if (isinstance(ifc_labels, InformationFlowLabels)
+                        and normalized is not None and isinstance(principal, str)
+                        and state is not None and state.consume_sink_approval(
+                            current=ifc_labels, sink_category=sink_category.value,
+                            destination=normalized, canonical_principal=principal,
+                            shadow=False,
+                        )):
+                    state.record_repo_test_sink_grant(tool_call_id)
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.OPEN,
+                        allowed=True, reason="ifc_declassification_approved",
+                        service_principal=service, enforcement_enabled=False,
+                    )
                 return ToolAuthorization(
-                    tool_name=tool_name, decision=OperationDecision.OPEN,
-                    allowed=True, reason="ifc_declassification_approved",
-                    service_principal=service, enforcement_enabled=False,
+                    tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                    allowed=False, reason="repo_test_blocked_by_untrusted_ingest",
+                    service_principal=service, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=True, would_block=True,
+                    refusal_detail=_repo_test_ingest_refusal(auth_context, ifc_labels, provenance_reason),
                 )
-            return ToolAuthorization(
-                tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
-                allowed=False, reason="repo_test_blocked_by_untrusted_ingest",
-                service_principal=service, required_tier=AccessTier.ADMIN,
-                enforcement_enabled=True, would_block=True,
-                refusal_detail=_repo_test_ingest_refusal(auth_context, ifc_labels),
-            )
+        if not enforce and tool_name == "repo_test" and not tainted_repo_test:
+            review = repo_review_state or getattr(auth_context, "repo_review_state", None)
+            lease = getattr(review, "checkout_lease", None)
+            if lease is not None:
+                from .pr_checkout_lease import _read_lease_trust
+                record = _read_lease_trust(lease)
+                if record is not None and record[0]:
+                    return ToolAuthorization(
+                        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+                        allowed=False, reason="repo_test_blocked_by_tainted_worktree",
+                        service_principal=service, required_tier=AccessTier.ADMIN,
+                        enforcement_enabled=True, would_block=True,
+                        refusal_detail="repo_test cannot execute a tainted_worktree lease",
+                    )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
         if (not enforce and tool_name in {"shell_exec", "bash_async"}
@@ -9717,6 +9791,8 @@ class ToolRegistry:
                     repo_pr_action_scope = (
                         state.action_scope if state is not None else None
                     )
+                    if tool_name == "repo_test" and not enforce:
+                        repo_review_state = state
                 if not retained_matches and (heartbeat_git_authority_enabled(preliminary_service) or heartbeat_git_authority_enabled(
                     getattr(auth_context, "service_authority", None),
                 )):
@@ -10298,6 +10374,26 @@ _UNTRUSTED_REFERENCE_SUBTREES = frozenset({("state", "pollers")})
 _PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 
 
+def checkout_content_trusted(review_state: Any, auth_context: Any) -> tuple[bool, str]:
+    """Judge the bytes the runner would execute, not the turn's read history."""
+    from .pr_checkout_lease import _read_lease_trust
+
+    scope = getattr(review_state, "action_scope", None)
+    lease = getattr(review_state, "checkout_lease", None)
+    if scope is None or lease is None:
+        return False, "lease_unattested"
+    record = _read_lease_trust(lease)
+    if record is None:
+        return False, "lineage_untrusted"
+    if record[0]:
+        return False, "tainted_worktree"
+    if not _attested_pr_checkout_lease(auth_context, scope, lease):
+        if getattr(lease, "head_sha", "").lower() != getattr(scope, "observed_head_sha", "").lower():
+            return False, "lineage_untrusted"
+        return False, "lease_unattested"
+    return True, "trusted_checkout"
+
+
 def _attested_pr_checkout_lease(
     auth_context: "AuthContext | None",
     scope: Any,
@@ -10385,7 +10481,7 @@ def _lease_has_clean_lineage(
     path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
 ) -> bool:
     """Check every local commit against the atomically recorded producing turns."""
-    from .pr_checkout_lease import _METADATA, _recorded_lineage, _recorded_verified_base
+    from .pr_checkout_lease import _METADATA, _read_lease_trust, _recorded_verified_base
     from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
 
     try:
@@ -10396,9 +10492,10 @@ def _lease_has_clean_lineage(
             "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
         )):
             return False
-        lineage = _recorded_lineage(raw)
-        if lineage is None:
+        trust = _read_lease_trust(lease)
+        if trust is None or trust[0]:
             return False
+        lineage = trust[1]
         base = getattr(lease, "base_sha", "").lower()
         verified_base = _recorded_verified_base(raw)
         protected = (

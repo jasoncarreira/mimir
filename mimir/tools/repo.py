@@ -301,8 +301,9 @@ def repo_checkout(
     repository: str,
     pull_request: int,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+    discard_worktree: bool = False,
 ) -> dict[str, Any]:
-    """Create the exact checkout lease bound to this turn's immutable PR scope."""
+    """Acquire the scoped lease; explicitly discard work only at its attested head."""
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_checkout")
     from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
@@ -336,6 +337,15 @@ def repo_checkout(
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
             verdict = _author_verdict(context, scope, scope.pull_request_author, client)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    if discard_worktree:
+        if context.ifc_state.pr_checkout_author_trust[scope.scope_id] is not True:
+            raise ToolPolicyRefusal("repository checkout reset requires author attestation")
+        try:
+            RepoGitTools(state, auth_context=context, enforce=_enforcement_enabled(
+                runtime, repository=repository, pull_request=pull_request,
+            )).reset_to_attested_head()
+        except (GitRefusal, OSError, RuntimeError) as exc:
+            raise ToolException(f"repository checkout reset rejected: {_redact_git_output(str(exc))}") from exc
     _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",
@@ -430,8 +440,52 @@ async def repo_test(
                 )
                 return result
         state = _state(runtime, repository, pull_request)
+        context = getattr(runtime, "context", None) if runtime is not None else None
+        checkout_factory = None
+        if getattr(context, "enforcement_enabled", None) is False:
+            from ..access_control import _turn_has_untrusted_active_ingest, checkout_content_trusted
+            from ..pr_checkout_lease import _lease_trust_lock, _read_lease_trust
+            from ..project_tests import create_repo_test_checkout
+
+            lease = state.checkout_lease
+            ifc = getattr(context, "ifc_state", None)
+            grant = getattr(ifc, "consume_repo_test_sink_grant", None)
+            approved = callable(grant) and grant(getattr(runtime, "tool_call_id", None))
+
+            def guarded_checkout(root: Path, **kwargs: Any):
+                """Seal the copied bytes against writes after the sink decision."""
+                tainted = _turn_has_untrusted_active_ingest(context, None)
+                record = _read_lease_trust(lease)
+                if record is None:
+                    if tainted and not approved:
+                        raise ProjectTestRefusal(
+                            "repo_test_blocked_by_untrusted_ingest", "lineage_untrusted",
+                            execution_started=False,
+                        )
+                    # A grant is explicit declassification; clean turns retain
+                    # their previous behavior when trust storage is unavailable.
+                    return create_repo_test_checkout(root, **kwargs)
+                with _lease_trust_lock(lease):
+                    if not approved:
+                        if tainted:
+                            trusted, reason = checkout_content_trusted(state, context)
+                            if not trusted:
+                                raise ProjectTestRefusal(
+                                    "repo_test_blocked_by_untrusted_ingest", reason,
+                                    execution_started=False,
+                                )
+                        elif _read_lease_trust(lease)[0]:
+                            raise ProjectTestRefusal(
+                                "repo_test_blocked_by_tainted_worktree", "tainted_worktree",
+                                execution_started=False,
+                            )
+                    return create_repo_test_checkout(root, **kwargs)
+
+            checkout_factory = guarded_checkout
         result = asdict(
-            await RepoProjectTests(state).execute(selectors, suite=suite)
+            await RepoProjectTests(state, **({"checkout_factory": checkout_factory} if checkout_factory else {})).execute(
+                selectors, suite=suite,
+            )
         )
         _publish_attested_lease_result(runtime, state)
         result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
