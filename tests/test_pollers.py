@@ -1771,21 +1771,55 @@ def test_instance_root_and_operator_alert_are_exact(
         trigger="poller", channel_id=channel, source="poller",
         service_principal=service.canonical, service_authority=service,
     )
-    auth = create_auth_context(event, enforce=True)
+    from mimir.models import InformationFlowState, Integrity, IntegrityEffect
+
     principal = f"service:{service.canonical}"
-    labels = InformationFlowLabels().with_channel(channel).with_source(SourceLabel(
+    source = SourceLabel(
         principal=principal, domain="channel", resource_id=channel,
         bridge_instance="poller", sensitivity="internal",
         authorized_principals=frozenset({principal}), source_kind="service",
-    ))
+        integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    labels = InformationFlowLabels().with_channel(channel).with_source(source)
+    auth = create_auth_context(event, enforce=True, ifc_labels=labels)
     own = tmp_path / "state" / "pollers" / "feed" / "cursor.json"
     other = tmp_path / "state" / "pollers" / "other" / ".recovery.json"
-    assert SinkGate.check_sink_flow("write_file", str(own), labels, auth, enforce=True).allowed
-    assert not SinkGate.check_sink_flow("write_file", str(other), labels, auth, enforce=True).allowed
+    for enforce in (False, True):
+        for target in (own, other):
+            denied = SinkGate.check_sink_flow(
+                "write_file", str(target), labels, auth, enforce=enforce,
+            )
+            assert not denied.allowed and denied.enforcement_enabled
+            assert not denied.is_shadow_decision
+            assert denied.reason == "write_blocked_by_untrusted_ingest"
+            assert denied.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+
+    # Root authority is tested independently of taint with a fresh carrier.
+    clean_labels = InformationFlowLabels().with_channel(channel).with_source(
+        replace(source, integrity=Integrity.TRUSTED),
+    )
+    clean_auth = replace(
+        create_auth_context(event, enforce=True, ifc_labels=clean_labels),
+        ifc_state=InformationFlowState(labels=clean_labels),
+    )
+    admitted = SinkGate.check_sink_flow(
+        "write_file", str(own), clean_labels, clean_auth, enforce=True,
+    )
+    wrong_root = SinkGate.check_sink_flow(
+        "write_file", str(other), clean_labels, clean_auth, enforce=True,
+    )
+    assert admitted.allowed, admitted.reason
+    assert not wrong_root.allowed
+    assert wrong_root.reason == "service_sink_destination_denied"
 
     monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "slack-alerts")
-    assert SinkGate.check_sink_flow("operator_alert", "slack-alerts", labels, auth, enforce=True).allowed
-    assert not SinkGate.check_sink_flow("operator_alert", "slack-other", labels, auth, enforce=True).allowed
+    for carrier, current in ((auth, labels), (clean_auth, clean_labels)):
+        assert SinkGate.check_sink_flow(
+            "operator_alert", "slack-alerts", current, carrier, enforce=True,
+        ).allowed
+        assert not SinkGate.check_sink_flow(
+            "operator_alert", "slack-other", current, carrier, enforce=True,
+        ).allowed
 
 
 def test_poller_authority_is_stable_across_shell_continuation(tmp_path: Path) -> None:

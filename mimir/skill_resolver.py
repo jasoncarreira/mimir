@@ -81,6 +81,9 @@ def _skill_dirs_for_poller(
             if not skill_dir.is_dir():
                 continue
             pollers_json = skill_dir / "pollers.json"
+            from ._paths import live_loader_path_allowed
+            if not live_loader_path_allowed(pollers_json):
+                continue
             if not pollers_json.is_file():
                 continue
             try:
@@ -126,6 +129,9 @@ def find_skill_for_channel(
     if skill_dir is None:
         return None
     skill_md = skill_dir / "SKILL.md"
+    from ._paths import live_loader_path_allowed
+    if not live_loader_path_allowed(skill_md):
+        return None
     if not skill_md.is_file():
         return None
     try:

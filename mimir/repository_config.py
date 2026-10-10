@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from ._paths import live_loader_path_allowed
+
 
 @dataclass(frozen=True)
 class RepositoryTestSuite:
@@ -44,6 +46,10 @@ class RepositoryInventory:
 
     @classmethod
     def load(cls, path: Path) -> "RepositoryInventory":
+        # Check before the missing-file fallback: a dangling scratch alias
+        # must not turn a declared policy into permissive legacy defaults.
+        if not live_loader_path_allowed(path):
+            raise ValueError(f"repository inventory cannot be loaded from scratch: {path}")
         if not path.exists():
             return cls()
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

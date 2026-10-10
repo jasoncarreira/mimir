@@ -393,9 +393,12 @@ def test_private_admin_can_approve_only_one_exact_file_sink_through_middleware(
 
     assert denied_before.status == "error"
     assert approval.status == "success"
-    assert written.status != "error"
+    # An unbound declassification grant cannot authorize a tainted file write.
+    assert written.status == "error"
+    assert "scratch/" in str(written.content) and "proposal PR" in str(written.content)
     assert denied_other.status == "error"
-    assert executions == [approved_path]
+    assert executions == []
+    assert not Path(approved_path).exists() and not Path(other_path).exists()
 
 
 @pytest.mark.asyncio
@@ -1651,8 +1654,11 @@ async def test_real_producer_unchanged_result_preserves_category_capability(
         reset_current_turn(token)
 
     assert produced.status != "error"
-    assert admitted.status != "error"
-    assert sink_calls == 1
+    # Unchanged producers preserve the capability, but a category grant must
+    # not override the always-on live-state write veto.
+    assert admitted.status == "error"
+    assert "scratch/" in str(admitted.content) and "proposal PR" in str(admitted.content)
+    assert sink_calls == 0
 
 
 @pytest.mark.parametrize("isolation", ["turn", "principal", "session"])
@@ -2298,7 +2304,9 @@ async def test_sync_and_async_tool_gate_paths_remain_in_parity(
 
         if scenario[0] == "denied_write":
             assert sync_snapshot["result"]["status"] == "error"
-            assert "ifc_label_blocked:file" in str(sync_snapshot["result"]["content"])
+            assert "scratch/" in str(sync_snapshot["result"]["content"])
+            assert "proposal PR" in str(sync_snapshot["result"]["content"])
+            assert sync_snapshot["handler_calls"] == 0
         elif scenario[0] == "fetch":
             assert "https://allowed.example/verbatim-only" in sync_snapshot["ingested_urls"]
         elif scenario[0] == "review":
@@ -2549,8 +2557,12 @@ async def test_real_file_search_preserves_only_anchored_turn_authority(
 
     assert (admitted.status != "error") == (location == "home")
     assert calls == ([tool_name] if location == "home" else [])
+    assert target.read_text() == "reference"
     if location != "home":
-        assert "ifc_label_blocked:" in str(admitted.content)
+        if tool_name == "shell_exec":
+            assert "ifc_label_blocked:" in str(admitted.content)
+        else:
+            assert "scratch/" in str(admitted.content) and "proposal PR" in str(admitted.content)
 
 
 @pytest.mark.asyncio
@@ -3275,20 +3287,16 @@ def test_file_taint_refusal_names_way_forward(
         target_channel=target,
     )
     assert decision.allowed is False
-    assert decision.reason == "ifc_label_blocked:file"
-    prefix = f"{tool_name} was refused before execution (ifc_label_blocked:file): "
-    if path.startswith("memory/core/"):
-        assert "open_proposal/submit_proposal; the operator merges it" in message
-        assert decision.enforcement_enabled and not decision.is_shadow_decision
-    elif durable:
-        assert message == prefix + (
-            "information-flow policy blocked this durable memory write. "
-            "Untrusted content must not be written to memory/ or state/ "
-            "(including state/wiki/). Ask the operator to open a fresh user "
-            "turn, or open a PR for content that belongs in the repository."
-        )
+    if path.startswith("scratch/"):
+        # Scratch bypasses the write veto, not unrelated confidentiality policy.
+        assert decision.reason == "ifc_label_blocked:file"
     else:
-        assert message == prefix + "information-flow policy blocked this call."
+        from mimir.access_control import _TAINTED_WRITE_REFUSAL
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert message == _TAINTED_WRITE_REFUSAL
+        assert "scratch/" in message and "proposal PR" in message
+        assert decision.enforcement_enabled and not decision.is_shadow_decision
+    assert not (tmp_path / path).exists()
 
 
 @pytest.mark.asyncio
@@ -7124,14 +7132,15 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
     assert isinstance(stale, ToolMessage)
     assert stale.status == "error"
     assert "remains unpushed in preserved checkout" in str(stale.content)
-    assert adapted.content == "adapted"
+    assert adapted.status == "error"
+    assert "scratch/" in str(adapted.content) and "proposal PR" in str(adapted.content)
     assert unsupported.content == "adapted"
-    assert calls == ["refused", "stale", "adapted", "unsupported"]
+    assert calls == ["refused", "stale", "unsupported"]
     assert ctx.ifc_labels.has_untrusted_active_ingest is True
     source = next(iter(ctx.ifc_labels.sources))
     assert source.domain == "repository"
     assert source.resource_id == f"owner/repo#pull/17@{'a' * 40}"
-    assert ctx.tool_call_count == 4
+    assert ctx.tool_call_count == 3
     assert ctx.hard_boundary_denials == [
         {
             "tool": "pr_metadata",
@@ -7144,11 +7153,11 @@ async def test_tool_refusal_is_a_result_and_next_tool_call_can_run(
             "reason": "unsupported_operation",
         },
     ]
-    assert ctx.remediation_effects == ["repo_push"]
+    assert ctx.remediation_effects == []
     assert state.checked_out is False
     assert state.checkout_lease is None
-    assert repo_classification_failures == [True, False]
-    assert repo_events == [False, True]
+    assert repo_classification_failures == [True]
+    assert repo_events == [False, False]
 
 
 @pytest.mark.asyncio

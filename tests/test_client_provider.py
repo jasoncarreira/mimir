@@ -1186,16 +1186,16 @@ async def test_accepted_unconfined_python_does_not_inherit_cwd_read_trust_or_ack
                 tool=hands_python, state=None, runtime=Runtime(context=auth),
             )
             result = await BudgetGateMiddleware().awrap_tool_call(request, execute)
-            assert result.status == "success"
-        assert risk_requests == ["hosted"]
-        assert len(broker.calls) == 2
-        assert all(call.host_execution.tainted is True for call in broker.calls)
+            assert result.status == "error"
+            assert "scratch/" in str(result.content) and "proposal PR" in str(result.content)
+        # Tainted calls are stopped before wrapper permission or unconfined risk
+        # consent; accepting risk is not an ingest-veto exemption.
+        assert risk_requests == []
+        assert broker.calls == []
         current = state.current()
-        assert initial.sources <= current.sources
+        assert current == initial
         python_sources = [source for source in current.sources if source.source_kind == "acp_hands_result"]
-        assert python_sources
-        assert all(source.integrity == "untrusted" for source in python_sources)
-        assert all(source.integrity_effect == "active_ingest" for source in python_sources)
+        assert not python_sources
         assert current.has_untrusted_active_ingest
         assert state.permission_has_untrusted_active_ingest(initial)
 

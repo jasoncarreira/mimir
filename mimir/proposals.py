@@ -355,6 +355,8 @@ def _ensure_scratch_ignored(home: Path) -> str | None:
         for line in existing.splitlines()
     ):
         return None
+    if _untrusted_proposal_turn():
+        return "scratch ignore requires trusted operator setup before opening a proposal"
     try:
         with gitignore.open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
@@ -581,6 +583,43 @@ def _check_outbox_names(worktree: Path, surface: Path) -> tuple[str, str] | None
     return None
 
 
+def _untrusted_proposal_turn() -> bool:
+    from ._context import get_current_turn
+    from .access_control import _turn_has_untrusted_active_ingest
+
+    turn = get_current_turn()
+    return bool(turn is not None and _turn_has_untrusted_active_ingest(
+        getattr(turn, "auth_context", None), getattr(turn, "ifc_labels", None),
+    ))
+
+
+_UNTRUSTED_PROPOSAL_NOTE = (
+    "Untrusted-origin proposal: requires operator review and must never auto-merge."
+)
+
+
+def _check_proposal_index(worktree: Path, surfaces: tuple[Path, ...]) -> str | None:
+    """Validate every staged entry, including pre-staged code/config and renames."""
+    result = _git(["diff", "--cached", "--no-renames", "--name-only", "-z"], cwd=worktree)
+    entries = _git(["ls-files", "--stage", "-z"], cwd=worktree)
+    if result.returncode or entries.returncode:
+        return "proposal index unavailable"
+    changed = set((result.stdout or "").split("\0")) - {""}
+    for path in changed:
+        if not any(path.startswith(s.as_posix() + "/") for s in surfaces):
+            return "proposal contains changes outside permitted surfaces"
+        if Path(path).suffix.lower() != ".md":
+            return "proposal contains code or config"
+    for entry in (entries.stdout or "").split("\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split("\t", 1)
+        mode, _, stage = metadata.split()
+        if path in changed and (stage != "0" or mode != "100644"):
+            return "proposal contains non-regular or executable content"
+    return None
+
+
 def finalize_proposal(
     home: Path,
     *,
@@ -647,6 +686,12 @@ def finalize_proposal(
             detail=f"no changes under {', '.join(map(str, surfaces))} to propose",
         )
 
+    untrusted_origin = _untrusted_proposal_turn() or poller is not None
+    if not (poller and poller.surface == "social-outbox"):
+        outside = _check_proposal_index(wt, surfaces)
+        if outside:
+            return ProposalResult(False, branch, False, None, "outside_surface", outside)
+
     if poller and poller.surface == "social-outbox":
         name_failure = _check_outbox_names(wt, poller.surface_root)
         if name_failure:
@@ -695,6 +740,9 @@ def finalize_proposal(
             f"{attribution}\n\nUntrusted-ingest source (not verified): {source}\n"
             f"Trusted origin_ref: {poller.origin_ref}\nTurn: {poller.turn_id}"
         )
+    if untrusted_origin:
+        title = "[untrusted-origin] " + title.removeprefix("[untrusted-origin] ")
+        attribution += "\n\n" + _UNTRUSTED_PROPOSAL_NOTE
     safe_title = _redact(title)
     safe_rationale = _redact(rationale + attribution)
     rolling_state: ProposalPrState | None = None

@@ -79,6 +79,30 @@ def resolve_within_roots(roots: list[Path], raw_path: str) -> Path:
     )
 
 
+def live_loader_path_allowed(path: Path, home: Path | None = None) -> bool:
+    """Refuse the configured home's scratch subtree, including symlink aliases.
+
+    An explicit home takes precedence over MIMIR_HOME. Other directories named
+    scratch are live sources, not the configured quarantine boundary.
+    """
+    try:
+        configured = os.environ.get("MIMIR_HOME", "").strip()
+        root = Path(home) if home is not None else (Path(configured) if configured else None)
+        lexical = Path(os.path.abspath(path))
+        resolved = path.resolve()
+        if root is None:
+            return True
+        scratch = root / "scratch"
+        # Check both spellings: a lexical scratch alias pointing out remains
+        # quarantined, and a live-looking alias pointing in is also refused.
+        return not (
+            lexical.is_relative_to(Path(os.path.abspath(scratch)))
+            or resolved.is_relative_to(scratch.resolve())
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def claude_code_persisted_output_root() -> Path:
     """Return Claude Code's persisted-output parent dir.
 

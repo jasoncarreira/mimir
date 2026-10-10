@@ -37,8 +37,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from ._paths import live_loader_path_allowed
 from .core_blocks import describe_file
-from .index_skip import is_index_skipped
+from .index_skip import deployment_index_skip_entries, is_index_skipped
 
 log = logging.getLogger(__name__)
 
@@ -323,7 +324,16 @@ def _bm25_norm(raw: float) -> float:
     return 1.0 / (1.0 + abs(raw))
 
 def _classify_scope(rel: str, home: Path | None = None) -> str | None:
-    if is_index_skipped(rel, home):
+    if not live_loader_path_allowed((home / rel) if home is not None else Path(rel), home):
+        return None
+    # index-skip.txt is also a live source read, even though its loader is
+    # shared with other consumers. Do not follow a scratch-backed override.
+    deployment_entries = (
+        deployment_index_skip_entries(home)
+        if home is not None and live_loader_path_allowed(home / ".mimir" / "index-skip.txt", home)
+        else ()
+    )
+    if is_index_skipped(rel, home, deployment_entries):
         return None
     if rel.startswith("memory/"):
         if rel.startswith("memory/core/") or rel == "memory/INDEX.md":
@@ -517,6 +527,8 @@ class Indexer:
     # ---- sync internals ----
 
     def _connect(self) -> sqlite3.Connection:
+        if not live_loader_path_allowed(self._db_path, self._home):
+            raise ValueError(f"file_search database cannot be loaded from scratch: {self._db_path}")
         # Re-create the parent dir if it was removed out-of-band — a
         # benchmark cleanup or test-fixture rm doesn't crash the sweep loop;
         # next sweep just starts from an empty schema.
@@ -551,7 +563,7 @@ class Indexer:
         roots = [self._home / "memory", self._home / "state"]
         out: list[Path] = []
         for root in roots:
-            if not root.is_dir():
+            if not live_loader_path_allowed(root, self._home) or not root.is_dir():
                 continue
             for p in root.rglob("*.md"):
                 if not p.is_file():
@@ -566,10 +578,8 @@ class Indexer:
 
     def _reindex_sync(self, rel_path: str) -> bool:
         scope = _classify_scope(rel_path, self._home)
-        if scope is None:
-            return False
         abs_path = self._abs_path(rel_path)
-        if not abs_path.is_file():
+        if scope is None or not abs_path.is_file():
             # File deleted — drop from index.
             # CR2 (memory & retrieval) fix: explicit DELETE on
             # ``chunks`` too. Pre-fix this branch deleted from
@@ -699,6 +709,14 @@ class Indexer:
         candidates: dict[tuple[str, int], dict] = {}
 
         with self._db_lock, self._connect() as conn:
+            # A live file can be replaced by a scratch symlink between sweeps.
+            # Evict before selecting candidates, not just before reindexing:
+            # cached content must not cross back into live retrieval either.
+            for (path,) in conn.execute("SELECT path FROM files").fetchall():
+                if not live_loader_path_allowed(self._abs_path(path), self._home):
+                    conn.execute("DELETE FROM files WHERE path = ?", (path,))
+                    conn.execute("DELETE FROM chunks WHERE path = ?", (path,))
+                    conn.execute("DELETE FROM chunks_fts WHERE path = ?", (path,))
             # 1) FTS5 candidates by BM25.
             if fts_query:
                 rows = conn.execute(

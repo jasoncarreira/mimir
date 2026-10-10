@@ -162,6 +162,7 @@ def maybe_create_worklink_budget_continuation(
     Chainlink context could be inferred.
     """
 
+    # Server-owned continuation metadata is not a model tool-call write.
     if is_dispatch_failure_intervention(event):
         return None
     if not getattr(ctx, "tool_call_budget_exhausted", False):

@@ -3166,6 +3166,18 @@ async def test_permission_outcome_after_execute_result(
         )
         assert marker is not None
         for tool_id in ("first", "second"):
+            authorization = get_tool_registry().authorize_tool(
+                wrapper, auth, enforce=True, arguments=arguments,
+                client_authorized_host_execution=marker, request_identity=request_identity,
+            )
+            if _live_untrusted_active_ingest(auth, labels):
+                assert not authorization.allowed
+                assert authorization.reason == "write_blocked_by_untrusted_ingest"
+                assert "scratch/" in authorization.refusal_detail
+                # Match production ordering: no permission request or execution
+                # is reached after the model-boundary veto.
+                continue
+            assert authorization.allowed
             active.dispatcher.enqueue({
                 "type": "tool_call", "phase": "start", "id": tool_id,
                 "tool_name": wrapper, "args": arguments,
@@ -3218,17 +3230,18 @@ async def test_permission_outcome_after_execute_result(
                 raise failures[0]
             raise
         assert response.stop_reason == "end_turn"
-        assert executions == [wrapper.removeprefix("hands_")] * 2
-        assert prompts == (["first"] if remains_clean else ["first", "second"])
+        assert executions == [wrapper.removeprefix("hands_")] * (
+            0 if already_tainted else 2 if remains_clean else 1
+        )
+        assert prompts == ([] if already_tainted else ["first"])
         assert events == [
             ("acp_permission_outcome", {
-                "wrapper_name": wrapper, "tainted": tainted,
+                "wrapper_name": wrapper, "tainted": False,
                 "resource_resolvable": False, "outcome": outcome,
             })
-            for tainted, outcome in [
-                (already_tainted, "operator_allow"),
-                (not remains_clean, "session_grant" if remains_clean else "operator_allow"),
-            ]
+            for outcome in ([] if already_tainted else
+                            ["operator_allow", "session_grant"] if remains_clean else
+                            ["operator_allow"])
         ]
     finally:
         await router.close()
@@ -4623,33 +4636,19 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
             "status": "in_progress",
             "rawInput": {"path": "notes-2.txt", "old_text": "old-2", "new_text": "new-2"},
         }
-        assert await next_outgoing() == permission_request(
-            5, "edit-2", "notes-2.txt", "old-2", "new-2", tainted=True,
-        )
-        await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 5,
-            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
-        })
-        provider_frame_2 = await next_outgoing()
-        progress_token_2 = provider_frame_2["params"]["params"]["_meta"]["progressToken"]
-        assert progress_token_2 != progress_token
-        assert provider_frame_2 == provider_request(
-            6, "notes-2.txt", "old-2", "new-2", progress_token_2
-        )
-        await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 6, "result": {
-                "content": [{"type": "text", "text": "changed"}],
-                "structuredContent": {"changed": True},
-            },
-        })
+        # The next frame must be a refusal, not a permission or tools/call
+        # request. The daemon retains no grant and the proxy cache is untouched.
         terminal_2 = await next_outgoing()
+        assert terminal_2["method"] == "session/update"
         terminal_2_update = terminal_2["params"]["update"]
         assert terminal_2_update["_meta"] == {"mimir.sequence": 7}
-        assert {key: value for key, value in terminal_2_update.items() if key != "_meta"} == {
-            "sessionUpdate": "tool_call_update", "toolCallId": "edit-2",
-            "status": "completed", "rawOutput": '{"changed": true}',
-        }
+        assert terminal_2_update["sessionUpdate"] == "tool_call_update"
+        assert terminal_2_update["toolCallId"] == "edit-2"
+        assert terminal_2_update["status"] == "failed"
+        assert "scratch/" in terminal_2_update["rawOutput"]
+        assert "proposal PR" in terminal_2_update["rawOutput"]
         assert (await asyncio.wait_for(prompting_2, HANG_GUARD_SECONDS)).stop_reason == "end_turn"
+        assert transport.outgoing.empty()
 
         rejecting = asyncio.create_task(
             agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="reject it")])
@@ -4671,10 +4670,10 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
             "rawInput": {"path": "notes-3.txt", "old_text": "old-3", "new_text": "new-3"},
         }
         assert await next_outgoing() == permission_request(
-            7, "edit-3", "notes-3.txt", "old-3", "new-3"
+            5, "edit-3", "notes-3.txt", "old-3", "new-3"
         )
         await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 7,
+            "jsonrpc": "2.0", "id": 5,
             "result": {"outcome": {"outcome": "selected", "optionId": "reject_once"}},
         })
         rejected_terminal = await next_outgoing()
@@ -4706,19 +4705,19 @@ async def test_daemon_emits_permission_for_every_call_and_stores_no_grant(
         assert bare_progress["toolCallId"] == "edit-4"
         assert bare_progress["status"] == "in_progress"
         assert await next_outgoing() == permission_request(
-            8, "edit-4", "notes-4.txt", "old-4", "new-4"
+            6, "edit-4", "notes-4.txt", "old-4", "new-4"
         )
         await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 8,
+            "jsonrpc": "2.0", "id": 6,
             "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
         })
         bare_provider_frame = await next_outgoing()
         bare_token = bare_provider_frame["params"]["params"]["_meta"]["progressToken"]
         assert bare_provider_frame == provider_request(
-            9, "notes-4.txt", "old-4", "new-4", bare_token
+            7, "notes-4.txt", "old-4", "new-4", bare_token
         )
         await transport.incoming.put({
-            "jsonrpc": "2.0", "id": 9,
+            "jsonrpc": "2.0", "id": 7,
             "result": {"changed": "provider payload must not be echoed"},
         })
         bare_terminal = (await next_outgoing())["params"]["update"]

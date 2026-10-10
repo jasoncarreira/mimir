@@ -3554,6 +3554,7 @@ class Agent:
             **result_fields,
         )
         await self._turn_logger.write(record)
+        # Continuation sidecars are server-owned bookkeeping, not model writes.
         if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
@@ -3641,11 +3642,14 @@ class Agent:
         finalize_timeout = self._config.post_turn_timeout_seconds
         if finalize_timeout <= 0:
             finalize_timeout = 180
+        from .access_control import _turn_has_untrusted_active_ingest
+        semantic_writes_allowed = not _turn_has_untrusted_active_ingest(ctx.auth_context, ctx.ifc_labels)
         try:
-            await asyncio.wait_for(
-                fire_hooks("finalize", self._hooks, ctx, event, record),
-                timeout=finalize_timeout,
-            )
+            if semantic_writes_allowed:
+                await asyncio.wait_for(
+                    fire_hooks("finalize", self._hooks, ctx, event, record),
+                    timeout=finalize_timeout,
+                )
         except asyncio.TimeoutError:
             log.warning(
                 "finalize hooks exceeded post_turn_timeout (%ss) — skipped to "
@@ -3665,9 +3669,10 @@ class Agent:
         #      outputs are part of the same commit as the writes that
         #      triggered them.
         # Each is best-effort: failures log + return; turn record stays.
-        await self._post_turn_wiki_backlinks(ctx)
-        await self._post_turn_index_rebuild()
-        await self._post_turn_git_commit(ctx)
+        if semantic_writes_allowed:
+            await self._post_turn_wiki_backlinks(ctx)
+            await self._post_turn_index_rebuild()
+            await self._post_turn_git_commit(ctx)
 
         # 0.3.0: no auto-dispatch. The agent delivers via the send_message
         # tool only; the model's final text is captured as reasoning (it's

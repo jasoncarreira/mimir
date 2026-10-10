@@ -155,7 +155,10 @@ def _report_non_utf8(path: Path, bad_byte: int, position: int) -> None:
 def _prompt_file_is_trusted(home: Path, path: Path) -> bool:
     """Admit existing canonical HOME files with trusted reference integrity."""
     from .access_control import _home_reference_integrity
+    from ._paths import live_loader_path_allowed
 
+    if not live_loader_path_allowed(path, home):
+        return False
     try:
         home = home.resolve(strict=True)
         relative = path.resolve(strict=True).relative_to(home)

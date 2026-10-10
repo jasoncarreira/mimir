@@ -116,6 +116,9 @@ def load_skill(skill_dir: Path) -> SkillEntry | None:
     on any parse error.
     """
     skill_md = skill_dir / "SKILL.md"
+    from ._paths import live_loader_path_allowed
+    if not live_loader_path_allowed(skill_md):
+        return None
     if not skill_md.is_file():
         return None
     try:
