@@ -62,9 +62,11 @@ def _scope_from(event: dict):
     return _repo_pr_scope(
         provenance=access_control.RepoPRScopeProvenance.POLLER_PAYLOAD,
         repo=event.get("repo"),
-        principal=event.get("author"),
+        principal=event.get("pr_author") if event.get("event_type") == "pr_synchronize"
+        else event.get("author"),
         event_type=event.get("event_type"),
         review_state=event.get("state"),
+        pr_author_is_trusted=event.get("pr_author_is_trusted"),
         number=event.get("number"),
         head_repo=event.get("head_repo"),
         head_remote=event.get("head_remote"),
@@ -91,6 +93,7 @@ def test_pr_opened_emits_a_scopeable_snapshot(monkeypatch, captured):
 
     assert _check_prs_count(monkeypatch) == 1
     event = _only_of(captured, "pr_opened")
+    assert event["pr_author_is_trusted"] is True
     scope = _scope_from(event)
 
     assert scope is not None
@@ -118,7 +121,9 @@ def test_pr_synchronize_emits_a_scopeable_snapshot(monkeypatch, captured):
     )
 
     assert emitted is True
-    scope = _scope_from(_only_of(captured, "pr_synchronize"))
+    event = _only_of(captured, "pr_synchronize")
+    assert event["pr_author_is_trusted"] is True
+    scope = _scope_from(event)
     assert scope is not None
     assert scope.pr_number == 9
     assert RepoPRAction.PR_REVIEW.value in scope.allowed_operations

@@ -108,7 +108,9 @@ async def test_author_attested_forge_results(tmp_path, monkeypatch, read_tool, v
                 read_tool.name, {}, runtime.context, authorization,
                 result=result, provenance=provenance,
             )
-            assert labels.has_untrusted_active_ingest is (verdict is not True)
+            assert labels.has_untrusted_active_ingest is (
+                verdict is not True and read_tool not in (pr_comments, pr_reviews)
+            )
             assert all(source.integrity_effect == "active_ingest" for source in labels.sources)
         assert len(calls) == (2 if verdict is None else 1)
     finally:
@@ -618,7 +620,7 @@ async def test_allowlisted_bot_does_not_trust_mixed_noncollaborator_comments(mon
             await pr_comments.coroutine("owner/repo", 17, runtime=runtime)
         finally:
             provenance = access_control.end_protected_result_capture(token)
-        assert provenance.sources[0].integrity == "untrusted"
+        assert provenance.sources[0].integrity == "trusted"
         assert calls == ["outsider"]
     finally:
         set_forge_client(None)
@@ -645,7 +647,7 @@ async def test_mixed_comment_authorship_and_retry(monkeypatch, other_verdict):
     runtime = _runtime(scope)
     set_forge_client(client)
     try:
-        for expected in (other_verdict is True, other_verdict is not False):
+        for expected in (True, True):
             token = access_control.begin_protected_result_capture()
             try:
                 await pr_comments.coroutine("owner/repo", 17, runtime=runtime)
@@ -763,10 +765,15 @@ def test_author_attestation_downgrade_identifies_read_tool(monkeypatch, read_too
     finally:
         provenance = access_control.end_protected_result_capture(capture)
         set_forge_client(None)
-    assert provenance.sources[0].integrity == "untrusted"
-    assert len(recorded) == 1
-    assert recorded[0][0] == "forge_author_attestation_downgraded"
-    assert recorded[0][1]["tool"] == read_tool.name
+    if read_tool in (pr_reviews, pr_comments):
+        assert provenance.sources[0].integrity == "trusted"
+        assert recorded[0][0] == "github_content_withheld"
+        assert recorded[0][1]["tool"] == read_tool.name
+    else:
+        assert provenance.sources[0].integrity == "untrusted"
+        assert len(recorded) == 1
+        assert recorded[0][0] == "forge_author_attestation_downgraded"
+        assert recorded[0][1]["tool"] == read_tool.name
 
 
 def test_author_attestation_denial_without_ifc_state(monkeypatch):
@@ -1073,7 +1080,7 @@ async def test_author_provenance_cannot_clear_unknown_or_failed_results(monkeypa
             "pr_comments", {}, runtime.context, authorization,
             provenance=provenance, failed=case == "failed",
         )
-        assert labels.has_untrusted_active_ingest is (case not in {"empty", "failed"})
+        assert labels.has_untrusted_active_ingest is (case not in {"empty", "failed", "missing"})
     finally:
         set_forge_client(None)
 
@@ -1232,6 +1239,21 @@ class FakeForge:
             ReviewProjection("1", "reviewer", "approve", "LGTM", "now", "a" * 40),
         )
 
+    def __getattr__(self, name):
+        # The fixture can attest an author discovered from a snapshot or list.
+        # Other scoped projection tests deliberately have no attestation API;
+        # exposing one there would trigger unrelated metadata warmup calls.
+        if name != "author_is_trusted" or not getattr(self, "_attestation_pending", False):
+            raise AttributeError(name)
+        self._attestation_pending = False
+
+        def attest(repo, author):
+            self._attestation_pending = False
+            self._attested_once = True
+            return author in {"author", "untrusted-author", "reviewer"}
+
+        return attest
+
     def get_pull_request(self, scope):
         self.calls.append(("metadata", scope))
         return PullRequestProjection(
@@ -1242,15 +1264,17 @@ class FakeForge:
     def list_pull_requests(self, repository, *, state, base, head, limit,
                            author=None, merged_since=None):
         self.calls.append(("pr_list", repository, state, base, head, limit, author, merged_since))
+        self._attestation_pending = True
         return (PullRequestSummary(
             17, "Title", "open", "author", "change", "main", "a" * 40,
             "2026-10-01T00:00:00Z", None, "https://github.com/owner/repo/pull/17",
         ),)
 
     def search_pull_requests(self, repository, *, query, state, base, head, limit,
-                             author, merged_since):
+                              author, merged_since):
         self.calls.append(("pr_search", repository, query, state, base, head, limit,
                            author, merged_since))
+        self._attestation_pending = True
         return (PullRequestSummary(
             17, "Title", "merged", "author", "", "", "",
             "2026-10-03T00:00:00Z", "2026-10-02T00:00:00Z",
@@ -1259,6 +1283,8 @@ class FakeForge:
 
     def get_pull_request_snapshot(self, repository, number):
         self.calls.append(("snapshot", repository, number))
+        if not getattr(self, "_attested_once", False):
+            self._attestation_pending = True
         head_sha = (
             self.snapshot_heads.pop(0)
             if len(self.snapshot_heads) > 1
@@ -1305,10 +1331,13 @@ class FakeForge:
 
     def list_reviews(self, scope):
         self.calls.append(("reviews", scope))
+        if scope.pull_request_author != "reviewer":
+            self._attestation_pending = True
         return self.reviews
 
     def list_comments(self, scope):
         self.calls.append(("comments", scope))
+        self._attestation_pending = True
         return (CommentProjection("1", "reviewer", "note", "now", "now"),)
 
     def list_review_requests(self, scope):
@@ -2101,6 +2130,7 @@ def test_pr_edit_body_middleware_action_guard(monkeypatch, remediation: bool) ->
     scope = access_control._repo_pr_scope(
         provenance="poller_payload", repo="owner/repo",
         principal="reviewer" if remediation else "author",
+        pr_author_is_trusted=True,
         event_type="pr_review", review_state="CHANGES_REQUESTED",
         number=17, head_repo="owner/repo", head_remote="origin",
         head_ref="change", head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
@@ -3401,6 +3431,7 @@ def test_review_scope_has_no_event_or_requested_reviewer_gate_and_exact_safe_act
         provenance="poller_payload",
         repo="owner/repo",
         principal="author",
+        pr_author_is_trusted=True,
         event_type="pr_review_requested",
         number=17,
         head_repo="fork/repo",
@@ -3776,6 +3807,16 @@ async def test_operator_read_then_review_preserves_ifc_boundaries(
     )
     assert clean_shell.allowed is True
     read = await invoke(read_tool, {"repository": "owner/repo", "pull_request": 17})
+    if not author_trusted:
+        assert read.status == "error"
+        assert read.content == (
+            "pull request withheld: its author is not a repository collaborator; "
+            "the operator has been notified"
+        )
+        assert attacker_text not in read.content
+        assert context.server_discovered_pr_states.resolve("owner/repo", 17) is None
+        assert client.calls == [("snapshot", "owner/repo", 17)]
+        return
     assert read.status != "error", read.content
     if read_tool is pr_comments:
         assert attacker_text in read.content
@@ -4702,7 +4743,7 @@ def test_pr_list_repository_shape_is_independent_of_configuration_check(monkeypa
 @pytest.mark.parametrize("search", [None, "1445"])
 def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch, search):
     client = FakeForge()
-    monkeypatch.setattr(client, "author_is_trusted", lambda *args: pytest.fail("list attested"), raising=False)
+    monkeypatch.setattr(client, "author_is_trusted", lambda *args: False, raising=False)
     set_forge_client(client)
     monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
     runtime = _runtime(_scope(RepoPRAction.INSPECT))
@@ -4712,6 +4753,8 @@ def test_pr_list_is_untrusted_repository_source_without_attestation(monkeypatch,
     finally:
         provenance = access_control.end_protected_result_capture(capture)
     assert provenance is None
+    assert result[0]["withheld"] is True
+    assert "title" not in result[0]
     authorization = access_control.ToolAuthorization(
         tool_name="pr_list", decision=access_control.OperationDecision.ADMIN_REQUIRED,
         allowed=True, flow_direction=access_control.ToolFlowDirection.SOURCE,
@@ -4733,3 +4776,102 @@ def test_pr_list_guidance_replaces_shell_listing() -> None:
         content = (skills / name / "SKILL.md").read_text(encoding="utf-8")
         assert "gh pr list" not in content
         assert "pr_list(" in content
+
+
+@pytest.mark.parametrize("read_tool", [pr_reviews, pr_comments])
+def test_outsider_thread_text_withheld_and_trusted_items_keep_order(monkeypatch, read_tool):
+    from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+    client = FakeForge()
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    monkeypatch.setattr(client, "author_is_trusted",
+                        lambda _repo, author: author == "collaborator", raising=False)
+    if read_tool is pr_reviews:
+        monkeypatch.setattr(client, "list_reviews", lambda scope: (
+            ReviewProjection("1", "collaborator", "APPROVED", "first", "now", "a" * 40),
+            ReviewProjection(OUTSIDER_MARKER, "outsider", "COMMENTED", OUTSIDER_MARKER, "now", None),
+            ReviewProjection("3", "collaborator", "COMMENTED", "last", "now", None),
+        ))
+    else:
+        monkeypatch.setattr(client, "list_comments", lambda scope: (
+            CommentProjection("1", "collaborator", "first", "now", "now"),
+            CommentProjection(OUTSIDER_MARKER, "outsider", OUTSIDER_MARKER,
+                              "now", "now", OUTSIDER_MARKER, 1),
+            CommentProjection("3", "collaborator", "last", "now", "now"),
+        ))
+    set_forge_client(client)
+    token = access_control.begin_protected_result_capture()
+    try:
+        result = read_tool.func("owner/repo", 17, runtime=_runtime(_scope(RepoPRAction.INSPECT)))
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+        set_forge_client(None)
+    assert [item["body"] for item in result[:2]] == ["first", "last"]
+    assert result[2]["withheld"] is True
+    assert provenance.sources[0].integrity == "trusted"
+    assert events == [("github_content_withheld", {
+        "tool": read_tool.name,
+        "kind": "review" if read_tool is pr_reviews else "review_comment",
+        "count": 1, "reason": "non_collaborator",
+    })]
+    assert_marker_absent(result, provenance, client.calls, events)
+
+
+@pytest.mark.parametrize("search", [None, "marker"])
+def test_pr_list_withholds_unattested_titles_and_keeps_trusted(monkeypatch, search):
+    from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+    client = FakeForge()
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda name, **fields: events.append((name, fields)))
+    entries = (
+        PullRequestSummary(17, "trusted", "open", "collaborator", "main", "main", "a" * 40,
+                           "now", None, "https://github.com/owner/repo/pull/17"),
+        PullRequestSummary(18, OUTSIDER_MARKER, "open", "outsider", OUTSIDER_MARKER,
+                           "main", "b" * 40, "now", None,
+                           "https://github.com/owner/repo/pull/18"),
+    )
+    monkeypatch.setattr(client, "list_pull_requests", lambda *a, **kw: entries)
+    monkeypatch.setattr(client, "search_pull_requests", lambda *a, **kw: entries)
+    monkeypatch.setattr(client, "author_is_trusted",
+                        lambda _repo, author: author == "collaborator", raising=False)
+    set_forge_client(client)
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    try:
+        result = pr_list.func(repository="owner/repo", search=search,
+                              runtime=_runtime(_scope(RepoPRAction.INSPECT)))
+    finally:
+        set_forge_client(None)
+    assert result[0]["title"] == "trusted"
+    assert result[1]["number"] == 18
+    assert result[1]["kind"] == "pull_request"
+    assert "title" not in result[1]
+    assert events == [("github_content_withheld", {
+        "tool": "pr_list", "kind": "pull_request", "count": 1,
+        "reason": "non_collaborator",
+    })]
+    assert_marker_absent(result, client.calls, events)
+
+
+def test_unavailable_comment_verdict_is_retried_on_next_turn(monkeypatch):
+    client = FakeForge()
+    verdicts = iter((None, True))
+    calls = []
+    monkeypatch.setattr(client, "author_is_trusted",
+                        lambda repo, author: calls.append(author) or next(verdicts), raising=False)
+    monkeypatch.setattr(client, "list_comments", lambda scope: (
+        CommentProjection("1", "other", "safe after attestation", "now", "now"),
+    ))
+    scope = _scope(RepoPRAction.INSPECT)
+    set_forge_client(client)
+    try:
+        first = pr_comments.func("owner/repo", 17, runtime=_runtime(scope))
+        second = pr_comments.func("owner/repo", 17, runtime=_runtime(scope))
+    finally:
+        set_forge_client(None)
+    assert first[0]["withheld"] is True
+    assert second[0]["body"] == "safe after attestation"
+    assert calls == ["other", "other"]

@@ -1356,6 +1356,7 @@ def _repo_pr_scope_resolution(
     actor: object = None,
     author_is_trusted: object = None,
     pr_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
@@ -1388,12 +1389,13 @@ def _repo_pr_scope_resolution(
     )
     if (
         not self_login
-        or (is_remediation and principal != self_login)
         or not isinstance(repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
         or not isinstance(number, int)
         or isinstance(number, bool)
         or number < 1
+        or not isinstance(principal, str)
+        or not principal
         or not isinstance(head_repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
         or (is_remediation and head_repo.lower() != repo.lower())
@@ -1419,6 +1421,35 @@ def _repo_pr_scope_resolution(
             )
         )
     root, origin = binding_resolution.binding
+    if principal != self_login and pr_author_is_trusted is not True:
+        from .event_logger import log_event_sync
+        from .github_withhold import sanitize_login
+
+        reason = (
+            "attestation_unavailable" if pr_author_is_trusted is None
+            else "bot_not_allowlisted" if principal.endswith("[bot]")
+            else "non_collaborator"
+        )
+        try:
+            log_event_sync(
+                "github_outsider_pr_refused", repo=repo, number=number,
+                author=sanitize_login(principal), reason=reason,
+            )
+            log_event_sync(
+                "github_content_withheld", tool="pr_scope", kind="pull_request",
+                count=1, reason=reason,
+            )
+        except RuntimeError:
+            # Standalone callers do not initialize the process event logger.
+            pass
+        return RepoPRScopeResolution(refusal_reason=(
+            "pull request withheld: its author is not a repository collaborator; "
+            "the operator has been notified"
+        ))
+    if is_remediation and principal != self_login:
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
     from .models import RepoPRActionScope
 
     return RepoPRScopeResolution(scope=RepoPRActionScope(
@@ -1491,6 +1522,7 @@ def create_server_discovered_heartbeat_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     event_type: str,
+    pr_author_is_trusted: object = None,
 ) -> Any:
     """Create heartbeat authority from one provider-normalized live PR snapshot."""
     if (
@@ -1510,6 +1542,7 @@ def create_server_discovered_heartbeat_scope(
         head_sha=pull_request.head_sha,
         base_ref=pull_request.base_ref,
         base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
     )
 
 
@@ -1518,10 +1551,12 @@ def create_server_discovered_review_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     review_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> Any:
     """Issue standing review or fresh-remediation authority from a live PR."""
     return resolve_server_discovered_review_scope(
         repo, pull_request, review_state=review_state,
+        pr_author_is_trusted=pr_author_is_trusted,
     ).scope
 
 
@@ -1530,6 +1565,7 @@ def resolve_server_discovered_review_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     review_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> RepoPRScopeResolution:
     """Resolve standing review or fresh-remediation authority with a refusal."""
     if (
@@ -1552,6 +1588,7 @@ def resolve_server_discovered_review_scope(
         head_sha=pull_request.head_sha,
         base_ref=pull_request.base_ref,
         base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
     )
 
 
@@ -1593,11 +1630,13 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         scope = _repo_pr_scope(
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
             repo=item.get("repo"),
-            principal=item.get("author"),
+            principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
+                       else item.get("author")),
             event_type=item.get("event_type"),
             review_state=item.get("state"),
             actor=item.get("actor"),
             author_is_trusted=item.get("author_is_trusted"),
+            pr_author_is_trusted=item.get("pr_author_is_trusted"),
             pr_state=item.get("pr_state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),

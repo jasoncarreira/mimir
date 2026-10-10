@@ -10032,6 +10032,64 @@ def _github_poller_auth(
     )
 
 
+@pytest.mark.parametrize("path", ["review", "heartbeat", "poller"])
+@pytest.mark.parametrize("verdict", [False, None, 1, "yes", "missing"])
+def test_outsider_pr_scope_requires_exact_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, verdict: object,
+) -> None:
+    from mimir.models import NormalizedPullRequestSnapshot
+
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", author="outside-author")
+    if verdict != "missing":
+        item["pr_author_is_trusted"] = verdict
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    if path == "poller":
+        assert _github_poller_auth(authority, item).repo_pr_action_scope is None
+    else:
+        snapshot = NormalizedPullRequestSnapshot(
+            repo="o/r", state="open", number=42, author="outside-author",
+            head_repo="o/r", head_remote="origin", head_ref="worklink/42",
+            head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+        )
+        if path == "review":
+            resolution = access_control.resolve_server_discovered_review_scope(
+                "o/r", snapshot, pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            )
+            assert resolution.scope is None
+            assert resolution.refusal_reason == (
+                "pull request withheld: its author is not a repository collaborator; "
+                "the operator has been notified"
+            )
+        else:
+            assert access_control.create_server_discovered_heartbeat_scope(
+                "o/r", snapshot, event_type="heartbeat_pr_maintenance",
+                pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            ) is None
+    refused, withheld = events
+    assert refused == ("github_outsider_pr_refused", {
+        "repo": "o/r", "number": 42, "author": "outside-author",
+        "reason": "attestation_unavailable" if verdict in (None, "missing")
+        else "non_collaborator",
+    })
+    assert withheld[0] == "github_content_withheld"
+    assert withheld[1]["count"] == 1
+
+
+def test_poller_collaborator_scope_needs_forwarded_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_opened", author="collaborator", pr_author_is_trusted=True)
+    scope = _github_poller_auth(authority, item).repo_pr_action_scope
+    assert scope is not None
+    assert scope.pull_request_author == "collaborator"
+
+
 def test_fresh_changes_requested_review_mints_remediation_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -10147,8 +10205,11 @@ def test_comment_remediation_guards_remain_review_only(
 
     scope = _github_poller_auth(authority, item).repo_pr_action_scope
 
-    assert scope is not None
-    assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
+    if change == "author":
+        assert scope is None
+    else:
+        assert scope is not None
+        assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
 
 
 @pytest.mark.parametrize(
@@ -10179,10 +10240,7 @@ def test_fresh_changes_requested_remediation_applies_every_write_guard(
     auth = _github_poller_auth(authority, item)
 
     if field == "author":
-        scope = auth.repo_pr_action_scope
-        assert scope is not None
-        assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
-        assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+        assert auth.repo_pr_action_scope is None
     else:
         assert auth.repo_pr_action_scope is None
 
