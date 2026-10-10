@@ -165,6 +165,40 @@ def test_symlink_turns_container_never_traversed(tmp_path):
     assert target.exists()
 
 
+@pytest.mark.parametrize(
+    ("root_name", "link_name"),
+    [
+        ("scratch/turns", "scratch/turns"),
+        ("scratch/turns/nested", "scratch/turns"),
+        ("scratch/turns/linked-turn", "scratch/turns/linked-turn"),
+    ],
+)
+def test_custom_turns_root_symlink_is_refused(tmp_path, root_name, link_name):
+    now = time.time()
+    target = tmp_path / "outside"
+    nested = _make_tree(target, "nested", days=5, now=now)
+    payload = nested / "sub" / "payload.bin"
+    expected_payload = payload.read_bytes()
+    expected_identity = (payload.stat().st_dev, payload.stat().st_ino)
+    _age(target, 5, now=now)
+    link = tmp_path / link_name
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target, target_is_directory=True)
+    _age(link, 5, now=now)
+
+    result = sweep_scratch_roots(tmp_path, roots=(root_name,), now=now)
+
+    assert result.errors == (f"{root_name}: unsafe scratch container",)
+    assert result.removed == ()
+    assert result.bytes_reclaimed == 0
+    assert link.is_symlink() and link.readlink() == target
+    assert sorted(target.iterdir()) == [nested]
+    assert sorted(nested.iterdir()) == [nested / "sub"]
+    assert sorted((nested / "sub").iterdir()) == [payload]
+    assert payload.read_bytes() == expected_payload
+    assert (payload.stat().st_dev, payload.stat().st_ino) == expected_identity
+
+
 def test_turn_admission_and_reset_do_not_wait_for_recursive_deletion(tmp_path, monkeypatch):
     from mimir import scratch_janitor
     from mimir._context import set_current_turn, reset_current_turn
