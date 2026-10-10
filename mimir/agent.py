@@ -1937,8 +1937,13 @@ class Agent:
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver) and (named_reply or bare_reply):
             sync_pending(self._config.home)
-            sync_pairings(self._config.home, getattr(self._config, "operator_alert_channel", ""), self._identity_resolver)
+            await asyncio.to_thread(
+                sync_pairings, self._config.home,
+                getattr(self._config, "operator_alert_channel", ""), self._identity_resolver,
+            )
             pending_entries = pending_approvals(event.channel_id)
+            if bare_reply:
+                pending_entries = tuple(entry for entry in pending_entries if entry.kind != "pair")
             memory_reply = is_mp_reply(event) or (bare_reply and bool(pending_entries) and all(
                 entry.kind == "mp" for entry in pending_entries
             ))

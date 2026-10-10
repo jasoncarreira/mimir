@@ -110,6 +110,73 @@ def test_pairing_mutations_require_matching_request_id(tmp_path):
     assert resolver.identity("discord-123").pairing.status == "pending"
 
 
+@pytest.mark.parametrize("kind", ["mp", "op"])
+@pytest.mark.parametrize("reference_pair", [False, True])
+def test_bare_reply_ignores_pairings_before_candidate_selection(tmp_path, kind, reference_pair):
+    import time
+
+    resolver, ids = _setup(tmp_path)
+    channel = f"ops-{tmp_path.name}"
+    sync_pending(tmp_path, channel, resolver)
+    pair_id = ids["slack-U1"]
+    approval_requests.set_prompt_message_id(pair_id, "pair-prompt")
+    calls = []
+    entry = approval_requests.register(
+        kind=kind, channel_id=channel, description="ordinary approval",
+        expires_at=time.monotonic() + 3600,
+        resolver=lambda *args: calls.append(args[0]) or "granted",
+    )
+    try:
+        event = AgentEvent(
+            trigger="user_message", author="discord-99", source="discord",
+            channel_id=channel, content="approve",
+            extra={"reply_to_message_id": "pair-prompt"} if reference_pair else {},
+        )
+        result = approval_requests.resolve(event, resolver)
+        assert result.entry == entry and result.status == "granted"
+        assert calls == ["approve"]
+        assert pair_id in {e.approval_id for e in approval_requests.pending(channel)}
+        assert resolver.identity("slack-U1").pairing.status == "pending"
+    finally:
+        approval_requests.cancel(entry.approval_id)
+        for request_id in ids.values():
+            approval_requests.cancel(request_id)
+
+
+@pytest.mark.parametrize("author,source,channel,bare", [
+    ("discord-123", "discord", "ops", False),
+    ("discord-99", "web", "ops", False),
+    ("discord-99", "api", "ops", False),
+    ("discord-99", "stdin", "ops", False),
+    ("discord-99", "discord", "other", False),
+    ("discord-99", "discord", "ops", True),
+])
+async def test_complete_reply_directly_rejects_unauthorized_or_unnamed_events(
+    tmp_path, author, source, channel, bare,
+):
+    resolver, ids = _setup(tmp_path)
+    request_id = ids["slack-U1"]
+    sync_pending(tmp_path, "ops", resolver)
+    valid = AgentEvent(trigger="user_message", author="discord-99", source="discord",
+                       channel_id="ops", content=f"approve {request_id}")
+    resolution = approval_requests.resolve(valid, resolver)
+    assert resolution.entry.approval_id == request_id
+    before = (tmp_path / "state" / "identities.yaml").read_bytes()
+    event = AgentEvent(
+        trigger="user_message", author=author, source=source, channel_id=channel,
+        content="approve" if bare else valid.content,
+        extra={"_pairing_action": valid.extra["_pairing_action"]},
+    )
+    try:
+        assert await complete_reply(tmp_path, "ops", event, resolution, resolver) == "no pending request"
+        assert (tmp_path / "state" / "identities.yaml").read_bytes() == before
+        assert not resolver.is_authorized("slack-U1")
+        assert request_id in {e.approval_id for e in approval_requests.pending("ops")}
+    finally:
+        for owned_id in ids.values():
+            approval_requests.cancel(owned_id)
+
+
 def test_no_operator_channel_skips_chat_registration(tmp_path, monkeypatch):
     resolver, ids = _setup(tmp_path)
     def unexpected_register(**kwargs):

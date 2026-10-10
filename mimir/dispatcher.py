@@ -270,8 +270,12 @@ class Dispatcher:
         ):
             existing = self._queues.get(channel_id)
             if existing is None or existing.qsize() == 0:
-                from .pairing_approval import sync_pending as sync_pairings
-                sync_pairings(self._config.home, getattr(self._config, "operator_alert_channel", ""), self._identity_resolver)
+                operator_channel = getattr(self._config, "operator_alert_channel", "")
+                if operator_channel and channel_id == operator_channel:
+                    from .pairing_approval import sync_pending as sync_pairings
+                    await asyncio.to_thread(
+                        sync_pairings, self._config.home, operator_channel, self._identity_resolver,
+                    )
                 from .mid_turn_injection import inject_authenticated_message
                 injection_status = inject_authenticated_message(
                     channel_id, event, self._identity_resolver,

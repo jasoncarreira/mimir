@@ -632,7 +632,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
     ("Alice\u202ediscord-999\u202c\u200b", "Alicediscord-999"),
 ])
 async def test_pairing_operator_alert_neutralizes_sender_display_name(
-    monkeypatch: pytest.MonkeyPatch, alert_channel: str, display: str, cleaned: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alert_channel: str, display: str, cleaned: str,
 ) -> None:
     from types import SimpleNamespace
     from mimir.server import _PairingNotifier
@@ -641,7 +641,7 @@ async def test_pairing_operator_alert_neutralizes_sender_display_name(
     channels = MagicMock()
     channels.send = AsyncMock()
     notifier = _PairingNotifier(
-        SimpleNamespace(operator_alert_channel=alert_channel,
+        SimpleNamespace(home=tmp_path, operator_alert_channel=alert_channel,
                         pairing_operator_digest_delay_seconds=60.0), channels,
     )
     try:
@@ -657,6 +657,46 @@ async def test_pairing_operator_alert_neutralizes_sender_display_name(
         assert "<!channel" not in alert and "<!subteam" not in alert
         assert f"discord-123 ({cleaned}; discord; DM)" in alert
         assert "mimir identities approve-pairing discord-123" in alert
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_alert_constructs_and_reloads_resolver_off_loop(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    loop_thread = threading.get_ident()
+    operations = []
+
+    class Resolver:
+        def __init__(self, home):
+            assert home == tmp_path
+            assert threading.get_ident() != loop_thread
+            operations.append("construct")
+
+        def reload(self):
+            assert threading.get_ident() != loop_thread
+            operations.append("reload")
+
+        def identity(self, canonical):
+            return SimpleNamespace(pairing=SimpleNamespace(request_id="pair-abcd"))
+
+    monkeypatch.setattr("mimir.identities.IdentityResolver", Resolver)
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(SimpleNamespace(
+        home=tmp_path, operator_alert_channel="discord-ops",
+        pairing_operator_digest_delay_seconds=60.0,
+    ), channels)
+    try:
+        await notifier.notify_operator(canonical="discord-123", display="Alice",
+                                       platform="discord", channel_id="discord-1", delivery="dm")
+        await notifier.flush_operator_alerts()
+        assert operations == ["construct", "reload"]
+        assert "approve pair-abcd" in channels.send.await_args.args[1]
     finally:
         await notifier.aclose()
 

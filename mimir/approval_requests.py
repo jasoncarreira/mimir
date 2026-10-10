@@ -181,6 +181,9 @@ def resolve(
                     return Resolution("already_resolved", message=f"already resolved {named_id}")
                 return Resolution("no_pending_request", message=f"no pending request {named_id}")
         else:
+            # Pairings require an explicit named ID; exclude them before both
+            # reply-reference selection and single/ambiguous candidate checks.
+            entries = [entry for entry in entries if entry.kind != "pair"]
             reference = event.extra.get("reply_to_message_id") if event.source == "discord" else None
             referenced = next((e for e in entries if reference is not None
                                and e.prompt_message_id == str(reference)), None)

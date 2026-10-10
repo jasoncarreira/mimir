@@ -1274,6 +1274,8 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
 ):
     from mimir import approval_requests
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir.pairing_approval import sync_pending as sync_pairings
 
     channel = f"discord-op-e2e-{tmp_path.name}"
     model = _FakeAgent([AIMessage(content="live-turn path")])
@@ -1283,6 +1285,14 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     aliases: [discord-99]
     access: {roles: [admin]}
 """)
+
+    agent._config.operator_alert_channel = channel
+    request_pairing_with_code(
+        agent._config.home, "discord-123", "discord",
+        channel_id="dm-discord-123", is_dm=True,
+    )
+    sync_pairings(agent._config.home, channel, agent._identity_resolver)
+    pair_id = agent._identity_resolver.identity("discord-123").pairing.request_id
 
     def unexpected_resolution(*args):
         pytest.fail("turn-bound request resolved by standalone pre-turn path")
@@ -1299,9 +1309,10 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
         ))
         assert result.error is None
         assert len(model.invocations) == 1
-        assert approval_requests.pending(channel) == (entry,)
+        assert {e.approval_id for e in approval_requests.pending(channel)} == {entry.approval_id, pair_id}
     finally:
         approval_requests.cancel(entry.approval_id)
+        approval_requests.cancel(pair_id)
 
 
 def test_agent_audience_provider_reuses_message_buffer_identity_resolver(

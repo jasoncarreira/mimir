@@ -207,8 +207,12 @@ class _PairingNotifier:
         pending, self._operator_pending = self._operator_pending, []
         lines = ["Pairing approval needed:"]
         from .identities import IdentityResolver
-        resolver = IdentityResolver(self._config.home)
-        resolver.reload()
+        def load_resolver():
+            resolver = IdentityResolver(self._config.home)
+            resolver.reload()
+            return resolver
+
+        resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
             identity = resolver.identity(item["canonical"])

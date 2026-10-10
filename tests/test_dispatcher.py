@@ -1957,6 +1957,29 @@ async def test_startup_principal_boundary_preserves_fifo(tmp_path, author):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["c1", "c2"])
+async def test_pairing_sync_is_operator_channel_only_and_offloaded(tmp_path, monkeypatch, channel):
+    import threading
+
+    disp = Dispatcher(replace(_inj_config(tmp_path, ("c",)), operator_alert_channel="c1"))
+    disp._in_flight.add(channel)
+    _arm_authenticated_injection(disp, tmp_path)
+    loop_thread = threading.get_ident()
+    calls = []
+
+    def sync(home, operator_channel, resolver):
+        assert threading.get_ident() != loop_thread
+        calls.append((home, operator_channel, resolver))
+
+    monkeypatch.setattr("mimir.pairing_approval.sync_pending", sync)
+    monkeypatch.setattr("mimir.mid_turn_injection.inject_authenticated_message", lambda *args: "injected")
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id=channel, content="follow-up", author="alice",
+    ))
+    assert calls == ([(tmp_path, "c1", disp._identity_resolver)] if channel == "c1" else [])
+
+
+@pytest.mark.asyncio
 async def test_enqueue_injects_when_in_flight_and_opted_in(tmp_path: Path):
     disp = Dispatcher(_inj_config(tmp_path, ("c",)), None)
     disp._in_flight.add("c1")          # simulate a running turn
