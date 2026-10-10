@@ -635,3 +635,40 @@ def test_retained_scope_centrally_authorizes_only_exact_unprotected_writes(
                 tool, reader.auth, enforce=True, target_channel=str(target),
                 arguments={"file_path": str(target)}, ifc_labels=InformationFlowLabels(),
             ).allowed
+
+
+def test_retained_commit_passes_sink_gate_and_refuses_outsider_ingest(
+    retained_reader, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = retained_reader
+    scope = reader.auth.retained_factory_scope
+    arguments = {"repository": scope.repository, "pull_request": scope.issue_id,
+                 "paths": ("issue.txt",), "message": "secret-commit-message"}
+    registry = ac.ToolRegistry()
+    seen = []
+    original_gate = ac.SinkGate.check_sink_flow.__func__
+
+    def observing_gate(cls, *args, **kwargs):
+        seen.append(args[0])
+        return original_gate(cls, *args, **kwargs)
+
+    monkeypatch.setattr(ac.SinkGate, "check_sink_flow", classmethod(observing_gate))
+    clean = registry.authorize_tool(
+        "repo_commit", reader.auth, enforce=False, arguments=arguments,
+    )
+    assert clean.allowed and clean.repo_pr_action_scope == scope
+    outsider = SourceLabel(
+        principal="outsider", domain="github", resource_id="outside-comment",
+        bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
+        integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = reader.auth.ifc_labels.with_source(outsider)
+    reader.state.merge(labels, fallback=reader.auth.ifc_labels)
+    reader.auth.ifc_labels = labels
+    refused = registry.authorize_tool(
+        "repo_commit", reader.auth, enforce=False, arguments=arguments,
+    )
+    assert "repo_commit" in seen
+    assert not refused.allowed and refused.reason == "repo_publish_blocked_by_untrusted_ingest"
+    assert refused.refusal_detail == ac._REPO_PUBLISH_INGEST_REFUSAL
+    assert "secret-commit-message" not in refused.refusal_detail

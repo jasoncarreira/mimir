@@ -5500,6 +5500,149 @@ def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
     ).reason == "ifc_declassification_approved"
 
 
+_REPO_PUBLISH_NAMES = (
+    "repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push",
+)
+
+
+def _outsider_repo_publish_auth() -> AuthContext:
+    auth = _trusted_operator_write_auth(admin=True)
+    outsider = SourceLabel(
+        principal="outside", domain="github", resource_id="outsider-comment-marker secret-commit-message",
+        bridge_instance="forge", source_kind="protected_tool", sensitivity="public",
+        integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+    )
+    labels = auth.ifc_labels.with_source(outsider)
+    return replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+
+
+@pytest.mark.parametrize("tool_name", _REPO_PUBLISH_NAMES)
+def test_repo_publish_outsider_veto_and_original_enforced_denial(tool_name: str) -> None:
+    auth = _outsider_repo_publish_auth()
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    target = "owner/repo#pull/7"
+    shadow = SinkGate.check_sink_flow(
+        tool_name, target, auth.ifc_labels, auth,
+        enforce=False, repo_pr_action_scope=scope,
+    )
+    enforced = SinkGate.check_sink_flow(
+        tool_name, target, auth.ifc_labels, auth,
+        enforce=True, repo_pr_action_scope=scope,
+    )
+    assert not shadow.allowed and not shadow.is_shadow_decision
+    assert shadow.decision == OperationDecision.ADMIN_REQUIRED
+    assert shadow.required_tier == access_control.AccessTier.ADMIN and shadow.would_block
+    assert shadow.reason == "repo_publish_blocked_by_untrusted_ingest"
+    assert shadow.refusal_detail == access_control._REPO_PUBLISH_INGEST_REFUSAL
+    assert not enforced.allowed
+    assert enforced.reason == "ifc_label_blocked:forge"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool_name", _REPO_PUBLISH_NAMES)
+def test_repo_publish_clean_turn_matches_original(
+    tool_name: str, enforce: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    labels = auth.ifc_labels.with_source(
+        _repository_result_labels("owner/repo", 7, scope.observed_head_sha).sources[0],
+    )
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    kwargs = dict(enforce=enforce, repo_pr_action_scope=scope)
+    decision = SinkGate.check_sink_flow(tool_name, "owner/repo#pull/7", labels, auth, **kwargs)
+    with monkeypatch.context() as original:
+        original.setattr(access_control, "_turn_has_untrusted_active_ingest", lambda *_: False)
+        baseline = SinkGate.check_sink_flow(tool_name, "owner/repo#pull/7", labels, auth, **kwargs)
+    assert decision == baseline
+    assert decision.allowed
+
+
+@pytest.mark.parametrize("tool_name", ["repo_commit", "repo_push"])
+def test_trusted_repository_and_attested_ci_output_do_not_veto(tool_name: str) -> None:
+    auth = _trusted_operator_write_auth(admin=True)
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    pr_read = replace(
+        _repository_result_labels("owner/repo", 7, scope.observed_head_sha).sources[0],
+        integrity="trusted", integrity_effect="active_ingest",
+    )
+    ci_log = replace(pr_read, resource_id="owner/repo#pull/7@" + scope.observed_head_sha,
+                     bridge_instance="ci")
+    labels = auth.ifc_labels.with_source(pr_read).with_source(ci_log)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    assert not access_control._turn_has_untrusted_active_ingest(auth, labels)
+    for enforce in (False, True):
+        decision = SinkGate.check_sink_flow(
+            tool_name, "owner/repo#pull/7", labels, auth,
+            enforce=enforce, repo_pr_action_scope=scope,
+        )
+        assert decision.allowed, decision.reason
+
+
+@pytest.mark.parametrize("tool_name", (
+    "repo_stage", "repo_merge_abort", "repo_rebase_abort", "repo_revert_abort",
+    "repo_cleanup", "repo_checkout", "repo_status", "repo_diff", "repo_unmerged",
+))
+def test_repo_nonpublishing_tools_keep_original_decision(
+    tool_name: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = _outsider_repo_publish_auth()
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    for enforce in (False, True):
+        kwargs = dict(enforce=enforce, repo_pr_action_scope=scope)
+        actual = SinkGate.check_sink_flow(tool_name, "owner/repo#pull/7", auth.ifc_labels, auth, **kwargs)
+        with monkeypatch.context() as original:
+            original.setattr(access_control, "_turn_has_untrusted_active_ingest", lambda *_: False)
+            baseline = SinkGate.check_sink_flow(tool_name, "owner/repo#pull/7", auth.ifc_labels, auth, **kwargs)
+        assert actual == baseline
+        if baseline.allowed:
+            assert actual.allowed
+
+
+@pytest.mark.parametrize("tool_name", ["repo_commit", "repo_push"])
+def test_repo_publish_one_time_grant_is_consumed(tool_name: str) -> None:
+    auth = _outsider_repo_publish_auth()
+    target = "owner/repo#pull/7"
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    assert auth.ifc_state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category="forge", destination=target,
+        canonical_principal=auth.canonical_principal, lifetime_seconds=30,
+        durable_audit=lambda *_: True,
+    )
+    def check(destination: str):
+        return SinkGate.check_sink_flow(
+            tool_name, destination, auth.ifc_labels, auth,
+            enforce=False, repo_pr_action_scope=scope,
+        )
+    assert check("owner/repo#pull/8").reason == "repo_publish_blocked_by_untrusted_ingest"
+    assert check(target).reason == "ifc_declassification_approved"
+    assert check(target).reason == "repo_publish_blocked_by_untrusted_ingest"
+
+
+def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import event_logger
+
+    auth = _outsider_repo_publish_auth()
+    scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+    events = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append((kind, fields)))
+    for tool_name in ("repo_commit", "repo_push"):
+        decision = SinkGate.check_sink_flow(
+            tool_name, "owner/repo#pull/7/private-path-marker", auth.ifc_labels, auth,
+            enforce=False, repo_pr_action_scope=scope,
+        )
+        assert decision.refusal_detail == access_control._REPO_PUBLISH_INGEST_REFUSAL
+        assert not hasattr(decision, "ifc_labels")
+        assert decision.protected_source_resources is None
+        assert events[-1] == ("repo_publish_blocked_by_untrusted_ingest", {
+            "tool": tool_name, "scope_id": scope.scope_id,
+            "domain": "github", "source_kind": "protected_tool",
+        })
+        for marker in ("outsider-comment-marker", "private-path-marker", "secret-commit-message"):
+            assert marker not in decision.refusal_detail
+            assert marker not in str(events[-1])
+
+
 @pytest.mark.parametrize("integrity,effect", [
     ("trusted", "active_ingest"), ("untrusted", "informational"),
 ])

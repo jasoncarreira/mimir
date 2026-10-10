@@ -696,6 +696,17 @@ access. See the
 [`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
 default, supported command syntax, and non-Python examples.
 
+### Always-on post-ingest repository vetoes
+
+Regardless of the enforcement switch or trigger, untrusted active ingest in a
+turn blocks `repo_test` from executing checkout code (#1913). The same condition
+blocks `repo_commit`, `repo_merge`, `repo_rebase`, `repo_revert`, and `repo_push`
+from creating or publishing commits, including retained Worklink remediation
+commits (#1937). A clean attested checkout does not override this turn-level
+decision. A one-time operator `approve_sink_once` grant for the exact forge sink
+can allow one call; otherwise use a clean turn. Staging, local abort/reset and
+repository reads retain their existing authorization decisions.
+
 ### Contained repository-code execution
 
 `repo_test` runs its configured command in a disposable snapshot of the active

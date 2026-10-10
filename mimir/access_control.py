@@ -6140,6 +6140,74 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
 
 
 _WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
+_REPO_PUBLISH_TOOLS = frozenset({
+    "repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push",
+})
+_REPO_PUBLISH_INGEST_REFUSAL = (
+    "This turn read untrusted outside content, so it cannot create or publish commits. "
+    "Describe the intended change in a PR comment (pr_comment) or a message to the "
+    "operator (send_message), or ask the operator for a fresh turn or a one-time "
+    "approve_sink_once grant."
+)
+
+
+def _post_ingest_one_time_grant(
+    tool_name: str, target: str | None, sink_category: SinkCategory,
+    ifc_labels: Any, auth_context: Any, service: ServicePrincipal | None,
+) -> "ToolAuthorization | None":
+    """Spend the same exact-destination grant for either post-ingest veto."""
+    from .models import InformationFlowLabels
+
+    normalized = normalize_sink_destination(sink_category, target)
+    state = getattr(auth_context, "ifc_state", None)
+    principal = getattr(auth_context, "canonical_principal", None)
+    if (isinstance(ifc_labels, InformationFlowLabels)
+            and normalized is not None and isinstance(principal, str)
+            and state is not None and state.consume_sink_approval(
+                current=ifc_labels, sink_category=sink_category.value,
+                destination=normalized, canonical_principal=principal,
+                shadow=False,
+            )):
+        return ToolAuthorization(
+            tool_name=tool_name, decision=OperationDecision.OPEN,
+            allowed=True, reason="ifc_declassification_approved",
+            service_principal=service, enforcement_enabled=False,
+        )
+    return None
+
+
+def _repo_publish_ingest_denial(
+    tool_name: str, auth_context: Any, ifc_labels: Any,
+    service: ServicePrincipal | None, scope: Any,
+) -> "ToolAuthorization":
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((
+        item for item in getattr(labels, "sources", ())
+        if getattr(item, "has_untrusted_active_ingest", False)
+    ), None)
+    try:
+        from .event_logger import log_event_sync
+
+        log_event_sync(
+            "repo_publish_blocked_by_untrusted_ingest",
+            tool=tool_name, scope_id=getattr(scope, "scope_id", None),
+            domain=getattr(source, "domain", None),
+            source_kind=getattr(source, "source_kind", None),
+        )
+    except Exception:  # Telemetry must never change a policy decision.
+        pass
+    return ToolAuthorization(
+        tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
+        allowed=False, reason="repo_publish_blocked_by_untrusted_ingest",
+        service_principal=service, required_tier=AccessTier.ADMIN,
+        enforcement_enabled=True, would_block=True,
+        refusal_detail=_REPO_PUBLISH_INGEST_REFUSAL,
+    )
 
 
 def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
@@ -6805,27 +6873,29 @@ class SinkGate:
         # Keep the enforced path's existing decisions byte-identical.
         if (not enforce and tool_name == "repo_test"
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            normalized = normalize_sink_destination(sink_category, target)
-            state = getattr(auth_context, "ifc_state", None)
-            principal = getattr(auth_context, "canonical_principal", None)
-            if (isinstance(ifc_labels, InformationFlowLabels)
-                    and normalized is not None and isinstance(principal, str)
-                    and state is not None and state.consume_sink_approval(
-                        current=ifc_labels, sink_category=sink_category.value,
-                        destination=normalized, canonical_principal=principal,
-                        shadow=False,
-                    )):
-                return ToolAuthorization(
-                    tool_name=tool_name, decision=OperationDecision.OPEN,
-                    allowed=True, reason="ifc_declassification_approved",
-                    service_principal=service, enforcement_enabled=False,
-                )
+            approved = _post_ingest_one_time_grant(
+                tool_name, target, sink_category, ifc_labels, auth_context, service,
+            )
+            if approved is not None:
+                return approved
             return ToolAuthorization(
                 tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
                 allowed=False, reason="repo_test_blocked_by_untrusted_ingest",
                 service_principal=service, required_tier=AccessTier.ADMIN,
                 enforcement_enabled=True, would_block=True,
                 refusal_detail=_repo_test_ingest_refusal(auth_context, ifc_labels),
+            )
+        # Creating or publishing a commit is the influenced action regardless of
+        # checkout provenance. Keep the enforced path's existing denials intact.
+        if (not enforce and tool_name in _REPO_PUBLISH_TOOLS
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            approved = _post_ingest_one_time_grant(
+                tool_name, target, sink_category, ifc_labels, auth_context, service,
+            )
+            if approved is not None:
+                return approved
+            return _repo_publish_ingest_denial(
+                tool_name, auth_context, ifc_labels, service, repo_pr_action_scope,
             )
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
