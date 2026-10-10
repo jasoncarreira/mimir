@@ -1234,8 +1234,10 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
 async def test_pairing_reply_bypasses_model_and_reloads_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
 ):
+    import threading
+
     from mimir.identities_populator import request_pairing_with_code
-    from mimir import approval_requests
+    from mimir import approval_requests, pairing_approval
 
     model = _FakeAgent([AIMessage(content="model must not handle pairing")])
     agent = _build_agent(tmp_path, fake_agent=model)
@@ -1251,6 +1253,16 @@ async def test_pairing_reply_bypasses_model_and_reloads_identity(
     request_pairing_with_code(home, "discord-123", "discord", channel_id="dm-discord-123", is_dm=True)
     identity.reload()
     request_id = identity.identity("discord-123").pairing.request_id
+    loop_thread = threading.get_ident()
+    sync_threads = []
+    original_sync = pairing_approval.sync_pending
+
+    def checked_sync(*args, **kwargs):
+        sync_threads.append(threading.get_ident())
+        assert sync_threads[-1] != loop_thread, "pairing sync ran on the event loop"
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(pairing_approval, "sync_pending", checked_sync)
     notices = []
 
     async def send_notice(channel_id, text):
@@ -1263,6 +1275,7 @@ async def test_pairing_reply_bypasses_model_and_reloads_identity(
         author="discord-99", content=f"{decision} {request_id}",
     ))
     assert record.kind == "operator_approval"
+    assert sync_threads, "agent reply did not synchronize pending pairings"
     assert notices == [(channel, record.output)]
     assert identity.identity("discord-123").pairing.status == ("approved" if decision == "approve" else "rejected")
     assert identity.access_metadata("discord-123").roles == (("user",) if decision == "approve" else ())

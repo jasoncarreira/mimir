@@ -345,7 +345,7 @@ _ALLOWED = {
         "_atomic_write_identities", "add_identity_alias", "remove_identity",
         "issue_web_key", "revoke_web_key", "set_user_prefs", "capture_dm_channel",
         "request_pairing_with_code", "prepare_pairing_code_delivery",
-        "approve_pairing", "approve_pairing_code", "merge_into_yaml",
+        "approve_pairing", "reject_pairing", "approve_pairing_code", "merge_into_yaml",
     },
     "commands/setup.py": {"_seed_identities"},
 }
