@@ -195,7 +195,11 @@ def test_tainted_proposal_writes_are_allowed_but_checkout_writes_are_denied(
             assert decision.reason == "write_blocked_by_untrusted_ingest"
             assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
         else:
-            assert decision.allowed, (path, decision.reason)
+            # Scratch is exempt from the ingest write veto, not this fixture's
+            # independent private-source confidentiality rule.
+            assert decision.reason != "write_blocked_by_untrusted_ingest"
+            assert decision.allowed is (not enforce), (path, decision.reason)
+        assert not path.exists()
 
 
 @pytest.mark.parametrize("tool", ["write_file", "edit_file", "replace_file"])

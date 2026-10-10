@@ -669,6 +669,6 @@ def test_retained_commit_passes_sink_gate_and_refuses_outsider_ingest(
         "repo_commit", reader.auth, enforce=False, arguments=arguments,
     )
     assert "repo_commit" in seen
-    assert not refused.allowed and refused.reason == "repo_publish_blocked_by_untrusted_ingest"
-    assert refused.refusal_detail == ac._REPO_PUBLISH_INGEST_REFUSAL
+    assert not refused.allowed and refused.reason == "write_blocked_by_untrusted_ingest"
+    assert refused.refusal_detail == ac._TAINTED_WRITE_REFUSAL
     assert "secret-commit-message" not in refused.refusal_detail

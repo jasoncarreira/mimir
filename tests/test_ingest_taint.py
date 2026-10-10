@@ -331,11 +331,21 @@ def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypat
     shadow = [access_control.SinkGate.check_sink_flow(
         tool, target, auth.ifc_labels, auth, enforce=False,
     ) for _ in range(2)]
-    assert auth.ifc_state._declassification is grant
+    if tool == "write_file" and case == "expired":
+        # Always-on veto checks prune expired capabilities but never spend an
+        # unrelated, unexpired destination-only approval.
+        assert auth.ifc_state._declassification is None
+    else:
+        assert auth.ifc_state._declassification is grant
     enforced = [access_control.SinkGate.check_sink_flow(
         tool, target, auth.ifc_labels, auth, enforce=True,
     ) for _ in range(2)]
     for index, (observed, actual) in enumerate(zip(shadow, enforced)):
+        if tool == "write_file":
+            assert not observed.allowed and not actual.allowed
+            assert observed.reason == actual.reason == "write_blocked_by_untrusted_ingest"
+            assert observed.refusal_detail == actual.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+            continue
         approved = case == "matching" and index == 0
         assert observed.allowed
         assert actual.allowed is approved
@@ -383,12 +393,27 @@ async def test_registry_shadow_approval_census(live_turn, tool, target, monkeypa
         )
         shadow.append(result)
         await asyncio.sleep(0)
+        if tool == "write_file":
+            assert not result.allowed and result.reason == "write_blocked_by_untrusted_ingest"
+            assert auth.ifc_state._declassification is grant
+            continue
         assert result.allowed
         if attempt == 0:
             assert not result.would_block
         assert len(captured) == attempt
         assert auth.ifc_state._declassification is grant
 
+    if tool == "write_file":
+        # This veto is enforced even in shadow mode and never spends the
+        # unrelated destination-only grant or records a shadow allowance.
+        assert captured == []
+        enforced = registry.authorize_tool(
+            tool, auth, enforce=True, target_channel=target,
+            arguments=arguments, ifc_labels=auth.ifc_labels,
+        )
+        assert not enforced.allowed and enforced.reason == "write_blocked_by_untrusted_ingest"
+        assert auth.ifc_state._declassification is grant
+        return
     kind, fields = captured[0]
     assert kind == "shadow_tool_decision"
     assert fields["tool"] == tool
@@ -465,5 +490,9 @@ async def test_egress_still_requires_declassification(live_turn, tool, target, t
             destination=target, reason="one output still needs its own approval",
         )[0]
         approved = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
-        assert approved.allowed and approved.reason == "ifc_declassification_approved"
+        if tool == "write_file":
+            assert not approved.allowed and approved.reason == "write_blocked_by_untrusted_ingest"
+            assert approved.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+        else:
+            assert approved.allowed and approved.reason == "ifc_declassification_approved"
         assert not access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True).allowed
