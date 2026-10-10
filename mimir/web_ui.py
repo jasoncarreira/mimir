@@ -1299,22 +1299,33 @@ def register_routes(
         if not await _try_acquire_live_event_slot(bucket):
             return web.Response(text="too many live event streams", status=429)
 
+        from .http_shutdown import HTTP_SHUTDOWN
+        shutdown = request.app.get(HTTP_SHUTDOWN)
+        if shutdown is not None:
+            shutdown.active_streams += 1
+
         delivered = request.query.get("since", "").strip() or None
         idle_for = 0.0
         stream_degraded = False
         try:
             await resp.prepare(request)
-            while True:
+            while shutdown is None or not shutdown.event.is_set():
                 items, scanned_cursor, read_status = await _live_event_items(
                     request, delivered, channel=channel
                 )
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 degraded = await _report_state_read(turns_log, read_status)
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 if degraded and not stream_degraded:
                     await resp.write(
                         b'event: state-degraded\ndata: {"degraded": true}\n\n'
                     )
                 stream_degraded = degraded
                 for item in items:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
                     block = (
                         f"id: {item['cursor']}\n"
                         "event: live-event\n"
@@ -1333,10 +1344,18 @@ def register_routes(
                     if idle_for >= LIVE_EVENTS_HEARTBEAT_S:
                         idle_for = 0.0
                         await resp.write(b": heartbeat\n\n")
-                await asyncio.sleep(LIVE_EVENTS_POLL_S)
+                if shutdown is None:
+                    await asyncio.sleep(LIVE_EVENTS_POLL_S)
+                else:
+                    try:
+                        await asyncio.wait_for(shutdown.event.wait(), LIVE_EVENTS_POLL_S)
+                    except asyncio.TimeoutError:
+                        pass
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
             _release_live_event_slot(bucket)
         return resp
 
@@ -1375,6 +1394,10 @@ def register_routes(
         bucket = _stream_identity_bucket(request)
         if not await _try_acquire_turn_event_slot(bucket):
             return web.Response(text="too many turn event streams", status=429)
+        from .http_shutdown import HTTP_SHUTDOWN, queue_or_shutdown
+        shutdown = request.app.get(HTTP_SHUTDOWN)
+        if shutdown is not None:
+            shutdown.active_streams += 1
         resp = web.StreamResponse(
             status=200,
             headers={
@@ -1388,14 +1411,20 @@ def register_routes(
         try:
             await resp.prepare(request)
             queue = turn_event_bus.subscribe(channel)
-            while True:
+            while shutdown is None or not shutdown.event.is_set():
                 try:
-                    event = await asyncio.wait_for(
-                        queue.get(), timeout=LIVE_EVENTS_HEARTBEAT_S
+                    event = (
+                        await queue_or_shutdown(queue, shutdown, LIVE_EVENTS_HEARTBEAT_S)
+                        if shutdown is not None else
+                        await asyncio.wait_for(queue.get(), timeout=LIVE_EVENTS_HEARTBEAT_S)
                     )
                 except asyncio.TimeoutError:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
                     await resp.write(b": heartbeat\n\n")
                     continue
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 # This stream carries tool-result content, not the activity
                 # panel's metadata-only HARNESS_DISPLAY payload. Evaluate turn
                 # taint as same-channel egress, including each wildcard event's
@@ -1419,6 +1448,8 @@ def register_routes(
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
             if queue is not None:
                 turn_event_bus.unsubscribe(channel, queue)
             _release_turn_event_slot(bucket)

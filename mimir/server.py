@@ -54,6 +54,7 @@ from .worklink.continuation import (
     stamp_http_event_ingress_extra,
 )
 from . import web_ui
+from .http_shutdown import HTTP_SHUTDOWN, HTTPShutdown
 
 log = logging.getLogger(__name__)
 
@@ -1301,6 +1302,15 @@ def build_app(config: Config) -> web.Application:
             _make_auth_middleware(config.api_key or "", web_host=config.web_host)
         ],
     )
+    app[HTTP_SHUTDOWN] = HTTPShutdown()
+    http_shutdown = app[HTTP_SHUTDOWN]
+    drain_task: asyncio.Task[None] | None = None
+    scheduler_stopped = False
+
+    def shutdown_log(stage: str) -> None:
+        elapsed = (time.monotonic() - http_shutdown.signalled_at
+                   if http_shutdown.signalled_at is not None else 0.0)
+        log.info("shutdown: %s elapsed=%.3fs", stage, elapsed)
 
     if not config.api_key:
         if getattr(config, "allow_unauthenticated", False):
@@ -2544,7 +2554,41 @@ def build_app(config: Config) -> web.Application:
                 original_exception.add_note(_cleanup_note(errors))
             raise
 
+    async def _on_shutdown(app: web.Application) -> None:
+        nonlocal drain_task, scheduler_stopped
+        shutdown_log("sites stopped")
+        http_shutdown.closing_streams = http_shutdown.active_streams
+        http_shutdown.event.set()
+        if not startup_state.compensated:
+            # Stop producers before rejecting admission: an edge-trigger scan
+            # must not advance its cursor while its emitted events are refused.
+            try:
+                await scheduler.stop()
+                scheduler_stopped = True
+            except Exception:
+                log.exception("scheduler stop during HTTP shutdown failed")
+            dispatcher.close_admission()
+        # Chat's existing sentinel also wakes subscribers that predate the
+        # shared event; the event covers full queues and subscription races.
+        disconnect = getattr(web_chat, "disconnect", None)
+        if disconnect is not None:
+            try:
+                await disconnect()
+            except Exception:
+                log.exception("chat stream closure during HTTP shutdown failed")
+        if not startup_state.compensated:
+            shutdown_log("dispatcher drain start")
+            drain_task = asyncio.create_task(
+                dispatcher.drain(timeout=config.drain_timeout_seconds),
+                name="server-dispatcher-drain",
+            )
+
+    async def _handlers_drained(app: web.Application) -> None:
+        shutdown_log(f"streams active at shutdown ({http_shutdown.closing_streams})")
+        shutdown_log("handlers drained")
+
     async def _on_cleanup(app: web.Application) -> None:
+        nonlocal drain_task
         errors: list[Exception] = []
 
         async def attempt(operation: Any) -> bool:
@@ -2580,11 +2624,15 @@ def build_app(config: Config) -> web.Application:
             cleanup_started = time.monotonic()
             from .liveness import mark_clean_shutdown
 
-            def persist_clean_shutdown() -> None:
+            def persist_clean_shutdown() -> bool:
                 if not mark_clean_shutdown(config.home):
                     raise RuntimeError("failed to persist clean-shutdown marker")
+                return True
 
-            attempt_sync(persist_clean_shutdown)
+            # #507: record graceful intent before waiting for drain or late
+            # teardown; a slow intended stop must not look like a crash.
+            if attempt_sync(persist_clean_shutdown):
+                shutdown_log("clean marker written")
             from .worklink.autonomy import release_claims_for_graceful_shutdown
 
             release_timeout = 5.0
@@ -2617,14 +2665,20 @@ def build_app(config: Config) -> web.Application:
             # admission. Otherwise a channel-drained callback can queue an
             # edge-trigger scan just before ``drain()`` and that scan can advance
             # its cursor while every emitted event is rejected.
-            await attempt(scheduler.stop)
+            if not scheduler_stopped:
+                await attempt(scheduler.stop)
             drain_timeout = config.drain_timeout_seconds
             if drain_timeout > 0:
                 drain_timeout = max(
                     0.0,
                     drain_timeout - (time.monotonic() - cleanup_started),
                 )
-            await attempt(lambda: dispatcher.drain(timeout=drain_timeout))
+            if drain_task is None:
+                shutdown_log("dispatcher drain start")
+                await attempt(lambda: dispatcher.drain(timeout=drain_timeout))
+            else:
+                await attempt(lambda: drain_task)
+            shutdown_log("dispatcher drain end")
             try:
                 task_errors = await cancel_background_tasks(
                     startup_background_tasks,
@@ -2654,6 +2708,7 @@ def build_app(config: Config) -> web.Application:
         from .git_tracking import cancel_pending_pushes
 
         await attempt(cancel_pending_pushes)
+        shutdown_log("cleanup complete")
         for error in errors:
             log.error("server cleanup failed: %s", error)
         if errors:
@@ -2661,11 +2716,22 @@ def build_app(config: Config) -> web.Application:
 
     app.on_startup.append(_capture_controller_source_commit)
     app.on_startup.append(_on_startup)
+    app.on_shutdown.append(_on_shutdown)
+    app.on_cleanup.append(_handlers_drained)
     app.on_cleanup.append(_on_cleanup)
     return app
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _http_runner(app: web.Application, config: Config) -> web.AppRunner:
+    return web.AppRunner(app, shutdown_timeout=config.http_shutdown_timeout_seconds)
+
+
+def _record_shutdown_signal(app: web.Application, sig: signal.Signals) -> None:
+    app[HTTP_SHUTDOWN].signalled_at = time.monotonic()
+    log.info("shutdown: signal received (%s) elapsed=0.000s", sig.name)
 
 
 def _validate_bind_security(host: str, api_key: str) -> None:
@@ -2721,7 +2787,7 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    runner = web.AppRunner(app)
+    runner = _http_runner(app, config)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host=config.web_host, port=config.web_port)
     loop.run_until_complete(site.start())
@@ -2729,13 +2795,14 @@ def main() -> None:
 
     stop = loop.create_future()
 
-    def _on_signal() -> None:
+    def _on_signal(sig: signal.Signals) -> None:
         if not stop.done():
+            _record_shutdown_signal(app, sig)
             stop.set_result(None)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _on_signal)
+            loop.add_signal_handler(sig, _on_signal, sig)
         except NotImplementedError:
             pass
 
