@@ -47,6 +47,9 @@ from .base import Bridge, MessageUpdate, SendResult
 log = logging.getLogger(__name__)
 
 DISCORD_MESSAGE_CHAR_LIMIT = 2000
+_ALLOWED_MENTIONS = discord.AllowedMentions(
+    everyone=False, roles=False, users=True, replied_user=True,
+)
 
 
 # Fatal-exception map: classes that mean "operator must intervene"
@@ -201,7 +204,7 @@ class _DiscordClient(discord.Client):
         # restart between send and reaction). The "raw" variants
         # don't require the message to be in the client's cache.
         intents.reactions = True
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, allowed_mentions=_ALLOWED_MENTIONS)
         self._bridge = bridge
 
     async def on_ready(self) -> None:  # pragma: no cover - network
@@ -581,6 +584,7 @@ class DiscordBridge(Bridge):
                 chunks = [""]
             for i, chunk in enumerate(chunks):
                 chunk_kwargs = dict(send_kwargs) if i == 0 else {}
+                chunk_kwargs["allowed_mentions"] = _ALLOWED_MENTIONS
                 if i == 0 and discord_embed is not None:
                     chunk_kwargs["embed"] = discord_embed
                 if i == 0 and files:
@@ -712,7 +716,9 @@ class DiscordBridge(Bridge):
             if not hasattr(channel, "fetch_message"):
                 return SendResult(sent=False, error=f"channel {cid_int} cannot fetch messages")
             message = await channel.fetch_message(mid_int)
-            kwargs: dict[str, Any] = {"content": update.text or ""}
+            kwargs: dict[str, Any] = {
+                "content": update.text or "", "allowed_mentions": _ALLOWED_MENTIONS,
+            }
             embed = _coerce_discord_embed(update.embed)
             if embed is not None:
                 kwargs["embed"] = embed

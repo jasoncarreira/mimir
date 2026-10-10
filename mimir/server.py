@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .background_tasks import cancel_background_tasks, spawn_background
+from .bridges._mentions import neutralize_display_name
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
@@ -191,7 +192,7 @@ class _PairingNotifier:
         self._operator_pending.append(
             {
                 "canonical": canonical,
-                "display": display.strip() or canonical,
+                "display": neutralize_display_name(display) or canonical,
                 "platform": platform.strip() or "unknown",
                 "channel_id": channel_id.strip(),
                 "delivery": delivery,
