@@ -1650,6 +1650,131 @@ class _FakePairingChannels:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id,is_dm", [
+    ("discord", "discord-123", "dm-discord-123", True),
+    ("slack", "slack-U123", "dm-slack-D123", True),
+    ("discord", "discord-123", "discord-C123", False),
+    ("slack", "slack-U123", "slack-C123", False),
+])
+async def test_pairing_digest_lists_approval_paths_without_exposing_code(
+    tmp_path, monkeypatch, platform, canonical, channel_id, is_dm,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    status, code = request_pairing_with_code(
+        tmp_path, canonical, platform, channel_id=channel_id,
+        author_display="New user", is_dm=is_dm,
+    )
+    assert status == "changed"
+    assert (code is not None) == is_dm
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    request_id = resolver.identity(canonical).pairing.request_id
+    stored_secrets = ()
+    if is_dm:
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        operator_alert_channel="ops", pairing_operator_digest_delay_seconds=60), channels)
+    try:
+        await notifier.notify_operator(
+            canonical=canonical, display="New user", platform=platform,
+            channel_id=channel_id, delivery="dm" if is_dm else "public_shared_channel",
+        )
+        if code is not None:
+            # Even if future wiring supplies a code to the digest queue, it stays private.
+            notifier._operator_pending[0]["code"] = code
+        await notifier.flush_operator_alerts()
+        assert len(channels.sent) == 1
+        digest = channels.sent[0][1]
+        assert digest.index(f"{canonical} (New user; {platform};") < digest.index(
+            f"reply: approve {request_id} / decline {request_id}"
+        ) < digest.index("dashboard: /app/admin/users") < digest.index(
+            f"cli: mimir identities approve-pairing"
+        )
+        assert f"mimir identities approve-pairing {canonical}" in digest
+        for value in stored_secrets:
+            assert value not in digest
+        if is_dm:
+            assert "; DM)" in digest
+            assert "mimir identities approve-pairing --code <the code they received>" in digest
+            assert "They were sent a pairing code; ask them for it to confirm it's really them." in digest
+            assert code not in digest
+        else:
+            assert f"; {channel_id})" in digest
+            assert "--code" not in digest
+            assert "ask them for it" not in digest
+        assert events == [("pairing_operator_alert_sent", {"count": 1, "channel_id": "ops"})]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_pairing_without_alert_channel_records_unrouted_once_per_canonical(
+    tmp_path, monkeypatch, platform, canonical, channel_id,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path), operator_alert_channel=""), channels)
+    try:
+        status, code = request_pairing_with_code(
+            tmp_path, canonical, platform, channel_id=channel_id, is_dm=True,
+        )
+        assert status == "changed" and code
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (code, pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+        for _ in range(2):
+            await notifier.notify_operator(
+                canonical=canonical, display=canonical, platform=platform,
+                channel_id=channel_id, delivery="dm",
+            )
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        assert resolver.identity(canonical).pairing.status == "pending"
+        assert channels.sent == []
+        unrouted = [(kind, fields) for kind, fields in events
+                    if kind == "pairing_alert_unrouted"]
+        assert unrouted
+        for value in stored_secrets:
+            assert value not in json.dumps(unrouted)
+        assert events == [("pairing_alert_unrouted", {
+            "canonical": canonical, "platform": platform, "delivery": "dm",
+        })]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
     tmp_path: Path, monkeypatch,
 ):
@@ -1722,6 +1847,7 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "Pairing pending cap reached" in channels.sent[0][1]
     assert "max=1" in channels.sent[0][1]
     assert "slack-C1" in channels.sent[0][1]
+    assert "/app/admin/users" in channels.sent[0][1]
 
 
 @pytest.mark.asyncio

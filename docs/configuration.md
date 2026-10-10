@@ -402,7 +402,7 @@ authenticate transport only; they do not create a named requester.
 | `GOG_HOME` | path | unset | Optional gogcli secret-store root. Interactive shell operands under this root are refused; the variable is not passed into the shell unless explicitly named in `MIMIR_SHELL_PASS_ENV`. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
 | `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Controls the extra `inbound_pairing_prompted` event for enforced public/shared-channel denials: `ignore` or `prompt-to-pair`. All enforced denials may still create a pending pairing and notify the operator; this setting sends no public reply. |
-| `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts, including pairing digests. With enforced Discord/Slack intake, an empty channel warns at startup; review pending users at `/app/admin/users` or with `mimir identities list`. |
 | `MIMIR_PAIRING_PENDING_MAX` | int | `100` | Max pending pairing requests retained. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | float | `1.0` | Coalesce window for operator pairing-notification digests. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `true` | Send a one-time pairing code to unpaired DM users. |

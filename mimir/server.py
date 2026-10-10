@@ -145,6 +145,7 @@ class _PairingNotifier:
         self._operator_pending: list[dict[str, str]] = []
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
+        self._operator_unrouted: set[str] = set()
         self._operator_cap_notified = False
         self._dm_reply_sent: set[tuple[str, str]] = set()
         self._dm_reply_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
@@ -187,6 +188,12 @@ class _PairingNotifier:
             return
         alert_channel = (self._config.operator_alert_channel or "").strip()
         if not alert_channel:
+            if canonical not in self._operator_unrouted:
+                self._operator_unrouted.add(canonical)
+                await log_event(
+                    "pairing_alert_unrouted", canonical=canonical,
+                    platform=platform, delivery=delivery,
+                )
             return
         self._operator_notified.add(canonical)
         self._operator_pending.append(
@@ -219,10 +226,19 @@ class _PairingNotifier:
             request_id = identity.pairing.request_id if identity and identity.pairing else None
             lines.append(
                 "- "
-                f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
-                f"- approve: mimir identities approve-pairing {item['canonical']}"
-                + (f" or approve {request_id} / decline {request_id}" if request_id else "")
+                f"{item['canonical']} ({item['display']}; {item['platform']}; {where})"
             )
+            if request_id:
+                lines.append(f"  reply: approve {request_id} / decline {request_id}")
+            lines.append("  dashboard: /app/admin/users")
+            if item["delivery"] == "dm":
+                lines.append("  cli: mimir identities approve-pairing --code <the code they received>, "
+                             f"or mimir identities approve-pairing {item['canonical']}")
+                lines.append(
+                    "  They were sent a pairing code; ask them for it to confirm it's really them."
+                )
+            else:
+                lines.append(f"  cli: mimir identities approve-pairing {item['canonical']}")
         try:
             await self._channels.send(
                 self._config.operator_alert_channel,
@@ -260,7 +276,8 @@ class _PairingNotifier:
             "Pairing pending cap reached: new unknown contacts are being "
             f"dropped without pending entries (max={self._config.pairing_pending_max}). "
             f"Latest dropped contact came from {platform or 'unknown'} via {where}. "
-            "Clear/approve pending pairings or raise MIMIR_PAIRING_PENDING_MAX."
+            "Clear/approve pending pairings at /app/admin/users or raise "
+            "MIMIR_PAIRING_PENDING_MAX."
         )
         try:
             await self._channels.send(alert_channel, text, final=True)
@@ -1762,6 +1779,21 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         startup_state.phase = "bridge_connect"
         startup_state.bridges_connect_attempted = True
+        pairing_platforms = sorted({
+            bridge.name for bridge in channels.bridges()
+            if getattr(bridge, "name", None) in ("discord", "slack")
+        })
+        if (
+            (config.access_control_enforced or not config.open_bridge)
+            and pairing_platforms
+            and not (config.operator_alert_channel or "").strip()
+        ):
+            log.warning(
+                "Pairing requests from new users will not be surfaced: set "
+                "MIMIR_OPERATOR_ALERT_CHANNEL; review pending requests at "
+                "/app/admin/users or with mimir identities list."
+            )
+            await log_event("pairing_alert_channel_missing", platforms=pairing_platforms)
         await channels.connect_all()
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).

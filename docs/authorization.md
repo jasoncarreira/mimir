@@ -525,6 +525,15 @@ with `approve pair-xxxx` or `decline pair-xxxx`; chat approval grants `user`
 only. IDs expire after seven days for chat replies, but the page and CLI still
 work. No model tool can approve or reject pairings.
 
+Pairing digests in the operator alert channel list the request ID for chat
+approval, `/app/admin/users` for dashboard review, and CLI approval by canonical
+identity (or, for 1:1 DMs, by the code supplied privately by the sender). The
+digest never includes the code. When intake is enforced (`MIMIR_ACCESS_CONTROL_ENFORCED`
+or `MIMIR_OPEN_BRIDGE=false`) and a Discord or Slack bridge is enabled, configure
+`MIMIR_OPERATOR_ALERT_CHANNEL` so pending requests are surfaced. Without it, the
+server warns at startup and logs each new pending request as unrouted; review
+pending identities at `/app/admin/users` or with `mimir identities list`.
+
 ### Denied-user handling
 
 | Setting | Default | Authorization effect |
@@ -535,7 +544,7 @@ work. No model tool can approve or reject pairings.
 | `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | `30.0` | Global DM response interval, clamped to zero or greater. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is \`{code}\` (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM response template; `{code}` is replaced, or a code line is appended if absent. |
-| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message; enforced Discord/Slack intake warns at startup. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | empty | Enables identity alias/metadata discovery. It does not grant roles. |
 
 ### HTTP identity and transport

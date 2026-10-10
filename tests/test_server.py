@@ -930,11 +930,15 @@ def _controlled_server_app(
             app.router.add_get("/chat/stream", ok)
 
     class DiscordBridge:
+        name = "discord"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("discord")
 
     class SlackBridge:
+        name = "slack"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("slack")
@@ -1341,6 +1345,46 @@ def test_optional_feedback_bridges_receive_core_identity_resolver(
     for bridge in optional_bridges:
         assert bridge.kwargs["enqueue"] == app["dispatcher"].enqueue
         assert bridge.kwargs["admit"] == app["dispatcher"].intake_admits
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platforms,enforced,open_bridge,alert_channel,expected", [
+    (("discord",), True, False, "", True),
+    (("slack",), False, False, "", True),
+    (("discord", "slack"), True, False, "", True),
+    (("discord", "slack"), False, True, "", False),
+    ((), True, False, "", False),
+    (("discord", "slack"), True, False, "ops", False),
+])
+async def test_startup_warns_only_for_enforced_pairing_without_alert_channel(
+    tmp_path, monkeypatch, caplog, platforms, enforced, open_bridge, alert_channel, expected,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true" if enforced else "false")
+    monkeypatch.setenv("MIMIR_OPEN_BRIDGE", "true" if open_bridge else "false")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", alert_channel)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(optional_bridges=True),
+    )
+    app["channels"]._bridges = [
+        bridge for bridge in app["channels"].bridges()
+        if getattr(bridge, "name", None) not in ("discord", "slack")
+        or bridge.name in platforms
+    ]
+    try:
+        with caplog.at_level("WARNING", logger="mimir.server"):
+            await _run_startup(app)
+        warnings = [record.message for record in caplog.records
+                    if record.name == "mimir.server" and "Pairing requests from new users" in record.message]
+        events = [fields for kind, fields in control.event_payloads
+                  if kind == "pairing_alert_channel_missing"]
+        assert len(warnings) == len(events) == int(expected)
+        if expected:
+            assert "MIMIR_OPERATOR_ALERT_CHANNEL" in warnings[0]
+            assert "/app/admin/users" in warnings[0]
+            assert "mimir identities list" in warnings[0]
+            assert events == [{"platforms": sorted(platforms)}]
+    finally:
+        await _run_cleanup(app)
 
 
 def test_route_and_hook_parity_with_runtime_proxies(
