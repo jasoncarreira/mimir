@@ -21,15 +21,123 @@ from mimir.wiki_backlinks import build_graph, build_wiki_payload, find_pages, fi
 
 @pytest.fixture
 def reject_scratch_reads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prove exclusion happens before reading, not after parsing the payload."""
+    """Prove existing scratch payloads are excluded before being read."""
     for name in ("read_text", "read_bytes"):
         original = getattr(Path, name)
 
         def checked(path: Path, *args, _original=original, **kwargs):
-            assert live_loader_path_allowed(path), f"scratch source read: {path}"
+            # Missing optional files carry no payload. A loader given a
+            # subtree as its explicit home may probe its own index-skip.txt;
+            # that re-anchors the helper, but must not read existing scratch.
+            if path.exists():
+                assert live_loader_path_allowed(path), f"scratch source read: {path}"
             return _original(path, *args, **kwargs)
 
         monkeypatch.setattr(Path, name, checked)
+
+
+def test_live_wiki_directory_named_scratch_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_scratch_reads: None,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    wiki = home / "state/wiki"
+    page = wiki / "scratch/page.md"
+    page.parent.mkdir(parents=True)
+    page.write_text("<!-- desc: live scratch-named page -->\n# Live page\n")
+    assert live_loader_path_allowed(page, home)
+    assert live_loader_path_allowed(page)
+    assert set(find_pages(wiki)) == {"scratch/page.md"}
+    assert set(build_graph(wiki).pages) == {"scratch/page.md"}
+    assert "wiki/scratch/page.md" in build_state_index(home)
+    indexer = Indexer(home, embedder=HashEmbedder())
+    indexer.init_schema()
+    assert indexer._reindex_sync("state/wiki/scratch/page.md")
+    assert indexer._stats_sync().files == 1
+
+
+def test_live_skill_named_scratch_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_scratch_reads: None,
+) -> None:
+    from mimir.skill_catalog import load_skill
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    skill = home / "skills/scratch"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: scratch\ndescription: A live skill named scratch\n---\n# Live skill\n"
+    )
+    loaded = load_skill(skill)
+    assert loaded is not None
+    assert loaded.name == "scratch"
+
+
+@pytest.mark.parametrize("explicit_home", [False, True])
+def test_live_symlink_resolving_into_configured_scratch_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_home: bool,
+    reject_scratch_reads: None,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = home / "scratch/page.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Quarantined page\n")
+    wiki = home / "state/wiki"
+    wiki.mkdir(parents=True)
+    alias = wiki / "page.md"
+    alias.symlink_to(target)
+    assert not alias.is_relative_to(home / "scratch")
+    assert alias.resolve().is_relative_to(home / "scratch")
+    # Removing the resolved-path check must fail this assertion, even though
+    # the alias's lexical spelling is an otherwise valid live wiki path.
+    assert not live_loader_path_allowed(alias, home if explicit_home else None)
+    assert find_pages(wiki) == {}
+
+
+@pytest.mark.parametrize("explicit_home", [False, True])
+def test_lexical_scratch_alias_to_live_outside_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit_home: bool,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    target = home / "state/wiki/page.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Live page\n")
+    alias = home / "scratch/alias.md"
+    alias.parent.mkdir()
+    alias.symlink_to(target)
+    boundary_home = home if explicit_home else None
+    assert live_loader_path_allowed(alias.resolve(), boundary_home)
+    assert not live_loader_path_allowed(alias, boundary_home)
+
+
+def test_explicit_loader_home_takes_precedence_over_mimir_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    explicit = tmp_path / "explicit"
+    configured = tmp_path / "configured"
+    monkeypatch.setenv("MIMIR_HOME", str(configured))
+    assert not live_loader_path_allowed(explicit / "scratch/page.md", explicit)
+    assert live_loader_path_allowed(configured / "scratch/page.md", explicit)
+    assert not live_loader_path_allowed(configured / "scratch/page.md")
+    # A supplied home is never implicitly replaced by its parent merely
+    # because its name is scratch.
+    assert live_loader_path_allowed(explicit / "scratch/page.md", explicit / "scratch")
+    assert not live_loader_path_allowed(
+        explicit / "scratch/scratch/page.md", explicit / "scratch"
+    )
+
+
+@pytest.mark.parametrize("configured", [None, "", "   "])
+def test_unconfigured_loader_does_not_ban_scratch_path_components(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None,
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("MIMIR_HOME", raising=False)
+    else:
+        monkeypatch.setenv("MIMIR_HOME", configured)
+    assert live_loader_path_allowed(tmp_path / "scratch/page.md")
 
 
 @pytest.mark.parametrize(
@@ -38,8 +146,11 @@ def reject_scratch_reads(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("loader", ["memory", "state", "wiki", "backlinks", "search"])
 def test_content_loaders_exclude_scratch(
     tmp_path: Path, shape: str, loader: str, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    configured_home = home
+    monkeypatch.setenv("MIMIR_HOME", str(configured_home))
     scratch = home / "scratch"
     scratch.mkdir(parents=True)
     roots = {
@@ -105,6 +216,9 @@ def test_content_loaders_exclude_scratch(
         live_root.symlink_to(outside, target_is_directory=True)
 
     expected = shape in {"live", "live-root", "live-leaf"}
+    # Even when a loader receives home/scratch, the configured home stays
+    # anchored to its parent; do not infer a new boundary from the subtree.
+    assert live_loader_path_allowed(home / relative_root / filename) == expected
     if loader == "memory":
         body = build_memory_index(home)
         assert ("sentinel.md" in body) == expected
@@ -125,7 +239,10 @@ def test_content_loaders_exclude_scratch(
         assert bool(build_wiki_payload(wiki)["pages"]) == expected
         assert find_slug_collisions(wiki) == {}
     else:
-        indexer = Indexer(home, embedder=HashEmbedder(), db_path=tmp_path / "index.db")
+        # Indexer's home is the configured boundary, not a loader subtree.
+        # Passing scratch as its explicit home would intentionally configure
+        # scratch/scratch instead, overriding MIMIR_HOME.
+        indexer = Indexer(configured_home, embedder=HashEmbedder(), db_path=tmp_path / "index.db")
         indexer.init_schema()
         # Search indexes both memory/ and state/: a live alias exposes the
         # canonical memory target as well as the state alias, unlike scratch.
@@ -135,14 +252,22 @@ def test_content_loaders_exclude_scratch(
         assert indexer._sweep_sync()["added"] == len(expected_paths)
         with indexer._connect() as conn:
             assert {row[0] for row in conn.execute("SELECT path FROM files")} == expected_paths
-        assert indexer._reindex_sync("state/sentinel.md") == expected
+        rel = (
+            "scratch/state/sentinel.md"
+            if shape in {"scratch", "dotdot", "outward"}
+            else "state/sentinel.md"
+        )
+        assert indexer._abs_path(rel).is_file()
+        assert indexer._reindex_sync(rel) == expected
         assert bool(indexer._search_sync("sentinel", [0.0] * 16, "all", 5, 50)) == expected
 
 
 @pytest.mark.parametrize("shape", ["live", "missing-live", "scratch", "root", "leaf", "dotdot", "dangling", "outward"])
 def test_repository_inventory_fails_closed(
     tmp_path: Path, shape: str, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     live = tmp_path / "live"
@@ -190,8 +315,10 @@ def test_repository_inventory_fails_closed(
 @pytest.mark.parametrize("shape", ["root", "leaf"])
 def test_search_evicts_all_existing_rows_after_scratch_retarget(
     tmp_path: Path, operation: str, shape: str, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
     state = home / "state"
     state.mkdir(parents=True)
     path = state / "sentinel.md"
@@ -223,8 +350,10 @@ def test_search_evicts_all_existing_rows_after_scratch_retarget(
 
 def test_direct_entry_builder_and_cached_index_reject_scratch(
     tmp_path: Path, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
     memory = home / "memory"
     memory.mkdir(parents=True)
     scratch = home / "scratch"
@@ -240,8 +369,10 @@ def test_direct_entry_builder_and_cached_index_reject_scratch(
 
 def test_scratch_skip_override_is_not_consumed(
     tmp_path: Path, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
     (home / "state").mkdir(parents=True)
     (home / "state/live.md").write_text("live sentinel")
     (home / ".mimir").mkdir()
@@ -257,8 +388,11 @@ def test_scratch_skip_override_is_not_consumed(
 
 
 @pytest.mark.parametrize("shape", ["live", "root", "leaf", "scratch"])
-def test_search_database_is_a_guarded_live_source(tmp_path: Path, shape: str) -> None:
+def test_search_database_is_a_guarded_live_source(
+    tmp_path: Path, shape: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     home = tmp_path / "home"
+    monkeypatch.setenv("MIMIR_HOME", str(home))
     home.mkdir()
     scratch = home / "scratch"
     scratch.mkdir()
@@ -283,7 +417,9 @@ def test_search_database_is_a_guarded_live_source(tmp_path: Path, shape: str) ->
 
 def test_scratch_pages_do_not_create_slug_collisions(
     tmp_path: Path, reject_scratch_reads: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     wiki = tmp_path / "wiki"
     (wiki / "entities").mkdir(parents=True)
     (wiki / "topics").mkdir()
@@ -301,7 +437,10 @@ def test_scratch_pages_do_not_create_slug_collisions(
 
 
 @pytest.mark.parametrize("shape", ["root", "leaf", "dotdot"])
-def test_repository_inventory_accepts_live_aliases(tmp_path: Path, shape: str) -> None:
+def test_repository_inventory_accepts_live_aliases(
+    tmp_path: Path, shape: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     live = tmp_path / "live"
     live.mkdir()
     target = live / "repositories.yaml"

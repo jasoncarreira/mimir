@@ -80,17 +80,25 @@ def resolve_within_roots(roots: list[Path], raw_path: str) -> Path:
 
 
 def live_loader_path_allowed(path: Path, home: Path | None = None) -> bool:
-    """Never load live instructions/config/state from scratch, even via aliases."""
+    """Refuse the configured home's scratch subtree, including symlink aliases.
+
+    An explicit home takes precedence over MIMIR_HOME. Other directories named
+    scratch are live sources, not the configured quarantine boundary.
+    """
     try:
         configured = os.environ.get("MIMIR_HOME", "").strip()
-        roots = [Path(home)] if home is not None else ([Path(configured)] if configured else [])
-        # A loader with an explicitly supplied isolated home must not depend on
-        # the deployment env; detect its lexical scratch ancestor as well.
+        root = Path(home) if home is not None else (Path(configured) if configured else None)
         lexical = Path(os.path.abspath(path))
         resolved = path.resolve()
-        if "scratch" in lexical.parts or "scratch" in resolved.parts:
-            return False
-        return not any(resolved.is_relative_to(root.resolve() / "scratch") for root in roots)
+        if root is None:
+            return True
+        scratch = root / "scratch"
+        # Check both spellings: a lexical scratch alias pointing out remains
+        # quarantined, and a live-looking alias pointing in is also refused.
+        return not (
+            lexical.is_relative_to(Path(os.path.abspath(scratch)))
+            or resolved.is_relative_to(scratch.resolve())
+        )
     except (OSError, RuntimeError, ValueError):
         return False
 

@@ -6366,8 +6366,7 @@ _REPO_PUBLISH_TOOLS = frozenset({
 _REPO_PUBLISH_INGEST_REFUSAL = (
     "This turn read untrusted outside content, so it cannot create or publish commits. "
     "Describe the intended change in a PR comment (pr_comment) or a message to the "
-    "operator (send_message), or ask the operator for a fresh turn or a one-time "
-    "approve_sink_once grant."
+    "operator (send_message), or ask the operator for a fresh clean turn."
 )
 
 
@@ -6400,8 +6399,10 @@ def tainted_file_write_target(raw_path: Any, home: Path | None = None) -> bool:
             home = Path(configured)
         root = home.resolve()
         scratch = root / "scratch"
-        # Do not bless a scratch directory redirected to live state.
-        if scratch.resolve() != scratch:
+        # Pin the resolved boundary before admitting descendants. A redirected
+        # scratch root must never turn its live target into a staging area.
+        scratch_root = scratch.resolve()
+        if scratch_root != scratch:
             return True
         if not isinstance(raw_path, str) or not raw_path.strip():
             return True
@@ -6409,7 +6410,7 @@ def tainted_file_write_target(raw_path: Any, home: Path | None = None) -> bool:
         if candidate is None:
             return True
         resolved = candidate.resolve(strict=False)
-        return not (resolved != scratch and resolved.is_relative_to(scratch))
+        return not (resolved != scratch_root and resolved.is_relative_to(scratch_root))
     except (ValueError, OSError, RuntimeError):
         return True
 
@@ -6433,31 +6434,6 @@ def _tainted_write_denial(tool_name: str, service: Any = None) -> "ToolAuthoriza
         enforcement_enabled=True, would_block=True,
         refusal_detail=_TAINTED_WRITE_REFUSAL,
     )
-
-
-def _post_ingest_one_time_grant(
-    tool_name: str, target: str | None, sink_category: SinkCategory,
-    ifc_labels: Any, auth_context: Any, service: ServicePrincipal | None,
-) -> "ToolAuthorization | None":
-    """Spend the same exact-destination grant for either post-ingest veto."""
-    from .models import InformationFlowLabels
-
-    normalized = normalize_sink_destination(sink_category, target)
-    state = getattr(auth_context, "ifc_state", None)
-    principal = getattr(auth_context, "canonical_principal", None)
-    if (isinstance(ifc_labels, InformationFlowLabels)
-            and normalized is not None and isinstance(principal, str)
-            and state is not None and state.consume_sink_approval(
-                current=ifc_labels, sink_category=sink_category.value,
-                destination=normalized, canonical_principal=principal,
-                shadow=False, tool_name=tool_name, require_tool=True,
-            )):
-        return ToolAuthorization(
-            tool_name=tool_name, decision=OperationDecision.OPEN,
-            allowed=True, reason="ifc_declassification_approved",
-            service_principal=service, enforcement_enabled=False,
-        )
-    return None
 
 
 def _repo_publish_ingest_denial(
@@ -6513,8 +6489,7 @@ def _repo_test_ingest_refusal(auth_context: Any, ifc_labels: Any) -> str:
         f"repo_test cannot execute repository code after untrusted active ingest "
         f"from {source_name}. Review the diff with pr_diff/repo_diff without "
         "executing it, rely on the PR's CI (pr_checks), or ask the operator for "
-        "a fresh turn or a one-time approve_sink_once grant "
-        "(request_operator_approval on an eligible operator turn)."
+        "a fresh clean turn."
         + _author_attestation_note(auth_context)
     )
 
@@ -7214,11 +7189,6 @@ class SinkGate:
         # This veto precedes both shadow allowances and the generic same-PR rule.
         if (tainted_write_target(tool_name, target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            approved = _post_ingest_one_time_grant(
-                tool_name, target, sink_category, ifc_labels, auth_context, service,
-            )
-            if approved is not None:
-                return approved
             return _tainted_write_denial(tool_name, service)
         # Enforcement already refuses all tainted tracker mutations with the
         # original reason/detail; only shadow mode needs this narrower veto.
@@ -7317,7 +7287,7 @@ class SinkGate:
                         and state is not None and state.consume_sink_approval(
                             current=ifc_labels, sink_category=sink_category.value,
                             destination=normalized, canonical_principal=principal,
-                            shadow=False, tool_name=tool_name,
+                            shadow=False,
                         )):
                     return ToolAuthorization(
                         tool_name=tool_name, decision=OperationDecision.OPEN,
@@ -8396,7 +8366,6 @@ def approve_live_declassification(
     sink_category: Any,
     destination: Any,
     reason: Any,
-    tool_name: str | None = None,
 ) -> tuple[bool, str]:
     """Approve one exact sink on the exact live admin request carrier."""
     from ._context import get_current_turn
@@ -8510,7 +8479,6 @@ def approve_live_declassification(
         canonical_principal=canonical_principal,
         lifetime_seconds=DECLASSIFICATION_LIFETIME_SECONDS,
         durable_audit=durable_audit,
-        tool_name=tool_name,
     )
     if approved and category is SinkCategory.NETWORK:
         # Destination approval persists for this server-owned session, while
@@ -9981,11 +9949,7 @@ class ToolRegistry:
         if (tool_name in _TAINTED_FILE_WRITE_TOOLS
                 and tainted_file_write_target(raw_write_target)
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
-            approved = _post_ingest_one_time_grant(
-                tool_name, raw_write_target, SinkCategory.FILE, ifc_labels,
-                auth_context, get_trusted_service_from_auth_context(auth_context),
-            )
-            return finish(approved or _tainted_write_denial(tool_name))
+            return finish(_tainted_write_denial(tool_name))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
         if tool_name in {"write_file", "edit_file", "replace_file"}:

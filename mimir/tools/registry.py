@@ -561,7 +561,6 @@ def approve_declassification(
     sink_category: str,
     destination: str,
     reason: str,
-    tool_name: str | None = None,
 ) -> str:
     """Authorize one audited egress to an exact destination for this private turn.
 

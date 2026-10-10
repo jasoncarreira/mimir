@@ -5739,7 +5739,7 @@ def test_post_ingest_shell_one_time_approval_is_spent(tool_name):
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="shell_process",
         destination="printf hello", canonical_principal=auth.canonical_principal,
-        lifetime_seconds=30, durable_audit=lambda *_: True, tool_name=tool_name,
+        lifetime_seconds=30, durable_audit=lambda *_: True,
     )
     first = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
     second = SinkGate.check_sink_flow(tool_name, "printf hello", auth.ifc_labels, auth, enforce=False)
@@ -5796,7 +5796,8 @@ def test_repo_test_refusal_preserves_author_attestation_context() -> None:
     assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
 
 
-def test_repo_test_shadow_veto_spends_only_exact_one_time_grant() -> None:
+@pytest.mark.parametrize("enforce", [False, True])
+def test_repo_test_veto_does_not_spend_exact_one_time_grant(enforce: bool) -> None:
     auth = _tainted_admin_operator_write_auth()
     state = InformationFlowState(auth.ifc_labels)
     auth = replace(auth, ifc_state=state)
@@ -5804,30 +5805,29 @@ def test_repo_test_shadow_veto_spends_only_exact_one_time_grant() -> None:
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True, tool_name="repo_test",
+        durable_audit=lambda *_: True,
     )
-    other = SinkGate.check_sink_flow(
-        "repo_test", "owner/repo#pull/8", auth.ifc_labels, auth, enforce=False,
-    )
-    wrong_tool = SinkGate.check_sink_flow(
-        "repo_push", target, auth.ifc_labels, auth, enforce=False,
-    )
-    assert not wrong_tool.allowed and not wrong_tool.is_shadow_decision
-    assert wrong_tool.reason == "write_blocked_by_untrusted_ingest"
-    assert wrong_tool.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
-    first = SinkGate.check_sink_flow(
-        "repo_test", target, auth.ifc_labels, auth, enforce=False,
-    )
-    second = SinkGate.check_sink_flow(
-        "repo_test", target, auth.ifc_labels, auth, enforce=False,
-    )
-    assert not other.allowed and other.reason == "write_blocked_by_untrusted_ingest"
-    assert first.allowed and first.reason == "ifc_declassification_approved"
-    assert not second.allowed and not second.is_shadow_decision
-    assert not state.consume_sink_approval(
+    for tool_name, destination in (
+        ("repo_test", "owner/repo#pull/8"), ("repo_push", target),
+        ("repo_test", target), ("repo_test", target),
+    ):
+        decision = SinkGate.check_sink_flow(
+            tool_name, destination, auth.ifc_labels, auth, enforce=enforce,
+        )
+        assert not decision.allowed and decision.enforcement_enabled
+        assert not decision.is_shadow_decision
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    assert state.current(auth.ifc_labels) is auth.ifc_labels
+    assert state.has_untrusted_active_ingest(auth.ifc_labels)
+    arguments = dict(
         current=auth.ifc_labels, sink_category="forge", destination=target,
-        canonical_principal=auth.canonical_principal, shadow=False,
+        canonical_principal=auth.canonical_principal,
     )
+    # Neither enforcement mode's write veto spends the egress allowance.
+    assert state.consume_sink_approval(**arguments, shadow=True)
+    assert state.consume_sink_approval(**arguments)
+    assert not state.consume_sink_approval(**arguments)
 
 
 def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
@@ -5838,14 +5838,22 @@ def test_repo_test_missing_labels_refuses_without_spending_grant() -> None:
     assert state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True, tool_name="repo_test",
+        durable_audit=lambda *_: True,
     )
     missing = SinkGate.check_sink_flow("repo_test", target, None, auth, enforce=False)
     assert not missing.allowed and not missing.is_shadow_decision
     assert missing.reason == "write_blocked_by_untrusted_ingest"
-    assert SinkGate.check_sink_flow(
+    decision = SinkGate.check_sink_flow(
         "repo_test", target, auth.ifc_labels, auth, enforce=False,
-    ).reason == "ifc_declassification_approved"
+    )
+    assert not decision.allowed and not decision.is_shadow_decision
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert state.current(auth.ifc_labels) is auth.ifc_labels
+    assert state.has_untrusted_active_ingest(auth.ifc_labels)
+    assert state.consume_sink_approval(
+        current=auth.ifc_labels, sink_category="forge", destination=target,
+        canonical_principal=auth.canonical_principal,
+    )
 
 
 _REPO_PUBLISH_NAMES = (
@@ -5948,23 +5956,39 @@ def test_repo_nonpublishing_tools_keep_original_decision(
 
 
 @pytest.mark.parametrize("tool_name", ["repo_commit", "repo_push"])
-def test_repo_publish_one_time_grant_is_consumed(tool_name: str) -> None:
+@pytest.mark.parametrize("enforce", [False, True])
+def test_repo_publish_veto_preserves_one_time_egress_grant(
+    tool_name: str, enforce: bool,
+) -> None:
     auth = _outsider_repo_publish_auth()
     target = "owner/repo#pull/7"
     scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
     assert auth.ifc_state.approve_sink_once(
         fallback=auth.ifc_labels, sink_category="forge", destination=target,
         canonical_principal=auth.canonical_principal, lifetime_seconds=30,
-        durable_audit=lambda *_: True, tool_name=tool_name,
+        durable_audit=lambda *_: True,
     )
-    def check(destination: str):
-        return SinkGate.check_sink_flow(
+    for destination in ("owner/repo#pull/8", target, target):
+        decision = SinkGate.check_sink_flow(
             tool_name, destination, auth.ifc_labels, auth,
-            enforce=False, repo_pr_action_scope=scope,
+            enforce=enforce, repo_pr_action_scope=scope,
         )
-    assert check("owner/repo#pull/8").reason == "write_blocked_by_untrusted_ingest"
-    assert check(target).reason == "ifc_declassification_approved"
-    assert check(target).reason == "write_blocked_by_untrusted_ingest"
+        assert not decision.allowed and decision.enforcement_enabled
+        assert not decision.is_shadow_decision
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+        assert decision.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
+    assert auth.ifc_state.current(auth.ifc_labels) is auth.ifc_labels
+    assert auth.ifc_state.has_untrusted_active_ingest(auth.ifc_labels)
+    # A refused code publication leaves the exact forge text egress available.
+    admitted = SinkGate.check_sink_flow(
+        "pr_comment", target, auth.ifc_labels, auth, enforce=enforce,
+    )
+    assert admitted.allowed and admitted.reason == "ifc_declassification_approved"
+    reused = SinkGate.check_sink_flow(
+        "pr_comment", target, auth.ifc_labels, auth, enforce=enforce,
+    )
+    assert reused.reason != "ifc_declassification_approved"
+    assert reused.would_block
 
 
 def test_repo_publish_refusal_and_event_contain_only_safe_metadata(monkeypatch: pytest.MonkeyPatch) -> None:

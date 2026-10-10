@@ -1,4 +1,4 @@
-"""#1937: always-on same-PR veto, exact tool grants, and scratch closure."""
+"""#1937: always-on same-PR veto, egress-only grants, and scratch closure."""
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,22 +30,20 @@ def test_every_tainted_write_same_pr_refused(tool, enforce):
     assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
 
 
-@pytest.mark.parametrize("granted", ["repo_test", "repo_push", "repo_commit"])
-@pytest.mark.parametrize("attempted", ["repo_test", "repo_push", "repo_commit"])
+@pytest.mark.parametrize("tool", ["repo_test", "repo_push", "repo_commit"])
 @pytest.mark.parametrize("enforce", [False, True])
-def test_grants_exact_tool_once(granted, attempted, enforce):
+def test_egress_grant_never_unlocks_repo_write(tool, enforce):
     auth, scope = tainted()
     target = "owner/repo#pull/7"
     assert auth.ifc_state.approve_sink_once(fallback=auth.ifc_labels, sink_category="forge",
         destination=target, canonical_principal=auth.canonical_principal,
-        lifetime_seconds=30, durable_audit=lambda *_: True, tool_name=granted)
-    def check(tool):
-        return ac.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth,
-                                          enforce=enforce, repo_pr_action_scope=scope)
-    assert check(attempted).allowed is (attempted == granted)
-    if attempted != granted:
-        assert check(granted).allowed
-    assert not check(granted).allowed
+        lifetime_seconds=30, durable_audit=lambda *_: True)
+    for _ in range(2):
+        decision = ac.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth,
+                                             enforce=enforce, repo_pr_action_scope=scope)
+        assert not decision.allowed
+        assert decision.reason == "write_blocked_by_untrusted_ingest"
+    assert auth.ifc_state._declassification is not None
 
 
 def test_unbound_grant_does_not_open_write():
@@ -62,6 +60,28 @@ def test_unbound_grant_does_not_open_write():
 def test_only_scratch_file_writes(path, tmp_path):
     assert ac.tainted_file_write_target(path, tmp_path)
     assert not ac.tainted_file_write_target("scratch/turns/a.md", tmp_path)
+
+
+@pytest.mark.parametrize("sibling", ["scratchy", "scratch-old"])
+def test_scratch_lexical_siblings_are_live_write_targets(tmp_path, sibling):
+    assert ac.tainted_file_write_target(str(tmp_path / sibling / "x.md"), tmp_path)
+    assert not ac.tainted_file_write_target("scratch/turns/x.md", tmp_path)
+
+
+def test_scratch_root_symlink_to_live_is_not_a_write_exception(tmp_path):
+    live = tmp_path / "state"
+    live.mkdir()
+    (tmp_path / "scratch").symlink_to(live, target_is_directory=True)
+    assert ac.tainted_file_write_target("scratch/x.md", tmp_path)
+    assert ac.tainted_file_write_target(str(live / "x.md"), tmp_path)
+
+
+def test_write_refusals_do_not_offer_model_unlocks():
+    auth, _ = tainted()
+    for text in (ac._TAINTED_WRITE_REFUSAL, ac._REPO_PUBLISH_INGEST_REFUSAL,
+                 ac._repo_test_ingest_refusal(auth, auth.ifc_labels)):
+        for forbidden in ("approve_sink_once", "approve_declassification", "request_operator_approval"):
+            assert forbidden not in text
 
 
 def test_scratch_symlink_to_live_refused(tmp_path):
@@ -95,7 +115,8 @@ def test_proposal_whole_index_filter_rejects_code(monkeypatch, tmp_path):
     assert proposals._check_proposal_index(tmp_path, proposals.PROPOSAL_SURFACES)
 
 
-def test_loader_production_templates_scheduler_skills(tmp_path):
+def test_loader_production_templates_scheduler_skills(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     from mimir.templates import load_template
     from mimir.scheduler import load_jobs, load_operator_shell_commands, _resolve_prompt_file
     from mimir.skill_catalog import load_skill

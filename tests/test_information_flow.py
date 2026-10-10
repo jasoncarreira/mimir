@@ -6707,30 +6707,31 @@ def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path, 
     labels = _labels(labels=ALL_LABELS)
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
     turn = bind_approval_turn(auth)
-    destination = str(tmp_path / "approved.txt")
+    destination = "https://audience.example/approved"
     try:
         denied = SinkGate.check_sink_flow(
-            "write_file", destination, labels, auth, enforce=True,
+            "http_request", destination, labels, auth, enforce=True,
         )
         approved, reason = approve_live_declassification(
             auth,
             turn_id=turn.turn_id,
-            sink_category="file",
-            tool_name="write_file",
+            sink_category="http_webhook",
             destination=destination,
-            reason="operator approved this exact file write",
+            reason="operator approved this exact HTTP egress",
         )
         mismatch = SinkGate.check_sink_flow(
-            "write_file", str(tmp_path / "other.txt"), labels, auth, enforce=True,
+            "http_request", "https://audience.example/other", labels, auth, enforce=True,
         )
-        wrong_tool = SinkGate.check_sink_flow(
-            "edit_file", destination, labels, auth, enforce=True,
+        wrong_category = SinkGate.check_sink_flow(
+            "http_request", destination, labels, auth, enforce=True,
+            sink_category=SinkCategory.NETWORK,
         )
         admitted = SinkGate.check_sink_flow(
-            "write_file", destination, labels, auth, enforce=True,
+            "http_request", destination, labels, auth, enforce=True,
         )
+        # Another tool in the same category shares the spent one-use grant.
         reused = SinkGate.check_sink_flow(
-            "write_file", destination, labels, auth, enforce=True,
+            "webhook", destination, labels, auth, enforce=True,
         )
     finally:
         _reset_logger_for_tests()
@@ -6738,21 +6739,20 @@ def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path, 
     assert denied.allowed is False
     assert (approved, reason) == (True, "approved")
     assert mismatch.allowed is False
-    assert wrong_tool.allowed is False
-    assert wrong_tool.reason == "write_blocked_by_untrusted_ingest"
-    assert wrong_tool.refusal_detail == ac._TAINTED_WRITE_REFUSAL
+    assert wrong_category.allowed is False
+    assert wrong_category.reason != "ifc_declassification_approved"
     assert admitted.allowed is True
     assert admitted.reason == "ifc_declassification_approved"
     assert reused.allowed is False
     assert auth.ifc_state.current(auth.ifc_labels) is labels
-    # Refused writes now emit telemetry alongside the durable approval record.
+    assert auth.ifc_state.has_untrusted_active_ingest(labels)
     records = [
         json.loads(line)
         for line in events_path.read_text(encoding="utf-8").splitlines()
     ]
     [record] = [item for item in records if item["type"] == "ifc_declassification"]
-    assert record["destination"] == str(Path(destination).resolve())
-    assert record["sink_category"] == "file"
+    assert record["destination"] == destination
+    assert record["sink_category"] == "http_webhook"
     assert record["policy_version"] == "ifc-v1"
     assert record["outcome"] == "approved"
     assert record["use_limit"] == 1
@@ -6761,19 +6761,18 @@ def test_live_declassification_is_one_use_exact_and_preserves_sources(tmp_path, 
 
 
 @pytest.mark.parametrize("mismatch", [
-    "sink_category", "destination", "tool_name", "canonical_principal",
+    "sink_category", "destination", "canonical_principal",
     "labels", "source_channels", "sources",
 ])
 def test_shadow_approval_mismatch_does_not_spend_grant(mismatch):
     labels = _labels()
     state = InformationFlowState(labels)
     assert state.approve_sink_once(
-        fallback=labels, sink_category="file", destination="/tmp/approved",
-        tool_name="write_file", canonical_principal="operator", lifetime_seconds=30,
+        fallback=labels, sink_category="forge", destination="owner/repo#pull/7",
+        canonical_principal="operator", lifetime_seconds=30,
         durable_audit=lambda *_: True,
     )
-    arguments = dict(current=labels, sink_category="file", destination="/tmp/approved",
-                     tool_name="write_file", require_tool=True,
+    arguments = dict(current=labels, sink_category="forge", destination="owner/repo#pull/7",
                      canonical_principal="operator")
     wrong = dict(arguments)
     if mismatch in {"labels", "source_channels", "sources"}:
@@ -6796,8 +6795,8 @@ def test_shadow_approval_mismatch_does_not_spend_grant(mismatch):
     assert not state.consume_sink_approval(**arguments)
     # A newly issued grant has its own shadow one-use budget.
     assert state.approve_sink_once(
-        fallback=labels, sink_category="file", destination="/tmp/approved",
-        tool_name="write_file", canonical_principal="operator", lifetime_seconds=30,
+        fallback=labels, sink_category="forge", destination="owner/repo#pull/7",
+        canonical_principal="operator", lifetime_seconds=30,
         durable_audit=lambda *_: True,
     )
     assert state.consume_sink_approval(**arguments, shadow=True)
@@ -6822,41 +6821,8 @@ def test_unbound_shell_declassification_cannot_bypass_active_ingest_gate(tool_na
     assert decision.refusal_detail is None
 
 
-@pytest.mark.parametrize("tool_name", [None, "edit_file"])
 @pytest.mark.parametrize("enforce", [False, True])
-def test_unbound_or_wrong_tool_file_grant_cannot_bypass_taint(
-    tmp_path: Path, tool_name: str | None, enforce: bool,
-) -> None:
-    labels = _labels()
-    state = InformationFlowState(labels=labels)
-    auth = replace(_auth(roles=("admin",)), ifc_labels=labels, ifc_state=state)
-    destination = str((tmp_path / "approved.txt").resolve())
-    # Whether issuance rejects an unbound grant or stores it for another sink,
-    # it must never authorize this tainted write_file call.
-    state.approve_sink_once(
-        fallback=labels, sink_category="file", destination=destination,
-        tool_name=tool_name, canonical_principal=auth.canonical_principal,
-        lifetime_seconds=30, durable_audit=lambda *_: True,
-    )
-    decision = ToolRegistry().authorize_tool(
-        "write_file", auth, enforce=enforce, target_channel=destination,
-        arguments={"file_path": destination}, ifc_labels=labels,
-    )
-    assert not decision.allowed and decision.enforcement_enabled
-    assert not decision.is_shadow_decision
-    assert decision.reason == "write_blocked_by_untrusted_ingest"
-    assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
-    sink = SinkGate.check_sink_flow(
-        "write_file", destination, labels, auth, enforce=enforce,
-    )
-    assert not sink.allowed and sink.enforcement_enabled
-    assert not sink.is_shadow_decision
-    assert sink.reason == "write_blocked_by_untrusted_ingest"
-    assert sink.refusal_detail == ac._TAINTED_WRITE_REFUSAL
-
-
-@pytest.mark.parametrize("enforce", [False, True])
-def test_exact_file_grant_admits_tainted_sink_once_without_clearing_sources(
+def test_exact_file_grant_refuses_tainted_write_without_clearing_or_spending(
     tmp_path: Path, enforce: bool,
 ) -> None:
     labels = _labels()
@@ -6865,23 +6831,120 @@ def test_exact_file_grant_admits_tainted_sink_once_without_clearing_sources(
     destination = str((tmp_path / "approved.txt").resolve())
     assert state.approve_sink_once(
         fallback=labels, sink_category="file", destination=destination,
-        tool_name="write_file", canonical_principal=auth.canonical_principal,
+        canonical_principal=auth.canonical_principal,
         lifetime_seconds=30, durable_audit=lambda *_: True,
     )
-    admitted = SinkGate.check_sink_flow(
-        "write_file", destination, labels, auth, enforce=enforce,
-    )
-    assert admitted.allowed
-    assert admitted.reason == "ifc_declassification_approved"
-    reused = SinkGate.check_sink_flow(
-        "write_file", destination, labels, auth, enforce=enforce,
-    )
-    assert not reused.allowed and reused.enforcement_enabled
-    assert not reused.is_shadow_decision
-    assert reused.reason == "write_blocked_by_untrusted_ingest"
-    assert reused.refusal_detail == ac._TAINTED_WRITE_REFUSAL
+    for _ in range(2):
+        decisions = (
+            SinkGate.check_sink_flow(
+                "write_file", destination, labels, auth, enforce=enforce,
+            ),
+            ToolRegistry().authorize_tool(
+                "write_file", auth, enforce=enforce, target_channel=destination,
+                arguments={"file_path": destination}, ifc_labels=labels,
+            ),
+        )
+        for decision in decisions:
+            assert not decision.allowed and decision.enforcement_enabled
+            assert not decision.is_shadow_decision
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
+            assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
     assert state.current(labels) is labels
     assert state.has_untrusted_active_ingest(labels)
+    arguments = dict(
+        current=labels, sink_category="file", destination=destination,
+        canonical_principal=auth.canonical_principal,
+    )
+    assert state.consume_sink_approval(**arguments, shadow=True)
+    assert state.consume_sink_approval(**arguments)
+    assert not state.consume_sink_approval(**arguments)
+
+
+@pytest.mark.parametrize("origin", ["admin", "acp"])
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("tool_name,gate", [
+    ("write_file", "sink"), ("write_file", "registry_target"),
+    ("write_file", "registry_file_path"), ("write_file", "registry_path"),
+    ("repo_commit", "sink"), ("repo_push", "sink"), ("repo_test", "sink"),
+])
+def test_live_declassification_cannot_bypass_tainted_write_veto(
+    tmp_path: Path, bind_approval_turn, origin: str, enforce: bool,
+    tool_name: str, gate: str,
+) -> None:
+    from mimir.event_logger import _reset_logger_for_tests, init_logger
+    from tests.test_access_control import _repository_result_labels, _review_state
+
+    auth = _auth(roles=("admin",))
+    if origin == "acp":
+        auth = replace(
+            _auth(channel="acp:session", roles=("admin",)),
+            bridge_instance="acp-stdio", origin_trigger="acp_session",
+        )
+    if tool_name == "write_file":
+        labels = _labels(auth.channel_id, bridge_instance=auth.bridge_instance)
+        scope = None
+        category = "file"
+        destination = str((tmp_path / "approved.txt").resolve())
+    else:
+        scope = _review_state("owner/repo", 7, "fix", "/srv/repo").action_scope
+        source = replace(
+            _repository_result_labels("owner/repo", 7, scope.observed_head_sha).sources[0],
+            integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
+        )
+        labels = InformationFlowLabels().with_source(source)
+        category = "forge"
+        destination = "owner/repo#pull/7"
+    state = InformationFlowState(labels=labels)
+    auth = replace(auth, ifc_labels=labels, ifc_state=state, enforcement_enabled=enforce)
+    turn = bind_approval_turn(auth)
+    events_path = tmp_path / "events.jsonl"
+    init_logger(events_path, session_id="ifc-approved-write-veto")
+    try:
+        assert approve_live_declassification(
+            auth, turn_id=turn.turn_id, sink_category=category,
+            destination=destination, reason="approve exact egress, not a code write",
+        ) == (True, "approved")
+        for _ in range(2):
+            if gate.startswith("registry_"):
+                target = destination if gate == "registry_target" else None
+                arguments = {"content": "tainted payload"}
+                if gate == "registry_file_path":
+                    arguments["file_path"] = destination
+                elif gate == "registry_path":
+                    arguments["path"] = destination
+                decision = ToolRegistry().authorize_tool(
+                    tool_name, auth, enforce=enforce, target_channel=target,
+                    arguments=arguments, ifc_labels=labels,
+                )
+            else:
+                decision = SinkGate.check_sink_flow(
+                    tool_name, destination, labels, auth, enforce=enforce,
+                    repo_pr_action_scope=scope,
+                )
+            assert not decision.allowed and decision.enforcement_enabled
+            assert not decision.is_shadow_decision
+            assert decision.reason == "write_blocked_by_untrusted_ingest"
+            assert decision.refusal_detail == ac._TAINTED_WRITE_REFUSAL
+        assert state.current(labels) is labels
+        assert state.has_untrusted_active_ingest(labels)
+        arguments = dict(
+            current=labels, sink_category=category, destination=destination,
+            canonical_principal=auth.canonical_principal,
+        )
+        # Prove both one-use budgets survived the hard veto, without clearing taint.
+        assert state.consume_sink_approval(**arguments, shadow=True)
+        assert state.consume_sink_approval(**arguments)
+        assert not state.consume_sink_approval(**arguments, shadow=True)
+        assert not state.consume_sink_approval(**arguments)
+        records = [json.loads(line) for line in events_path.read_text().splitlines()]
+        [approval] = [record for record in records if record["type"] == "ifc_declassification"]
+        assert approval["outcome"] == "approved"
+        assert approval["destination"] == destination
+        assert approval["sink_category"] == category
+        assert approval["use_limit"] == 1
+        assert approval["source_labels"]
+    finally:
+        _reset_logger_for_tests()
 
 
 def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path, bind_approval_turn):
@@ -6892,14 +6955,13 @@ def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path, bi
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
     turn = bind_approval_turn(auth)
     other_turn = replace(_auth(roles=("admin",)), ifc_labels=labels)
-    destination = str(tmp_path / "approved.txt")
+    destination = "https://audience.example/approved"
     try:
         assert approve_live_declassification(
             auth,
-            sink_category="file",
-            tool_name="write_file",
+            sink_category="http_webhook",
             destination=destination,
-            reason="one exact write",
+            reason="one exact HTTP egress",
             turn_id=turn.turn_id,
         ) == (True, "approved")
     finally:
@@ -6909,15 +6971,18 @@ def test_live_declassification_does_not_cross_turn_or_sink_category(tmp_path, bi
         "activity_panel_post", auth.channel_id, labels, auth, enforce=True,
     )
     other = SinkGate.check_sink_flow(
-        "write_file", destination, labels, other_turn, enforce=True,
+        "http_request", destination, labels, other_turn, enforce=True,
     )
     original = SinkGate.check_sink_flow(
-        "write_file", destination, labels, auth, enforce=True,
+        "http_request", destination, labels, auth, enforce=True,
     )
 
     assert panel.reason != "ifc_declassification_approved"
     assert other.allowed is False
     assert original.allowed is True
+    assert original.reason == "ifc_declassification_approved"
+    assert auth.ifc_state.current(labels) is labels
+    assert auth.ifc_state.has_untrusted_active_ingest(labels)
 
 
 def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path, bind_approval_turn):
@@ -6925,27 +6990,25 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path,
 
     labels = _labels()
     auth = replace(_auth(roles=("admin",)), ifc_labels=labels)
-    destination = str(tmp_path / "approved.txt")
+    destination = "https://audience.example/approved"
     _reset_logger_for_tests()
     turn = bind_approval_turn(auth)
     assert approve_live_declassification(
         auth,
-        sink_category="file",
-        tool_name="write_file",
+        sink_category="http_webhook",
         destination=destination,
         reason="audit is unavailable",
         turn_id=turn.turn_id,
     ) == (False, "approval_failed")
     assert SinkGate.check_sink_flow(
-        "write_file", destination, labels, auth, enforce=True,
+        "http_request", destination, labels, auth, enforce=True,
     ).allowed is False
 
     init_logger(tmp_path / "events.jsonl", session_id="ifc-taint-test")
     try:
         assert approve_live_declassification(
             auth,
-            sink_category="file",
-            tool_name="write_file",
+            sink_category="http_webhook",
             destination=destination,
             reason="source snapshot must remain exact",
             turn_id=turn.turn_id,
@@ -6959,13 +7022,12 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path,
             fallback=labels,
         )
         assert SinkGate.check_sink_flow(
-            "write_file", destination, labels, auth, enforce=True,
+            "http_request", destination, labels, auth, enforce=True,
         ).reason == "ifc_declassification_approved"
 
         assert approve_live_declassification(
             auth,
-            sink_category="file",
-            tool_name="write_file",
+            sink_category="http_webhook",
             destination=destination,
             reason="new taint must invalidate approval",
             turn_id=turn.turn_id,
@@ -6975,7 +7037,7 @@ def test_live_declassification_audit_failure_and_new_taint_fail_closed(tmp_path,
     tainted = labels.with_label("confidential")
     auth.ifc_state.merge(tainted, fallback=labels)
     assert SinkGate.check_sink_flow(
-        "write_file", destination, tainted, auth, enforce=True,
+        "http_request", destination, tainted, auth, enforce=True,
     ).allowed is False
 
 

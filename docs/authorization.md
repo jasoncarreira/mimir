@@ -799,11 +799,13 @@ A clean attested checkout does not override this turn-level decision, including
 retained Worklink remediation. ACP hands calls refuse before requesting client
 permission; this change does not clear taint or alter the proxy grant cache.
 
-A one-time operator `approve_sink_once` grant must bind the exact tool and
-normalized destination. It permits one matching call without clearing sources;
-a grant for `repo_test` cannot authorize `repo_push`, and a category-only grant
-cannot bypass the veto. Reads, discard/abort operations, forge text tools and
-`send_message` retain their independent authorization decisions.
+The write veto has no grant path: model-callable `approve_declassification`
+retains its egress-only meaning and cannot unlock file writes, repository
+publication or `repo_test`. Neither exact-destination nor category approvals
+bypass this veto. Operator-only unlocking is a separate follow-up (#1942);
+until then, use a proposal or ask for a fresh clean turn. Reads, discard/abort
+operations, forge text tools and `send_message` retain their independent
+authorization decisions.
 
 Use scratch and gated operator-reviewed proposals (`open_proposal`,
 `submit_proposal`, or `memory_propose`) instead of live writes. Untrusted-origin

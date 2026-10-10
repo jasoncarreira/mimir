@@ -331,12 +331,9 @@ def test_shadow_declassification_parity(live_turn, tool, target, case, monkeypat
     shadow = [access_control.SinkGate.check_sink_flow(
         tool, target, auth.ifc_labels, auth, enforce=False,
     ) for _ in range(2)]
-    if tool == "write_file" and case == "expired":
-        # Always-on veto checks prune expired capabilities but never spend an
-        # unrelated, unexpired destination-only approval.
-        assert auth.ifc_state._declassification is None
-    else:
-        assert auth.ifc_state._declassification is grant
+    # The write veto never consults egress approvals, even expired ones;
+    # shadow egress only observes its capability without consuming it.
+    assert auth.ifc_state._declassification is grant
     enforced = [access_control.SinkGate.check_sink_flow(
         tool, target, auth.ifc_labels, auth, enforce=True,
     ) for _ in range(2)]
