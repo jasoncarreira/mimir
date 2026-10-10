@@ -6384,8 +6384,9 @@ _TAINTED_FILE_WRITE_TOOLS = frozenset({
 })
 _TAINTED_WRITE_REFUSAL = (
     "This turn read untrusted outside content, so it cannot directly write code "
-    "or live state. Use scratch and operator-reviewed proposals, describe the "
-    "change with pr_comment/send_message, or ask for a fresh clean turn."
+    "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
+    "or memory_propose; the operator merges it. Describe the change with "
+    "pr_comment/send_message, or ask for a fresh clean turn."
 )
 
 
