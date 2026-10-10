@@ -787,16 +787,35 @@ access. See the
 [`worklink.yaml` operator reference](configuration.md#worklink-yaml) for its
 default, supported command syntax, and non-Python examples.
 
-### Always-on post-ingest repository vetoes
+### Always-on post-ingest code and live-state vetoes
 
-Regardless of the enforcement switch or trigger, untrusted active ingest in a
-turn blocks `repo_test` from executing checkout code (#1913). The same condition
-blocks `repo_commit`, `repo_merge`, `repo_rebase`, `repo_revert`, and `repo_push`
-from creating or publishing commits, including retained Worklink remediation
-commits (#1937). A clean attested checkout does not override this turn-level
-decision. A one-time operator `approve_sink_once` grant for the exact forge sink
-can allow one call; otherwise use a clean turn. Staging, local abort/reset and
-repository reads retain their existing authorization decisions.
+Regardless of the enforcement switch or trigger, untrusted active ingest blocks
+model tool calls that directly write code or live state (#1937): `repo_stage`,
+`repo_commit`, `repo_merge`, `repo_rebase`, `repo_revert`, `repo_push`, `repo_test`,
+`hands_edit`, `hands_shell`, `hands_python`, and SAGA mutation tools. File writes
+(including async variants) are blocked except to resolved descendants of
+`MIMIR_HOME/scratch/`; symlinks or traversal into live state are not exempt.
+A clean attested checkout does not override this turn-level decision, including
+retained Worklink remediation. ACP hands calls refuse before requesting client
+permission; this change does not clear taint or alter the proxy grant cache.
+
+A one-time operator `approve_sink_once` grant must bind the exact tool and
+normalized destination. It permits one matching call without clearing sources;
+a grant for `repo_test` cannot authorize `repo_push`, and a category-only grant
+cannot bypass the veto. Reads, discard/abort operations, forge text tools and
+`send_message` retain their independent authorization decisions.
+
+Use scratch and gated operator-reviewed proposals (`open_proposal`,
+`submit_proposal`, or `memory_propose`) instead of live writes. Untrusted-origin
+proposal PRs carry an `[untrusted-origin]` title prefix and a fixed review note,
+must never auto-merge, and submission checks the whole staged index for changes
+outside the permitted surfaces, including code/config. Live loaders reject
+scratch-backed sources, even through aliases; automatic semantic persistence
+must not bypass gated tools.
+
+The veto is enforced at the model tool-call boundary, not on shared server
+persistence backends. Continuation sidecars, summarization offload, retrieval
+statistics and audit logs remain functional after untrusted ingest.
 
 ### Contained repository-code execution
 
