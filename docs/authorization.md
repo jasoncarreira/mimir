@@ -458,10 +458,14 @@ refuse a call or change any existing shadow/enforced decision.
 Each `egress_veto_would_block` event includes the tool, sink category, trigger,
 service principal/poller, destination **host only** for URLs, missed exemption,
 reason, untrusted source metadata and whether the actual decision allowed it.
-To review counts by tool, host, trigger/poller and reason without writing to the
-agent home, run `mimir stats --home <home> --egress-shadow` (optionally
-`--since 2026-10-09T00:00:00Z`). Arming an actual veto requires a separate
-operator decision.
+The `origin` field distinguishes model `tool_call` egress from `harness` delivery;
+opaque repository source IDs retain their `#pull/N@sha` attribution. Destination
+hosts are IDNA-normalised, falling back to the raw host on encoding errors.
+To review counts by tool, host, trigger/poller, reason and origin without writing
+to the agent home, run `mimir stats --home <home> --egress-shadow` (optionally
+`--since 2026-10-09T00:00:00Z`). Historical events without an origin are grouped
+under `origin=-`; `--since` without `--egress-shadow` is an error. Arming an actual
+veto requires a separate operator decision.
 
 ### Ingest acknowledgement
 

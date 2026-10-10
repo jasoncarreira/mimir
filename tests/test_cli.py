@@ -688,6 +688,10 @@ def test_stats_egress_shadow_report_is_read_only_and_groups_fixture(
         {"type": "egress_veto_would_block", "timestamp": "2026-10-09T10:01:00Z",
          "tool": "send_message", "destination_host": None, "trigger": "user_message",
          "reason": "private_source_cross_channel"},
+        *[dict(type="egress_veto_would_block", timestamp="2026-10-09T10:01:00Z",
+               tool="send_message", destination_host=None, trigger="user_message",
+               reason="private_source_cross_channel", origin=origin)
+          for origin in ("harness", "tool_call")],
         {"type": "tool_call", "timestamp": "2026-10-09T10:01:00Z"},
     ]
     events.write_text("\n".join(json.dumps(record) for record in records) + "\ninvalid\n")
@@ -695,12 +699,22 @@ def test_stats_egress_shadow_report_is_read_only_and_groups_fixture(
     main(["stats", "--home", str(home), "--egress-shadow", "--since", "2026-10-09T09:00:00Z"])
     out = capsys.readouterr().out
     assert "2  tool=fetch_url host=new.example trigger=poller poller=news reason=egress_destination_not_approved" in out
-    assert "1  tool=send_message host=- trigger=user_message poller=- reason=private_source_cross_channel" in out
+    for origin in ("-", "harness", "tool_call"):
+        assert ("1  tool=send_message host=- trigger=user_message poller=- "
+                f"reason=private_source_cross_channel origin={origin}") in out
+    assert "3  tool=send_message" not in out
     assert "old.example" not in out
     assert events.read_bytes() == before
     assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == [
         "logs", "logs/events.jsonl",
     ]
+
+
+def test_stats_since_requires_egress_shadow(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["stats", "--since", "2026-10-09T00:00:00Z"])
+    assert exc.value.code == 2
+    assert "--since requires --egress-shadow" in capsys.readouterr().err
 
 
 def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixture):

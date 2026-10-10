@@ -137,6 +137,65 @@ def test_egress_shadow_verdicts_and_original_decisions(
         assert len(events) == before, tool
 
 
+@pytest.mark.parametrize("resource_id,expected", [
+    ("owner/repo#pull/2318@abc123", "owner/repo#pull/2318@abc123"),
+    ("opaque?part#attribution", "opaque?part#attribution"),
+    ("https://source.example/private?secret=hidden#hidden", "source.example"),
+])
+def test_egress_shadow_preserves_opaque_source_attribution(
+    monkeypatch: pytest.MonkeyPatch, resource_id: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    source = replace(auth.ifc_labels.sources[0], resource_id=resource_id)
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    SinkGate.check_sink_flow("fetch_url", "https://other.example/", labels, auth)
+    assert len(events) == 1
+    assert events[0]["source"]["resource_id"] == expected
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("bücher.example", "xn--bcher-kva.example"),
+    ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+    ("a" * 64 + ".example", "a" * 64 + ".example"),
+])
+def test_egress_shadow_normalises_idn_hosts_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch, host: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    SinkGate.check_sink_flow("fetch_url", f"https://{host}/private?hidden=yes", auth.ifc_labels, auth)
+    assert len(events) == 1
+    assert events[0]["destination_host"] == expected
+    assert events[0]["origin"] == "tool_call"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_egress_shadow_channel_resolution_failure_preserves_decision(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    auth = _egress_shadow_auth()
+    baseline = SinkGate._check_sink_flow_decision(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    )
+    monkeypatch.setattr(SinkGate, "_check_sink_flow_decision", lambda *args, **kwargs: baseline)
+
+    def fail_resolution(*args: object) -> None:
+        raise RuntimeError("shadow channel resolution unavailable")
+
+    monkeypatch.setattr(access_control.ChannelResourceAdapter, "_resolve_channel", fail_resolution)
+    assert SinkGate.check_sink_flow(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    ) == baseline
+
+
 @pytest.mark.parametrize("enforce", [False, True])
 @pytest.mark.parametrize("category", [SinkCategory.CROSS_CHANNEL, None])
 def test_egress_shadow_cross_channel_sink_approval_is_exempt(

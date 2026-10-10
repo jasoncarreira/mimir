@@ -38,7 +38,7 @@ def _egress_since(value: str) -> datetime:
 
 def _print_egress_shadow_report(events_path: Path, since: datetime | None) -> None:
     """Stream a read-only count of the dedicated shadow event by operator pivot."""
-    counts: Counter[tuple[str, str, str, str, str]] = Counter()
+    counts: Counter[tuple[str, str, str, str, str, str]] = Counter()
     if events_path.is_file():
         with events_path.open(encoding="utf-8") as stream:
             for line in stream:
@@ -53,7 +53,7 @@ def _print_egress_shadow_report(events_path: Path, since: datetime | None) -> No
                         if stamp.tzinfo is None or stamp.astimezone(timezone.utc) < since:
                             continue
                     key = tuple(str(event.get(field) or "-") for field in (
-                        "tool", "destination_host", "trigger", "poller", "reason",
+                        "tool", "destination_host", "trigger", "poller", "reason", "origin",
                     ))
                     counts[key] += 1
                 except (ValueError, TypeError, KeyError, AttributeError):
@@ -61,8 +61,8 @@ def _print_egress_shadow_report(events_path: Path, since: datetime | None) -> No
     print("Egress veto shadow would-blocks:")
     if not counts:
         print("  (no events recorded)")
-    for (tool, host, trigger, poller, reason), count in sorted(counts.items()):
-        print(f"  {count}  tool={tool} host={host} trigger={trigger} poller={poller} reason={reason}")
+    for (tool, host, trigger, poller, reason, origin), count in sorted(counts.items()):
+        print(f"  {count}  tool={tool} host={host} trigger={trigger} poller={poller} reason={reason} origin={origin}")
 
 # ---------------------------------------------------------------------------
 # Re-exports from commands.setup (backward compatibility — tests and external
@@ -550,6 +550,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "stats":
+        if args.since is not None and not args.egress_shadow:
+            stats_p.error("--since requires --egress-shadow")
         if args.egress_shadow:
             home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
             _print_egress_shadow_report(Path(home_arg) / "logs" / "events.jsonl", args.since)

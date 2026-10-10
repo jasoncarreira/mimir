@@ -6169,16 +6169,13 @@ def _egress_shadow_source(auth_context: Any, ifc_labels: Any) -> dict[str, str |
     source = next((item for item in getattr(labels, "sources", ())
                    if getattr(item, "has_untrusted_active_ingest", False)), None)
     resource_id = getattr(source, "resource_id", None)
-    # Resource IDs are normally channel IDs, but never copy a URL query or
-    # fragment into this dedicated audit record.
-    if isinstance(resource_id, str):
-        if "://" in resource_id:
-            try:
-                resource_id = urlsplit(resource_id).hostname
-            except ValueError:
-                resource_id = None
-        else:
-            resource_id = resource_id.split("?", 1)[0].split("#", 1)[0]
+    # Opaque IDs retain attribution, including repository #pull/N@sha suffixes.
+    # Only actual URLs are reduced to hosts to avoid logging URL secrets.
+    if isinstance(resource_id, str) and "://" in resource_id:
+        try:
+            resource_id = urlsplit(resource_id).hostname
+        except ValueError:
+            resource_id = None
     return {
         "domain": getattr(source, "domain", None),
         "resource_id": resource_id,
@@ -6815,25 +6812,25 @@ class SinkGate:
     @classmethod
     def check_sink_flow(
         cls, tool_name: str, target: str | None, ifc_labels: Any,
-        auth_context: Any, **kwargs: Any,
+        auth_context: Any, *, origin: str = "tool_call", **kwargs: Any,
     ) -> "ToolAuthorization":
         """Audit the proposed egress veto after the unchanged sink decision."""
         decision = cls._check_sink_flow_decision(
             tool_name, target, ifc_labels, auth_context, **kwargs,
         )
-        category = kwargs.get("sink_category") or get_sink_category(tool_name)
-        shadow_category = category
-        # send_message's descriptor is SAME_CHANNEL; its target can still be
-        # another channel. Classify the destination only for this audit event.
-        if (tool_name == "send_message" and category is SinkCategory.SAME_CHANNEL
-                and target and ChannelResourceAdapter._resolve_channel(target)
-                != ChannelResourceAdapter._resolve_channel(
-                    getattr(auth_context, "channel_id", None))):
-            shadow_category = SinkCategory.CROSS_CHANNEL
-        if (tool_name in {"fetch_url", "web_search", "webhook", "http_request", "send_message"}
-                and shadow_category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK,
-                                        SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}):
-            try:
+        try:
+            category = kwargs.get("sink_category") or get_sink_category(tool_name)
+            shadow_category = category
+            # send_message's descriptor is SAME_CHANNEL; classify its target
+            # only for telemetry, inside the fail-safe boundary.
+            if (tool_name == "send_message" and category is SinkCategory.SAME_CHANNEL
+                    and target and ChannelResourceAdapter._resolve_channel(target)
+                    != ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None))):
+                shadow_category = SinkCategory.CROSS_CHANNEL
+            if (tool_name in {"fetch_url", "web_search", "webhook", "http_request", "send_message"}
+                    and shadow_category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK,
+                                            SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}):
                 verdict = _egress_veto_shadow_verdict(
                     tool_name, shadow_category, target, ifc_labels, auth_context, decision,
                 )
@@ -6846,11 +6843,17 @@ class SinkGate:
                     if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
                         try:
                             host = urlsplit(target or "").hostname
+                            if host is not None:
+                                try:
+                                    host = host.encode("idna").decode("ascii").lower()
+                                except UnicodeError:
+                                    pass
                         except ValueError:
                             pass
                     log_event_sync(
                         "egress_veto_would_block",
                         tool=tool_name, sink_category=shadow_category.value,
+                        origin=origin,
                         trigger=getattr(auth_context, "trigger", None),
                         service_principal=principal,
                         poller=(principal.removeprefix("poller:")
@@ -6860,9 +6863,9 @@ class SinkGate:
                         source=_egress_shadow_source(auth_context, ifc_labels),
                         actual_allowed=decision.allowed,
                     )
-            except Exception:
-                # Best-effort telemetry must never alter the returned decision.
-                log.debug("egress shadow audit unavailable", exc_info=True)
+        except Exception:
+            # Best-effort telemetry must never alter the returned decision.
+            log.debug("egress shadow audit unavailable", exc_info=True)
         return decision
 
     @classmethod
