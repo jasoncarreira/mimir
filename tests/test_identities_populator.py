@@ -907,25 +907,111 @@ async def test_populate_all_dry_run_does_not_write(tmp_path: Path):
     assert not _state_yaml(tmp_path).is_file()
 
 
-@pytest.mark.parametrize("writer", ["request", "approve", "web_key", "merge"])
+# Keep this explicit: deriving parameters from the inventory would silently
+# count a newly added writer as covered without giving it a real write case.
+_INTAKE_WRITERS = [
+    "_atomic_write_identities", "add_identity_alias", "remove_identity",
+    "issue_web_key", "revoke_web_key", "set_user_prefs", "capture_dm_channel",
+    "request_pairing_with_code", "prepare_pairing_code_delivery",
+    "approve_pairing", "reject_pairing", "approve_pairing_code", "merge_into_yaml",
+    "_seed_identities", "request_pairing_status",
+]
+
+
+def test_intake_writer_coverage_matches_reviewed_inventory():
+    from tests.test_identities_writers import _ALLOWED
+
+    inventoried = {writer for writers in _ALLOWED.values() for writer in writers}
+    # The status API is an additional public wrapper, not a direct write sink.
+    assert set(_INTAKE_WRITERS) == inventoried | {"request_pairing_status"}
+    assert len(_INTAKE_WRITERS) == len(set(_INTAKE_WRITERS))
+
+
+@pytest.mark.parametrize("writer", _INTAKE_WRITERS)
 def test_intake_survives_every_identities_writer(tmp_path, writer):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
     import yaml
     from mimir import identities_populator as pop
+    from mimir.commands import setup
 
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     path = state / "identities.yaml"
-    intake = {"unknown_senders": {"default": {"dm": "pair", "channel": "ignore"},
-                                  "discord": {"dm": "decline"}}, "decline_text": "No thanks"}
-    path.write_text(yaml.safe_dump({"people": [{"canonical": "slack-U1", "aliases": ["slack-U1"],
-                                             "pairing": {"status": "pending"}}],
-                                   "channels": [], "intake": intake}))
-    if writer == "request":
-        pop.request_pairing_status(tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True)
-    elif writer == "approve":
+    intake = {
+        "unknown_senders": {
+            "default": {"dm": "pair", "channel": "ignore"},
+            "discord": {"dm": "decline"},
+            "slack": {"channel": "decline"},
+        },
+        "decline_text": "No thanks",
+    }
+    code = "ABCDEFGH"
+    salt = b"intake-test-salt"
+    doc = {
+        "people": [{
+            "canonical": "slack-U1",
+            "aliases": ["slack-U1", "webkey:" + "a" * 64],
+            "pairing": {
+                "status": "pending",
+                "code_salt": salt.hex(),
+                "code_hash": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+                "code_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+            },
+        }],
+        "channels": [],
+        "intake": intake,
+    }
+    path.write_text(yaml.safe_dump(doc))
+    before = path.read_bytes()
+
+    if writer == "request_pairing_status":
+        assert pop.request_pairing_status(
+            tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True,
+        ) == "changed"
+    elif writer == "request_pairing_with_code":
+        status, minted = pop.request_pairing_with_code(
+            tmp_path, "slack-U2", "slack", channel_id="dm-slack-D2", is_dm=True,
+        )
+        assert status == "changed" and minted
+    elif writer == "approve_pairing":
         assert pop.approve_pairing(tmp_path, "slack-U1")
-    elif writer == "web_key":
-        pop.issue_web_key(tmp_path, "slack-U1", key_factory=lambda: "test-secret")
+    elif writer == "reject_pairing":
+        assert pop.reject_pairing(tmp_path, "slack-U1")
+    elif writer == "approve_pairing_code":
+        assert pop.approve_pairing_code(tmp_path, code)
+    elif writer == "prepare_pairing_code_delivery":
+        assert pop.prepare_pairing_code_delivery(tmp_path, "slack-U1", code)
+    elif writer == "issue_web_key":
+        assert pop.issue_web_key(tmp_path, "slack-U1", key_factory=lambda: "test-secret") == "test-secret"
+    elif writer == "revoke_web_key":
+        assert pop.revoke_web_key(tmp_path, "slack-U1")
+    elif writer == "capture_dm_channel":
+        assert pop.capture_dm_channel(tmp_path, "slack-U1", "slack", "dm-slack-D1")
+    elif writer == "set_user_prefs":
+        assert pop.set_user_prefs(tmp_path, "slack-U1", {"theme": "dark"})
+    elif writer == "add_identity_alias":
+        pop.add_identity_alias(tmp_path, "slack-U1", "discord-123")
+    elif writer == "remove_identity":
+        assert pop.remove_identity(tmp_path, None, "slack-U1") == "removed identity: slack-U1"
+    elif writer == "merge_into_yaml":
+        counts = pop.merge_into_yaml(
+            tmp_path, people=[{"canonical": "slack-U3", "aliases": ["slack-U3"]}], channels=[],
+        )
+        assert counts["people_added"] == 1
+    elif writer == "_atomic_write_identities":
+        doc["channels"].append({"canonical": "slack-C1"})
+        with pop._IDENTITIES_WRITE_LOCK:
+            pop._atomic_write_identities(path, "", doc)
     else:
-        pop.merge_into_yaml(tmp_path, people=[{"canonical": "slack-U3", "aliases": ["slack-U3"]}], channels=[])
+        assert writer == "_seed_identities"
+        # Setup's writer is create-only; it must not replace existing intake.
+        assert not setup._seed_identities(tmp_path, "people: []\nchannels: []\n")
+        assert path.read_bytes() == before
+
+    # Every mutating fixture must really change the file: preservation on an
+    # early return/no-op is not evidence that the writer's round-trip is safe.
+    if writer != "_seed_identities":
+        assert path.read_bytes() != before
     assert yaml.safe_load(path.read_text())["intake"] == intake
