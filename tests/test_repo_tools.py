@@ -4134,10 +4134,19 @@ async def test_failed_repo_test_after_tainted_commit_stays_untrusted(tmp_path, m
     assert integ == "untrusted" and allowed is False
 
 
-def test_recorded_inventory_symlink_loop_fails_closed(tmp_path):
+def test_recorded_inventory_unresolvable_key_fails_closed(tmp_path, monkeypatch):
+    """An inventory key that cannot be resolved (e.g. a symlink loop on Python
+    <= 3.12, where Path.resolve raises) must fail closed, never crash result
+    classification. Simulated so the test does not depend on the Python
+    version's resolve() semantics (3.13 returns the looped path instead)."""
     from mimir import project_tests
 
-    loop = tmp_path / "loop"
-    loop.symlink_to(tmp_path / "loop")
-    project_tests.remember_node_inventory(loop, "scope-loop", frozenset({"x"}))
-    assert project_tests.recorded_node_inventory(loop, "scope-loop") is None
+    project_tests.remember_node_inventory(tmp_path, "scope-loop", frozenset({"x"}))
+
+    for error in (RuntimeError("Symlink loop"), OSError("unresolvable")):
+        def raise_error(root, scope_id, _error=error):
+            raise _error
+
+        monkeypatch.setattr(project_tests, "_inventory_key", raise_error)
+        project_tests.remember_node_inventory(tmp_path, "scope-other", frozenset({"y"}))
+        assert project_tests.recorded_node_inventory(tmp_path, "scope-loop") is None
