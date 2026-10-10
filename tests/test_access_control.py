@@ -7456,6 +7456,65 @@ def test_github_fetch_cache_read_follows_capability(
         assert decision.reason == "read_scope"
 
 
+@pytest.mark.asyncio
+async def test_github_fetch_url_metadata_has_no_trusted_provenance_and_cache_read_is_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fetching a configured GitHub PR API URL cannot acquire forge trust."""
+    from io import BytesIO
+
+    import yaml
+
+    from mimir.tools import web
+
+    url = "https://api.github.com/repos/owner/repo/pulls/42"
+    body = b'{"body":"external content"}'
+
+    class Response(BytesIO):
+        headers = {"Content-Type": "application/json"}
+
+        def getcode(self) -> int:
+            return 200
+
+    def fake_open(request: object, timeout: int = 0) -> Response:
+        assert request.full_url == url
+        return Response(body)
+
+    monkeypatch.setattr(web, "_open_url", fake_open)
+    monkeypatch.setattr(web, "_validate_fetch_url", lambda _url: None)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    web.set_home(tmp_path)
+    (tmp_path / "attachments").mkdir()
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url", "read_file"),
+        approved_urls=("https://api.github.com/repos/",), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+    fetch_auth = registry.authorize_tool("fetch_url", auth, enforce=True, target_channel=url)
+    assert fetch_auth.allowed
+    result = await web.fetch_url.ainvoke({"url": url})
+    metadata = yaml.safe_load(result)
+    assert metadata["url"] == url
+    # Current fetch_url returns metadata, not the remote body; it has no
+    # content label at all, even for configured repositories.
+    labels = classify_protected_result("fetch_url", {"url": url}, auth, fetch_auth, result=result)
+    assert labels is None
+    body_path = tmp_path / metadata["file_path"].lstrip("/")
+    assert body_path.read_bytes() == body
+    read_args = {"file_path": str(body_path)}
+    read_auth = registry.authorize_tool("read_file", auth, enforce=True, arguments=read_args)
+    assert read_auth.allowed
+    read_labels = classify_protected_result("read_file", read_args, auth, read_auth)
+    assert read_labels is not None
+    assert read_labels.has_untrusted_active_ingest
+    assert {(source.domain, source.integrity) for source in read_labels.sources} == {
+        ("filesystem", "untrusted"),
+    }
+
+
 @pytest.fixture
 def github_activity_fetch_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AuthContext:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
