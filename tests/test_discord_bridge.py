@@ -156,6 +156,52 @@ def test_discord_client_defaults_block_broadcasts_and_roles():
     bridge = DiscordBridge(token="TEST", enqueue=AsyncMock())
     client = _DiscordClient(bridge)
     _assert_safe_mentions(client.allowed_mentions)
+    assert client.intents.members is False
+
+
+@pytest.mark.asyncio
+async def test_message_member_roles_are_bridge_only_guild_extras(monkeypatch):
+    import discord
+
+    class FakeMember:
+        id = 9
+        bot = False
+        display_name = "Member"
+        roles = [SimpleNamespace(id=33), SimpleNamespace(id=22)]
+
+    monkeypatch.setattr(discord, "Member", FakeMember)
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return False
+
+    bridge = DiscordBridge(token="TEST", enqueue=enqueue)
+    bridge.send_typing_indicator = AsyncMock()
+
+    def message(author, *, guild=None, mid=1, dm=False):
+        return SimpleNamespace(
+            id=mid, author=author, guild=guild,
+            channel=_fake_channel(id=10, is_dm=dm), content="hello",
+            mentions=[], reference=None, attachments=[],
+        )
+
+    await bridge._on_message(message(FakeMember(), guild=SimpleNamespace(id=111)))
+    assert events[-1].extra["discord_guild_id"] == "111"
+    assert events[-1].extra["discord_member_role_ids"] == ["22", "33"]
+    await bridge._on_message(message(SimpleNamespace(id=9, bot=False, display_name="User"),
+                                     mid=2, dm=True))
+    assert "discord_guild_id" not in events[-1].extra
+    assert "discord_member_role_ids" not in events[-1].extra
+    await bridge._on_message(message(SimpleNamespace(id=10, bot=False, roles=[SimpleNamespace(id=22)]),
+                                     guild=SimpleNamespace(id=111), mid=3))
+    assert "discord_guild_id" not in events[-1].extra
+    partial = FakeMember()
+    partial.roles = None
+    await bridge._on_message(message(partial, guild=SimpleNamespace(id=111), mid=4))
+    assert "discord_guild_id" not in events[-1].extra
+    await bridge._on_message(message(FakeMember(), mid=5, dm=True))
+    assert "discord_guild_id" not in events[-1].extra
 
 
 @pytest.fixture

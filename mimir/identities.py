@@ -162,6 +162,32 @@ _INTAKE_MODES = {"pair", "ignore", "decline"}
 _INTAKE_PLATFORMS = {"discord", "slack"}
 
 
+def _parse_discord_role_admission(raw: object) -> tuple[tuple[str, str], ...]:
+    """Return enabled (guild, role) pairs; malformed policy never grants access."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        log.warning("identities.yaml: intake.discord_role_admission is not a map")
+        return ()
+    if raw.get("enabled") is not True:
+        return ()
+    grants = raw.get("grants")
+    if not isinstance(grants, list):
+        log.warning("identities.yaml: intake.discord_role_admission.grants is not a list")
+        return ()
+    pairs = []
+    for grant in grants:
+        if not isinstance(grant, dict) or any(
+            type(grant.get(key)) not in (str, int)
+            or not str(grant[key]).isdigit()
+            for key in ("guild_id", "role_id")
+        ):
+            log.warning("identities.yaml: skipping malformed discord role admission grant: %r", grant)
+            continue
+        pairs.append((str(grant["guild_id"]), str(grant["role_id"])))
+    return tuple(pairs)
+
+
 def _parse_intake(raw: object) -> tuple[dict[str, dict[str, str]], str]:
     modes = {"default": {"dm": "pair", "channel": "pair"}}
     if raw is None:
@@ -169,7 +195,7 @@ def _parse_intake(raw: object) -> tuple[dict[str, dict[str, str]], str]:
     if not isinstance(raw, dict):
         log.warning("identities.yaml: intake is not a map; using defaults")
         return modes, DEFAULT_DECLINE_TEXT
-    for key in raw.keys() - {"unknown_senders", "decline_text"}:
+    for key in raw.keys() - {"unknown_senders", "decline_text", "discord_role_admission"}:
         log.warning("identities.yaml: unknown intake key %r", key)
     text = raw.get("decline_text", DEFAULT_DECLINE_TEXT)
     if not isinstance(text, str) or not text.strip():
@@ -205,6 +231,7 @@ class Identity:
     aliases: list[str] = field(default_factory=list)
     notes: str | None = None
     access: AccessMetadata = field(default_factory=AccessMetadata)
+    access_source: str | None = None
     # User-facing web preferences. Kept deliberately generic so new frontend
     # preferences can ride the same identities.yaml field without schema churn.
     prefs: dict[str, object] = field(default_factory=dict)
@@ -274,6 +301,7 @@ class IdentityResolver:
         self._channels: dict[str, Channel] = {}
         self._intake_modes: dict[str, dict[str, str]] = {"default": {"dm": "pair", "channel": "pair"}}
         self._decline_text = DEFAULT_DECLINE_TEXT
+        self._discord_role_grants: tuple[tuple[str, str], ...] = ()
         # Credential loss or an unreadable credential source must not restore
         # the unauthenticated first-run mode.
         self._web_gate_latched = False
@@ -504,6 +532,9 @@ class IdentityResolver:
                 aliases=aliases,
                 notes=notes,
                 access=access,
+                access_source=(raw["access"].get("source")
+                               if isinstance(raw.get("access"), dict)
+                               and isinstance(raw["access"].get("source"), str) else None),
                 prefs=dict(prefs),
                 dm_channels=dm_channels,
                 web_key_labels=web_key_labels(aliases, raw.get("web_key_labels")),
@@ -641,6 +672,10 @@ class IdentityResolver:
         self._intake_modes, self._decline_text = _parse_intake(
             doc.get("intake") if isinstance(doc, dict) else None
         )
+        intake = doc.get("intake") if isinstance(doc, dict) else None
+        self._discord_role_grants = _parse_discord_role_admission(
+            intake.get("discord_role_admission") if isinstance(intake, dict) else None
+        )
         has_web_keys = any(
             alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in alias_map
         )
@@ -680,6 +715,14 @@ class IdentityResolver:
         with self._lock:
             self.reload_if_changed()
             return self._decline_text
+
+    def discord_role_grant(self, guild_id: str, role_ids: list[str]) -> tuple[str, str] | None:
+        """Match current bridge member roles to enabled operator grants."""
+        with self._lock:
+            if not self.reload_if_changed():
+                return None
+            return next((pair for pair in self._discord_role_grants
+                         if pair[0] == guild_id and pair[1] in role_ids), None)
 
     def resolve(self, author: str | None) -> str | None:
         """Map ``author`` (a platform-prefixed id) to canonical. Unknown

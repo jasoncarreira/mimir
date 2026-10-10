@@ -44,6 +44,270 @@ def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
     return resolver
 
 
+def _role_event(*, guild="111", roles=("222",), author="discord-9", extra=None):
+    return AgentEvent(
+        trigger="user_message", source="discord", channel_id="discord-10",
+        author=author, author_id="9", content="private message text",
+        author_display="Private Display Name",
+        extra=({"discord_guild_id": guild, "discord_member_role_ids": list(roles)}
+               if extra is None else extra),
+    )
+
+
+def _role_policy(enabled=True, grants=None):
+    import yaml
+    return yaml.safe_dump({"people": [], "intake": {"discord_role_admission": {
+        "enabled": enabled,
+        "grants": [{"guild_id": "111", "role_id": "222"}] if grants is None else grants,
+    }}})
+
+
+@pytest.mark.asyncio
+async def test_discord_role_admission_persists_once_and_revokes_on_role_loss(tmp_path, monkeypatch):
+    import yaml
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    path = tmp_path / "state" / "identities.yaml"
+    writes = []
+    original = pop._atomic_write_identities
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: (writes.append(1), original(*args)))
+    event = _role_event()
+    assert disp.intake_admits(event)
+    assert writes == []
+    assert await disp._authorize_bridge_event(event)
+    assert writes == [1]
+    person = yaml.safe_load(path.read_text())["people"][0]
+    assert person["canonical"] == "discord-9"
+    assert person["aliases"] == ["discord-9"]
+    assert person["access"] == {"roles": ["user"], "source": "discord_role",
+                                "granted_by": {"guild_id": "111", "role_id": "222"}}
+    assert resolver.access_metadata(event.author).roles == ("user",)
+    assert await disp._authorize_bridge_event(event)
+    assert writes == [1]
+    assert not disp.intake_admits(_role_event(roles=()))
+    assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert writes == [1, 1]
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access["roles"] == [] and access["revoked_at"]
+    assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert writes == [1, 1]
+    records = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    granted = [r for r in records if r["type"] == "discord_role_admission_granted"]
+    revoked = [r for r in records if r["type"] == "discord_role_admission_revoked"]
+    assert len(granted) == len(revoked) == 1
+    assert all("Private" not in json.dumps(r) for r in granted + revoked)
+    assert all(r["canonical"] == "discord-9" for r in granted + revoked)
+    assert granted[0]["guild_id"] == "111" and granted[0]["role_id"] == "222"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [
+    {"discord_guild_id": "333", "discord_member_role_ids": ["222"]},
+    {"discord_guild_id": "111", "discord_member_role_ids": []},
+    {"discord_guild_id": "111"}, {},
+    {"discord_guild_id": "111", "discord_member_role_ids": ["222"],
+     HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
+])
+async def test_discord_role_admission_denies_missing_wrong_and_http_extras(tmp_path, monkeypatch, extra):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: pytest.fail("identity write"))
+    event = _role_event(extra=extra)
+    assert not disp.intake_admits(event)
+    assert not await disp._authorize_bridge_event(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,trigger,extra", [
+    ("slack", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": ["222"]}),
+    ("discord", "poller", {"discord_guild_id": "111", "discord_member_role_ids": ["222"]}),
+    ("discord", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": [222]}),
+    ("discord", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": "222"}),
+    ("discord", "user_message", {"discord_guild_id": 111, "discord_member_role_ids": ["222"]}),
+])
+async def test_discord_role_admission_requires_bridge_message_and_valid_snapshot(tmp_path, source, trigger, extra):
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    event = _role_event(extra=extra)
+    event.source = source
+    event.trigger = trigger
+    if trigger == "user_message":
+        assert not disp.intake_admits(event)
+        assert not await disp._authorize_bridge_event(event)
+    else:
+        assert disp._discord_role_state(event)[0] is None
+    assert resolver.identity("discord-9") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["people: []\n", _role_policy(False), _role_policy("true")])
+async def test_discord_role_admission_disabled_no_write(tmp_path, monkeypatch, policy):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, policy)
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: pytest.fail("identity write"))
+    assert not disp.intake_admits(_role_event())
+    assert not await disp._authorize_bridge_event(_role_event())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["disable", "remove"])
+async def test_discord_role_admission_config_change_revokes(tmp_path, change):
+    import yaml
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    path = tmp_path / "state" / "identities.yaml"
+    doc = yaml.safe_load(path.read_text())
+    policy = doc["intake"]["discord_role_admission"]
+    if change == "disable":
+        policy["enabled"] = False
+    else:
+        policy["grants"] = []
+    path.write_text(yaml.safe_dump(doc))
+    assert not disp.intake_admits(_role_event())
+    assert not await disp._authorize_bridge_event(_role_event())
+    assert yaml.safe_load(path.read_text())["people"][0]["access"]["roles"] == []
+
+
+@pytest.mark.asyncio
+async def test_discord_role_admission_write_failure_is_denied(tmp_path, monkeypatch):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: (_ for _ in ()).throw(OSError("failed")))
+    assert not await disp._authorize_bridge_event(_role_event())
+    assert resolver.identity("discord-9") is None
+    records = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert any(r["type"] == "discord_role_admission_write_failed" for r in records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access", ["{roles: []}", "{roles: [user]}",
+                                         "{roles: [admin]}", "{roles: [user, admin], source: discord_role}"])
+async def test_discord_role_admission_preserves_operator_access(tmp_path, access):
+    resolver = _resolver(tmp_path, _role_policy())
+    path = tmp_path / "state" / "identities.yaml"
+    import yaml
+    doc = yaml.safe_load(path.read_text())
+    doc["people"] = [yaml.safe_load(f"{{canonical: ops, aliases: [discord-9], access: {access}}}")]
+    path.write_text(yaml.safe_dump(doc))
+    resolver.reload()
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    before = path.read_bytes()
+    authorized = bool(resolver.access_metadata("discord-9").roles)
+    assert disp.intake_admits(_role_event()) is authorized
+    assert await disp._authorize_bridge_event(_role_event()) is authorized
+    assert await disp._authorize_bridge_event(_role_event(roles=())) is authorized
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [{"role": "admin"}, {"roles": ["admin"]}])
+async def test_discord_role_grant_cannot_configure_admin(tmp_path, override):
+    import yaml
+
+    grant = {"guild_id": "111", "role_id": "222", **override}
+    resolver = _resolver(tmp_path, _role_policy(grants=[grant]))
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    access = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["access"]
+    assert access["roles"] == ["user"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoked", [False, True])
+async def test_operator_approval_takes_ownership_of_discord_role_entry(tmp_path, revoked):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    if revoked:
+        assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert approve_pairing(tmp_path, "discord-9")
+    path = tmp_path / "state" / "identities.yaml"
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access == {"roles": ["user"]}
+    before = path.read_bytes()
+    assert disp.intake_admits(_role_event(roles=()))
+    assert await disp._authorize_bridge_event(_role_event(roles=()))
+    assert path.read_bytes() == before
+    assert resolver.access_metadata("discord-9").roles == ("user",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,author,channel", [
+    ("slack", "slack-U9", "slack-C9"),
+    ("web", "web-user9", "web-session9"),
+    ("http_event", "discord-9", "discord-10"),
+])
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_discord_role_grant_does_not_authorize_other_sources(tmp_path, source, author, channel, enforced):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=enforced), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    path = tmp_path / "state" / "identities.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["people"][0]["aliases"].append(author)
+    path.write_text(yaml.safe_dump(doc))
+    event = _role_event(author=author)
+    event.source, event.channel_id = source, channel
+    before = path.read_bytes()
+    assert not disp.intake_admits(event)
+    assert not await disp._authorize_bridge_event(event)
+    assert path.read_bytes() == before
+    # This is source isolation, not a global revocation of the Discord grant.
+    assert await disp._authorize_bridge_event(_role_event())
+    assert approve_pairing(tmp_path, "discord-9")
+    assert disp.intake_admits(event)
+    assert await disp._authorize_bridge_event(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["grant", "unchanged_grant", "revoke"])
+async def test_discord_role_writers_leave_event_loop_responsive(tmp_path, monkeypatch, operation):
+    import threading
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    if operation != "grant":
+        assert await disp._authorize_bridge_event(_role_event())
+    name = "revoke_role_admission" if operation == "revoke" else "grant_role_admission"
+    original = getattr(pop, name)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    heartbeat = threading.Event()
+    observed = []
+
+    def blocked_writer(*args):
+        # Synchronize inside the actual synchronous write call. The loop must
+        # run its callback while this worker is waiting, not after it returns.
+        observed.append(threading.get_ident())
+        loop.call_soon_threadsafe(heartbeat.set)
+        if not heartbeat.wait(2):
+            raise RuntimeError("role writer stalled the event loop")
+        return original(*args)
+
+    monkeypatch.setattr(pop, name, blocked_writer)
+    event = _role_event(roles=() if operation == "revoke" else ("222",))
+    assert await disp._authorize_bridge_event(event) is (operation != "revoke")
+    assert heartbeat.is_set()
+    assert len(observed) == 1 and observed[0] != loop_thread
+
+
 def test_dispatcher_callbacks_and_runner_can_be_cleared(tmp_path: Path):
     async def callback(*args) -> None:
         return None

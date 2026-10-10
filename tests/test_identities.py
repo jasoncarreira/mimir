@@ -810,6 +810,29 @@ def test_missing_file_keeps_channel_state(tmp_path: Path):
     r.reload()
     assert r.channel_count() == 1
     assert r.channel("ch-1") is not None
+def test_discord_role_policy_is_opt_in_and_hot_reloaded(tmp_path, caplog):
+    import yaml
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    resolver = IdentityResolver(tmp_path)
+    match = lambda: resolver.discord_role_grant("111", ["222"])
+    assert match() is None
+    for enabled in (False, "true", 1, None):
+        path.write_text(yaml.safe_dump({"intake": {"discord_role_admission": {
+            "enabled": enabled, "grants": [{"guild_id": 111, "role_id": 222}],
+        }}}))
+        assert match() is None
+    path.write_text(yaml.safe_dump({"intake": {"discord_role_admission": {
+        "enabled": True, "grants": ["bad", {"guild_id": 111, "role_id": 222}],
+    }}}))
+    assert match() == ("111", "222")
+    assert resolver.discord_role_grant("333", ["222"]) is None
+    assert "skipping malformed" in caplog.text
+    path.write_text("intake: [broken\n")
+    assert match() is None
+
+
 def test_intake_modes_reload_defaults_and_malformed_sections(tmp_path, caplog):
     from mimir.identities import IdentityResolver, DEFAULT_DECLINE_TEXT
 

@@ -563,6 +563,31 @@ roles. These three options correspond to Hermes' `unauthorized_dm_behavior`
 
 Only the operator can change this file; model file tools cannot write it.
 
+#### Discord role admission
+
+Optionally admit members holding a specified role in a specified Discord guild:
+
+```yaml
+intake:
+  discord_role_admission:
+    enabled: true
+    grants:
+      - {guild_id: "111", role_id: "222"}
+```
+
+This is off by default; only literal `true` enables it. Only holders of a
+configured role in its matching guild are admitted, always as `user`, never
+`admin`. Membership is re-checked on every message: removing the Discord role,
+disabling the feature, or removing the grant revokes a bridge-managed identity
+on its next message. Operator-approved identities remain untouched. DMs and
+webhooks carry no guild-member roles and cannot use this admission path.
+Slack user groups are not covered by this Discord-only option. While an entry
+has `access.source: discord_role`, its stored grant cannot authorize messages
+from Slack, web, or other non-Discord sources, even through an added alias.
+An explicit operator approval (including pairing-code approval) takes ownership
+by removing `source`, `granted_by`, and `revoked_at`; later role loss cannot
+undo that approval. Identity grant/revoke writes run off the event loop.
+
 | Setting | Default | Authorization effect |
 |---|---|---|
 | `MIMIR_PAIRING_PENDING_MAX` | `100` | Caps newly recorded pending identities. `0` rejects new pending identities; a negative value disables the cap. |
