@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import threading
 import unicodedata
 from dataclasses import asdict
@@ -1159,6 +1161,59 @@ def pr_metadata(
 
 
 @tool
+def pr_spec(
+    repository: str,
+    pull_request: int,
+    runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Read the armed Chainlink spec of record bound by Worklink evidence to this PR."""
+    scope = _scope(runtime, repository, pull_request)
+    from ..worklink.continuation import issue_bound_to_pr
+    from ..access_control import publish_protected_result
+    from ..models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is not None:
+        principal = context.canonical_principal
+        if context.is_service and principal:
+            principal = f"service:{principal}"
+        publish_protected_result((SourceLabel(
+            principal=principal, domain="repository",
+            resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+        ),))
+
+    home = os.environ.get("MIMIR_HOME", "").strip()
+    issue_id = issue_bound_to_pr(Path(home), scope.canonical_repo, scope.pr_number) if home else None
+    if issue_id is None:
+        return {"error": "no_bound_spec"}
+    try:
+        with tempfile.TemporaryFile() as output:
+            result = subprocess.run(
+                ["chainlink", "issue", "show", str(issue_id), "--json"],
+                cwd=home, stdout=output, stderr=subprocess.DEVNULL, timeout=5, check=False,
+            )
+            if result.returncode != 0 or output.tell() > 131_072:
+                return {"error": "spec_read_failed"}
+            output.seek(0)
+            payload = json.load(output)
+        if not isinstance(payload, dict) or type(payload.get("id")) is not int or payload["id"] != issue_id:
+            return {"error": "spec_read_failed"}
+        labels = payload.get("labels")
+        if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
+            return {"error": "spec_read_failed"}
+        if not any(label.startswith("worklink:") for label in labels):
+            return {"error": "spec_not_armed"}
+        if not all(isinstance(payload.get(key), str) for key in ("title", "status", "description")):
+            return {"error": "spec_read_failed"}
+        return {key: payload[key] for key in ("id", "title", "status", "labels", "description")}
+    except (OSError, subprocess.SubprocessError, ValueError, UnicodeError):
+        return {"error": "spec_read_failed"}
+
+
+@tool
 def pr_files(
     repository: str,
     pull_request: int,
@@ -1727,6 +1782,7 @@ def _bind_injected_runtime(forge_tool: StructuredTool) -> StructuredTool:
 FORGE_TOOLS = tuple(_bind_injected_runtime(forge_tool) for forge_tool in (
     pr_list,
     pr_metadata,
+    pr_spec,
     pr_files,
     pr_diff,
     pr_file_content,

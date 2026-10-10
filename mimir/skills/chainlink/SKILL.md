@@ -39,6 +39,10 @@ instruction.
 
 ## Where to operate
 
+To read the spec of record for the PR you are remediating, call `pr_spec`.
+It reads only the Worklink-evidence-bound, armed issue description; use the
+CLI examples below for other tracker work when your turn permits them.
+
 Chainlink commands need a `.chainlink/` directory in the cwd or an ancestor.
 The operator's home repo or a working directory will have one. If you get
 ``No .chainlink directory found``, you're in the wrong place — check the

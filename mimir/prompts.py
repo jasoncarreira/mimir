@@ -423,6 +423,8 @@ def build_turn_prompt(
                 "its own release) or any spawn tool (review authority does not "
                 "delegate into a coding process); neither capability is available."
             )
+            if "pr_spec" in capabilities:
+                lines.append("To read the spec of record for the PR you are remediating, call `pr_spec`.")
         _add_labeled("Autonomous trigger authority", "\n".join(lines))
 
     # Algedonic channel (v0.4 §2): self-feedback signals between identities
