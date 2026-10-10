@@ -24,7 +24,8 @@ their own skill subprocesses.
 - **Process environment wins.** Anything exported into the process (your shell,
   a Docker `compose.env`, a systemd unit) takes precedence.
 - **`<MIMIR_HOME>/.env` supplies defaults** for anything not already in the
-  process environment. It's loaded once at startup; the process env overrides it.
+  process environment, except channel scope keys (operator-only). It's loaded
+  once at startup; the process env overrides it.
 - **Unset optional flags fall back to the defaults below.**
 
 To confirm what a running agent actually resolved, read `Config.from_env()` or
@@ -33,6 +34,78 @@ the startup banner — not the `.env` file, since the process env can override i
 Almost everything here is optional. The only things a minimal deployment needs
 are an auth path (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / a gateway) and,
 for anything non-loopback, `MIMIR_WEB_HOST` + `MIMIR_API_KEY`.
+
+## Channel scope (Discord and Slack)
+
+Configure the bridge, rather than telling mimir in chat to stay in one channel:
+chat instructions are not enforced. For **only channel X**, set
+`MIMIR_DISCORD_ALLOWED_CHANNELS=<id>` (or the Slack equivalent); add
+`MIMIR_DISCORD_REQUIRE_MENTION=true` to require a direct mention there. Threads
+inherit their parent channel's policy. Scope is checked before intake, pairing,
+profile lookups, and attachment downloads. DMs bypass channel lists and mention
+requirements, retaining their existing identity/pairing gate. Group DMs are not
+treated as DMs: channel lists and mention requirements apply to them.
+
+Each of the following has a `MIMIR_DISCORD_` and a `MIMIR_SLACK_` form:
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_CHANNEL_SCOPE_FILE` | path | `/etc/mimir/channel-scope.yaml` if present | Protected YAML source for both bridges. Conflicts with platform scope environment keys reject both bridges. |
+
+| Suffix | Default | Meaning |
+|---|---|---|
+| `ALLOWED_CHANNELS` | `*` | Comma-separated channel ids; unset or `*` allows all; an empty value allows none. |
+| `IGNORED_CHANNELS` | empty | Excluded channel ids; wins over allowed, mentions, and free-response. |
+| `REQUIRE_MENTION` | `false` | Require a direct bot mention in non-DM channels. Discord replies to the bot's message count too. |
+| `FREE_RESPONSE_CHANNELS` | empty | Channel ids exempt from require-mention. |
+| `ALLOW_BOTS` | `none` | `none` drops other bots, `mentions` allows directly mentioning bots, `all` allows other bots (subject to mention requirements). Unknown values reject startup. |
+| `ALLOWED_BOT_IDS` | empty | Bot author ids always admitted after channel allow/ignore checks, even without a mention. |
+
+Lists accept bare platform ids (`123`, `C0123`) or prefixed ids
+(`discord-123`, `slack-C0123`); use comma-separated values in process env.
+The order is: own-message filter; DM bypass of channel/mention rules; ignored;
+allowed; bot-author rule; require-mention unless free-response. Every rejected
+message produces one content-free `channel_scope_dropped` event with `platform`,
+`channel_id`, `parent_channel_id`, `reason`, and `author_kind`.
+
+For protected file configuration set `MIMIR_CHANNEL_SCOPE_FILE` to a YAML file,
+or place it at `/etc/mimir/channel-scope.yaml` (auto-loaded if present):
+
+```yaml
+discord:
+  allowed_channels: ["123"]
+  ignored_channels: ["456"]
+  require_mention: true
+  free_response_channels: ["789"]
+  allow_bots: none
+  allowed_bot_ids: []
+slack:
+  allowed_channels: ["C0123"]
+  ignored_channels: []
+  require_mention: false
+  free_response_channels: []
+  allow_bots: none
+  allowed_bot_ids: []
+```
+
+File lists are YAML lists. Discord ids may be quoted strings or unquoted YAML
+integers, which are normalized to strings; booleans and floats are rejected.
+Slack ids must be strings. A missing `allowed_channels` means all; an empty list
+means none. The resolved file (including symlink targets) and **every ancestor
+directory up to `/`** must be non-writable by the running process, and the file
+must not be under `MIMIR_HOME`. **File-based scope requires a non-root runtime**:
+running as root always rejects the scope file because root can write every path.
+Root deployments must instead use operator-supplied process environment scope.
+An unreadable, writable, or invalid file, or
+mixing a file with any platform scope env key, rejects the configuration and
+prevents **both** chat bridges from starting; the failure emits
+`channel_scope_config_rejected` without file contents. A configured file is the
+only scope source; otherwise process env applies, then defaults. Scope keys in
+`<MIMIR_HOME>/.env` are ignored with a key-name-only warning: the running agent
+can write that file. Scope is loaded once at bridge startup, never from chat or
+tools. On mimirbot, bake the file into the image as `root:root 0644` under
+`/etc/mimir/`, or bind-mount it read-only from the host; for simple setups use
+host-side `compose.env` process environment values.
 
 ## Feature flags that ship off by default
 
@@ -102,7 +175,7 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_TURN_TIMEOUT_SECONDS` | int | `3600` | Per-turn wall-clock timeout on the model stream. `0` = no timeout. |
 | `MIMIR_POST_TURN_TIMEOUT_SECONDS` | int | `180` | Ceiling for finalize hooks after the model loop. Zero or negative values use the 180-second default, not an immediate timeout or an unlimited wait. Worklink continuation recovery uses a separate ceiling of 30 seconds, reduced to this value when positive and smaller. |
 | `MIMIR_DRAIN_TIMEOUT_SECONDS` | int | `30` | Graceful-drain bound on SIGTERM for in-flight turns. `0` = unbounded. Keep HTTP shutdown timeout + drain timeout + cleanup margin below the supervisor stop grace. |
-| `MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` | float | `5` | aiohttp handler shutdown bound in seconds; HTTP timeout + drain timeout + cleanup margin must be below the supervisor stop grace. |
+| `MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` | float | `5` | Finite, positive aiohttp handler shutdown bound in seconds; zero, negative and non-finite values are rejected. HTTP timeout + drain timeout + cleanup margin must be below the supervisor stop grace. |
 | `MIMIR_TOOL_CALL_BUDGET` | int | `200` | Per-turn tool-call budget; caps panic-search loops. `0` disables. |
 | `MIMIR_MAX_TURN_ITERATIONS` | int | `200` | Per-turn model-iteration ceiling; nudges at 75%/90%, hard-stops at 100%. `0` disables. |
 | `MIMIR_SEND_LOOP_SOFT_LIMIT` | int | `5` | `send_message` circuit-breaker soft limit. |
@@ -330,12 +403,12 @@ authenticate transport only; they do not create a named requester.
 | `GOG_HOME` | path | unset | Optional gogcli secret-store root. Interactive shell operands under this root are refused; the variable is not passed into the shell unless explicitly named in `MIMIR_SHELL_PASS_ENV`. |
 | `MIMIR_CROSS_PLATFORM_PULL` | bool | `true` | Cross-platform recent-context pull. `false` stops canonical cross-platform history matching, but does not isolate authorization roles: aliases still share their canonical identity's access metadata. |
 | `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | enum | `ignore` | Controls the extra `inbound_pairing_prompted` event for enforced public/shared-channel denials: `ignore` or `prompt-to-pair`. All enforced denials may still create a pending pairing and notify the operator; this setting sends no public reply. |
-| `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts. Empty = inactive. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | str | `""` | Channel id for high-priority operator alerts, including pairing digests. With enforced Discord/Slack intake, an empty channel warns at startup; review pending users at `/app/admin/users` or with `mimir identities list`. |
 | `MIMIR_PAIRING_PENDING_MAX` | int | `100` | Max pending pairing requests retained. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | float | `1.0` | Coalesce window for operator pairing-notification digests. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `false` | Enable fixed-text DM auto-reply to unpaired users. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | bool | `true` | Send a one-time pairing code to unpaired DM users. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | float | `30.0` | Global rate limit between DM auto-replies. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | str | `Request forwarded to operator; no access until approved.` | The fixed DM auto-reply text. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | str | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is {code} (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM reply template; `{code}` is replaced, or a code line is appended if absent. |
 
 ## Spawn (subagent) controls
 

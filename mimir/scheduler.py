@@ -928,6 +928,7 @@ class Scheduler:
         arbiter: HomeostaticArbiter | None = None,
         home: Path | None = None,
         scheduler_tz: str = "UTC",
+        operator_notice: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         # APScheduler interprets cron expressions in the scheduler's
         # timezone. Default UTC keeps back-compat for mimirbot + bench
@@ -956,6 +957,7 @@ class Scheduler:
         # ``<home>/prompts/<file>`` at fire time. Optional for tests
         # and bench harnesses that construct Scheduler without a home.
         self._home = home
+        self._operator_notice = operator_notice
         # Named-callable registry. Populated by ``register_callable``
         # at startup (server.py wires each non-LLM cron). The yaml
         # is the override surface — entries naming a registered
@@ -2654,6 +2656,8 @@ class Scheduler:
                         enqueue=enqueue_with_turn_budget,
                         home=self._home,
                         timeout=timeout,
+                        **({"operator_notice": self._operator_notice}
+                           if self._operator_notice is not None else {}),
                     )
             except TimeoutError:
                 if not deadline.expired():

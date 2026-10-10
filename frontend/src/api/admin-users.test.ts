@@ -1,8 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { issueUserKey, listUsers, revokeUserKey } from "./admin-users";
+import { approveUserPairing, issueUserKey, listUsers, rejectUserPairing, revokeUserKey } from "./admin-users";
 
 describe("admin users key requests", () => {
+  it("posts pairing decisions only to admin routes", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ ok: true, data: { canonical: "discord-1" } }), { headers: { "Content-Type": "application/json" } }));
+    await approveUserPairing("discord-1", "user", { fetchImpl });
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe("/api/v1/admin/users/pairing/approve");
+    expect(JSON.parse(String(fetchImpl.mock.calls[0]?.[1]?.body))).toEqual({ canonical: "discord-1", role: "user" });
+    await rejectUserPairing("discord-1", { fetchImpl });
+    expect(fetchImpl.mock.calls[1]?.[0]).toBe("/api/v1/admin/users/pairing/reject");
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toEqual({ canonical: "discord-1" });
+  });
   it("keeps labelled issuance additive and rotation explicit", async () => {
     const fetchImpl = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({
       ok: true, data: { canonical: "alice", key: "show-once" }

@@ -18,6 +18,7 @@ def _run(run_id, conclusion="success", status="completed", workflow="CI"):
         "status": status,
         "conclusion": conclusion,
         "workflowName": workflow,
+        "event": "push",
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "url": f"https://github.com/o/r/actions/runs/{run_id}",
     }
@@ -50,6 +51,39 @@ def test_emits_only_new_completed_failures(monkeypatch, captured):
     # url is populated (regression: poller used to read the wrong JSON field)
     assert all(e["url"].endswith(str(e["run_id"])) for e in captured)
     assert seen["o/r"]["watermark"] == 3
+
+
+def test_dynamic_repository_run_failure_alerts_and_deduplicates(monkeypatch, captured):
+    run = _run(42, "failure", workflow="Dependabot Updates")
+    run["event"] = "dynamic"
+    monkeypatch.setattr(poller, "_gh", lambda *args: [run])
+    log_calls = []
+
+    def logs(*args):
+        log_calls.append(args)
+        return "repository-owned failure excerpt"
+
+    monkeypatch.setattr(poller, "_failure_logs", logs)
+    seen = {"o/r": {"watermark": 0, "alerted": set()}}
+    poller._check_repo("o/r", seen)
+    poller._check_repo("o/r", seen)
+    assert len(captured) == 1
+    assert captured[0]["event_type"] == "ci_failure"
+    assert captured[0]["run_id"] == 42
+    assert "repository-owned failure excerpt" in captured[0]["prompt"]
+    assert log_calls == [("o/r", 42, "failure")]
+
+
+def test_pull_request_target_run_on_main_cannot_publish_outsider_logs(monkeypatch, captured):
+    from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+    run = _run(42, "failure", workflow=OUTSIDER_MARKER)
+    run["event"] = "pull_request_target"
+    monkeypatch.setattr(poller, "_gh", lambda *args: [run])
+    monkeypatch.setattr(poller, "_failure_logs", lambda *args: pytest.fail("outsider log fetched"))
+    poller._check_repo("o/r", {"o/r": {"watermark": 0, "alerted": set()}})
+    assert captured == []
+    assert_marker_absent(captured)
 
 
 @pytest.mark.parametrize("workflow_id,expected", [

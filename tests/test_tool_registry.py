@@ -355,7 +355,8 @@ def test_repo_test_schema_exposes_no_execution_authority() -> None:
     }
     schema = tools["repo_test"].tool_call_schema.model_json_schema()
     properties = schema["properties"]
-    assert set(properties) == {"repository", "pull_request", "selectors", "suite"}
+    assert set(properties) == {"repository", "pull_request", "selectors", "suite", "include_output"}
+    assert properties["include_output"]["default"] is False
     assert properties["suite"]["default"] is None
     assert properties["suite"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
     assert "suite" not in schema["required"]

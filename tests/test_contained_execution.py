@@ -8,6 +8,7 @@ import stat
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 import mimir.contained_execution as contained
 import mimir.output_capture as output_capture
@@ -212,9 +213,9 @@ async def test_execute_contained_cancellation_sends_cancel_before_reraising(
         )
     )
     try:
-        await asyncio.wait_for(collecting.wait(), 1)
+        await asyncio.wait_for(collecting.wait(), HANG_GUARD_SECONDS)
         if overflow:
-            await asyncio.wait_for(cancelling_overflow.wait(), 1)
+            await asyncio.wait_for(cancelling_overflow.wait(), HANG_GUARD_SECONDS)
         launched_sinks = [client.launched[0][name] for name in ("stdout_sink", "stderr_sink")]
         descriptors = [sink.fd for sink in launched_sinks]
         task.cancel()

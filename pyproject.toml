@@ -268,7 +268,7 @@ exclude = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-n auto"
+addopts = "-n auto --dist worksteal"
 markers = [
     "allow_empty_parametrize: permit an intentionally empty parameter set to skip",
     "real_worklink_identities: use provisioned mimir/worklink accounts instead of synthetic IDs",

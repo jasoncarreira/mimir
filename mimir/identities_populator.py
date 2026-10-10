@@ -36,12 +36,15 @@ same way fetch_history does.
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import logging
 import os
 import secrets
 import tempfile
 import threading
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
@@ -49,10 +52,69 @@ import yaml
 
 from .event_logger import log_event, log_event_sync
 from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
+from .approval_requests import mint_id
 
 log = logging.getLogger(__name__)
 
 PairingRequestStatus = Literal["changed", "unchanged", "capped"]
+_PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def is_private_pairing_dm(platform: str, channel_id: str) -> bool:
+    """Pairing is narrower than the cross-channel privacy filter (no MPIMs)."""
+    if platform == "slack":
+        tail = channel_id.removeprefix("dm-slack-")
+        return channel_id.startswith("dm-slack-D") and tail.isalnum()
+    if platform == "discord":
+        return channel_id.startswith("dm-discord-") and channel_id[11:].isdigit()
+    return False
+
+
+class PairingCodeLockedError(ValueError):
+    """Code approval is locked; canonical-id approval remains available."""
+
+
+def _pairing_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    except ValueError:
+        return None
+
+
+def _clear_pairing_code(pairing: dict[str, Any]) -> None:
+    for key in ("code_hash", "code_salt", "code_expires_at"):
+        pairing.pop(key, None)
+
+
+def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
+    changed = False
+    access = match.get("access")
+    if not isinstance(access, dict):
+        access = {}
+    if access.get("roles") != roles:
+        access["roles"] = roles
+        match["access"] = access
+        changed = True
+    pairing = match.get("pairing")
+    if isinstance(pairing, dict):
+        if pairing.pop("request_id", None) is not None:
+            changed = True
+        if pairing.get("status") != "approved":
+            pairing["status"] = "approved"
+            pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+        if any(key in pairing for key in ("code_hash", "code_salt", "code_expires_at")):
+            _clear_pairing_code(pairing)
+            changed = True
+    return changed
+
+
+def _clean_roles(roles: Iterable[str]) -> list[str]:
+    return [role.strip() for role in roles
+            if isinstance(role, str) and role.strip() in {"user", "admin"}]
 
 
 class LastWebKeyError(ValueError):
@@ -93,8 +155,8 @@ def _extract_header(text: str) -> str:
 def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
     """Read identities.yaml; return ``(doc, header_text)``.
 
-    ``doc`` is the parsed YAML mapping (empty dict for missing /
-    non-mapping files). ``header_text`` is the leading comment block —
+    ``doc`` is the parsed YAML mapping (empty dict for a missing file or
+    a null/empty document). ``header_text`` is the leading comment block —
     every line from the start of the file through the last consecutive
     comment / blank line before the first document content. The header
     is preserved verbatim and prepended on write back, so the
@@ -110,27 +172,35 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       write. If that ever becomes load-bearing, the right escalation
       is ``ruamel.yaml`` round-trip mode (carries inline comments) —
       a new dependency, deferred until a real use case shows up.
-    - Treats missing / unparseable / non-mapping files as empty so a
-      fresh deployment starts clean.
+    - A missing file or a null/empty document is treated as empty;
+      a null ``people`` field is normalized to an empty list. Read errors
+      propagate so every transaction aborts rather than replacing unreadable
+      state. Invalid YAML, a non-null non-mapping root, or a non-null
+      non-list ``people`` field also aborts before any writer can reset state.
     """
-    if not path.is_file():
-        return {}, ""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("identities.yaml read failed: %s — treating as empty", exc)
+    except FileNotFoundError:
         return {}, ""
     try:
-        doc = yaml.safe_load(text) or {}
+        doc = yaml.safe_load(text)
     except yaml.YAMLError:
         log.warning("identities.yaml parse failed — refusing to overwrite")
-        # Returning a sentinel telling the caller to abort (preserve the
-        # operator's broken-but-recoverable file rather than nuke it).
+        # Preserve the operator's broken-but-recoverable file, not an empty
+        # substitute that a later transaction could publish over it.
         raise
-    header = _extract_header(text)
+    # PyYAML uses None for empty/comment-only documents and explicit null.
+    # Do not use a truthiness fallback: false, zero and [] are still invalid.
+    if doc is None:
+        doc = {}
     if not isinstance(doc, dict):
-        return {}, header
-    return doc, header
+        raise ValueError("identities.yaml root must be a mapping — refusing to overwrite")
+    if "people" in doc:
+        if doc["people"] is None:
+            doc["people"] = []
+        elif not isinstance(doc["people"], list):
+            raise ValueError("identities.yaml people must be a list — refusing to overwrite")
+    return doc, _extract_header(text)
 
 
 def _strip_value(v: Any) -> Any:
@@ -155,22 +225,42 @@ def _find_person(
     return None
 
 
-# All in-process writers of ``state/identities.yaml`` share this lock so the
-# read → mutate → write is atomic across the live first-contact DM capture
-# (``capture_dm_channel``) and the scheduled populator (``merge_into_yaml``) —
-# otherwise they lost-update each other. Unique temp files (below) additionally
-# remove the shared-``.tmp`` rename race. RLock in case a future caller nests;
-# today neither writer calls the other.
+# One lock protects identities AND the approval lockout across server/CLI
+# processes. Lock a stable sibling inode: the data files are atomically replaced.
 _IDENTITIES_WRITE_LOCK = threading.RLock()
+_IDENTITIES_HELD_LOCKS = threading.local()
 
 
 def _serialized_identities_write(fn):
-    """Hold ``_IDENTITIES_WRITE_LOCK`` for the whole call — decorate every
-    function that does a read-modify-write of ``state/identities.yaml``."""
+    """Serialize the entire read-modify-write transaction, including nested calls."""
     @functools.wraps(fn)
     def _wrapper(*args, **kwargs):
+        import fcntl
+
+        home = Path(args[0] if args else kwargs["home"]).resolve()
         with _IDENTITIES_WRITE_LOCK:
-            return fn(*args, **kwargs)
+            held = getattr(_IDENTITIES_HELD_LOCKS, "paths", set())
+            if home in held:
+                return fn(*args, **kwargs)
+            state_dir = home / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(state_dir / "identities.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "a") as lock:
+                deadline = time.monotonic() + 10.0
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("identity state write lock unavailable")
+                        time.sleep(0.01)
+                _IDENTITIES_HELD_LOCKS.paths = held | {home}
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    _IDENTITIES_HELD_LOCKS.paths = held
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return _wrapper
 
 
@@ -193,6 +283,80 @@ def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
+    """Keep CLI parse errors actionable while using the shared YAML loader."""
+    try:
+        doc, header = _load_yaml(yaml_path)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"identities.yaml parse failed: {exc}") from exc
+    # The shared loader validates existing fields and normalizes null people.
+    # Initialize an absent field, including the fresh, missing-file case.
+    doc.setdefault("people", [])
+    return doc, header
+
+
+@_serialized_identities_write
+def add_identity_alias(
+    home: Path, canonical: str, alias: str,
+    display_name: str | None = None, notes: str | None = None,
+) -> None:
+    """Add an operator alias in one locked read-modify-write transaction."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc["people"]
+    for entry in people:
+        for existing_alias in entry.get("aliases") or []:
+            if existing_alias == alias and entry.get("canonical") != canonical:
+                raise ValueError(
+                    f"alias {alias!r} already maps to canonical "
+                    f"{entry.get('canonical')!r}; remove it first or use a "
+                    f"different alias"
+                )
+
+    target = next((e for e in people if e.get("canonical") == canonical), None)
+    if target is None:
+        target = {"canonical": canonical, "aliases": []}
+        people.append(target)
+    if display_name:
+        target["display_name"] = display_name
+    if notes:
+        target["notes"] = notes
+    aliases = target.setdefault("aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+    _atomic_write_identities(yaml_path, header, doc)
+
+
+@_serialized_identities_write
+def remove_identity(home: Path, alias: str | None, canonical: str | None) -> str | None:
+    """Remove a canonical or alias, returning the CLI's result message."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc.get("people") or []
+    if canonical:
+        before = len(people)
+        people[:] = [p for p in people if p.get("canonical") != canonical]
+        if len(people) == before:
+            return f"(no identity with canonical {canonical!r})"
+        doc["people"] = people
+        _atomic_write_identities(yaml_path, header, doc)
+        return f"removed identity: {canonical}"
+    if alias:
+        for entry in people:
+            aliases = entry.get("aliases") or []
+            if alias in aliases:
+                aliases.remove(alias)
+                if not aliases:
+                    canonical = entry.get("canonical")
+                    people[:] = [p for p in people if p is not entry]
+                    _atomic_write_identities(yaml_path, header, doc)
+                    return f"removed alias: {alias} (and {canonical}: no aliases remained)"
+                _atomic_write_identities(yaml_path, header, doc)
+                return f"removed alias: {alias} (from {entry.get('canonical')})"
+        return f"(alias {alias!r} not found)"
+    return None
 
 
 def _default_web_key() -> str:
@@ -556,12 +720,33 @@ def request_pairing_status(
     distinguish "unchanged duplicate" from "new contact dropped because the
     pending cap is full", so this status API keeps that signal observable.
     """
+    status, _ = request_pairing_with_code(
+        home, author, platform, channel_id=channel_id,
+        author_display=author_display, is_dm=is_dm, max_pending=max_pending,
+        mint_code=False,
+    )
+    return status
+
+
+@_serialized_identities_write
+def request_pairing_with_code(
+    home: Path,
+    author: str,
+    platform: str,
+    *,
+    channel_id: str,
+    author_display: str | None = None,
+    is_dm: bool = False,
+    max_pending: int | None = None,
+    mint_code: bool = True,
+) -> tuple[PairingRequestStatus, str | None]:
+    """Persist a pending pairing; expose plaintext only on a private DM mint edge."""
     author = (author or "").strip()
     platform = (platform or "").strip()
     channel_id = (channel_id or "").strip()
     display = (author_display or "").strip()
     if not (author and platform and channel_id):
-        return "unchanged"
+        return "unchanged", None
 
     yaml_path = home / "state" / "identities.yaml"
     doc, header = _load_yaml(yaml_path)
@@ -581,7 +766,7 @@ def request_pairing_status(
                 if isinstance(pairing, dict) and pairing.get("status") == "pending":
                     pending_count += 1
             if pending_count >= max_pending:
-                return "capped"
+                return "capped", None
         match = {"canonical": author, "aliases": [author]}
         if display:
             match["display_name"] = display
@@ -624,12 +809,16 @@ def request_pairing_status(
         if changed:
             doc["people"] = people
             _atomic_write_identities(yaml_path, header, doc)
-            return "changed"
-        return "unchanged"
+            return "changed", None
+        return "unchanged", None
 
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
         pairing = {}
+    if pairing.get("status") == "rejected":
+        # Rejection is durable until an operator explicitly approves or removes
+        # this identity. In particular, never mint another DM code on contact.
+        return "unchanged", None
     requested_at = datetime.now(timezone.utc).isoformat()
     pending = {
         "status": "pending",
@@ -642,10 +831,24 @@ def request_pairing_status(
     if is_dm:
         pending["dm_channel"] = channel_id
     if pairing.get("status") != "pending":
+        existing_ids = frozenset(
+            p["pairing"]["request_id"] for p in people
+            if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+            and isinstance(p["pairing"].get("request_id"), str)
+        )
+        pending["request_id"] = mint_id("pair", excluded=existing_ids)
         pairing.update(pending)
         match["pairing"] = pairing
         changed = True
     else:
+        if not isinstance(pairing.get("request_id"), str):
+            existing_ids = frozenset(
+                p["pairing"]["request_id"] for p in people
+                if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+                and isinstance(p["pairing"].get("request_id"), str)
+            )
+            pairing["request_id"] = mint_id("pair", excluded=existing_ids)
+            changed = True
         # Keep the first requested_at for audit stability; refresh only facts
         # that can be corrected by the bridge layer.
         for key in ("platform", "author", "channel", "delivery", "dm_channel"):
@@ -656,11 +859,52 @@ def request_pairing_status(
                 changed = True
         match["pairing"] = pairing
 
+    code = None
+    if is_dm and mint_code and is_private_pairing_dm(platform, channel_id):
+        now = datetime.now(timezone.utc)
+        expires = _pairing_time(pairing.get("code_expires_at"))
+        active = (expires is not None and expires > now
+                  and isinstance(pairing.get("code_hash"), str)
+                  and isinstance(pairing.get("code_salt"), str))
+        # The expiration is exactly one hour after minting. A missing or
+        # malformed code is reissued rather than stranding the sender.
+        if not active or now >= expires - timedelta(minutes=50):
+            code = "".join(secrets.choice(_PAIRING_ALPHABET) for _ in range(8))
+            salt = secrets.token_bytes(16)
+            pairing["code_hash"] = hashlib.sha256(salt + code.encode("ascii")).hexdigest()
+            pairing["code_salt"] = salt.hex()
+            pairing["code_expires_at"] = (now + timedelta(hours=1)).isoformat()
+            changed = True
+
     if not changed:
-        return "unchanged"
+        return "unchanged", None
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
-    return "changed"
+    return "changed", code
+
+
+@_serialized_identities_write
+def prepare_pairing_code_delivery(home: Path, author: str, code: str, *, failed: bool = False) -> bool:
+    """Refresh TTL at dequeue, or invalidate a failed send without erasing a newer code."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    person = _find_person(doc.get("people") or [], author)
+    pairing = person.get("pairing") if person else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    try:
+        salt = bytes.fromhex(pairing["code_salt"])
+        digest = hashlib.sha256(salt + code.encode("ascii")).hexdigest()
+        if not secrets.compare_digest(digest, pairing["code_hash"]):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if failed:
+        _clear_pairing_code(pairing)
+    else:
+        pairing["code_expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
 
 
 @_serialized_identities_write
@@ -669,6 +913,8 @@ def approve_pairing(
     author_or_canonical: str,
     *,
     roles: Iterable[str] = ("user",),
+    pending_only: bool = False,
+    request_id: str | None = None,
 ) -> bool:
     """Approve a pending identity by granting canonical-level access roles.
 
@@ -677,11 +923,7 @@ def approve_pairing(
     aliases, DM channels, and other operator-authored fields are preserved.
     """
     key = (author_or_canonical or "").strip()
-    clean_roles = [
-        role.strip()
-        for role in roles
-        if isinstance(role, str) and role.strip() in {"user", "admin"}
-    ]
+    clean_roles = _clean_roles(roles)
     if not key or not clean_roles:
         return False
 
@@ -693,28 +935,115 @@ def approve_pairing(
     match = _find_person(people, key)
     if match is None:
         return False
-
-    changed = False
-    access = match.get("access")
-    if not isinstance(access, dict):
-        access = {}
-    if access.get("roles") != clean_roles:
-        access["roles"] = clean_roles
-        match["access"] = access
-        changed = True
-
     pairing = match.get("pairing")
-    if isinstance(pairing, dict) and pairing.get("status") != "approved":
-        pairing["status"] = "approved"
-        pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
-        match["pairing"] = pairing
-        changed = True
+    if pending_only and (not isinstance(pairing, dict) or pairing.get("status") != "pending"):
+        return False
+    if request_id is not None and (not isinstance(pairing, dict) or pairing.get("request_id") != request_id):
+        return False
 
-    if not changed:
+    if not _approve_entry(match, clean_roles):
         return False
     doc["people"] = people
     _atomic_write_identities(yaml_path, header, doc)
     return True
+
+
+@_serialized_identities_write
+def reject_pairing(home: Path, canonical: str, *, request_id: str | None = None) -> bool:
+    """Reject a pending pairing without granting roles or reopening on contact."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    match = _find_person(doc.get("people") or [], canonical.strip())
+    pairing = match.get("pairing") if match else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    if request_id is not None and pairing.get("request_id") != request_id:
+        return False
+    pairing["status"] = "rejected"
+    pairing["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    pairing.pop("request_id", None)
+    _clear_pairing_code(pairing)
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
+
+
+def _write_pairing_lockout(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix=".pairing-lockout-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+        os.replace(name, path)
+    except BaseException:
+        os.unlink(name)
+        raise
+
+
+@_serialized_identities_write
+def approve_pairing_code(
+    home: Path, code: str, *, roles: Iterable[str] = ("user",),
+) -> bool:
+    """Approve a pending unexpired code; wrong guesses share a durable lockout."""
+    lock_path = home / "state" / "pairing_lockout.json"
+    try:
+        state = json.loads(lock_path.read_text(encoding="utf-8")) if lock_path.exists() else {}
+        if not isinstance(state, dict):
+            raise ValueError("invalid lockout state")
+        failures = state.get("failed_attempts", 0)
+        if type(failures) is not int or failures < 0:
+            raise ValueError("invalid lockout state")
+        locked = _pairing_time(state.get("locked_until"))
+        if state.get("locked_until") and locked is None:
+            raise ValueError("invalid lockout state")
+    except (OSError, ValueError) as exc:
+        raise PairingCodeLockedError("pairing code approval locked (lockout state unavailable)") from exc
+
+    now = datetime.now(timezone.utc)
+    if locked and now < locked:
+        raise PairingCodeLockedError("pairing code approval locked; try again later")
+    if locked:
+        failures = 0
+
+    normalized = "".join(code.split()).upper() if isinstance(code, str) else ""
+    clean_roles = _clean_roles(roles)
+    match = None
+    if len(normalized) == 8 and all(char in _PAIRING_ALPHABET for char in normalized) and clean_roles:
+        yaml_path = home / "state" / "identities.yaml"
+        doc, header = _load_yaml(yaml_path)
+        people = doc.get("people")
+        if isinstance(people, list):
+            for person in people:
+                if not isinstance(person, dict):
+                    continue
+                pairing = person.get("pairing")
+                if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+                    continue
+                expires = _pairing_time(pairing.get("code_expires_at"))
+                if expires is None or expires <= now:
+                    continue
+                try:
+                    salt = bytes.fromhex(pairing["code_salt"])
+                    stored = pairing["code_hash"]
+                    if len(salt) != 16 or not isinstance(stored, str) or len(stored) != 64:
+                        continue
+                    digest = hashlib.sha256(salt + normalized.encode("ascii")).hexdigest()
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if secrets.compare_digest(digest, stored):
+                    match = person
+                    break
+    if match is not None:
+        _approve_entry(match, clean_roles)
+        _atomic_write_identities(yaml_path, header, doc)
+        _write_pairing_lockout(lock_path, {"failed_attempts": 0, "locked_until": None})
+        return True
+
+    failures += 1
+    _write_pairing_lockout(lock_path, {
+        "failed_attempts": failures,
+        "locked_until": (now + timedelta(hours=1)).isoformat() if failures >= 5 else None,
+    })
+    return False
 
 
 @_serialized_identities_write

@@ -11,8 +11,9 @@ import threading
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from yarl import URL
 
 from mimir.config import Config
@@ -1826,7 +1827,7 @@ def _sse_data_items(text: str) -> list[dict]:
     return items
 
 
-async def _read_sse_data(resp, *, timeout: float = 2.0) -> dict:
+async def _read_sse_data(resp, *, timeout: float = HANG_GUARD_SECONDS) -> dict:
     while True:
         line = await asyncio.wait_for(resp.content.readline(), timeout=timeout)
         assert line, "SSE stream closed before data"
@@ -2444,7 +2445,7 @@ async def test_sse_releases_slot_under_repeated_cancellation(
     monkeypatch.setattr(web.StreamResponse, "prepare", blocked_prepare)
     task = asyncio.create_task(handler(request))
     try:
-        await asyncio.wait_for(preparing.wait(), timeout=2)
+        await asyncio.wait_for(preparing.wait(), timeout=HANG_GUARD_SECONDS)
         async with lock:
             task.cancel()
             # The original cleanup suspends on the held lock here, so another
@@ -2539,10 +2540,46 @@ async def test_react_app_serves_built_index_and_assets(tmp_path: Path):
         assert asset_resp.status == 200
         assert await asset_resp.text() == "console.log('mimir app')"
 
+        missing_resp = await client.get("/app/assets/missing-abc123.js")
+        assert missing_resp.status == 404
+        assert missing_resp.content_type == "text/plain"
+        assert missing_resp.headers["Cache-Control"].startswith("no-store")
+        assert "<div" not in await missing_resp.text()
+
         fallback_resp = await client.get("/app/turns/42")
         assert fallback_resp.status == 200
         assert fallback_resp.headers["Cache-Control"].startswith("no-store")
         assert "/app/assets/app.js" in await fallback_resp.text()
+
+        dotted_resp = await client.get("/app/wiki/notes/2026-10-09.md")
+        assert dotted_resp.status == 200
+        assert dotted_resp.headers["Cache-Control"].startswith("no-store")
+        assert "/app/assets/app.js" in await dotted_resp.text()
+
+        # Preserve the existing containment guard even for missing asset requests.
+        traversal_resp = await client.get("/app/assets/%2e%2e/%2e%2e/secret.js")
+        assert traversal_resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_react_app_rejects_escaped_path_after_routing(tmp_path: Path):
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("dashboard")
+    a = web.Application()
+    web_ui.register_routes(
+        a, turns_log=tmp_path / "t.jsonl",
+        events_log=tmp_path / "e.jsonl", react_app_dist=dist,
+    )
+
+    # Browsers normalize literal dot segments before sending them. Supply the
+    # decoded route parameter directly to exercise the handler's containment guard.
+    request = make_mocked_request("GET", "/app/assets/escape", app=a)
+    match_info = await a.router.resolve(request)
+    match_info["path"] = "assets/../../secret.js"
+    request._match_info = match_info
+    response = await match_info.handler(request)
+    assert response.status == 404
 
 
 @pytest.mark.asyncio

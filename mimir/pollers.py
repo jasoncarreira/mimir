@@ -825,6 +825,31 @@ def _github_framework_trigger_is_trusted(
     )
 
 
+def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Discard stale framework snapshots after our own verified fast-forward."""
+    from .repo_tools import was_superseded_by_own_push
+
+    from .event_logger import log_event_sync
+
+    retained = []
+    for item in batch:
+        extras = item["extras"]
+        if (
+            extras.get("event_type") in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES
+            and isinstance(extras.get("repo"), str)
+            and type(extras.get("number")) is int
+            and isinstance(extras.get("head_sha"), str)
+            and was_superseded_by_own_push(extras["repo"], extras["number"], extras["head_sha"])
+        ):
+            log_event_sync(
+                "github_stale_trigger_dropped", stage="poller_fire",
+                reason="superseded_by_verified_own_push",
+            )
+            continue
+        retained.append(item)
+    return retained
+
+
 # Pollers manifest schema version history:
 #
 #   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
@@ -2315,6 +2340,7 @@ async def run_poller(
     enqueue: Callable[..., Awaitable[bool]],
     timeout: float = POLLER_TIMEOUT_SECONDS,
     home: Path | None = None,
+    operator_notice: Callable[[str], Awaitable[None]] | None = None,
 ) -> int:
     """Run one poller subprocess; parse its stdout JSONL; enqueue
     each emitted event. Returns the count of events successfully
@@ -2884,6 +2910,7 @@ async def run_poller(
     else:
         per_item_cap = None
     signals_emitted = len(delivery_barriers_accepted)
+    outsider_notices: list[str] = []
     for line in stdout_text.splitlines():
         line = line.strip()
         if not line:
@@ -2962,6 +2989,22 @@ async def run_poller(
                         "signal", "poller", "prompt", "event_type", "delivery_barrier",
                     )
                 }
+            if signal_name in {
+                "github_outsider_issue_withheld",
+                "pr_auto_review_skipped_untrusted_author",
+            }:
+                from .github_withhold import sanitize_login, sanitize_url
+
+                repo = payload.get("repo")
+                number = payload.get("number")
+                payload = {
+                    "repo": repo if isinstance(repo, str) and sanitize_url(
+                        f"https://github.com/{repo}/issues/1", repo,
+                    ) else None,
+                    "number": number if type(number) is int and number > 0 else None,
+                    "author": sanitize_login(payload.get("author")),
+                    "url": sanitize_url(payload.get("url"), repo),
+                }
             try:
                 # Same ordering rule as the mid-run barrier: the receipt durably
                 # acknowledges this signal, so the signal must be durable first.
@@ -2976,6 +3019,21 @@ async def run_poller(
                     _write_delivery_receipt, persist_dir, parsed.get("delivery_key"),
                 )
                 signals_emitted += 1
+                if poller.name in {"github-activity", "github-ci-watch"} and signal_name in {
+                    "github_outsider_issue_withheld",
+                    "pr_auto_review_skipped_untrusted_author",
+                }:
+                    from .bridges._mentions import neutralize_display_name
+                    from .github_withhold import sanitize_login, sanitize_url
+
+                    repo = payload.get("repo")
+                    url = sanitize_url(payload.get("url"), repo)
+                    if url:
+                        login = neutralize_display_name(
+                            sanitize_login(payload.get("author")),
+                        )
+                        kind = "issue" if signal_name == "github_outsider_issue_withheld" else "PR"
+                        outsider_notices.append(f"Outsider {kind} withheld: {login} {url}")
             except Exception as exc:  # noqa: BLE001
                 # log_event should be best-effort but defend against
                 # an unexpected payload shape (non-string keys, etc.)
@@ -3081,6 +3139,10 @@ async def run_poller(
     authority = poller.resolved_authority()
     service_principal = f"service:{authority.canonical}"
     for batch_idx, batch in enumerate(batches):
+        if poller.name == "github-activity":
+            batch = _drop_superseded_github_framework_items(batch)
+            if not batch:
+                continue
         content = _render_batch(poller.name, batch, batch_idx, len(batches))
         # Apply the prompt cap once more on the assembled batch — even
         # with per-item caps, ``batch_size × cap`` could exceed the
@@ -3258,6 +3320,11 @@ async def run_poller(
     # Operator queries reading ``events_emitted`` for "how many items
     # came in?" should switch to ``items_collected``; queries asking
     # "how many turns will this fire?" stay on ``events_emitted``.
+    if outsider_notices and operator_notice is not None and not timed_out:
+        try:
+            await operator_notice("\n".join(outsider_notices))
+        except Exception:
+            log.warning("poller outsider operator notice delivery failed", exc_info=True)
     await log_event(
         "poller_timeout" if timed_out else "poller_complete",
         poller=poller.name,

@@ -653,9 +653,18 @@ export interface AdminUser {
   display_name: string | null;
   roles: string[];
   is_admin: boolean;
+  pairing: AdminPairing | null;
   prefs: Record<string, unknown>;
   has_web_key: boolean;
   web_keys: { label: string; present: true }[];
+}
+
+export interface AdminPairing {
+  status: string | null;
+  platform: string | null;
+  delivery: string | null;
+  requested_at: string | null;
+  request_id: string | null;
 }
 
 export interface AdminUsersData {

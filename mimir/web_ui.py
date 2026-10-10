@@ -1477,6 +1477,11 @@ def register_routes(
         if requested.is_file():
             headers = _no_store_headers() if requested.name == "index.html" else None
             return web.FileResponse(requested, headers=headers)
+        if rel.split("/", 1)[0] == "assets":
+            return web.Response(
+                text="not found", status=404, content_type="text/plain",
+                headers=_no_store_headers(),
+            )
         return web.FileResponse(root / "index.html", headers=_no_store_headers())
 
     async def web_auth_js(_request: web.Request) -> web.Response:
@@ -1833,6 +1838,38 @@ def register_routes(
         if resolver is None:
             return json_error("unavailable", "identity resolver not configured", status=503)
         return json_success(build_users_payload(resolver), headers=_no_store_headers())
+
+    async def admin_users_pairing_action_v1(request: web.Request, *, approve: bool) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return json_error("bad_request", "invalid json", status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("canonical"), str) or not body["canonical"].strip():
+            return json_error("bad_request", "canonical required", status=400)
+        canonical = body["canonical"].strip()
+        if approve and body.get("role") not in ("user", "admin"):
+            return json_error("bad_request", "role must be user or admin", status=400)
+        from .identities_populator import approve_pairing, reject_pairing
+
+        if approve:
+            changed = await asyncio.to_thread(
+                approve_pairing, home, canonical,
+                roles=roles_for_request(body["role"]), pending_only=True,
+            )
+        else:
+            changed = await asyncio.to_thread(reject_pairing, home, canonical)
+        if not changed:
+            return json_error("not_found", "pending pairing not found", status=404)
+        resolver = request.app.get("identity_resolver")
+        if resolver is not None:
+            await asyncio.to_thread(resolver.reload)
+        return json_success({"canonical": canonical}, headers=_no_store_headers())
+
+    async def admin_users_pairing_approve_v1(request: web.Request) -> web.Response:
+        return await admin_users_pairing_action_v1(request, approve=True)
+
+    async def admin_users_pairing_reject_v1(request: web.Request) -> web.Response:
+        return await admin_users_pairing_action_v1(request, approve=False)
 
     async def admin_users_issue_key_v1(request: web.Request) -> web.Response:
         try:
@@ -2409,6 +2446,8 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/admin/users", admin_users_v1),
             DashboardBackendRoute("POST", "/api/v1/admin/users/key", admin_users_issue_key_v1),
             DashboardBackendRoute("POST", "/api/v1/admin/users/revoke", admin_users_revoke_key_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/pairing/approve", admin_users_pairing_approve_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/pairing/reject", admin_users_pairing_reject_v1),
         ]
 
     def admin_mcp_backend_routes() -> list[DashboardBackendRoute]:

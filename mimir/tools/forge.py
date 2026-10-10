@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import date, datetime, time, timezone
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -506,6 +507,7 @@ def revalidate_review_head_for_context(
             scope.canonical_repo, scope.pr_number,
         )
     except ForgeError as exc:
+        _publish_scoped_error(SimpleNamespace(context=context), scope)
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
     if (
         not isinstance(snapshot.repo, str)
@@ -547,6 +549,7 @@ def remediation_checkout_preflight(
     try:
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
+        _publish_scoped_error(SimpleNamespace(context=context), scope)
         raise ToolException(f"repository checkout rejected: {exc}") from exc
     if snapshot.state != "open":
         return None, "pull request is closed or merged"
@@ -570,6 +573,7 @@ def remediation_checkout_preflight(
         try:
             checks = client.list_checks(scope)
         except ForgeError as exc:
+            _publish_scoped_error(SimpleNamespace(context=context), scope)
             raise ToolException(f"repository checkout rejected: {exc}") from exc
         if not any(
             check.status == "completed"
@@ -780,12 +784,42 @@ def _path(value: str) -> str:
     return value
 
 
-def _call(operation: Any) -> Any:
+def _publish_scoped_error(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope | None) -> None:
+    """Attest server error text only after an exact own-repository PR is known."""
+    if scope is None:
+        return
+    from ..access_control import _github_repo_from_remote
+
+    context = getattr(runtime, "context", None)
+    author = scope.pull_request_author
+    if (
+        context is None or context.ifc_state is None or not author
+        or scope.head_repo != scope.canonical_repo
+        or scope.head_remote != "origin"
+        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    ):
+        return
+    try:
+        if _author_verdict(context, scope, author, _client(scope)) is True:
+            _publish_author_attestation(runtime, scope, (author,), "forge_error")
+    except ForgeError:
+        return
+
+
+def _call(operation: Any, *, runtime: ToolRuntime[AuthContext] | None = None,
+          scope: RepoPRActionScope | None = None) -> Any:
     try:
         return operation()
     except ForgeError as exc:
         from ..forge.github import GitHubIdentityVerificationError
 
+        from ..forge.client import ForgeReadUnavailable
+
+        if isinstance(exc, ForgeReadUnavailable):
+            # A typed, fixed diagnostic contains no third-party content. Do
+            # not extend this exemption to arbitrary adapter error strings.
+            raise ToolPolicyRefusal(str(exc)) from exc
         if isinstance(exc, GitHubIdentityVerificationError):
             _latch_github_identity_degraded(exc)
             raise ToolException(
@@ -793,6 +827,7 @@ def _call(operation: Any) -> Any:
             ) from exc
         # The adapter may have contacted the forge before failing, so this is a
         # fault rather than a proven pre-execution policy refusal.
+        _publish_scoped_error(runtime, scope)
         raise ToolException(str(exc)) from exc
 
 
@@ -816,28 +851,32 @@ def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str,
 
 
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
-    """Publish only a server-owned projection of an already attested PR."""
-    from ..access_control import publish_protected_result
-    from ..models import SourceLabel
+    """Independently attest a validated server-owned projection at its scope.
 
-    context = getattr(runtime, "context", None)
-    if context is None or context.ifc_state is None or not (
-        context.ifc_state.pr_checkout_author_trust.get(scope.scope_id) is True
-        or (bool(scope.pull_request_author) and context.ifc_state.repository_author_trust.trusted(
-            scope.canonical_repo, scope.pull_request_author,
-        ))
-    ):
+    Never depend on another parallel read warming the author cache. These
+    bounded projections belong to the authorized scope, not a later live head;
+    _pr_content_authors still rejects an unrelated live-head change.
+    """
+    client = _client(scope)
+    if not callable(getattr(client, "author_is_trusted", None)):
         return
-    principal = context.canonical_principal
-    if context.is_service and principal:
-        principal = f"service:{principal}"
-    publish_protected_result((SourceLabel(
-        principal=principal, domain="repository",
-        resource_id=f"{scope.canonical_repo}#pull/{scope.pr_number}@{scope.observed_head_sha}",
-        bridge_instance="forge", sensitivity="internal",
-        authorized_principals=frozenset({principal}) if principal else frozenset(),
-        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
-    ),))
+    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
+    _publish_author_attestation(
+        runtime, scope, authors, "forge_projection", head_sha=scope.observed_head_sha,
+    )
+
+
+def _publish_write_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
+    """Best-effort attestation must not turn a completed write into a retry.
+
+    On adapter/read failure publish no trusted provenance: result classification
+    retains its default untrusted label. Never reuse cached trust as a fallback.
+    """
+    try:
+        _publish_trusted_projection(runtime, scope)
+    except (ForgeError, ToolException):
+        # Do not expose arbitrary adapter error text after the write succeeded.
+        log.warning("forge write completed; result attestation unavailable")
 
 
 def _safe_check_projection(check: Any, scope: RepoPRActionScope) -> bool:
@@ -864,9 +903,9 @@ def _publish_author_attestation(
     Missing actors/adapters and unavailable attestation fail closed for this
     result. Only definitive verdicts enter the turn-local cache; no PR-level
     verdict is persisted. Contained ``repo_test`` output is a function of the
-    attested checked-in checkout and inherits its lease attestation. CI logs,
-    checks, and forge mutation output are not author text; their bounded server
-    projections have separate provenance rules.
+    attested checked-in checkout and inherits its lease attestation. Scoped CI
+    job logs inherit the PR author verdict; checks and forge mutation output
+    have separate provenance rules.
     """
     from ..access_control import publish_protected_result
     from ..models import SourceLabel
@@ -1028,7 +1067,7 @@ def pr_metadata(
 ) -> dict[str, Any]:
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
-    metadata = _call(lambda: _client(scope).get_pull_request(scope))
+    metadata = _call(lambda: _client(scope).get_pull_request(scope), runtime=runtime, scope=scope)
     authors, head_sha = _pr_attestation(metadata, scope, runtime)
     _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
@@ -1043,9 +1082,9 @@ def pr_files(
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    items = _call(lambda: client.list_files(scope))
+    items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
     return [asdict(item) for item in items]
 
@@ -1059,9 +1098,9 @@ def pr_diff(
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    diff = _call(lambda: client.get_diff(scope))
+    diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
     return diff
 
@@ -1076,9 +1115,9 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    content = _call(lambda: client.get_file_content(scope, path))
+    content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
     return content
 
@@ -1091,7 +1130,7 @@ def pr_checks(
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
-    checks = _call(lambda: _client(scope).list_checks(scope))
+    checks = _call(lambda: _client(scope).list_checks(scope), runtime=runtime, scope=scope)
     if all(_safe_check_projection(item, scope) for item in checks):
         _publish_trusted_projection(runtime, scope)
     return [asdict(item) for item in checks]
@@ -1105,7 +1144,7 @@ def pr_job_log(
     run_id: StrictInt | None = None,
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
 ) -> str:
-    """Read an untrusted, redacted bounded excerpt from one scoped failing CI job."""
+    """Read a redacted bounded CI job excerpt; trusted only for an attested PR."""
     _repository(repository)
     for name, value in (("pull_request", pull_request), ("job_id", job_id), ("run_id", run_id)):
         if name == "run_id" and value is None:
@@ -1133,7 +1172,74 @@ def pr_job_log(
     ):
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
-    return _call(lambda: _client(scope).get_job_log(scope, job_id, run_id))
+    client = _client(scope)
+    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
+    if callable(getattr(client, "author_is_trusted", None)):
+        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
+        # get_job_log independently pins job/run metadata to this exact head.
+        _publish_author_attestation(
+            runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
+        )
+    return excerpt
+
+
+def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
+                    runs: list[dict[str, Any]], resource_id: str) -> None:
+    """Publish only when every returned run belongs to a protected head."""
+    from ..access_control import publish_protected_result
+    from ..models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is None or not runs or not all(
+        _trusted_ci_head(context, repository, run) for run in runs
+    ):
+        return
+    principal = context.canonical_principal
+    if context.is_service and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal, domain="repository", resource_id=resource_id,
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    ),))
+
+
+def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any]) -> bool:
+    from ..repo_tools import _PROTECTED_BRANCH_REFS
+
+    if not isinstance(run, dict):
+        return False
+    branch, sha = run.get("head_branch"), run.get("head_sha")
+    if (
+        not isinstance(run.get("head_repository"), str)
+        or run["head_repository"].lower() != repository.lower()
+        or not isinstance(sha, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", sha) is None
+    ):
+        return False
+    if isinstance(branch, str) and f"refs/heads/{branch}" in _PROTECTED_BRANCH_REFS:
+        return True
+    for inventory in (context.server_discovered_pr_states, context.repo_pr_scope_registry):
+        for state in getattr(inventory, "review_states", ()):
+            scope = state.action_scope
+            if (
+                scope.canonical_repo == repository.lower()
+                and scope.head_repo == repository.lower()
+                and scope.head_remote == "origin"
+                and _github_origin_matches(scope)
+                and scope.head_ref == branch and scope.observed_head_sha == sha
+                and context.ifc_state is not None
+                and context.ifc_state.pr_checkout_author_trust.get(scope.scope_id) is True
+            ):
+                return True
+    return False
+
+
+def _github_origin_matches(scope: RepoPRActionScope) -> bool:
+    from ..access_control import _github_repo_from_remote
+
+    return _github_repo_from_remote(scope.canonical_origin) == scope.canonical_repo
 
 
 @tool
@@ -1153,7 +1259,11 @@ def ci_run_jobs(
         context, "ci_run_targets", frozenset(),
     ):
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
-    return _call(lambda: _client_for_repository(repo).list_run_jobs(repo, run_id))
+    client = _client_for_repository(repo)
+    run = _call(lambda: client.get_run(repo, run_id))
+    if isinstance(run, dict) and run.get("id") == run_id:
+        _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}/jobs")
+    return _call(lambda: client.list_run_jobs(repo, run_id))
 
 
 @tool
@@ -1173,7 +1283,10 @@ def ci_run(
         context, "ci_run_targets", frozenset(),
     ):
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
-    return _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+    run = _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+    if isinstance(run, dict) and run.get("id") == run_id:
+        _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}")
+    return run
 
 
 @tool
@@ -1205,7 +1318,15 @@ def ci_recent_runs(
     if type(limit) is not int:
         raise ToolPolicyRefusal("CI runs rejected: limit must be an integer")
     bounded_limit = max(1, min(20, limit))
-    return _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+    runs = _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+    if isinstance(runs, list) and all(
+        isinstance(run, dict) and run.get("head_branch") == branch
+        and (workflow_id is None or run.get("workflow_id") == workflow_id)
+        for run in runs
+    ):
+        _attest_ci_runs(runtime, repo, runs, f"{repo.lower()}#actions/runs?branch={branch}"
+                        + (f"&workflow={workflow_id}" if workflow_id is not None else ""))
+    return runs
 
 
 @tool
@@ -1216,7 +1337,7 @@ def pr_reviews(
 ) -> list[dict[str, Any]]:
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_reviews(scope))
+    items = _call(lambda: _client(scope).list_reviews(scope), runtime=runtime, scope=scope)
     _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_reviews")
     return [asdict(item) for item in items]
 
@@ -1229,7 +1350,7 @@ def pr_comments(
 ) -> list[dict[str, Any]]:
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_comments(scope))
+    items = _call(lambda: _client(scope).list_comments(scope), runtime=runtime, scope=scope)
     _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_comments")
     return [asdict(item) for item in items]
 
@@ -1242,7 +1363,7 @@ def pr_review_requests(
 ) -> list[dict[str, Any]]:
     """List bounded pending review requests for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_review_requests(scope))
+    items = _call(lambda: _client(scope).list_review_requests(scope), runtime=runtime, scope=scope)
     if all(
         item.kind in {"user", "team"} and isinstance(item.reviewer, str)
         and _REVIEWER.fullmatch(item.reviewer) is not None for item in items
@@ -1263,7 +1384,7 @@ def pr_submit_review(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).submit_review(scope, verdict, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1287,7 +1408,7 @@ def pr_inline_review_comment(
     result = asdict(_call(lambda: _client(scope).add_inline_review_comment(
         scope, path=safe_path, line=line, body=safe_body,
     )))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1302,7 +1423,7 @@ def pr_comment(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     result = asdict(_call(lambda: _client(scope).add_pull_request_comment(scope, safe_body)))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return result
 
 
@@ -1317,7 +1438,7 @@ def pr_edit_body(
     scope = _scope(runtime, repository, pull_request)
     safe_body = _body(body)
     _call(lambda: _client(scope).edit_pull_request_body(scope, safe_body))
-    _publish_trusted_projection(runtime, scope)
+    _publish_write_projection(runtime, scope)
     return {"status": "body_updated"}
 
 

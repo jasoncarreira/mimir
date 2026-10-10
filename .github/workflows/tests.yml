@@ -421,6 +421,9 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
       - name: Run mimir test suite
         # ``testpaths`` is set in pyproject.toml so no explicit path
         # arg needed. Excludes saga/saga/tests/ (workspace member's
@@ -430,7 +433,7 @@ jobs:
         # its own conftest; the optional-skills trees run in the dedicated
         # per-skill step below (chainlink #299).
         # Keep tracebacks short; upload raw evidence files on failure instead of huge logs.
-        run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - name: Run optional-skills tests (per-skill, isolated)
         # Each optional skill under mimir/optional-skills/ ships its own
@@ -573,6 +576,9 @@ jobs:
               tests/test_worklink_worker_exec.py::test_factory_file_rpc_creates_as_worklink_not_controller \
               tests/test_repo_tools.py::test_project_test_real_executor_preserves_active_lease_for_later_commit
 
+      - name: Report pytest worker capacity
+        run: .venv/bin/python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
       - name: Run mimir test suite as the non-owning worker uid
         # `.venv/bin/python -m pytest`, not `uv run`: uv derives its cache from HOME,
         # and this HOME is deliberately unwritable -- the gate invokes pytest directly
@@ -600,7 +606,7 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \
             MIMIR_FILE_TOOL_ROOTS="$MIMIR_FILE_TOOL_ROOTS" \
             MIMIR_CLAUDE_OAUTH_CREDENTIALS="$HOME/.claude/.credentials.json" \
-            .venv/bin/python -m pytest -q --tb=short -p no:cacheprovider \
+            .venv/bin/python -m pytest -q --tb=short --durations=25 -p no:cacheprovider \
               --basetemp "$PYTEST_EVIDENCE_ROOT/main" \
               --deselect tests/test_root_dockerfile.py::test_build_without_provenance_args_fails_with_named_error \
               --deselect tests/test_root_dockerfile.py::test_built_image_provides_process_tools
@@ -627,7 +633,7 @@ jobs:
     # Keep this separate from the required pytest matrix so its existing
     # ``pytest (3.11)`` and ``pytest (3.12)`` check names remain unchanged.
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -666,8 +672,11 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
       - name: Run mimir test suite
-        run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - name: Run optional-skills tests (per-skill, isolated)
         run: |
@@ -751,8 +760,11 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
       - name: Run mimir test suite against the fresh resolution
-        run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - *stage-pytest-evidence
 
@@ -824,10 +836,13 @@ jobs:
           mkdir -p "$evidence_root/optional-skills"
           echo "PYTEST_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
 
+      - name: Report pytest worker capacity
+        run: uv run python -c 'import os; from types import SimpleNamespace; from xdist.plugin import pytest_xdist_auto_num_workers as workers; print("logical CPUs:", os.cpu_count(), "; xdist -n auto workers:", workers(SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))))'
+
       - name: Run mimir test suite (enforcement on)
         env:
           MIMIR_ACCESS_CONTROL_ENFORCED: "1"
-        run: uv run pytest -q --tb=short --basetemp "$PYTEST_EVIDENCE_ROOT/main"
+        run: uv run pytest -q --tb=short --durations=25 --basetemp "$PYTEST_EVIDENCE_ROOT/main"
 
       - *stage-pytest-evidence
 

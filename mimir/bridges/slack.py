@@ -50,8 +50,10 @@ from ._attachments import _SLACK_CDN_HOSTS, build_inbound_path, download_to_path
 from ._chunking import chunk_message
 from ._emoji import resolve_for_slack
 from ._history import ChannelMessage
+from ._mentions import neutralize_slack_blocks, neutralize_slack_broadcasts
 from ._seen_ids import SeenIdCache
 from .base import Bridge, MessageUpdate, SendResult
+from .channel_scope import ChannelScope, admit as scope_admit
 
 log = logging.getLogger(__name__)
 
@@ -154,15 +156,14 @@ class SlackBridge(Bridge):
         app_token: ``xapp-`` app-level token for Socket Mode (env: ``SLACK_APP_TOKEN``).
         enqueue: dispatcher's enqueue coroutine.
         admit: optional side-effect-free dispatcher intake author gate.
-        respond_to_bots: if True, on_message accepts other bots' messages.
-            Default False — humans only. Self-messages are always skipped
-            via the bot's own user id or bot id.
+        channel_scope: operator-configured inbound policy. Self-messages are
+            always skipped via the bot's own user id or bot id.
     """
 
     bot_token: str
     app_token: str
     enqueue: Callable[[AgentEvent], Awaitable[bool]]
-    respond_to_bots: bool = False
+    channel_scope: ChannelScope = field(default_factory=ChannelScope)
     attachments_dir: Path | None = None
     attachments_max_bytes: int | None = None
     bridge_instance: str | None = None
@@ -500,11 +501,13 @@ class SlackBridge(Bridge):
         upload_count = 0
         try:
             for chunk in chunks:
-                kwargs: dict[str, Any] = {"channel": slack_channel, "text": chunk}
+                kwargs: dict[str, Any] = {
+                    "channel": slack_channel, "text": neutralize_slack_broadcasts(chunk),
+                }
                 if reply_to_message_id:
                     kwargs["thread_ts"] = reply_to_message_id
                 if blocks is not None and sent_count == 0:
-                    kwargs["blocks"] = blocks
+                    kwargs["blocks"] = neutralize_slack_blocks(blocks)
                 resp = await self._app.client.chat_postMessage(**kwargs)
                 self._capture_own_bot_id_from_response(resp)
                 last_id = resp.get("ts") or last_id
@@ -581,10 +584,10 @@ class SlackBridge(Bridge):
         kwargs: dict[str, Any] = {
             "channel": slack_channel,
             "ts": message_id,
-            "text": update.text or "",
+            "text": neutralize_slack_broadcasts(update.text or ""),
         }
         if update.blocks is not None:
-            kwargs["blocks"] = update.blocks
+            kwargs["blocks"] = neutralize_slack_blocks(update.blocks)
         try:
             resp = await self._app.client.chat_update(**kwargs)
         except SlackApiError as exc:
@@ -812,9 +815,25 @@ class SlackBridge(Bridge):
         if subtype is not None and subtype != "file_share":
             return
 
-        # Skip other bots unless opted in.
         is_bot = bool(event.get("bot_id"))
-        if is_bot and not self.respond_to_bots:
+        slack_channel = event.get("channel") or ""
+        channel_type = event.get("channel_type")
+        channel_id = _slack_channel_to_id(slack_channel, channel_type)
+        is_dm = _is_dm_channel(slack_channel, channel_type)
+        mentioned = bool(
+            self._bot_user_id and f"<@{self._bot_user_id}>" in (event.get("text") or "")
+        )
+        admitted, reason = scope_admit(
+            self.channel_scope, channel_id=channel_id, parent_channel_id=None,
+            is_dm=is_dm, mentioned=mentioned, author_is_bot=is_bot,
+            author_id=f"slack-{user_id}",
+        )
+        if not admitted:
+            await _safe_log_event(
+                "channel_scope_dropped", platform="slack", channel_id=channel_id,
+                parent_channel_id=None, reason=reason,
+                author_kind="bot" if is_bot else "human",
+            )
             return
 
         # chainlink #232: dedup before any work — Slack Socket Mode
@@ -833,11 +852,6 @@ class SlackBridge(Bridge):
             return
         if source_id:
             self._inbound_claims.add(source_id)
-
-        slack_channel = event.get("channel") or ""
-        channel_type = event.get("channel_type")
-        channel_id = _slack_channel_to_id(slack_channel, channel_type)
-        is_dm = _is_dm_channel(slack_channel, channel_type)
 
         text = (event.get("text") or "").strip()
         if not text:

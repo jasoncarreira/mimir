@@ -109,6 +109,7 @@ def test_enabled_guidance_is_runner_neutral_and_selector_accurate(poller, monkey
 def test_changes_requested_prompt_embeds_the_guidance(poller, monkeypatch):
     """The guidance must actually reach the emitted prompt, not just exist."""
     monkeypatch.setenv("MIMIR_CODING_ENABLED", "true")
+    monkeypatch.setattr(poller, "_github_author_is_trusted", lambda *args: True)
     emitted: list[str] = []
     monkeypatch.setattr(poller, "_emit", lambda prompt, **kw: emitted.append(prompt))
 

@@ -10,32 +10,34 @@ finish (up to a bound), records a clean shutdown, and exits. (chainlink #510)
 On `SIGTERM`/`SIGINT` (what `docker compose stop`/`restart` and systemd send):
 
 1. HTTP sites stop accepting connections; the shared shutdown signal closes
-   live-event, turn-event and chat SSE streams. The dispatcher is **closed**
-   during `on_shutdown`, before aiohttp waits for handlers — new inbound is rejected cleanly (`POST /event`
-   → `503 queue_full_or_closed`; bridge events drop rather than half-process).
-2. In-flight turns are **drained**: it waits up to `MIMIR_DRAIN_TIMEOUT_SECONDS`
-   (default **30**) for the live turns to finish.
-3. If the drain times out, the still-running turns are **cancelled** and a
-   `dispatcher_drain_timeout` event is logged (with the in-flight/queued counts)
-   — so a cut-off turn is visible, and shutdown stays deterministic instead of
-   hanging until Docker SIGKILLs.
-4. The clean-shutdown marker is set (so the next boot does **not** raise an
-   "unclean restart" alert — see [`docs/watchdog.md`](watchdog.md)), and the
-   process exits. The supervisor (Docker `restart:` / systemd) brings it back.
+   live-event, turn-event and chat SSE streams. During `on_shutdown`, the
+   scheduler stops **before** dispatcher admission closes, so an edge-trigger
+   scan cannot advance its cursor while its events are rejected. New inbound
+   then receives `503 queue_full_or_closed`; bridge events drop cleanly.
+2. The dispatcher drain starts before aiohttp waits for handlers. At the start
+   of graceful `on_cleanup`, the clean-shutdown marker is written **before**
+   joining the drain or waiting for late resource teardown. It records graceful
+   intent, not completed teardown, so an intended slow stop does not cause a
+   false unclean-restart alert (see [`docs/watchdog.md`](watchdog.md)).
+3. In-flight turns are **drained** up to `MIMIR_DRAIN_TIMEOUT_SECONDS`
+   (default **30**). If the drain times out, still-running turns are **cancelled**
+   and a `dispatcher_drain_timeout` event records the in-flight/queued counts.
+4. Resources are closed and the process exits. The supervisor (Docker
+   `restart:` / systemd) brings it back.
 
 Net: `docker compose restart` mid-turn lets the turn finish first; deploys no
 longer need a manual idle-check.
 
 ## Configuration — keep the shutdown inside the supervisor grace
 
-`MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` (default 5) bounds aiohttp's wait for
-in-flight handlers. `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) bounds the
+`MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS` (default 5; must be finite and positive)
+bounds aiohttp's wait for in-flight handlers. `MIMIR_DRAIN_TIMEOUT_SECONDS` (default 30) bounds the
 dispatcher drain; it starts while handlers are closing. Budget conservatively:
 
 **HTTP shutdown timeout + drain timeout + cleanup margin < supervisor stop grace**.
 
-The **supervisor's** kill grace must exceed this total, or it SIGKILLs before
-cleanup and the clean marker:
+The **supervisor's** kill grace must exceed this total, or it can SIGKILL
+before teardown finishes (and, if HTTP shutdown stalls, before the marker):
 
 - **Docker Compose:** `stop_grace_period`. Docker's default is only **10s** —
   too short. The scaffold `compose.yml` sets `stop_grace_period: 45s`; match it

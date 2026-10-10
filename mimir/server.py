@@ -11,6 +11,7 @@ indexer, SAGA client, session manager, scheduler.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .background_tasks import cancel_background_tasks, spawn_background
+from .bridges._mentions import neutralize_display_name
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
@@ -144,9 +146,10 @@ class _PairingNotifier:
         self._operator_pending: list[dict[str, str]] = []
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
+        self._operator_unrouted: set[str] = set()
         self._operator_cap_notified = False
-        self._dm_reply_sent: set[str] = set()
-        self._dm_reply_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._dm_reply_sent: set[tuple[str, str]] = set()
+        self._dm_reply_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
 
     async def aclose(self) -> None:
@@ -186,12 +189,18 @@ class _PairingNotifier:
             return
         alert_channel = (self._config.operator_alert_channel or "").strip()
         if not alert_channel:
+            if canonical not in self._operator_unrouted:
+                self._operator_unrouted.add(canonical)
+                await log_event(
+                    "pairing_alert_unrouted", canonical=canonical,
+                    platform=platform, delivery=delivery,
+                )
             return
         self._operator_notified.add(canonical)
         self._operator_pending.append(
             {
                 "canonical": canonical,
-                "display": display.strip() or canonical,
+                "display": neutralize_display_name(display) or canonical,
                 "platform": platform.strip() or "unknown",
                 "channel_id": channel_id.strip(),
                 "delivery": delivery,
@@ -205,13 +214,32 @@ class _PairingNotifier:
             return
         pending, self._operator_pending = self._operator_pending, []
         lines = ["Pairing approval needed:"]
+        from .identities import IdentityResolver
+        def load_resolver():
+            resolver = IdentityResolver(self._config.home)
+            resolver.reload()
+            return resolver
+
+        resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
+            identity = resolver.identity(item["canonical"])
+            request_id = identity.pairing.request_id if identity and identity.pairing else None
             lines.append(
                 "- "
-                f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
-                f"- approve: mimir identities approve-pairing {item['canonical']}"
+                f"{item['canonical']} ({item['display']}; {item['platform']}; {where})"
             )
+            if request_id:
+                lines.append(f"  reply: approve {request_id} / decline {request_id}")
+            lines.append("  dashboard: /app/admin/users")
+            if item["delivery"] == "dm":
+                lines.append("  cli: mimir identities approve-pairing --code <the code they received>, "
+                             f"or mimir identities approve-pairing {item['canonical']}")
+                lines.append(
+                    "  They were sent a pairing code; ask them for it to confirm it's really them."
+                )
+            else:
+                lines.append(f"  cli: mimir identities approve-pairing {item['canonical']}")
         try:
             await self._channels.send(
                 self._config.operator_alert_channel,
@@ -249,7 +277,8 @@ class _PairingNotifier:
             "Pairing pending cap reached: new unknown contacts are being "
             f"dropped without pending entries (max={self._config.pairing_pending_max}). "
             f"Latest dropped contact came from {platform or 'unknown'} via {where}. "
-            "Clear/approve pending pairings or raise MIMIR_PAIRING_PENDING_MAX."
+            "Clear/approve pending pairings at /app/admin/users or raise "
+            "MIMIR_PAIRING_PENDING_MAX."
         )
         try:
             await self._channels.send(alert_channel, text, final=True)
@@ -281,17 +310,21 @@ class _PairingNotifier:
             await asyncio.sleep(delay)
         await self.flush_operator_alerts()
 
-    async def maybe_reply_dm(self, *, canonical: str, dm_channel_id: str) -> None:
+    async def maybe_reply_dm(self, *, canonical: str, dm_channel_id: str, code: str) -> None:
         if not self._config.pairing_dm_auto_reply_enabled:
             return
         canonical = canonical.strip()
         dm_channel_id = dm_channel_id.strip()
-        if not canonical or not dm_channel_id.startswith("dm-"):
+        from .identities_populator import is_private_pairing_dm
+
+        platform = "slack" if dm_channel_id.startswith("dm-slack-") else "discord"
+        if not canonical or not is_private_pairing_dm(platform, dm_channel_id) or not code:
             return
-        if canonical in self._dm_reply_sent:
+        key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
+        if key in self._dm_reply_sent:
             return
-        self._dm_reply_sent.add(canonical)
-        await self._dm_reply_queue.put((canonical, dm_channel_id))
+        self._dm_reply_sent.add(key)
+        await self._dm_reply_queue.put((canonical, dm_channel_id, code))
         if self._dm_reply_task is None or self._dm_reply_task.done():
             self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
 
@@ -301,28 +334,54 @@ class _PairingNotifier:
             float(self._config.pairing_dm_auto_reply_interval_seconds or 0.0),
         )
         while not self._dm_reply_queue.empty():
-            canonical, dm_channel_id = await self._dm_reply_queue.get()
+            canonical, dm_channel_id, code = await self._dm_reply_queue.get()
+            from .identities_populator import prepare_pairing_code_delivery
+
+            key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
+            delivered = False
             try:
-                await self._channels.send(
+                # Queue wait must not consume the sender's one-hour TTL. Drop
+                # superseded/approved codes instead of sending unusable plaintext.
+                if not await asyncio.to_thread(
+                    prepare_pairing_code_delivery, self._config.home, canonical, code,
+                ):
+                    continue
+                template = self._config.pairing_dm_auto_reply_text
+                text = (template.replace("{code}", code) if "{code}" in template
+                        else f"{template}\nPairing code: `{code}`")
+                result = await self._channels.send(
                     dm_channel_id,
-                    self._config.pairing_dm_auto_reply_text,
+                    text,
                     final=True,
                 )
+                if not result.sent:
+                    raise RuntimeError("pairing delivery unsuccessful")
+                delivered = True
                 await log_event(
                     "pairing_dm_auto_reply_sent",
                     author=canonical,
                     channel_id=dm_channel_id,
                 )
-            except Exception as exc:  # noqa: BLE001 — best-effort notification
-                log.debug("pairing DM auto-reply failed", exc_info=True)
+            except Exception:  # noqa: BLE001 — bridge errors may echo the code
+                log.debug("pairing DM auto-reply failed")
                 await log_event(
                     "pairing_dm_auto_reply_failed",
                     author=canonical,
                     channel_id=dm_channel_id,
-                    error=str(exc)[:500],
                 )
             finally:
-                self._dm_reply_queue.task_done()
+                try:
+                    if not delivered:
+                        self._dm_reply_sent.discard(key)
+                        try:
+                            await asyncio.to_thread(
+                                prepare_pairing_code_delivery, self._config.home, canonical, code,
+                                failed=True,
+                            )
+                        except Exception:
+                            log.debug("pairing delivery cleanup unavailable")
+                finally:
+                    self._dm_reply_queue.task_done()
             if interval and not self._dm_reply_queue.empty():
                 await asyncio.sleep(interval)
 
@@ -1338,11 +1397,17 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
+    async def github_outsider_notice(text: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if channel:
+            await channels.send(channel, text, final=True)
+
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
         home=config.home,
         scheduler_tz=config.scheduler_tz,
+        operator_notice=github_outsider_notice,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:
@@ -1368,15 +1433,27 @@ def build_app(config: Config) -> web.Application:
     # paths under attachments/outbound/ — created lazily on first use.
     attachments_inbound = config.home / "attachments" / "inbound"
 
+    # A rejected operator policy disables BOTH chat bridges. Never fall back
+    # to unrestricted intake for either one after a configuration error.
+    from .config import load_channel_scopes
+    try:
+        channel_scopes = load_channel_scopes(config.home)
+    except (ValueError, OSError, RuntimeError) as exc:
+        scope_path = os.environ.get("MIMIR_CHANNEL_SCOPE_FILE", "/etc/mimir/channel-scope.yaml")
+        log.error("channel scope rejected at %s: %s", scope_path, exc)
+        log_event_sync("channel_scope_config_rejected", path=scope_path, reason=str(exc))
+        channel_scopes = None
+
     # DiscordBridge — opt-in via DISCORD_TOKEN. Import is deferred so absent
     # discord-py doesn't crash deployments that don't use Discord.
-    if config.discord_token:
+    if config.discord_token and channel_scopes is not None:
         try:
             from .bridges.discord import DiscordBridge
 
             channels.register(
                 DiscordBridge(
                     token=config.discord_token,
+                    channel_scope=channel_scopes["discord"],
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
                     attachments_dir=attachments_inbound,
@@ -1394,13 +1471,14 @@ def build_app(config: Config) -> web.Application:
     # SlackBridge — opt-in via SLACK_BOT_TOKEN + SLACK_APP_TOKEN. Both required
     # because we use Socket Mode (no public webhook needed). Same deferred-
     # import pattern as Discord.
-    if config.slack_bot_token and config.slack_app_token:
+    if config.slack_bot_token and config.slack_app_token and channel_scopes is not None:
         try:
             from .bridges.slack import SlackBridge
 
             channels.register(
                 SlackBridge(
                     bot_token=config.slack_bot_token,
+                    channel_scope=channel_scopes["slack"],
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
@@ -1415,7 +1493,7 @@ def build_app(config: Config) -> web.Application:
                 "skipping SlackBridge. Install with `pip install mimir[slack]`.",
                 exc,
             )
-    elif config.slack_bot_token or config.slack_app_token:
+    elif channel_scopes is not None and (config.slack_bot_token or config.slack_app_token):
         log.warning(
             "Slack tokens partially configured (bot=%s, app=%s) — both required for "
             "Socket Mode. Skipping SlackBridge.",
@@ -1717,6 +1795,21 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         startup_state.phase = "bridge_connect"
         startup_state.bridges_connect_attempted = True
+        pairing_platforms = sorted({
+            bridge.name for bridge in channels.bridges()
+            if getattr(bridge, "name", None) in ("discord", "slack")
+        })
+        if (
+            (config.access_control_enforced or not config.open_bridge)
+            and pairing_platforms
+            and not (config.operator_alert_channel or "").strip()
+        ):
+            log.warning(
+                "Pairing requests from new users will not be surfaced: set "
+                "MIMIR_OPERATOR_ALERT_CHANNEL; review pending requests at "
+                "/app/admin/users or with mimir identities list."
+            )
+            await log_event("pairing_alert_channel_missing", platforms=pairing_platforms)
         await channels.connect_all()
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
@@ -2467,6 +2560,13 @@ def build_app(config: Config) -> web.Application:
         http_shutdown.closing_streams = http_shutdown.active_streams
         http_shutdown.event.set()
         if not startup_state.compensated:
+            # Stop producers before rejecting admission: an edge-trigger scan
+            # must not advance its cursor while its emitted events are refused.
+            try:
+                await scheduler.stop()
+                scheduler_stopped = True
+            except Exception:
+                log.exception("scheduler stop during HTTP shutdown failed")
             dispatcher.close_admission()
         # Chat's existing sentinel also wakes subscribers that predate the
         # shared event; the event covers full queues and subscription races.
@@ -2477,11 +2577,6 @@ def build_app(config: Config) -> web.Application:
             except Exception:
                 log.exception("chat stream closure during HTTP shutdown failed")
         if not startup_state.compensated:
-            try:
-                await scheduler.stop()
-                scheduler_stopped = True
-            except Exception:
-                log.exception("scheduler stop during HTTP shutdown failed")
             shutdown_log("dispatcher drain start")
             drain_task = asyncio.create_task(
                 dispatcher.drain(timeout=config.drain_timeout_seconds),
@@ -2489,7 +2584,7 @@ def build_app(config: Config) -> web.Application:
             )
 
     async def _handlers_drained(app: web.Application) -> None:
-        shutdown_log(f"streams closed ({http_shutdown.closing_streams})")
+        shutdown_log(f"streams active at shutdown ({http_shutdown.closing_streams})")
         shutdown_log("handlers drained")
 
     async def _on_cleanup(app: web.Application) -> None:
@@ -2534,6 +2629,10 @@ def build_app(config: Config) -> web.Application:
                     raise RuntimeError("failed to persist clean-shutdown marker")
                 return True
 
+            # #507: record graceful intent before waiting for drain or late
+            # teardown; a slow intended stop must not look like a crash.
+            if attempt_sync(persist_clean_shutdown):
+                shutdown_log("clean marker written")
             from .worklink.autonomy import release_claims_for_graceful_shutdown
 
             release_timeout = 5.0
@@ -2610,9 +2709,6 @@ def build_app(config: Config) -> web.Application:
 
         await attempt(cancel_pending_pushes)
         shutdown_log("cleanup complete")
-        if not startup_state.compensated:
-            if attempt_sync(persist_clean_shutdown):
-                shutdown_log("clean marker written")
         for error in errors:
             log.error("server cleanup failed: %s", error)
         if errors:

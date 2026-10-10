@@ -8,6 +8,7 @@ import threading
 from unittest.mock import patch
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.version_check import (
     VersionCheck,
@@ -316,5 +317,5 @@ async def test_scheduled_check_runs_lookup_off_event_loop(tmp_path, monkeypatch)
         return VersionCheck(current="1.0", latest="1.0", is_newer=False)
 
     monkeypatch.setattr("mimir.version_check.check_for_update", fake_check)
-    await asyncio.wait_for(run_scheduled_update_check(tmp_path), timeout=1)
+    await asyncio.wait_for(run_scheduled_update_check(tmp_path), timeout=HANG_GUARD_SECONDS)
     assert lookup_threads and lookup_threads[0] != loop_thread

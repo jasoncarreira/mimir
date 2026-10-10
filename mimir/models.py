@@ -2063,6 +2063,10 @@ class TurnRecord:
     integrity_effect: IntegrityEffect | None = None
     integrity_sources: list[dict[str, Any]] = field(default_factory=list)
     integrity_sources_omitted: int = 0
+    # Counts and taint domains cover all sources, including those beyond the
+    # bounded integrity_sources preview. Empty on records from older writers.
+    integrity_source_counts: dict[str, int] = field(default_factory=dict)
+    untrusted_active_ingest_domains: list[str] = field(default_factory=list)
 
 
 def make_turn_id() -> str:

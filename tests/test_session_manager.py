@@ -7,6 +7,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.event_logger import init_logger
 from mimir.models import (
@@ -235,7 +236,7 @@ async def test_turn_cap_forces_synthesis_for_burst_channel():
         while not fired:
             await asyncio.sleep(0.005)
 
-    await asyncio.wait_for(_wait_for_fired(), timeout=2.0)
+    await asyncio.wait_for(_wait_for_fired(), timeout=HANG_GUARD_SECONDS)
     assert len(fired) == 1, "burst-cap synthesis didn't fire"
     assert fired[0].saga_session_id == first.saga_session_id
     assert fired[0].turn_count == 3
@@ -272,7 +273,7 @@ async def test_turn_cap_spawns_exactly_one_task_even_past_cap():
         while not fired:
             await asyncio.sleep(0.005)
 
-    await asyncio.wait_for(_wait_for_fired(), timeout=2.0)
+    await asyncio.wait_for(_wait_for_fired(), timeout=HANG_GUARD_SECONDS)
     # Give the loop one more pass in case extra tasks were lingering.
     await asyncio.sleep(0.01)
     assert len(fired) == 1, "cap fired more than once"
@@ -341,7 +342,7 @@ async def test_idle_fire_task_is_strongly_held_and_cancelled_by_shutdown():
     task = session.idle_handle
     assert isinstance(task, asyncio.Task)
 
-    await asyncio.wait_for(dispatch_started.wait(), timeout=1.0)
+    await asyncio.wait_for(dispatch_started.wait(), timeout=HANG_GUARD_SECONDS)
     assert "c1" not in mgr._sessions
     assert session.idle_handle is None
     assert task in mgr._pending_tasks

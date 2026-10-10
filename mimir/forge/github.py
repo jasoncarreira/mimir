@@ -788,7 +788,9 @@ class GitHubForgeClient:
         ):
             raise ForgeError("run is outside the scoped repository/run/head")
         if run.get("status") != "completed":
-            raise ForgeError("run is still in progress; retry after completion")
+            from .client import ForgeReadUnavailable
+
+            raise ForgeReadUnavailable()
         if job.get("status") != "completed" or job.get("conclusion") not in {
             "failure", "timed_out", "startup_failure", "action_required", "cancelled",
         }:
@@ -843,6 +845,10 @@ class GitHubForgeClient:
             "event": cls._text(run.get("event"), 100),
             "head_branch": cls._text(run.get("head_branch"), 200),
             "head_sha": cls._text(run.get("head_sha"), 64),
+            "head_repository": cls._text(
+                run.get("head_repository", {}).get("full_name")
+                if isinstance(run.get("head_repository"), Mapping) else None, 200,
+            ),
             "run_attempt": run.get("run_attempt") if type(run.get("run_attempt")) is int else None,
             "workflow_id": run.get("workflow_id") if type(run.get("workflow_id")) is int else None,
             "created_at": cls._text(run.get("created_at"), 64) or None,

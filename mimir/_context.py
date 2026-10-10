@@ -85,6 +85,26 @@ def idle_turn_eviction_guard() -> Iterator[bool]:
         yield not _active_turns
 
 
+@contextmanager
+def turn_scratch_eviction_guard(entry: Path) -> Iterator[bool]:
+    """Keep live turn workspaces intact, serialized with turn admission.
+
+    Include ancestors/descendants so custom janitor roots cannot remove a live
+    workspace as a unit or delete its contents individually. Hold this guard
+    only through atomic quarantine, never through recursive trash deletion.
+    """
+    with _turn_lifecycle_lock:
+        paths = (
+            Path(path)
+            for ctx in _active_turns.values()
+            if (path := getattr(ctx, "turn_scratch_path", None)) is not None
+        )
+        yield not any(
+            entry == path or entry in path.parents or path in entry.parents
+            for path in paths
+        )
+
+
 class _TurnCell:
     """Per-client mutable holder for the currently-acquired turn id.
 

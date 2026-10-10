@@ -14,13 +14,55 @@ loading ``Config.from_env()``, so the CLI flag and the env var converge.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
 log = logging.getLogger(__name__)
+
+
+def _egress_since(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("timezone required")
+        return parsed.astimezone(timezone.utc)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--since requires a timezone-aware ISO timestamp") from exc
+
+
+def _print_egress_shadow_report(events_path: Path, since: datetime | None) -> None:
+    """Stream a read-only count of the dedicated shadow event by operator pivot."""
+    counts: Counter[tuple[str, str, str, str, str, str]] = Counter()
+    if events_path.is_file():
+        with events_path.open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                    if not isinstance(event, dict) or event.get("type") != "egress_veto_would_block":
+                        continue
+                    if since is not None:
+                        stamp = datetime.fromisoformat(
+                            event["timestamp"].replace("Z", "+00:00"),
+                        )
+                        if stamp.tzinfo is None or stamp.astimezone(timezone.utc) < since:
+                            continue
+                    key = tuple(str(event.get(field) or "-") for field in (
+                        "tool", "destination_host", "trigger", "poller", "reason", "origin",
+                    ))
+                    counts[key] += 1
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    print("Egress veto shadow would-blocks:")
+    if not counts:
+        print("  (no events recorded)")
+    for (tool, host, trigger, poller, reason, origin), count in sorted(counts.items()):
+        print(f"  {count}  tool={tool} host={host} trigger={trigger} poller={poller} reason={reason} origin={origin}")
 
 # ---------------------------------------------------------------------------
 # Re-exports from commands.setup (backward compatibility — tests and external
@@ -55,7 +97,6 @@ from .commands.setup import (  # noqa: E402
 # callers that import the private helpers from mimir.cli).
 from .commands.identities import (  # noqa: E402
     _identities_load,
-    _identities_save,
     _identities_list_cmd,
     _identities_add_cmd,
     _identities_remove_cmd,
@@ -130,6 +171,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--tools",
         action="store_true",
         help="Also show per-tool call/error counts from logs/events.jsonl.",
+    )
+    stats_p.add_argument(
+        "--egress-shadow", action="store_true",
+        help="Report #1903 would-block counts from logs/events.jsonl (read-only).",
+    )
+    stats_p.add_argument(
+        "--since", type=_egress_since, default=None,
+        help="Start of egress-shadow report (timezone-aware ISO timestamp).",
     )
 
     # `mimir verify-cred` / `mimir verify-creds`
@@ -500,6 +549,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
 
     if args.command == "stats":
+        if args.since is not None and not args.egress_shadow:
+            stats_p.error("--since requires --egress-shadow")
+        if args.egress_shadow:
+            home_arg = args.home or os.environ.get("MIMIR_HOME") or Path.cwd()
+            _print_egress_shadow_report(Path(home_arg) / "logs" / "events.jsonl", args.since)
+            return
         from .config import Config as _Config
         from .rate_limits import RateLimitStore
         from .stats_block import assemble_stats_block

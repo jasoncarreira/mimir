@@ -24,7 +24,10 @@
 #        -e ANTHROPIC_MODEL=claude-haiku-4-5  (or gateway-equivalent name)
 # ─────────────────────────────────────────────────────────────────────
 
-FROM python:3.11-slim AS provenance-validation
+# ECR Public mirrors the same Docker Official Image; switch back with
+# --build-arg BASE_IMAGE=python:3.11-slim if needed.
+ARG BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim
+FROM ${BASE_IMAGE} AS provenance-validation
 
 # Every canonical image must identify one remote ref and the exact commit it is
 # expected to resolve. Keep this validation in its own early stage so an

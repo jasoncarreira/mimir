@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React from "react";
 
-import { issueUserKey, listUsers, revokeUserKey } from "../api/admin-users";
+import { approveUserPairing, issueUserKey, listUsers, rejectUserPairing, revokeUserKey } from "../api/admin-users";
 import type { AdminUser } from "../api/generated/contracts";
 import {
   Badge,
@@ -32,6 +32,7 @@ export function UsersView() {
   const [role, setRole] = React.useState<"user" | "admin">("user");
   const [mintedKey, setMintedKey] = React.useState<{ canonical: string; key: string } | null>(null);
   const [actionError, setActionError] = React.useState<string | null>(null);
+  const [adminConfirmation, setAdminConfirmation] = React.useState<AdminUser | null>(null);
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["admin-users"] });
   const fail = (e: unknown) => setActionError(e instanceof Error ? e.message : String(e));
@@ -56,8 +57,22 @@ export function UsersView() {
     onError: fail
   });
 
+  const pairingAction = useMutation({
+    mutationFn: (vars: { canonical: string; action: "approve" | "reject"; role?: "user" | "admin" }) =>
+      vars.action === "approve"
+        ? approveUserPairing(vars.canonical, vars.role ?? "user")
+        : rejectUserPairing(vars.canonical),
+    onSuccess: () => {
+      setAdminConfirmation(null);
+      setActionError(null);
+      void refresh();
+    },
+    onError: fail
+  });
+
   const users = data?.users ?? [];
-  const busy = issue.isPending || revoke.isPending;
+  const busy = issue.isPending || revoke.isPending || pairingAction.isPending;
+  const pending = users.filter((user) => user.pairing?.status === "pending");
 
   return (
     <>
@@ -118,6 +133,37 @@ export function UsersView() {
 
       {actionError ? <ErrorState title="Action failed">{actionError}</ErrorState> : null}
 
+      <Panel title="Pending approval" subtitle="Review new Discord and Slack accounts before granting access.">
+        {adminConfirmation ? (
+          <div className="route-state-form__actions">
+            <span>Grant admin to {adminConfirmation.display_name || adminConfirmation.canonical} ({adminConfirmation.canonical})?</span>
+            <Button variant="primary" disabled={busy} onClick={() => pairingAction.mutate({ canonical: adminConfirmation.canonical, action: "approve", role: "admin" })}>Confirm grant admin</Button>
+            <Button onClick={() => setAdminConfirmation(null)}>Cancel</Button>
+          </div>
+        ) : null}
+        {pending.length ? (
+          <DataTable caption="Pending pairings" columns={[
+            { key: "account", header: "Account" },
+            { key: "platform", header: "Platform" },
+            { key: "delivery", header: "Delivery" },
+            { key: "requested", header: "Requested" },
+            { key: "requestId", header: "Request ID" },
+            { key: "actions", header: "Actions" }
+          ]} rows={pending.map((user) => ({
+            account: <span>{user.display_name || user.canonical} (<code>{user.canonical}</code>)</span>,
+            platform: user.pairing?.platform || "unknown",
+            delivery: user.pairing?.delivery === "dm" ? "DM" : "Public",
+            requested: user.pairing?.requested_at || "unknown",
+            requestId: <code>{user.pairing?.request_id}</code>,
+            actions: <span className="route-state-form__actions">
+              <Button disabled={busy} onClick={() => pairingAction.mutate({ canonical: user.canonical, action: "approve", role: "user" })}>Approve</Button>
+              <Button disabled={busy} onClick={() => setAdminConfirmation(user)}>Grant admin</Button>
+              <Button disabled={busy} onClick={() => pairingAction.mutate({ canonical: user.canonical, action: "reject" })}>Reject</Button>
+            </span>
+          }))} />
+        ) : <EmptyState title="No pending pairings" />}
+      </Panel>
+
       <Panel title="Users">
         {isLoading ? <LoadingState label="Loading users" /> : null}
         {isError ? (
@@ -142,6 +188,7 @@ export function UsersView() {
                 <span>
                   <code>{user.canonical}</code>
                   {user.display_name ? ` — ${user.display_name}` : ""}
+                  {user.pairing?.status === "rejected" ? <Badge tone="warning">Rejected</Badge> : null}
                 </span>
               ),
               roles: user.roles.length ? (

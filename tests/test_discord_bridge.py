@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 # Skip the whole module if discord-py isn't installed in the test env.
 pytest.importorskip("discord")
@@ -25,6 +26,7 @@ from mimir.bridges.discord import (
     _channel_to_id,
     _channel_visibility,
     _chunk_message,
+    _DiscordClient,
 )
 from mimir.event_logger import init_logger
 from mimir.config import Config
@@ -105,6 +107,19 @@ def test_channel_to_id_dm():
     assert _channel_to_id(ch) == "dm-discord-99"
 
 
+@pytest.mark.parametrize("kind,private", [("private", True), ("group", False)])
+def test_pairing_codes_follow_discord_one_to_one_classification(tmp_path, kind, private):
+    from mimir.identities_populator import request_pairing_with_code
+    import yaml
+
+    channel = _fake_channel(id=99, type_name=kind)
+    _, code = request_pairing_with_code(tmp_path, "discord-1", "discord",
+        channel_id=_channel_to_id(channel), is_dm=_channel_conversation_type(channel) == "dm")
+    assert bool(code) is private
+    pairing = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]
+    assert ("code_hash" in pairing) is private
+
+
 def test_channel_id_to_int_round_trip():
     assert _channel_id_to_int("discord-42") == 42
     assert _channel_id_to_int("dm-discord-7") == 7
@@ -125,6 +140,22 @@ def test_channel_visibility_dm_is_private():
 
 
 # ---- bridge surface ------------------------------------------------------
+
+
+def _assert_safe_mentions(value):
+    import discord
+
+    assert isinstance(value, discord.AllowedMentions)
+    assert value.everyone is False
+    assert value.roles is False
+    assert value.users is True
+    assert value.replied_user is True
+
+
+def test_discord_client_defaults_block_broadcasts_and_roles():
+    bridge = DiscordBridge(token="TEST", enqueue=AsyncMock())
+    client = _DiscordClient(bridge)
+    _assert_safe_mentions(client.allowed_mentions)
 
 
 @pytest.fixture
@@ -241,6 +272,45 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
     assert result.chunks == 3  # 2*limit + 100 → 3 chunks under the limit
     # All chunks landed on the right channel.
     assert all(item["channel_id"] == 1 for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_send_text_chunks_block_broadcasts_and_roles(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    text = "build passed" + "x" * (DISCORD_MESSAGE_CHAR_LIMIT * 2)
+    assert (await bridge.send("discord-1", text)).sent
+    assert len(sent) > 1
+    assert "".join(item["content"] for item in sent) == text
+    for item in sent:
+        _assert_safe_mentions(item["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_files_only_blocks_broadcasts_and_roles(bridge_with_fake_client, tmp_path):
+    bridge, _, sent = bridge_with_fake_client
+    attachment = tmp_path / "file.txt"
+    attachment.write_text("hello")
+    assert (await bridge.send("discord-1", "", attachment_paths=[attachment])).sent
+    assert sent[0]["content"] == ""
+    assert len(sent[0]["files"]) == 1
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_reply_blocks_broadcasts_and_keeps_user_ping(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    assert (await bridge.send("discord-1", "hi <@123> @everyone <@&456>",
+                              reply_to_message_id="999")).sent
+    assert sent[0]["content"] == "hi <@123> @everyone <@&456>"
+    assert sent[0]["reference"].id == 999
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_discord_ordinary_text_is_unchanged(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    assert (await bridge.send("discord-1", "build passed")).sent
+    assert sent[0]["content"] == "build passed"
 
 
 @pytest.mark.asyncio
@@ -711,6 +781,7 @@ async def test_send_passes_embed_and_reply_reference(bridge_with_fake_client):
     assert sent[0]["reference"].id == 999
     assert sent[0]["embed"].title == "Working"
     assert sent[0]["embed"].description == "[ ] Working"
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
 
 
 @pytest.mark.asyncio
@@ -722,14 +793,12 @@ async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_clien
 
     assert result.sent is True
     assert result.message_id == "1001"
-    assert bridge._client._edits == [  # type: ignore[union-attr]
-        {
-            "channel_id": 1,
-            "message_id": 1001,
-            "content": "updated",
-            "embed": embed,
-        }
-    ]
+    assert len(bridge._client._edits) == 1
+    edited = bridge._client._edits[0]
+    _assert_safe_mentions(edited.pop("allowed_mentions"))
+    assert edited == {
+        "channel_id": 1, "message_id": 1001, "content": "updated", "embed": embed,
+    }
 
 
 @pytest.mark.asyncio
@@ -908,11 +977,10 @@ async def test_on_message_skips_self(bridge_with_fake_client):
 
 @pytest.mark.asyncio
 async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
-    """A non-self bot message is dropped unless ``respond_to_bots=True``."""
+    """A non-self bot message is dropped unless channel scope sets ``allow_bots="all"``."""
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client
-    bridge.respond_to_bots = False
 
     channel = SimpleNamespace(
         id=1, type=getattr(discord.ChannelType, "text", None), name="g"
@@ -924,7 +992,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
     await bridge._on_message(msg)
     assert enqueued == []
 
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
     await bridge._on_message(msg)
     assert len(enqueued) == 1
     assert enqueued[0].author_id == "999"
@@ -1709,10 +1778,10 @@ async def test_discord_connect_retains_runner_task(monkeypatch):
 
     await bridge.connect()
     assert bridge._runner in bridge._background_tasks
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
 
     release.set()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     await asyncio.sleep(0)
     assert bridge._runner not in bridge._background_tasks
 
@@ -1760,7 +1829,7 @@ async def test_supervisor_retries_on_transient_5xx(monkeypatch, tmp_path: Path):
     await bridge.connect()
     # Wait for the supervisor task to finish — the second attempt
     # should return cleanly.
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 2  # one failure, one success
 
 
@@ -1788,7 +1857,7 @@ async def test_supervisor_does_not_retry_on_login_failure(monkeypatch, tmp_path:
     await bridge.connect()
     # The runner task should fail with LoginFailure.
     with pytest.raises(discord.LoginFailure):
-        await asyncio.wait_for(bridge._runner, timeout=1.0)
+        await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # Only one attempt — no retries on operator-actionable errors.
     assert attempts["n"] == 1
 
@@ -1830,7 +1899,7 @@ async def test_supervisor_caps_backoff(monkeypatch, tmp_path: Path):
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # First sleep is the initial 0.01; subsequent doublings 0.02, 0.04 (cap), 0.04.
     assert sleeps[0] == pytest.approx(0.01)
     # After 4 retries (5th attempt succeeds), the last sleep we recorded
@@ -1934,7 +2003,7 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1  # no retries on clean exit
     assert captured == [(
         "discord_bridge_exited",
@@ -2032,7 +2101,7 @@ async def test_supervisor_closes_old_client_before_constructing_new(monkeypatch,
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Three constructions: initial + 2 retries (2 failures + 1 success).
     assert construct_calls == [0, 1, 2]

@@ -106,6 +106,7 @@ def test_ci_run_projects_only_bounded_metadata():
         "id": 42, "name": "C" * 300, "display_title": "D" * 300,
         "status": "completed", "conclusion": "failure", "event": "push",
         "head_branch": "branch" * 40, "head_sha": "a" * 40,
+        "head_repository": {"full_name": "owner/repo"},
         "run_attempt": 2, "workflow_id": 7,
         "created_at": "created", "updated_at": "updated", "run_started_at": "started",
         "html_url": "private", "url": "private", "jobs_url": "private",
@@ -118,6 +119,7 @@ def test_ci_run_projects_only_bounded_metadata():
         "id": 42, "name": "C" * 200, "display_title": "D" * 200,
         "status": "completed", "conclusion": "failure", "event": "push",
         "head_branch": ("branch" * 40)[:200], "head_sha": "a" * 40,
+        "head_repository": "owner/repo",
         "run_attempt": 2, "workflow_id": 7,
         "created_at": "created", "updated_at": "updated", "run_started_at": "started",
     }
@@ -718,8 +720,11 @@ def test_job_log_rejects_each_independent_binding_or_state(monkeypatch, target, 
     message = "run is still in progress" if target == "run" and field == "status" else None
     if target == "job" and field in {"status", "conclusion"}:
         message = "^job is not a completed failing job$"
-    with pytest.raises(ForgeError, match=message):
+    from mimir.forge.client import ForgeReadUnavailable
+
+    with pytest.raises(ForgeError, match=message) as raised:
         GitHubForgeClient(session=session).get_job_log(_scope(), 456)
+    assert isinstance(raised.value, ForgeReadUnavailable) is (target == "run" and field == "status")
 
 
 @pytest.mark.parametrize("job_id,run_id", [

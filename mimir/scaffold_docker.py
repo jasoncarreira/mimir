@@ -22,8 +22,8 @@ shadow bundled same-named entries on collision, matching
   placeholders. Re-running after installing a poller adds its new
   env vars without touching the operator's existing secrets.
 
-The base template draws from mimirbot's actual Dockerfile —
-python:3.11-slim + git/gh/uv/Node + a ``mimir``
+The base template draws from mimirbot's actual Dockerfile — the ECR Public
+mirror of python:3.11-slim + git/gh/uv/Node + a ``mimir``
 non-root user — generalized so the container name is parametric.
 """
 
@@ -39,6 +39,9 @@ from typing import Literal
 
 from .worklink.backends.feature_factory import FACTORY_VERSION
 from .worklink.tool_pins import OPENCODE_VERSION
+
+
+DEFAULT_BASE_IMAGE = "public.ecr.aws/docker/library/python:3.11-slim"
 
 
 # ── Data shapes ──────────────────────────────────────────────────────
@@ -269,7 +272,8 @@ _DOCKERFILE_BASE = """\
 # Build: docker compose build --build-arg USER_UID=$(id -u)
 # Run:   docker compose up -d
 
-FROM python:3.11-slim
+ARG BASE_IMAGE=__BASE_IMAGE__
+FROM ${BASE_IMAGE}
 
 # Base system tooling — same set mimirbot has been running with since
 # 2026-05: git for the source clone + agent dev loop, gh for PR
@@ -367,7 +371,8 @@ _DOCKERFILE_BASE_PYPI = """\
 # Build: docker compose build --build-arg USER_UID=$(id -u)
 # Run:   docker compose up -d
 
-FROM python:3.11-slim
+ARG BASE_IMAGE=__BASE_IMAGE__
+FROM ${BASE_IMAGE}
 
 # Base system tooling — git for any local commits the agent makes,
 # gh for PR / issue automation, build-essential for C extensions
@@ -539,6 +544,7 @@ def render_dockerfile(
         base = _DOCKERFILE_BASE
     else:
         raise ValueError(f"unknown scaffold mode {mode!r}; expected one of {_MODES}")
+    base = base.replace("__BASE_IMAGE__", DEFAULT_BASE_IMAGE)
     # Shared userdel/groupdel block — inlined here so the workspace
     # and pypi templates can't drift on the defensive cleanup logic.
     base = base.replace("__USERDEL_BLOCK__", _USERDEL_BLOCK)

@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir import background_tasks
 from mimir.background_tasks import cancel_background_tasks, spawn_background
@@ -25,12 +26,12 @@ async def test_spawn_background_holds_ref_until_task_finishes():
 
     task = spawn_background(tasks, work(), name="test-bg-task")
 
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     assert task in tasks
     assert not task.done()
 
     release.set()
-    assert await asyncio.wait_for(task, timeout=1.0) == "done"
+    assert await asyncio.wait_for(task, timeout=HANG_GUARD_SECONDS) == "done"
     await asyncio.sleep(0)
     assert task not in tasks
 
@@ -132,7 +133,7 @@ async def test_spawn_background_cancel_is_not_failure(tmp_path):
 
     task = spawn_background(tasks, wait_forever(), name="cancel-task")
 
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -255,5 +256,5 @@ async def test_cancel_background_tasks_times_out_cancellation_resistant_task_aft
     )
 
     release.set()
-    await asyncio.wait_for(late_results_consumed.wait(), timeout=1.0)
+    await asyncio.wait_for(late_results_consumed.wait(), timeout=HANG_GUARD_SECONDS)
     assert consumed_names == {"alpha-task", "zeta-task"}
