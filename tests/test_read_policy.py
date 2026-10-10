@@ -56,6 +56,13 @@ def test_protected_names_and_templates(stem, suffix, uppercase, tmp_path, monkey
     )
 
 
+@pytest.mark.parametrize("name", ["identities.yaml", "pairing_lockout.json"])
+def test_pairing_security_state_is_protected_by_name(tmp_path, name):
+    target = tmp_path / "state" / name
+    assert is_protected_read_path(target)
+    assert protected_read_denial_reason(target) == "protected_name_match"
+
+
 @pytest.mark.parametrize("roles", [(), ("admin",)])
 def test_live_social_outbox_denial_reason_is_protected_name_match(
     tmp_path, monkeypatch, roles,

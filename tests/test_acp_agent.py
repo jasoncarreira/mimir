@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 import yaml
 
 import mimir.acp.agent as agent_module
@@ -172,7 +173,7 @@ async def _run_requests(
         sdk.run_stdio_agent(agent, request_reader=reader, response_writer=writer)
     )
     expected_responses = sum("id" in request for request in requests)
-    async with asyncio.timeout(1):
+    async with asyncio.timeout(HANG_GUARD_SECONDS):
         while len(output.getvalue().splitlines()) < expected_responses:
             await asyncio.sleep(0)
     reader.feed_eof()

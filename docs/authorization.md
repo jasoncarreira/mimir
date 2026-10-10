@@ -481,10 +481,18 @@ boundary.
 | `<MIMIR_HOME>/state/identities.yaml` | generated with no people | Canonical aliases and human roles. `user` admits normal inbound use; `admin` also admits admin-required operations. This is a policy file, not an environment variable. |
 | `MIMIR_CROSS_PLATFORM_PULL` | `true` | Controls cross-platform recent-context pull. It does **not** isolate authorization roles: aliases still resolve to one canonical identity and role snapshot when false. |
 
-Pairing can add the required identity role with
-`mimir identities approve-pairing <identity>`; add `--admin` for both `user` and
-`admin`. The identities populator may add aliases and metadata but preserves
-operator-managed access fields.
+An unknown sender in a **1:1** Discord DM or Slack IM receives a one-time
+pairing code (valid for one hour). Group DMs, including Slack MPIMs, never
+receive codes. Ask the sender for the code and run `mimir identities approve-pairing
+--code <CODE>`; codes are issued at most once per ten minutes per person, except
+that a failed send permits immediate reissue on the sender's next message.
+Queued codes get a fresh one-hour TTL immediately before delivery; superseded
+codes are not sent. Identity changes and the approval lockout share a sibling
+file lock across the server and CLI processes. Five wrong codes lock code
+approval for one hour. The existing
+`mimir identities approve-pairing <identity>` remains available independently of
+the lockout. Add `--admin` for both `user` and `admin`. The identities populator
+may add aliases and metadata but preserves operator-managed access fields.
 
 ### Denied-user handling
 
@@ -493,9 +501,9 @@ operator-managed access fields.
 | `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | `ignore` | Controls the additional `inbound_pairing_prompted` event for an enforced public/shared-channel denial. Every enforced denial may still be recorded as a pending pairing and notify the operator; denied turns are never enqueued. No public reply is sent by this setting. |
 | `MIMIR_PAIRING_PENDING_MAX` | `100` | Caps newly recorded pending identities. `0` rejects new pending identities; a negative value disables the cap. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | `1.0` | Coalesces operator pairing notifications; clamped to zero or greater. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `false` | Enables a fixed best-effort DM response to a denied user; it does not grant access. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | `30.0` | Global DM response interval, clamped to zero or greater. |
-| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `Request forwarded to operator; no access until approved.` | Verbatim denial response text. |
+| `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is \`{code}\` (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM response template; `{code}` is replaced, or a code line is appended if absent. |
 | `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | empty | Enables identity alias/metadata discovery. It does not grant roles. |
 

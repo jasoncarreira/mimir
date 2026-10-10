@@ -35,6 +35,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -581,7 +582,7 @@ def test_runtime_field_proxies_delegate_and_fail_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     from types import SimpleNamespace
 
@@ -597,6 +598,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
         pairing_dm_auto_reply_interval_seconds=60.0,
         pairing_dm_auto_reply_text="pending",
         pairing_pending_max=100,
+        home=tmp_path,
     )
     notifier = _PairingNotifier(config, channels)
     await notifier.notify_operator(
@@ -606,7 +608,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
         channel_id="dm-alice",
         delivery="dm",
     )
-    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-alice")
+    await notifier.maybe_reply_dm(canonical="alice", dm_channel_id="dm-slack-D123", code="ABCDEF23")
     await asyncio.sleep(0)
     operator_task = notifier._operator_task
     dm_task = notifier._dm_reply_task
@@ -1811,7 +1813,7 @@ async def test_notification_finishing_during_cleanup_preserves_clean_marker(
     monkeypatch.setattr(mimir.liveness, "write_session_marker", write_session_marker)
 
     await _run_startup(app)
-    await asyncio.wait_for(notify_started.wait(), timeout=1.0)
+    await asyncio.wait_for(notify_started.wait(), timeout=HANG_GUARD_SECONDS)
     await _run_cleanup(app)
 
     marker = mimir.liveness.read_session_marker(tmp_path)

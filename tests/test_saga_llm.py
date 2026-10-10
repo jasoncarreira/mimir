@@ -5,6 +5,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.saga import _llm
 
@@ -63,14 +64,16 @@ async def call(timeout=0.02):
 @pytest.mark.parametrize("stage", ["connect", "query", "response"])
 async def test_hung_sdk_times_out_and_restores_capacity(claude, stage):
     claude.stage = stage
-    assert await asyncio.wait_for(call(), 1) == ""
+    # Timeout behaviour is the contract: 2s is below both the 30s default
+    # and a 1000x regression of the configured 0.02s budget.
+    assert await asyncio.wait_for(call(), 2.0) == ""
     assert claude.entered.is_set()
     assert claude.clients[0].closed
     assert claude.pool.size == 0
     assert claude.pool._idle == []
 
     claude.stage = None
-    assert await asyncio.wait_for(call(), 1) == "reply"
+    assert await asyncio.wait_for(call(), HANG_GUARD_SECONDS) == "reply"
     assert len(claude.clients) == 2
     assert claude.pool.size == 1
     await claude.pool.aclose()
@@ -79,11 +82,13 @@ async def test_hung_sdk_times_out_and_restores_capacity(claude, stage):
 @pytest.mark.asyncio
 async def test_acquire_deadline_does_not_discard_borrowed_runner(claude):
     borrowed = await claude.pool.acquire()
-    assert await asyncio.wait_for(call(), 1) == ""
+    # Timeout behaviour is the contract: 2s is below both the 30s default
+    # and a 1000x regression of the configured 0.02s budget.
+    assert await asyncio.wait_for(call(), 2.0) == ""
     assert claude.pool.size == 1
     assert claude.clients == []
     await claude.pool.release(borrowed)
-    assert await asyncio.wait_for(call(), 1) == "reply"
+    assert await asyncio.wait_for(call(), HANG_GUARD_SECONDS) == "reply"
     assert claude.pool._idle == [borrowed]
     await claude.pool.aclose()
 
@@ -93,13 +98,13 @@ async def test_acquire_deadline_does_not_discard_borrowed_runner(claude):
 async def test_cancellation_discards_runner_and_wakes_waiter(claude, stage):
     claude.stage = stage
     task = asyncio.create_task(call(timeout=10))
-    await asyncio.wait_for(claude.entered.wait(), 1)
+    await asyncio.wait_for(claude.entered.wait(), HANG_GUARD_SECONDS)
     waiter = asyncio.create_task(claude.pool.acquire())
     await asyncio.sleep(0)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, 1)
-    replacement = await asyncio.wait_for(waiter, 1)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
+    replacement = await asyncio.wait_for(waiter, HANG_GUARD_SECONDS)
     assert claude.clients[0].closed
     assert replacement._client is None
     assert claude.pool.size == 1
@@ -142,13 +147,14 @@ async def test_discard_restores_capacity_even_when_close_hangs(claude, cancel_cl
     runner = await claude.pool.acquire()
     claude.stage = "disconnect"
     task = asyncio.create_task(claude.pool.discard(runner, timeout=0.02))
-    await asyncio.wait_for(claude.entered.wait(), 1)
+    await asyncio.wait_for(claude.entered.wait(), HANG_GUARD_SECONDS)
     if cancel_cleanup:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
     else:
-        await asyncio.wait_for(task, 1)
+        # Must honour discard's 0.02s timeout, not a 20s/30s fallback.
+        await asyncio.wait_for(task, 2.0)
     assert claude.pool.size == 0
     assert claude.pool._idle == []
     claude.stage = None

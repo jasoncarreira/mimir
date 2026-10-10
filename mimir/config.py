@@ -1139,13 +1139,15 @@ class Config:
     unauthorized_user_behavior: str = "ignore"
     # Pairing notification/reply controls. Operator alerts are deduped by the
     # pending-pairing first-write edge and coalesced over this window. DM
-    # auto-replies are fixed text, DM-only, and globally rate-limited.
+    # auto-replies include a one-time code, are DM-only and globally rate-limited.
     pairing_pending_max: int = 100
     pairing_operator_digest_delay_seconds: float = 1.0
-    pairing_dm_auto_reply_enabled: bool = False
+    pairing_dm_auto_reply_enabled: bool = True
     pairing_dm_auto_reply_interval_seconds: float = 30.0
     pairing_dm_auto_reply_text: str = (
-        "Request forwarded to operator; no access until approved."
+        "I don't recognize you yet, so I can't reply until the operator approves you. "
+        "Your pairing code is `{code}` (valid for 1 hour). Send it to the operator; "
+        "after approval, send your message again."
     )
 
     # Resend-nudge recovery (forgot-to-send): channels (prefix allow-list, ``*``
@@ -1335,14 +1337,16 @@ class Config:
                 "MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS", 1.0,
             ),
             pairing_dm_auto_reply_enabled=_env_bool(
-                "MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED", False,
+                "MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED", True,
             ),
             pairing_dm_auto_reply_interval_seconds=_env_float(
                 "MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS", 30.0,
             ),
             pairing_dm_auto_reply_text=_env_allow_empty(
                 "MIMIR_PAIRING_DM_AUTO_REPLY_TEXT",
-                "Request forwarded to operator; no access until approved.",
+                "I don't recognize you yet, so I can't reply until the operator approves you. "
+                "Your pairing code is `{code}` (valid for 1 hour). Send it to the operator; "
+                "after approval, send your message again.",
             ),
             resend_nudge_channels=tuple(
                 p.strip() for p in _env("MIMIR_RESEND_NUDGE_CHANNELS", "").split(",")

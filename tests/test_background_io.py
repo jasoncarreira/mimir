@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 
 @pytest.mark.parametrize("operation", ["scratch", "worklink", "attestation", "event"])
@@ -56,20 +57,20 @@ def test_jobs_complete_with_saturated_default_pool(tmp_path, monkeypatch, operat
         blocker = loop.run_in_executor(None, occupy)
         token = marker.set("caller-context")
         try:
-            await asyncio.wait_for(entered.wait(), 2)
+            await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
             if operation == "scratch":
-                await asyncio.wait_for(sched._callables["scratch-janitor"].fn(), 2)
+                await asyncio.wait_for(sched._callables["scratch-janitor"].fn(), HANG_GUARD_SECONDS)
                 assert observed == ["caller-context"]
             elif operation == "worklink":
-                await asyncio.wait_for(sched._callables["worklink-reaper"].fn(), 2)
+                await asyncio.wait_for(sched._callables["worklink-reaper"].fn(), HANG_GUARD_SECONDS)
             elif operation == "attestation":
                 check = pollers._github_recovery_relevance_check("token")
                 event = AgentEvent(trigger="poller", channel_id="test", content="PR", extra={
                     "items": [{"repo": "owner/repo", "number": 1, "subject_type": "pull_request"}],
                 })
-                assert await asyncio.wait_for(check(event), 2) is True
+                assert await asyncio.wait_for(check(event), HANG_GUARD_SECONDS) is True
             else:
-                await asyncio.wait_for(logger.log("isolated"), 2)
+                await asyncio.wait_for(logger.log("isolated"), HANG_GUARD_SECONDS)
                 assert json.loads((tmp_path / "events.jsonl").read_text())["type"] == "isolated"
             assert not blocker.done(), "the default worker must still be saturated"
         finally:

@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 # Skip the whole module if discord-py isn't installed in the test env.
 pytest.importorskip("discord")
@@ -103,6 +104,19 @@ def test_channel_to_id_dm():
     """A DM channel routes through the dm-discord- prefix."""
     ch = _fake_channel(id=99, is_dm=True, name=None)
     assert _channel_to_id(ch) == "dm-discord-99"
+
+
+@pytest.mark.parametrize("kind,private", [("private", True), ("group", False)])
+def test_pairing_codes_follow_discord_one_to_one_classification(tmp_path, kind, private):
+    from mimir.identities_populator import request_pairing_with_code
+    import yaml
+
+    channel = _fake_channel(id=99, type_name=kind)
+    _, code = request_pairing_with_code(tmp_path, "discord-1", "discord",
+        channel_id=_channel_to_id(channel), is_dm=_channel_conversation_type(channel) == "dm")
+    assert bool(code) is private
+    pairing = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]
+    assert ("code_hash" in pairing) is private
 
 
 def test_channel_id_to_int_round_trip():
@@ -1709,10 +1723,10 @@ async def test_discord_connect_retains_runner_task(monkeypatch):
 
     await bridge.connect()
     assert bridge._runner in bridge._background_tasks
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
 
     release.set()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     await asyncio.sleep(0)
     assert bridge._runner not in bridge._background_tasks
 
@@ -1760,7 +1774,7 @@ async def test_supervisor_retries_on_transient_5xx(monkeypatch, tmp_path: Path):
     await bridge.connect()
     # Wait for the supervisor task to finish — the second attempt
     # should return cleanly.
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 2  # one failure, one success
 
 
@@ -1788,7 +1802,7 @@ async def test_supervisor_does_not_retry_on_login_failure(monkeypatch, tmp_path:
     await bridge.connect()
     # The runner task should fail with LoginFailure.
     with pytest.raises(discord.LoginFailure):
-        await asyncio.wait_for(bridge._runner, timeout=1.0)
+        await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # Only one attempt — no retries on operator-actionable errors.
     assert attempts["n"] == 1
 
@@ -1830,7 +1844,7 @@ async def test_supervisor_caps_backoff(monkeypatch, tmp_path: Path):
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     # First sleep is the initial 0.01; subsequent doublings 0.02, 0.04 (cap), 0.04.
     assert sleeps[0] == pytest.approx(0.01)
     # After 4 retries (5th attempt succeeds), the last sleep we recorded
@@ -1934,7 +1948,7 @@ async def test_supervisor_clean_exit_when_client_returns(monkeypatch, tmp_path: 
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1  # no retries on clean exit
     assert captured == [(
         "discord_bridge_exited",
@@ -2032,7 +2046,7 @@ async def test_supervisor_closes_old_client_before_constructing_new(monkeypatch,
     )
 
     await bridge.connect()
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Three constructions: initial + 2 retries (2 failures + 1 success).
     assert construct_calls == [0, 1, 2]

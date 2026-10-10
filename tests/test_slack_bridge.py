@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 # Skip the whole module if slack-bolt isn't installed in the test env.
 pytest.importorskip("slack_bolt")
@@ -82,6 +83,19 @@ def test_is_dm_channel_mpim_via_channel_type():
     assert _is_dm_channel("D01XYZ", "im") is True
     # Public channel.
     assert _is_dm_channel("C01ABC", "channel") is False
+
+
+@pytest.mark.parametrize("channel,kind,private", [("D123", "im", True), ("G123", "mpim", False)])
+def test_pairing_codes_follow_slack_one_to_one_classification(tmp_path, channel, kind, private):
+    from mimir.identities_populator import request_pairing_with_code
+    import yaml
+
+    channel_id = _slack_channel_to_id(channel, kind)
+    _, code = request_pairing_with_code(tmp_path, "slack-U1", "slack",
+                                       channel_id=channel_id, is_dm=_is_dm_channel(channel, kind))
+    assert bool(code) is private
+    pairing = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["pairing"]
+    assert ("code_hash" in pairing) is private
 
 
 def test_slack_channel_to_id_mpim():
@@ -1384,10 +1398,10 @@ async def test_slack_connect_retains_runner_task(monkeypatch):
 
     await bridge.connect()
     assert bridge._runner in bridge._background_tasks
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
 
     release.set()
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     await asyncio.sleep(0)
     assert bridge._runner not in bridge._background_tasks
 
@@ -1432,7 +1446,7 @@ async def test_slack_supervisor_retries_on_transient(monkeypatch, tmp_path: Path
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 2
 
 
@@ -1465,7 +1479,7 @@ async def test_slack_supervisor_does_not_retry_on_invalid_auth(monkeypatch, tmp_
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
     with pytest.raises(SlackApiError):
-        await asyncio.wait_for(bridge._runner, timeout=1.0)
+        await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1  # no retries on operator-actionable errors
 
 
@@ -1497,7 +1511,7 @@ async def test_slack_supervisor_does_not_retry_on_missing_scope(monkeypatch, tmp
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
     with pytest.raises(SlackApiError):
-        await asyncio.wait_for(bridge._runner, timeout=1.0)
+        await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1
 
 
@@ -1590,7 +1604,7 @@ async def test_slack_supervisor_clean_exit_when_handler_returns(monkeypatch, tmp
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=1.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
     assert attempts["n"] == 1
     assert captured == [(
         "slack_bridge_exited",
@@ -1648,7 +1662,7 @@ async def test_slack_supervisor_refreshes_bot_user_id_after_outage(monkeypatch, 
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Both auth_test attempts ran (first 503'd, second succeeded), and
     # _bot_user_id is now populated.
@@ -1696,7 +1710,7 @@ async def test_slack_supervisor_skips_auth_test_when_user_id_already_set(monkeyp
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Auth_test never called — _bot_user_id was preset.
     assert auth_calls["n"] == 0
@@ -1743,7 +1757,7 @@ async def test_slack_supervisor_closes_old_handler_before_constructing_new(monke
     )
 
     bridge._runner = asyncio.create_task(bridge._supervised_run())
-    await asyncio.wait_for(bridge._runner, timeout=2.0)
+    await asyncio.wait_for(bridge._runner, timeout=HANG_GUARD_SECONDS)
 
     # Three handlers constructed (initial + 2 retries).
     assert construct_calls == [0, 1, 2]

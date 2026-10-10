@@ -123,6 +123,7 @@ class PairingNotifier(Protocol):
         *,
         canonical: str,
         dm_channel_id: str,
+        code: str,
     ) -> None: ...
 
 
@@ -479,7 +480,12 @@ async def create_agent_runtime(
                 author = (event.author or "").strip()
                 platform = (event.source or "").strip()
                 channel_id = (event.channel_id or "").strip()
-                is_dm = channel_id.startswith("dm-")
+                from .identities_populator import is_private_pairing_dm
+
+                is_dm = is_private_pairing_dm(platform, channel_id)
+                extra = getattr(event, "extra", None) or {}
+                if extra.get("channel_conversation_type") == "multi_user":
+                    is_dm = False
                 if not (
                     author
                     and platform in ("slack", "discord")
@@ -487,10 +493,10 @@ async def create_agent_runtime(
                 ):
                     return
                 from .event_logger import log_event
-                from .identities_populator import request_pairing_status
+                from .identities_populator import request_pairing_with_code
 
-                status = await asyncio.to_thread(
-                    request_pairing_status,
+                status, code = await asyncio.to_thread(
+                    request_pairing_with_code,
                     config.home,
                     author,
                     platform,
@@ -498,6 +504,7 @@ async def create_agent_runtime(
                     author_display=event.author_display,
                     is_dm=is_dm,
                     max_pending=config.pairing_pending_max,
+                    mint_code=getattr(config, "pairing_dm_auto_reply_enabled", True),
                 )
                 delivery = "dm" if is_dm else "public_shared_channel"
                 if status == "capped":
@@ -532,6 +539,7 @@ async def create_agent_runtime(
                     platform=platform,
                     delivery=delivery,
                     reason=getattr(decision, "denial_reason", None),
+                    code_issued=code is not None,
                 )
                 if is_dm:
                     await log_event(
@@ -543,6 +551,7 @@ async def create_agent_runtime(
                         platform=platform,
                         dm_channel=channel_id,
                         reason=getattr(decision, "denial_reason", None),
+                        code_issued=code is not None,
                     )
                 await adapters.pairing_notifier.notify_operator(
                     canonical=canonical,
@@ -551,13 +560,14 @@ async def create_agent_runtime(
                     channel_id=channel_id,
                     delivery=delivery,
                 )
-                if is_dm:
+                if is_dm and code is not None:
                     await adapters.pairing_notifier.maybe_reply_dm(
                         canonical=canonical,
                         dm_channel_id=channel_id,
+                        code=code,
                     )
             except Exception:
-                log.debug("dm-pairing request failed", exc_info=True)
+                log.debug("dm-pairing request failed")
 
         async def on_session_idle(session: Any) -> None:
             from .event_logger import log_event

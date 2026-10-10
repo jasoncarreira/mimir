@@ -100,6 +100,21 @@ asserting shared state.** Fix the assertion, not the ordering. Do not reach for
 ordering plugins, `importlib.reload`, or fixtures that reset globals — those hide
 the coupling instead of removing it.
 
+### Timing in tests
+
+Outer `asyncio.wait_for` timeouts on expected results are normally loose hang
+guards, not latency requirements. Exception: when the behaviour under test is
+that a configured short timeout fires, keep the assertion guard well below the
+unpatched default and any slow regression path, or patch that slow path far
+above the guard. Never widen those guards mechanically: eventual completion
+alone does not prove that the configured timeout was honoured.
+Await tasks or signals owned by the component instead
+of sleeping before an assertion. Prove overlap and ordering by observing entry,
+exit, and state transitions rather than comparing wall-clock times. Where a
+timing sample is necessary, use the minimum, not the median, of samples.
+See [Don't assert on ambient state you don't own](#dont-assert-on-ambient-state-you-dont-own)
+when choosing what to observe.
+
 ### Observing queued telemetry in tests
 
 `log_event_sync` queues best-effort writes when called on an event loop.
