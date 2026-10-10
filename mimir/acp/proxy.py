@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import socket
@@ -71,7 +72,7 @@ class PermissionGrantStore:
         self._ingest_acknowledgements: dict[str, str] = {}
 
     def ingest_boundary(self, session_id: str, acknowledgement: str | None = None) -> str | None:
-        # A model can acknowledge ingest, but cannot renew a human's grant.
+        # Only a human can acknowledge ingest; this boundary revokes cached grants.
         # Retain the boundary across fresh turns (which have no acknowledgement).
         if (
             acknowledgement is not None
@@ -287,7 +288,7 @@ def _permission_candidate(
     ):
         raise ProxyError("invalid reserved permission metadata")
     wrapper_name = metadata.get("mimir.wrapper")
-    if wrapper_name not in HANDS_PERMISSION_ARGUMENTS:
+    if wrapper_name not in HANDS_PERMISSION_ARGUMENTS and wrapper_name != "ingest_trust":
         raise ProxyError("invalid reserved permission metadata")
     if "mimir.tainted" in metadata and metadata["mimir.tainted"] is not True:
         raise ProxyError("invalid reserved permission metadata")
@@ -298,7 +299,12 @@ def _permission_candidate(
     session_id = params.get("sessionId")
     if not isinstance(session_id, str) or not session_id or not isinstance(tool_call, dict):
         raise ProxyError("invalid reserved permission request")
-    if params.get("options") != PERMISSION_OPTIONS:
+    trust_request = wrapper_name == "ingest_trust"
+    trust_options = [
+        {"optionId": "allow_once", "name": "Clear", "kind": "allow_once"},
+        {"optionId": "reject_once", "name": "Keep", "kind": "reject_once"},
+    ]
+    if params.get("options") != (trust_options if trust_request else PERMISSION_OPTIONS):
         raise ProxyError("invalid reserved permission request")
     if set(tool_call) != {
         "toolCallId", "title", "kind", "status", "rawInput",
@@ -309,14 +315,24 @@ def _permission_candidate(
     if (
         not isinstance(tool_call.get("toolCallId"), str)
         or not tool_call["toolCallId"]
-        or tool_call.get("title") != wrapper_name
+        or (not trust_request and tool_call.get("title") != wrapper_name)
+        or (trust_request and (
+            not isinstance(tool_call.get("title"), str)
+            or re.fullmatch(
+                r"This session read untrusted content \([a-z0-9_: ,]+\)\. Clear and trust it\?",
+                tool_call["title"],
+            ) is None
+        ))
         or tool_call.get("kind") != "other"
         or tool_call.get("status") != "pending"
         or not isinstance(raw_input, dict)
-        or argument_keys not in HANDS_PERMISSION_ARGUMENTS[wrapper_name]
+        or (argument_keys != frozenset() if trust_request
+            else argument_keys not in HANDS_PERMISSION_ARGUMENTS[wrapper_name])
         or any(not isinstance(value, str) for value in raw_input.values())
     ):
         raise ProxyError("invalid reserved permission request")
+    if trust_request and ("mimir.tainted" in metadata or acknowledgement is not None):
+        raise ProxyError("invalid reserved permission metadata")
     return session_id, wrapper_name, "mimir.tainted" in metadata, acknowledgement
 
 
@@ -483,6 +499,7 @@ class ProxyRouter:
             if (
                 isinstance(pending, _PendingPermission)
                 and decision == "allow_session"
+                and pending.wrapper_name != "ingest_trust"
                 and pending.ingest_boundary == self._grants.ingest_boundary(pending.session_id)
             ):
                 self._grants.add(
@@ -543,7 +560,8 @@ class ProxyRouter:
                     session_id, wrapper_name, self._generation,
                     self._grants.ingest_boundary(session_id, acknowledgement),
                 )
-                if self._grants.allows(session_id, wrapper_name) and not tainted:
+                if (wrapper_name != "ingest_trust"
+                        and self._grants.allows(session_id, wrapper_name) and not tainted):
                     self._daemon_requests.pop(key)
                     # Telemetry only: the daemon emits the single permission event
                     # from this completion; the proxy must not emit another event.

@@ -603,6 +603,8 @@ class InformationFlowState:
         default_factory=dict, repr=False, compare=False,
     )
     _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
+    _untrusted_ingest_arrival_ordinal: int = field(default=0, repr=False, compare=False)
+    _acknowledged_untrusted_ordinal: int = field(default=0, repr=False, compare=False)
     _acknowledged_ingest: InformationFlowLabels | None = field(
         default=None, repr=False, compare=False,
     )
@@ -642,12 +644,16 @@ class InformationFlowState:
     def has_untrusted_active_ingest(
         self, fallback: InformationFlowLabels | None = None,
     ) -> bool:
-        """Evaluate the integrity predicate against the lock-protected live carrier."""
+        """Uncovered active ingest in the live carrier (labels remain append-only)."""
         with self._lock:
             current = self.labels if self.labels is not None else fallback
             return bool(
                 isinstance(current, InformationFlowLabels)
-                and current.has_untrusted_active_ingest
+                and (self._untrusted_ingest_arrival_ordinal > self._acknowledged_untrusted_ordinal
+                     or any(source.has_untrusted_active_ingest
+                        and source not in (self._acknowledged_ingest.sources
+                                           if self._acknowledged_ingest is not None else ())
+                        for source in current.sources))
             )
 
     def source_arrival_ordinal(self) -> int:
@@ -657,29 +663,38 @@ class InformationFlowState:
     def permission_has_untrusted_active_ingest(
         self, fallback: InformationFlowLabels | None = None,
     ) -> bool:
-        """ACP prompt taint only; sink and durable trust retain original labels."""
+        """The same effective taint as every other live sink gate."""
         with self._lock:
             current = self.labels if self.labels is not None else fallback
             return (
                 not isinstance(current, InformationFlowLabels)
-                or (current.has_untrusted_active_ingest and current != self._acknowledged_ingest)
+                or self._untrusted_ingest_arrival_ordinal > self._acknowledged_untrusted_ordinal
+                or any(source.has_untrusted_active_ingest
+                       and source not in (self._acknowledged_ingest.sources
+                                          if self._acknowledged_ingest is not None else ())
+                       for source in current.sources)
             )
 
-    def clear_ingest_taint(
-        self, *, fallback: InformationFlowLabels | None, durable_audit: Any,
+    def acknowledge_ingest_snapshot(
+        self, *, expected: InformationFlowLabels, durable_audit: Any,
+        expected_ordinal: int | None = None,
     ) -> bool:
-        """Audit and acknowledge the current input snapshot, never an egress."""
+        """Audit and acknowledge exactly the snapshot reviewed by a human."""
         with self._lock:
-            current = self.labels if self.labels is not None else fallback
-            if not isinstance(current, InformationFlowLabels):
+            current = self.labels
+            if (not isinstance(current, InformationFlowLabels) or current != expected
+                    or (expected_ordinal is not None
+                        and self._source_arrival_ordinal != expected_ordinal)):
                 return False
-            sources = tuple(
-                source for source in current.sources
-                if source.has_untrusted_active_ingest
-            ) if current != self._acknowledged_ingest else ()
+            covered = self._acknowledged_ingest.sources if self._acknowledged_ingest else ()
+            sources = tuple(source for source in current.sources
+                            if source.has_untrusted_active_ingest and source not in covered)
+            if not sources and self._untrusted_ingest_arrival_ordinal <= self._acknowledged_untrusted_ordinal:
+                return False
             if not durable_audit(sources):
                 return False
             self._acknowledged_ingest = current
+            self._acknowledged_untrusted_ordinal = self._untrusted_ingest_arrival_ordinal
             return True
 
     def source_snapshot(
@@ -704,14 +719,12 @@ class InformationFlowState:
         fallback: InformationFlowLabels | None = None,
         *,
         event_identity: Any = None,
+        fresh_untrusted_ingest: bool = False,
     ) -> tuple[InformationFlowLabels, "SourceFoldReceipt"]:
         with self._lock:
             current = self.labels if self.labels is not None else fallback
             merged = current if isinstance(current, InformationFlowLabels) else InformationFlowLabels()
             if isinstance(added, InformationFlowLabels):
-                # Even re-reading the same deduplicated source is new ingest.
-                if added.has_untrusted_active_ingest:
-                    self._acknowledged_ingest = None
                 for label in added.labels:
                     merged = merged.with_label(label)
                 for channel in added.source_channels:
@@ -728,10 +741,18 @@ class InformationFlowState:
                 event_identity is not None
                 and isinstance(added, InformationFlowLabels)
                 and bool(added.sources)
-            )
+            ) or fresh_untrusted_ingest
             pre_ordinal = self._source_arrival_ordinal
             if source_arrived:
                 self._source_arrival_ordinal += 1
+                if (fresh_untrusted_ingest or (
+                    isinstance(added, InformationFlowLabels)
+                    and any(source.has_untrusted_active_ingest
+                            and (not isinstance(current, InformationFlowLabels)
+                                 or source not in current.sources)
+                            for source in added.sources)
+                )):
+                    self._untrusted_ingest_arrival_ordinal += 1
             if changed and current is not None:
                 self._declassification = None
             if (changed and current is not None) or source_arrived:
@@ -1863,6 +1884,11 @@ class TurnContext:
     # this carrier, NOT from model session_id, ContextVar fallback, or
     # single-active-turn heuristics.
     auth_context: AuthContext | None = None
+    # Server-owned chat trust delivery and ingress binding (never model arguments).
+    operator_ingress_event: AgentEvent | None = None
+    trust_notice_sender: Any = None
+    trust_owner_loop: Any = None
+    trust_cleared_notice: bool = False
     # Information flow control labels (chainlink #871). Immutable/monotonic
     # labels tracking data sensitivity from various sources. Initialized before
     # the first model call from inbound/folded messages, recent history,

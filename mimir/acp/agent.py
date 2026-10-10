@@ -18,7 +18,7 @@ import mimir
 from mimir.access_control import create_auth_context
 from mimir.channel_audience import ServerChannelAudienceProvider
 from mimir.event_logger import safe_log_event
-from mimir.models import AgentEvent
+from mimir.models import AgentEvent, InformationFlowLabels, InformationFlowState
 from mimir.tools.client_provider import (
     ClientProviderResultError,
     MIMIR_HANDS_V1,
@@ -135,6 +135,9 @@ class SessionState:
     active_prompt: ActivePrompt | None = None
     dirty: bool = False
     ingest_acknowledgement: str | None = None
+    ifc_state: InformationFlowState = field(default_factory=InformationFlowState)
+    trust_requested_snapshot: InformationFlowLabels | None = None
+    trust_requested_ordinal: int = -1
 
 
 @dataclass
@@ -180,6 +183,76 @@ class ActivePrompt:
         if not self._is_current():
             raise RuntimeError("ingest acknowledgement requires a live ACP prompt")
         self.session.ingest_acknowledgement = uuid.uuid4().hex
+
+    async def offer_ingest_trust(self, auth: AuthContext) -> None:
+        """Ask the peer once for this taint snapshot, independent of model tools."""
+        from mimir.trust_approval import (
+            audit_decision, operator_ingest_allowed, summary,
+        )
+
+        if (not self._is_current() or not operator_ingest_allowed(auth, surface="acp")
+                or self.session.ifc_state is not auth.ifc_state):
+            return
+        state = self.session.ifc_state
+        snapshot, ordinal = state.source_snapshot(auth.ifc_labels)
+        if (not isinstance(snapshot, InformationFlowLabels)
+                or not state.has_untrusted_active_ingest(auth.ifc_labels)
+                or (snapshot == self.session.trust_requested_snapshot
+                    and ordinal == self.session.trust_requested_ordinal)):
+            return
+        self.session.trust_requested_snapshot = snapshot
+        self.session.trust_requested_ordinal = ordinal
+        provider = self.session.provider
+        if provider is None or provider.peer is None:
+            return
+        permission = PermissionSnapshot(
+            tool_call_id=f"ingest-trust-{uuid.uuid4().hex}",
+            title=f"This session read untrusted content ({summary(snapshot)}). Clear and trust it?",
+            kind="other", raw_input={}, wrapper_name="ingest_trust",
+        )
+        try:
+            completion = await provider.peer.request_tool_permission(
+                self.session.record.session_id, permission,
+            )
+            current, current_ordinal = state.source_snapshot(auth.ifc_labels)
+            if (not self._is_current() or current != snapshot
+                    or current_ordinal != ordinal):
+                return
+            if completion.error is None and completion.decision == "allow_once":
+                state.acknowledge_ingest_snapshot(
+                    expected=snapshot,
+                    expected_ordinal=ordinal,
+                    durable_audit=lambda _sources: (
+                        self._audit_and_advance_ingest(auth, snapshot)
+                    ),
+                )
+            else:
+                audit_decision(auth, snapshot, surface="acp", cleared=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.warning("ACP ingest trust request failed", exc_info=True)
+
+    def _audit_and_advance_ingest(
+        self, auth: AuthContext, snapshot: InformationFlowLabels,
+    ) -> bool:
+        from mimir.trust_approval import audit_decision
+
+        if not self._is_current():
+            return False
+        try:
+            self.acknowledge_ingest()
+        except RuntimeError:
+            return False
+        if not audit_decision(auth, snapshot, surface="acp", cleared=True):
+            return False
+        from mimir._context import get_current_turn
+
+        turn = get_current_turn()
+        if (turn is not None and getattr(turn, "auth_context", None) is not None
+                and turn.auth_context.ifc_state is auth.ifc_state):
+            turn.trust_cleared_notice = True
+        return True
 
     async def request_permission(
         self, eligibility: PermissionEligibility
@@ -1187,16 +1260,12 @@ class MimirAcpAgent:
         if context is None:
             return None
         thread_id = state.record.thread_id
-        if (
-            getattr(context, "channel_id", None) == thread_id
-            and context.origin_trigger == "acp_session"
-        ):
-            return context
         return replace(
             context,
             channel_id=thread_id,
             resource_id=thread_id,
             origin_trigger="acp_session",
+            ifc_state=state.ifc_state,
         )
 
     def _display_name_for(self, state: SessionState) -> str | None:

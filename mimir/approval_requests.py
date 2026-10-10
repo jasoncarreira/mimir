@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 _ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
 _RECENT_SECONDS = 24 * 60 * 60
-_REPLY = re.compile(r"^(approve|decline)(?:\s+([a-z]+-[a-z2-7]{4})(?:\s*:\s*(.*))?)?$", re.I | re.S)
+_REPLY = re.compile(r"^(approve|decline|trust|keep)(?:\s+([a-z]+-[a-z2-7]{4})(?:\s*:\s*(.*))?)?$", re.I | re.S)
 Resolver = Callable[[str, str | None, "AgentEvent", "IdentityResolver | None", float, "AgentEvent | None", "SourceLabel | None"], str]
 
 
@@ -161,7 +161,9 @@ def resolve(
     """Only authenticated bridge-origin operator events can resolve requests."""
     from .operator_approval import _is_authenticated_operator
 
-    if not _is_authenticated_operator(event, identity_resolver):
+    trust_reply = re.fullmatch(r"(trust|keep)\s+trust-[a-z2-7]{4}",
+                               (event.content or "").strip(), re.I) is not None
+    if not _is_authenticated_operator(event, identity_resolver, allow_web=trust_reply):
         return Resolution("unauthenticated_operator")
     now = time.monotonic() if now is None else now
     match = _REPLY.fullmatch((event.content or "").strip())
@@ -183,7 +185,7 @@ def resolve(
         else:
             # Pairings require an explicit named ID; exclude them before both
             # reply-reference selection and single/ambiguous candidate checks.
-            entries = [entry for entry in entries if entry.kind != "pair"]
+            entries = [entry for entry in entries if entry.kind not in {"pair", "trust"}]
             reference = event.extra.get("reply_to_message_id") if event.source == "discord" else None
             referenced = next((e for e in entries if reference is not None
                                and e.prompt_message_id == str(reference)), None)
@@ -197,6 +199,9 @@ def resolve(
             else:
                 return Resolution("no_pending_request")
         if edit is not None and not entry.supports_edits:
+            return Resolution("not_an_approval_response")
+        if ((entry.kind == "trust") != (decision.lower() in {"trust", "keep"})
+                or (entry.kind == "trust" and named_id is None)):
             return Resolution("not_an_approval_response")
         if entry.kind == "pair" and named_id is None:
             return Resolution("no_pending_request", message="specify a pair-xxxx request id")

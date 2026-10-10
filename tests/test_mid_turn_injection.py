@@ -984,10 +984,12 @@ def test_authenticated_injection_is_only_production_approval_recorder():
         for name in _approval_recorder_calls(path.read_text(encoding="utf-8")):
             callers.append((relative, name))
 
-    # The agent resolves authenticated memory replies before any model turn.
+    # The agent resolves authenticated memory replies before any model turn;
+    # the dispatcher resolves only exact trust replies during an in-flight turn.
     # The operator_approval wrapper is retained for existing tests.
     assert callers == [
         ("agent.py", "resolve"),
+        ("dispatcher.py", "resolve"),
         ("mid_turn_injection.py", "resolve"),
         ("operator_approval.py", "resolve"),
     ]
@@ -2572,10 +2574,12 @@ async def test_post_fold_live_state_race_refuses_and_spends_category_grant(
     original_merge = auth.ifc_state.merge_with_receipt
     raced = False
 
-    def _racing_merge(added, fallback=None, *, event_identity=None):
+    def _racing_merge(added, fallback=None, *, event_identity=None,
+                      fresh_untrusted_ingest=False):
         nonlocal raced
         merged, receipt = original_merge(
             added, fallback=fallback, event_identity=event_identity,
+            fresh_untrusted_ingest=fresh_untrusted_ingest,
         )
         if event_identity is not None and not raced:
             raced = True

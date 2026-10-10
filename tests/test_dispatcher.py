@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from textwrap import dedent
 from unittest.mock import AsyncMock
 
@@ -19,6 +20,63 @@ from mimir.models import AgentEvent
 from mimir.server import _PairingNotifier
 from mimir.worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_KEY, HTTP_EVENT_INGRESS_EXTRA_VALUE
 from tests.timing import HANG_GUARD_SECONDS, wait_until
+
+
+@pytest.mark.asyncio
+async def test_trust_reply_clears_running_channel_without_entering_model(tmp_path):
+    from mimir import approval_requests, trust_approval
+    from tests.test_trust_approval import _turn
+
+    resolver = _resolver(tmp_path, """
+        people:
+          - canonical: operator
+            aliases: [discord-99]
+            access: {roles: [admin]}
+          - canonical: outsider
+            aliases: [discord-98]
+            access: {roles: [user]}
+    """)
+    ctx, auth = _turn(resolver, channel="discord-10")
+    notices = []
+    delivered = asyncio.get_running_loop().create_future()
+
+    async def send(channel, text):
+        notices.append((channel, text))
+        if not delivered.done():
+            delivered.set_result(None)
+        return SimpleNamespace(sent=True)
+
+    dispatcher = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver,
+                            run_turn=lambda *_args: pytest.fail("trust entered model"))
+    dispatcher.set_notice_sender(send)
+    ctx.trust_notice_sender = dispatcher._send_approval_notice
+    request_id = trust_approval.register_chat_request(ctx, auth)
+    await asyncio.wait_for(delivered, HANG_GUARD_SECONDS)
+    assert request_id in notices[0][1]
+    assert "hostile.example" not in notices[0][1]
+    dispatcher._in_flight.add("discord-10")
+    try:
+        wrong_author = AgentEvent(trigger="user_message", source="discord", channel_id="discord-10",
+                                  author="discord-98", content=f"trust {request_id}")
+        await dispatcher.enqueue(wrong_author)
+        assert auth.ifc_state.has_untrusted_active_ingest()
+        other_channel = replace(wrong_author, author="discord-99", channel_id="discord-other")
+        await dispatcher.enqueue(other_channel)
+        assert auth.ifc_state.has_untrusted_active_ingest()
+        # A model-composed message has no authenticated human ingress.
+        await dispatcher.enqueue(replace(wrong_author, author=None, content=f"trust {request_id}"))
+        assert auth.ifc_state.has_untrusted_active_ingest()
+        reply = replace(wrong_author, author="discord-99")
+        assert await dispatcher.enqueue(reply)
+        assert not auth.ifc_state.has_untrusted_active_ingest()
+        assert len(notices) == 2
+        await dispatcher.enqueue(reply)
+        assert len(notices) == 2  # replay cannot produce another clear or notice
+        assert not any(entry.kind == "trust" for entry in approval_requests.pending("discord-10"))
+    finally:
+        dispatcher._in_flight.clear()
+        approval_requests.cancel(request_id)
+        await dispatcher.drain()
 
 
 def _make_config(home: Path, **overrides) -> Config:

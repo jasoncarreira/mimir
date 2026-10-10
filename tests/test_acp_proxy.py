@@ -21,6 +21,7 @@ from mimir.acp.execution_scope import ScopeApproval
 from mimir.acp.hosted import HostedMcpError
 from mimir.acp.profiles import Profile, ProfileStore
 from mimir.acp.proxy import MAX_FRAME_BYTES, FrameWriter, PermissionGrantStore, ProxyError, ProxyRouter, _route_stream, run_local_proxy, run_router
+from mimir.acp.sdk import PermissionSnapshot, permission_request_params
 from mimir.channel_registry import ChannelRegistry
 from mimir.identities import IdentityResolver, hash_web_key
 from mimir.tools.client_provider import MIMIR_HANDS_V1, PermissionDecision, PermissionEligibility, get_turn_capability_context
@@ -46,6 +47,41 @@ def frame(value: object) -> bytes:
 
 def messages(writer: Writer) -> list[dict[str, Any]]:
     return [json.loads(line) for line in bytes(writer.data).splitlines()]
+
+
+@pytest.mark.parametrize("response", ["allow_once", "reject_once", "allow_session"])
+@pytest.mark.parametrize("cached", [False, True])
+async def test_ingest_trust_request_never_uses_or_creates_session_grant(response, cached):
+    client, daemon = Writer(), Writer()
+    router = ProxyRouter(client, daemon, "secret")
+    router._active_sessions.add("session")
+    if cached:
+        router._grants.add("session", "ingest_trust")  # Even a corrupt cache cannot answer it.
+    try:
+        snapshot = PermissionSnapshot(
+            tool_call_id="ingest-trust-test", kind="other", raw_input={},
+            wrapper_name="ingest_trust",
+            title="This session read untrusted content (web: 2 protected_tool). Clear and trust it?",
+        )
+        request = {"jsonrpc": "2.0", "id": 712, "method": "session/request_permission",
+                   "params": permission_request_params("session", snapshot)}
+        await router.route_daemon(request)
+        assert messages(client)[-1] == request
+        assert not messages(daemon)
+        await router.route_client({
+            "jsonrpc": "2.0", "id": 712,
+            "result": {"outcome": {"outcome": "selected", "optionId": response}},
+        })
+        assert messages(daemon)[-1]["id"] == 712
+        if not cached:
+            assert not router._grants.allows("session", "ingest_trust")
+        router._grants.revoke_session("session")
+        request["id"] = 713
+        await router.route_daemon(request)
+        assert messages(client)[-1]["id"] == 713
+        assert messages(daemon)[-1]["id"] == 712
+    finally:
+        await router.close()
 
 
 @pytest.fixture(params=["confined", "unavailable"])

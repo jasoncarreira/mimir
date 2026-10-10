@@ -462,7 +462,16 @@ def permission_request_params(
             {"optionId": "reject_once", "name": "Reject once", "kind": "reject_once"},
         ],
     }
-    if snapshot.wrapper_name is not None:
+    if snapshot.wrapper_name == "ingest_trust":
+        if (snapshot.kind != "other" or snapshot.raw_input != {}
+                or snapshot.tainted or snapshot.ingest_acknowledgement is not None):
+            raise AcpProtocolError("Malformed ingest trust request")
+        result["options"] = [
+            {"optionId": "allow_once", "name": "Clear", "kind": "allow_once"},
+            {"optionId": "reject_once", "name": "Keep", "kind": "reject_once"},
+        ]
+        result["_meta"] = {"mimir.wrapper": "ingest_trust"}
+    elif snapshot.wrapper_name is not None:
         if snapshot.wrapper_name not in {"hands_edit", "hands_shell", "hands_python"}:
             raise AcpProtocolError("Malformed permission lifecycle snapshot")
         result["_meta"] = {"mimir.wrapper": snapshot.wrapper_name}

@@ -249,6 +249,19 @@ class Dispatcher:
         if not await self._authorize_bridge_event(event):
             return False
 
+        # A trust reply is a server action, not a model turn. Handle it while
+        # the channel's turn is in flight even when mid-turn injection is off.
+        from .trust_approval import _TRUST_REPLY, complete_reply as complete_trust_reply
+        if _TRUST_REPLY.fullmatch((event.content or "").strip()) is not None:
+            from .approval_requests import resolve as resolve_approval
+
+            resolution = resolve_approval(event, self._identity_resolver)
+            if resolution.entry is not None and resolution.entry.kind == "trust":
+                notice = await complete_trust_reply(event, resolution, self._identity_resolver)
+                if notice:
+                    await self._send_approval_notice(event.channel_id, notice)
+            return True
+
         # First-contact DM-channel capture (best-effort, fire-and-forget):
         # observe inbound user messages without blocking or risking admission.
         if self._on_event is not None and event.trigger == "user_message":
@@ -288,7 +301,10 @@ class Dispatcher:
                 )
                 if injection_status == "consumed":
                     resolution = event.extra.pop("_memory_proposal_resolution")
-                    if resolution.entry is not None and resolution.entry.kind == "pair":
+                    if resolution.entry is not None and resolution.entry.kind == "trust":
+                        from .trust_approval import complete_reply
+                        notice = await complete_reply(event, resolution, self._identity_resolver)
+                    elif resolution.entry is not None and resolution.entry.kind == "pair":
                         from .pairing_approval import complete_reply
                         notice = await complete_reply(
                             self._config.home, getattr(self._config, "operator_alert_channel", ""),

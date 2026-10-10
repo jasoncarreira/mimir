@@ -234,12 +234,20 @@ integrity signal (mimir round 6). Represent integrity with **two fields on
 Both `active_ingest` and `informational` sources ride the same `ifc_state`
 accumulator (mimir round 7 — recalled/prompt sources already do), so the field is
 what separates them. The **integrity gate fires iff an accumulated source is
-`integrity == untrusted` AND `integrity_effect == active_ingest`.** An untrusted
+`integrity == untrusted` AND `integrity_effect == active_ingest` and it is not
+covered by an operator acknowledgement of the exact source snapshot.** An untrusted
 *informational* source (a recalled untrusted memory) is rendered/visible but does
 **not** gate — reconciling this gate with §5.3's "auto-recall never handcuffs a
 user turn." Wherever this doc says "untrusted taint" / "the turn-taint gate," that
-is the exact test — *any untrusted **active-ingest** source this turn* — never
+is the exact test — *any uncovered untrusted **active-ingest** source this turn* — never
 confidentiality emptiness and never an informational recall.
+
+ACP asks the authenticated operator to Clear or Keep when active ingest taints
+the session. Chat posts a server-owned `trust-xxxx` notice after a tainted write
+veto. A valid operator reply acknowledges the channel's current snapshot;
+subsequent turns in that channel remain clear until new untrusted sources arrive.
+The model, pollers, schedules, service identities and `/event` ingress cannot
+acknowledge ingest. Audit and notices contain only fixed-taxonomy counts.
 
 The remediation trigger itself is trusted active ingest, not external content.
 This is the “trigger payload is not untrusted ingest” fix; `repo_test` remains a

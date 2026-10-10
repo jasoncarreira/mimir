@@ -317,6 +317,7 @@ def _drain(channel_id: str | None) -> list["AgentEvent"]:
             ctx.ifc_labels, receipt = ctx.auth_context.ifc_state.merge_with_receipt(
                 ctx.ifc_labels,
                 event_identity=event,
+                fresh_untrusted_ingest=event_labels.has_untrusted_active_ingest,
             )
             ctx.auth_context = replace(ctx.auth_context, ifc_labels=ctx.ifc_labels)
             request = authenticated_grants.get(id(event))

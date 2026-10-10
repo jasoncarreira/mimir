@@ -334,20 +334,20 @@ weaken server-side policy.** This decision adds no config-options implementation
 
 ## Providers, permissions, and filesystems
 
-When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, `python`, and `request_scope`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again unless an admin has acknowledged the current ingest snapshot with `clear_ingest_taint`. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
+When `mcpServers` is missing or empty, the local proxy injects one locally hosted MCP-over-ACP provider named `mimir-hands`. An explicit nonempty provider collection is preserved. The `mimir.hands.v1` profile contains exactly `read`, `edit`, `shell`, `python`, and `request_scope`; it is validated afresh on session new, session load, and provider-list change. Read is prompt-free. Edit, shell, and Python require exact-call operator permission immediately before execution. `allow_session` creates only an in-memory proxy grant for that session and tool, and a tainted call always prompts again until the operator clears its ingest snapshot. Grants never create daemon authority and are revoked on load, disconnect, generation replacement, or proxy exit.
 
-An authenticated, non-service admin on a live user turn can ask Mimir to call
-`clear_ingest_taint`. It durably audits and acknowledges only the current ingest
-snapshot for the ACP permission prompt. Acknowledging untrusted ingest revokes
-existing wrapper session grants, even if no permission request occurred while
-tainted. The next call requires a fresh human response; choosing `allow_session`
-there enables reuse again until another acknowledgement or session reset.
-Clearing alone cannot restore a grant. It does **not** clear source labels,
-declassify data, grant execution permission, or change sink and durable-memory
-decisions. Later untrusted active
-ingest, including rereading the same source, re-arms the prompt. See
-[ingest acknowledgement](authorization.md#ingest-acknowledgement) for eligibility
-and audit failure behavior.
+When a session first ingests untrusted content, or reaches a tainted write veto,
+the daemon sends one server-originated `session/request_permission` with **Clear**
+and **Keep** options. Only fixed-taxonomy source counts appear in its title; no
+source URL, ID, or content is disclosed. Clear durably audits and acknowledges
+the exact current source snapshot for the session. Keep, cancellation and
+timeout leave it tainted. The model cannot invoke a clear. Clearing restores
+the write gates, but does not remove source labels, alter egress
+declassification, or grant Hands execution permission. New untrusted content
+re-taints the session. The proxy never auto-answers this distinct trust request
+from a cached `allow_session` grant. Clear advances the ingest boundary and
+revokes existing wrapper grants; the next Hands call needs a fresh human
+permission response. See [ingest acknowledgement](authorization.md#ingest-acknowledgement).
 
 **Behavior change in 0.9.0:** the previous `client-file:*` grant permitted
 Hands file access to any path on the operator's machine that the client user
