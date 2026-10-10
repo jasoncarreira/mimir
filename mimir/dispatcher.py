@@ -18,9 +18,10 @@ import logging
 import shlex
 import threading
 import traceback
+from dataclasses import replace
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .access_control import AccessDecision, authorize_inbound
+from .access_control import AccessDecision, AccessStatus, AccessTier, authorize_inbound
 from .background_tasks import cancel_background_tasks, spawn_background
 from .config import Config
 from .event_logger import log_event
@@ -357,6 +358,27 @@ class Dispatcher:
         ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
         return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
 
+    def _discord_role_state(self, event: AgentEvent) -> tuple[tuple[str, str] | None, bool]:
+        """Evaluate current Discord member roles without persisting anything."""
+        resolver = self._identity_resolver
+        if resolver is None or event.source != "discord" or event.trigger != "user_message":
+            return None, False
+        resolver.reload_if_changed()
+        identity = resolver.identity(event.author)
+        managed = (identity is not None and identity.access_source == "discord_role"
+                   and "admin" not in identity.access.roles)
+        if self._is_http_ingress(event) or not isinstance(event.author, str) or not event.author.startswith("discord-") or not event.author[8:].isdigit():
+            return None, managed
+        if identity is not None and not managed:
+            return None, False
+        guild = event.extra.get("discord_guild_id")
+        roles = event.extra.get("discord_member_role_ids")
+        if (not isinstance(guild, str) or not guild.isdigit()
+                or not isinstance(roles, list)
+                or any(not isinstance(role, str) or not role.isdigit() for role in roles)):
+            return None, managed
+        return resolver.discord_role_grant(guild, roles), managed
+
     def _intake_decision(self, event: AgentEvent) -> AccessDecision | None:
         """Return the external author decision, or None for a trusted/bypassed event."""
         is_http_ingress = self._is_http_ingress(event)
@@ -364,11 +386,18 @@ class Dispatcher:
             return None
         if (event.source or "").strip().lower() in TRUSTED_INTERNAL_SOURCES and not is_http_ingress:
             return None
-        return authorize_inbound(
+        decision = authorize_inbound(
             event,
             self._identity_resolver,
             enforce=self._config.access_control_enforced or not self._config.open_bridge,
         )
+        match, managed = self._discord_role_state(event)
+        if managed and match is None:
+            return replace(decision, allowed=False, status=AccessStatus.DENIED)
+        if match is not None and (managed or self._identity_resolver.identity(event.author) is None):
+            return replace(decision, allowed=True, status=AccessStatus.USER_ALLOWED,
+                           required_tier=AccessTier.USER, reason=None, roles=("user",))
+        return decision
 
     def intake_admits(self, event: AgentEvent) -> bool:
         """Side-effect-free author gate for pre-download bridge intake."""
@@ -377,6 +406,33 @@ class Dispatcher:
 
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
         """Gate external user messages before any admission side effect."""
+        match, managed = self._discord_role_state(event)
+        if managed or match is not None:
+            from .identities_populator import grant_role_admission, revoke_role_admission
+
+            try:
+                if match is not None:
+                    changed, canonical = grant_role_admission(
+                        self._config.home, event.author, *match,
+                    )
+                elif managed:
+                    changed, canonical = revoke_role_admission(self._config.home, event.author)
+                else:
+                    changed, canonical = False, None
+                if changed:
+                    self._identity_resolver.reload()
+                    await log_event(
+                        "discord_role_admission_granted" if match else "discord_role_admission_revoked",
+                        canonical=canonical,
+                        **({"guild_id": match[0], "role_id": match[1]} if match else {}),
+                    )
+                # A concurrent operator edit may have taken ownership of the entry.
+                if match is not None and canonical is None and not self._identity_resolver.is_authorized(event.author):
+                    return False
+            except Exception:  # a failed identity write cannot authorize this message
+                log.warning("discord_role_admission_write_failed", exc_info=True)
+                await log_event("discord_role_admission_write_failed")
+                return False
         decision = self._intake_decision(event)
         admitted = decision is None or decision.allowed
         source = (event.source or "").strip().lower()

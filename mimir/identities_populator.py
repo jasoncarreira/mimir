@@ -268,6 +268,67 @@ def _serialized_identities_write(fn):
     return _wrapper
 
 
+# Role admission cannot select an access tier from the operator's grant row.
+DISCORD_ADMISSION_ROLES = ["user"]
+
+
+@_serialized_identities_write
+def grant_role_admission(
+    home: Path, author: str, guild_id: str, role_id: str,
+    *, roles: Sequence[str] = ("user",),
+) -> tuple[bool, str | None]:
+    """Persist a Discord-only user grant; return (changed, canonical)."""
+    assert list(roles) == DISCORD_ADMISSION_ROLES
+    if not author or not author.startswith("discord-") or not author[8:].isdigit():
+        return False, None
+    path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(path)
+    people = doc["people"]
+    entry = _find_person(people, author)
+    if entry is None:
+        entry = {"canonical": author, "aliases": [author]}
+        people.append(entry)
+    else:
+        access = entry.get("access")
+        if not isinstance(access, dict) or access.get("source") != "discord_role" or "admin" in (access.get("roles") or []):
+            return False, None
+    access = entry.get("access") if isinstance(entry.get("access"), dict) else {}
+    desired = {"roles": list(DISCORD_ADMISSION_ROLES), "source": "discord_role",
+               "granted_by": {"guild_id": guild_id, "role_id": role_id}}
+    changed = any(access.get(key) != value for key, value in desired.items()) or "revoked_at" in access
+    aliases = entry.get("aliases")
+    if not isinstance(aliases, list):
+        aliases = []
+    if author not in aliases:
+        entry["aliases"] = [*aliases, author]
+        changed = True
+    if not changed:
+        return False, str(entry["canonical"])
+    access.update(desired)
+    access.pop("revoked_at", None)
+    entry["access"] = access
+    _atomic_write_identities(path, header, doc)
+    return True, str(entry["canonical"])
+
+
+@_serialized_identities_write
+def revoke_role_admission(home: Path, author: str) -> tuple[bool, str | None]:
+    """Revoke only a still-bridge-managed grant, retaining its person record."""
+    path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(path)
+    entry = _find_person(doc["people"], author)
+    access = entry.get("access") if entry else None
+    if not isinstance(access, dict) or access.get("source") != "discord_role" or "admin" in (access.get("roles") or []):
+        return False, None
+    canonical = str(entry["canonical"])
+    if access.get("roles") == [] and access.get("revoked_at"):
+        return False, canonical
+    access["roles"] = []
+    access["revoked_at"] = datetime.now(timezone.utc).isoformat()
+    _atomic_write_identities(path, header, doc)
+    return True, canonical
+
+
 def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
     """Write ``header + safe_dump(doc)`` to ``yaml_path`` via a UNIQUE temp
     file + atomic rename, so concurrent writers never share (and clobber) a

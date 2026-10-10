@@ -914,6 +914,7 @@ _INTAKE_WRITERS = [
     "issue_web_key", "revoke_web_key", "set_user_prefs", "capture_dm_channel",
     "request_pairing_with_code", "prepare_pairing_code_delivery",
     "approve_pairing", "reject_pairing", "approve_pairing_code", "merge_into_yaml",
+    "grant_role_admission", "revoke_role_admission",
     "_seed_identities", "request_pairing_status",
 ]
 
@@ -946,6 +947,7 @@ def test_intake_survives_every_identities_writer(tmp_path, writer):
             "slack": {"channel": "decline"},
         },
         "decline_text": "No thanks",
+        "discord_role_admission": {"enabled": True, "grants": [{"guild_id": "111", "role_id": "222"}]},
     }
     code = "ABCDEFGH"
     salt = b"intake-test-salt"
@@ -963,6 +965,9 @@ def test_intake_survives_every_identities_writer(tmp_path, writer):
         "channels": [],
         "intake": intake,
     }
+    if writer == "revoke_role_admission":
+        doc["people"].append({"canonical": "discord-9", "aliases": ["discord-9"],
+                              "access": {"roles": ["user"], "source": "discord_role"}})
     path.write_text(yaml.safe_dump(doc))
     before = path.read_bytes()
 
@@ -989,6 +994,10 @@ def test_intake_survives_every_identities_writer(tmp_path, writer):
         assert pop.revoke_web_key(tmp_path, "slack-U1")
     elif writer == "capture_dm_channel":
         assert pop.capture_dm_channel(tmp_path, "slack-U1", "slack", "dm-slack-D1")
+    elif writer == "grant_role_admission":
+        assert pop.grant_role_admission(tmp_path, "discord-8", "111", "222")[0]
+    elif writer == "revoke_role_admission":
+        assert pop.revoke_role_admission(tmp_path, "discord-9")[0]
     elif writer == "set_user_prefs":
         assert pop.set_user_prefs(tmp_path, "slack-U1", {"theme": "dark"})
     elif writer == "add_identity_alias":
@@ -1015,3 +1024,55 @@ def test_intake_survives_every_identities_writer(tmp_path, writer):
     if writer != "_seed_identities":
         assert path.read_bytes() != before
     assert yaml.safe_load(path.read_text())["intake"] == intake
+
+
+def test_discord_role_writer_preserves_header_and_refuses_admin(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+    import yaml
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text("# policy header\npeople: []\n")
+    with pytest.raises(AssertionError):
+        grant_role_admission(tmp_path, "discord-1", "11", "22", roles=["admin"])
+    assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (True, "discord-1")
+    text = path.read_text()
+    assert text.startswith("# policy header\n")
+    assert yaml.safe_load(text)["people"][0]["access"] == {
+        "roles": ["user"], "source": "discord_role",
+        "granted_by": {"guild_id": "11", "role_id": "22"},
+    }
+    assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (False, "discord-1")
+    assert path.read_text() == text
+    assert revoke_role_admission(tmp_path, "discord-1") == (True, "discord-1")
+    revoked = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert revoked["roles"] == [] and revoked["revoked_at"]
+    assert revoke_role_admission(tmp_path, "discord-1") == (False, "discord-1")
+
+
+def test_discord_role_writer_never_modifies_operator_identity(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    for access in ("{roles: [admin]}", "{roles: []}", "{roles: [user, admin], source: discord_role}"):
+        path.write_text(f"people: [{{canonical: ops, aliases: [discord-1], access: {access}}}]\n")
+        before = path.read_text()
+        assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (False, None)
+        assert revoke_role_admission(tmp_path, "discord-1") == (False, None)
+        assert path.read_text() == before
+
+
+def test_discord_role_writer_repairs_managed_alias_and_regrants(tmp_path):
+    from mimir.identities_populator import grant_role_admission, revoke_role_admission
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    path.write_text("people: [{canonical: discord-9, aliases: [], access: {roles: [], source: discord_role, revoked_at: previous}}]\n")
+    assert grant_role_admission(tmp_path, "discord-9", "111", "222") == (True, "discord-9")
+    person = yaml.safe_load(path.read_text())["people"][0]
+    assert person["aliases"] == ["discord-9"]
+    assert person["access"]["roles"] == ["user"]
+    assert "revoked_at" not in person["access"]
+    assert revoke_role_admission(tmp_path, "discord-9")[0]
+    assert grant_role_admission(tmp_path, "discord-9", "111", "222")[0]

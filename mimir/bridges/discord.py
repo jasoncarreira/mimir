@@ -965,6 +965,18 @@ class DiscordBridge(Bridge):
         author_key = f"discord-{author_id}" if author_id else None
         reply_id = getattr(reference, "message_id", None)
 
+        member_extra: dict[str, Any] = {}
+        if getattr(message, "guild", None) is not None and isinstance(message.author, discord.Member):
+            roles = getattr(message.author, "roles", None)
+            guild_id = getattr(message.guild, "id", None)
+            if guild_id is not None and isinstance(roles, (list, tuple)) and all(
+                getattr(role, "id", None) is not None for role in roles
+            ):
+                member_extra = {
+                    "discord_guild_id": str(guild_id),
+                    "discord_member_role_ids": sorted(str(role.id) for role in roles),
+                }
+
         event = AgentEvent(
             trigger="user_message",
             channel_id=channel_id,
@@ -981,6 +993,7 @@ class DiscordBridge(Bridge):
                 "channel_conversation_type": conv_type,
                 "channel_visibility": visibility,
                 "channel_name": channel_name,
+                **member_extra,
                 **({"reply_to_message_id": str(reply_id)} if reply_id is not None else {}),
             },
         )
