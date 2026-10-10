@@ -10899,7 +10899,9 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
-def _bounded_repo_test_failure(result: Any, expected_head: str, lease_root: Path | None) -> bool:
+def _bounded_repo_test_failure(
+    result: Any, expected_head: str, lease_root: Path | None, scope_id: str,
+) -> bool:
     """Only the output-free, structured completed-failure envelope is attestable."""
     from langchain_core.messages import ToolMessage
 
@@ -10915,9 +10917,11 @@ def _bounded_repo_test_failure(result: Any, expected_head: str, lease_root: Path
         "remediation_guidance",
     }:
         return False
-    from .project_tests import _PYTEST_FAILING_BYTES, pytest_node_inventory, validated_pytest_node
+    from .project_tests import _PYTEST_FAILING_BYTES, recorded_node_inventory, validated_pytest_node
 
-    inventory = pytest_node_inventory(lease_root) if lease_root is not None else frozenset()
+    # Reuse the inventory the runner captured before execution: re-scanning
+    # here would block the event loop, and a miss trusts nothing.
+    inventory = recorded_node_inventory(lease_root, scope_id) if lease_root is not None else frozenset()
     summary = result["summary"]
     return (
         result["ok"] is False and result["code"] == "tests_failed"
@@ -11099,7 +11103,7 @@ def classify_protected_result(
                 lease_root = Path(lease.path)
         if (
             (not failed or tool_name == "repo_test" and lease_root is not None and _bounded_repo_test_failure(
-                result, scope.observed_head_sha, lease_root,
+                result, scope.observed_head_sha, lease_root, scope.scope_id,
             ))
             and provenance is not None and provenance.sources
         ):

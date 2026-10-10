@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
@@ -126,7 +128,9 @@ def pytest_node_inventory(root: Path) -> frozenset[str]:
                 relative = path.relative_to(root).as_posix()
                 try:
                     tree = ast.parse(path.read_bytes())
-                except (SyntaxError, ValueError, UnicodeError):
+                except (SyntaxError, ValueError, UnicodeError, MemoryError, RecursionError):
+                    # A parse bomb (deep nesting) must not crash repo_test; its
+                    # definitions are simply never trusted.
                     continue
                 for definition in tree.body:
                     if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)) and definition.name.startswith('test'):
@@ -138,6 +142,24 @@ def pytest_node_inventory(root: Path) -> frozenset[str]:
     except (OSError, ValueError):
         return frozenset()
     return frozenset(nodes)
+
+
+_NODE_INVENTORY_CACHE_SIZE = 32
+_NODE_INVENTORIES: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
+
+
+def remember_node_inventory(root: Path, scope_id: str, inventory: frozenset[str]) -> None:
+    """Record the inventory captured before a run for the result classifier."""
+    key = (str(root), scope_id)
+    _NODE_INVENTORIES[key] = inventory
+    _NODE_INVENTORIES.move_to_end(key)
+    while len(_NODE_INVENTORIES) > _NODE_INVENTORY_CACHE_SIZE:
+        _NODE_INVENTORIES.popitem(last=False)
+
+
+def recorded_node_inventory(root: Path, scope_id: str) -> frozenset[str]:
+    """Return the pre-run inventory, or an empty one (nothing trusted) on a miss."""
+    return _NODE_INVENTORIES.get((str(root), scope_id), frozenset())
 
 
 def validated_pytest_node(candidate: str, inventory: frozenset[str]) -> str | None:
@@ -705,7 +727,8 @@ class RepoProjectTests:
                 fixed_message=exc.fixed_message,
             ) from exc
         # Capture controller source before any worker/plugin can execute.
-        node_inventory = pytest_node_inventory(root)
+        node_inventory = await asyncio.to_thread(pytest_node_inventory, root)
+        remember_node_inventory(root, scope.scope_id, node_inventory)
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
             source_paths=(os.environ.get("MIMIR_HOME", ""),),

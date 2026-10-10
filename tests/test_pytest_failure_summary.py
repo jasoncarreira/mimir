@@ -114,3 +114,24 @@ def test_actual_quiet_xdist_output_and_fake_trailing_plugin_section(tmp_path, mo
     assert attacked_summary["failing_dropped"] == 1
     # Output counts are bounded observations, NOT proof of what actually ran.
     assert attacked_summary["passed"] == 999
+
+
+def test_inventory_skips_parse_bomb_without_crashing(tmp_path):
+    """A hostile, deeply nested test file must not crash repo_test."""
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_bomb.py").write_text("x = " + "-" * 200_000 + "1\ndef test_bomb():\n    pass\n")
+    (tests / "test_ok.py").write_text("def test_ok():\n    pass\n")
+    assert pytest_node_inventory(tmp_path) == frozenset({"tests/test_ok.py::test_ok"})
+
+
+def test_recorded_inventory_is_bounded_and_misses_trust_nothing(tmp_path):
+    from mimir import project_tests
+
+    project_tests._NODE_INVENTORIES.clear()
+    for index in range(project_tests._NODE_INVENTORY_CACHE_SIZE + 5):
+        project_tests.remember_node_inventory(tmp_path, f"scope-{index}", frozenset({f"n{index}"}))
+    assert len(project_tests._NODE_INVENTORIES) == project_tests._NODE_INVENTORY_CACHE_SIZE
+    assert project_tests.recorded_node_inventory(tmp_path, "scope-0") == frozenset()
+    last = project_tests._NODE_INVENTORY_CACHE_SIZE + 4
+    assert project_tests.recorded_node_inventory(tmp_path, f"scope-{last}") == frozenset({f"n{last}"})

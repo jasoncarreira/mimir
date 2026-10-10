@@ -44,6 +44,19 @@ def _self_login(monkeypatch: pytest.MonkeyPatch):
     yield real_head_check
 
 
+
+def _remember_inventory(lease, scope):
+    """Mirror the runner: capture the lease's test inventory before classification."""
+    from mimir.project_tests import pytest_node_inventory, remember_node_inventory
+
+    remember_node_inventory(lease.path, scope.scope_id, pytest_node_inventory(lease.path))
+
+
+def _recorded(lease, scope):
+    from mimir.project_tests import recorded_node_inventory
+
+    return recorded_node_inventory(lease.path, scope.scope_id)
+
 def _recorded_lease(
     root: Path,
     *,
@@ -402,6 +415,7 @@ async def test_repo_test_red_run_remediation_sequence(
     test_file = lease.path / "tests" / "test_work.py"
     test_file.parent.mkdir()
     test_file.write_text("def test_fix():\n    pass\n")
+    _remember_inventory(lease, scope)
     monkeypatch.setattr(repo, "_state", lambda *_: state)
     output = b"FAILED tests/test_work.py::test_fix - AssertionError\n=== short test summary info ===\nFAILED tests/test_work.py::test_fix - AssertionError\n=== 1 failed, 2 passed in 0.1s ===\n"
 
@@ -592,7 +606,8 @@ def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
 
 @pytest.mark.parametrize("change", ["stdout", "stderr", "git_context", "wrong_head",
     "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector",
-    "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit"])
+    "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit",
+    "non_ascii_node", "lease_head_moved", "inventory_not_recorded"])
 def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
@@ -601,6 +616,7 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_
     test_file = lease.path / "tests" / "test_a.py"
     test_file.parent.mkdir()
     test_file.write_text("def test_a():\n    pass\n")
+    _remember_inventory(lease, scope)
     source = SourceLabel(principal="operator", domain="repository",
                          resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
                          bridge_instance="forge", sensitivity="internal",
@@ -651,11 +667,24 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_
     elif change == "total_bytes":
         name = "test_" + "x" * 150
         test_file.write_text(f"def {name}(): pass\n")
+        _remember_inventory(lease, scope)
         altered["summary"]["failing"] = [f"tests/test_a.py::{name}"] * 50
     elif change == "inactive_lease":
         lease.is_active = False
     elif change == "zero_exit":
         altered["exit_code"] = 0
+    elif change == "non_ascii_node":
+        # A real definition whose path falls outside the node-id charset is
+        # still refused: the inventory alone does not admit arbitrary text.
+        (lease.path / "tests" / "test_b c.py").write_text("def test_b():\n    pass\n")
+        _remember_inventory(lease, scope)
+        assert "tests/test_b c.py::test_b" in _recorded(lease, scope)
+        altered["summary"]["failing"] = ["tests/test_b c.py::test_b"]
+    elif change == "lease_head_moved":
+        lease.head_sha = "c" * 40
+    elif change == "inventory_not_recorded":
+        from mimir import project_tests
+        project_tests._NODE_INVENTORIES.pop((str(lease.path), scope.scope_id), None)
     if change == "wrong_scope":
         source = replace(source, resource_id="owner/repo#pull/7@" + "b" * 40)
     assert integrity(altered, source) == "untrusted"
