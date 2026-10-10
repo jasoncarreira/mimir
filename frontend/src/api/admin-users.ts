@@ -45,3 +45,21 @@ export function revokeUserKey(
     ...options
   });
 }
+
+export function approveUserPairing(
+  canonical: string, role: "user" | "admin", options?: ApiClientOptions & RequestInit
+): Promise<ApiSuccessEnvelope<{ canonical: string }>> {
+  return apiFetchEnvelope("/api/v1/admin/users/pairing/approve", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canonical, role }), ...options
+  });
+}
+
+export function rejectUserPairing(
+  canonical: string, options?: ApiClientOptions & RequestInit
+): Promise<ApiSuccessEnvelope<{ canonical: string }>> {
+  return apiFetchEnvelope("/api/v1/admin/users/pairing/reject", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ canonical }), ...options
+  });
+}

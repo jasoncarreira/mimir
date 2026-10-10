@@ -1231,10 +1231,64 @@ async def test_update_reply_after_requesting_turn_ends_never_invokes_model(
 
 
 @pytest.mark.parametrize("decision", ["approve", "decline"])
+async def test_pairing_reply_bypasses_model_and_reloads_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
+):
+    import threading
+
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir import approval_requests, pairing_approval
+
+    model = _FakeAgent([AIMessage(content="model must not handle pairing")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    home = agent._config.home
+    channel = f"discord-pair-ops-{tmp_path.name}"
+    agent._config.operator_alert_channel = channel
+    identity = _resolver(home, """people:
+  - canonical: operator
+    aliases: [discord-99]
+    access: {roles: [admin]}
+""")
+    agent._identity_resolver = identity
+    request_pairing_with_code(home, "discord-123", "discord", channel_id="dm-discord-123", is_dm=True)
+    identity.reload()
+    request_id = identity.identity("discord-123").pairing.request_id
+    loop_thread = threading.get_ident()
+    sync_threads = []
+    original_sync = pairing_approval.sync_pending
+
+    def checked_sync(*args, **kwargs):
+        sync_threads.append(threading.get_ident())
+        assert sync_threads[-1] != loop_thread, "pairing sync ran on the event loop"
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(pairing_approval, "sync_pending", checked_sync)
+    notices = []
+
+    async def send_notice(channel_id, text):
+        notices.append((channel_id, text))
+
+    agent._dispatcher = SimpleNamespace(_send_approval_notice=send_notice)
+    monkeypatch.setattr("mimir.agent._initialize_ifc_labels", lambda *args, **kwargs: pytest.fail("pairing entered model turn"))
+    record = await agent.run_turn(AgentEvent(
+        trigger="user_message", channel_id=channel, source="discord",
+        author="discord-99", content=f"{decision} {request_id}",
+    ))
+    assert record.kind == "operator_approval"
+    assert sync_threads, "agent reply did not synchronize pending pairings"
+    assert notices == [(channel, record.output)]
+    assert identity.identity("discord-123").pairing.status == ("approved" if decision == "approve" else "rejected")
+    assert identity.access_metadata("discord-123").roles == (("user",) if decision == "approve" else ())
+    assert request_id not in {entry.approval_id for entry in approval_requests.pending(channel)}
+
+
+@pytest.mark.parametrize("decision", ["approve", "decline"])
 async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: str,
 ):
     from mimir import approval_requests
+    from mimir.identities_populator import request_pairing_with_code
+    from mimir.pairing_approval import sync_pending as sync_pairings
 
     channel = f"discord-op-e2e-{tmp_path.name}"
     model = _FakeAgent([AIMessage(content="live-turn path")])
@@ -1244,6 +1298,14 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
     aliases: [discord-99]
     access: {roles: [admin]}
 """)
+
+    agent._config.operator_alert_channel = channel
+    request_pairing_with_code(
+        agent._config.home, "discord-123", "discord",
+        channel_id="dm-discord-123", is_dm=True,
+    )
+    sync_pairings(agent._config.home, channel, agent._identity_resolver)
+    pair_id = agent._identity_resolver.identity("discord-123").pairing.request_id
 
     def unexpected_resolution(*args):
         pytest.fail("turn-bound request resolved by standalone pre-turn path")
@@ -1260,9 +1322,10 @@ async def test_bare_turn_bound_reply_keeps_ordinary_turn_path(
         ))
         assert result.error is None
         assert len(model.invocations) == 1
-        assert approval_requests.pending(channel) == (entry,)
+        assert {e.approval_id for e in approval_requests.pending(channel)} == {entry.approval_id, pair_id}
     finally:
         approval_requests.cancel(entry.approval_id)
+        approval_requests.cancel(pair_id)
 
 
 def test_agent_audience_provider_reuses_message_buffer_identity_resolver(

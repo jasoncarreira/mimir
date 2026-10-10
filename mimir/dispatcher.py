@@ -270,16 +270,29 @@ class Dispatcher:
         ):
             existing = self._queues.get(channel_id)
             if existing is None or existing.qsize() == 0:
+                operator_channel = getattr(self._config, "operator_alert_channel", "")
+                if operator_channel and channel_id == operator_channel:
+                    from .pairing_approval import sync_pending as sync_pairings
+                    await asyncio.to_thread(
+                        sync_pairings, self._config.home, operator_channel, self._identity_resolver,
+                    )
                 from .mid_turn_injection import inject_authenticated_message
                 injection_status = inject_authenticated_message(
                     channel_id, event, self._identity_resolver,
                 )
                 if injection_status == "consumed":
-                    from .memory_proposals import complete_reply
                     resolution = event.extra.pop("_memory_proposal_resolution")
-                    notice = await complete_reply(
-                        self._config.home, event, resolution, self._identity_resolver,
-                    )
+                    if resolution.entry is not None and resolution.entry.kind == "pair":
+                        from .pairing_approval import complete_reply
+                        notice = await complete_reply(
+                            self._config.home, getattr(self._config, "operator_alert_channel", ""),
+                            event, resolution, self._identity_resolver,
+                        )
+                    else:
+                        from .memory_proposals import complete_reply
+                        notice = await complete_reply(
+                            self._config.home, event, resolution, self._identity_resolver,
+                        )
                     if notice:
                         await self._send_approval_notice(channel_id, notice)
                     return True

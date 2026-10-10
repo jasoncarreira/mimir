@@ -52,6 +52,7 @@ import yaml
 
 from .event_logger import log_event, log_event_sync
 from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
+from .approval_requests import mint_id
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +100,8 @@ def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
         changed = True
     pairing = match.get("pairing")
     if isinstance(pairing, dict):
+        if pairing.pop("request_id", None) is not None:
+            changed = True
         if pairing.get("status") != "approved":
             pairing["status"] = "approved"
             pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
@@ -812,6 +815,10 @@ def request_pairing_with_code(
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
         pairing = {}
+    if pairing.get("status") == "rejected":
+        # Rejection is durable until an operator explicitly approves or removes
+        # this identity. In particular, never mint another DM code on contact.
+        return "unchanged", None
     requested_at = datetime.now(timezone.utc).isoformat()
     pending = {
         "status": "pending",
@@ -824,10 +831,24 @@ def request_pairing_with_code(
     if is_dm:
         pending["dm_channel"] = channel_id
     if pairing.get("status") != "pending":
+        existing_ids = frozenset(
+            p["pairing"]["request_id"] for p in people
+            if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+            and isinstance(p["pairing"].get("request_id"), str)
+        )
+        pending["request_id"] = mint_id("pair", excluded=existing_ids)
         pairing.update(pending)
         match["pairing"] = pairing
         changed = True
     else:
+        if not isinstance(pairing.get("request_id"), str):
+            existing_ids = frozenset(
+                p["pairing"]["request_id"] for p in people
+                if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+                and isinstance(p["pairing"].get("request_id"), str)
+            )
+            pairing["request_id"] = mint_id("pair", excluded=existing_ids)
+            changed = True
         # Keep the first requested_at for audit stability; refresh only facts
         # that can be corrected by the bridge layer.
         for key in ("platform", "author", "channel", "delivery", "dm_channel"):
@@ -892,6 +913,8 @@ def approve_pairing(
     author_or_canonical: str,
     *,
     roles: Iterable[str] = ("user",),
+    pending_only: bool = False,
+    request_id: str | None = None,
 ) -> bool:
     """Approve a pending identity by granting canonical-level access roles.
 
@@ -912,10 +935,34 @@ def approve_pairing(
     match = _find_person(people, key)
     if match is None:
         return False
+    pairing = match.get("pairing")
+    if pending_only and (not isinstance(pairing, dict) or pairing.get("status") != "pending"):
+        return False
+    if request_id is not None and (not isinstance(pairing, dict) or pairing.get("request_id") != request_id):
+        return False
 
     if not _approve_entry(match, clean_roles):
         return False
     doc["people"] = people
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
+
+
+@_serialized_identities_write
+def reject_pairing(home: Path, canonical: str, *, request_id: str | None = None) -> bool:
+    """Reject a pending pairing without granting roles or reopening on contact."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    match = _find_person(doc.get("people") or [], canonical.strip())
+    pairing = match.get("pairing") if match else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    if request_id is not None and pairing.get("request_id") != request_id:
+        return False
+    pairing["status"] = "rejected"
+    pairing["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    pairing.pop("request_id", None)
+    _clear_pairing_code(pairing)
     _atomic_write_identities(yaml_path, header, doc)
     return True
 

@@ -206,12 +206,22 @@ class _PairingNotifier:
             return
         pending, self._operator_pending = self._operator_pending, []
         lines = ["Pairing approval needed:"]
+        from .identities import IdentityResolver
+        def load_resolver():
+            resolver = IdentityResolver(self._config.home)
+            resolver.reload()
+            return resolver
+
+        resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
+            identity = resolver.identity(item["canonical"])
+            request_id = identity.pairing.request_id if identity and identity.pairing else None
             lines.append(
                 "- "
                 f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
                 f"- approve: mimir identities approve-pairing {item['canonical']}"
+                + (f" or approve {request_id} / decline {request_id}" if request_id else "")
             )
         try:
             await self._channels.send(
