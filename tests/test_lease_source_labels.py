@@ -965,6 +965,50 @@ def test_attested_forge_error_after_scope_resolution(tmp_path, monkeypatch):
     ).allowed
 
 
+@pytest.mark.parametrize("field,value", [
+    ("head_repo", "outsider/fork"),
+    ("head_remote", "upstream"),
+    ("canonical_origin", "https://github.com/outsider/repo.git"),
+    ("checkout_ref", "refs/pull/8/head"),
+])
+def test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value):
+    from langchain_core.tools import ToolException
+    from mimir.forge import ForgeError
+    from mimir.tools import forge
+
+    auth, scope, _, _, _ = _real_attested_lease(tmp_path)
+    # Keep the cached author verdict and authorization matched to this scope:
+    # only the producer's own-repository guard can reject this error.
+    object.__setattr__(scope, field, value)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = True
+    calls = []
+
+    def fail_diff(*_):
+        calls.append("get_diff")
+        raise ForgeError("misbound server failure")
+
+    monkeypatch.setattr(forge, "_scope", lambda *_: scope)
+    monkeypatch.setattr(forge, "_client", lambda *_: SimpleNamespace(
+        author_is_trusted=lambda *_: True, get_diff=fail_diff,
+    ))
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException, match="misbound server failure") as raised:
+            forge.pr_diff.func("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert calls == ["get_diff"]
+    assert provenance is None
+    labels = classify_protected_result(
+        "pr_diff", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_diff", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=raised.value,
+        provenance=provenance, failed=True,
+    )
+    assert labels.sources[0].integrity == "untrusted"
+    assert labels.has_untrusted_active_ingest
+
+
 def test_forge_error_before_scope_resolution_remains_untrusted(tmp_path, monkeypatch):
     from langchain_core.tools import ToolException
     from mimir.tools import forge
@@ -1029,6 +1073,103 @@ def test_ci_run_provenance_requires_protected_or_attested_head(
         result=result, provenance=provenance,
     )
     assert labels.sources[0].integrity == ("trusted" if trusted else "untrusted")
+
+
+@pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
+@pytest.mark.parametrize("failed", [False, True], ids=["success", "failure"])
+@pytest.mark.parametrize("mismatch", [
+    None, "resource_id", "principal", "domain", "bridge_instance", "sensitivity",
+    "authorized_principals", "source_kind", "integrity_effect", "integrity",
+])
+def test_ci_classifier_requires_exact_provenance(monkeypatch, tool_name, failed, mismatch):
+    from mimir.access_control import ProtectedResultProvenance
+
+    auth = _auth()
+    monkeypatch.setattr(access_control_module, "is_configured_github_repo", lambda *_: True)
+    if tool_name == "ci_recent_runs":
+        args = {"repository": "owner/repo", "branch": "main", "workflow_id": 7}
+        resource_id = "owner/repo#actions/runs?branch=main&workflow=7"
+        other_resource = "owner/repo#actions/runs?branch=other&workflow=8"
+    else:
+        args = {"repository": "owner/repo", "run_id": 42}
+        suffix = "/jobs" if tool_name == "ci_run_jobs" else ""
+        resource_id = f"owner/repo#actions/run/42{suffix}"
+        other_resource = f"owner/repo#actions/run/43{suffix}"
+    object.__setattr__(auth, "ci_run_targets", frozenset({("owner/repo", 42)}))
+    object.__setattr__(auth, "ci_branch_targets", frozenset({("owner/repo", "main", 7)}))
+    fields = dict(
+        principal="operator", domain="repository", resource_id=resource_id,
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({"operator"}), source_kind="protected_tool",
+        integrity_effect="active_ingest", integrity="trusted",
+    )
+    if mismatch is not None:
+        fields[mismatch] = {
+            "resource_id": other_resource, "principal": "different-operator",
+            "domain": "channel", "bridge_instance": "other-forge",
+            "sensitivity": "public", "authorized_principals": frozenset({"outsider"}),
+            "source_kind": "channel", "integrity_effect": "informational",
+            "integrity": "untrusted",
+        }[mismatch]
+    labels = classify_protected_result(
+        tool_name, args, auth,
+        ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True),
+        result={"ok": not failed},
+        provenance=ProtectedResultProvenance((SourceLabel(**fields),)), failed=failed,
+    )
+    source, = labels.sources
+    assert source.resource_id == resource_id
+    assert source.principal == "operator"
+    assert source.integrity == ("trusted" if mismatch is None else "untrusted")
+    assert labels.has_untrusted_active_ingest is (mismatch is not None)
+
+
+@pytest.mark.parametrize("field,value,guard", [
+    ("head_repo", "outsider/fork", "or scope.head_repo != scope.canonical_repo"),
+    ("head_remote", "upstream", 'or scope.head_remote != "origin"'),
+    ("canonical_origin", "https://github.com/outsider/repo.git",
+     "or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo"),
+    ("checkout_ref", "refs/pull/8/head",
+     'or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")'),
+])
+def test_temporary_forge_guard_mutants_are_killed(tmp_path, monkeypatch, field, value, guard):
+    import inspect
+    from mimir.tools import forge
+
+    source = inspect.getsource(forge._publish_scoped_error)
+    assert source.count(guard) == 1
+    namespace = dict(vars(forge))
+    exec(compile(source.replace(guard, "or False"), "<forge-guard-mutant>", "exec"), namespace)
+    from types import FunctionType
+    # Use the live module globals so the nested test's _scope/_client doubles
+    # reach the mutant too; a copied namespace would bypass those doubles.
+    mutant = FunctionType(namespace["_publish_scoped_error"].__code__, vars(forge))
+    monkeypatch.setattr(forge, "_publish_scoped_error", mutant)
+    with pytest.raises(AssertionError):
+        test_forge_error_rejects_misbound_scope(tmp_path, monkeypatch, field, value)
+
+
+@pytest.mark.parametrize("tool_name", ["ci_run", "ci_run_jobs", "ci_recent_runs"])
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("field", [
+    "resource_id", "principal", "domain", "bridge_instance", "sensitivity",
+    "authorized_principals", "source_kind", "integrity_effect", "integrity",
+])
+def test_temporary_ci_guard_mutants_are_killed(monkeypatch, tool_name, failed, field):
+    import inspect
+
+    source = inspect.getsource(access_control_module.classify_protected_result)
+    guard = (f'item.{field} == source.{field}' if field != "integrity"
+             else 'item.integrity == "trusted"')
+    # Mutate only the ci_* branch, not a later repository classifier branch.
+    prefix, rest = source.split('    if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:', 1)
+    assert prefix.count(guard) == 1
+    source = prefix.replace(guard, "True") + '    if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:' + rest
+    namespace = dict(vars(access_control_module))
+    exec(compile(source, "<ci-guard-mutant>", "exec"), namespace)
+    monkeypatch.setitem(globals(), "classify_protected_result", namespace["classify_protected_result"])
+    with pytest.raises(AssertionError):
+        test_ci_classifier_requires_exact_provenance(monkeypatch, tool_name, failed, field)
 
 
 def test_ci_jobs_api_error_after_run_attestation_keeps_turn_clean(tmp_path, monkeypatch):
