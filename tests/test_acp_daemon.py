@@ -929,10 +929,13 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     aborted = asyncio.Event()
     runner_completed = asyncio.Event()
     unrelated_completed = asyncio.Event()
+    ordering_violations: list[str] = []
 
     class AbortTransport(_Transport):
         def abort(self) -> None:
-            assert cancelled.is_set(), "abort must follow the cancellation grace period"
+            if not cancelled.is_set():
+                ordering_violations.append("abort must follow the cancellation grace period")
+            # Always release the resistant runner, even when ordering is wrong.
             super().abort()
             aborted.set()
 
@@ -967,6 +970,7 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     assert cancelled.is_set()
     assert aborted.is_set()
     assert runner_completed.is_set()
+    assert not ordering_violations, ordering_violations
     assert unrelated_completed.is_set()
     assert not daemon._connection_runners
     shutil.rmtree(home)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
@@ -86,15 +87,85 @@ _PYTEST_SUMMARY_HEADER = re.compile(r"^=+ short test summary info =+$")
 _PYTEST_SECTION_END = re.compile(r"^=+ .+ =+$")
 _PYTEST_COUNTS = re.compile(r"\b(\d+) (failed|errors?|passed|skipped)\b")
 _PYTEST_FINAL_LINE = re.compile(r"^=+ (.+) =+$")
+_PYTEST_QUIET_FINAL = re.compile(
+    r"(?:\d+ (?:failed|errors?|passed|skipped|deselected|xfailed|xpassed|warnings?)"
+    r"(?:, )?)+ in \d+(?:\.\d+)?s(?: \([^\r\n]*\))?"
+)
+_PYTEST_FAILING_BYTES = 4_096
 
 
-def pytest_failure_summary(stdout: bytes) -> dict[str, object]:
-    """Extract only numeric counts and bounded node ids from captured pytest output."""
+def pytest_node_inventory(root: Path) -> frozenset[str]:
+    """Read definitions from controller-owned source, never importing test code.
+
+    No symlink or hidden/cache tree is followed. Resource limits fail closed;
+    unsupported dynamic test definitions are omitted rather than trusted.
+    """
+    nodes: set[str] = set()
+    entries = 0
+    total_bytes = 0
+    try:
+        if root.is_symlink() or not root.is_dir():
+            return frozenset()
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.')
+                             and d not in {'node_modules', '__pycache__', 'venv', 'site-packages'}
+                             and not (Path(directory) / d).is_symlink())
+            entries += len(dirs) + len(files)
+            if entries > 100_000:
+                return frozenset()
+            for name in sorted(files):
+                if not (name.startswith('test_') or name.endswith('_test.py')) or not name.endswith('.py'):
+                    continue
+                path = Path(directory) / name
+                if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
+                    continue
+                size = path.stat().st_size
+                total_bytes += size
+                if size > 2_000_000 or total_bytes > 64_000_000:
+                    return frozenset()
+                relative = path.relative_to(root).as_posix()
+                try:
+                    tree = ast.parse(path.read_bytes())
+                except (SyntaxError, ValueError, UnicodeError):
+                    continue
+                for definition in tree.body:
+                    if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)) and definition.name.startswith('test'):
+                        nodes.add(f'{relative}::{definition.name}')
+                    elif isinstance(definition, ast.ClassDef) and definition.name.startswith('Test'):
+                        for method in definition.body:
+                            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)) and method.name.startswith('test'):
+                                nodes.add(f'{relative}::{definition.name}::{method.name}')
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(nodes)
+
+
+def validated_pytest_node(candidate: str, inventory: frozenset[str]) -> str | None:
+    """Remove parameter prose; only return a real leased-source definition."""
+    if _PYTEST_NODE_ID.fullmatch(candidate) is None:
+        return None
+    base, bracket, parameter = candidate.partition('[')
+    if bracket and (not parameter.endswith(']') or len(parameter[:-1]) > 64
+                    or '[' in parameter or ']' in parameter[:-1]):
+        return None
+    if base not in inventory:
+        return None
+    return base
+
+
+def pytest_failure_summary(
+    stdout: bytes, inventory: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Extract numeric observations and source-validated ids from untrusted output.
+
+    A plugin may forge sections/counts, so section position is not an attestation.
+    Only source definitions cross the boundary; counts remain observations.
+    """
     lines = stdout.decode("utf-8", errors="replace").splitlines()
     failing: list[str] = []
     dropped = 0
-    # Only the LAST short summary section is authoritative. A printed imitation
-    # elsewhere in the run cannot add ids unless it is inside that section.
+    # Read the last section, but validate every id against pre-execution source.
+    failing_bytes = 0
     starts = [i for i, line in enumerate(lines) if _PYTEST_SUMMARY_HEADER.fullmatch(line)]
     if starts:
         for line in lines[starts[-1] + 1:]:
@@ -103,18 +174,26 @@ def pytest_failure_summary(stdout: bytes) -> dict[str, object]:
             if line.startswith(("FAILED ", "ERROR ")):
                 # Pytest may append ' - reason'; never parse the reason as an id.
                 candidate = line.split(" ", 1)[1].split(" - ", 1)[0]
-                if _PYTEST_NODE_ID.fullmatch(candidate) is None:
+                node = validated_pytest_node(candidate, inventory)
+                if node is None:
                     dropped += 1
-                elif len(failing) < 50:
-                    failing.append(candidate)
+                elif node in failing:
+                    continue
+                elif len(failing) < 50 and failing_bytes + len(node) <= _PYTEST_FAILING_BYTES:
+                    failing.append(node)
+                    failing_bytes += len(node)
                 else:
                     dropped += 1
     counts: dict[str, int | None] = dict.fromkeys(("failed", "errors", "passed", "skipped"))
     for line in reversed(lines):
         match = _PYTEST_FINAL_LINE.fullmatch(line)
-        if match is None:
+        if match is not None:
+            text = match[1]
+        elif _PYTEST_QUIET_FINAL.fullmatch(line):
+            text = line
+        else:
             continue
-        found = _PYTEST_COUNTS.findall(match[1])
+        found = _PYTEST_COUNTS.findall(text)
         if found:
             for amount, kind in found:
                 if len(amount) <= 9:
@@ -625,6 +704,8 @@ class RepoProjectTests:
                 execution_started=exc.execution_started,
                 fixed_message=exc.fixed_message,
             ) from exc
+        # Capture controller source before any worker/plugin can execute.
+        node_inventory = pytest_node_inventory(root)
         scrubber = SensitiveMaterialScrubber(
             checkout=root,
             source_paths=(os.environ.get("MIMIR_HOME", ""),),
@@ -859,7 +940,7 @@ class RepoProjectTests:
                 False, code, result.exit_code, stdout, stderr,
                 command, command_source, **truncation,
                 git_context=_git_execution_context(),
-                failure_summary=(pytest_failure_summary(result.stdout) if code == "tests_failed" else None),
+                failure_summary=(pytest_failure_summary(result.stdout, node_inventory) if code == "tests_failed" else None),
             )
         # A non-default suite must not satisfy the existing default-test push gate.
         if not retained and not selectors and is_default:

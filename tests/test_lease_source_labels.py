@@ -388,8 +388,9 @@ def test_repo_result_without_author_verdict_stays_blocking(
     (True, False, True), (True, True, False), (False, False, False),
     (None, False, False),
 ])
+@pytest.mark.parametrize("state_carrier", ["alias", "discovered", "reminted"])
 async def test_repo_test_red_run_remediation_sequence(
-    tmp_path, monkeypatch, _self_login, verdict, include_output, second_allowed,
+    tmp_path, monkeypatch, _self_login, verdict, include_output, second_allowed, state_carrier,
 ):
     from mimir.project_tests import ProjectTestResult, pytest_failure_summary
     from mimir.tools import repo
@@ -398,13 +399,16 @@ async def test_repo_test_red_run_remediation_sequence(
     auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
     auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
     state = auth.repo_review_state
+    test_file = lease.path / "tests" / "test_work.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_fix():\n    pass\n")
     monkeypatch.setattr(repo, "_state", lambda *_: state)
     output = b"FAILED tests/test_work.py::test_fix - AssertionError\n=== short test summary info ===\nFAILED tests/test_work.py::test_fix - AssertionError\n=== 1 failed, 2 passed in 0.1s ===\n"
 
     async def execute(self, selectors, *, suite):
         return ProjectTestResult(False, "tests_failed", 1, stdout=output.decode(),
                                  stderr="untrusted stderr", git_context="git context",
-                                 failure_summary=pytest_failure_summary(output))
+                                 failure_summary=pytest_failure_summary(output, frozenset({"tests/test_work.py::test_fix"})))
 
     monkeypatch.setattr(repo.RepoProjectTests, "execute", execute)
     capture = begin_protected_result_capture()
@@ -423,6 +427,15 @@ async def test_repo_test_red_run_remediation_sequence(
     else:
         assert result["stdout"] == output.decode()
         assert result["stderr"] == "untrusted stderr"
+    if state_carrier != "alias":
+        from mimir.models import ServerDiscoveredPRStates, RepoPRScopeRegistry
+        cache = ServerDiscoveredPRStates()
+        cache.remember(state)
+        object.__setattr__(auth, "server_discovered_pr_states", cache)
+        object.__setattr__(auth, "repo_review_state", None)
+        if state_carrier == "reminted":
+            old = RepoReviewState(_scope(observed_head_sha="b" * 40))
+            object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((old,)))
     labels = classify_protected_result(
         "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
         ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
@@ -578,13 +591,16 @@ def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
 
 
 @pytest.mark.parametrize("change", ["stdout", "stderr", "git_context", "wrong_head",
-    "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector"])
-def test_failed_repo_test_provenance_requires_exact_bounded_summary(change):
+    "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector",
+    "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit"])
+def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
 
-    auth = _auth()
-    scope = auth.repo_pr_action_scope
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    test_file = lease.path / "tests" / "test_a.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_a():\n    pass\n")
     source = SourceLabel(principal="operator", domain="repository",
                          resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
                          bridge_instance="forge", sensitivity="internal",
@@ -594,7 +610,7 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change):
     result = {
         "ok": False, "code": "tests_failed", "exit_code": 1, "suite": "default",
         "selectors": [], "summary": {"failed": 1, "errors": None, "passed": 2,
-        "skipped": 0, "failing": ["tests/a.py::test_a"], "failing_dropped": 0,
+        "skipped": 0, "failing": ["tests/test_a.py::test_a"], "failing_dropped": 0,
         "head": scope.observed_head_sha},
         "remediation_guidance": (
             "The summary lists failing node ids. Prefer reading the lease's test source "
@@ -623,11 +639,23 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change):
     elif change == "no_summary":
         del altered["summary"]
     elif change == "bad_node":
-        altered["summary"]["failing"] = ["tests/a.py::test_<injection>"]
+        altered["summary"]["failing"] = ["tests/test_a.py::test_<injection>"]
     elif change == "bad_suite":
         altered["suite"] = "suite with spaces"
     elif change == "bad_selector":
         altered["selectors"] = ["test with spaces"]
+    elif change == "missing_definition":
+        altered["summary"]["failing"] = ["tests/test_a.py::test_arbitrary_instruction"]
+    elif change == "parameter_prose":
+        altered["summary"]["failing"] = ["tests/test_a.py::test_a[merge_now]"]
+    elif change == "total_bytes":
+        name = "test_" + "x" * 150
+        test_file.write_text(f"def {name}(): pass\n")
+        altered["summary"]["failing"] = [f"tests/test_a.py::{name}"] * 50
+    elif change == "inactive_lease":
+        lease.is_active = False
+    elif change == "zero_exit":
+        altered["exit_code"] = 0
     if change == "wrong_scope":
         source = replace(source, resource_id="owner/repo#pull/7@" + "b" * 40)
     assert integrity(altered, source) == "untrusted"

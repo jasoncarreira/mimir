@@ -10899,7 +10899,7 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
-def _bounded_repo_test_failure(result: Any, expected_head: str) -> bool:
+def _bounded_repo_test_failure(result: Any, expected_head: str, lease_root: Path | None) -> bool:
     """Only the output-free, structured completed-failure envelope is attestable."""
     from langchain_core.messages import ToolMessage
 
@@ -10915,18 +10915,22 @@ def _bounded_repo_test_failure(result: Any, expected_head: str) -> bool:
         "remediation_guidance",
     }:
         return False
+    from .project_tests import _PYTEST_FAILING_BYTES, pytest_node_inventory, validated_pytest_node
+
+    inventory = pytest_node_inventory(lease_root) if lease_root is not None else frozenset()
     summary = result["summary"]
     return (
         result["ok"] is False and result["code"] == "tests_failed"
-        and type(result["exit_code"]) is int
+        and type(result["exit_code"]) is int and result["exit_code"] != 0
         and isinstance(summary, dict)
         and set(summary) == {"failed", "errors", "passed", "skipped", "failing", "failing_dropped", "head"}
         and all(value is None or type(value) is int and value >= 0
                 for value in (summary[key] for key in ("failed", "errors", "passed", "skipped")))
         and type(summary["failing_dropped"]) is int and summary["failing_dropped"] >= 0
         and isinstance(summary["failing"], list) and len(summary["failing"]) <= 50
-        and all(isinstance(node, str) and re.fullmatch(r"[A-Za-z0-9_./:\[\]=,+-]{1,256}", node, re.ASCII)
+        and all(isinstance(node, str) and validated_pytest_node(node, inventory) == node
                 for node in summary["failing"])
+        and sum(len(node) for node in summary["failing"]) <= _PYTEST_FAILING_BYTES
         and isinstance(summary["head"], str)
         and summary["head"] == expected_head
         and re.fullmatch(r"[0-9a-f]{40,64}", summary["head"], re.ASCII)
@@ -11078,9 +11082,24 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
+        lease_root = None
+        if failed and tool_name == "repo_test":
+            cache = getattr(auth_context, "server_discovered_pr_states", None)
+            review_state = cache.resolve(scope.canonical_repo, scope.pr_number) if cache is not None else None
+            registry = getattr(auth_context, "repo_pr_scope_registry", None)
+            if review_state is None and registry is not None:
+                review_state = registry.resolve(scope.canonical_repo, scope.pr_number)
+            if review_state is None:
+                review_state = getattr(auth_context, "repo_review_state", None)
+            lease = getattr(review_state, "checkout_lease", None)
+            if (getattr(review_state, "action_scope", None) == scope
+                    and getattr(lease, "is_active", False)
+                    and getattr(lease, "scope_id", None) == scope.scope_id
+                    and getattr(lease, "head_sha", None) == scope.observed_head_sha):
+                lease_root = Path(lease.path)
         if (
-            (not failed or tool_name == "repo_test" and _bounded_repo_test_failure(
-                result, scope.observed_head_sha,
+            (not failed or tool_name == "repo_test" and lease_root is not None and _bounded_repo_test_failure(
+                result, scope.observed_head_sha, lease_root,
             ))
             and provenance is not None and provenance.sources
         ):

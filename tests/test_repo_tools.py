@@ -2676,7 +2676,8 @@ def test_pytest_failure_summary_is_bounded_and_uses_last_section_only():
         "FAILED injected text with spaces\n" + ids +
         "=== 55 failed, 1 error, 2 passed, 3 skipped in 0.2s ===\n"
     ).encode()
-    summary = pytest_failure_summary(output)
+    inventory = frozenset(f"tests/test_a.py::test_{i}" for i in range(55))
+    summary = pytest_failure_summary(output, inventory)
     assert summary == {
         "failed": 55, "errors": 1, "passed": 2, "skipped": 3,
         "failing": [f"tests/test_a.py::test_{i}" for i in range(50)],
