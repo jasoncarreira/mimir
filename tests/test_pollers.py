@@ -74,6 +74,9 @@ def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
     from mimir.repo_tools import _record_verified_push, was_verified_push
     from mimir.models import InformationFlowState
 
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
     old, pushed = "a" * 40, "c" * 40
     scope = RepoPRActionScope(
         provenance="poller_payload", canonical_repo="owner/repo", canonical_root="/unused",
@@ -102,6 +105,13 @@ def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
                        extra={"items": [item]})
     service = SimpleNamespace(authority_profile="github")
     assert access_control._repo_review_state_from_event(event, service) is None
+    assert events == [
+        ("github_stale_trigger_dropped", {
+            "stage": stage, "reason": "superseded_by_verified_own_push",
+        }) for stage in ("poller_fire", "scope_binding")
+    ]
+
+
 from mimir.access_control import (
     CapabilityTier,
     SinkGate,

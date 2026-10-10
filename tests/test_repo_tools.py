@@ -297,7 +297,9 @@ def _lineage_turn(scope, state, *, tainted=False):
     )
 
 
-@pytest.mark.parametrize("lineage", ["clean", "tainted", "missing", "unrecorded", "corrupt"])
+@pytest.mark.parametrize("lineage", [
+    "clean", "tainted", "tainted_flip", "tainted_base", "missing", "unrecorded", "corrupt",
+])
 def test_resumed_local_commit_requires_clean_producing_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lineage: str,
 ) -> None:
@@ -309,7 +311,7 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     _origin, _source, scope, first = _repo_scope_and_state(tmp_path)
     object.__setattr__(scope, "pull_request_author", scope.principal)
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(tmp_path / "leases"))
-    turn1 = _lineage_turn(scope, first, tainted=lineage == "tainted")
+    turn1 = _lineage_turn(scope, first, tainted=lineage.startswith("tainted"))
     lease = first.checkout_lease
     (lease.path / "tracked.txt").write_text("local remediation\n")
     RepoGitTools(first, auth_context=turn1, enforce=False).execute(
@@ -318,6 +320,27 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     head = _git(lease.path, "rev-parse", "HEAD")
     assert first.git_expected_head == head
     assert lease.head_sha == head != scope.observed_head_sha
+    if lineage in {"tainted_flip", "tainted_base"}:
+        from mimir.readonly_backend import FileToolRouter, WriteGuardBackend, build_file_tool_routes
+
+        home = tmp_path / "home"
+        home.mkdir()
+        router = FileToolRouter(
+            default=WriteGuardBackend(home, ["state"]),
+            routes=build_file_tool_routes([(str(lease.lease_root), "rw")]),
+        )
+        metadata_path = lease.path / _METADATA
+        before = metadata_path.read_text()
+        if lineage == "tainted_flip":
+            old, new = f'"{head}": false', f'"{head}": true'
+        else:
+            old, new = f'"{lease.base_sha}"', f'"{head}"'
+        # Real router, shadow enforcement, no SinkGate as a safety net.
+        assert turn1.enforcement_enabled is False
+        assert old in before
+        result = router.edit(str(metadata_path), old, new, replace_all=True)
+        assert "git_metadata_readonly" in result.error
+        assert metadata_path.read_text() == before
     if lineage in {"missing", "unrecorded", "corrupt"}:
         record = json.loads((lease.path / _METADATA).read_text())
         record["lineage"] = (
@@ -451,6 +474,51 @@ def test_rebase_onto_live_advanced_protected_base_stays_attested(tmp_path: Path)
     object.__setattr__(lease, "head_sha", foreign)
     (lease.path / _METADATA).write_text(json.dumps(record))
     assert not access_control._attested_pr_checkout_lease(turn, scope, lease)
+
+
+def test_rebase_refuses_non_descendant_protected_base(tmp_path: Path) -> None:
+    origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    _git(source, "checkout", "--orphan", "unrelated")
+    _git(source, "commit", "-qm", "unrelated root")
+    unrelated = _git(source, "rev-parse", "HEAD")
+    # Transfer the orphan commit before pointing the bare remote's main at it.
+    _git(origin, "fetch", str(source), "unrelated")
+    _git(origin, "update-ref", "refs/heads/main", unrelated)
+    before = state.git_expected_head
+    with pytest.raises(GitRefusal, match="does not descend") as error:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).execute(GitRebase())
+    assert error.value.code == "unverified_base"
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == before
+
+
+def test_rebase_refuses_unprotected_base_ref(tmp_path: Path) -> None:
+    _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    object.__setattr__(scope, "base_ref", "worklink/7")
+    with pytest.raises(GitRefusal, match="protected base") as error:
+        RepoGitTools(state, auth_context=_lineage_turn(scope, state)).execute(GitRebase())
+    assert error.value.code == "unverified_base"
+
+
+def test_lineage_refuses_attested_base_not_descending_from_observed(tmp_path: Path) -> None:
+    from mimir import access_control
+    from mimir.pr_checkout_lease import _METADATA, _metadata
+
+    _origin, source, scope, state = _repo_scope_and_state(tmp_path)
+    lease = state.checkout_lease
+    turn = _lineage_turn(scope, state)
+    (lease.path / "tracked.txt").write_text("clean fix\n")
+    RepoGitTools(state, auth_context=turn).execute(GitCommit(("tracked.txt",), "clean fix"))
+    _git(source, "checkout", "--orphan", "unrelated")
+    _git(source, "commit", "-qm", "unrelated root")
+    unrelated = _git(source, "rev-parse", "HEAD")
+    _git(lease.path, "fetch", str(source), "unrelated")
+    object.__setattr__(lease, "base_sha", unrelated)
+    object.__setattr__(lease, "verified_base_sha", unrelated)
+    (lease.path / _METADATA).write_text(json.dumps(_metadata(lease)))
+    # Isolate this guard: identity/patch-id checks cannot mask its removal.
+    assert not access_control._lease_has_clean_lineage(
+        lease.path, lease, scope, scope.observed_head_sha, state.git_expected_head,
+    )
 
 
 def test_fresh_lease_revert_refreshes_head_and_keeps_clean_lineage(tmp_path: Path) -> None:

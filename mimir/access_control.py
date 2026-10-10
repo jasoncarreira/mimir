@@ -1506,6 +1506,12 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
             if was_superseded_by_own_push(item["repo"], item["number"], item["head_sha"]):
                 # A queued event may outlive the poller fire that generated it.
                 # Never issue a stale authority even when it was already queued.
+                from .event_logger import log_event_sync
+
+                log_event_sync(
+                    "github_stale_trigger_dropped", stage="scope_binding",
+                    reason="superseded_by_verified_own_push",
+                )
                 continue
         scope = _repo_pr_scope(
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,

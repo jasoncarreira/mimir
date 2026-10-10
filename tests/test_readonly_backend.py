@@ -51,6 +51,55 @@ from mimir.readonly_backend import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [
+    "edit", "aedit", "write", "awrite", "replace", "areplace", "upload_files", "aupload_files",
+])
+@pytest.mark.parametrize("alias", ["direct", "symlink", "git_root"])
+async def test_router_git_metadata_is_hard_readonly(tmp_path, operation, alias, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    leases = tmp_path / "leases"
+    checkout = leases / "active"
+    metadata = checkout / ".git" / "mimir-pr-checkout-lease.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text('"sha": false\n')
+    target = metadata
+    root = leases
+    if alias == "symlink":
+        target = checkout / "alias.json"
+        target.symlink_to(metadata)
+    elif alias == "git_root":
+        root = metadata.parent
+    router = FileToolRouter(
+        default=WriteGuardBackend(home, ["state"]),
+        routes=build_file_tool_routes([(str(root), "rw")]),
+    )
+    auth = AuthContext(
+        principal="u", canonical_principal="u", roles=("user",), event_ingress=None,
+        trigger="user_message", channel_id="c", interactivity=None, enforcement_enabled=False,
+    )
+    events = []
+    monkeypatch.setattr("mimir.tools.budget_gate._emit_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
+    token = set_current_turn(SimpleNamespace(turn_id="shadow-git", auth_context=auth))
+    try:
+        if "edit" in operation:
+            args = (str(target), "false", "true")
+        elif "upload" in operation:
+            args = ([(str(target), b'"sha": true\n')],)
+        else:
+            args = (str(target), '"sha": true\n')
+        result = getattr(router, operation)(*args)
+        if operation.startswith("a"):
+            result = await result
+    finally:
+        reset_current_turn(token)
+    assert (result[0].error if isinstance(result, list) else result.error)
+    assert metadata.read_text() == '"sha": false\n'
+    assert any(fields.get("reason") == "git_metadata_readonly" for _, fields in events)
+
+
 class _ScandirEntries(AbstractContextManager):
     def __init__(self, entries):
         self._entries = entries
