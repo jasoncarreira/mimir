@@ -346,6 +346,51 @@ async def test_send_neutralizes_slack_broadcasts_in_text_and_nested_blocks(bridg
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit"])
+@pytest.mark.parametrize("broadcast_range", ["here", "channel", "everyone"])
+async def test_rich_text_group_mentions_are_inert_on_send_and_edit(
+    bridge_with_fake_app, operation, broadcast_range,
+):
+    from copy import deepcopy
+
+    bridge, _, sent = bridge_with_fake_app
+    safe_elements = [
+        {"type": "text", "text": "build passed"},
+        {"type": "user", "user_id": "U123"},
+        {"type": "channel", "channel_id": "C123"},
+        {"type": "link", "url": "https://example.com", "text": "link"},
+    ]
+    blocks = [{"type": "rich_text", "elements": [
+        {"type": "rich_text_section", "elements": [
+            {"type": "broadcast", "range": broadcast_range}, *safe_elements,
+        ]},
+        {"type": "rich_text_list", "style": "bullet", "elements": [
+            {"type": "rich_text_section", "elements": [
+                {"type": "usergroup", "usergroup_id": "S123"},
+            ]},
+        ]},
+    ]}]
+    original = deepcopy(blocks)
+    if operation == "send":
+        result = await bridge.send("slack-C01ABC", "build passed", blocks=blocks)
+        outgoing = sent[0]
+    else:
+        result = await bridge.edit_message(
+            "slack-C01ABC", "123.001", MessageUpdate(text="build passed", blocks=blocks),
+        )
+        outgoing = bridge._app._updates[0]
+    assert result.sent
+    elements = outgoing["blocks"][0]["elements"]
+    assert elements[0]["elements"] == [
+        {"type": "text", "text": "@broadcast"}, *safe_elements,
+    ]
+    assert elements[1]["elements"][0]["elements"] == [
+        {"type": "text", "text": "@subteam"},
+    ]
+    assert blocks == original
+
+
+@pytest.mark.asyncio
 async def test_send_slack_ordinary_text_is_unchanged(bridge_with_fake_app):
     bridge, _, sent = bridge_with_fake_app
     ordinary = "build passed for PR #2319 — see <https://github.com/x/y/pull/1|PR>"

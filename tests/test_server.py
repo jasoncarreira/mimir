@@ -629,6 +629,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
 @pytest.mark.parametrize("display,cleaned", [
     ("@everyone <@&123> [x](https://evil)", "everyone &123 xhttps://evil"),
     ("<!channel> <!subteam^S123|@devs>", "!channel !subteam^S123|devs"),
+    ("Alice\u202ediscord-999\u202c\u200b", "Alicediscord-999"),
 ])
 async def test_pairing_operator_alert_neutralizes_sender_display_name(
     monkeypatch: pytest.MonkeyPatch, alert_channel: str, display: str, cleaned: str,
@@ -658,6 +659,20 @@ async def test_pairing_operator_alert_neutralizes_sender_display_name(
         assert "mimir identities approve-pairing discord-123" in alert
     finally:
         await notifier.aclose()
+
+
+@pytest.mark.parametrize("codepoint", [
+    0x00AD, 0x061C, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F,
+    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
+    0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF,
+])
+def test_neutralize_display_name_strips_bidi_and_format_characters(codepoint):
+    import unicodedata
+    from mimir.bridges._mentions import neutralize_display_name
+
+    char = chr(codepoint)
+    assert unicodedata.category(char) == "Cf"
+    assert neutralize_display_name(f"Alice{char}discord-999") == "Alicediscord-999"
 
 
 def test_neutralize_display_name_removes_controls_collapses_spaces_and_caps_length():
