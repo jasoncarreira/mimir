@@ -1461,7 +1461,6 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
 ):
     cfg = replace(
         _make_config(tmp_path, access_control_enforced=False),
-        unauthorized_user_behavior="prompt-to-pair",
     )
     resolver = _resolver(tmp_path, "people: []\n")
     ran: list[str] = []
@@ -1489,7 +1488,7 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
         for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    assert any(row.get("type") == "inbound_pairing_prompted" for row in rows)
+    assert any(row.get("type") == "inbound_event_denied" for row in rows)
     assert not any(row.get("type") == "event_queued" for row in rows)
 
 
@@ -2602,3 +2601,231 @@ async def test_server_owned_source_bypasses_with_audit(tmp_path: Path):
     assert len(allowed) == 1
     assert allowed[0]["source"] == "api"
     assert allowed[0]["reason"] == "trusted_internal_source"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,delivery,mode", [
+    (platform, delivery, mode)
+    for platform in ("discord", "slack")
+    for delivery in ("dm", "channel")
+    for mode in ("pair", "ignore", "decline")
+])
+async def test_unknown_sender_policy_never_admits_or_pairs_other_modes(
+    tmp_path, monkeypatch, platform, delivery, mode,
+):
+    from mimir.bridges.base import SendResult
+
+    cfg = replace(_make_config(tmp_path), operator_alert_channel="dm-slack-OPS",
+                  pairing_dm_auto_reply_interval_seconds=0,
+                  pairing_operator_digest_delay_seconds=0)
+    resolver = _resolver(tmp_path, f"""people: []
+intake:
+  unknown_senders:
+    {platform}: {{dm: {mode}, channel: {mode}}}
+  decline_text: Fixed refusal
+""")
+    disp = Dispatcher(cfg, resolver=resolver)
+    logs = []
+    pairing = []
+    sends = []
+    ephemeral = []
+    resolved = []
+
+    class Bridge:
+        async def resolve_dm_channel(self, author_id):
+            resolved.append(author_id)
+            return "dm-discord-101"
+
+        async def send_ephemeral(self, channel_id, user_id, text):
+            ephemeral.append((channel_id, user_id, text))
+            return SendResult(sent=True)
+
+    class Channels:
+        def find(self, channel_id):
+            return Bridge()
+
+        async def send(self, channel_id, text, *, final=True):
+            sends.append((channel_id, text))
+            return SendResult(sent=True)
+
+    async def record(kind, **fields):
+        logs.append((kind, fields))
+
+    monkeypatch.setattr("mimir.dispatcher.log_event", record)
+    notifier = _PairingNotifier(cfg, Channels())
+    async def on_unknown(event, decision, selected):
+        if selected == "ignore":
+            await notifier.notify_ignored(canonical=decision.canonical_author,
+                                           platform=platform, delivery=delivery)
+        else:
+            await notifier.maybe_decline(canonical=decision.canonical_author,
+                platform=platform, delivery=delivery, channel_id=event.channel_id,
+                author_id=event.author_id, text=resolver.decline_text())
+
+    disp.set_on_pairing_required(lambda event, decision: _record_pairing(pairing, event))
+    disp.set_on_unknown_sender(on_unknown)
+    channel = ("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1"
+    event = AgentEvent(trigger="user_message", source=platform, channel_id=channel,
+                       author=f"{platform}-U1", author_id="U1", author_display="PRIVATE DISPLAY",
+                       content="PRIVATE CONTENT")
+    try:
+        assert disp.intake_admits(event) is False
+        assert await disp.enqueue(event) is False
+        assert await disp.enqueue(event) is False
+        assert disp._queues == {}
+        assert len(pairing) == (2 if mode == "pair" else 0)
+        if mode != "pair":
+            rows = [fields for kind, fields in logs if kind == f"inbound_unknown_sender_{'ignored' if mode == 'ignore' else 'declined'}"]
+            assert len(rows) == 2
+            assert all("PRIVATE" not in str(fields) for fields in rows)
+            await notifier._dm_reply_queue.join()
+            await notifier.flush_operator_alerts()
+            if mode == "ignore":
+                assert len(sends) == 1 and sends[0][0] == "dm-slack-OPS"
+                assert sends[0][1].count("ignored unknown sender") == 1
+            elif platform == "slack" and delivery == "channel":
+                assert ephemeral == [(channel, "U1", "Fixed refusal")]
+                assert sends == []
+            else:
+                assert sends == [(channel if delivery == "dm" else "dm-discord-101", "Fixed refusal")]
+                assert resolved == (["U1"] if delivery == "channel" else [])
+    finally:
+        await notifier.aclose()
+
+
+async def _record_pairing(calls, event):
+    calls.append(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,delivery", [("discord", "channel"), ("slack", "channel"), ("discord", "dm")])
+async def test_decline_failure_stays_private_and_denied(tmp_path, monkeypatch, platform, delivery):
+    from mimir.bridges.base import SendResult
+
+    cfg = replace(_make_config(tmp_path), pairing_dm_auto_reply_interval_seconds=0)
+    resolver = _resolver(tmp_path, f"people: []\nintake:\n  unknown_senders:\n    {platform}: {{dm: decline, channel: decline}}\n")
+    disp = Dispatcher(cfg, resolver=resolver)
+    rows = []
+    monkeypatch.setattr("mimir.server.log_event", lambda *a, **k: _record_failure(rows, *a, **k))
+
+    class Bridge:
+        async def resolve_dm_channel(self, author_id):
+            return None
+
+        async def send_ephemeral(self, channel_id, user_id, text):
+            return SendResult(sent=False)
+
+    class Channels:
+        def find(self, channel_id):
+            return Bridge()
+
+        async def send(self, *args, **kwargs):
+            return SendResult(sent=False)
+
+    notifier = _PairingNotifier(cfg, Channels())
+    async def on_unknown(event, decision, mode):
+        await notifier.maybe_decline(canonical=decision.canonical_author, platform=platform,
+            delivery=delivery, channel_id=event.channel_id, author_id=event.author_id,
+            text=resolver.decline_text())
+    disp.set_on_unknown_sender(on_unknown)
+    event = AgentEvent(trigger="user_message", source=platform,
+        channel_id=("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1",
+        author=f"{platform}-U1", author_id="U1", content="do not log me")
+    try:
+        assert not disp.intake_admits(event)
+        assert not await disp.enqueue(event)
+        await notifier._dm_reply_queue.join()
+        assert len(rows) == 1 and rows[0][0] == "inbound_decline_failed"
+        assert "do not log me" not in str(rows)
+    finally:
+        await notifier.aclose()
+
+
+async def _record_failure(rows, *args, **kwargs):
+    rows.append((args[0], kwargs))
+
+
+@pytest.mark.asyncio
+async def test_email_denial_ignores_configured_pair_or_decline(tmp_path, monkeypatch):
+    resolver = _resolver(tmp_path, """people: []
+intake:
+  unknown_senders:
+    default: {dm: decline, channel: pair}
+    email: {dm: pair, channel: decline}
+""")
+    disp = Dispatcher(_make_config(tmp_path), resolver=resolver)
+    pairing = []
+    unknown = []
+    events = []
+    async def observe(event, decision, mode):
+        unknown.append(mode)
+    async def record(kind, **fields):
+        events.append(kind)
+    monkeypatch.setattr("mimir.dispatcher.log_event", record)
+    disp.set_on_pairing_required(lambda event, decision: _record_pairing(pairing, event))
+    disp.set_on_unknown_sender(observe)
+    for channel in ("dm-email-D1", "email-C1"):
+        event = AgentEvent(trigger="user_message", source="email", channel_id=channel,
+                           author="email:unknown@example.test", author_id="unknown@example.test", content="private")
+        assert not disp.intake_admits(event)
+        assert not await disp.enqueue(event)
+    assert unknown == ["ignore", "ignore"]
+    assert pairing == [] and disp._queues == {}
+    assert events.count("inbound_unknown_sender_ignored") == 2
+
+
+def test_retired_unauthorized_env_only_warns_once(monkeypatch, caplog, tmp_path):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "not-an-option")
+    monkeypatch.setattr(Config, "_retired_intake_warned", False, raising=False)
+    with caplog.at_level("WARNING", logger="mimir.config"):
+        first = Config.from_env()
+        second = Config.from_env()
+    assert first.home == second.home == tmp_path
+    assert not hasattr(first, "unauthorized_user_behavior")
+    assert caplog.text.count("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired") == 1
+
+
+@pytest.mark.asyncio
+async def test_decline_interval_survives_worker_restart(tmp_path):
+    from mimir.bridges.base import SendResult
+
+    starts = []
+    class Channels:
+        async def send(self, channel_id, text, *, final=True):
+            starts.append(asyncio.get_running_loop().time())
+            return SendResult(sent=True)
+
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_interval_seconds=0.05), Channels())
+    try:
+        for name in ("discord-U1", "discord-U2"):
+            await notifier.maybe_decline(canonical=name, platform="discord", delivery="dm",
+                channel_id="dm-discord-101", author_id=name, text="Fixed refusal")
+            await notifier._dm_reply_queue.join()  # force a worker restart
+        assert len(starts) == 2
+        assert starts[1] - starts[0] >= 0.045
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_decline_refuses_public_destination_disguised_as_dm(tmp_path, monkeypatch):
+    from mimir.bridges.base import SendResult
+
+    sent = []
+    failures = []
+    class Channels:
+        async def send(self, channel_id, text, *, final=True):
+            sent.append(channel_id)
+            return SendResult(sent=True)
+
+    monkeypatch.setattr("mimir.server.log_event", lambda *a, **k: _record_failure(failures, *a, **k))
+    notifier = _PairingNotifier(_make_config(tmp_path), Channels())
+    try:
+        await notifier.maybe_decline(canonical="discord-U1", platform="discord", delivery="dm",
+            channel_id="discord-C1", author_id="U1", text="Fixed refusal")
+        await notifier._dm_reply_queue.join()
+        assert sent == []
+        assert len(failures) == 1 and failures[0][0] == "inbound_decline_failed"
+        assert failures[0][1]["reason"] == "invalid_destination"
+    finally:
+        await notifier.aclose()

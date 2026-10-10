@@ -482,15 +482,18 @@ async def create_agent_runtime(
                 channel_id = (event.channel_id or "").strip()
                 from .identities_populator import is_private_pairing_dm
 
-                is_dm = is_private_pairing_dm(platform, channel_id)
                 extra = getattr(event, "extra", None) or {}
-                if extra.get("channel_conversation_type") == "multi_user":
-                    is_dm = False
+                is_dm = is_private_pairing_dm(
+                    platform, channel_id,
+                    conversation_type=extra.get("channel_conversation_type"),
+                )
                 if not (
                     author
                     and platform in ("slack", "discord")
                     and channel_id
                 ):
+                    return
+                if core.identity_resolver.unknown_sender_mode(platform, "dm" if is_dm else "channel") != "pair":
                     return
                 from .event_logger import log_event
                 from .identities_populator import request_pairing_with_code
@@ -573,6 +576,26 @@ async def create_agent_runtime(
             except Exception:
                 log.debug("dm-pairing request failed")
 
+        async def on_unknown_sender(event: Any, decision: Any, mode: str) -> None:
+            canonical = getattr(decision, "canonical_author", None) or event.author or ""
+            platform = (event.source or "").strip().lower()
+            from .identities_populator import is_private_pairing_dm
+
+            delivery = "dm" if is_private_pairing_dm(
+                platform, event.channel_id,
+                conversation_type=event.extra.get("channel_conversation_type"),
+            ) else "channel"
+            if mode == "ignore":
+                await adapters.pairing_notifier.notify_ignored(
+                    canonical=canonical, platform=platform, delivery=delivery,
+                )
+            elif mode == "decline":
+                await adapters.pairing_notifier.maybe_decline(
+                    canonical=canonical, platform=platform, delivery=delivery,
+                    channel_id=event.channel_id, author_id=event.author_id or "",
+                    text=core.identity_resolver.decline_text(),
+                )
+
         async def on_session_idle(session: Any) -> None:
             from .event_logger import log_event
 
@@ -594,6 +617,7 @@ async def create_agent_runtime(
         adapters.dispatcher.set_notice_sender(send_notice)
         adapters.dispatcher.set_on_event(capture_dm_channel)
         adapters.dispatcher.set_on_pairing_required(request_dm_pairing)
+        adapters.dispatcher.set_on_unknown_sender(on_unknown_sender)
         sessions.set_on_idle(on_session_idle)
         sessions.set_is_busy(is_busy)
 
@@ -758,6 +782,7 @@ async def _cleanup_runtime(
         lambda: dispatcher.set_notice_sender(None),
         lambda: dispatcher.set_on_event(None),
         lambda: dispatcher.set_on_pairing_required(None),
+        lambda: dispatcher.set_on_unknown_sender(None),
     ]
     if sessions is not None:
         callback_resetters.extend(

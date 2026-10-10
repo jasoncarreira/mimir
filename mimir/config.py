@@ -1278,7 +1278,6 @@ class Config:
     # only logs the denial; ``prompt-to-pair`` logs an explicit pairing prompt
     # event without queueing a normal agent turn. DM denials always use the
     # pending-pairing path when access control is enforced.
-    unauthorized_user_behavior: str = "ignore"
     # Pairing notification/reply controls. Operator alerts are deduped by the
     # pending-pairing first-write edge and coalesced over this window. DM
     # auto-replies include a one-time code, are DM-only and globally rate-limited.
@@ -1341,6 +1340,9 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
+        if "MIMIR_UNAUTHORIZED_USER_BEHAVIOR" in os.environ and not getattr(cls, "_retired_intake_warned", False):
+            log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
+            cls._retired_intake_warned = True
         _configure_declared_repositories(home)
         if "MIMIR_FILE_OP_ROOTS" in os.environ:
             log.warning(
@@ -1471,9 +1473,6 @@ class Config:
             open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
 
             operator_alert_channel=_env("MIMIR_OPERATOR_ALERT_CHANNEL"),
-            unauthorized_user_behavior=_env(
-                "MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "ignore"
-            ),
             pairing_pending_max=_env_int("MIMIR_PAIRING_PENDING_MAX", 100),
             pairing_operator_digest_delay_seconds=_env_float(
                 "MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS", 1.0,

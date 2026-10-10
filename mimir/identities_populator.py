@@ -60,8 +60,12 @@ PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 _PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def is_private_pairing_dm(platform: str, channel_id: str) -> bool:
+def is_private_pairing_dm(
+    platform: str, channel_id: str, *, conversation_type: str | None = None,
+) -> bool:
     """Pairing is narrower than the cross-channel privacy filter (no MPIMs)."""
+    if conversation_type == "multi_user":
+        return False
     if platform == "slack":
         tail = channel_id.removeprefix("dm-slack-")
         return channel_id.startswith("dm-slack-D") and tail.isalnum()

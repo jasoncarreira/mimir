@@ -54,6 +54,10 @@ ALLOWLIST = {
                           # read to enforce the recursion cap, not operator-set.
 }
 
+# Only read to warn once at boot; retired and deliberately absent from the
+# operator configuration reference.
+RETIRED_KEYS = {"MIMIR_UNAUTHORIZED_USER_BEHAVIOR"}
+
 _ENV_ACCESSOR_HINT = "env"  # substring identifying env-reading helper callees
 # Double-underscore suffixes are namespace prefixes (for example
 # ``MIMIR_EXTRAS__``), not environment-variable names.
@@ -180,7 +184,7 @@ def _documented_names() -> set[str]:
 
 
 def test_every_core_env_var_is_documented():
-    missing = sorted(_scan_core() - _documented_names() - ALLOWLIST)
+    missing = sorted(_scan_core() - _documented_names() - ALLOWLIST - RETIRED_KEYS)
     assert not missing, (
         "Environment variables read by mimir core runtime but absent from "
         "docs/configuration.md. Add a table row there, or add it to ALLOWLIST "
@@ -189,11 +193,16 @@ def test_every_core_env_var_is_documented():
 
 
 def test_every_core_mimir_name_has_a_reference_entry():
-    missing = sorted(_scan_core_mimir_names() - _documented_names())
+    missing = sorted(_scan_core_mimir_names() - _documented_names() - RETIRED_KEYS)
     assert not missing, (
         "Exact MIMIR_* names reachable from core Python code but absent from "
         f"docs/configuration.md table entries: {missing}"
     )
+
+
+def test_retired_keys_only_remain_as_startup_warnings():
+    assert RETIRED_KEYS <= _scan_core_mimir_names()
+    assert RETIRED_KEYS.isdisjoint(_documented_names())
 
 
 def test_acp_journal_ttl_reference_contract():

@@ -146,11 +146,14 @@ class _PairingNotifier:
         self._operator_pending: list[dict[str, str]] = []
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
+        self._ignored_notified: set[str] = set()
         self._operator_unrouted: set[str] = set()
         self._operator_cap_notified = False
         self._dm_reply_sent: set[tuple[str, str]] = set()
-        self._dm_reply_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        self._decline_sent: set[str] = set()
+        self._dm_reply_queue: asyncio.Queue[tuple[str, ...]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
+        self._last_reply_started: float | None = None
 
     async def aclose(self) -> None:
         tasks = {
@@ -209,11 +212,21 @@ class _PairingNotifier:
         if self._operator_task is None or self._operator_task.done():
             self._operator_task = asyncio.create_task(self._flush_operator_later())
 
+    async def notify_ignored(self, *, canonical: str, platform: str, delivery: str) -> None:
+        if not canonical or canonical in self._ignored_notified:
+            return
+        if not (self._config.operator_alert_channel or "").strip():
+            return
+        self._ignored_notified.add(canonical)
+        self._operator_pending.append({"ignored": canonical, "platform": platform, "delivery": delivery})
+        if self._operator_task is None or self._operator_task.done():
+            self._operator_task = asyncio.create_task(self._flush_operator_later())
+
     async def flush_operator_alerts(self) -> None:
         if not self._operator_pending:
             return
         pending, self._operator_pending = self._operator_pending, []
-        lines = ["Pairing approval needed:"]
+        lines = ["Unknown sender intake:"]
         from .identities import IdentityResolver
         def load_resolver():
             resolver = IdentityResolver(self._config.home)
@@ -222,6 +235,12 @@ class _PairingNotifier:
 
         resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
+            if "ignored" in item:
+                lines.append(
+                    f"- ignored unknown sender {item['ignored']} on {item['platform']} "
+                    f"({item['delivery']}); to allow, approve-pairing or change intake policy"
+                )
+                continue
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
             identity = resolver.identity(item["canonical"])
             request_id = identity.pairing.request_id if identity and identity.pairing else None
@@ -328,13 +347,87 @@ class _PairingNotifier:
         if self._dm_reply_task is None or self._dm_reply_task.done():
             self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
 
+    async def maybe_decline(
+        self, *, canonical: str, platform: str, delivery: str,
+        channel_id: str, author_id: str, text: str,
+    ) -> None:
+        if not canonical or canonical in self._decline_sent:
+            return
+        # Refuse ambiguous/forged destinations before the send worker sees them.
+        from .identities_populator import is_private_pairing_dm
+
+        if platform not in {"discord", "slack"} or not author_id or not (
+            is_private_pairing_dm(platform, channel_id) if delivery == "dm"
+            else channel_id.startswith(f"{platform}-") or (
+                platform == "slack" and channel_id.startswith(("dm-slack-G", "dm-slack-C", "dm-slack-D"))
+            )
+        ):
+            await log_event(
+                "inbound_decline_failed", source=platform, channel_id=channel_id,
+                author_id=author_id, canonical_author=canonical, delivery=delivery,
+                reason="invalid_destination",
+            )
+            return
+        self._decline_sent.add(canonical)
+        await self._dm_reply_queue.put(("decline", canonical, platform, delivery, channel_id, author_id, text))
+        if self._dm_reply_task is None or self._dm_reply_task.done():
+            self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
+
+    async def _send_decline(self, item: tuple[str, ...]) -> None:
+        _, canonical, platform, delivery, channel_id, author_id, text = item
+        # Literal operator text, never interpreted as a platform mention.
+        from .bridges._mentions import neutralize_decline_text
+
+        text = neutralize_decline_text(platform, text)
+        reason = "delivery_failed"
+        try:
+            if delivery == "dm":
+                destination = channel_id
+                result = await self._channels.send(destination, text, final=True)
+            elif platform == "discord":
+                bridge = self._channels.find(channel_id)
+                destination = await bridge.resolve_dm_channel(author_id) if bridge else None
+                if not destination or not destination.startswith("dm-discord-"):
+                    reason = "dm_unavailable"
+                    raise RuntimeError(reason)
+                result = await self._channels.send(destination, text, final=True)
+            else:
+                bridge = self._channels.find(channel_id)
+                if bridge is None or not hasattr(bridge, "send_ephemeral"):
+                    reason = "bridge_unavailable"
+                    raise RuntimeError(reason)
+                result = await bridge.send_ephemeral(channel_id, author_id, text)
+            if not result.sent:
+                raise RuntimeError(reason)
+        except Exception:  # noqa: BLE001 — no sender content in failure logs
+            await log_event(
+                "inbound_decline_failed", source=platform, channel_id=channel_id,
+                author_id=author_id, canonical_author=canonical, delivery=delivery,
+                reason=reason,
+            )
+
     async def _dm_reply_worker(self) -> None:
         interval = max(
             0.0,
             float(self._config.pairing_dm_auto_reply_interval_seconds or 0.0),
         )
         while not self._dm_reply_queue.empty():
-            canonical, dm_channel_id, code = await self._dm_reply_queue.get()
+            # Apply the interval across worker restarts too: a new sender can
+            # arrive after the queue drained but before the cooldown elapsed.
+            now = asyncio.get_running_loop().time()
+            if interval and self._last_reply_started is not None:
+                remaining = self._last_reply_started + interval - now
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            self._last_reply_started = asyncio.get_running_loop().time()
+            item = await self._dm_reply_queue.get()
+            if item[0] == "decline":
+                try:
+                    await self._send_decline(item)
+                finally:
+                    self._dm_reply_queue.task_done()
+                continue
+            canonical, dm_channel_id, code = item
             from .identities_populator import prepare_pairing_code_delivery
 
             key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
@@ -382,8 +475,6 @@ class _PairingNotifier:
                             log.debug("pairing delivery cleanup unavailable")
                 finally:
                     self._dm_reply_queue.task_done()
-            if interval and not self._dm_reply_queue.empty():
-                await asyncio.sleep(interval)
 
 
 @dataclass(slots=True)

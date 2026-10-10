@@ -157,6 +157,43 @@ class AccessMetadata:
 
 
 _KNOWN_ACCESS_VALUES = {"user", "admin"}
+DEFAULT_DECLINE_TEXT = "Sorry, I only talk to approved users."
+_INTAKE_MODES = {"pair", "ignore", "decline"}
+_INTAKE_PLATFORMS = {"discord", "slack"}
+
+
+def _parse_intake(raw: object) -> tuple[dict[str, dict[str, str]], str]:
+    modes = {"default": {"dm": "pair", "channel": "pair"}}
+    if raw is None:
+        return modes, DEFAULT_DECLINE_TEXT
+    if not isinstance(raw, dict):
+        log.warning("identities.yaml: intake is not a map; using defaults")
+        return modes, DEFAULT_DECLINE_TEXT
+    for key in raw.keys() - {"unknown_senders", "decline_text"}:
+        log.warning("identities.yaml: unknown intake key %r", key)
+    text = raw.get("decline_text", DEFAULT_DECLINE_TEXT)
+    if not isinstance(text, str) or not text.strip():
+        log.warning("identities.yaml: invalid intake.decline_text; using default")
+        text = DEFAULT_DECLINE_TEXT
+    senders = raw.get("unknown_senders", {})
+    if not isinstance(senders, dict):
+        log.warning("identities.yaml: intake.unknown_senders is not a map")
+        return modes, text
+    for platform, slots in senders.items():
+        if platform != "default" and platform not in _INTAKE_PLATFORMS:
+            log.warning("identities.yaml: unknown intake platform %r", platform)
+            continue
+        if not isinstance(slots, dict):
+            log.warning("identities.yaml: intake.%s is not a map", platform)
+            continue
+        parsed = modes["default"].copy() if platform == "default" else {}
+        for slot, mode in slots.items():
+            if slot not in {"dm", "channel"} or not isinstance(mode, str) or mode not in _INTAKE_MODES:
+                log.warning("identities.yaml: invalid intake.%s.%s mode %r", platform, slot, mode)
+                continue
+            parsed[slot] = mode
+        modes[platform] = parsed
+    return modes, text
 
 
 @dataclass
@@ -235,6 +272,8 @@ class IdentityResolver:
         self._channel_alias_map: dict[str, str] = {}  # alias → canonical
         self._channel_display_names: dict[str, str] = {}
         self._channels: dict[str, Channel] = {}
+        self._intake_modes: dict[str, dict[str, str]] = {"default": {"dm": "pair", "channel": "pair"}}
+        self._decline_text = DEFAULT_DECLINE_TEXT
         # Credential loss or an unreadable credential source must not restore
         # the unauthenticated first-run mode.
         self._web_gate_latched = False
@@ -599,6 +638,9 @@ class IdentityResolver:
         self._channel_alias_map = channel_alias_map
         self._channel_display_names = channel_display_names
         self._channels = channels
+        self._intake_modes, self._decline_text = _parse_intake(
+            doc.get("intake") if isinstance(doc, dict) else None
+        )
         has_web_keys = any(
             alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in alias_map
         )
@@ -624,6 +666,20 @@ class IdentityResolver:
                 self._reload_unlocked()
                 self._identities_signature = signature
             return self._web_key_source_valid
+
+    def unknown_sender_mode(self, platform: str, delivery: str) -> str:
+        """Denial handling only; never grants admission. Email is always silent."""
+        if platform == "email":
+            return "ignore"
+        with self._lock:
+            self.reload_if_changed()
+            slot = "dm" if delivery == "dm" else "channel"
+            return self._intake_modes.get(platform, {}).get(slot, self._intake_modes["default"][slot])
+
+    def decline_text(self) -> str:
+        with self._lock:
+            self.reload_if_changed()
+            return self._decline_text
 
     def resolve(self, author: str | None) -> str | None:
         """Map ``author`` (a platform-prefixed id) to canonical. Unknown
