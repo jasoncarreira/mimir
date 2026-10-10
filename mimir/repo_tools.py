@@ -20,14 +20,16 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Iterator, Literal, Protocol, TypeAlias
+from typing import Any, Iterator, Literal, Protocol, TypeAlias
 import uuid
 from urllib.parse import urlsplit
 
 from .access_control import ToolFlowDirection, authorize_repo_pr_tool
 from .git_bootstrap import DEFAULT_USER_EMAIL, DEFAULT_USER_NAME
 from .models import RetainedFactoryScope, RepoPRAction, RepoPRActionScope, RepoReviewState
-from .pr_checkout_lease import PUBLISHED_HEAD_REF, _METADATA, _metadata
+from .pr_checkout_lease import (
+    PUBLISHED_HEAD_REF, _METADATA, _metadata, _recorded_lineage,
+)
 from .redaction import redact_text
 
 
@@ -56,6 +58,7 @@ _recent_agent_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict
 _recent_agent_pushes_lock = threading.Lock()
 _verified_pushes: OrderedDict[tuple[str, int, str, str], None] = OrderedDict()
 _verified_pushes_lock = threading.Lock()
+_ancestral_verified_pushes: OrderedDict[tuple[str, int, str], None] = OrderedDict()
 
 
 def _history_rewrite_push_permitted(scope: RepoPRActionScope) -> bool:
@@ -88,7 +91,10 @@ def was_agent_push(
         return key in _recent_agent_pushes
 
 
-def _record_verified_push(scope: RepoPRActionScope, previous_head: str, pushed_head: str) -> None:
+def _record_verified_push(
+    scope: RepoPRActionScope, previous_head: str, pushed_head: str, *,
+    fast_forward: bool = False,
+) -> None:
     key = (scope.canonical_repo.casefold(), scope.pr_number,
            previous_head.casefold(), pushed_head.casefold())
     with _verified_pushes_lock:
@@ -96,6 +102,10 @@ def _record_verified_push(scope: RepoPRActionScope, previous_head: str, pushed_h
         _verified_pushes.move_to_end(key)
         while len(_verified_pushes) > _RECENT_AGENT_PUSH_LIMIT:
             _verified_pushes.popitem(last=False)
+        if fast_forward:
+            _ancestral_verified_pushes[(key[0], key[1], key[2])] = None
+            while len(_ancestral_verified_pushes) > _RECENT_AGENT_PUSH_LIMIT:
+                _ancestral_verified_pushes.popitem(last=False)
 
 
 def was_verified_push(
@@ -106,6 +116,12 @@ def was_verified_push(
            previous_head.casefold(), current_head.casefold())
     with _verified_pushes_lock:
         return key in _verified_pushes
+
+
+def was_superseded_by_own_push(repository: str, pull_request: int, head: str) -> bool:
+    """Recognize only an ancestor displaced by a verified fast-forward push."""
+    with _verified_pushes_lock:
+        return (repository.casefold(), pull_request, head.casefold()) in _ancestral_verified_pushes
 
 _BASE_CONFIG = (
     "-c", "core.fsmonitor=",
@@ -492,6 +508,7 @@ class RepoGitTools:
         timeout: float = _DEFAULT_TIMEOUT_SECONDS,
         output_limit: int = _DEFAULT_OUTPUT_BYTES,
         enforce: bool = True,
+        auth_context: Any = None,
     ) -> None:
         if (review_state is None) == (retained_scope is None):
             raise ValueError("exactly one repository scope is required")
@@ -515,6 +532,7 @@ class RepoGitTools:
         self._timeout = timeout
         self._output_limit = output_limit
         self._enforce = enforce
+        self._auth_context = auth_context
         self._env = _sanitized_git_env()
         self._execution_started = False
         self._root = self._validate_lease()
@@ -789,6 +807,66 @@ class RepoGitTools:
         if self._state is not None:
             self._state.record_git_head(self._scope.scope_id, self._expected_head)
 
+    def _record_local_head(
+        self, previous: str, *, verified_base: str | None = None,
+        rewrite: bool = False,
+    ) -> None:
+        """Persist the actual new commits and the live turn's integrity verdict."""
+        if self._state is None or self._expected_head == previous:
+            return
+        from .access_control import _turn_has_untrusted_active_ingest
+
+        lease = self._state.checkout_lease
+        metadata_path = lease.path / _METADATA
+        try:
+            raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+                "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
+            )):
+                raise ValueError("lease metadata identity mismatch")
+            lineage = _recorded_lineage(raw)
+            # Older leases are resumable but their unrecorded commits cannot be
+            # promoted into clean history by a later operation.
+            if lineage is None:
+                lineage = {}
+            commits = self._command((
+                "rev-list", "--max-count=501", self._expected_head, "--not", previous,
+                *((verified_base or lease.base_sha,) if verified_base or lease.base_sha else ()), "--",
+            )).stdout.splitlines()
+            if len(commits) > 500 or (not commits and self._expected_head != (verified_base or lease.base_sha)):
+                raise ValueError("local commit range is missing or oversized")
+            clean = self._auth_context is not None and not _turn_has_untrusted_active_ingest(
+                self._auth_context, None,
+            )
+            if rewrite and previous != self._scope.observed_head_sha.lower():
+                prior = self._command((
+                    "rev-list", "--max-count=501", previous, "--not",
+                    self._scope.observed_head_sha, lease.base_sha, "--",
+                )).stdout.splitlines()
+                clean = clean and bool(prior) and len(prior) <= 500 and all(
+                    lineage.get(commit) is True for commit in prior
+                )
+            for commit in commits:
+                lineage[commit] = lineage.get(commit, True) and clean
+            advanced = replace(
+                lease, lineage=lineage, head_sha=self._expected_head,
+                base_sha=verified_base or lease.base_sha,
+                verified_base_sha=verified_base or lease.verified_base_sha,
+            )
+            staging = metadata_path.with_suffix(".tmp")
+            try:
+                staging.write_text(json.dumps(_metadata(advanced), sort_keys=True) + "\n", encoding="utf-8")
+                os.replace(staging, metadata_path)
+            finally:
+                staging.unlink(missing_ok=True)
+            object.__setattr__(lease, "lineage", lineage)
+            object.__setattr__(lease, "head_sha", self._expected_head)
+            if verified_base is not None:
+                object.__setattr__(lease, "base_sha", verified_base)
+                object.__setattr__(lease, "verified_base_sha", verified_base)
+        except (OSError, ValueError, TypeError) as exc:
+            raise GitRefusal("lineage_record_failed", "local commit lineage could not be recorded") from exc
+
     @staticmethod
     def _conflict_evidence(operation: GitRebase) -> tuple[str, str, str, str]:
         values = (
@@ -1059,10 +1137,13 @@ class RepoGitTools:
                     f"{_out_of_scope_paths_message(staged_after - set(paths))}; "
                     "include them in `paths`, or unstage them",
                 )
+            previous = self._expected_head
             result = self._command(("commit", "-m", operation.message), identity=True)
             self._refresh_expected_head()
+            self._record_local_head(previous)
         elif isinstance(operation, GitMerge):
             self._require("repo_merge", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            previous = self._expected_head
             try:
                 result = self._command(
                     ("merge", "--no-edit", "--", self._state.checkout_lease.base_sha),
@@ -1072,6 +1153,8 @@ class RepoGitTools:
                 # published PR head. Merge that immutable head too: recovery
                 # must offer a fast-forward path without granting rewrite authority.
                 self._refresh_expected_head()
+                self._record_local_head(previous)
+                previous = self._expected_head
                 publication_merge = self._command(
                     ("merge", "--no-edit", "--", self._scope.observed_head_sha),
                     identity=True,
@@ -1094,11 +1177,13 @@ class RepoGitTools:
                     f"Git output: {exc}",
                 ) from exc
             self._refresh_expected_head()
+            self._record_local_head(previous)
         elif isinstance(operation, GitMergeAbort):
             self._require("repo_merge_abort", RepoPRAction.WRITE)
             result = self._command(("merge", "--abort"))
         elif isinstance(operation, GitRebase):
             self._require("repo_rebase", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            previous = self._expected_head
             if not _history_rewrite_push_permitted(self._scope):
                 raise GitRefusal(
                     "rebase_in_lease_refused",
@@ -1107,6 +1192,25 @@ class RepoGitTools:
                     "and scoped published PR head, resolve any conflicts, then repo_push",
                 )
             continuing = self._has_in_progress_merge_or_rebase()
+            verified_base = None
+            if not continuing:
+                # A scope's base can move while the turn runs. Only the freshly
+                # fetched protected destination tip may become the rebase base.
+                if f"refs/heads/{self._scope.base_ref}" not in _PROTECTED_BRANCH_REFS:
+                    raise GitRefusal("unverified_base", "rebase requires a protected base")
+                self._command((
+                    "fetch", "--no-tags", "--no-recurse-submodules",
+                    self._scope.canonical_origin, f"refs/heads/{self._scope.base_ref}",
+                ), network=True)
+                verified_base = self._command((
+                    "rev-parse", "--verify", "FETCH_HEAD^{commit}",
+                )).stdout.strip().lower()
+                ancestry = self._raw((
+                    "merge-base", "--is-ancestor", self._scope.observed_base_sha,
+                    verified_base,
+                ))
+                if ancestry.returncode != 0 or ancestry.timed_out or ancestry.output_limited:
+                    raise GitRefusal("unverified_base", "protected base does not descend from scoped base")
             if continuing:
                 if self._scope.event_type != "pr_mergeability_conflicting":
                     raise GitRefusal("rebase_continue_refused", "this scope may not continue a rebase")
@@ -1128,9 +1232,10 @@ class RepoGitTools:
                 self._command(("commit", "--amend", "-m", evidence), identity=True)
             else:
                 result = self._command(
-                    ("rebase", "--", self._state.checkout_lease.base_sha), identity=True,
+                    ("rebase", "--", verified_base), identity=True,
                 )
             self._refresh_expected_head()
+            self._record_local_head(previous, verified_base=verified_base, rewrite=True)
             if continuing:
                 self._state.record_conflict_evidence(
                     self._scope.scope_id, self._expected_head,
@@ -1140,6 +1245,7 @@ class RepoGitTools:
             result = self._command(("rebase", "--abort"))
         elif isinstance(operation, GitRevert):
             self._require("repo_revert", RepoPRAction.WRITE, RepoPRAction.COMMIT)
+            previous = self._expected_head
             if not _SHA_RE.fullmatch(operation.commit):
                 raise GitRefusal("invalid_commit", "revert requires one full commit id")
             allowed = set(filter(None, self._command((
@@ -1149,6 +1255,7 @@ class RepoGitTools:
                 raise GitRefusal("invalid_revert_ancestry", "revert commit is outside head ^base")
             result = self._command(("revert", "--no-edit", operation.commit), identity=True)
             self._refresh_expected_head()
+            self._record_local_head(previous)
         elif isinstance(operation, GitRevertAbort):
             self._require("repo_revert_abort", RepoPRAction.WRITE)
             result = self._command(("revert", "--abort"))
@@ -1260,7 +1367,10 @@ class RepoGitTools:
                 # stay fixed; do not cache these objects as immutable head snapshots.
                 object.__setattr__(lease, "head_sha", self._expected_head)
                 object.__setattr__(self._scope, "observed_head_sha", self._expected_head)
-                _record_verified_push(self._scope, previous_head, self._expected_head)
+                _record_verified_push(
+                    self._scope, previous_head, self._expected_head,
+                    fast_forward=not rewritten_history,
+                )
             except GitRefusal as exc:
                 if exc.code == "git_failed":
                     raise GitRefusal(

@@ -55,6 +55,7 @@ from mimir.pollers import (
     _github_author_is_trusted,
     _github_content_author,
     _github_framework_trigger_is_trusted,
+    _drop_superseded_github_framework_items,
     _github_recovery_relevance_check,
     _kill_process_group,
     _parse_poller_authority,
@@ -65,6 +66,52 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
+
+
+def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir.repo_tools import _record_verified_push, was_verified_push
+    from mimir.models import InformationFlowState
+
+    events = []
+    monkeypatch.setattr("mimir.event_logger.log_event_sync",
+                        lambda kind, **fields: events.append((kind, fields)))
+    old, pushed = "a" * 40, "c" * 40
+    scope = RepoPRActionScope(
+        provenance="poller_payload", canonical_repo="owner/repo", canonical_root="/unused",
+        canonical_origin="https://github.com/owner/repo.git", principal="mimir-bot",
+        event_type="pr_ci_failure", allowed_operations=frozenset({RepoPRAction.INSPECT.value}),
+        pr_number=987654, head_repo="owner/repo", head_remote="origin",
+        destination_ref="refs/heads/issue-987654", observed_head_sha=old,
+        base_ref="main", observed_base_sha="b" * 40,
+    )
+    item = {"event_type": "pr_ci_failure", "repo": scope.canonical_repo,
+            "number": scope.pr_number, "head_sha": old}
+    batch = [{"prompt": "stale", "extras": item}]
+    assert _drop_superseded_github_framework_items(batch) == batch
+    # Simulates record_own_push after a push that verified the remote contains
+    # the new HEAD and proved the previous head an ancestor.
+    ifc = InformationFlowState()
+    ifc.record_own_push(scope.canonical_repo, scope.pr_number, old)
+    _record_verified_push(scope, old, pushed, fast_forward=True)
+    assert was_verified_push(scope.canonical_repo, scope.pr_number, old, pushed)
+    assert _drop_superseded_github_framework_items(batch) == []
+    current = {**item, "head_sha": pushed}
+    assert _drop_superseded_github_framework_items([{"prompt": "current", "extras": current}])
+
+    monkeypatch.setattr(access_control, "_repo_pr_scope", lambda **kwargs: scope)
+    event = AgentEvent(trigger="poller", channel_id="poller:github-activity",
+                       extra={"items": [item]})
+    service = SimpleNamespace(authority_profile="github")
+    assert access_control._repo_review_state_from_event(event, service) is None
+    assert events == [
+        ("github_stale_trigger_dropped", {
+            "stage": stage, "reason": "superseded_by_verified_own_push",
+        }) for stage in ("poller_fire", "scope_binding")
+    ]
+
+
 from mimir.access_control import (
     CapabilityTier,
     SinkGate,
