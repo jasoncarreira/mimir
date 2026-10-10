@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,19 @@ def _self_login(monkeypatch: pytest.MonkeyPatch):
     )
     yield real_head_check
 
+
+
+def _remember_inventory(lease, scope):
+    """Mirror the runner: capture the lease's test inventory before classification."""
+    from mimir.project_tests import pytest_node_inventory, remember_node_inventory
+
+    remember_node_inventory(lease.path, scope.scope_id, pytest_node_inventory(lease.path))
+
+
+def _recorded(lease, scope):
+    from mimir.project_tests import recorded_node_inventory
+
+    return recorded_node_inventory(lease.path, scope.scope_id)
 
 def _recorded_lease(
     root: Path,
@@ -405,6 +419,357 @@ def test_repo_result_without_author_verdict_stays_blocking(
     assert source.integrity == "untrusted"
     auth.ifc_state.merge(labels)
     assert auth.ifc_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verdict,include_output,second_allowed", [
+    (True, False, True), (True, True, False), (False, False, False),
+    (None, False, False),
+])
+@pytest.mark.parametrize("state_carrier", ["alias", "discovered", "reminted"])
+async def test_repo_test_red_run_remediation_sequence(
+    tmp_path, monkeypatch, _self_login, verdict, include_output, second_allowed, state_carrier,
+):
+    from mimir.project_tests import ProjectTestResult, pytest_failure_summary
+    from mimir.tools import repo
+
+    monkeypatch.setattr(access_control_module, "_lease_head_is_author_attested", _self_login)
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    auth.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
+    state = auth.repo_review_state
+    test_file = lease.path / "tests" / "test_work.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_fix():\n    pass\n")
+    _remember_inventory(lease, scope)
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+    output = b"FAILED tests/test_work.py::test_fix - AssertionError\n=== short test summary info ===\nFAILED tests/test_work.py::test_fix - AssertionError\n=== 1 failed, 2 passed in 0.1s ===\n"
+
+    async def execute(self, selectors, *, suite):
+        return ProjectTestResult(False, "tests_failed", 1, stdout=output.decode(),
+                                 stderr="untrusted stderr", git_context="git context",
+                                 failure_summary=pytest_failure_summary(output, frozenset({"tests/test_work.py::test_fix"})))
+
+    monkeypatch.setattr(repo.RepoProjectTests, "execute", execute)
+    capture = begin_protected_result_capture()
+    try:
+        result = await repo.repo_test.coroutine(
+            "owner/repo", 7, runtime=SimpleNamespace(context=auth),
+            include_output=include_output,
+        )
+    finally:
+        provenance = end_protected_result_capture(capture)
+    if not include_output:
+        assert set(result) == {"ok", "code", "exit_code", "suite", "selectors", "summary", "remediation_guidance"}
+        assert result["summary"]["failing"] == ["tests/test_work.py::test_fix"]
+        assert result["summary"]["head"] == scope.observed_head_sha
+        assert "stdout" not in result and "stderr" not in result and "git_context" not in result
+    else:
+        assert result["stdout"] == output.decode()
+        assert result["stderr"] == "untrusted stderr"
+    if state_carrier != "alias":
+        from mimir.models import ServerDiscoveredPRStates, RepoPRScopeRegistry
+        cache = ServerDiscoveredPRStates()
+        cache.remember(state)
+        object.__setattr__(auth, "server_discovered_pr_states", cache)
+        object.__setattr__(auth, "repo_review_state", None)
+        if state_carrier == "reminted":
+            old = RepoReviewState(_scope(observed_head_sha="b" * 40))
+            object.__setattr__(auth, "repo_pr_scope_registry", RepoPRScopeRegistry((old,)))
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=result, provenance=provenance,
+        failed=True,
+    )
+    assert labels.sources[0].integrity == ("trusted" if second_allowed else "untrusted")
+    auth.ifc_state.merge(labels)
+    assert auth.ifc_state.has_untrusted_active_ingest() is not second_allowed
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is second_allowed
+    if not second_allowed:
+        assert decision.reason == "repo_test_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,message,fixed", [
+    ("test_snapshot_unavailable", "project test snapshot is unavailable", True),
+    ("test_config_invalid", "project test command or environment contains a controller path", True),
+    ("test_stale_root_executor", "FAILED injected text with spaces", False),
+    ("test_stale_root_executor", "FAILED injected text with spaces", True),
+    ("inactive_checkout", "the checkout has no current HEAD", False),
+])
+async def test_repo_test_post_execution_refusal_labels(
+    tmp_path, monkeypatch, _self_login, code, message, fixed,
+):
+    from langchain_core.messages import ToolMessage
+    from mimir.project_tests import ProjectTestRefusal
+    from mimir.tools import repo
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    state = auth.repo_review_state
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+
+    safe = fixed and code != "test_stale_root_executor"
+
+    async def execute(self, selectors, *, suite):
+        raise ProjectTestRefusal(code, message, execution_started=True, fixed_message=fixed)
+
+    monkeypatch.setattr(repo.RepoProjectTests, "execute", execute)
+    capture = begin_protected_result_capture()
+    try:
+        with pytest.raises(Exception) as raised:
+            await repo.repo_test.coroutine("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(capture)
+    assert provenance is None
+    assert isinstance(raised.value, ToolPolicyRefusal) is safe
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope),
+        result=ToolMessage(content=f"Error: {raised.value}", tool_call_id="refusal", status="error"),
+        policy_refusal=raised.value if safe else None, failed=True,
+    )
+    assert (labels is None) is safe
+    if labels is not None:
+        auth.ifc_state.merge(labels)
+    decision = SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    )
+    assert decision.allowed is safe
+
+
+@pytest.mark.asyncio
+async def test_missing_selector_is_pre_execution_policy_refusal_and_allows_rerun(
+    tmp_path, monkeypatch,
+):
+    from mimir import project_tests
+    from mimir.tools import repo
+    from mimir.tools.refusals import ToolPolicyRefusal
+
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    state = auth.repo_review_state
+    monkeypatch.setattr(repo, "_state", lambda *_: state)
+
+    class Git:
+        execution_started = False
+
+        def __init__(self, *_args):
+            pass
+
+        def validated_checkout_root(self):
+            return lease.path
+
+    monkeypatch.setattr(project_tests, "RepoGitTools", Git)
+    object.__setattr__(scope, "allowed_operations", frozenset({"repo.test"}))
+    monkeypatch.setattr(project_tests, "_configured_command", lambda *_args: (
+        ("/usr/bin/true",), {}, "deployment", "default", True,
+    ))
+    with pytest.raises(ToolPolicyRefusal, match="test_selector_not_found"):
+        await repo.repo_test.coroutine(
+            "owner/repo", 7, selectors=("missing.py::test_case",),
+            runtime=SimpleNamespace(context=auth),
+        )
+    assert SinkGate.check_sink_flow(
+        "repo_test", f"owner/repo#pull/7@{scope.observed_head_sha}:{scope.scope_id}",
+        auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
+    ).allowed
+
+
+@pytest.mark.parametrize("tool_name", ["repo_fetch", "repo_push", "pr_metadata", "pr_files",
+    "pr_diff", "pr_file_content", "pr_job_log", "pr_checks", "pr_reviews", "pr_comments", "pr_review_requests", "pr_list",
+    "pr_submit_review", "pr_inline_review_comment", "pr_comment", "pr_edit_body"])
+def test_other_failed_repository_results_never_use_attested_provenance(tool_name):
+    auth = _auth()
+    scope = auth.repo_pr_action_scope
+    source = SourceLabel(principal="operator", domain="repository",
+                         resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
+                         bridge_instance="forge", sensitivity="internal",
+                         authorized_principals=frozenset({"operator"}),
+                         source_kind="protected_tool", integrity="trusted",
+                         integrity_effect="active_ingest")
+    from mimir.access_control import ProtectedResultProvenance
+    authorization = ToolAuthorization(tool_name=tool_name, decision="resource_scoped", allowed=True,
+                                      repo_pr_action_scope=scope)
+    arguments = {"repository": "owner/repo", "pull_request": 7}
+    result = {"ok": False, "code": "tests_failed", "summary": {}}
+    baseline = classify_protected_result(
+        tool_name, arguments, auth, authorization, result=result, failed=True,
+    )
+    labels = classify_protected_result(
+        tool_name, arguments, auth, authorization, result=result,
+        provenance=ProtectedResultProvenance((source,)), failed=True,
+    )
+    assert labels == baseline
+
+
+def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
+    from mimir.access_control import ProtectedResultProvenance
+
+    auth = _auth()
+    scope = auth.repo_pr_action_scope
+    source = SourceLabel(principal="operator", domain="repository",
+                         resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
+                         bridge_instance="forge", sensitivity="internal",
+                         authorized_principals=frozenset({"operator"}),
+                         source_kind="protected_tool", integrity="trusted",
+                         integrity_effect="active_ingest")
+    labels = classify_protected_result(
+        "pr_rerequest_review", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="pr_rerequest_review", decision="resource_scoped",
+                          allowed=True, repo_pr_action_scope=scope),
+        result={"ok": False}, provenance=ProtectedResultProvenance((source,)), failed=True,
+    )
+    # The pre-existing NONE-origin branch forwards native provenance verbatim.
+    assert labels.sources == (source,)
+
+
+@pytest.mark.parametrize("change", ["stdout", "stderr", "git_context", "wrong_head",
+    "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector",
+    "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit",
+    "non_ascii_node", "lease_head_moved", "inventory_not_recorded",
+    "inventory_not_recorded_empty_failing"])
+def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
+    from copy import deepcopy
+    from mimir.access_control import ProtectedResultProvenance
+
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    test_file = lease.path / "tests" / "test_a.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_a():\n    pass\n")
+    _remember_inventory(lease, scope)
+    source = SourceLabel(principal="operator", domain="repository",
+                         resource_id=f"owner/repo#pull/7@{scope.observed_head_sha}",
+                         bridge_instance="forge", sensitivity="internal",
+                         authorized_principals=frozenset({"operator"}),
+                         source_kind="protected_tool", integrity="trusted",
+                         integrity_effect="active_ingest")
+    result = {
+        "ok": False, "code": "tests_failed", "exit_code": 1, "suite": "default",
+        "selectors": [], "summary": {"failed": 1, "errors": None, "passed": 2,
+        "skipped": 0, "failing": ["tests/test_a.py::test_a"], "failing_dropped": 0,
+        "head": scope.observed_head_sha},
+        "remediation_guidance": (
+            "The summary lists failing node ids. Prefer reading the lease's test source "
+            "and rerunning selected ids. include_output=true reveals raw output, "
+            "marks the turn untrusted, and blocks further repo_test runs this turn."
+        ),
+    }
+    authz = ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                              repo_pr_action_scope=scope)
+
+    def integrity(payload, proof=source):
+        labels = classify_protected_result(
+            "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
+            authz, result=payload, provenance=ProtectedResultProvenance((proof,)), failed=True,
+        )
+        return labels.sources[0].integrity
+
+    assert integrity(result) == "trusted"
+    altered = deepcopy(result)
+    if change in {"stdout", "stderr", "git_context"}:
+        altered[change] = "network-derived text"
+    elif change == "wrong_head":
+        altered["summary"]["head"] = "b" * 40
+    elif change == "raw_code":
+        altered["code"] = "test_timeout"
+    elif change == "no_summary":
+        del altered["summary"]
+    elif change == "bad_node":
+        altered["summary"]["failing"] = ["tests/test_a.py::test_<injection>"]
+    elif change == "bad_suite":
+        altered["suite"] = "suite with spaces"
+    elif change == "bad_selector":
+        altered["selectors"] = ["test with spaces"]
+    elif change == "missing_definition":
+        altered["summary"]["failing"] = ["tests/test_a.py::test_arbitrary_instruction"]
+    elif change == "parameter_prose":
+        altered["summary"]["failing"] = ["tests/test_a.py::test_a[merge_now]"]
+    elif change == "total_bytes":
+        name = "test_" + "x" * 150
+        test_file.write_text(f"def {name}(): pass\n")
+        _remember_inventory(lease, scope)
+        altered["summary"]["failing"] = [f"tests/test_a.py::{name}"] * 50
+    elif change == "inactive_lease":
+        lease.is_active = False
+    elif change == "zero_exit":
+        altered["exit_code"] = 0
+    elif change == "non_ascii_node":
+        # A real definition whose path falls outside the node-id charset is
+        # still refused: the inventory alone does not admit arbitrary text.
+        (lease.path / "tests" / "test_b c.py").write_text("def test_b():\n    pass\n")
+        _remember_inventory(lease, scope)
+        assert "tests/test_b c.py::test_b" in _recorded(lease, scope)
+        altered["summary"]["failing"] = ["tests/test_b c.py::test_b"]
+    elif change == "lease_head_moved":
+        lease.head_sha = "c" * 40
+    elif change == "inventory_not_recorded":
+        from mimir import project_tests
+        project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
+    elif change == "inventory_not_recorded_empty_failing":
+        # Empty ``failing`` must not pass vacuously when no run recorded an inventory.
+        from mimir import project_tests
+        project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
+        altered["summary"]["failing"] = []
+    if change == "wrong_scope":
+        source = replace(source, resource_id="owner/repo#pull/7@" + "b" * 40)
+    assert integrity(altered, source) == "untrusted"
+
+
+@pytest.mark.asyncio
+async def test_repo_test_scope_resolution_fault_publishes_no_attestation(monkeypatch):
+    from langchain_core.tools import ToolException
+    from mimir.tools import repo
+
+    def no_state(*_args):
+        raise ToolException("scope unavailable")
+
+    monkeypatch.setattr(repo, "_state", no_state)
+    token = begin_protected_result_capture()
+    try:
+        with pytest.raises(ToolException):
+            await repo.repo_test.coroutine("owner/repo", 7)
+    finally:
+        provenance = end_protected_result_capture(token)
+    assert provenance is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["test_timeout", "test_output_overflow", "tests_failed_output_overflow", "tests_passed"])
+async def test_repo_test_non_summary_results_keep_original_shape(tmp_path, monkeypatch, code):
+    from dataclasses import asdict
+    from mimir.project_tests import ProjectTestResult
+    from mimir.tools import repo
+
+    auth, scope, lease, _, _ = _real_attested_lease(tmp_path)
+    monkeypatch.setattr(repo, "_state", lambda *_: auth.repo_review_state)
+    original = ProjectTestResult(code == "tests_passed", code, 0 if code == "tests_passed" else 1,
+                                 stdout="raw stdout", stderr="raw stderr", git_context="git")
+
+    async def execute(self, selectors, *, suite):
+        return original
+
+    monkeypatch.setattr(repo.RepoProjectTests, "execute", execute)
+    token = begin_protected_result_capture()
+    try:
+        returned = await repo.repo_test.coroutine("owner/repo", 7, runtime=SimpleNamespace(context=auth))
+    finally:
+        provenance = end_protected_result_capture(token)
+    expected = asdict(original)
+    expected.pop("failure_summary")
+    assert {key: value for key, value in returned.items() if key != "remediation_guidance"} == expected
+    labels = classify_protected_result(
+        "repo_test", {"repository": "owner/repo", "pull_request": 7}, auth,
+        ToolAuthorization(tool_name="repo_test", decision="resource_scoped", allowed=True,
+                          repo_pr_action_scope=scope), result=returned, provenance=provenance,
+        failed=code != "tests_passed",
+    )
+    assert labels.sources[0].integrity == ("trusted" if code == "tests_passed" else "untrusted")
 
 
 @pytest.mark.parametrize("verdict", [True, False, None])
