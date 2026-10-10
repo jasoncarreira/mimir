@@ -37,6 +37,7 @@ from mimir.access_control import (
     ChannelResourceAdapter,
     SinkGate,
     build_scheduled_tick_service_principal,
+    ensure_turn_scratch,
 )
 from mimir.agent import (
     Agent,
@@ -151,6 +152,7 @@ async def test_parallel_loaders_preserve_serial_prompt_and_provenance_order(
     )
     ctx = _make_ctx(event)
     ctx.auth_context = replace(ctx.auth_context, roles=("admin",))
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
     auth = ctx.auth_context
     blocks = {
         name: _domain_block(name.upper(), name)
@@ -820,6 +822,7 @@ async def test_build_turn_prompt_routes_synthesis_to_dedicated_template(
         ifc_labels=_session_labels("ch-3"),
     )
     ctx = _make_ctx(event, saga_session_id="sess-xyz")
+    ctx.turn_scratch_path = ensure_turn_scratch(tmp_path, ctx.turn_id)
     turn_prompt, recent = await agent._build_turn_prompt(
         ctx, event, saga_block=None,
     )
@@ -2188,6 +2191,9 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         ("context_boundary", "mimir/agent.py", "Agent.__init__", "ServerChannelAudienceProvider"): 1,
         ("context_boundary", "mimir/agent.py", "Agent.run_turn", "create_auth_context"): 1,
         ("context_boundary", "mimir/agent.py", "_create_turn_auth_context", "create_auth_context"): 1,
+        # Test-only helper exercises emitted poller trust verdicts through the
+        # registered-service ingress; it does not add a production boundary.
+        ("context_boundary", "mimir/optional-skills/github-poller/tests/test_github_poller_pr_scope_snapshot.py", "_framework_scope_from", "access_control.create_auth_context"): 1,
         ("context_rescope", "mimir/acp/agent.py", "MimirAcpAgent._auth_context_for", "replace"): 1,
         ("context_factory", "mimir/access_control.py", "create_auth_context", "AuthContext"): 1,
         # Added on main while this branch was diverged: the saga_session_end
@@ -2230,6 +2236,8 @@ def test_channel_bearing_source_inventory_is_closed() -> None:
         # _publish_trusted_projection delegates to this producer; it no longer
         # constructs a separate SourceLabel after a cached author verdict.
         ("producer", "mimir/tools/forge.py", "_publish_author_attestation", "SourceLabel"): 1,
+        ("producer", "mimir/tools/forge.py", "_attest_ci_runs", "SourceLabel"): 1,
+        ("producer", "mimir/tools/forge.py", "pr_list", "SourceLabel"): 1,
         # Retained remediation results preserve their exact factory authority.
         ("producer", "mimir/tools/repo.py", "_publish_retained_result", "SourceLabel"): 1,
         # PR checkout reads inherit exact-scope author attestation.

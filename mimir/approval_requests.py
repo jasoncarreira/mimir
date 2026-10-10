@@ -181,6 +181,9 @@ def resolve(
                     return Resolution("already_resolved", message=f"already resolved {named_id}")
                 return Resolution("no_pending_request", message=f"no pending request {named_id}")
         else:
+            # Pairings require an explicit named ID; exclude them before both
+            # reply-reference selection and single/ambiguous candidate checks.
+            entries = [entry for entry in entries if entry.kind != "pair"]
             reference = event.extra.get("reply_to_message_id") if event.source == "discord" else None
             referenced = next((e for e in entries if reference is not None
                                and e.prompt_message_id == str(reference)), None)
@@ -195,6 +198,8 @@ def resolve(
                 return Resolution("no_pending_request")
         if edit is not None and not entry.supports_edits:
             return Resolution("not_an_approval_response")
+        if entry.kind == "pair" and named_id is None:
+            return Resolution("no_pending_request", message="specify a pair-xxxx request id")
         _PENDING.pop(entry.approval_id)
         _RECENT[entry.approval_id] = (now + _RECENT_SECONDS, entry.channel_id)
     status = entry.resolver(decision.lower(), edit, event, identity_resolver, now,

@@ -30,6 +30,14 @@ def neutralize_slack_broadcasts(text: str) -> str:
         text = cleaned
 
 
+def neutralize_decline_text(platform: str, text: str) -> str:
+    """Fixed refusals must not activate even individual user mentions."""
+    if platform == "slack":
+        return neutralize_slack_broadcasts(text).replace("<", "&lt;")
+    # Discord delivery additionally uses the bridge's shared AllowedMentions.
+    return text.replace("@", "@\u200b")
+
+
 def neutralize_slack_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Copy Block Kit payloads, neutralizing group mentions at any depth."""
 

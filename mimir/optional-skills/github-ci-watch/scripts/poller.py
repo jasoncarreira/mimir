@@ -244,7 +244,7 @@ def _check_repo(repo: str, seen: dict[str, dict]) -> None:
             "--repo", repo,
             "--branch", BRANCH,
             "--limit", str(limit),
-            "--json", "databaseId,status,conclusion,name,workflowName,createdAt,url,headSha,workflowDatabaseId",
+            "--json", "databaseId,status,conclusion,name,workflowName,createdAt,url,headSha,workflowDatabaseId,event",
         )
         if runs is None:
             return
@@ -289,6 +289,12 @@ def _check_repo(repo: str, seen: dict[str, dict]) -> None:
             continue
         if run_id in alerted:
             continue  # already reported
+
+        # pull_request_target runs execute on the protected branch while using
+        # outsider PR input. The branch selector alone does not exclude them.
+        # dynamic covers repository-owned Dependabot/Dependency Graph runs.
+        if run.get("event") not in {"push", "schedule", "workflow_dispatch", "dynamic"}:
+            continue
 
         if conclusion == "cancelled" and classify_cancelled_run(run, runs) in {
             "SUPERSEDED", "OVERTAKEN_BY_SUCCESS",

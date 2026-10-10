@@ -52,6 +52,7 @@ import yaml
 
 from .event_logger import log_event, log_event_sync
 from .identities import WEB_KEY_ALIAS_PREFIX, hash_web_key, web_key_labels
+from .approval_requests import mint_id
 
 log = logging.getLogger(__name__)
 
@@ -59,8 +60,12 @@ PairingRequestStatus = Literal["changed", "unchanged", "capped"]
 _PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def is_private_pairing_dm(platform: str, channel_id: str) -> bool:
+def is_private_pairing_dm(
+    platform: str, channel_id: str, *, conversation_type: str | None = None,
+) -> bool:
     """Pairing is narrower than the cross-channel privacy filter (no MPIMs)."""
+    if conversation_type == "multi_user":
+        return False
     if platform == "slack":
         tail = channel_id.removeprefix("dm-slack-")
         return channel_id.startswith("dm-slack-D") and tail.isalnum()
@@ -97,8 +102,15 @@ def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
         access["roles"] = roles
         match["access"] = access
         changed = True
+    # An explicit operator grant takes ownership even if the roles are unchanged.
+    for key in ("source", "granted_by", "revoked_at"):
+        if key in access:
+            del access[key]
+            changed = True
     pairing = match.get("pairing")
     if isinstance(pairing, dict):
+        if pairing.pop("request_id", None) is not None:
+            changed = True
         if pairing.get("status") != "approved":
             pairing["status"] = "approved"
             pairing["approved_at"] = datetime.now(timezone.utc).isoformat()
@@ -259,6 +271,68 @@ def _serialized_identities_write(fn):
                     _IDENTITIES_HELD_LOCKS.paths = held
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     return _wrapper
+
+
+# Role admission cannot select an access tier from the operator's grant row.
+DISCORD_ADMISSION_ROLES = ["user"]
+
+
+@_serialized_identities_write
+def grant_role_admission(
+    home: Path, author: str, guild_id: str, role_id: str,
+    *, roles: Sequence[str] = ("user",),
+) -> tuple[bool, str | None]:
+    """Persist a Discord-only user grant; return (changed, canonical)."""
+    if list(roles) != DISCORD_ADMISSION_ROLES:
+        raise ValueError("Discord role admission can only grant user access")
+    if not author or not author.startswith("discord-") or not author[8:].isdigit():
+        return False, None
+    path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(path)
+    people = doc["people"]
+    entry = _find_person(people, author)
+    if entry is None:
+        entry = {"canonical": author, "aliases": [author]}
+        people.append(entry)
+    else:
+        access = entry.get("access")
+        if not isinstance(access, dict) or access.get("source") != "discord_role" or "admin" in (access.get("roles") or []):
+            return False, None
+    access = entry.get("access") if isinstance(entry.get("access"), dict) else {}
+    desired = {"roles": list(DISCORD_ADMISSION_ROLES), "source": "discord_role",
+               "granted_by": {"guild_id": guild_id, "role_id": role_id}}
+    changed = any(access.get(key) != value for key, value in desired.items()) or "revoked_at" in access
+    aliases = entry.get("aliases")
+    if not isinstance(aliases, list):
+        aliases = []
+    if author not in aliases:
+        entry["aliases"] = [*aliases, author]
+        changed = True
+    if not changed:
+        return False, str(entry["canonical"])
+    access.update(desired)
+    access.pop("revoked_at", None)
+    entry["access"] = access
+    _atomic_write_identities(path, header, doc)
+    return True, str(entry["canonical"])
+
+
+@_serialized_identities_write
+def revoke_role_admission(home: Path, author: str) -> tuple[bool, str | None]:
+    """Revoke only a still-bridge-managed grant, retaining its person record."""
+    path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(path)
+    entry = _find_person(doc["people"], author)
+    access = entry.get("access") if entry else None
+    if not isinstance(access, dict) or access.get("source") != "discord_role" or "admin" in (access.get("roles") or []):
+        return False, None
+    canonical = str(entry["canonical"])
+    if access.get("roles") == [] and access.get("revoked_at"):
+        return False, canonical
+    access["roles"] = []
+    access["revoked_at"] = datetime.now(timezone.utc).isoformat()
+    _atomic_write_identities(path, header, doc)
+    return True, canonical
 
 
 def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
@@ -812,6 +886,10 @@ def request_pairing_with_code(
     pairing = match.get("pairing")
     if not isinstance(pairing, dict):
         pairing = {}
+    if pairing.get("status") == "rejected":
+        # Rejection is durable until an operator explicitly approves or removes
+        # this identity. In particular, never mint another DM code on contact.
+        return "unchanged", None
     requested_at = datetime.now(timezone.utc).isoformat()
     pending = {
         "status": "pending",
@@ -824,10 +902,24 @@ def request_pairing_with_code(
     if is_dm:
         pending["dm_channel"] = channel_id
     if pairing.get("status") != "pending":
+        existing_ids = frozenset(
+            p["pairing"]["request_id"] for p in people
+            if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+            and isinstance(p["pairing"].get("request_id"), str)
+        )
+        pending["request_id"] = mint_id("pair", excluded=existing_ids)
         pairing.update(pending)
         match["pairing"] = pairing
         changed = True
     else:
+        if not isinstance(pairing.get("request_id"), str):
+            existing_ids = frozenset(
+                p["pairing"]["request_id"] for p in people
+                if isinstance(p, dict) and isinstance(p.get("pairing"), dict)
+                and isinstance(p["pairing"].get("request_id"), str)
+            )
+            pairing["request_id"] = mint_id("pair", excluded=existing_ids)
+            changed = True
         # Keep the first requested_at for audit stability; refresh only facts
         # that can be corrected by the bridge layer.
         for key in ("platform", "author", "channel", "delivery", "dm_channel"):
@@ -892,6 +984,8 @@ def approve_pairing(
     author_or_canonical: str,
     *,
     roles: Iterable[str] = ("user",),
+    pending_only: bool = False,
+    request_id: str | None = None,
 ) -> bool:
     """Approve a pending identity by granting canonical-level access roles.
 
@@ -912,10 +1006,34 @@ def approve_pairing(
     match = _find_person(people, key)
     if match is None:
         return False
+    pairing = match.get("pairing")
+    if pending_only and (not isinstance(pairing, dict) or pairing.get("status") != "pending"):
+        return False
+    if request_id is not None and (not isinstance(pairing, dict) or pairing.get("request_id") != request_id):
+        return False
 
     if not _approve_entry(match, clean_roles):
         return False
     doc["people"] = people
+    _atomic_write_identities(yaml_path, header, doc)
+    return True
+
+
+@_serialized_identities_write
+def reject_pairing(home: Path, canonical: str, *, request_id: str | None = None) -> bool:
+    """Reject a pending pairing without granting roles or reopening on contact."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_yaml(yaml_path)
+    match = _find_person(doc.get("people") or [], canonical.strip())
+    pairing = match.get("pairing") if match else None
+    if not isinstance(pairing, dict) or pairing.get("status") != "pending":
+        return False
+    if request_id is not None and pairing.get("request_id") != request_id:
+        return False
+    pairing["status"] = "rejected"
+    pairing["rejected_at"] = datetime.now(timezone.utc).isoformat()
+    pairing.pop("request_id", None)
+    _clear_pairing_code(pairing)
     _atomic_write_identities(yaml_path, header, doc)
     return True
 

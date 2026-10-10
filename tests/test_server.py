@@ -25,6 +25,7 @@ import inspect
 import json
 import logging
 import os
+import signal
 import shutil
 import sys
 import tempfile
@@ -35,8 +36,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import ClientSession, web
 from tests.timing import HANG_GUARD_SECONDS
-from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from mimir.server import (
@@ -53,7 +54,167 @@ from mimir.server import (
     _handle_root,
     build_app,
     reattach_inflight_worklink_runs,
+    _http_runner,
+    _record_shutdown_signal,
 )
+
+
+@pytest.mark.asyncio
+async def test_real_http_shutdown_closes_all_sse_before_marker(tmp_path, monkeypatch, caplog):
+    """Three real SSE handlers must release aiohttp before graceful cleanup."""
+    from mimir import web_ui
+    from mimir.bridges.web_chat import WebChatBridge as RealWebChatBridge
+    from mimir.http_shutdown import HTTP_SHUTDOWN
+    from mimir.turn_event_bus import TurnEventBus
+
+    real_routes = web_ui.register_routes
+    controlled, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(controlled)
+    app = web.Application()
+    app[HTTP_SHUTDOWN] = controlled[HTTP_SHUTDOWN]
+    real_routes(app, turns_log=tmp_path / "turns.jsonl",
+                events_log=tmp_path / "events.jsonl", turn_event_bus=TurnEventBus())
+
+    @web.middleware
+    async def identity(request, handler):
+        request["auth_identity"] = SimpleNamespace(canonical="alice", display_name="Alice")
+        return await handler(request)
+
+    app.middlewares.append(identity)
+    chat = RealWebChatBridge(enqueue=AsyncMock(return_value=True), home=tmp_path)
+    chat.register_routes(app)
+    # These are the actual build_app lifecycle hooks, shared with the app-level
+    # signal; the small app avoids starting the unrelated runtime a second time.
+    app.on_shutdown.append(next(h for h in controlled.on_shutdown
+                                if getattr(h, "__name__", "") == "_on_shutdown"))
+    app.on_cleanup.append(next(h for h in controlled.on_cleanup
+                               if getattr(h, "__name__", "") == "_handlers_drained"))
+    completed = []
+
+    async def finish(_app):
+        await _run_cleanup(controlled)
+        completed.append("marker")
+
+    app.on_cleanup.append(finish)
+    # An ignored shutdown signal must fail the 9s hang guard rather than
+    # succeeding only because aiohttp forcibly cancels handlers at its bound.
+    runner = _http_runner(app, SimpleNamespace(http_shutdown_timeout_seconds=30.0))
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    caplog.set_level(logging.INFO, logger="mimir.server")
+    async with ClientSession() as session:
+        streams = [await session.get(f"http://127.0.0.1:{port}{path}") for path in (
+            "/api/v1/live-events", "/api/v1/turn-events", "/chat/stream",
+        )]
+        try:
+            assert all(stream.status == 200 for stream in streams)
+            assert app[HTTP_SHUTDOWN].active_streams == 3
+            _record_shutdown_signal(app, signal.SIGTERM)
+            await asyncio.wait_for(runner.cleanup(), 9)
+            assert completed == ["marker"]
+            assert "liveness:clean" in control.events
+            assert [await stream.content.read() for stream in streams] == [b"", b"", b""]
+            assert app[HTTP_SHUTDOWN].active_streams == 0
+            stages = [r.getMessage() for r in caplog.records if r.name == "mimir.server"
+                      and r.getMessage().startswith("shutdown:")]
+            expected = ("signal received (SIGTERM)", "sites stopped", "dispatcher drain start",
+                        "streams active at shutdown (3)", "handlers drained", "clean marker written",
+                        "dispatcher drain end", "cleanup complete")
+            assert [next(s for s in stages if name in s) for name in expected] == stages
+            assert all("elapsed=" in stage for stage in stages)
+        finally:
+            if not completed:
+                for stream in streams:
+                    stream.close()
+                await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_on_shutdown_closes_admission_before_handler_drain_and_cleanup_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+    shutdown = next(h for h in app.on_shutdown if getattr(h, "__name__", "") == "_on_shutdown")
+    await shutdown(app)
+    control.events.append("handlers:drained")
+    await _run_cleanup(app)
+    assert control.events.count("scheduler:stop") == 1
+    assert control.events.index("scheduler:stop") < control.events.index("dispatcher:close")
+    assert control.events.count("dispatcher:drain") == 1
+    assert control.events.index("dispatcher:close") < control.events.index("handlers:drained")
+    assert control.events.index("dispatcher:close") < control.events.index("dispatcher:drain")
+    assert control.events.index("webchat:disconnect") < control.events.index("handlers:drained")
+
+
+def test_http_runner_uses_configured_shutdown_bound(tmp_path, monkeypatch):
+    from mimir.config import Config
+    monkeypatch.delenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    assert Config.from_env().http_shutdown_timeout_seconds == 5.0
+    monkeypatch.setenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", "2.5")
+    config = Config.from_env()
+    runner = _http_runner(web.Application(), config)
+    assert runner._shutdown_timeout == 2.5
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "-inf"])
+def test_http_shutdown_timeout_rejects_nonpositive_or_nonfinite(monkeypatch, raw):
+    from mimir.config import Config
+
+    monkeypatch.setenv("MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS", raw)
+    with pytest.raises(ValueError, match="MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS"):
+        Config.from_env()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_stage", ["drain", "bundle"])
+async def test_clean_marker_precedes_blocked_graceful_cleanup(
+    tmp_path, monkeypatch, blocked_stage,
+):
+    app, control = _controlled_server_app(tmp_path, monkeypatch)
+    await _run_startup(app)
+    control.events.clear()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    marked = asyncio.Event()
+    from mimir import liveness
+
+    def mark_clean(home):
+        control.hit("liveness:clean")
+        marked.set()
+        return True
+
+    monkeypatch.setattr(liveness, "mark_clean_shutdown", mark_clean)
+
+    async def block(*args, **kwargs):
+        entered.set()
+        await release.wait()
+
+    if blocked_stage == "drain":
+        control.dispatcher.drain = block
+        # Exercise joining the drain that on_shutdown started, not just the
+        # cleanup-only fallback.
+        shutdown = next(h for h in app.on_shutdown
+                        if getattr(h, "__name__", "") == "_on_shutdown")
+        await shutdown(app)
+    else:
+        control.bundle.aclose = block
+
+    cleanup = asyncio.create_task(_run_cleanup(app))
+    try:
+        await asyncio.wait_for(entered.wait(), HANG_GUARD_SECONDS)
+        # The early drain may enter before cleanup; observe the marker itself.
+        await asyncio.wait_for(marked.wait(), HANG_GUARD_SECONDS)
+        assert "liveness:clean" in control.events
+        assert not cleanup.done()
+        assert "bridges:disconnect" not in control.events
+    finally:
+        release.set()
+        await asyncio.wait_for(cleanup, HANG_GUARD_SECONDS)
+    assert control.events.count("liveness:clean") == 1
 
 
 def test_server_startup_routes_factory_recovery_to_run_epic(
@@ -632,7 +793,7 @@ async def test_pairing_notifier_aclose_is_idempotent_and_clears_tasks(
     ("Alice\u202ediscord-999\u202c\u200b", "Alicediscord-999"),
 ])
 async def test_pairing_operator_alert_neutralizes_sender_display_name(
-    monkeypatch: pytest.MonkeyPatch, alert_channel: str, display: str, cleaned: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, alert_channel: str, display: str, cleaned: str,
 ) -> None:
     from types import SimpleNamespace
     from mimir.server import _PairingNotifier
@@ -641,7 +802,7 @@ async def test_pairing_operator_alert_neutralizes_sender_display_name(
     channels = MagicMock()
     channels.send = AsyncMock()
     notifier = _PairingNotifier(
-        SimpleNamespace(operator_alert_channel=alert_channel,
+        SimpleNamespace(home=tmp_path, operator_alert_channel=alert_channel,
                         pairing_operator_digest_delay_seconds=60.0), channels,
     )
     try:
@@ -657,6 +818,46 @@ async def test_pairing_operator_alert_neutralizes_sender_display_name(
         assert "<!channel" not in alert and "<!subteam" not in alert
         assert f"discord-123 ({cleaned}; discord; DM)" in alert
         assert "mimir identities approve-pairing discord-123" in alert
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pairing_alert_constructs_and_reloads_resolver_off_loop(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from mimir.server import _PairingNotifier
+
+    loop_thread = threading.get_ident()
+    operations = []
+
+    class Resolver:
+        def __init__(self, home):
+            assert home == tmp_path
+            assert threading.get_ident() != loop_thread
+            operations.append("construct")
+
+        def reload(self):
+            assert threading.get_ident() != loop_thread
+            operations.append("reload")
+
+        def identity(self, canonical):
+            return SimpleNamespace(pairing=SimpleNamespace(request_id="pair-abcd"))
+
+    monkeypatch.setattr("mimir.identities.IdentityResolver", Resolver)
+    monkeypatch.setattr("mimir.server.log_event", AsyncMock())
+    channels = MagicMock()
+    channels.send = AsyncMock()
+    notifier = _PairingNotifier(SimpleNamespace(
+        home=tmp_path, operator_alert_channel="discord-ops",
+        pairing_operator_digest_delay_seconds=60.0,
+    ), channels)
+    try:
+        await notifier.notify_operator(canonical="discord-123", display="Alice",
+                                       platform="discord", channel_id="discord-1", delivery="dm")
+        await notifier.flush_operator_alerts()
+        assert operations == ["construct", "reload"]
+        assert "approve pair-abcd" in channels.send.await_args.args[1]
     finally:
         await notifier.aclose()
 
@@ -793,6 +994,9 @@ def _controlled_server_app(
         def intake_admits(self, event: Any) -> bool:
             return True
 
+        def close_admission(self) -> None:
+            control.hit("dispatcher:close")
+
         async def drain(self, *, timeout: float) -> None:
             control.hit("dispatcher:drain")
 
@@ -889,12 +1093,19 @@ def _controlled_server_app(
             app.router.add_post("/chat", ok)
             app.router.add_get("/chat/stream", ok)
 
+        async def disconnect(self) -> None:
+            control.hit("webchat:disconnect")
+
     class DiscordBridge:
+        name = "discord"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("discord")
 
     class SlackBridge:
+        name = "slack"
+
         def __init__(self, **kwargs: Any) -> None:
             self.kwargs = kwargs
             control.hit("slack")
@@ -1189,6 +1400,7 @@ async def _run_cleanup(app: web.Application) -> None:
         hook
         for hook in app.on_cleanup
         if getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
+        and getattr(hook, "__name__", "") == "_on_cleanup"
     ]
     assert len(hooks) == 1
     await hooks[0](app)
@@ -1303,6 +1515,46 @@ def test_optional_feedback_bridges_receive_core_identity_resolver(
         assert bridge.kwargs["admit"] == app["dispatcher"].intake_admits
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platforms,enforced,open_bridge,alert_channel,expected", [
+    (("discord",), True, False, "", True),
+    (("slack",), False, False, "", True),
+    (("discord", "slack"), True, False, "", True),
+    (("discord", "slack"), False, True, "", False),
+    ((), True, False, "", False),
+    (("discord", "slack"), True, False, "ops", False),
+])
+async def test_startup_warns_only_for_enforced_pairing_without_alert_channel(
+    tmp_path, monkeypatch, caplog, platforms, enforced, open_bridge, alert_channel, expected,
+):
+    monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true" if enforced else "false")
+    monkeypatch.setenv("MIMIR_OPEN_BRIDGE", "true" if open_bridge else "false")
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", alert_channel)
+    app, control = _controlled_server_app(
+        tmp_path, monkeypatch, _ServerControl(optional_bridges=True),
+    )
+    app["channels"]._bridges = [
+        bridge for bridge in app["channels"].bridges()
+        if getattr(bridge, "name", None) not in ("discord", "slack")
+        or bridge.name in platforms
+    ]
+    try:
+        with caplog.at_level("WARNING", logger="mimir.server"):
+            await _run_startup(app)
+        warnings = [record.message for record in caplog.records
+                    if record.name == "mimir.server" and "Pairing requests from new users" in record.message]
+        events = [fields for kind, fields in control.event_payloads
+                  if kind == "pairing_alert_channel_missing"]
+        assert len(warnings) == len(events) == int(expected)
+        if expected:
+            assert "MIMIR_OPERATOR_ALERT_CHANNEL" in warnings[0]
+            assert "/app/admin/users" in warnings[0]
+            assert "mimir identities list" in warnings[0]
+            assert events == [{"platforms": sorted(platforms)}]
+    finally:
+        await _run_cleanup(app)
+
+
 def test_route_and_hook_parity_with_runtime_proxies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1328,7 +1580,7 @@ def test_route_and_hook_parity_with_runtime_proxies(
     assert sum(
         getattr(hook, "__qualname__", "").startswith("build_app.<locals>.")
         for hook in app.on_cleanup
-    ) == 1
+    ) == 2
     assert _capture_controller_source_commit in app.on_startup
     assert app.on_startup.index(_capture_controller_source_commit) < next(
         index for index, hook in enumerate(app.on_startup)

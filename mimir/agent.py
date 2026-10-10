@@ -104,6 +104,7 @@ from .access_control import (
     ChannelResourceAdapter,
     _source_is_triggering_channel_compatible,
     create_auth_context,
+    ensure_turn_scratch,
     get_event_service_principal,
     get_trusted_service_from_auth_context,
     record_ingested_urls,
@@ -1461,6 +1462,8 @@ class Agent:
         if self._saga_store is not None:
             from .memory_proposals import configure_approvals
             configure_approvals(config.home, config.operator_alert_channel, self._saga_store)
+        from .pairing_approval import sync_pending as sync_pairings
+        sync_pairings(config.home, getattr(config, "operator_alert_channel", ""), self._identity_resolver)
 
     def _try_inject_memory_client(self, saga_client: SagaClient) -> None:
         """If saga_client is a SagaStore (or wraps one at any depth),
@@ -1927,6 +1930,7 @@ class Agent:
         """Run one agent turn — preserves the SDK Agent.run_turn contract."""
         from .operator_approval import _is_authenticated_operator
         from .memory_proposals import complete_reply, is_mp_reply, sync_pending
+        from .pairing_approval import complete_reply as complete_pairing_reply, sync_pending as sync_pairings
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
@@ -1934,7 +1938,13 @@ class Agent:
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver) and (named_reply or bare_reply):
             sync_pending(self._config.home)
+            await asyncio.to_thread(
+                sync_pairings, self._config.home,
+                getattr(self._config, "operator_alert_channel", ""), self._identity_resolver,
+            )
             pending_entries = pending_approvals(event.channel_id)
+            if bare_reply:
+                pending_entries = tuple(entry for entry in pending_entries if entry.kind != "pair")
             memory_reply = is_mp_reply(event) or (bare_reply and bool(pending_entries) and all(
                 entry.kind == "mp" for entry in pending_entries
             ))
@@ -1946,7 +1956,12 @@ class Agent:
                 resolution = None
             if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
                     or (resolution.entry is None and (named_reply or bare_reply))):
-                if memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
+                if resolution.entry is not None and resolution.entry.kind == "pair":
+                    notice = await complete_pairing_reply(
+                        self._config.home, getattr(self._config, "operator_alert_channel", ""),
+                        event, resolution, self._identity_resolver,
+                    )
+                elif memory_reply or (resolution.entry is not None and resolution.entry.kind == "mp"):
                     notice = await complete_reply(
                         self._config.home, event, resolution, self._identity_resolver,
                     )
@@ -2203,6 +2218,15 @@ class Agent:
                 auth_context=auth_ctx,
                 ifc_labels=initial_ifc_labels,
             )
+            # Both ordinary and synthesis turns share this setup. Register the
+            # intended workspace before validating/repairing it so the janitor
+            # cannot evict an old reused directory during setup. No prompt or
+            # tool sees this provisional path; refusal clears it before either.
+            ctx.turn_scratch_path = (
+                self._config.home.resolve() / "scratch" / "turns" / ctx.turn_id
+            )
+            ctx_token = set_current_turn(ctx)
+            ctx.turn_scratch_path = ensure_turn_scratch(self._config.home, ctx.turn_id)
             ctx.turn_event_emitter = emitter
             emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
@@ -2213,8 +2237,6 @@ class Agent:
             # invariant from the SDK build. Empty dict when the wiki dir
             # doesn't exist; finalize early-returns in that case.
             ctx.wiki_mtime_snapshot = await self._snapshot_wiki_mtimes_async()
-
-            ctx_token = set_current_turn(ctx)
             # Populate the module-global current_channel_id as a fallback
             # for the claude-code path. ChatClaudeCode dispatches tools
             # via the ClaudeSDKClient subprocess; the SDK round-trips back
@@ -4631,17 +4653,17 @@ class Agent:
             synthesis_prompt = synthesis_block.content
             if synthesis_block.labels.sources:
                 source_blocks.append(synthesis_block)
-            scratch_path = self._config.home / "scratch" / "turns" / ctx.turn_id
+            scratch_path = getattr(ctx, "turn_scratch_path", None)
             ctx.ifc_labels = _merge_ifc_labels(
                 ctx.ifc_labels, *(block.labels for block in source_blocks),
             )
-            return (
+            scratch_section = (
                 "## Current turn scratch\n\n"
                 f"Use `{scratch_path}/` for ordinary ephemeral files. This workspace "
                 "is private to this turn; the shared `scratch/` root and other turns' "
-                f"workspaces are unreadable.\n\n{synthesis_prompt}",
-                [],
-            )
+                "workspaces are unreadable.\n\n"
+            ) if scratch_path is not None else ""
+            return scratch_section + synthesis_prompt, []
 
         auth_context = _require_auth_context(initial_auth_context or ctx.auth_context)
         recent, recent_blocks = self._select_recent_activity(event, auth_context)
@@ -4964,8 +4986,9 @@ class Agent:
                 if trigger_authority
                 else None
             ),
-            turn_scratch_path=str(
-                self._config.home / "scratch" / "turns" / ctx.turn_id
+            turn_scratch_path=(
+                str(ctx.turn_scratch_path)
+                if getattr(ctx, "turn_scratch_path", None) is not None else None
             ),
         )
         ctx.ifc_labels = _merge_ifc_labels(

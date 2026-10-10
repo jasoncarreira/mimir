@@ -13,7 +13,7 @@ from github_ci_test_support import poller
 def _run(run_id, conclusion="cancelled", **fields):
     return {
         "databaseId": run_id, "conclusion": conclusion, "status": "completed",
-        "headSha": "abc", "workflowDatabaseId": 10, "workflowName": "CI",
+        "headSha": "abc", "workflowDatabaseId": 10, "workflowName": "CI", "event": "push",
         "createdAt": (datetime.now(timezone.utc) - timedelta(minutes=100 - run_id)).isoformat(),
         "url": f"https://github.com/o/r/actions/runs/{run_id}", **fields,
     }

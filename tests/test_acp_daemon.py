@@ -932,11 +932,17 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     home = _short_home()
     daemon = AcpDaemon(_bundle(home))
     daemon._agent = object()
+    cancelled = asyncio.Event()
     aborted = asyncio.Event()
+    runner_completed = asyncio.Event()
     unrelated_completed = asyncio.Event()
+    ordering_violations: list[str] = []
 
     class AbortTransport(_Transport):
         def abort(self) -> None:
+            if not cancelled.is_set():
+                ordering_violations.append("abort must follow the cancellation grace period")
+            # Always release the resistant runner, even when ordering is wrong.
             super().abort()
             aborted.set()
 
@@ -947,7 +953,9 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
+            cancelled.set()
             await aborted.wait()
+            runner_completed.set()
 
     async def unrelated_turn() -> None:
         await asyncio.sleep(0)
@@ -958,6 +966,9 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_CANCEL_TIMEOUT", 0.01)
     monkeypatch.setattr("mimir.acp.daemon.ACP_PEER_ABORT_TIMEOUT", 0.02)
     turn = asyncio.create_task(unrelated_turn())
+    # The daemon retains its short auth/cancel/abort budgets above. This outer
+    # timeout is only a deadlock guard, not a 100ms CI scheduling SLA; ordered
+    # events below prove the resistant runner is cancelled, aborted, and drained.
     with pytest.raises(AcpDaemonError, match="authentication timed out"):
         await asyncio.wait_for(
             # Below the unpatched 1s abort and 2s cancel budgets; setup
@@ -965,7 +976,10 @@ async def test_preauth_cancellation_resistance_is_post_abort_bounded(
             daemon._run_peer(asyncio.StreamReader(), writer), 0.5
         )
     await turn
+    assert cancelled.is_set()
     assert aborted.is_set()
+    assert runner_completed.is_set()
+    assert not ordering_violations, ordering_violations
     assert unrelated_completed.is_set()
     assert not daemon._connection_runners
     shutil.rmtree(home)

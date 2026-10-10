@@ -1877,3 +1877,29 @@ def test_slack_should_emit_retry_algedonic_throttling():
     assert _should_emit_retry_algedonic(11) is False
     assert _should_emit_retry_algedonic(20) is True
     assert _should_emit_retry_algedonic(101) is False
+@pytest.mark.asyncio
+async def test_ephemeral_refusal_never_posts_to_channel():
+    bridge = SlackBridge(bot_token="xoxb-x", app_token="xapp-x", enqueue=AsyncMock())
+    post = AsyncMock(return_value={"ok": True})
+    visible = AsyncMock()
+    bridge._app = SimpleNamespace(client=SimpleNamespace(chat_postEphemeral=post, chat_postMessage=visible))
+    assert (await bridge.send_ephemeral("slack-C1", "U1", "Fixed refusal")).sent
+    post.assert_awaited_once_with(channel="C1", user="U1", text="Fixed refusal")
+    visible.assert_not_awaited()
+    assert not (await bridge.send_ephemeral("email-C1", "U1", "Fixed refusal")).sent
+    post.side_effect = RuntimeError("closed")
+    assert not (await bridge.send_ephemeral("slack-C1", "U1", "Fixed refusal")).sent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["slack-C1", "dm-slack-G1", "dm-slack-C1"])
+async def test_ephemeral_uses_shared_broadcast_sanitizer(channel):
+    bridge = SlackBridge(bot_token="x", app_token="x", enqueue=AsyncMock())
+    post = AsyncMock(return_value={"ok": True})
+    visible = AsyncMock()
+    bridge._app = SimpleNamespace(client=SimpleNamespace(
+        chat_postEphemeral=post, chat_postMessage=visible))
+    assert (await bridge.send_ephemeral(channel, "U1", "<!channel> <!here> <!everyone>")).sent
+    assert post.await_args.kwargs["text"] == "@channel @here @everyone"
+    assert post.await_args.kwargs["user"] == "U1"
+    visible.assert_not_awaited()

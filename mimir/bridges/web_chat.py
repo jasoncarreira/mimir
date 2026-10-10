@@ -421,6 +421,8 @@ class WebChatBridge(Bridge):
         return frozenset({_web_channel_for(identity.canonical)})
 
     async def _handle_stream(self, request: web.Request) -> web.StreamResponse:
+        from ..http_shutdown import HTTP_SHUTDOWN, queue_or_shutdown
+        shutdown = request.app.get(HTTP_SHUTDOWN)
         identity, auth_error = _chat_identity(request)
         if auth_error is not None:
             return auth_error.legacy_response()
@@ -438,6 +440,8 @@ class WebChatBridge(Bridge):
             if sum(s.canonical == identity.canonical for s in self._subscribers) >= self.max_subscribers:
                 return web.Response(text="too many chat streams", status=429)
             self._subscribers.append(subscriber)
+        if shutdown is not None:
+            shutdown.active_streams += 1
 
         resp = web.StreamResponse(
             status=200,
@@ -461,10 +465,16 @@ class WebChatBridge(Bridge):
         )
         try:
             await resp.prepare(request)
-            while True:
+            while shutdown is None or not shutdown.event.is_set():
                 try:
-                    item = await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_S)
+                    item = (
+                        await queue_or_shutdown(q, shutdown, SSE_HEARTBEAT_S)
+                        if shutdown is not None else
+                        await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_S)
+                    )
                 except asyncio.TimeoutError:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
                     # Heartbeat keeps proxies from closing the connection.
                     await resp.write(b": heartbeat\n\n")
                     continue
@@ -475,6 +485,8 @@ class WebChatBridge(Bridge):
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
             async with self._lock:
                 if subscriber in self._subscribers:
                     self._subscribers.remove(subscriber)

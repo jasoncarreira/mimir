@@ -63,6 +63,223 @@ from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
+def _egress_shadow_auth(*, tainted: bool = True) -> AuthContext:
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="owner", domain="channel", resource_id="web:origin",
+        bridge_instance="web", sensitivity="private",
+        authorized_principals=frozenset({"owner"}), source_kind="channel",
+        integrity="untrusted" if tainted else "trusted",
+        integrity_effect="active_ingest",
+    ))
+    return AuthContext(
+        principal="owner", canonical_principal="owner", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="web:origin",
+        interactivity=TurnInteractivity.INTERACTIVE, ifc_labels=labels,
+        ifc_state=InformationFlowState(labels),
+    )
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_egress_shadow_verdicts_and_original_decisions(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append({"type": kind, **fields}))
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    url = "https://unapproved.example/private?token=do-not-log#fragment-do-not-log"
+    approved = "https://approved.example/data"
+    cases = [
+        ("fetch_url", url, None, True),
+        ("web_search", url, None, True),
+        ("webhook", url, None, True),
+        ("http_request", url, None, True),
+        ("send_message", "web:other", SinkCategory.CROSS_CHANNEL, True),
+        ("send_message", "web:other", None, True),
+        ("send_message", "web:someone", SinkCategory.DIRECT_MESSAGE, True),
+        ("send_message", "web:origin", SinkCategory.SAME_CHANNEL, False),
+        ("send_message", "web:origin", SinkCategory.CROSS_CHANNEL, False),
+        ("fetch_url", approved, None, False),
+        ("fetch_url", "https://verbatim.example/read", None, False),
+    ]
+    fixed = access_control._fixed_web_search_url()
+    if fixed:
+        cases.append(("web_search", fixed, None, False))
+    for tool, target, category, expected in cases:
+        auth = _egress_shadow_auth()
+        auth.egress_state.approve_url(approved)
+        auth.ingested_url_state.add("https://verbatim.example/read")
+        kwargs = {"enforce": enforce, **({"sink_category": category} if category else {})}
+        with monkeypatch.context() as without_helper:
+            without_helper.setattr(access_control, "_egress_veto_shadow_verdict", lambda *args: None)
+            baseline = SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, **kwargs)
+        before = len(events)
+        decision = SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, **kwargs)
+        assert decision == baseline, (tool, target)
+        if tool == "fetch_url" and target == url:
+            assert decision.allowed is (not enforce)
+        assert len(events) - before == expected, (tool, target)
+        if expected:
+            event = events[-1]
+            assert event["type"] == "egress_veto_would_block"
+            assert event["actual_allowed"] is decision.allowed
+            assert event["source"] == {
+                "domain": "channel", "resource_id": "web:origin", "source_kind": "channel",
+            }
+            if tool != "send_message":
+                assert event["destination_host"] == "unapproved.example"
+                assert "do-not-log" not in json.dumps(event)
+                assert "https://" not in json.dumps(event)
+        clean = _egress_shadow_auth(tainted=False)
+        before = len(events)
+        SinkGate.check_sink_flow(tool, target, clean.ifc_labels, clean, **kwargs)
+        assert len(events) == before, tool
+
+
+@pytest.mark.parametrize("resource_id,expected", [
+    ("owner/repo#pull/2318@abc123", "owner/repo#pull/2318@abc123"),
+    ("opaque?part#attribution", "opaque?part#attribution"),
+    ("https://source.example/private?secret=hidden#hidden", "source.example"),
+])
+def test_egress_shadow_preserves_opaque_source_attribution(
+    monkeypatch: pytest.MonkeyPatch, resource_id: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    source = replace(auth.ifc_labels.sources[0], resource_id=resource_id)
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    SinkGate.check_sink_flow("fetch_url", "https://other.example/", labels, auth)
+    assert len(events) == 1
+    assert events[0]["source"]["resource_id"] == expected
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("bücher.example", "xn--bcher-kva.example"),
+    ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+    ("a" * 64 + ".example", "a" * 64 + ".example"),
+])
+def test_egress_shadow_normalises_idn_hosts_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch, host: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    SinkGate.check_sink_flow("fetch_url", f"https://{host}/private?hidden=yes", auth.ifc_labels, auth)
+    assert len(events) == 1
+    assert events[0]["destination_host"] == expected
+    assert events[0]["origin"] == "tool_call"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_egress_shadow_channel_resolution_failure_preserves_decision(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    auth = _egress_shadow_auth()
+    baseline = SinkGate._check_sink_flow_decision(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    )
+    monkeypatch.setattr(SinkGate, "_check_sink_flow_decision", lambda *args, **kwargs: baseline)
+
+    def fail_resolution(*args: object) -> None:
+        raise RuntimeError("shadow channel resolution unavailable")
+
+    monkeypatch.setattr(access_control.ChannelResourceAdapter, "_resolve_channel", fail_resolution)
+    assert SinkGate.check_sink_flow(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    ) == baseline
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("category", [SinkCategory.CROSS_CHANNEL, None])
+def test_egress_shadow_cross_channel_sink_approval_is_exempt(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool, category: SinkCategory | None,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    assert auth.ifc_state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category=(category or SinkCategory.SAME_CHANNEL).value,
+        destination="web:other", canonical_principal="owner",
+        lifetime_seconds=60, durable_audit=lambda *_: True,
+    )
+    decision = SinkGate.check_sink_flow(
+        "send_message", "web:other", auth.ifc_labels, auth,
+        enforce=enforce, **({"sink_category": category} if category else {}),
+    )
+    assert decision.reason == "ifc_declassification_approved"
+    assert decision.allowed
+    assert not events
+
+
+def test_egress_shadow_poller_approved_urls_exemption(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE, capabilities=("fetch_url",),
+        approved_urls=("https://poller.example/",), creation_path="test",
+    )
+    labels = _egress_shadow_auth().ifc_labels
+    auth = _service_auth(service, labels)
+    target = "https://poller.example/read"
+    assert access_control.fetch_url_is_approved(target, auth)
+    SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=False)
+    assert not events
+    SinkGate.check_sink_flow("fetch_url", "https://other.example/read", labels, auth, enforce=False)
+    assert len(events) == 1
+    assert events[0]["service_principal"] == "poller:research"
+    assert events[0]["poller"] == "research"
+
+
+def test_egress_shadow_cross_channel_requires_private_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="owner", domain="channel", resource_id="web:origin",
+        bridge_instance="web", sensitivity="public",
+        authorized_principals=frozenset({"owner"}), source_kind="channel",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = replace(_egress_shadow_auth(), ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    assert labels.has_untrusted_active_ingest
+    SinkGate.check_sink_flow("send_message", "web:other", labels, auth, enforce=False)
+    assert not events
+
+
+def test_egress_shadow_configured_webhook_and_operator_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", '["https://approved.example/notify"]')
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "web:operator")
+    auth = _egress_shadow_auth()
+    SinkGate.check_sink_flow(
+        "webhook", "https://approved.example/notify", auth.ifc_labels, auth,
+        enforce=False,
+    )
+    operator_delivery = SinkGate.check_sink_flow(
+        "send_message", "web:operator", auth.ifc_labels, auth, enforce=False,
+    )
+    assert operator_delivery.reason == "ifc_allowed"
+    assert not events
+
+
 @pytest.fixture(autouse=True)
 def _isolate_operator_repository_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests opt into repository inventories explicitly, never from the host."""
@@ -399,6 +616,7 @@ def test_turn_can_write_and_read_its_own_scratch_workspace(
     service = access_control.builtin_trigger_service_principal("heartbeat", home)
     auth = _service_auth(service, InformationFlowLabels())
     target = home / "scratch" / "turns" / "heartbeat-turn" / "result.json"
+    assert access_control.ensure_turn_scratch(home, "heartbeat-turn") == target.parent
     token = set_current_turn(SimpleNamespace(
         turn_id="heartbeat-turn", auth_context=auth,
     ))
@@ -421,6 +639,128 @@ def test_turn_can_write_and_read_its_own_scratch_workspace(
         assert backend.read(str(target)).file_data["content"] == '{"ok": true}\n'
     finally:
         reset_current_turn(token)
+
+
+@pytest.mark.parametrize("turn_id", ["..", "a/b", ""])
+def test_turn_scratch_rejects_invalid_id(tmp_path, monkeypatch, turn_id):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    assert access_control.ensure_turn_scratch(tmp_path, turn_id) is None
+    assert not (tmp_path / "scratch").exists()
+    token = set_current_turn(SimpleNamespace(turn_id=turn_id))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+def test_turn_scratch_refuses_symlinks_at_every_component(tmp_path, monkeypatch, component):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = {"scratch": home / "scratch",
+            "turns": home / "scratch" / "turns",
+            "turn": home / "scratch" / "turns" / "one"}[component]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    assert access_control.ensure_turn_scratch(home, "one") is None
+    assert list(outside.iterdir()) == []
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=None))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+def test_turn_scratch_creation_reuse_and_refused_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    path = access_control.ensure_turn_scratch(tmp_path, "one")
+    assert path == tmp_path / "scratch" / "turns" / "one"
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert path.stat().st_uid == os.getuid()
+    assert access_control.ensure_turn_scratch(tmp_path, "one") == path
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=None))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+    token = set_current_turn(SimpleNamespace(turn_id="one", turn_scratch_path=path))
+    try:
+        assert access_control.current_turn_scratch_root() == path
+        path.rmdir()
+        path.symlink_to(tmp_path)
+        assert access_control.current_turn_scratch_root() is None
+    finally:
+        reset_current_turn(token)
+
+
+def test_turn_scratch_root_lookup_never_creates_missing_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    token = set_current_turn(SimpleNamespace(turn_id="not-started"))
+    try:
+        assert access_control.current_turn_scratch_root() is None
+        assert not (tmp_path / "scratch").exists()
+    finally:
+        reset_current_turn(token)
+
+
+@pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
+def test_turn_scratch_refuses_non_directory(tmp_path, component):
+    entry = {"scratch": tmp_path / "scratch",
+             "turns": tmp_path / "scratch" / "turns",
+             "turn": tmp_path / "scratch" / "turns" / "one"}[component]
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("keep")
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert entry.read_text() == "keep"
+
+
+def test_turn_scratch_refuses_other_owner_and_reuses_owned_directory(tmp_path, monkeypatch):
+    path = tmp_path / "scratch" / "turns" / "one"
+    path.mkdir(parents=True, mode=0o755)
+    path.chmod(0o755)  # Independent of the invoking process umask.
+    assert access_control.ensure_turn_scratch(tmp_path, "one") == path
+    assert path.stat().st_mode & 0o7777 == 0o700
+    monkeypatch.setattr(access_control.os, "getuid", lambda: path.stat().st_uid + 1)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+
+
+def test_turn_scratch_refuses_when_private_mode_cannot_be_enforced(tmp_path, monkeypatch):
+    path = tmp_path / "scratch" / "turns" / "one"
+    path.mkdir(parents=True)
+    path.chmod(0o755)
+
+    def refuse_chmod(fd, mode):
+        assert (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (
+            path.stat().st_dev, path.stat().st_ino,
+        )
+        assert mode == 0o700
+        raise PermissionError("mode change refused")
+
+    monkeypatch.setattr(access_control.os, "fchmod", refuse_chmod)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert path.stat().st_mode & 0o777 == 0o755
+
+
+def test_turn_scratch_refuses_component_replaced_between_stat_and_open(tmp_path, monkeypatch):
+    path = access_control.ensure_turn_scratch(tmp_path, "one")
+    assert path is not None
+    original_open = os.open
+    replaced = False
+
+    def replace_on_open(name, flags, *args, **kwargs):
+        nonlocal replaced
+        if name == "one" and not replaced:
+            replaced = True
+            path.rename(path.with_name("previous"))
+            path.mkdir(mode=0o700)
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(access_control.os, "open", replace_on_open)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert replaced
 
 
 def test_interactive_turn_is_scoped_to_its_own_scratch_workspace(
@@ -7259,6 +7599,65 @@ def test_github_fetch_cache_read_follows_capability(
         assert decision.reason == "read_scope"
 
 
+@pytest.mark.asyncio
+async def test_github_fetch_url_metadata_has_no_trusted_provenance_and_cache_read_is_untrusted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fetching a configured GitHub PR API URL cannot acquire forge trust."""
+    from io import BytesIO
+
+    import yaml
+
+    from mimir.tools import web
+
+    url = "https://api.github.com/repos/owner/repo/pulls/42"
+    body = b'{"body":"external content"}'
+
+    class Response(BytesIO):
+        headers = {"Content-Type": "application/json"}
+
+        def getcode(self) -> int:
+            return 200
+
+    def fake_open(request: object, timeout: int = 0) -> Response:
+        assert request.full_url == url
+        return Response(body)
+
+    monkeypatch.setattr(web, "_open_url", fake_open)
+    monkeypatch.setattr(web, "_validate_fetch_url", lambda _url: None)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    web.set_home(tmp_path)
+    (tmp_path / "attachments").mkdir()
+    service = build_trigger_service_principal(
+        canonical="poller:github-activity", trigger="poller", profile="github",
+        tier=CapabilityTier.CODE_EXECUTION, capabilities=("fetch_url", "read_file"),
+        approved_urls=("https://api.github.com/repos/",), creation_path="test",
+    )
+    auth = _service_auth(service, InformationFlowLabels())
+    registry = ToolRegistry()
+    fetch_auth = registry.authorize_tool("fetch_url", auth, enforce=True, target_channel=url)
+    assert fetch_auth.allowed
+    result = await web.fetch_url.ainvoke({"url": url})
+    metadata = yaml.safe_load(result)
+    assert metadata["url"] == url
+    # Current fetch_url returns metadata, not the remote body; it has no
+    # content label at all, even for configured repositories.
+    labels = classify_protected_result("fetch_url", {"url": url}, auth, fetch_auth, result=result)
+    assert labels is None
+    body_path = tmp_path / metadata["file_path"].lstrip("/")
+    assert body_path.read_bytes() == body
+    read_args = {"file_path": str(body_path)}
+    read_auth = registry.authorize_tool("read_file", auth, enforce=True, arguments=read_args)
+    assert read_auth.allowed
+    read_labels = classify_protected_result("read_file", read_args, auth, read_auth)
+    assert read_labels is not None
+    assert read_labels.has_untrusted_active_ingest
+    assert {(source.domain, source.integrity) for source in read_labels.sources} == {
+        ("filesystem", "untrusted"),
+    }
+
+
 @pytest.fixture
 def github_activity_fetch_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AuthContext:
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
@@ -8205,6 +8604,7 @@ def test_static_service_write_allows_scratch_tmp_and_existing_safe_roots(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
+    assert access_control.ensure_turn_scratch(home, "scheduler-turn") is not None
     token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
     try:
         for target in (
@@ -8374,6 +8774,7 @@ def test_static_service_write_git_metadata_exception_is_scratch_only(
     auth = _service_auth(service, InformationFlowLabels())
     registry = ToolRegistry()
 
+    assert access_control.ensure_turn_scratch(home, "scheduler-turn") is not None
     token = set_current_turn(SimpleNamespace(turn_id="scheduler-turn", auth_context=auth))
     try:
         allowed = registry.authorize_tool(
@@ -9774,6 +10175,64 @@ def _github_poller_auth(
     )
 
 
+@pytest.mark.parametrize("path", ["review", "heartbeat", "poller"])
+@pytest.mark.parametrize("verdict", [False, None, 1, "yes", "missing"])
+def test_outsider_pr_scope_requires_exact_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, verdict: object,
+) -> None:
+    from mimir.models import NormalizedPullRequestSnapshot
+
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_review", author="outside-author")
+    if verdict != "missing":
+        item["pr_author_is_trusted"] = verdict
+    events = []
+    monkeypatch.setattr(
+        "mimir.event_logger.log_event_sync",
+        lambda name, **fields: events.append((name, fields)),
+    )
+    if path == "poller":
+        assert _github_poller_auth(authority, item).repo_pr_action_scope is None
+    else:
+        snapshot = NormalizedPullRequestSnapshot(
+            repo="o/r", state="open", number=42, author="outside-author",
+            head_repo="o/r", head_remote="origin", head_ref="worklink/42",
+            head_sha="a" * 40, base_ref="main", base_sha="b" * 40,
+        )
+        if path == "review":
+            resolution = access_control.resolve_server_discovered_review_scope(
+                "o/r", snapshot, pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            )
+            assert resolution.scope is None
+            assert resolution.refusal_reason == (
+                "pull request withheld: its author is not a repository collaborator; "
+                "the item was withheld and logged"
+            )
+        else:
+            assert access_control.create_server_discovered_heartbeat_scope(
+                "o/r", snapshot, event_type="heartbeat_pr_maintenance",
+                pr_author_is_trusted=item.get("pr_author_is_trusted"),
+            ) is None
+    refused, withheld = events
+    assert refused == ("github_outsider_pr_refused", {
+        "repo": "o/r", "number": 42, "author": "outside-author",
+        "reason": "attestation_unavailable" if verdict in (None, "missing")
+        else "non_collaborator",
+    })
+    assert withheld[0] == "github_content_withheld"
+    assert withheld[1]["count"] == 1
+
+
+def test_poller_collaborator_scope_needs_forwarded_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _root, authority, item = _github_scope_test_setup(tmp_path, monkeypatch)
+    item.update(event_type="pr_opened", author="collaborator", pr_author_is_trusted=True)
+    scope = _github_poller_auth(authority, item).repo_pr_action_scope
+    assert scope is not None
+    assert scope.pull_request_author == "collaborator"
+
+
 def test_fresh_changes_requested_review_mints_remediation_authority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9889,8 +10348,11 @@ def test_comment_remediation_guards_remain_review_only(
 
     scope = _github_poller_auth(authority, item).repo_pr_action_scope
 
-    assert scope is not None
-    assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
+    if change == "author":
+        assert scope is None
+    else:
+        assert scope is not None
+        assert scope.allowed_operations == access_control._REPO_PR_REVIEW_ACTIONS
 
 
 @pytest.mark.parametrize(
@@ -9921,10 +10383,7 @@ def test_fresh_changes_requested_remediation_applies_every_write_guard(
     auth = _github_poller_auth(authority, item)
 
     if field == "author":
-        scope = auth.repo_pr_action_scope
-        assert scope is not None
-        assert access_control.RepoPRAction.COMMIT.value not in scope.allowed_operations
-        assert access_control.RepoPRAction.PUSH.value not in scope.allowed_operations
+        assert auth.repo_pr_action_scope is None
     else:
         assert auth.repo_pr_action_scope is None
 

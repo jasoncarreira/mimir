@@ -54,6 +54,7 @@ from .worklink.continuation import (
     stamp_http_event_ingress_extra,
 )
 from . import web_ui
+from .http_shutdown import HTTP_SHUTDOWN, HTTPShutdown
 
 log = logging.getLogger(__name__)
 
@@ -145,10 +146,14 @@ class _PairingNotifier:
         self._operator_pending: list[dict[str, str]] = []
         self._operator_task: asyncio.Task[Any] | None = None
         self._operator_notified: set[str] = set()
+        self._ignored_notified: set[str] = set()
+        self._operator_unrouted: set[str] = set()
         self._operator_cap_notified = False
         self._dm_reply_sent: set[tuple[str, str]] = set()
-        self._dm_reply_queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        self._decline_sent: set[str] = set()
+        self._dm_reply_queue: asyncio.Queue[tuple[str, ...]] = asyncio.Queue()
         self._dm_reply_task: asyncio.Task[Any] | None = None
+        self._last_reply_started: float | None = None
 
     async def aclose(self) -> None:
         tasks = {
@@ -187,6 +192,12 @@ class _PairingNotifier:
             return
         alert_channel = (self._config.operator_alert_channel or "").strip()
         if not alert_channel:
+            if canonical not in self._operator_unrouted:
+                self._operator_unrouted.add(canonical)
+                await log_event(
+                    "pairing_alert_unrouted", canonical=canonical,
+                    platform=platform, delivery=delivery,
+                )
             return
         self._operator_notified.add(canonical)
         self._operator_pending.append(
@@ -201,18 +212,53 @@ class _PairingNotifier:
         if self._operator_task is None or self._operator_task.done():
             self._operator_task = asyncio.create_task(self._flush_operator_later())
 
+    async def notify_ignored(self, *, canonical: str, platform: str, delivery: str) -> None:
+        if not canonical or canonical in self._ignored_notified:
+            return
+        if not (self._config.operator_alert_channel or "").strip():
+            return
+        self._ignored_notified.add(canonical)
+        self._operator_pending.append({"ignored": canonical, "platform": platform, "delivery": delivery})
+        if self._operator_task is None or self._operator_task.done():
+            self._operator_task = asyncio.create_task(self._flush_operator_later())
+
     async def flush_operator_alerts(self) -> None:
         if not self._operator_pending:
             return
         pending, self._operator_pending = self._operator_pending, []
-        lines = ["Pairing approval needed:"]
+        lines = ["Unknown sender intake:"]
+        from .identities import IdentityResolver
+        def load_resolver():
+            resolver = IdentityResolver(self._config.home)
+            resolver.reload()
+            return resolver
+
+        resolver = await asyncio.to_thread(load_resolver)
         for item in pending:
+            if "ignored" in item:
+                lines.append(
+                    f"- ignored unknown sender {item['ignored']} on {item['platform']} "
+                    f"({item['delivery']}); to allow, approve-pairing or change intake policy"
+                )
+                continue
             where = "DM" if item["delivery"] == "dm" else item["channel_id"]
+            identity = resolver.identity(item["canonical"])
+            request_id = identity.pairing.request_id if identity and identity.pairing else None
             lines.append(
                 "- "
-                f"{item['canonical']} ({item['display']}; {item['platform']}; {where}) "
-                f"- approve: mimir identities approve-pairing {item['canonical']}"
+                f"{item['canonical']} ({item['display']}; {item['platform']}; {where})"
             )
+            if request_id:
+                lines.append(f"  reply: approve {request_id} / decline {request_id}")
+            lines.append("  dashboard: /app/admin/users")
+            if item["delivery"] == "dm":
+                lines.append("  cli: mimir identities approve-pairing --code <the code they received>, "
+                             f"or mimir identities approve-pairing {item['canonical']}")
+                lines.append(
+                    "  They were sent a pairing code; ask them for it to confirm it's really them."
+                )
+            else:
+                lines.append(f"  cli: mimir identities approve-pairing {item['canonical']}")
         try:
             await self._channels.send(
                 self._config.operator_alert_channel,
@@ -250,7 +296,8 @@ class _PairingNotifier:
             "Pairing pending cap reached: new unknown contacts are being "
             f"dropped without pending entries (max={self._config.pairing_pending_max}). "
             f"Latest dropped contact came from {platform or 'unknown'} via {where}. "
-            "Clear/approve pending pairings or raise MIMIR_PAIRING_PENDING_MAX."
+            "Clear/approve pending pairings at /app/admin/users or raise "
+            "MIMIR_PAIRING_PENDING_MAX."
         )
         try:
             await self._channels.send(alert_channel, text, final=True)
@@ -300,13 +347,87 @@ class _PairingNotifier:
         if self._dm_reply_task is None or self._dm_reply_task.done():
             self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
 
+    async def maybe_decline(
+        self, *, canonical: str, platform: str, delivery: str,
+        channel_id: str, author_id: str, text: str,
+    ) -> None:
+        if not canonical or canonical in self._decline_sent:
+            return
+        # Refuse ambiguous/forged destinations before the send worker sees them.
+        from .identities_populator import is_private_pairing_dm
+
+        if platform not in {"discord", "slack"} or not author_id or not (
+            is_private_pairing_dm(platform, channel_id) if delivery == "dm"
+            else channel_id.startswith(f"{platform}-") or (
+                platform == "slack" and channel_id.startswith(("dm-slack-G", "dm-slack-C", "dm-slack-D"))
+            )
+        ):
+            await log_event(
+                "inbound_decline_failed", source=platform, channel_id=channel_id,
+                author_id=author_id, canonical_author=canonical, delivery=delivery,
+                reason="invalid_destination",
+            )
+            return
+        self._decline_sent.add(canonical)
+        await self._dm_reply_queue.put(("decline", canonical, platform, delivery, channel_id, author_id, text))
+        if self._dm_reply_task is None or self._dm_reply_task.done():
+            self._dm_reply_task = asyncio.create_task(self._dm_reply_worker())
+
+    async def _send_decline(self, item: tuple[str, ...]) -> None:
+        _, canonical, platform, delivery, channel_id, author_id, text = item
+        # Literal operator text, never interpreted as a platform mention.
+        from .bridges._mentions import neutralize_decline_text
+
+        text = neutralize_decline_text(platform, text)
+        reason = "delivery_failed"
+        try:
+            if delivery == "dm":
+                destination = channel_id
+                result = await self._channels.send(destination, text, final=True)
+            elif platform == "discord":
+                bridge = self._channels.find(channel_id)
+                destination = await bridge.resolve_dm_channel(author_id) if bridge else None
+                if not destination or not destination.startswith("dm-discord-"):
+                    reason = "dm_unavailable"
+                    raise RuntimeError(reason)
+                result = await self._channels.send(destination, text, final=True)
+            else:
+                bridge = self._channels.find(channel_id)
+                if bridge is None or not hasattr(bridge, "send_ephemeral"):
+                    reason = "bridge_unavailable"
+                    raise RuntimeError(reason)
+                result = await bridge.send_ephemeral(channel_id, author_id, text)
+            if not result.sent:
+                raise RuntimeError(reason)
+        except Exception:  # noqa: BLE001 — no sender content in failure logs
+            await log_event(
+                "inbound_decline_failed", source=platform, channel_id=channel_id,
+                author_id=author_id, canonical_author=canonical, delivery=delivery,
+                reason=reason,
+            )
+
     async def _dm_reply_worker(self) -> None:
         interval = max(
             0.0,
             float(self._config.pairing_dm_auto_reply_interval_seconds or 0.0),
         )
         while not self._dm_reply_queue.empty():
-            canonical, dm_channel_id, code = await self._dm_reply_queue.get()
+            # Apply the interval across worker restarts too: a new sender can
+            # arrive after the queue drained but before the cooldown elapsed.
+            now = asyncio.get_running_loop().time()
+            if interval and self._last_reply_started is not None:
+                remaining = self._last_reply_started + interval - now
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+            self._last_reply_started = asyncio.get_running_loop().time()
+            item = await self._dm_reply_queue.get()
+            if item[0] == "decline":
+                try:
+                    await self._send_decline(item)
+                finally:
+                    self._dm_reply_queue.task_done()
+                continue
+            canonical, dm_channel_id, code = item
             from .identities_populator import prepare_pairing_code_delivery
 
             key = (canonical, hashlib.sha256(code.encode("ascii")).hexdigest())
@@ -354,8 +475,6 @@ class _PairingNotifier:
                             log.debug("pairing delivery cleanup unavailable")
                 finally:
                     self._dm_reply_queue.task_done()
-            if interval and not self._dm_reply_queue.empty():
-                await asyncio.sleep(interval)
 
 
 @dataclass(slots=True)
@@ -1274,6 +1393,15 @@ def build_app(config: Config) -> web.Application:
             _make_auth_middleware(config.api_key or "", web_host=config.web_host)
         ],
     )
+    app[HTTP_SHUTDOWN] = HTTPShutdown()
+    http_shutdown = app[HTTP_SHUTDOWN]
+    drain_task: asyncio.Task[None] | None = None
+    scheduler_stopped = False
+
+    def shutdown_log(stage: str) -> None:
+        elapsed = (time.monotonic() - http_shutdown.signalled_at
+                   if http_shutdown.signalled_at is not None else 0.0)
+        log.info("shutdown: %s elapsed=%.3fs", stage, elapsed)
 
     if not config.api_key:
         if getattr(config, "allow_unauthenticated", False):
@@ -1360,11 +1488,17 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
+    async def github_outsider_notice(text: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if channel:
+            await channels.send(channel, text, final=True)
+
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
         home=config.home,
         scheduler_tz=config.scheduler_tz,
+        operator_notice=github_outsider_notice,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:
@@ -1752,6 +1886,21 @@ def build_app(config: Config) -> web.Application:
         await indexer.start(run_initial_sweep=False, sweep_loop=True)
         startup_state.phase = "bridge_connect"
         startup_state.bridges_connect_attempted = True
+        pairing_platforms = sorted({
+            bridge.name for bridge in channels.bridges()
+            if getattr(bridge, "name", None) in ("discord", "slack")
+        })
+        if (
+            (config.access_control_enforced or not config.open_bridge)
+            and pairing_platforms
+            and not (config.operator_alert_channel or "").strip()
+        ):
+            log.warning(
+                "Pairing requests from new users will not be surfaced: set "
+                "MIMIR_OPERATOR_ALERT_CHANNEL; review pending requests at "
+                "/app/admin/users or with mimir identities list."
+            )
+            await log_event("pairing_alert_channel_missing", platforms=pairing_platforms)
         await channels.connect_all()
 
         # MCP servers (opt-in via MIMIR_MCP_SERVERS_JSON / _PATH).
@@ -2496,7 +2645,41 @@ def build_app(config: Config) -> web.Application:
                 original_exception.add_note(_cleanup_note(errors))
             raise
 
+    async def _on_shutdown(app: web.Application) -> None:
+        nonlocal drain_task, scheduler_stopped
+        shutdown_log("sites stopped")
+        http_shutdown.closing_streams = http_shutdown.active_streams
+        http_shutdown.event.set()
+        if not startup_state.compensated:
+            # Stop producers before rejecting admission: an edge-trigger scan
+            # must not advance its cursor while its emitted events are refused.
+            try:
+                await scheduler.stop()
+                scheduler_stopped = True
+            except Exception:
+                log.exception("scheduler stop during HTTP shutdown failed")
+            dispatcher.close_admission()
+        # Chat's existing sentinel also wakes subscribers that predate the
+        # shared event; the event covers full queues and subscription races.
+        disconnect = getattr(web_chat, "disconnect", None)
+        if disconnect is not None:
+            try:
+                await disconnect()
+            except Exception:
+                log.exception("chat stream closure during HTTP shutdown failed")
+        if not startup_state.compensated:
+            shutdown_log("dispatcher drain start")
+            drain_task = asyncio.create_task(
+                dispatcher.drain(timeout=config.drain_timeout_seconds),
+                name="server-dispatcher-drain",
+            )
+
+    async def _handlers_drained(app: web.Application) -> None:
+        shutdown_log(f"streams active at shutdown ({http_shutdown.closing_streams})")
+        shutdown_log("handlers drained")
+
     async def _on_cleanup(app: web.Application) -> None:
+        nonlocal drain_task
         errors: list[Exception] = []
 
         async def attempt(operation: Any) -> bool:
@@ -2532,11 +2715,15 @@ def build_app(config: Config) -> web.Application:
             cleanup_started = time.monotonic()
             from .liveness import mark_clean_shutdown
 
-            def persist_clean_shutdown() -> None:
+            def persist_clean_shutdown() -> bool:
                 if not mark_clean_shutdown(config.home):
                     raise RuntimeError("failed to persist clean-shutdown marker")
+                return True
 
-            attempt_sync(persist_clean_shutdown)
+            # #507: record graceful intent before waiting for drain or late
+            # teardown; a slow intended stop must not look like a crash.
+            if attempt_sync(persist_clean_shutdown):
+                shutdown_log("clean marker written")
             from .worklink.autonomy import release_claims_for_graceful_shutdown
 
             release_timeout = 5.0
@@ -2569,14 +2756,20 @@ def build_app(config: Config) -> web.Application:
             # admission. Otherwise a channel-drained callback can queue an
             # edge-trigger scan just before ``drain()`` and that scan can advance
             # its cursor while every emitted event is rejected.
-            await attempt(scheduler.stop)
+            if not scheduler_stopped:
+                await attempt(scheduler.stop)
             drain_timeout = config.drain_timeout_seconds
             if drain_timeout > 0:
                 drain_timeout = max(
                     0.0,
                     drain_timeout - (time.monotonic() - cleanup_started),
                 )
-            await attempt(lambda: dispatcher.drain(timeout=drain_timeout))
+            if drain_task is None:
+                shutdown_log("dispatcher drain start")
+                await attempt(lambda: dispatcher.drain(timeout=drain_timeout))
+            else:
+                await attempt(lambda: drain_task)
+            shutdown_log("dispatcher drain end")
             try:
                 task_errors = await cancel_background_tasks(
                     startup_background_tasks,
@@ -2606,6 +2799,7 @@ def build_app(config: Config) -> web.Application:
         from .git_tracking import cancel_pending_pushes
 
         await attempt(cancel_pending_pushes)
+        shutdown_log("cleanup complete")
         for error in errors:
             log.error("server cleanup failed: %s", error)
         if errors:
@@ -2613,11 +2807,22 @@ def build_app(config: Config) -> web.Application:
 
     app.on_startup.append(_capture_controller_source_commit)
     app.on_startup.append(_on_startup)
+    app.on_shutdown.append(_on_shutdown)
+    app.on_cleanup.append(_handlers_drained)
     app.on_cleanup.append(_on_cleanup)
     return app
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _http_runner(app: web.Application, config: Config) -> web.AppRunner:
+    return web.AppRunner(app, shutdown_timeout=config.http_shutdown_timeout_seconds)
+
+
+def _record_shutdown_signal(app: web.Application, sig: signal.Signals) -> None:
+    app[HTTP_SHUTDOWN].signalled_at = time.monotonic()
+    log.info("shutdown: signal received (%s) elapsed=0.000s", sig.name)
 
 
 def _validate_bind_security(host: str, api_key: str) -> None:
@@ -2673,7 +2878,7 @@ def main() -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    runner = web.AppRunner(app)
+    runner = _http_runner(app, config)
     loop.run_until_complete(runner.setup())
     site = web.TCPSite(runner, host=config.web_host, port=config.web_port)
     loop.run_until_complete(site.start())
@@ -2681,13 +2886,14 @@ def main() -> None:
 
     stop = loop.create_future()
 
-    def _on_signal() -> None:
+    def _on_signal(sig: signal.Signals) -> None:
         if not stop.done():
+            _record_shutdown_signal(app, sig)
             stop.set_result(None)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _on_signal)
+            loop.add_signal_handler(sig, _on_signal, sig)
         except NotImplementedError:
             pass
 

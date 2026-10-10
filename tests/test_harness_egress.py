@@ -15,10 +15,40 @@ from mimir.harness_egress import harness_sink_allowed
 from mimir.models import (
     AuthContext,
     InformationFlowLabels,
+    InformationFlowState,
     SourceLabel,
     TurnInteractivity,
 )
 from mimir.turn_event_bus import TurnEventBus
+
+
+@pytest.mark.parametrize("enforced", [False, True])
+def test_egress_shadow_distinguishes_harness_from_tool_calls(
+    monkeypatch: pytest.MonkeyPatch, enforced: bool,
+) -> None:
+    monkeypatch.delenv("MIMIR_OPERATOR_ALERT_CHANNEL", raising=False)
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="alice", domain="channel", resource_id="web-private",
+        bridge_instance="web", sensitivity="private",
+        authorized_principals=frozenset({"alice"}),
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = AuthContext(
+        principal="alice", canonical_principal="alice", roles=(),
+        event_ingress=None, trigger="user_message", channel_id="web-private",
+        interactivity=TurnInteractivity.INTERACTIVE, enforcement_enabled=enforced,
+        ifc_labels=labels, ifc_state=InformationFlowState(labels),
+    )
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append({"type": kind, **fields}))
+    baseline = SinkGate.check_sink_flow(
+        "send_message", "web-other", labels, auth, enforce=enforced,
+    )
+    assert harness_sink_allowed("send_message", "web-other", labels, auth) is baseline.allowed
+    shadow_events = [event for event in events if event["type"] == "egress_veto_would_block"]
+    assert len(shadow_events) == 2
+    assert [event.pop("origin") for event in shadow_events] == ["tool_call", "harness"]
+    assert shadow_events[0] == shadow_events[1]
 
 
 @pytest.fixture

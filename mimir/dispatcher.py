@@ -18,9 +18,10 @@ import logging
 import shlex
 import threading
 import traceback
+from dataclasses import replace
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .access_control import AccessDecision, authorize_inbound
+from .access_control import AccessDecision, AccessStatus, AccessTier, authorize_inbound
 from .background_tasks import cancel_background_tasks, spawn_background
 from .config import Config
 from .event_logger import log_event
@@ -52,6 +53,7 @@ NoticeSender = Callable[[str, str], Awaitable["SendResult"]]
 # raise into enqueue and must not block it.
 EventObserver = Callable[[AgentEvent], Awaitable[None]]
 PairingObserver = Callable[[AgentEvent, AccessDecision], Awaitable[None]]
+UnknownSenderObserver = Callable[[AgentEvent, AccessDecision, str], Awaitable[None]]
 ChannelIdleCallback = Callable[[str], None]
 ChannelDrainedCallback = Callable[[str], None]
 # Inbound user-message admission is fail-closed for bridge/external sources.
@@ -120,6 +122,7 @@ class Dispatcher:
         # (the asyncio strong-ref gotcha, chainlink #118).
         self._on_event: EventObserver | None = None
         self._on_pairing_required: PairingObserver | None = None
+        self._on_unknown_sender: UnknownSenderObserver | None = None
         self._on_channel_idle: ChannelIdleCallback | None = None
         self._on_channel_drained: ChannelDrainedCallback | None = None
         self._bg_tasks: set[asyncio.Task] = set()
@@ -206,6 +209,9 @@ class Dispatcher:
         """
         self._on_pairing_required = on_pairing_required
 
+    def set_on_unknown_sender(self, observer: UnknownSenderObserver | None) -> None:
+        self._on_unknown_sender = observer
+
     def set_on_channel_idle(
         self, on_channel_idle: ChannelIdleCallback | None
     ) -> None:
@@ -270,16 +276,29 @@ class Dispatcher:
         ):
             existing = self._queues.get(channel_id)
             if existing is None or existing.qsize() == 0:
+                operator_channel = getattr(self._config, "operator_alert_channel", "")
+                if operator_channel and channel_id == operator_channel:
+                    from .pairing_approval import sync_pending as sync_pairings
+                    await asyncio.to_thread(
+                        sync_pairings, self._config.home, operator_channel, self._identity_resolver,
+                    )
                 from .mid_turn_injection import inject_authenticated_message
                 injection_status = inject_authenticated_message(
                     channel_id, event, self._identity_resolver,
                 )
                 if injection_status == "consumed":
-                    from .memory_proposals import complete_reply
                     resolution = event.extra.pop("_memory_proposal_resolution")
-                    notice = await complete_reply(
-                        self._config.home, event, resolution, self._identity_resolver,
-                    )
+                    if resolution.entry is not None and resolution.entry.kind == "pair":
+                        from .pairing_approval import complete_reply
+                        notice = await complete_reply(
+                            self._config.home, getattr(self._config, "operator_alert_channel", ""),
+                            event, resolution, self._identity_resolver,
+                        )
+                    else:
+                        from .memory_proposals import complete_reply
+                        notice = await complete_reply(
+                            self._config.home, event, resolution, self._identity_resolver,
+                        )
                     if notice:
                         await self._send_approval_notice(channel_id, notice)
                     return True
@@ -339,18 +358,54 @@ class Dispatcher:
         ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
         return isinstance(ingress, str) and ingress.strip() == HTTP_EVENT_INGRESS_EXTRA_VALUE
 
+    def _discord_role_state(self, event: AgentEvent) -> tuple[tuple[str, str] | None, bool]:
+        """Evaluate current Discord member roles without persisting anything."""
+        resolver = self._identity_resolver
+        if resolver is None or event.source != "discord" or event.trigger != "user_message":
+            return None, False
+        resolver.reload_if_changed()
+        identity = resolver.identity(event.author)
+        managed = (identity is not None and identity.access_source == "discord_role"
+                   and "admin" not in identity.access.roles)
+        if self._is_http_ingress(event) or not isinstance(event.author, str) or not event.author.startswith("discord-") or not event.author[8:].isdigit():
+            return None, managed
+        if identity is not None and not managed:
+            return None, False
+        guild = event.extra.get("discord_guild_id")
+        roles = event.extra.get("discord_member_role_ids")
+        if (not isinstance(guild, str) or not guild.isdigit()
+                or not isinstance(roles, list)
+                or any(not isinstance(role, str) or not role.isdigit() for role in roles)):
+            return None, managed
+        return resolver.discord_role_grant(guild, roles), managed
+
     def _intake_decision(self, event: AgentEvent) -> AccessDecision | None:
         """Return the external author decision, or None for a trusted/bypassed event."""
         is_http_ingress = self._is_http_ingress(event)
         if event.trigger != "user_message" and not is_http_ingress:
             return None
+        # Role grants belong to the Discord gateway, not other aliases/sources.
+        resolver = self._identity_resolver
+        if resolver is not None:
+            resolver.reload_if_changed()
+        identity = resolver.identity(event.author) if resolver is not None else None
+        if identity is not None and identity.access_source == "discord_role" and event.source != "discord":
+            decision = authorize_inbound(event, resolver, enforce=True)
+            return replace(decision, allowed=False, status=AccessStatus.DENIED)
         if (event.source or "").strip().lower() in TRUSTED_INTERNAL_SOURCES and not is_http_ingress:
             return None
-        return authorize_inbound(
+        decision = authorize_inbound(
             event,
             self._identity_resolver,
             enforce=self._config.access_control_enforced or not self._config.open_bridge,
         )
+        match, managed = self._discord_role_state(event)
+        if managed and match is None:
+            return replace(decision, allowed=False, status=AccessStatus.DENIED)
+        if match is not None and (managed or self._identity_resolver.identity(event.author) is None):
+            return replace(decision, allowed=True, status=AccessStatus.USER_ALLOWED,
+                           required_tier=AccessTier.USER, reason=None, roles=("user",))
+        return decision
 
     def intake_admits(self, event: AgentEvent) -> bool:
         """Side-effect-free author gate for pre-download bridge intake."""
@@ -359,6 +414,35 @@ class Dispatcher:
 
     async def _authorize_bridge_event(self, event: AgentEvent) -> bool:
         """Gate external user messages before any admission side effect."""
+        match, managed = self._discord_role_state(event)
+        if managed or match is not None:
+            from .identities_populator import grant_role_admission, revoke_role_admission
+
+            try:
+                if match is not None:
+                    changed, canonical = await asyncio.to_thread(
+                        grant_role_admission, self._config.home, event.author, *match,
+                    )
+                elif managed:
+                    changed, canonical = await asyncio.to_thread(
+                        revoke_role_admission, self._config.home, event.author,
+                    )
+                else:
+                    changed, canonical = False, None
+                if changed:
+                    self._identity_resolver.reload()
+                    await log_event(
+                        "discord_role_admission_granted" if match else "discord_role_admission_revoked",
+                        canonical=canonical,
+                        **({"guild_id": match[0], "role_id": match[1]} if match else {}),
+                    )
+                # A concurrent operator edit may have taken ownership of the entry.
+                if match is not None and canonical is None and not self._identity_resolver.is_authorized(event.author):
+                    return False
+            except Exception:  # a failed identity write cannot authorize this message
+                log.warning("discord_role_admission_write_failed", exc_info=True)
+                await log_event("discord_role_admission_write_failed")
+                return False
         decision = self._intake_decision(event)
         admitted = decision is None or decision.allowed
         source = (event.source or "").strip().lower()
@@ -437,7 +521,29 @@ class Dispatcher:
                             _denial_hints_seen.popitem(last=False)
             except Exception:  # noqa: BLE001 — logging cannot bypass the intake gate
                 pass
-        is_dm = self._is_dm_channel(event.channel_id)
+        from .identities_populator import is_private_pairing_dm
+
+        is_dm = is_private_pairing_dm(
+            source, event.channel_id,
+            conversation_type=event.extra.get("channel_conversation_type"),
+        )
+        delivery = "dm" if is_dm else "channel"
+        mode = (self._identity_resolver.unknown_sender_mode(source, delivery)
+                if self._identity_resolver is not None else
+                "ignore" if source == "email" else "pair")
+        if mode != "pair":
+            await log_event(
+                "inbound_unknown_sender_ignored" if mode == "ignore" else "inbound_unknown_sender_declined",
+                source=source or "unknown", channel_id=event.channel_id,
+                author_id=event.author_id, canonical_author=decision.canonical_author,
+                delivery=delivery,
+            )
+            if self._on_unknown_sender is not None:
+                try:
+                    await self._on_unknown_sender(event, decision, mode)
+                except Exception:  # noqa: BLE001 — denial stays closed
+                    log.debug("unknown-sender observer failed", exc_info=True)
+            return False
         if is_dm:
             await log_event(
                 "inbound_pairing_required",
@@ -450,22 +556,6 @@ class Dispatcher:
                 status=decision.status.value,
                 delivery="dm",
             )
-        elif self._unauthorized_behavior() == "prompt-to-pair":
-            await log_event(
-                "inbound_pairing_prompted",
-                source=source or "unknown",
-                channel_id=event.channel_id,
-                author=decision.author,
-                author_id=event.author_id,
-                canonical_author=decision.canonical_author,
-                reason=decision.denial_reason,
-                status=decision.status.value,
-                delivery="public_shared_channel",
-            )
-        # Pairing capture is intentionally independent of
-        # unauthorized_user_behavior. That config only controls whether mimir
-        # sends a public-channel prompt; the operator still needs visibility
-        # into unknown public/DM contacts so they can approve legitimate users.
         if self._on_pairing_required is not None:
             try:
                 await self._on_pairing_required(event, decision)
@@ -476,12 +566,6 @@ class Dispatcher:
     @staticmethod
     def _is_dm_channel(channel_id: str) -> bool:
         return channel_id.startswith("dm-")
-
-    def _unauthorized_behavior(self) -> str:
-        behavior = (
-            getattr(self._config, "unauthorized_user_behavior", "ignore") or "ignore"
-        ).strip().lower()
-        return behavior if behavior in {"ignore", "prompt-to-pair"} else "ignore"
 
     def drain_startup_user_messages(self, channel_id: str | None) -> list[AgentEvent]:
         """Remove startup-queued same-channel user messages for the turn that
@@ -744,6 +828,10 @@ class Dispatcher:
             await log_event("worker_cancelled", channel_id=channel_id)
             raise
 
+    def close_admission(self) -> None:
+        """Reject new work synchronously before HTTP handlers begin draining."""
+        self._closed = True
+
     async def drain(self, *, timeout: float | None = None) -> None:
         """Stop accepting new events and wait for in-flight turns to finish.
 
@@ -756,7 +844,7 @@ class Dispatcher:
         Best-effort event observers are cancelled first using the shared bounded
         background-task cleanup, independently of the turn timeout.
         """
-        self._closed = True
+        self.close_admission()
         for error in await cancel_background_tasks(
             self._bg_tasks, label="dispatcher observers",
         ):

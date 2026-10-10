@@ -810,3 +810,75 @@ def test_missing_file_keeps_channel_state(tmp_path: Path):
     r.reload()
     assert r.channel_count() == 1
     assert r.channel("ch-1") is not None
+def test_discord_role_policy_is_opt_in_and_hot_reloaded(tmp_path, caplog):
+    import yaml
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    resolver = IdentityResolver(tmp_path)
+    match = lambda: resolver.discord_role_grant("111", ["222"])
+    assert match() is None
+    for enabled in (False, "true", 1, None):
+        path.write_text(yaml.safe_dump({"intake": {"discord_role_admission": {
+            "enabled": enabled, "grants": [{"guild_id": 111, "role_id": 222}],
+        }}}))
+        assert match() is None
+    path.write_text(yaml.safe_dump({"intake": {"discord_role_admission": {
+        "enabled": True, "grants": ["bad", {"guild_id": 111, "role_id": 222}],
+    }}}))
+    assert match() == ("111", "222")
+    assert resolver.discord_role_grant("333", ["222"]) is None
+    assert "skipping malformed" in caplog.text
+    path.write_text("intake: [broken\n")
+    assert match() is None
+
+
+def test_intake_modes_reload_defaults_and_malformed_sections(tmp_path, caplog):
+    from mimir.identities import IdentityResolver, DEFAULT_DECLINE_TEXT
+
+    state = tmp_path / "state"
+    state.mkdir()
+    path = state / "identities.yaml"
+    path.write_text("people: [{canonical: alice, aliases: [slack-U1], access: {roles: [user]}}]\nchannels: [{canonical: slack-C1}]\n")
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    assert resolver.unknown_sender_mode("discord", "channel") == "pair"
+    assert resolver.unknown_sender_mode("slack", "dm") == "pair"
+    assert resolver.decline_text() == DEFAULT_DECLINE_TEXT
+    path.write_text("""people: [{canonical: alice, aliases: [slack-U1], access: {roles: [user]}}]
+channels: [{canonical: slack-C1}]
+intake:
+  unknown_senders:
+    discord: {channel: ignore, dm: decline}
+    slack: {channel: bogus}
+    email: {dm: decline}
+    default: {dm: ignore, channel: pair}
+  decline_text: No thanks
+  typo: pair
+""")
+    assert resolver.unknown_sender_mode("discord", "channel") == "ignore"
+    assert resolver.unknown_sender_mode("discord", "dm") == "decline"
+    assert resolver.unknown_sender_mode("slack", "channel") == "pair"
+    assert resolver.unknown_sender_mode("slack", "dm") == "ignore"
+    assert resolver.unknown_sender_mode("email", "dm") == "ignore"
+    assert resolver.decline_text() == "No thanks"
+    assert "invalid intake" in caplog.text and "unknown intake" in caplog.text
+    path.write_text("people: [{canonical: alice, aliases: [slack-U1], access: {roles: [user]}}]\nchannels: [{canonical: slack-C1}]\nintake: oops\n")
+    resolver.reload()
+    assert resolver.is_authorized("slack-U1")
+    assert resolver.channel("slack-C1") is not None
+    assert resolver.unknown_sender_mode("discord", "channel") == "pair"
+
+
+def test_model_tools_do_not_import_intake_policy():
+    import ast
+    from pathlib import Path
+
+    tools = Path(__file__).resolve().parents[1] / "mimir" / "tools"
+    for path in tools.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module in {"mimir.identities", "..identities", "identities"}:
+                assert not {alias.name for alias in node.names} & {"_parse_intake", "DEFAULT_DECLINE_TEXT"}
+            if isinstance(node, ast.Import):
+                assert not any(alias.name.endswith("intake_policy") for alias in node.names)

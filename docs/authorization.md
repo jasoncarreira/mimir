@@ -445,6 +445,28 @@ fetch adapter, and every redirect hop must independently be an exact approved or
 approved-and-ingested URL. `http://` URLs, userinfo, and explicit ports do not
 populate the set. A new turn starts with an empty set.
 
+### Egress veto shadow telemetry (#1903)
+
+After untrusted active ingest, the proposed egress veto is measured **only**:
+`fetch_url` outside verbatim-ingest URLs and approved fetch URLs (including poller
+`approved_urls`), `web_search` outside its fixed URL, `webhook`/`http_request`
+outside `MIMIR_EGRESS_APPROVED_URLS`, and cross-channel/DM `send_message` carrying
+private-source labels without a sink approval or declassification. Same-channel
+replies and clean turns do not generate a would-block. This telemetry does not
+refuse a call or change any existing shadow/enforced decision.
+
+Each `egress_veto_would_block` event includes the tool, sink category, trigger,
+service principal/poller, destination **host only** for URLs, missed exemption,
+reason, untrusted source metadata and whether the actual decision allowed it.
+The `origin` field distinguishes model `tool_call` egress from `harness` delivery;
+opaque repository source IDs retain their `#pull/N@sha` attribution. Destination
+hosts are IDNA-normalised, falling back to the raw host on encoding errors.
+To review counts by tool, host, trigger/poller, reason and origin without writing
+to the agent home, run `mimir stats --home <home> --egress-shadow` (optionally
+`--since 2026-10-09T00:00:00Z`). Historical events without an origin are grouped
+under `origin=-`; `--since` without `--egress-shadow` is an error. Arming an actual
+veto requires a separate operator decision.
+
 ### Ingest acknowledgement
 
 `clear_ingest_taint` is a model tool for an authenticated, non-service admin on
@@ -494,17 +516,86 @@ approval for one hour. The existing
 the lockout. Add `--admin` for both `user` and `admin`. The identities populator
 may add aliases and metadata but preserves operator-managed access fields.
 
+Admins can also review pending Discord and Slack pairings in the admin Users page:
+Approve grants `user`, Grant admin requires confirmation and grants `user` plus
+`admin`, and Reject blocks subsequent contact from reopening the pairing. The
+page shows the request ID and metadata, never the DM code or its hash. When an
+operator alert channel is configured, an authenticated admin may reply there
+with `approve pair-xxxx` or `decline pair-xxxx`; chat approval grants `user`
+only. IDs expire after seven days for chat replies, but the page and CLI still
+work. No model tool can approve or reject pairings.
+
+Pairing digests in the operator alert channel list the request ID for chat
+approval, `/app/admin/users` for dashboard review, and CLI approval by canonical
+identity (or, for 1:1 DMs, by the code supplied privately by the sender). The
+digest never includes the code. When intake is enforced (`MIMIR_ACCESS_CONTROL_ENFORCED`
+or `MIMIR_OPEN_BRIDGE=false`) and a Discord or Slack bridge is enabled, configure
+`MIMIR_OPERATOR_ALERT_CHANNEL` so pending requests are surfaced. Without it, the
+server warns at startup and logs each new pending request as unrouted; review
+pending identities at `/app/admin/users` or with `mimir identities list`.
+
 ### Denied-user handling
+
+#### Unknown senders
+
+The operator can edit `state/identities.yaml` alongside `people:` and `channels:`:
+
+```yaml
+intake:
+  unknown_senders:
+    default: {dm: pair, channel: pair}
+    discord: {dm: pair, channel: ignore}
+    slack: {dm: decline, channel: decline}
+  decline_text: "Sorry, I only talk to approved users."
+```
+
+Missing settings default to `pair` for both deliveries. `pair` records a pending
+request, notifies the operator, and sends a pairing code only in a 1:1 DM; it
+never replies in a public channel. `ignore` records no pairing and sends no
+reply, but adds one digest notice per sender per process. `decline` records no
+pairing and sends the fixed refusal at most once per sender per process, paced
+by the global DM auto-reply worker. In public channels Discord sends a private
+DM and Slack sends an ephemeral message visible only to that user. Delivery
+failures never cause a public response. Email always ignores denials. The file
+hot-reloads; malformed settings fall back to the defaults without changing
+roles. These three options correspond to Hermes' `unauthorized_dm_behavior`
+`pair`, `ignore`, and `decline`; they only handle denials, never grant access.
+
+Only the operator can change this file; model file tools cannot write it.
+
+#### Discord role admission
+
+Optionally admit members holding a specified role in a specified Discord guild:
+
+```yaml
+intake:
+  discord_role_admission:
+    enabled: true
+    grants:
+      - {guild_id: "111", role_id: "222"}
+```
+
+This is off by default; only literal `true` enables it. Only holders of a
+configured role in its matching guild are admitted, always as `user`, never
+`admin`. Membership is re-checked on every message: removing the Discord role,
+disabling the feature, or removing the grant revokes a bridge-managed identity
+on its next message. Operator-approved identities remain untouched. DMs and
+webhooks carry no guild-member roles and cannot use this admission path.
+Slack user groups are not covered by this Discord-only option. While an entry
+has `access.source: discord_role`, its stored grant cannot authorize messages
+from Slack, web, or other non-Discord sources, even through an added alias.
+An explicit operator approval (including pairing-code approval) takes ownership
+by removing `source`, `granted_by`, and `revoked_at`; later role loss cannot
+undo that approval. Identity grant/revoke writes run off the event loop.
 
 | Setting | Default | Authorization effect |
 |---|---|---|
-| `MIMIR_UNAUTHORIZED_USER_BEHAVIOR` | `ignore` | Controls the additional `inbound_pairing_prompted` event for an enforced public/shared-channel denial. Every enforced denial may still be recorded as a pending pairing and notify the operator; denied turns are never enqueued. No public reply is sent by this setting. |
 | `MIMIR_PAIRING_PENDING_MAX` | `100` | Caps newly recorded pending identities. `0` rejects new pending identities; a negative value disables the cap. |
 | `MIMIR_PAIRING_OPERATOR_DIGEST_DELAY_SECONDS` | `1.0` | Coalesces operator pairing notifications; clamped to zero or greater. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_ENABLED` | `true` | Sends a best-effort pairing code to a denied DM sender; it does not grant access. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_INTERVAL_SECONDS` | `30.0` | Global DM response interval, clamped to zero or greater. |
 | `MIMIR_PAIRING_DM_AUTO_REPLY_TEXT` | `I don't recognize you yet, so I can't reply until the operator approves you. Your pairing code is \`{code}\` (valid for 1 hour). Send it to the operator; after approval, send your message again.` | DM response template; `{code}` is replaced, or a code line is appended if absent. |
-| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message. |
+| `MIMIR_OPERATOR_ALERT_CHANNEL` | empty | Destination for pairing digests/cap alerts and other operator alerts. Empty leaves pairing recorded without an operator message; enforced Discord/Slack intake warns at startup. |
 | `MIMIR_IDENTITIES_POPULATE_CRON` | empty | Enables identity alias/metadata discovery. It does not grant roles. |
 
 ### HTTP identity and transport

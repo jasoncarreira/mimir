@@ -596,10 +596,8 @@ services:
         MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
     container_name: {SERVICE_NAME}
     restart: unless-stopped
-    # chainlink #510: give the graceful drain time to finish in-flight turns
-    # on stop/restart before Docker SIGKILLs. Keep this >= MIMIR_DRAIN_TIMEOUT_SECONDS
-    # (default 30s); Docker's default grace is only 10s, which would cut the
-    # drain off mid-turn.
+    # Stop grace > MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS (5s) +
+    # MIMIR_DRAIN_TIMEOUT_SECONDS (30s) + cleanup margin (9s).
     stop_grace_period: 45s
     env_file:
       - compose.env
@@ -669,10 +667,8 @@ services:
         MIMIR_CODING_ENABLED: "${MIMIR_CODING_ENABLED:-false}"
     container_name: {SERVICE_NAME}
     restart: unless-stopped
-    # chainlink #510: give the graceful drain time to finish in-flight turns
-    # on stop/restart before Docker SIGKILLs. Keep this >= MIMIR_DRAIN_TIMEOUT_SECONDS
-    # (default 30s); Docker's default grace is only 10s, which would cut the
-    # drain off mid-turn.
+    # Stop grace > MIMIR_HTTP_SHUTDOWN_TIMEOUT_SECONDS (5s) +
+    # MIMIR_DRAIN_TIMEOUT_SECONDS (30s) + cleanup margin (9s).
     stop_grace_period: 45s
     env_file:
       - compose.env

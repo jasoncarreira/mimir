@@ -14,6 +14,7 @@ from dataclasses import asdict
 from datetime import date, datetime, time, timezone
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from langchain.tools import ToolRuntime
@@ -22,6 +23,7 @@ from langchain_core.tools.base import create_schema_from_function
 from pydantic import StrictInt
 
 from ..forge import ForgeClient, ForgeError, IssueTarget, PullRequestProjection, ReviewVerdict
+from ..github_withhold import WithheldItem, partition, placeholder, sanitize_login, sanitize_url, summarise
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
@@ -393,8 +395,14 @@ def resolve_review_state_for_context(
                     latest[review.author] = state
             if "CHANGES_REQUESTED" in latest.values():
                 review_state = "CHANGES_REQUESTED"
+    verdict = (
+        True if snapshot.author == self_login else
+        _author_verdict(context, snapshot.repo, snapshot.author, client)
+        if isinstance(snapshot.author, str) and snapshot.author else None
+    )
     resolution = resolve_server_discovered_review_scope(
         snapshot.repo, snapshot, review_state=review_state,
+        pr_author_is_trusted=verdict,
     )
     scope = resolution.scope
     if (
@@ -506,6 +514,7 @@ def revalidate_review_head_for_context(
             scope.canonical_repo, scope.pr_number,
         )
     except ForgeError as exc:
+        _publish_scoped_error(SimpleNamespace(context=context), scope)
         raise ToolException(f"pull-request operation rejected: {exc}") from exc
     if (
         not isinstance(snapshot.repo, str)
@@ -547,6 +556,7 @@ def remediation_checkout_preflight(
     try:
         snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
     except ForgeError as exc:
+        _publish_scoped_error(SimpleNamespace(context=context), scope)
         raise ToolException(f"repository checkout rejected: {exc}") from exc
     if snapshot.state != "open":
         return None, "pull request is closed or merged"
@@ -570,6 +580,7 @@ def remediation_checkout_preflight(
         try:
             checks = client.list_checks(scope)
         except ForgeError as exc:
+            _publish_scoped_error(SimpleNamespace(context=context), scope)
             raise ToolException(f"repository checkout rejected: {exc}") from exc
         if not any(
             check.status == "completed"
@@ -780,7 +791,31 @@ def _path(value: str) -> str:
     return value
 
 
-def _call(operation: Any) -> Any:
+def _publish_scoped_error(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope | None) -> None:
+    """Attest server error text only after an exact own-repository PR is known."""
+    if scope is None:
+        return
+    from ..access_control import _github_repo_from_remote
+
+    context = getattr(runtime, "context", None)
+    author = scope.pull_request_author
+    if (
+        context is None or context.ifc_state is None or not author
+        or scope.head_repo != scope.canonical_repo
+        or scope.head_remote != "origin"
+        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    ):
+        return
+    try:
+        if _author_verdict(context, scope, author, _client(scope)) is True:
+            _publish_author_attestation(runtime, scope, (author,), "forge_error")
+    except ForgeError:
+        return
+
+
+def _call(operation: Any, *, runtime: ToolRuntime[AuthContext] | None = None,
+          scope: RepoPRActionScope | None = None) -> Any:
     try:
         return operation()
     except ForgeError as exc:
@@ -799,26 +834,63 @@ def _call(operation: Any) -> Any:
             ) from exc
         # The adapter may have contacted the forge before failing, so this is a
         # fault rather than a proven pre-execution policy refusal.
+        _publish_scoped_error(runtime, scope)
         raise ToolException(str(exc)) from exc
 
 
-def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str, client: Any) -> bool | None:
+def _author_verdict(context: AuthContext, repo: str | RepoPRActionScope, author: str, client: Any) -> bool | None:
     from ..config import trusted_github_bot_logins
 
+    repository = repo.canonical_repo if isinstance(repo, RepoPRActionScope) else repo
+    if not isinstance(author, str) or not author or context.ifc_state is None:
+        return None
     attest = getattr(client, "author_is_trusted", None)
     if _BOT_LOGIN.fullmatch(author):
         # A bot is trusted only by exact operator designation; never ask the
         # collaborator API to upgrade an unlisted app identity.
         return context.ifc_state.repository_author_trust.resolve(
-            scope.canonical_repo, author,
+            repository, author,
             lambda: author.casefold() in trusted_github_bot_logins(),
         )
     if not callable(attest):
         return None
     return context.ifc_state.repository_author_trust.resolve(
-        scope.canonical_repo, author,
-        lambda: attest(scope.canonical_repo, author),
+        repository, author,
+        lambda: attest(repository, author),
     )
+
+
+def _withheld_event(tool: str, kind: str, reason: str, count: int = 1) -> None:
+    from ..event_logger import log_event_sync
+
+    try:
+        log_event_sync("github_content_withheld", tool=tool, kind=kind, count=count, reason=reason)
+    except RuntimeError:
+        pass
+
+
+def _withhold_thread(runtime: ToolRuntime[AuthContext], scope: RepoPRActionScope,
+                     items: Any, tool: str) -> list[dict[str, Any]]:
+    client = _client(scope)
+    context = runtime.context
+    projected = [dict(asdict(item), kind=(
+        "review" if tool == "pr_reviews" else
+        "review_comment" if item.path is not None else "comment"
+    ), repository=scope.canonical_repo) for item in items]
+    kept, withheld = partition(
+        projected, lambda item: item["author"],
+        lambda author: _author_verdict(context, scope, author, client),
+    )
+    _publish_author_attestation(runtime, scope, tuple(item["author"] for item in kept), tool)
+    for item in withheld:
+        _withheld_event(tool, item.kind, item.reason)
+    result = [{key: value for key, value in item.items() if key not in {"kind", "repository"}}
+              for item in kept]
+    if len(withheld) > 20:
+        result.append(summarise(withheld))
+    else:
+        result.extend(placeholder(item) for item in withheld)
+    return result
 
 
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
@@ -831,7 +903,7 @@ def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope:
     client = _client(scope)
     if not callable(getattr(client, "author_is_trusted", None)):
         return
-    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+    authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
     _publish_author_attestation(
         runtime, scope, authors, "forge_projection", head_sha=scope.observed_head_sha,
     )
@@ -1027,7 +1099,49 @@ def pr_list(
             repo, query=query, state=state, base=base, head=head, limit=limit,
             author=author, merged_since=since,
         ))
-    return [asdict(item) for item in items]
+    context = getattr(runtime, "context", None)
+    if context is None or context.ifc_state is None:
+        # Direct invocations have no turn cache; still attest before projecting.
+        def verdict_for(author: str) -> bool | None:
+            from ..config import trusted_github_bot_logins
+
+            if not isinstance(author, str) or not author:
+                return None
+            if _BOT_LOGIN.fullmatch(author):
+                return author.casefold() in trusted_github_bot_logins()
+            attest = getattr(client, "author_is_trusted", None)
+            return attest(repo, author) if callable(attest) else None
+    else:
+        verdict_for = lambda author: _author_verdict(context, repo, author, client)
+    result = []
+    trusted = True
+    for item in items:
+        verdict = verdict_for(item.author)
+        if verdict is True:
+            result.append(asdict(item))
+            continue
+        trusted = False
+        reason = ("attestation_unavailable" if verdict is None else
+                  "bot_not_allowlisted" if item.author.endswith("[bot]") else "non_collaborator")
+        result.append({"number": item.number, **placeholder(WithheldItem(
+            "pull_request", sanitize_login(item.author), None,
+            sanitize_url(item.url, repo), reason,
+        ))})
+        _withheld_event("pr_list", "pull_request", reason)
+    if trusted and context is not None:
+        from ..access_control import publish_protected_result
+        from ..models import SourceLabel
+
+        principal = context.canonical_principal
+        if context.is_service and principal:
+            principal = f"service:{principal}"
+        publish_protected_result((SourceLabel(
+            principal=principal, domain="repository", resource_id=f"{repo.lower()}#pulls",
+            bridge_instance="forge", sensitivity="internal",
+            authorized_principals=frozenset({principal}) if principal else frozenset(),
+            source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+        ),))
+    return result
 
 
 @tool
@@ -1038,7 +1152,7 @@ def pr_metadata(
 ) -> dict[str, Any]:
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
-    metadata = _call(lambda: _client(scope).get_pull_request(scope))
+    metadata = _call(lambda: _client(scope).get_pull_request(scope), runtime=runtime, scope=scope)
     authors, head_sha = _pr_attestation(metadata, scope, runtime)
     _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
@@ -1053,9 +1167,9 @@ def pr_files(
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    items = _call(lambda: client.list_files(scope))
+    items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
     return [asdict(item) for item in items]
 
@@ -1069,9 +1183,9 @@ def pr_diff(
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    diff = _call(lambda: client.get_diff(scope))
+    diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
     return diff
 
@@ -1086,9 +1200,9 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
-    content = _call(lambda: client.get_file_content(scope, path))
+    content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
     return content
 
@@ -1101,7 +1215,7 @@ def pr_checks(
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
-    checks = _call(lambda: _client(scope).list_checks(scope))
+    checks = _call(lambda: _client(scope).list_checks(scope), runtime=runtime, scope=scope)
     if all(_safe_check_projection(item, scope) for item in checks):
         _publish_trusted_projection(runtime, scope)
     return [asdict(item) for item in checks]
@@ -1144,14 +1258,73 @@ def pr_job_log(
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     client = _client(scope)
-    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id))
+    excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
     if callable(getattr(client, "author_is_trusted", None)):
-        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime))
+        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
         # get_job_log independently pins job/run metadata to this exact head.
         _publish_author_attestation(
             runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
         )
     return excerpt
+
+
+def _attest_ci_runs(runtime: ToolRuntime[AuthContext] | None, repository: str,
+                    runs: list[dict[str, Any]], resource_id: str) -> None:
+    """Publish only when every returned run belongs to a protected head."""
+    from ..access_control import publish_protected_result
+    from ..models import SourceLabel
+
+    context = getattr(runtime, "context", None)
+    if context is None or not runs or not all(
+        _trusted_ci_head(context, repository, run) for run in runs
+    ):
+        return
+    principal = context.canonical_principal
+    if context.is_service and principal:
+        principal = f"service:{principal}"
+    publish_protected_result((SourceLabel(
+        principal=principal, domain="repository", resource_id=resource_id,
+        bridge_instance="forge", sensitivity="internal",
+        authorized_principals=frozenset({principal}) if principal else frozenset(),
+        source_kind="protected_tool", integrity="trusted", integrity_effect="active_ingest",
+    ),))
+
+
+def _trusted_ci_head(context: AuthContext, repository: str, run: dict[str, Any]) -> bool:
+    from ..repo_tools import _PROTECTED_BRANCH_REFS
+
+    if not isinstance(run, dict):
+        return False
+    branch, sha = run.get("head_branch"), run.get("head_sha")
+    if (
+        not isinstance(run.get("head_repository"), str)
+        or run["head_repository"].lower() != repository.lower()
+        or not isinstance(sha, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", sha) is None
+    ):
+        return False
+    if isinstance(branch, str) and f"refs/heads/{branch}" in _PROTECTED_BRANCH_REFS:
+        return True
+    for inventory in (context.server_discovered_pr_states, context.repo_pr_scope_registry):
+        for state in getattr(inventory, "review_states", ()):
+            scope = state.action_scope
+            if (
+                scope.canonical_repo == repository.lower()
+                and scope.head_repo == repository.lower()
+                and scope.head_remote == "origin"
+                and _github_origin_matches(scope)
+                and scope.head_ref == branch and scope.observed_head_sha == sha
+                and context.ifc_state is not None
+                and context.ifc_state.pr_checkout_author_trust.get(scope.scope_id) is True
+            ):
+                return True
+    return False
+
+
+def _github_origin_matches(scope: RepoPRActionScope) -> bool:
+    from ..access_control import _github_repo_from_remote
+
+    return _github_repo_from_remote(scope.canonical_origin) == scope.canonical_repo
 
 
 @tool
@@ -1171,7 +1344,11 @@ def ci_run_jobs(
         context, "ci_run_targets", frozenset(),
     ):
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
-    return _call(lambda: _client_for_repository(repo).list_run_jobs(repo, run_id))
+    client = _client_for_repository(repo)
+    run = _call(lambda: client.get_run(repo, run_id))
+    if isinstance(run, dict) and run.get("id") == run_id:
+        _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}/jobs")
+    return _call(lambda: client.list_run_jobs(repo, run_id))
 
 
 @tool
@@ -1191,7 +1368,10 @@ def ci_run(
         context, "ci_run_targets", frozenset(),
     ):
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
-    return _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+    run = _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+    if isinstance(run, dict) and run.get("id") == run_id:
+        _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}")
+    return run
 
 
 @tool
@@ -1223,7 +1403,15 @@ def ci_recent_runs(
     if type(limit) is not int:
         raise ToolPolicyRefusal("CI runs rejected: limit must be an integer")
     bounded_limit = max(1, min(20, limit))
-    return _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+    runs = _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+    if isinstance(runs, list) and all(
+        isinstance(run, dict) and run.get("head_branch") == branch
+        and (workflow_id is None or run.get("workflow_id") == workflow_id)
+        for run in runs
+    ):
+        _attest_ci_runs(runtime, repo, runs, f"{repo.lower()}#actions/runs?branch={branch}"
+                        + (f"&workflow={workflow_id}" if workflow_id is not None else ""))
+    return runs
 
 
 @tool
@@ -1234,9 +1422,8 @@ def pr_reviews(
 ) -> list[dict[str, Any]]:
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_reviews(scope))
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_reviews")
-    return [asdict(item) for item in items]
+    items = _call(lambda: _client(scope).list_reviews(scope), runtime=runtime, scope=scope)
+    return _withhold_thread(runtime, scope, items, "pr_reviews")
 
 
 @tool
@@ -1247,9 +1434,8 @@ def pr_comments(
 ) -> list[dict[str, Any]]:
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_comments(scope))
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_comments")
-    return [asdict(item) for item in items]
+    items = _call(lambda: _client(scope).list_comments(scope), runtime=runtime, scope=scope)
+    return _withhold_thread(runtime, scope, items, "pr_comments")
 
 
 @tool
@@ -1260,7 +1446,7 @@ def pr_review_requests(
 ) -> list[dict[str, Any]]:
     """List bounded pending review requests for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
-    items = _call(lambda: _client(scope).list_review_requests(scope))
+    items = _call(lambda: _client(scope).list_review_requests(scope), runtime=runtime, scope=scope)
     if all(
         item.kind in {"user", "team"} and isinstance(item.reviewer, str)
         and _REVIEWER.fullmatch(item.reviewer) is not None for item in items

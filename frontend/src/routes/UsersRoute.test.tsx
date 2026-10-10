@@ -7,13 +7,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { UsersView } from "./UsersRoute";
 
 const { api } = vi.hoisted(() => ({
-  api: { listUsers: vi.fn(), issueUserKey: vi.fn(), revokeUserKey: vi.fn() }
+  api: { listUsers: vi.fn(), issueUserKey: vi.fn(), revokeUserKey: vi.fn(), approveUserPairing: vi.fn(), rejectUserPairing: vi.fn() }
 }));
 
 vi.mock("../api/admin-users", () => ({
   listUsers: api.listUsers,
   issueUserKey: api.issueUserKey,
-  revokeUserKey: api.revokeUserKey
+  revokeUserKey: api.revokeUserKey,
+  approveUserPairing: api.approveUserPairing,
+  rejectUserPairing: api.rejectUserPairing
 }));
 
 function renderUsers() {
@@ -35,6 +37,35 @@ afterEach(() => {
 });
 
 describe("UsersView (#563)", () => {
+  it("reviews pending accounts and requires confirmation before granting admin", async () => {
+    api.listUsers.mockResolvedValue(envelope({ users: [
+      { canonical: "discord-123", display_name: "Alice", roles: [], web_keys: [], has_web_key: false,
+        pairing: { status: "pending", platform: "discord", delivery: "dm", requested_at: "2026-10-09", request_id: "pair-abcd" } },
+      { canonical: "slack-U1", display_name: "Bob", roles: [], web_keys: [], has_web_key: false,
+        pairing: { status: "pending", platform: "slack", delivery: "public_shared_channel", requested_at: "2026-10-09", request_id: "pair-bcde" } },
+      { canonical: "discord-456", display_name: "Charlie", roles: [], web_keys: [], has_web_key: false,
+        pairing: { status: "rejected", platform: "discord", delivery: "dm", requested_at: "2026-10-08", request_id: null } }
+    ] }));
+    api.approveUserPairing.mockResolvedValue(envelope({ canonical: "discord-123" }));
+    api.rejectUserPairing.mockResolvedValue(envelope({ canonical: "slack-U1" }));
+    renderUsers();
+    expect(await screen.findByText("Pending approval")).toBeTruthy();
+    expect((await screen.findAllByText("discord-123")).length).toBeGreaterThan(0);
+    expect(screen.getByText("DM")).toBeTruthy();
+    expect(screen.getByText("Public")).toBeTruthy();
+    expect(screen.getByText("Rejected")).toBeTruthy();
+    fireEvent.click(screen.getAllByRole("button", { name: "Approve" })[0]);
+    await waitFor(() => expect(api.approveUserPairing).toHaveBeenCalledWith("discord-123", "user"));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Grant admin" })[1].hasAttribute("disabled")).toBe(false));
+    fireEvent.click(screen.getAllByRole("button", { name: "Grant admin" })[1]);
+    expect(screen.getByText(/Grant admin to Bob/)).toBeTruthy();
+    expect(api.approveUserPairing).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm grant admin" }));
+    await waitFor(() => expect(api.approveUserPairing).toHaveBeenCalledWith("slack-U1", "admin"));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Reject" })[0].hasAttribute("disabled")).toBe(false));
+    fireEvent.click(screen.getAllByRole("button", { name: "Reject" })[0]);
+    await waitFor(() => expect(api.rejectUserPairing).toHaveBeenCalledWith("discord-123"));
+  });
   it("lists users with roles + key status", async () => {
     api.listUsers.mockResolvedValue(
       envelope({

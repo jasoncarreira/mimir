@@ -157,6 +157,69 @@ class AccessMetadata:
 
 
 _KNOWN_ACCESS_VALUES = {"user", "admin"}
+DEFAULT_DECLINE_TEXT = "Sorry, I only talk to approved users."
+_INTAKE_MODES = {"pair", "ignore", "decline"}
+_INTAKE_PLATFORMS = {"discord", "slack"}
+
+
+def _parse_discord_role_admission(raw: object) -> tuple[tuple[str, str], ...]:
+    """Return enabled (guild, role) pairs; malformed policy never grants access."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        log.warning("identities.yaml: intake.discord_role_admission is not a map")
+        return ()
+    if raw.get("enabled") is not True:
+        return ()
+    grants = raw.get("grants")
+    if not isinstance(grants, list):
+        log.warning("identities.yaml: intake.discord_role_admission.grants is not a list")
+        return ()
+    pairs = []
+    for grant in grants:
+        if not isinstance(grant, dict) or any(
+            type(grant.get(key)) not in (str, int)
+            or not str(grant[key]).isdigit()
+            for key in ("guild_id", "role_id")
+        ):
+            log.warning("identities.yaml: skipping malformed discord role admission grant: %r", grant)
+            continue
+        pairs.append((str(grant["guild_id"]), str(grant["role_id"])))
+    return tuple(pairs)
+
+
+def _parse_intake(raw: object) -> tuple[dict[str, dict[str, str]], str]:
+    modes = {"default": {"dm": "pair", "channel": "pair"}}
+    if raw is None:
+        return modes, DEFAULT_DECLINE_TEXT
+    if not isinstance(raw, dict):
+        log.warning("identities.yaml: intake is not a map; using defaults")
+        return modes, DEFAULT_DECLINE_TEXT
+    for key in raw.keys() - {"unknown_senders", "decline_text", "discord_role_admission"}:
+        log.warning("identities.yaml: unknown intake key %r", key)
+    text = raw.get("decline_text", DEFAULT_DECLINE_TEXT)
+    if not isinstance(text, str) or not text.strip():
+        log.warning("identities.yaml: invalid intake.decline_text; using default")
+        text = DEFAULT_DECLINE_TEXT
+    senders = raw.get("unknown_senders", {})
+    if not isinstance(senders, dict):
+        log.warning("identities.yaml: intake.unknown_senders is not a map")
+        return modes, text
+    for platform, slots in senders.items():
+        if platform != "default" and platform not in _INTAKE_PLATFORMS:
+            log.warning("identities.yaml: unknown intake platform %r", platform)
+            continue
+        if not isinstance(slots, dict):
+            log.warning("identities.yaml: intake.%s is not a map", platform)
+            continue
+        parsed = modes["default"].copy() if platform == "default" else {}
+        for slot, mode in slots.items():
+            if slot not in {"dm", "channel"} or not isinstance(mode, str) or mode not in _INTAKE_MODES:
+                log.warning("identities.yaml: invalid intake.%s.%s mode %r", platform, slot, mode)
+                continue
+            parsed[slot] = mode
+        modes[platform] = parsed
+    return modes, text
 
 
 @dataclass
@@ -168,6 +231,7 @@ class Identity:
     aliases: list[str] = field(default_factory=list)
     notes: str | None = None
     access: AccessMetadata = field(default_factory=AccessMetadata)
+    access_source: str | None = None
     # User-facing web preferences. Kept deliberately generic so new frontend
     # preferences can ride the same identities.yaml field without schema churn.
     prefs: dict[str, object] = field(default_factory=dict)
@@ -177,6 +241,22 @@ class Identity:
     # reach this person directly without the operator pre-configuring it.
     dm_channels: dict[str, str] = field(default_factory=dict)
     web_key_labels: dict[str, str] = field(default_factory=dict)
+    pairing: PairingView | None = None
+
+
+@dataclass(frozen=True)
+class PairingView:
+    """Public metadata only: no code or private channel data crosses this boundary."""
+
+    status: str | None
+    platform: str | None
+    delivery: str | None
+    requested_at: str | None
+    request_id: str | None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {key: getattr(self, key) for key in
+                ("status", "platform", "delivery", "requested_at", "request_id")}
 
 
 @dataclass
@@ -219,6 +299,9 @@ class IdentityResolver:
         self._channel_alias_map: dict[str, str] = {}  # alias → canonical
         self._channel_display_names: dict[str, str] = {}
         self._channels: dict[str, Channel] = {}
+        self._intake_modes: dict[str, dict[str, str]] = {"default": {"dm": "pair", "channel": "pair"}}
+        self._decline_text = DEFAULT_DECLINE_TEXT
+        self._discord_role_grants: tuple[tuple[str, str], ...] = ()
         # Credential loss or an unreadable credential source must not restore
         # the unauthenticated first-run mode.
         self._web_gate_latched = False
@@ -410,6 +493,11 @@ class IdentityResolver:
                 notes = None
 
             access = self._parse_access(raw.get("access"), canonical)
+            raw_pairing = raw.get("pairing")
+            pairing = PairingView(**{
+                key: raw_pairing.get(key) if isinstance(raw_pairing.get(key), str) else None
+                for key in ("status", "platform", "delivery", "requested_at", "request_id")
+            }) if isinstance(raw_pairing, dict) else None
 
             raw_prefs = raw.get("prefs") or {}
             prefs: dict[str, object] = raw_prefs if isinstance(raw_prefs, dict) else {}
@@ -444,9 +532,13 @@ class IdentityResolver:
                 aliases=aliases,
                 notes=notes,
                 access=access,
+                access_source=(raw["access"].get("source")
+                               if isinstance(raw.get("access"), dict)
+                               and isinstance(raw["access"].get("source"), str) else None),
                 prefs=dict(prefs),
                 dm_channels=dm_channels,
                 web_key_labels=web_key_labels(aliases, raw.get("web_key_labels")),
+                pairing=pairing,
             )
             if display_name:
                 display_names[canonical] = display_name
@@ -577,6 +669,13 @@ class IdentityResolver:
         self._channel_alias_map = channel_alias_map
         self._channel_display_names = channel_display_names
         self._channels = channels
+        self._intake_modes, self._decline_text = _parse_intake(
+            doc.get("intake") if isinstance(doc, dict) else None
+        )
+        intake = doc.get("intake") if isinstance(doc, dict) else None
+        self._discord_role_grants = _parse_discord_role_admission(
+            intake.get("discord_role_admission") if isinstance(intake, dict) else None
+        )
         has_web_keys = any(
             alias.startswith(WEB_KEY_ALIAS_PREFIX) for alias in alias_map
         )
@@ -602,6 +701,28 @@ class IdentityResolver:
                 self._reload_unlocked()
                 self._identities_signature = signature
             return self._web_key_source_valid
+
+    def unknown_sender_mode(self, platform: str, delivery: str) -> str:
+        """Denial handling only; never grants admission. Email is always silent."""
+        if platform == "email":
+            return "ignore"
+        with self._lock:
+            self.reload_if_changed()
+            slot = "dm" if delivery == "dm" else "channel"
+            return self._intake_modes.get(platform, {}).get(slot, self._intake_modes["default"][slot])
+
+    def decline_text(self) -> str:
+        with self._lock:
+            self.reload_if_changed()
+            return self._decline_text
+
+    def discord_role_grant(self, guild_id: str, role_ids: list[str]) -> tuple[str, str] | None:
+        """Match current bridge member roles to enabled operator grants."""
+        with self._lock:
+            if not self.reload_if_changed():
+                return None
+            return next((pair for pair in self._discord_role_grants
+                         if pair[0] == guild_id and pair[1] in role_ids), None)
 
     def resolve(self, author: str | None) -> str | None:
         """Map ``author`` (a platform-prefixed id) to canonical. Unknown

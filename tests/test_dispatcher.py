@@ -44,6 +44,270 @@ def _resolver(tmp_path: Path, body: str) -> IdentityResolver:
     return resolver
 
 
+def _role_event(*, guild="111", roles=("222",), author="discord-9", extra=None):
+    return AgentEvent(
+        trigger="user_message", source="discord", channel_id="discord-10",
+        author=author, author_id="9", content="private message text",
+        author_display="Private Display Name",
+        extra=({"discord_guild_id": guild, "discord_member_role_ids": list(roles)}
+               if extra is None else extra),
+    )
+
+
+def _role_policy(enabled=True, grants=None):
+    import yaml
+    return yaml.safe_dump({"people": [], "intake": {"discord_role_admission": {
+        "enabled": enabled,
+        "grants": [{"guild_id": "111", "role_id": "222"}] if grants is None else grants,
+    }}})
+
+
+@pytest.mark.asyncio
+async def test_discord_role_admission_persists_once_and_revokes_on_role_loss(tmp_path, monkeypatch):
+    import yaml
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    path = tmp_path / "state" / "identities.yaml"
+    writes = []
+    original = pop._atomic_write_identities
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: (writes.append(1), original(*args)))
+    event = _role_event()
+    assert disp.intake_admits(event)
+    assert writes == []
+    assert await disp._authorize_bridge_event(event)
+    assert writes == [1]
+    person = yaml.safe_load(path.read_text())["people"][0]
+    assert person["canonical"] == "discord-9"
+    assert person["aliases"] == ["discord-9"]
+    assert person["access"] == {"roles": ["user"], "source": "discord_role",
+                                "granted_by": {"guild_id": "111", "role_id": "222"}}
+    assert resolver.access_metadata(event.author).roles == ("user",)
+    assert await disp._authorize_bridge_event(event)
+    assert writes == [1]
+    assert not disp.intake_admits(_role_event(roles=()))
+    assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert writes == [1, 1]
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access["roles"] == [] and access["revoked_at"]
+    assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert writes == [1, 1]
+    records = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    granted = [r for r in records if r["type"] == "discord_role_admission_granted"]
+    revoked = [r for r in records if r["type"] == "discord_role_admission_revoked"]
+    assert len(granted) == len(revoked) == 1
+    assert all("Private" not in json.dumps(r) for r in granted + revoked)
+    assert all(r["canonical"] == "discord-9" for r in granted + revoked)
+    assert granted[0]["guild_id"] == "111" and granted[0]["role_id"] == "222"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [
+    {"discord_guild_id": "333", "discord_member_role_ids": ["222"]},
+    {"discord_guild_id": "111", "discord_member_role_ids": []},
+    {"discord_guild_id": "111"}, {},
+    {"discord_guild_id": "111", "discord_member_role_ids": ["222"],
+     HTTP_EVENT_INGRESS_EXTRA_KEY: HTTP_EVENT_INGRESS_EXTRA_VALUE},
+])
+async def test_discord_role_admission_denies_missing_wrong_and_http_extras(tmp_path, monkeypatch, extra):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: pytest.fail("identity write"))
+    event = _role_event(extra=extra)
+    assert not disp.intake_admits(event)
+    assert not await disp._authorize_bridge_event(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,trigger,extra", [
+    ("slack", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": ["222"]}),
+    ("discord", "poller", {"discord_guild_id": "111", "discord_member_role_ids": ["222"]}),
+    ("discord", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": [222]}),
+    ("discord", "user_message", {"discord_guild_id": "111", "discord_member_role_ids": "222"}),
+    ("discord", "user_message", {"discord_guild_id": 111, "discord_member_role_ids": ["222"]}),
+])
+async def test_discord_role_admission_requires_bridge_message_and_valid_snapshot(tmp_path, source, trigger, extra):
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    event = _role_event(extra=extra)
+    event.source = source
+    event.trigger = trigger
+    if trigger == "user_message":
+        assert not disp.intake_admits(event)
+        assert not await disp._authorize_bridge_event(event)
+    else:
+        assert disp._discord_role_state(event)[0] is None
+    assert resolver.identity("discord-9") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["people: []\n", _role_policy(False), _role_policy("true")])
+async def test_discord_role_admission_disabled_no_write(tmp_path, monkeypatch, policy):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, policy)
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: pytest.fail("identity write"))
+    assert not disp.intake_admits(_role_event())
+    assert not await disp._authorize_bridge_event(_role_event())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["disable", "remove"])
+async def test_discord_role_admission_config_change_revokes(tmp_path, change):
+    import yaml
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    path = tmp_path / "state" / "identities.yaml"
+    doc = yaml.safe_load(path.read_text())
+    policy = doc["intake"]["discord_role_admission"]
+    if change == "disable":
+        policy["enabled"] = False
+    else:
+        policy["grants"] = []
+    path.write_text(yaml.safe_dump(doc))
+    assert not disp.intake_admits(_role_event())
+    assert not await disp._authorize_bridge_event(_role_event())
+    assert yaml.safe_load(path.read_text())["people"][0]["access"]["roles"] == []
+
+
+@pytest.mark.asyncio
+async def test_discord_role_admission_write_failure_is_denied(tmp_path, monkeypatch):
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    monkeypatch.setattr(pop, "_atomic_write_identities", lambda *args: (_ for _ in ()).throw(OSError("failed")))
+    assert not await disp._authorize_bridge_event(_role_event())
+    assert resolver.identity("discord-9") is None
+    records = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert any(r["type"] == "discord_role_admission_write_failed" for r in records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access", ["{roles: []}", "{roles: [user]}",
+                                         "{roles: [admin]}", "{roles: [user, admin], source: discord_role}"])
+async def test_discord_role_admission_preserves_operator_access(tmp_path, access):
+    resolver = _resolver(tmp_path, _role_policy())
+    path = tmp_path / "state" / "identities.yaml"
+    import yaml
+    doc = yaml.safe_load(path.read_text())
+    doc["people"] = [yaml.safe_load(f"{{canonical: ops, aliases: [discord-9], access: {access}}}")]
+    path.write_text(yaml.safe_dump(doc))
+    resolver.reload()
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    before = path.read_bytes()
+    authorized = bool(resolver.access_metadata("discord-9").roles)
+    assert disp.intake_admits(_role_event()) is authorized
+    assert await disp._authorize_bridge_event(_role_event()) is authorized
+    assert await disp._authorize_bridge_event(_role_event(roles=())) is authorized
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [{"role": "admin"}, {"roles": ["admin"]}])
+async def test_discord_role_grant_cannot_configure_admin(tmp_path, override):
+    import yaml
+
+    grant = {"guild_id": "111", "role_id": "222", **override}
+    resolver = _resolver(tmp_path, _role_policy(grants=[grant]))
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    access = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())["people"][0]["access"]
+    assert access["roles"] == ["user"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoked", [False, True])
+async def test_operator_approval_takes_ownership_of_discord_role_entry(tmp_path, revoked):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    if revoked:
+        assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert approve_pairing(tmp_path, "discord-9")
+    path = tmp_path / "state" / "identities.yaml"
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access == {"roles": ["user"]}
+    before = path.read_bytes()
+    assert disp.intake_admits(_role_event(roles=()))
+    assert await disp._authorize_bridge_event(_role_event(roles=()))
+    assert path.read_bytes() == before
+    assert resolver.access_metadata("discord-9").roles == ("user",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,author,channel", [
+    ("slack", "slack-U9", "slack-C9"),
+    ("web", "web-user9", "web-session9"),
+    ("http_event", "discord-9", "discord-10"),
+])
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_discord_role_grant_does_not_authorize_other_sources(tmp_path, source, author, channel, enforced):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=enforced), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    path = tmp_path / "state" / "identities.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["people"][0]["aliases"].append(author)
+    path.write_text(yaml.safe_dump(doc))
+    event = _role_event(author=author)
+    event.source, event.channel_id = source, channel
+    before = path.read_bytes()
+    assert not disp.intake_admits(event)
+    assert not await disp._authorize_bridge_event(event)
+    assert path.read_bytes() == before
+    # This is source isolation, not a global revocation of the Discord grant.
+    assert await disp._authorize_bridge_event(_role_event())
+    assert approve_pairing(tmp_path, "discord-9")
+    assert disp.intake_admits(event)
+    assert await disp._authorize_bridge_event(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["grant", "unchanged_grant", "revoke"])
+async def test_discord_role_writers_leave_event_loop_responsive(tmp_path, monkeypatch, operation):
+    import threading
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    if operation != "grant":
+        assert await disp._authorize_bridge_event(_role_event())
+    name = "revoke_role_admission" if operation == "revoke" else "grant_role_admission"
+    original = getattr(pop, name)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    heartbeat = threading.Event()
+    observed = []
+
+    def blocked_writer(*args):
+        # Synchronize inside the actual synchronous write call. The loop must
+        # run its callback while this worker is waiting, not after it returns.
+        observed.append(threading.get_ident())
+        loop.call_soon_threadsafe(heartbeat.set)
+        if not heartbeat.wait(2):
+            raise RuntimeError("role writer stalled the event loop")
+        return original(*args)
+
+    monkeypatch.setattr(pop, name, blocked_writer)
+    event = _role_event(roles=() if operation == "revoke" else ("222",))
+    assert await disp._authorize_bridge_event(event) is (operation != "revoke")
+    assert heartbeat.is_set()
+    assert len(observed) == 1 and observed[0] != loop_thread
+
+
 def test_dispatcher_callbacks_and_runner_can_be_cleared(tmp_path: Path):
     async def callback(*args) -> None:
         return None
@@ -1461,7 +1725,6 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
 ):
     cfg = replace(
         _make_config(tmp_path, access_control_enforced=False),
-        unauthorized_user_behavior="prompt-to-pair",
     )
     resolver = _resolver(tmp_path, "people: []\n")
     ran: list[str] = []
@@ -1489,7 +1752,7 @@ async def test_public_unauthorized_prompt_to_pair_logs_without_queueing(
         for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    assert any(row.get("type") == "inbound_pairing_prompted" for row in rows)
+    assert any(row.get("type") == "inbound_event_denied" for row in rows)
     assert not any(row.get("type") == "event_queued" for row in rows)
 
 
@@ -1650,6 +1913,131 @@ class _FakePairingChannels:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id,is_dm", [
+    ("discord", "discord-123", "dm-discord-123", True),
+    ("slack", "slack-U123", "dm-slack-D123", True),
+    ("discord", "discord-123", "discord-C123", False),
+    ("slack", "slack-U123", "slack-C123", False),
+])
+async def test_pairing_digest_lists_approval_paths_without_exposing_code(
+    tmp_path, monkeypatch, platform, canonical, channel_id, is_dm,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    status, code = request_pairing_with_code(
+        tmp_path, canonical, platform, channel_id=channel_id,
+        author_display="New user", is_dm=is_dm,
+    )
+    assert status == "changed"
+    assert (code is not None) == is_dm
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    request_id = resolver.identity(canonical).pairing.request_id
+    stored_secrets = ()
+    if is_dm:
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        operator_alert_channel="ops", pairing_operator_digest_delay_seconds=60), channels)
+    try:
+        await notifier.notify_operator(
+            canonical=canonical, display="New user", platform=platform,
+            channel_id=channel_id, delivery="dm" if is_dm else "public_shared_channel",
+        )
+        if code is not None:
+            # Even if future wiring supplies a code to the digest queue, it stays private.
+            notifier._operator_pending[0]["code"] = code
+        await notifier.flush_operator_alerts()
+        assert len(channels.sent) == 1
+        digest = channels.sent[0][1]
+        assert digest.index(f"{canonical} (New user; {platform};") < digest.index(
+            f"reply: approve {request_id} / decline {request_id}"
+        ) < digest.index("dashboard: /app/admin/users") < digest.index(
+            f"cli: mimir identities approve-pairing"
+        )
+        assert f"mimir identities approve-pairing {canonical}" in digest
+        for value in stored_secrets:
+            assert value not in digest
+        if is_dm:
+            assert "; DM)" in digest
+            assert "mimir identities approve-pairing --code <the code they received>" in digest
+            assert "They were sent a pairing code; ask them for it to confirm it's really them." in digest
+            assert code not in digest
+        else:
+            assert f"; {channel_id})" in digest
+            assert "--code" not in digest
+            assert "ask them for it" not in digest
+        assert events == [("pairing_operator_alert_sent", {"count": 1, "channel_id": "ops"})]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,canonical,channel_id", [
+    ("discord", "discord-123", "dm-discord-123"),
+    ("slack", "slack-U123", "dm-slack-D123"),
+])
+async def test_pairing_without_alert_channel_records_unrouted_once_per_canonical(
+    tmp_path, monkeypatch, platform, canonical, channel_id,
+):
+    from mimir.identities import IdentityResolver
+    from mimir.identities_populator import request_pairing_with_code
+
+    events = []
+
+    async def record_event(kind, **fields):
+        events.append((kind, fields))
+
+    monkeypatch.setattr("mimir.server.log_event", record_event)
+    channels = _FakePairingChannels()
+    notifier = _PairingNotifier(replace(_make_config(tmp_path), operator_alert_channel=""), channels)
+    try:
+        status, code = request_pairing_with_code(
+            tmp_path, canonical, platform, channel_id=channel_id, is_dm=True,
+        )
+        assert status == "changed" and code
+        import yaml
+
+        stored = yaml.safe_load((tmp_path / "state" / "identities.yaml").read_text())
+        pairing = next(person["pairing"] for person in stored["people"]
+                       if person["canonical"] == canonical)
+        stored_secrets = (code, pairing["code_hash"], pairing["code_salt"])
+        assert all(isinstance(value, str) and value for value in stored_secrets)
+        for _ in range(2):
+            await notifier.notify_operator(
+                canonical=canonical, display=canonical, platform=platform,
+                channel_id=channel_id, delivery="dm",
+            )
+        resolver = IdentityResolver(tmp_path)
+        resolver.reload()
+        assert resolver.identity(canonical).pairing.status == "pending"
+        assert channels.sent == []
+        unrouted = [(kind, fields) for kind, fields in events
+                    if kind == "pairing_alert_unrouted"]
+        assert unrouted
+        for value in stored_secrets:
+            assert value not in json.dumps(unrouted)
+        assert events == [("pairing_alert_unrouted", {
+            "canonical": canonical, "platform": platform, "delivery": "dm",
+        })]
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
 async def test_pairing_notifier_coalesces_operator_alerts_and_limits_dm_replies(
     tmp_path: Path, monkeypatch,
 ):
@@ -1722,6 +2110,7 @@ async def test_pairing_notifier_sends_pending_cap_alert_once(tmp_path: Path):
     assert "Pairing pending cap reached" in channels.sent[0][1]
     assert "max=1" in channels.sent[0][1]
     assert "slack-C1" in channels.sent[0][1]
+    assert "/app/admin/users" in channels.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -1954,6 +2343,29 @@ async def test_startup_principal_boundary_preserves_fifo(tmp_path, author):
     queue.task_done()
     queue.task_done()
     await asyncio.wait_for(queue.join(), timeout=HANG_GUARD_SECONDS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ["c1", "c2"])
+async def test_pairing_sync_is_operator_channel_only_and_offloaded(tmp_path, monkeypatch, channel):
+    import threading
+
+    disp = Dispatcher(replace(_inj_config(tmp_path, ("c",)), operator_alert_channel="c1"))
+    disp._in_flight.add(channel)
+    _arm_authenticated_injection(disp, tmp_path)
+    loop_thread = threading.get_ident()
+    calls = []
+
+    def sync(home, operator_channel, resolver):
+        assert threading.get_ident() != loop_thread
+        calls.append((home, operator_channel, resolver))
+
+    monkeypatch.setattr("mimir.pairing_approval.sync_pending", sync)
+    monkeypatch.setattr("mimir.mid_turn_injection.inject_authenticated_message", lambda *args: "injected")
+    assert await disp.enqueue(AgentEvent(
+        trigger="user_message", channel_id=channel, content="follow-up", author="alice",
+    ))
+    assert calls == ([(tmp_path, "c1", disp._identity_resolver)] if channel == "c1" else [])
 
 
 @pytest.mark.asyncio
@@ -2453,3 +2865,231 @@ async def test_server_owned_source_bypasses_with_audit(tmp_path: Path):
     assert len(allowed) == 1
     assert allowed[0]["source"] == "api"
     assert allowed[0]["reason"] == "trusted_internal_source"
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,delivery,mode", [
+    (platform, delivery, mode)
+    for platform in ("discord", "slack")
+    for delivery in ("dm", "channel")
+    for mode in ("pair", "ignore", "decline")
+])
+async def test_unknown_sender_policy_never_admits_or_pairs_other_modes(
+    tmp_path, monkeypatch, platform, delivery, mode,
+):
+    from mimir.bridges.base import SendResult
+
+    cfg = replace(_make_config(tmp_path), operator_alert_channel="dm-slack-OPS",
+                  pairing_dm_auto_reply_interval_seconds=0,
+                  pairing_operator_digest_delay_seconds=0)
+    resolver = _resolver(tmp_path, f"""people: []
+intake:
+  unknown_senders:
+    {platform}: {{dm: {mode}, channel: {mode}}}
+  decline_text: Fixed refusal
+""")
+    disp = Dispatcher(cfg, resolver=resolver)
+    logs = []
+    pairing = []
+    sends = []
+    ephemeral = []
+    resolved = []
+
+    class Bridge:
+        async def resolve_dm_channel(self, author_id):
+            resolved.append(author_id)
+            return "dm-discord-101"
+
+        async def send_ephemeral(self, channel_id, user_id, text):
+            ephemeral.append((channel_id, user_id, text))
+            return SendResult(sent=True)
+
+    class Channels:
+        def find(self, channel_id):
+            return Bridge()
+
+        async def send(self, channel_id, text, *, final=True):
+            sends.append((channel_id, text))
+            return SendResult(sent=True)
+
+    async def record(kind, **fields):
+        logs.append((kind, fields))
+
+    monkeypatch.setattr("mimir.dispatcher.log_event", record)
+    notifier = _PairingNotifier(cfg, Channels())
+    async def on_unknown(event, decision, selected):
+        if selected == "ignore":
+            await notifier.notify_ignored(canonical=decision.canonical_author,
+                                           platform=platform, delivery=delivery)
+        else:
+            await notifier.maybe_decline(canonical=decision.canonical_author,
+                platform=platform, delivery=delivery, channel_id=event.channel_id,
+                author_id=event.author_id, text=resolver.decline_text())
+
+    disp.set_on_pairing_required(lambda event, decision: _record_pairing(pairing, event))
+    disp.set_on_unknown_sender(on_unknown)
+    channel = ("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1"
+    event = AgentEvent(trigger="user_message", source=platform, channel_id=channel,
+                       author=f"{platform}-U1", author_id="U1", author_display="PRIVATE DISPLAY",
+                       content="PRIVATE CONTENT")
+    try:
+        assert disp.intake_admits(event) is False
+        assert await disp.enqueue(event) is False
+        assert await disp.enqueue(event) is False
+        assert disp._queues == {}
+        assert len(pairing) == (2 if mode == "pair" else 0)
+        if mode != "pair":
+            rows = [fields for kind, fields in logs if kind == f"inbound_unknown_sender_{'ignored' if mode == 'ignore' else 'declined'}"]
+            assert len(rows) == 2
+            assert all("PRIVATE" not in str(fields) for fields in rows)
+            await notifier._dm_reply_queue.join()
+            await notifier.flush_operator_alerts()
+            if mode == "ignore":
+                assert len(sends) == 1 and sends[0][0] == "dm-slack-OPS"
+                assert sends[0][1].count("ignored unknown sender") == 1
+            elif platform == "slack" and delivery == "channel":
+                assert ephemeral == [(channel, "U1", "Fixed refusal")]
+                assert sends == []
+            else:
+                assert sends == [(channel if delivery == "dm" else "dm-discord-101", "Fixed refusal")]
+                assert resolved == (["U1"] if delivery == "channel" else [])
+    finally:
+        await notifier.aclose()
+
+
+async def _record_pairing(calls, event):
+    calls.append(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform,delivery", [("discord", "channel"), ("slack", "channel"), ("discord", "dm")])
+async def test_decline_failure_stays_private_and_denied(tmp_path, monkeypatch, platform, delivery):
+    from mimir.bridges.base import SendResult
+
+    cfg = replace(_make_config(tmp_path), pairing_dm_auto_reply_interval_seconds=0)
+    resolver = _resolver(tmp_path, f"people: []\nintake:\n  unknown_senders:\n    {platform}: {{dm: decline, channel: decline}}\n")
+    disp = Dispatcher(cfg, resolver=resolver)
+    rows = []
+    monkeypatch.setattr("mimir.server.log_event", lambda *a, **k: _record_failure(rows, *a, **k))
+
+    class Bridge:
+        async def resolve_dm_channel(self, author_id):
+            return None
+
+        async def send_ephemeral(self, channel_id, user_id, text):
+            return SendResult(sent=False)
+
+    class Channels:
+        def find(self, channel_id):
+            return Bridge()
+
+        async def send(self, *args, **kwargs):
+            return SendResult(sent=False)
+
+    notifier = _PairingNotifier(cfg, Channels())
+    async def on_unknown(event, decision, mode):
+        await notifier.maybe_decline(canonical=decision.canonical_author, platform=platform,
+            delivery=delivery, channel_id=event.channel_id, author_id=event.author_id,
+            text=resolver.decline_text())
+    disp.set_on_unknown_sender(on_unknown)
+    event = AgentEvent(trigger="user_message", source=platform,
+        channel_id=("dm-discord-101" if platform == "discord" else "dm-slack-D1") if delivery == "dm" else f"{platform}-C1",
+        author=f"{platform}-U1", author_id="U1", content="do not log me")
+    try:
+        assert not disp.intake_admits(event)
+        assert not await disp.enqueue(event)
+        await notifier._dm_reply_queue.join()
+        assert len(rows) == 1 and rows[0][0] == "inbound_decline_failed"
+        assert "do not log me" not in str(rows)
+    finally:
+        await notifier.aclose()
+
+
+async def _record_failure(rows, *args, **kwargs):
+    rows.append((args[0], kwargs))
+
+
+@pytest.mark.asyncio
+async def test_email_denial_ignores_configured_pair_or_decline(tmp_path, monkeypatch):
+    resolver = _resolver(tmp_path, """people: []
+intake:
+  unknown_senders:
+    default: {dm: decline, channel: pair}
+    email: {dm: pair, channel: decline}
+""")
+    disp = Dispatcher(_make_config(tmp_path), resolver=resolver)
+    pairing = []
+    unknown = []
+    events = []
+    async def observe(event, decision, mode):
+        unknown.append(mode)
+    async def record(kind, **fields):
+        events.append(kind)
+    monkeypatch.setattr("mimir.dispatcher.log_event", record)
+    disp.set_on_pairing_required(lambda event, decision: _record_pairing(pairing, event))
+    disp.set_on_unknown_sender(observe)
+    for channel in ("dm-email-D1", "email-C1"):
+        event = AgentEvent(trigger="user_message", source="email", channel_id=channel,
+                           author="email:unknown@example.test", author_id="unknown@example.test", content="private")
+        assert not disp.intake_admits(event)
+        assert not await disp.enqueue(event)
+    assert unknown == ["ignore", "ignore"]
+    assert pairing == [] and disp._queues == {}
+    assert events.count("inbound_unknown_sender_ignored") == 2
+
+
+def test_retired_unauthorized_env_only_warns_once(monkeypatch, caplog, tmp_path):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("MIMIR_UNAUTHORIZED_USER_BEHAVIOR", "not-an-option")
+    monkeypatch.setattr(Config, "_retired_intake_warned", False, raising=False)
+    with caplog.at_level("WARNING", logger="mimir.config"):
+        first = Config.from_env()
+        second = Config.from_env()
+    assert first.home == second.home == tmp_path
+    assert not hasattr(first, "unauthorized_user_behavior")
+    assert caplog.text.count("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired") == 1
+
+
+@pytest.mark.asyncio
+async def test_decline_interval_survives_worker_restart(tmp_path):
+    from mimir.bridges.base import SendResult
+
+    starts = []
+    class Channels:
+        async def send(self, channel_id, text, *, final=True):
+            starts.append(asyncio.get_running_loop().time())
+            return SendResult(sent=True)
+
+    notifier = _PairingNotifier(replace(_make_config(tmp_path),
+        pairing_dm_auto_reply_interval_seconds=0.05), Channels())
+    try:
+        for name in ("discord-U1", "discord-U2"):
+            await notifier.maybe_decline(canonical=name, platform="discord", delivery="dm",
+                channel_id="dm-discord-101", author_id=name, text="Fixed refusal")
+            await notifier._dm_reply_queue.join()  # force a worker restart
+        assert len(starts) == 2
+        assert starts[1] - starts[0] >= 0.045
+    finally:
+        await notifier.aclose()
+
+
+@pytest.mark.asyncio
+async def test_decline_refuses_public_destination_disguised_as_dm(tmp_path, monkeypatch):
+    from mimir.bridges.base import SendResult
+
+    sent = []
+    failures = []
+    class Channels:
+        async def send(self, channel_id, text, *, final=True):
+            sent.append(channel_id)
+            return SendResult(sent=True)
+
+    monkeypatch.setattr("mimir.server.log_event", lambda *a, **k: _record_failure(failures, *a, **k))
+    notifier = _PairingNotifier(_make_config(tmp_path), Channels())
+    try:
+        await notifier.maybe_decline(canonical="discord-U1", platform="discord", delivery="dm",
+            channel_id="discord-C1", author_id="U1", text="Fixed refusal")
+        await notifier._dm_reply_queue.join()
+        assert sent == []
+        assert len(failures) == 1 and failures[0][0] == "inbound_decline_failed"
+        assert failures[0][1]["reason"] == "invalid_destination"
+    finally:
+        await notifier.aclose()

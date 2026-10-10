@@ -471,6 +471,22 @@ class SlackBridge(Bridge):
         self._handler = None
         self._runner = None
 
+    async def send_ephemeral(self, channel_id: str, user_id: str, text: str) -> SendResult:
+        """Send a private in-channel refusal to one Slack user."""
+        channel = _channel_id_to_slack(channel_id)
+        # Shared DMs are eligible only for a per-user ephemeral response.
+        if not channel_id.startswith(("slack-", "dm-slack-G", "dm-slack-C", "dm-slack-D")):
+            channel = None
+        if self._app is None or not channel or not user_id:
+            return SendResult(sent=False, error="ephemeral destination unavailable")
+        try:
+            await self._app.client.chat_postEphemeral(
+                channel=channel, user=user_id, text=neutralize_slack_broadcasts(text),
+            )
+            return SendResult(sent=True)
+        except Exception:  # noqa: BLE001 — best effort refusal
+            return SendResult(sent=False, error="ephemeral delivery failed")
+
     async def send(
         self,
         channel_id: str,

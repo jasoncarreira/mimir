@@ -864,18 +864,95 @@ def _upgrade_proposals_root() -> Path | None:
     return (Path(home).resolve() / "scratch" / "proposals").resolve()
 
 
+def _valid_turn_scratch_id(turn_id: object) -> bool:
+    return (
+        isinstance(turn_id, str)
+        and bool(turn_id)
+        and "\x00" not in turn_id
+        and Path(turn_id).name == turn_id
+        and turn_id not in {".", ".."}
+    )
+
+
+def _turn_scratch_path(home: Path, turn_id: object, *, create: bool) -> Path | None:
+    """Check each component relative to an opened directory, without following links.
+
+    The descriptor walk also prevents a replaced parent between lstat and mkdir
+    from redirecting creation through a symlink.
+    """
+    if not _valid_turn_scratch_id(turn_id):
+        return None
+    root = Path(home).resolve()
+    fd = None
+    component = "home"
+    index = -1
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        for index, component in enumerate(("scratch", "turns", turn_id)):
+            try:
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    return None
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass  # Another turn may have created it; validate below.
+                st = os.stat(component, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or (
+                index == 2 and st.st_uid != os.getuid()
+            ):
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=unsafe_entry",
+                                "turn" if index == 2 else component)
+                return None
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                              dir_fd=fd)
+            opened = os.fstat(next_fd)
+            if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                os.close(next_fd)
+                if create:
+                    log.warning("turn_scratch_refused component=%s reason=changed_entry",
+                                "turn" if index == 2 else component)
+                return None
+            os.close(fd)
+            fd = next_fd
+            if index == 2 and create:
+                # Repair pre-existing owned workspaces through the validated fd,
+                # never a pathname that could be replaced with a symlink.
+                os.fchmod(fd, 0o700)
+        return root / "scratch" / "turns" / turn_id
+    except (OSError, RuntimeError) as exc:
+        if create:
+            log.warning("turn_scratch_refused component=%s reason=%s",
+                        "turn" if index == 2 else component,
+                        type(exc).__name__)
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def ensure_turn_scratch(home: Path, turn_id: str) -> Path | None:
+    """Create (or reuse) this turn's private scratch directory, or refuse it."""
+    return _turn_scratch_path(home, turn_id, create=True)
+
+
 def current_turn_scratch_root() -> Path | None:
     """Return the active turn's server-owned ordinary scratch workspace."""
     from ._context import get_current_turn
 
     home = os.environ.get("MIMIR_HOME", "").strip()
-    turn_id = getattr(get_current_turn(), "turn_id", None)
-    if not home or not isinstance(turn_id, str) or not turn_id:
+    ctx = get_current_turn()
+    turn_id = getattr(ctx, "turn_id", None)
+    if not home:
         return None
-    component = Path(turn_id)
-    if component.name != turn_id or turn_id in {".", ".."}:
+    # An explicitly refused turn cannot acquire the root later via another
+    # caller's mkdir; the current filesystem entry must still be safe as well.
+    path = _turn_scratch_path(Path(home), turn_id, create=False)
+    if ctx is not None and hasattr(ctx, "turn_scratch_path") and path != ctx.turn_scratch_path:
         return None
-    return (Path(home).resolve() / "scratch" / "turns" / turn_id).resolve()
+    return path
 
 
 def worklink_retained_checkout_root() -> Path:
@@ -1279,6 +1356,7 @@ def _repo_pr_scope_resolution(
     actor: object = None,
     author_is_trusted: object = None,
     pr_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> RepoPRScopeResolution:
     """Validate a PR snapshot, preserving whether state or configuration refused it."""
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
@@ -1311,12 +1389,13 @@ def _repo_pr_scope_resolution(
     )
     if (
         not self_login
-        or (is_remediation and principal != self_login)
         or not isinstance(repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(repo) is None
         or not isinstance(number, int)
         or isinstance(number, bool)
         or number < 1
+        or not isinstance(principal, str)
+        or not principal
         or not isinstance(head_repo, str)
         or _GITHUB_REPO_PATTERN.fullmatch(head_repo) is None
         or (is_remediation and head_repo.lower() != repo.lower())
@@ -1342,6 +1421,35 @@ def _repo_pr_scope_resolution(
             )
         )
     root, origin = binding_resolution.binding
+    if principal != self_login and pr_author_is_trusted is not True:
+        from .event_logger import log_event_sync
+        from .github_withhold import sanitize_login
+
+        reason = (
+            "attestation_unavailable" if pr_author_is_trusted is None
+            else "bot_not_allowlisted" if principal.endswith("[bot]")
+            else "non_collaborator"
+        )
+        try:
+            log_event_sync(
+                "github_outsider_pr_refused", repo=repo, number=number,
+                author=sanitize_login(principal), reason=reason,
+            )
+            log_event_sync(
+                "github_content_withheld", tool="pr_scope", kind="pull_request",
+                count=1, reason=reason,
+            )
+        except RuntimeError:
+            # Standalone callers do not initialize the process event logger.
+            pass
+        return RepoPRScopeResolution(refusal_reason=(
+            "pull request withheld: its author is not a repository collaborator; "
+            "the item was withheld and logged"
+        ))
+    if is_remediation and principal != self_login:
+        return RepoPRScopeResolution(
+            refusal_reason="pull-request operation rejected: live pull request is closed or invalid"
+        )
     from .models import RepoPRActionScope
 
     return RepoPRScopeResolution(scope=RepoPRActionScope(
@@ -1414,6 +1522,7 @@ def create_server_discovered_heartbeat_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     event_type: str,
+    pr_author_is_trusted: object = None,
 ) -> Any:
     """Create heartbeat authority from one provider-normalized live PR snapshot."""
     if (
@@ -1433,6 +1542,7 @@ def create_server_discovered_heartbeat_scope(
         head_sha=pull_request.head_sha,
         base_ref=pull_request.base_ref,
         base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
     )
 
 
@@ -1441,10 +1551,12 @@ def create_server_discovered_review_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     review_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> Any:
     """Issue standing review or fresh-remediation authority from a live PR."""
     return resolve_server_discovered_review_scope(
         repo, pull_request, review_state=review_state,
+        pr_author_is_trusted=pr_author_is_trusted,
     ).scope
 
 
@@ -1453,6 +1565,7 @@ def resolve_server_discovered_review_scope(
     pull_request: NormalizedPullRequestSnapshot,
     *,
     review_state: object = None,
+    pr_author_is_trusted: object = None,
 ) -> RepoPRScopeResolution:
     """Resolve standing review or fresh-remediation authority with a refusal."""
     if (
@@ -1475,6 +1588,7 @@ def resolve_server_discovered_review_scope(
         head_sha=pull_request.head_sha,
         base_ref=pull_request.base_ref,
         base_sha=pull_request.base_sha,
+        pr_author_is_trusted=pr_author_is_trusted,
     )
 
 
@@ -1516,11 +1630,13 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
         scope = _repo_pr_scope(
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
             repo=item.get("repo"),
-            principal=item.get("author"),
+            principal=(item.get("pr_author") if item.get("event_type") == "pr_synchronize"
+                       else item.get("author")),
             event_type=item.get("event_type"),
             review_state=item.get("state"),
             actor=item.get("actor"),
             author_is_trusted=item.get("author_is_trusted"),
+            pr_author_is_trusted=item.get("pr_author_is_trusted"),
             pr_state=item.get("pr_state"),
             number=item.get("number"),
             head_repo=item.get("head_repo"),
@@ -5425,7 +5541,36 @@ def _trigger_service_read_target_is_allowed(
             service, lexical_root, lexical_relative,
         ):
             return False
-        resolved = candidate.resolve(strict=True)
+        missing_target = False
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            # Admit an ordinary file-not-found only for a bounded file read.
+            # Directory/search and shell scopes retain strict resolution.
+            if (
+                service.authority_profile != "github"
+                or shell_roots
+                or tool_name not in {"read_file", "aread"}
+            ):
+                return False
+            resolved_root = lexical_root.resolve(strict=True)
+            ancestor = candidate.parent
+            while True:
+                try:
+                    resolved_ancestor = ancestor.resolve(strict=True)
+                    break
+                except FileNotFoundError:
+                    if ancestor == ancestor.parent:
+                        return False
+                    ancestor = ancestor.parent
+            if not resolved_ancestor.is_relative_to(resolved_root):
+                return False
+            resolved = candidate.resolve(strict=False)
+            # The common checks below enforce resolved-root containment and
+            # protected names; only missing memory needs a separate rejection.
+            if is_memory_read_path(resolved):
+                return False
+            missing_target = True
         if service.authority_profile == "github":
             resolved.relative_to(lexical_root.resolve(strict=True))
         # Infrastructure roots are created lazily on first use. A missing
@@ -5444,12 +5589,12 @@ def _trigger_service_read_target_is_allowed(
     resolved_is_artifact = artifact_root is not None and root == artifact_root
     if resolved_is_artifact:
         return True
+    # _has_protected_read_name includes exact operator-configured secret
+    # paths, even when absent; do not duplicate that policy check here.
     if (
         _is_service_protected_read_path(service, root, relative)
         or _has_protected_read_name(resolved)
     ):
-        return False
-    if is_operator_secret_read_path(resolved):
         return False
     if home:
         home_root = Path(home).resolve()
@@ -5467,6 +5612,8 @@ def _trigger_service_read_target_is_allowed(
                 return False
             if tool_name not in {"read_file", "aread"} and not resolved.is_dir():
                 return False
+    if missing_target:
+        return True
     return not (
         tool_name in {"read_file", "aread"}
         and (not resolved.is_file() or file_contains_secret(resolved))
@@ -6124,6 +6271,79 @@ def _turn_has_untrusted_active_ingest(auth_context: Any, ifc_labels: Any) -> boo
     return _has_untrusted_active_ingest(
         auth_context, ifc_labels, missing_is_tainted=ifc_labels is None,
     )
+
+
+def _egress_veto_shadow_verdict(
+    tool_name: str, sink_category: SinkCategory, target: str | None,
+    ifc_labels: Any, auth_context: Any, decision: "ToolAuthorization",
+) -> tuple[str, str] | None:
+    """Compute #1903's proposed veto without participating in authorization."""
+    if not _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+        return None
+    if not target or decision.reason == "ifc_declassification_approved":
+        return None
+    if tool_name == "fetch_url" and sink_category is SinkCategory.NETWORK:
+        if _target_is_verbatim_ingest_url(target, auth_context):
+            return None
+        if fetch_url_is_approved(target, auth_context):
+            return None
+        return "egress_destination_not_approved", "verbatim_ingest_url,approved_urls"
+    if tool_name == "web_search" and sink_category is SinkCategory.NETWORK:
+        fixed = _fixed_web_search_url()
+        if fixed is not None and normalize_sink_destination(sink_category, target) == fixed:
+            return None
+        return "egress_destination_not_approved", "fixed_web_search_url"
+    if tool_name in {"webhook", "http_request"} and sink_category is SinkCategory.HTTP_WEBHOOK:
+        if _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS"):
+            return None
+        return "egress_destination_not_approved", "MIMIR_EGRESS_APPROVED_URLS"
+    if tool_name == "send_message" and sink_category in {
+        SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE,
+    }:
+        if (ChannelResourceAdapter._resolve_channel(target)
+                == ChannelResourceAdapter._resolve_channel(
+                    getattr(auth_context, "channel_id", None))):
+            return None
+        if decision.reason in {"ifc_allowed", "no_labels"}:
+            return None
+        state = getattr(auth_context, "ifc_state", None)
+        current = getattr(state, "current", None)
+        try:
+            labels = current(ifc_labels) if callable(current) else ifc_labels
+        except Exception:
+            labels = ifc_labels
+        if not any(getattr(source, "sensitivity", None) in {
+            "private", "confidential", "internal",
+        } for source in getattr(labels, "sources", ())):
+            return None
+        # Cross-channel/DM flow has no implicit ACL grant. A consumed operator
+        # approval is recognized above from the original decision, not re-consumed.
+        return "private_source_cross_channel", "source_acl,declassification_or_sink_approval"
+    return None
+
+
+def _egress_shadow_source(auth_context: Any, ifc_labels: Any) -> dict[str, str | None]:
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((item for item in getattr(labels, "sources", ())
+                   if getattr(item, "has_untrusted_active_ingest", False)), None)
+    resource_id = getattr(source, "resource_id", None)
+    # Opaque IDs retain attribution, including repository #pull/N@sha suffixes.
+    # Only actual URLs are reduced to hosts to avoid logging URL secrets.
+    if isinstance(resource_id, str) and "://" in resource_id:
+        try:
+            resource_id = urlsplit(resource_id).hostname
+        except ValueError:
+            resource_id = None
+    return {
+        "domain": getattr(source, "domain", None),
+        "resource_id": resource_id,
+        "source_kind": getattr(source, "source_kind", None),
+    }
 
 
 def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuthorization":
@@ -6822,6 +7042,65 @@ class SinkGate:
 
     @classmethod
     def check_sink_flow(
+        cls, tool_name: str, target: str | None, ifc_labels: Any,
+        auth_context: Any, *, origin: str = "tool_call", **kwargs: Any,
+    ) -> "ToolAuthorization":
+        """Audit the proposed egress veto after the unchanged sink decision."""
+        decision = cls._check_sink_flow_decision(
+            tool_name, target, ifc_labels, auth_context, **kwargs,
+        )
+        try:
+            category = kwargs.get("sink_category") or get_sink_category(tool_name)
+            shadow_category = category
+            # send_message's descriptor is SAME_CHANNEL; classify its target
+            # only for telemetry, inside the fail-safe boundary.
+            if (tool_name == "send_message" and category is SinkCategory.SAME_CHANNEL
+                    and target and ChannelResourceAdapter._resolve_channel(target)
+                    != ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None))):
+                shadow_category = SinkCategory.CROSS_CHANNEL
+            if (tool_name in {"fetch_url", "web_search", "webhook", "http_request", "send_message"}
+                    and shadow_category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK,
+                                            SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}):
+                verdict = _egress_veto_shadow_verdict(
+                    tool_name, shadow_category, target, ifc_labels, auth_context, decision,
+                )
+                if verdict is not None:
+                    from .event_logger import log_event_sync
+
+                    service = get_trusted_service_from_auth_context(auth_context)
+                    principal = service.canonical if service is not None else None
+                    host = None
+                    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+                        try:
+                            host = urlsplit(target or "").hostname
+                            if host is not None:
+                                try:
+                                    host = host.encode("idna").decode("ascii").lower()
+                                except UnicodeError:
+                                    pass
+                        except ValueError:
+                            pass
+                    log_event_sync(
+                        "egress_veto_would_block",
+                        tool=tool_name, sink_category=shadow_category.value,
+                        origin=origin,
+                        trigger=getattr(auth_context, "trigger", None),
+                        service_principal=principal,
+                        poller=(principal.removeprefix("poller:")
+                                if principal and principal.startswith("poller:") else None),
+                        destination_host=host,
+                        reason=verdict[0], exemption_missed=verdict[1],
+                        source=_egress_shadow_source(auth_context, ifc_labels),
+                        actual_allowed=decision.allowed,
+                    )
+        except Exception:
+            # Best-effort telemetry must never alter the returned decision.
+            log.debug("egress shadow audit unavailable", exc_info=True)
+        return decision
+
+    @classmethod
+    def _check_sink_flow_decision(
         cls,
         tool_name: str,
         target: str | None,
@@ -11065,6 +11344,35 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
+def _log_retained_repository_failure(tool_name: str, result: Any, repository: str,
+                                     pull_request: int | None, head: str | None) -> None:
+    """Emit only bounded identifiers, never failure content or server error text."""
+    from langchain_core.messages import ToolMessage
+
+    try:
+        from .event_logger import log_event_sync
+
+        code = None
+        if isinstance(result, dict):
+            code = result.get("code")
+        elif isinstance(result, ToolMessage):
+            try:
+                payload = json.loads(result.content) if isinstance(result.content, str) else None
+                code = payload.get("code") if isinstance(payload, dict) else None
+            except (ValueError, TypeError):
+                pass
+        if not isinstance(code, str) or code not in {
+            "tests_failed", "merge_conflict", "rebase_conflict", "push_rejected",
+        }:
+            code = "tool_error"
+        log_event_sync(
+            "repository_failure_provenance_retained", tool=tool_name,
+            code=code, repository=repository, pull_request=pull_request, head=head,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must not change classification
+        pass
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -11156,7 +11464,7 @@ def classify_protected_result(
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
-        labels = InformationFlowLabels().with_source(protected_result_source(
+        source = protected_result_source(
             auth_context,
             principal=principal,
             domain="repository",
@@ -11168,7 +11476,23 @@ def classify_protected_result(
                 + ("/jobs" if tool_name == "ci_run_jobs" else "")
             ),
             bridge_instance="forge",
-        ))
+        )
+        if provenance is not None and provenance.sources and all(
+            item.domain == source.domain
+            and item.resource_id == source.resource_id
+            and item.principal == source.principal
+            and item.bridge_instance == source.bridge_instance
+            and item.sensitivity == source.sensitivity
+            and item.authorized_principals == source.authorized_principals
+            and item.source_kind == source.source_kind
+            and item.integrity_effect == source.integrity_effect
+            and item.integrity == "trusted"
+            for item in provenance.sources
+        ):
+            source = replace(source, integrity="trusted")
+            if failed:
+                _log_retained_repository_failure(tool_name, result, repo.lower(), None, None)
+        labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
@@ -11198,7 +11522,7 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        if not failed and provenance is not None and provenance.sources:
+        if provenance is not None and provenance.sources:
             if all(
                 item.domain == source.domain
                 and item.domain_qualifier == source.domain_qualifier
@@ -11218,6 +11542,11 @@ def classify_protected_result(
                         else "untrusted"
                     ),
                 )
+                if failed and source.integrity == "trusted":
+                    _log_retained_repository_failure(
+                        tool_name, result, scope.canonical_repo, scope.pr_number,
+                        scope.observed_head_sha,
+                    )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels

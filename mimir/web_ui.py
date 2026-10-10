@@ -1299,22 +1299,33 @@ def register_routes(
         if not await _try_acquire_live_event_slot(bucket):
             return web.Response(text="too many live event streams", status=429)
 
+        from .http_shutdown import HTTP_SHUTDOWN
+        shutdown = request.app.get(HTTP_SHUTDOWN)
+        if shutdown is not None:
+            shutdown.active_streams += 1
+
         delivered = request.query.get("since", "").strip() or None
         idle_for = 0.0
         stream_degraded = False
         try:
             await resp.prepare(request)
-            while True:
+            while shutdown is None or not shutdown.event.is_set():
                 items, scanned_cursor, read_status = await _live_event_items(
                     request, delivered, channel=channel
                 )
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 degraded = await _report_state_read(turns_log, read_status)
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 if degraded and not stream_degraded:
                     await resp.write(
                         b'event: state-degraded\ndata: {"degraded": true}\n\n'
                     )
                 stream_degraded = degraded
                 for item in items:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
                     block = (
                         f"id: {item['cursor']}\n"
                         "event: live-event\n"
@@ -1333,10 +1344,18 @@ def register_routes(
                     if idle_for >= LIVE_EVENTS_HEARTBEAT_S:
                         idle_for = 0.0
                         await resp.write(b": heartbeat\n\n")
-                await asyncio.sleep(LIVE_EVENTS_POLL_S)
+                if shutdown is None:
+                    await asyncio.sleep(LIVE_EVENTS_POLL_S)
+                else:
+                    try:
+                        await asyncio.wait_for(shutdown.event.wait(), LIVE_EVENTS_POLL_S)
+                    except asyncio.TimeoutError:
+                        pass
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
             _release_live_event_slot(bucket)
         return resp
 
@@ -1375,6 +1394,10 @@ def register_routes(
         bucket = _stream_identity_bucket(request)
         if not await _try_acquire_turn_event_slot(bucket):
             return web.Response(text="too many turn event streams", status=429)
+        from .http_shutdown import HTTP_SHUTDOWN, queue_or_shutdown
+        shutdown = request.app.get(HTTP_SHUTDOWN)
+        if shutdown is not None:
+            shutdown.active_streams += 1
         resp = web.StreamResponse(
             status=200,
             headers={
@@ -1388,14 +1411,20 @@ def register_routes(
         try:
             await resp.prepare(request)
             queue = turn_event_bus.subscribe(channel)
-            while True:
+            while shutdown is None or not shutdown.event.is_set():
                 try:
-                    event = await asyncio.wait_for(
-                        queue.get(), timeout=LIVE_EVENTS_HEARTBEAT_S
+                    event = (
+                        await queue_or_shutdown(queue, shutdown, LIVE_EVENTS_HEARTBEAT_S)
+                        if shutdown is not None else
+                        await asyncio.wait_for(queue.get(), timeout=LIVE_EVENTS_HEARTBEAT_S)
                     )
                 except asyncio.TimeoutError:
+                    if shutdown is not None and shutdown.event.is_set():
+                        break
                     await resp.write(b": heartbeat\n\n")
                     continue
+                if shutdown is not None and shutdown.event.is_set():
+                    break
                 # This stream carries tool-result content, not the activity
                 # panel's metadata-only HARNESS_DISPLAY payload. Evaluate turn
                 # taint as same-channel egress, including each wildcard event's
@@ -1419,6 +1448,8 @@ def register_routes(
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         finally:
+            if shutdown is not None:
+                shutdown.active_streams -= 1
             if queue is not None:
                 turn_event_bus.unsubscribe(channel, queue)
             _release_turn_event_slot(bucket)
@@ -1807,6 +1838,38 @@ def register_routes(
         if resolver is None:
             return json_error("unavailable", "identity resolver not configured", status=503)
         return json_success(build_users_payload(resolver), headers=_no_store_headers())
+
+    async def admin_users_pairing_action_v1(request: web.Request, *, approve: bool) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return json_error("bad_request", "invalid json", status=400)
+        if not isinstance(body, dict) or not isinstance(body.get("canonical"), str) or not body["canonical"].strip():
+            return json_error("bad_request", "canonical required", status=400)
+        canonical = body["canonical"].strip()
+        if approve and body.get("role") not in ("user", "admin"):
+            return json_error("bad_request", "role must be user or admin", status=400)
+        from .identities_populator import approve_pairing, reject_pairing
+
+        if approve:
+            changed = await asyncio.to_thread(
+                approve_pairing, home, canonical,
+                roles=roles_for_request(body["role"]), pending_only=True,
+            )
+        else:
+            changed = await asyncio.to_thread(reject_pairing, home, canonical)
+        if not changed:
+            return json_error("not_found", "pending pairing not found", status=404)
+        resolver = request.app.get("identity_resolver")
+        if resolver is not None:
+            await asyncio.to_thread(resolver.reload)
+        return json_success({"canonical": canonical}, headers=_no_store_headers())
+
+    async def admin_users_pairing_approve_v1(request: web.Request) -> web.Response:
+        return await admin_users_pairing_action_v1(request, approve=True)
+
+    async def admin_users_pairing_reject_v1(request: web.Request) -> web.Response:
+        return await admin_users_pairing_action_v1(request, approve=False)
 
     async def admin_users_issue_key_v1(request: web.Request) -> web.Response:
         try:
@@ -2383,6 +2446,8 @@ def register_routes(
             DashboardBackendRoute("GET", "/api/v1/admin/users", admin_users_v1),
             DashboardBackendRoute("POST", "/api/v1/admin/users/key", admin_users_issue_key_v1),
             DashboardBackendRoute("POST", "/api/v1/admin/users/revoke", admin_users_revoke_key_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/pairing/approve", admin_users_pairing_approve_v1),
+            DashboardBackendRoute("POST", "/api/v1/admin/users/pairing/reject", admin_users_pairing_reject_v1),
         ]
 
     def admin_mcp_backend_routes() -> list[DashboardBackendRoute]:

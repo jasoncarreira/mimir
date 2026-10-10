@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -49,6 +50,26 @@ _GIT_BINDING_REFUSAL_CODES = frozenset({
 _REPOSITORY_AUTHORIZATION_REFUSED = "repository_authorization_refused"
 _REPOSITORY_BINDING_INVALID = "repository_binding_invalid"
 _REPOSITORY_GIT_FAILED = "repository_git_failed"
+_FIXED_TEST_REFUSALS = {
+    "test_snapshot_unavailable": frozenset({"project test snapshot is unavailable"}),
+    "test_containment_unavailable": frozenset({"contained project test execution is unavailable"}),
+    "test_snapshot_cleanup_failed": frozenset({"project test snapshot cleanup failed"}),
+    "test_config_invalid": frozenset({
+        "project test command is invalid", "invalid env unset directive",
+        "test runner is missing",
+        "project test command or environment contains a controller path",
+    }),
+    "test_snapshot_credentials_refused": frozenset({
+        "project test snapshot contains credential-like material",
+    }),
+    "test_snapshot_embedded_repository": frozenset({
+        "project test snapshot source contains an embedded Git repository",
+    }),
+    "inactive_checkout": frozenset({"the checkout has no current HEAD"}),
+}
+_SUMMARY_SELECTOR = re.compile(r"[A-Za-z0-9._/,:+=-]{1,256}", re.ASCII)
+_SUMMARY_SUITE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", re.ASCII)
+_SUMMARY_HEAD = re.compile(r"[0-9a-f]{40,64}", re.ASCII)
 
 
 def _tool_refusal(
@@ -152,6 +173,22 @@ def _publish_attested_lease_result(
     if context is None:
         return
     scope = state.action_scope
+    from ..access_control import _github_repo_from_remote
+
+    # The failed command may contain remote server text. Bind that text to our
+    # origin and the exact allowed refs before inheriting the lease verdict.
+    from ..repo_tools import _PROTECTED_BRANCH_REFS
+
+    if (
+        scope.head_remote != "origin"
+        or scope.head_repo != scope.canonical_repo
+        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or not scope.destination_ref.startswith("refs/heads/")
+        or scope.destination_ref != f"refs/heads/{scope.head_ref}"
+        or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    ):
+        return
     if not _attested_pr_checkout_lease(context, scope, state.checkout_lease):
         return
     _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
@@ -221,6 +258,7 @@ def _execute(
     operation: Any,
 ) -> dict[str, Any]:
     git_tools: RepoGitTools | None = None
+    state: RepoReviewState | None = None
     try:
         retained = _retained_scope(runtime, repository, pull_request)
         if retained is not None:
@@ -265,8 +303,7 @@ def _execute(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,
                     previous_head,
                 )
-        if result["ok"]:
-            _publish_attested_lease_result(runtime, state)
+        _publish_attested_lease_result(runtime, state)
         return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
@@ -289,6 +326,8 @@ def _execute(
         cause = f" [{cause_code}]" if cause_code else ""
         detail = _redact_git_output(str(exc))
         message = f"repository operation rejected ({code}){cause}: {detail}"
+        if execution_started and state is not None:
+            _publish_attested_lease_result(runtime, state)
         raise _tool_refusal(
             message,
             exc,
@@ -321,6 +360,7 @@ def repo_checkout(
         )
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
+        _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
     scope = state.action_scope
     # Record only turn-local authority, never trust in checkout-controlled metadata.
@@ -359,6 +399,7 @@ def repo_cleanup(
     lease = state.checkout_lease
     if lease is None:
         raise ToolPolicyRefusal("repository cleanup rejected: no active checkout lease")
+    _publish_attested_lease_result(runtime, state)
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -398,6 +439,7 @@ async def repo_test(
     selectors: tuple[str, ...] = (),
     runtime: ToolRuntime[AuthContext] = None,  # type: ignore[assignment]
     suite: str | None = None,
+    include_output: bool = False,
 ) -> dict[str, Any]:
     """Run configured tests in a contained repository snapshot.
 
@@ -409,6 +451,7 @@ async def repo_test(
     incident's Chainlink issue id.
     """
     try:
+        state: RepoReviewState | None = None
         retained = _retained_scope(runtime, repository, pull_request)
         if retained is not None:
             home_value = os.environ.get("MIMIR_HOME", "").strip()
@@ -424,6 +467,7 @@ async def repo_test(
                         selectors, suite=suite,
                     )
                 )
+                result.pop("failure_summary", None)
                 result = _retained_result(runtime, retained, result)
                 result["remediation_guidance"] = _remediation_test_guidance(
                     result["code"], scoped=bool(selectors),
@@ -433,13 +477,46 @@ async def repo_test(
         result = asdict(
             await RepoProjectTests(state).execute(selectors, suite=suite)
         )
+        failure_summary = result.pop("failure_summary", None)
         _publish_attested_lease_result(runtime, state)
+        if (
+            result["code"] == "tests_failed" and not include_output
+            and failure_summary is not None
+            and type(result["returncode"]) is int and result["returncode"] != 0
+            and _SUMMARY_SUITE.fullmatch(result["suite"]) is not None
+            and _SUMMARY_HEAD.fullmatch(state.action_scope.observed_head_sha) is not None
+            and isinstance(selectors, tuple)
+            and len(selectors) <= 32
+            and all(isinstance(item, str) and _SUMMARY_SELECTOR.fullmatch(item) for item in selectors)
+        ):
+            return {
+                "ok": False, "code": "tests_failed", "exit_code": result["returncode"],
+                "suite": result["suite"], "selectors": list(selectors),
+                "summary": {**failure_summary, "head": state.action_scope.observed_head_sha},
+                "remediation_guidance": (
+                    "The summary lists failing node ids. Prefer reading the lease's test source "
+                    "and rerunning selected ids. include_output=true reveals bounded raw output."
+                ),
+            }
         result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
         return result
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+        if state is not None and (
+            not isinstance(exc, ProjectTestRefusal) or exc.execution_started
+        ) and not (
+            isinstance(exc, ProjectTestRefusal) and exc.fixed_message
+            and str(exc) in _FIXED_TEST_REFUSALS.get(exc.code, ())
+        ):
+            _publish_attested_lease_result(runtime, state)
         code = getattr(exc, "code", "project_test_failed")
         message = f"project test rejected ({code}): {exc}"
         message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))
+        if (
+            isinstance(exc, ProjectTestRefusal)
+            and exc.fixed_message
+            and str(exc) in _FIXED_TEST_REFUSALS.get(code, ())
+        ):
+            raise ToolPolicyRefusal(message) from exc
         raise _tool_refusal(
             message,
             exc,

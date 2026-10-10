@@ -7,6 +7,7 @@ from mimir.pollers import _github_author_is_trusted
 
 
 _REAL_PR_AUTHOR_IS_TRUSTED = poller._pr_author_is_trusted
+_REAL_AUTHOR_IS_TRUSTED = poller._github_author_is_trusted
 
 
 def _pr(
@@ -45,6 +46,7 @@ def _capture(monkeypatch):
 
 def _use_real_trust_filter(monkeypatch) -> None:
     monkeypatch.setattr(poller, "_pr_author_is_trusted", _REAL_PR_AUTHOR_IS_TRUSTED)
+    monkeypatch.setattr(poller, "_github_author_is_trusted", _REAL_AUTHOR_IS_TRUSTED)
 
 
 def test_collaborator_pr_is_reviewed_from_server_attested_author(monkeypatch):
@@ -115,6 +117,7 @@ def test_non_collaborator_pr_is_not_reviewed_and_surfaces_once(monkeypatch):
         "repo": "acme/widget",
         "number": 2,
         "url": "https://github.com/acme/widget/pull/2",
+        "author": "outsider",
     }]
     assert surfaced == {"2"}
 
@@ -195,7 +198,7 @@ def test_trust_verdict_transport_failure_is_retryable_and_not_cached(monkeypatch
     }
 
 
-def test_explicit_review_request_bypasses_failed_author_trust(monkeypatch):
+def test_explicit_review_request_waits_for_author_trust(monkeypatch):
     events, signals = _capture(monkeypatch)
     _use_real_trust_filter(monkeypatch)
     monkeypatch.setattr(poller, "_github_content_author", lambda *args: None)
@@ -211,7 +214,7 @@ def test_explicit_review_request_bypasses_failed_author_trust(monkeypatch):
         trust_cache={}, surfaced_untrusted=set(),
     )
 
-    assert [event["event_type"] for event in events] == ["pr_review_requested"]
+    assert events == []
     assert signals == []
 
 
