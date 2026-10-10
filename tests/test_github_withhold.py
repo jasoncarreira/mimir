@@ -57,6 +57,36 @@ def test_partition_keeps_only_attested_authors_and_omits_all_content() -> None:
         withheld[0].kind = "issue"  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("verdict", [1, "yes"])
+def test_partition_withholds_truthy_non_bool_attestations(verdict: object) -> None:
+    candidate = _candidate("comment", "outsider")
+    kept, withheld = partition(
+        [candidate], lambda item: str(item["user"]),
+        lambda _: verdict,  # type: ignore[arg-type,return-value]
+    )
+    assert kept == []
+    assert len(withheld) == 1
+    assert withheld[0].reason == "non_collaborator"
+    assert placeholder(withheld[0])["withheld"] is True
+    assert_marker_absent([placeholder(item) for item in withheld])
+
+
+@pytest.mark.parametrize("verdict", [1, "yes"])
+def test_truthy_attestation_mutant_fails_regression(
+    monkeypatch: pytest.MonkeyPatch, verdict: object,
+) -> None:
+    import mimir.github_withhold as withhold
+
+    source = Path(withhold.__file__).read_text(encoding="utf-8")
+    assert source.count("if verdict is True:") == 1
+    namespace = dict(vars(withhold))
+    exec(compile(source.replace("if verdict is True:", "if verdict:"),
+                 str(withhold.__file__), "exec"), namespace)
+    monkeypatch.setitem(globals(), "partition", namespace["partition"])
+    with pytest.raises(AssertionError):
+        test_partition_withholds_truthy_non_bool_attestations(verdict)
+
+
 @pytest.mark.parametrize("login,expected", [
     ("evil<@everyone>", "<invalid-login>"),
     ("a" * 40, "<invalid-login>"),
@@ -133,10 +163,52 @@ def test_marker_probe_reads_events_jsonl(tmp_path: Path) -> None:
     assert_marker_absent({"outer": ["safe"]}, '[{"content":"safe"}]')
 
 
-def test_forge_and_github_pollers_do_not_read_fetch_cache() -> None:
-    root = Path(__file__).resolve().parents[1]
+def _assert_github_fetch_cache_closed(root: Path) -> None:
     sources = [root / "mimir/tools/forge.py", root / "mimir/pollers.py"]
     sources.extend((root / "mimir/forge").rglob("*.py"))
-    sources.extend((root / "mimir/pollers").rglob("*.py") if (root / "mimir/pollers").exists() else ())
+    sources.extend((root / "mimir/pollers").rglob("*.py"))
+    # Include both shipped GitHub pollers and any future GitHub skill scripts.
+    skills = root / "mimir/optional-skills"
+    for name in ("github-poller", "github-ci-watch"):
+        assert (skills / name / "scripts/poller.py").is_file(), name
+    for skill in skills.glob("github-*"):
+        sources.extend(skill.rglob("*.py"))
     for source in sources:
-        assert "attachments/fetch-cache" not in source.read_text(), source
+        # Also catches component-built paths, not just the slash spelling.
+        assert "fetch-cache" not in source.read_text(encoding="utf-8"), source
+
+
+def test_forge_and_github_pollers_do_not_read_fetch_cache() -> None:
+    _assert_github_fetch_cache_closed(Path(__file__).resolve().parents[1])
+
+
+@pytest.mark.parametrize("relative_path", [
+    "mimir/tools/forge.py",
+    "mimir/forge/nested/client.py",
+    "mimir/pollers/nested/github.py",
+    "mimir/optional-skills/github-poller/scripts/poller.py",
+    "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+    "mimir/optional-skills/github-future/scripts/poller.py",
+])
+@pytest.mark.parametrize("injected_source", [
+    '_CACHE = "attachments/fetch-cache"\n',
+    '_CACHE = ("attachments", "fetch-cache")\n',
+    '_CACHE = home / "attachments" / "fetch-cache"\n',
+])
+def test_fetch_cache_closure_detects_injected_path_spellings(
+    tmp_path: Path, relative_path: str, injected_source: str,
+) -> None:
+    for required in (
+        "mimir/tools/forge.py", "mimir/pollers.py",
+        "mimir/optional-skills/github-poller/scripts/poller.py",
+        "mimir/optional-skills/github-ci-watch/scripts/poller.py",
+    ):
+        source = tmp_path / required
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("# no cache access\n", encoding="utf-8")
+    _assert_github_fetch_cache_closed(tmp_path)
+    source = tmp_path / relative_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(injected_source, encoding="utf-8")
+    with pytest.raises(AssertionError, match=relative_path):
+        _assert_github_fetch_cache_closed(tmp_path)
