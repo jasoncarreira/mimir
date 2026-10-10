@@ -4,7 +4,7 @@ import ast
 import inspect
 import json
 import textwrap
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -68,7 +68,206 @@ from mimir.tools.forge import (
     unsupported_operation,
 )
 from mimir.tools.repo import repo_status, repo_test
+from mimir.tools.repo import repo_checkout
 from mimir.tools.budget_gate import BudgetGateMiddleware
+from tests.withhold_probe import OUTSIDER_MARKER, assert_marker_absent
+
+
+@pytest.mark.parametrize("selected,kind", [(pr_comments, "comment"), (pr_reviews, "review")])
+def test_outsider_thread_text_withheld_and_trusted_items_keep_order(monkeypatch, selected, kind):
+    import mimir.event_logger as events
+
+    emitted = []
+    monkeypatch.setattr(events, "log_event_sync", lambda name, **fields: emitted.append((name, fields)))
+    monkeypatch.setenv("MIMIR_GITHUB_TRUSTED_BOT_LOGINS", "dependabot[bot]")
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda _repo, author:
+                        author in {"reviewer", "collaborator"}, raising=False)
+    if selected is pr_comments:
+        monkeypatch.setattr(client, "list_comments", lambda _: (
+            CommentProjection("1", "collaborator", "first\x00byte", "now", "now"),
+            CommentProjection("2", "outsider", OUTSIDER_MARKER, "now", "now"),
+            CommentProjection("3", "dependabot[bot]", "bot text", "now", "now"),
+            CommentProjection("4", "outsider", OUTSIDER_MARKER, "now", "now", "bad-path", 1),
+            CommentProjection("5", "reviewer", "last", "now", "now"),
+        ))
+    else:
+        monkeypatch.setattr(client, "list_reviews", lambda _: (
+            ReviewProjection("1", "collaborator", "COMMENTED", "first\x00byte", "now", None),
+            ReviewProjection("2", "outsider", "COMMENTED", OUTSIDER_MARKER, "now", None),
+            ReviewProjection("3", "dependabot[bot]", "COMMENTED", "bot text", "now", None),
+            ReviewProjection("4", "reviewer", "COMMENTED", "last", "now", None),
+        ))
+    scope = _scope(RepoPRAction.INSPECT)
+    runtime = _runtime(scope)
+    set_forge_client(client)
+    try:
+        token = access_control.begin_protected_result_capture()
+        try:
+            result = selected.func("owner/repo", 17, runtime=runtime)
+        finally:
+            provenance = access_control.end_protected_result_capture(token)
+        assert [item["body"] for item in result if "body" in item] == [
+            "first\x00byte", "bot text", "last",
+        ]
+        assert [item["kind"] for item in result if item.get("withheld")] == (
+            ["comment", "review_comment"] if selected is pr_comments else [kind]
+        )
+        assert provenance.sources[0].integrity == "trusted"
+        assert_marker_absent(result, provenance, emitted)
+        assert sum(name == "github_content_withheld" for name, _ in emitted) == (
+            2 if selected is pr_comments else 1
+        )
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("selected,kwargs", [
+    (pr_metadata, {}), (pr_files, {}), (pr_diff, {}),
+    (pr_file_content, {"path": "src/app.py"}), (pr_checks, {}),
+    (pr_job_log, {"job_id": 3}),
+])
+@pytest.mark.parametrize("verdict", [False, None])
+def test_outsider_pr_owned_text_refused(monkeypatch, selected, kwargs, verdict):
+    import mimir.event_logger as events
+    from mimir.tools.forge import OUTSIDER_PR_REFUSAL
+
+    emitted = []
+    monkeypatch.setattr(events, "log_event_sync", lambda name, **fields: emitted.append((name, fields)))
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: verdict, raising=False)
+    monkeypatch.setattr(client, "get_pull_request", lambda _: PullRequestProjection(
+        17, OUTSIDER_MARKER, "open", "outsider", False, "main", "change",
+        "a" * 40, True, "now", "now",
+    ))
+    monkeypatch.setattr(client, "get_diff", lambda _: OUTSIDER_MARKER)
+    monkeypatch.setattr(client, "get_file_content", lambda *_: OUTSIDER_MARKER)
+    monkeypatch.setattr(client, "get_job_log", lambda *_: OUTSIDER_MARKER, raising=False)
+    scope = _scope(RepoPRAction.INSPECT)
+    set_forge_client(client)
+    try:
+        with pytest.raises(ToolException) as exc:
+            selected.func("owner/repo", 17, runtime=_runtime(scope), **kwargs)
+        assert str(exc.value) == OUTSIDER_PR_REFUSAL
+        assert_marker_absent(str(exc.value), emitted)
+        assert any(name == "github_content_withheld" for name, _ in emitted)
+        assert any(name == "github_outsider_pr_refused" for name, _ in emitted)
+        assert not any(call[0] in {"files", "diff", "file_content", "checks"} for call in client.calls)
+    finally:
+        set_forge_client(None)
+
+
+@pytest.mark.parametrize("search", [None, "is:open"])
+def test_pr_list_withholds_unattested_titles_and_keeps_trusted(monkeypatch, search):
+    import mimir.event_logger as events
+
+    emitted = []
+    monkeypatch.setattr(events, "log_event_sync", lambda name, **fields: emitted.append((name, fields)))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    client = FakeForge()
+    summaries = (
+        PullRequestSummary(17, OUTSIDER_MARKER, "open", "outsider", OUTSIDER_MARKER,
+                           "main", "a" * 40, "now", None, "https://github.com/owner/repo/pull/17"),
+        PullRequestSummary(18, "trusted title", "open", "collaborator", "safe", "main",
+                           "b" * 40, "now", None, "https://github.com/owner/repo/pull/18"),
+    )
+    monkeypatch.setattr(client, "list_pull_requests", lambda *a, **kw: summaries)
+    monkeypatch.setattr(client, "search_pull_requests", lambda *a, **kw: summaries)
+    monkeypatch.setattr(client, "author_is_trusted", lambda repo, author: author == "collaborator", raising=False)
+    set_forge_client(client)
+    try:
+        result = pr_list.func("owner/repo", search=search, runtime=_runtime(_scope()))
+        assert result[0]["kind"] == "pull_request" and result[0]["number"] == 17
+        assert result[0]["html_url"] == "https://github.com/owner/repo/pull/17"
+        assert result[1] == asdict(summaries[1])
+        assert_marker_absent(result, emitted)
+    finally:
+        set_forge_client(None)
+
+
+def test_outsider_checkout_refused_before_acquiring_lease(monkeypatch):
+    import mimir.event_logger as events
+    import mimir.tools.repo as repo_module
+    from mimir.tools.forge import OUTSIDER_PR_REFUSAL
+
+    emitted = []
+    monkeypatch.setattr(events, "log_event_sync", lambda name, **fields: emitted.append((name, fields)))
+    monkeypatch.setattr(repo_module, "acquire_pr_checkout_lease",
+                        lambda *_args, **_kw: pytest.fail("outsider checkout acquired"))
+    client = FakeForge()
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: False)
+    monkeypatch.setattr(client, "get_pull_request", lambda _: PullRequestProjection(
+        17, OUTSIDER_MARKER, "open", "outsider", False, "main", "change",
+        "a" * 40, True, "now", "now",
+    ))
+    set_forge_client(client)
+    try:
+        with pytest.raises(ToolException) as exc:
+            repo_checkout.func("owner/repo", 17, runtime=_runtime(_scope(RepoPRAction.CHECKOUT)))
+        assert str(exc.value) == OUTSIDER_PR_REFUSAL
+        assert_marker_absent(str(exc.value), emitted)
+    finally:
+        set_forge_client(None)
+
+
+def test_live_scope_refuses_outsider_author_before_issuance(tmp_path, monkeypatch):
+    import mimir.event_logger as events
+    from mimir.tools.forge import OUTSIDER_PR_REFUSAL
+
+    emitted = []
+    monkeypatch.setattr(events, "log_event_sync", lambda name, **fields: emitted.append((name, fields)))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    monkeypatch.setenv("MIMIR_GITHUB_SELF_LOGIN", "reviewer")
+    monkeypatch.setattr(access_control, "_canonical_repo_binding_resolution",
+                        lambda _: access_control.RepoBindingResolution(
+                            ("/tmp/repo", "git@github.com:owner/repo.git"), ("/tmp/repo",), 1))
+    client = FakeForge()
+    client.snapshot_author = "outsider"
+    monkeypatch.setattr(client, "author_is_trusted", lambda *_: False)
+    set_forge_client(client)
+    context = _production_auth_context(tmp_path, "operator_user")
+    try:
+        with pytest.raises(ToolException) as exc:
+            resolve_review_state_for_context(context, "owner/repo", 1291)
+        assert str(exc.value) == OUTSIDER_PR_REFUSAL
+        assert context.server_discovered_pr_states.resolve("owner/repo", 1291) is None
+        assert_marker_absent(str(exc.value), emitted)
+    finally:
+        set_forge_client(None)
+
+
+def test_unavailable_comment_verdict_is_retried_on_next_turn(monkeypatch):
+    import mimir.event_logger as events
+
+    monkeypatch.setattr(events, "log_event_sync", lambda *_args, **_kw: None)
+    verdicts = [None, True]
+    client = FakeForge()
+    calls = []
+
+    def attest(repo, author):
+        calls.append((repo, author))
+        return verdicts[0]
+
+    monkeypatch.setattr(client, "author_is_trusted", attest)
+    monkeypatch.setattr(client, "list_comments", lambda _: (
+        CommentProjection("1", "unknown", OUTSIDER_MARKER, "now", "now"),
+    ))
+    set_forge_client(client)
+    try:
+        scope = _scope(RepoPRAction.INSPECT)
+        first_turn = _runtime(scope)
+        result = pr_comments.func("owner/repo", 17, runtime=first_turn)
+        assert result[0]["reason"] == "attestation_unavailable"
+        assert_marker_absent(result)
+        assert first_turn.context.ifc_state.repository_author_trust.resolve(
+            "owner/repo", "unknown", lambda: None,
+        ) is None
+        verdicts[0] = True
+        result = pr_comments.func("owner/repo", 17, runtime=_runtime(scope))
+        assert result[0]["body"] == OUTSIDER_MARKER
+        assert calls == [("owner/repo", "unknown"), ("owner/repo", "unknown")]
+    finally:
+        set_forge_client(None)
 
 
 @pytest.mark.asyncio
@@ -1232,6 +1431,9 @@ class FakeForge:
             ReviewProjection("1", "reviewer", "approve", "LGTM", "now", "a" * 40),
         )
 
+    def author_is_trusted(self, repository, author):
+        return True
+
     def get_pull_request(self, scope):
         self.calls.append(("metadata", scope))
         return PullRequestProjection(
@@ -1297,11 +1499,13 @@ class FakeForge:
 
     def get_run(self, repository, run_id):
         self.calls.append(("run", repository, run_id))
-        return {"id": run_id, "name": "CI"}
+        return {"id": run_id, "name": "CI", "head_repository": repository,
+                "head_branch": "main"}
 
     def list_runs(self, repository, branch, workflow_id, limit):
         self.calls.append(("runs", repository, branch, workflow_id, limit))
-        return [{"id": 42, "name": "CI"}]
+        return [{"id": 42, "name": "CI", "head_repository": repository,
+                 "head_branch": branch}]
 
     def list_reviews(self, scope):
         self.calls.append(("reviews", scope))

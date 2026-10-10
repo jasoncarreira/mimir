@@ -344,7 +344,7 @@ def repo_checkout(
     """Create the exact checkout lease bound to this turn's immutable PR scope."""
     if _retained_scope(runtime, repository, pull_request) is not None:
         raise _retained_refusal("repo_checkout")
-    from .forge import _call, _client, _pr_content_authors, remediation_checkout_preflight
+    from .forge import _call, _client, _pr_content_authors, _refuse_outsider_pr, remediation_checkout_preflight
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     state, stopped = remediation_checkout_preflight(context, repository, pull_request)
@@ -352,6 +352,11 @@ def repo_checkout(
         return {"status": "stopped", "message": stopped}
     if state is None:
         raise ToolPolicyRefusal("repository checkout rejected: no authorized pull request state")
+    scope = state.action_scope
+    client = _client(scope)
+    # A failed verification must revoke any earlier lease attestation too.
+    context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
+    _refuse_outsider_pr(runtime, scope, client, "repo_checkout")
     try:
         lease, candidates = acquire_pr_checkout_lease(
             state.action_scope,
@@ -362,11 +367,9 @@ def repo_checkout(
         detail = _redact_git_output(str(exc))
         _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
-    scope = state.action_scope
     # Record only turn-local authority, never trust in checkout-controlled metadata.
     # Clear an earlier verdict before fetching metadata, so failures stay closed.
     context.ifc_state.pr_checkout_author_trust[scope.scope_id] = None
-    client = _client(scope)
     from .forge import _BOT_LOGIN, _author_verdict
 
     if callable(getattr(client, "author_is_trusted", None)) or (

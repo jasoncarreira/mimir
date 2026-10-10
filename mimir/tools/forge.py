@@ -23,6 +23,7 @@ from langchain_core.tools.base import create_schema_from_function
 from pydantic import StrictInt
 
 from ..forge import ForgeClient, ForgeError, IssueTarget, PullRequestProjection, ReviewVerdict
+from ..github_withhold import partition, placeholder, sanitize_login, summarise
 from ..redaction import redact_text
 from ..models import (
     AuthContext, RepoPRActionScope, RepoPRScopeRegistry, RepoReviewState,
@@ -48,6 +49,10 @@ _ESCALATION_DESCRIPTION_MAX_BYTES = 4_096
 _ESCALATION_ATTEMPT_MAX_BYTES = 512
 _ESCALATION_MAX_ATTEMPTS = 16
 _SCOPE_REFUSAL_TARGET_LIMIT = 5
+OUTSIDER_PR_REFUSAL = (
+    "pull request withheld: its author is not a repository collaborator; "
+    "the operator has been notified"
+)
 _clients: dict[str, ForgeClient] = {}
 _default_client: ForgeClient | None = None
 _escalation_lock = threading.Lock()
@@ -290,6 +295,7 @@ def resolve_review_state_for_context(
             )
         except ForgeError as exc:
             raise ToolException(f"pull-request operation rejected: {exc}") from exc
+        _refuse_snapshot_author(context, stored_scope.canonical_repo, snapshot, client)
         if (
             snapshot.state == "open"
             and isinstance(snapshot.repo, str)
@@ -357,6 +363,7 @@ def resolve_review_state_for_context(
             snapshot = client.get_pull_request_snapshot(repository.lower(), pull_request)
         except ForgeError as exc:
             raise ToolException(f"pull-request operation rejected: {exc}") from exc
+    _refuse_snapshot_author(context, repository.lower(), snapshot, client)
     self_login = os.environ.get("MIMIR_GITHUB_SELF_LOGIN", "").strip()
     if (
         not can_resolve_forge_review_scope(
@@ -850,6 +857,103 @@ def _author_verdict(context: AuthContext, scope: RepoPRActionScope, author: str,
     )
 
 
+def _withheld_event(tool: str, kind: str, count: int, reason: str) -> None:
+    from ..event_logger import log_event_sync
+
+    try:
+        log_event_sync("github_content_withheld", tool=tool, kind=kind,
+                       count=count, reason=reason)
+    except RuntimeError:
+        # Some embedders have no event logger; the refusal still fails closed.
+        log.warning("github_content_withheld: event logger unavailable")
+
+
+def _outsider_pr_event(repo: str, number: int, author: object) -> None:
+    from ..event_logger import log_event_sync
+
+    try:
+        log_event_sync("github_outsider_pr_refused", repo=repo, number=number,
+                       author=sanitize_login(author))
+    except RuntimeError:
+        log.warning("github_outsider_pr_refused: event logger unavailable")
+
+
+def _refuse_snapshot_author(context: AuthContext | None, repo: str,
+                            snapshot: Any, client: ForgeClient) -> None:
+    """Verify a live author's eligibility before minting a discovery scope."""
+    author = getattr(snapshot, "author", None)
+    verdict = _author_verdict(context, SimpleNamespace(canonical_repo=repo), author, client) if (
+        context is not None and context.ifc_state is not None and isinstance(author, str) and author
+    ) else None
+    if verdict is not True:
+        _withheld_event("pr_scope", "pull_request", 1,
+                        "attestation_unavailable" if verdict is None else "non_collaborator")
+        _outsider_pr_event(repo, getattr(snapshot, "number", None), author)
+        raise ToolPolicyRefusal(OUTSIDER_PR_REFUSAL)
+
+
+def _refuse_outsider_pr(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
+    client: ForgeClient, tool: str, *, metadata: PullRequestProjection | None = None,
+) -> tuple[tuple[str, ...], str]:
+    """Refuse PR-owned text before it can become a tool result or a checkout."""
+    authors, head = _call(
+        lambda: _pr_attestation(metadata, scope, runtime) if metadata is not None
+        else _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope,
+    )
+    # Preserve the existing untrusted head-mismatch result, which is not an
+    # author verdict. An unavailable author verdict, by contrast, fails closed.
+    if authors == ("<head-mismatch>",):
+        return authors, head
+    context = getattr(runtime, "context", None)
+    author = authors[0] if len(authors) == 1 else ""
+    verdict = _author_verdict(context, scope, author, client) if (
+        context is not None and context.ifc_state is not None and author
+    ) else None
+    if verdict is not True:
+        reason = ("attestation_unavailable" if verdict is None else
+                  "bot_not_allowlisted" if isinstance(author, str) and author.endswith("[bot]")
+                  else "non_collaborator")
+        _withheld_event(tool, "pull_request", 1, reason)
+        _outsider_pr_event(scope.canonical_repo, scope.pr_number, author)
+        raise ToolPolicyRefusal(OUTSIDER_PR_REFUSAL)
+    return authors, head
+
+
+def _withhold_thread(
+    runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope,
+    items: Any, tool: str,
+) -> list[dict[str, Any]]:
+    client = _client(scope)
+    context = getattr(runtime, "context", None)
+    repo = scope.canonical_repo
+    candidates = [dict(
+        asdict(item),
+        kind=("review" if tool == "pr_reviews" else
+              "review_comment" if item.path is not None else "comment"),
+        repository=repo,
+        html_url=f"https://github.com/{repo}/pull/{scope.pr_number}",
+        created_at=(item.submitted_at if tool == "pr_reviews" else item.created_at),
+    ) for item in items]
+    kept, withheld = partition(
+        candidates, lambda item: item["author"],
+        lambda author: _author_verdict(context, scope, author, client) if (
+            context is not None and context.ifc_state is not None and isinstance(author, str)
+        ) else None,
+    )
+    _publish_author_attestation(runtime, scope, tuple(item["author"] for item in kept), tool)
+    for item in withheld:
+        _withheld_event(tool, item.kind, 1, item.reason)
+    # Forge projections do not expose individual comment URLs. The canonical
+    # PR URL above is the only validated link available for these placeholders.
+    kept_ids = {id(item) for item in kept}
+    trusted = [asdict(item) for item, candidate in zip(items, candidates)
+               if id(candidate) in kept_ids]
+    if len(withheld) > 20:
+        return [*trusted, summarise(withheld)]
+    return [*trusted, *(placeholder(item) for item in withheld)]
+
+
 def _publish_trusted_projection(runtime: ToolRuntime[AuthContext] | None, scope: RepoPRActionScope) -> None:
     """Independently attest a validated server-owned projection at its scope.
 
@@ -1056,7 +1160,28 @@ def pr_list(
             repo, query=query, state=state, base=base, head=head, limit=limit,
             author=author, merged_since=since,
         ))
-    return [asdict(item) for item in items]
+    context = getattr(runtime, "context", None)
+    scope = SimpleNamespace(canonical_repo=repo)
+    candidates = [dict(kind="pull_request", author=item.author,
+                       created_at=None, html_url=item.url, repository=repo)
+                  for item in items]
+    kept, withheld = partition(
+        candidates, lambda item: item["author"],
+        lambda author: _author_verdict(context, scope, author, client) if (
+            context is not None and context.ifc_state is not None and isinstance(author, str)
+        ) else None,
+    )
+    kept_ids = {id(item) for item in kept}
+    for item in withheld:
+        _withheld_event("pr_list", "pull_request", 1, item.reason)
+    result = []
+    withheld_iter = iter(withheld)
+    for item, candidate in zip(items, candidates):
+        if id(candidate) in kept_ids:
+            result.append(asdict(item))
+        else:
+            result.append({**placeholder(next(withheld_iter)), "number": item.number})
+    return result
 
 
 @tool
@@ -1068,7 +1193,7 @@ def pr_metadata(
     """Read metadata for an exact pull request authorized by this turn."""
     scope = _scope(runtime, repository, pull_request)
     metadata = _call(lambda: _client(scope).get_pull_request(scope), runtime=runtime, scope=scope)
-    authors, head_sha = _pr_attestation(metadata, scope, runtime)
+    authors, head_sha = _refuse_outsider_pr(runtime, scope, _client(scope), "pr_metadata", metadata=metadata)
     _publish_author_attestation(runtime, scope, authors, "pr_metadata", head_sha=head_sha)
     return asdict(metadata)
 
@@ -1082,10 +1207,9 @@ def pr_files(
     """List bounded file projections for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
+    authors, head_sha = _refuse_outsider_pr(runtime, scope, client, "pr_files")
     items = _call(lambda: client.list_files(scope), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
+    _publish_author_attestation(runtime, scope, authors, "pr_files", head_sha=head_sha)
     return [asdict(item) for item in items]
 
 
@@ -1098,10 +1222,9 @@ def pr_diff(
     """Read the bounded unified diff for the pull request bound to this turn."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
+    authors, head_sha = _refuse_outsider_pr(runtime, scope, client, "pr_diff")
     diff = _call(lambda: client.get_diff(scope), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
+    _publish_author_attestation(runtime, scope, authors, "pr_diff", head_sha=head_sha)
     return diff
 
 
@@ -1115,10 +1238,9 @@ def pr_file_content(
     """Read one regular file at the pull request's verified head."""
     scope = _scope(runtime, repository, pull_request)
     client = _client(scope)
+    authors, head_sha = _refuse_outsider_pr(runtime, scope, client, "pr_file_content")
     content = _call(lambda: client.get_file_content(scope, path), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
+    _publish_author_attestation(runtime, scope, authors, "pr_file_content", head_sha=head_sha)
     return content
 
 
@@ -1130,6 +1252,7 @@ def pr_checks(
 ) -> list[dict[str, Any]]:
     """List bounded check projections for the bound pull request head."""
     scope = _scope(runtime, repository, pull_request)
+    _refuse_outsider_pr(runtime, scope, _client(scope), "pr_checks")
     checks = _call(lambda: _client(scope).list_checks(scope), runtime=runtime, scope=scope)
     if all(_safe_check_projection(item, scope) for item in checks):
         _publish_trusted_projection(runtime, scope)
@@ -1173,13 +1296,11 @@ def pr_job_log(
         state = resolve_review_state_for_context(context, repository, pull_request)
     scope = state.action_scope
     client = _client(scope)
+    authors, _head_sha = _refuse_outsider_pr(runtime, scope, client, "pr_job_log")
     excerpt = _call(lambda: client.get_job_log(scope, job_id, run_id), runtime=runtime, scope=scope)
-    if callable(getattr(client, "author_is_trusted", None)):
-        authors, _head_sha = _call(lambda: _pr_content_authors(client, scope, runtime), runtime=runtime, scope=scope)
-        # get_job_log independently pins job/run metadata to this exact head.
-        _publish_author_attestation(
-            runtime, scope, authors, "pr_job_log", head_sha=scope.observed_head_sha,
-        )
+    # get_job_log independently pins job/run metadata to this exact head.
+    _publish_author_attestation(runtime, scope, authors, "pr_job_log",
+                                head_sha=scope.observed_head_sha)
     return excerpt
 
 
@@ -1242,6 +1363,23 @@ def _github_origin_matches(scope: RepoPRActionScope) -> bool:
     return _github_repo_from_remote(scope.canonical_origin) == scope.canonical_repo
 
 
+def _require_protected_ci_run(repository: str, run: Any, *, run_id: int | None = None,
+                              branch: str | None = None) -> None:
+    from ..repo_tools import _PROTECTED_BRANCH_REFS
+
+    if (
+        not isinstance(run, dict)
+        or (run_id is not None and run.get("id") != run_id)
+        or not isinstance(run.get("head_repository"), str)
+        or run["head_repository"].lower() != repository.lower()
+        or not isinstance(run.get("head_branch"), str)
+        or f"refs/heads/{run['head_branch']}" not in _PROTECTED_BRANCH_REFS
+        or (branch is not None and run["head_branch"] != branch)
+    ):
+        _withheld_event("ci_run", "pull_request", 1, "attestation_unavailable")
+        raise ToolPolicyRefusal(OUTSIDER_PR_REFUSAL)
+
+
 @tool
 def ci_run_jobs(
     repository: str,
@@ -1261,6 +1399,7 @@ def ci_run_jobs(
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
     client = _client_for_repository(repo)
     run = _call(lambda: client.get_run(repo, run_id))
+    _require_protected_ci_run(repo, run, run_id=run_id)
     if isinstance(run, dict) and run.get("id") == run_id:
         _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}/jobs")
     return _call(lambda: client.list_run_jobs(repo, run_id))
@@ -1284,6 +1423,7 @@ def ci_run(
     ):
         raise ToolPolicyRefusal("CI run rejected: run is outside this turn's poller scope")
     run = _call(lambda: _client_for_repository(repo).get_run(repo, run_id))
+    _require_protected_ci_run(repo, run, run_id=run_id)
     if isinstance(run, dict) and run.get("id") == run_id:
         _attest_ci_runs(runtime, repo, [run], f"{repo.lower()}#actions/run/{run_id}")
     return run
@@ -1319,6 +1459,8 @@ def ci_recent_runs(
         raise ToolPolicyRefusal("CI runs rejected: limit must be an integer")
     bounded_limit = max(1, min(20, limit))
     runs = _call(lambda: _client_for_repository(repo).list_runs(repo, branch, workflow_id, bounded_limit))
+    for run in runs:
+        _require_protected_ci_run(repo, run, branch=branch)
     if isinstance(runs, list) and all(
         isinstance(run, dict) and run.get("head_branch") == branch
         and (workflow_id is None or run.get("workflow_id") == workflow_id)
@@ -1338,8 +1480,7 @@ def pr_reviews(
     """List bounded submitted-review projections for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_reviews(scope), runtime=runtime, scope=scope)
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_reviews")
-    return [asdict(item) for item in items]
+    return _withhold_thread(runtime, scope, items, "pr_reviews")
 
 
 @tool
@@ -1351,8 +1492,7 @@ def pr_comments(
     """List bounded conversation and inline comments for the bound pull request."""
     scope = _scope(runtime, repository, pull_request)
     items = _call(lambda: _client(scope).list_comments(scope), runtime=runtime, scope=scope)
-    _publish_author_attestation(runtime, scope, tuple(item.author for item in items), "pr_comments")
-    return [asdict(item) for item in items]
+    return _withhold_thread(runtime, scope, items, "pr_comments")
 
 
 @tool

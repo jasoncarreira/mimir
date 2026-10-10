@@ -12689,6 +12689,8 @@ def create_auth_context(
     ):
         items = extra.get("items")
         if isinstance(items, list):
+            from .repo_tools import _PROTECTED_BRANCH_REFS
+
             valid_items = [
                 item
                 for item in items
@@ -12700,6 +12702,7 @@ def create_auth_context(
                 and item["run_id"] > 0
                 and isinstance(item.get("branch"), str)
                 and bool(item["branch"])
+                and f"refs/heads/{item['branch']}" in _PROTECTED_BRANCH_REFS
             ]
             ci_run_targets = frozenset(
                 (item["repo"].lower(), item["run_id"]) for item in valid_items
