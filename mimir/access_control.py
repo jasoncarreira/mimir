@@ -1497,6 +1497,22 @@ def _repo_review_state_from_event(event: "AgentEvent", service: ServicePrincipal
     for item in items:
         if not isinstance(item, dict):
             continue
+        if item.get("event_type") in {
+            "pr_changes_requested_stale", "pr_ci_failure",
+            "pr_mergeability_rebase", "pr_mergeability_conflicting",
+        } and isinstance(item.get("repo"), str) and type(item.get("number")) is int and isinstance(item.get("head_sha"), str):
+            from .repo_tools import was_superseded_by_own_push
+
+            if was_superseded_by_own_push(item["repo"], item["number"], item["head_sha"]):
+                # A queued event may outlive the poller fire that generated it.
+                # Never issue a stale authority even when it was already queued.
+                from .event_logger import log_event_sync
+
+                log_event_sync(
+                    "github_stale_trigger_dropped", stage="scope_binding",
+                    reason="superseded_by_verified_own_push",
+                )
+                continue
         scope = _repo_pr_scope(
             provenance=RepoPRScopeProvenance.POLLER_PAYLOAD,
             repo=item.get("repo"),
@@ -10298,8 +10314,6 @@ def _attested_pr_checkout_lease(
         or getattr(scope, "canonical_repo", "").lower()
         != getattr(lease, "canonical_repo", "").lower()
         or getattr(scope, "pr_number", None) != getattr(lease, "pr_number", None)
-        or getattr(scope, "observed_head_sha", "").lower()
-        != getattr(lease, "head_sha", "").lower()
         or not getattr(lease, "is_active", False)
     ):
         return False
@@ -10316,10 +10330,28 @@ def _attested_pr_checkout_lease(
         if registry is not None
         else getattr(auth_context, "repo_review_state", None)
     )
-    if review_state is None or getattr(review_state, "checkout_lease", None) is not lease:
+    attached = getattr(review_state, "checkout_lease", None)
+    if (
+        attached is not lease
+        and getattr(review_state, "git_expected_head", None) == expected_head
+        and getattr(lease, "head_sha", "").lower() == expected_head
+    ):
+        # A file read reconstructs the same lease from metadata. With no local
+        # HEAD advance, the immutable observed commit still suffices; the real
+        # checkout/branch are inspected by the author-attestation predicate.
+        return _lease_head_is_author_attested(
+            path, expected_branch, expected_head, expected_head,
+            scope=scope, lease=lease, ifc_state=ifc_state,
+        )
+    if review_state is None or attached is None or any(
+        getattr(attached, key, None) != getattr(lease, key, None) for key in (
+            "path", "scope_id", "head_sha", "base_sha", "recovery_id",
+            "canonical_origin", "owner", "verified_base_sha",
+        )
+    ):
         # Synthetic callers without the runtime's RepoReviewState do not get the
         # cache, but still fail closed against the immutable attested head.
-        return _lease_head_is_author_attested(
+        return getattr(lease, "head_sha", "").lower() == expected_head and _lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
             scope=scope, lease=lease, ifc_state=ifc_state,
         )
@@ -10335,6 +10367,10 @@ def _attested_pr_checkout_lease(
         # tools. Never reuse a verdict unless the real branch and HEAD still
         # match the server's recorded state.
         return False
+    if (observed_head != expected_head or getattr(lease, "head_sha", "").lower() != expected_head) and not _lease_has_clean_lineage(
+        path, lease, scope, expected_head, observed_head,
+    ):
+        return False
     return review_state.author_attestation_verdict(
         observed_head,
         lambda: _lease_head_is_author_attested(
@@ -10342,6 +10378,57 @@ def _attested_pr_checkout_lease(
             observed_state=observed_state,
             scope=scope, lease=lease, ifc_state=ifc_state,
         ),
+    )
+
+
+def _lease_has_clean_lineage(
+    path: Path, lease: Any, scope: Any, expected_head: str, current_head: str,
+) -> bool:
+    """Check every local commit against the atomically recorded producing turns."""
+    from .pr_checkout_lease import _METADATA, _recorded_lineage, _recorded_verified_base
+    from .repo_tools import _PROTECTED_BRANCH_REFS, hardened_git_command
+
+    try:
+        raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
+        if current_head != getattr(lease, "head_sha", "").lower():
+            return False
+        if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
+            "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
+        )):
+            return False
+        lineage = _recorded_lineage(raw)
+        if lineage is None:
+            return False
+        base = getattr(lease, "base_sha", "").lower()
+        verified_base = _recorded_verified_base(raw)
+        protected = (
+            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
+            and (base == verified_base or base == getattr(scope, "observed_base_sha", "").lower())
+        )
+        if protected and base != getattr(scope, "observed_base_sha", "").lower():
+            ancestor = hardened_git_command(
+                path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base), timeout=5,
+            )
+            if ancestor.returncode != 0 or ancestor.timed_out or ancestor.output_limited:
+                return False
+        result = hardened_git_command(
+            path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
+                   *((base,) if protected else ()), "--"), timeout=5,
+        )
+        if result.returncode != 0 or result.timed_out or result.output_limited:
+            return False
+        commits = result.stdout.splitlines()
+        return bool(commits) and len(commits) <= 500 and all(
+            lineage.get(commit) is True for commit in commits
+        )
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return False
+
+
+def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> bool:
+    return (
+        getattr(scope, "destination_ref", None) in protected_refs
+        or f"refs/heads/{getattr(scope, 'base_ref', '')}" in protected_refs
     )
 
 
@@ -10426,10 +10513,19 @@ def _lease_head_is_author_attested(
             return True
         base = getattr(scope, "observed_base_sha", "").lower()
         protected_base = (
-            getattr(scope, "destination_ref", None) in _PROTECTED_BRANCH_REFS
+            _scope_has_protected_base(scope, _PROTECTED_BRANCH_REFS)
             and len(base) == 40 and all(c in "0123456789abcdef" for c in base)
-            and base == getattr(lease, "base_sha", "").lower()
+            and (
+                base == getattr(lease, "base_sha", "").lower()
+                or (
+                    base == getattr(lease, "scope_base_sha", "").lower()
+                    and getattr(lease, "verified_base_sha", None) == getattr(lease, "base_sha", None)
+                    and run("merge-base", "--is-ancestor", base, lease.base_sha).returncode == 0
+                )
+            )
         )
+        if protected_base:
+            base = lease.base_sha.lower()
         head_ancestor = run("merge-base", "--is-ancestor", expected_head, current_head).returncode == 0
         base_ancestor = protected_base and run(
             "merge-base", "--is-ancestor", base, current_head,
@@ -10899,6 +10995,63 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
+def _bounded_repo_test_failure(
+    result: Any, expected_head: str, lease_root: Path | None, scope_id: str,
+) -> bool:
+    """Only the output-free, structured completed-failure envelope is attestable."""
+    from langchain_core.messages import ToolMessage
+
+    if isinstance(result, ToolMessage):
+        result = result.content
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return False
+    if not isinstance(result, dict) or set(result) != {
+        "ok", "code", "exit_code", "suite", "selectors", "summary",
+        "remediation_guidance",
+    }:
+        return False
+    from .project_tests import _PYTEST_FAILING_BYTES, recorded_node_inventory, validated_pytest_node
+
+    # Reuse the inventory the runner captured before execution: re-scanning
+    # here would block the event loop. A miss trusts nothing, not even a
+    # summary with an empty ``failing`` list.
+    inventory = recorded_node_inventory(lease_root, scope_id) if lease_root is not None else None
+    if inventory is None:
+        return False
+    summary = result["summary"]
+    return (
+        result["ok"] is False and result["code"] == "tests_failed"
+        and type(result["exit_code"]) is int and result["exit_code"] != 0
+        and isinstance(summary, dict)
+        and set(summary) == {"failed", "errors", "passed", "skipped", "failing", "failing_dropped", "head"}
+        and all(value is None or type(value) is int and value >= 0
+                for value in (summary[key] for key in ("failed", "errors", "passed", "skipped")))
+        and type(summary["failing_dropped"]) is int and summary["failing_dropped"] >= 0
+        and isinstance(summary["failing"], list) and len(summary["failing"]) <= 50
+        and all(isinstance(node, str) and validated_pytest_node(node, inventory) == node
+                for node in summary["failing"])
+        and sum(len(node) for node in summary["failing"]) <= _PYTEST_FAILING_BYTES
+        and isinstance(summary["head"], str)
+        and summary["head"] == expected_head
+        and re.fullmatch(r"[0-9a-f]{40,64}", summary["head"], re.ASCII)
+        and isinstance(result["suite"], str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", result["suite"], re.ASCII)
+        and isinstance(result["selectors"], list)
+        and len(result["selectors"]) <= 32
+        and all(isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9._/,:+=-]{1,256}", item, re.ASCII)
+                for item in result["selectors"])
+        and isinstance(result["remediation_guidance"], str)
+        and result["remediation_guidance"] == (
+            "The summary lists failing node ids. Prefer reading the lease's test source "
+            "and rerunning selected ids. include_output=true reveals raw output, "
+            "marks the turn untrusted, and blocks further repo_test runs this turn."
+        )
+    )
+
+
 def classify_protected_result(
     tool_name: str,
     arguments: dict[str, Any] | None,
@@ -11032,7 +11185,33 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        if not failed and provenance is not None and provenance.sources:
+        lease_root = None
+        if failed and tool_name == "repo_test":
+            cache = getattr(auth_context, "server_discovered_pr_states", None)
+            review_state = cache.resolve(scope.canonical_repo, scope.pr_number) if cache is not None else None
+            registry = getattr(auth_context, "repo_pr_scope_registry", None)
+            if review_state is None and registry is not None:
+                review_state = registry.resolve(scope.canonical_repo, scope.pr_number)
+            if review_state is None:
+                review_state = getattr(auth_context, "repo_review_state", None)
+            lease = getattr(review_state, "checkout_lease", None)
+            if (getattr(review_state, "action_scope", None) == scope
+                    and getattr(lease, "is_active", False)
+                    and getattr(lease, "scope_id", None) == scope.scope_id
+                    and (
+                        getattr(lease, "head_sha", None) == scope.observed_head_sha
+                        # #1934: a lease advanced by clean-lineage commits or a
+                        # verified rebase stays attested; its failed runs must
+                        # stay trusted too, or fix-and-rerun stalls again.
+                        or _attested_pr_checkout_lease(auth_context, scope, lease)
+                    )):
+                lease_root = Path(lease.path)
+        if (
+            (not failed or tool_name == "repo_test" and lease_root is not None and _bounded_repo_test_failure(
+                result, scope.observed_head_sha, lease_root, scope.scope_id,
+            ))
+            and provenance is not None and provenance.sources
+        ):
             if all(
                 item.domain == source.domain
                 and item.domain_qualifier == source.domain_qualifier

@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 
 from mimir.saga.client import SagaStore
 
@@ -141,7 +142,7 @@ async def test_cancelled_query_worker_never_writes_access(tmp_path, monkeypatch,
         await asyncio.wait_for(entered.wait(), 5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 1)
+            await asyncio.wait_for(task, HANG_GUARD_SECONDS)
         assert not release.is_set()
     finally:
         release.set()
@@ -200,7 +201,7 @@ async def test_cancelled_query_discards_queued_access_write(tmp_path, monkeypatc
         assert not access_futures[0].running()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 1)
+            await asyncio.wait_for(task, HANG_GUARD_SECONDS)
         assert not release.is_set()
         assert access_futures[0].cancelled()
     finally:
@@ -242,9 +243,9 @@ async def test_shared_waiters_do_not_occupy_workers_or_default_pool(monkeypatch)
         await asyncio.sleep(0)
         # The cancelled worker still owns its slot. Other shared operations
         # wait as coroutines, leaving the second dedicated worker available.
-        name = await asyncio.wait_for(store._run_worker(lambda: threading.current_thread().name), 2)
+        name = await asyncio.wait_for(store._run_worker(lambda: threading.current_thread().name), HANG_GUARD_SECONDS)
         assert name.startswith("test-saga")
-        default_name = await asyncio.wait_for(asyncio.to_thread(lambda: threading.current_thread().name), 2)
+        default_name = await asyncio.wait_for(asyncio.to_thread(lambda: threading.current_thread().name), HANG_GUARD_SECONDS)
         assert not default_name.startswith("test-saga")
         assert not any(task.done() for task in waiters)
     finally:

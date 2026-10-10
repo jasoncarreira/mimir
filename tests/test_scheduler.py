@@ -11,6 +11,7 @@ from unittest import mock
 from pathlib import Path
 
 import pytest
+from tests.timing import HANG_GUARD_SECONDS
 import yaml
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 from apscheduler.triggers.date import DateTrigger
@@ -2515,7 +2516,7 @@ async def test_self_wrapping_job_does_not_emit_generic_error_twice(
     )
     sched.start()
     try:
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=HANG_GUARD_SECONDS)
         await asyncio.sleep(0.05)
     finally:
         await sched.stop()
@@ -2749,12 +2750,12 @@ async def test_fire_poller_resheds_after_acquiring_semaphore(
     monkeypatch.setattr(sched, "_poller_budget_status", budget)
     task = asyncio.create_task(sched._fire_poller(poller_name="p1"))
     try:
-        await asyncio.wait_for(semaphore.waiting.wait(), 2)
+        await asyncio.wait_for(semaphore.waiting.wait(), HANG_GUARD_SECONDS)
         assert arb.calls == 0
         budget.assert_not_called()
         arb.paused = True
         semaphore.release_wait.set()
-        await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(task, HANG_GUARD_SECONDS)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -3445,7 +3446,7 @@ async def test_on_job_missed_task_is_held_in_background_tasks(tmp_path: Path):
         )
         sched._on_job_missed(fake_event)
         # Yield until the task starts — proves it was actually scheduled.
-        await asyncio.wait_for(log_started.wait(), timeout=1.0)
+        await asyncio.wait_for(log_started.wait(), timeout=HANG_GUARD_SECONDS)
 
         # While the task is suspended, the strong-ref set must hold it.
         assert len(sched._background_tasks) == 1, (
@@ -5045,7 +5046,7 @@ async def test_stop_cancels_trigger_accepted_immediately_before_shutdown(
     assert sched.trigger_poller(
         "github-activity", reason="remediation_queue_drained"
     ) is True
-    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(started.wait(), timeout=HANG_GUARD_SECONDS)
     await sched.stop()
 
     assert cancelled.is_set()
@@ -5322,7 +5323,7 @@ async def test_completion_fifo_reaches_triggered_poller(tmp_path: Path, monkeypa
         assert notify_poller(
             home, "worklink-ready-queue", reason="worklink_failed"
         ) is True
-        await asyncio.wait_for(ran.wait(), timeout=1)
+        await asyncio.wait_for(ran.wait(), timeout=HANG_GUARD_SECONDS)
         await asyncio.sleep(0)
     finally:
         await sched.stop()

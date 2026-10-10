@@ -155,8 +155,8 @@ def _extract_header(text: str) -> str:
 def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
     """Read identities.yaml; return ``(doc, header_text)``.
 
-    ``doc`` is the parsed YAML mapping (empty dict for missing /
-    non-mapping files). ``header_text`` is the leading comment block —
+    ``doc`` is the parsed YAML mapping (empty dict for a missing file or
+    a null/empty document). ``header_text`` is the leading comment block —
     every line from the start of the file through the last consecutive
     comment / blank line before the first document content. The header
     is preserved verbatim and prepended on write back, so the
@@ -172,27 +172,35 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       write. If that ever becomes load-bearing, the right escalation
       is ``ruamel.yaml`` round-trip mode (carries inline comments) —
       a new dependency, deferred until a real use case shows up.
-    - Treats missing / unparseable / non-mapping files as empty so a
-      fresh deployment starts clean.
+    - A missing file or a null/empty document is treated as empty;
+      a null ``people`` field is normalized to an empty list. Read errors
+      propagate so every transaction aborts rather than replacing unreadable
+      state. Invalid YAML, a non-null non-mapping root, or a non-null
+      non-list ``people`` field also aborts before any writer can reset state.
     """
-    if not path.is_file():
-        return {}, ""
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        log.warning("identities.yaml read failed: %s — treating as empty", exc)
+    except FileNotFoundError:
         return {}, ""
     try:
-        doc = yaml.safe_load(text) or {}
+        doc = yaml.safe_load(text)
     except yaml.YAMLError:
         log.warning("identities.yaml parse failed — refusing to overwrite")
-        # Returning a sentinel telling the caller to abort (preserve the
-        # operator's broken-but-recoverable file rather than nuke it).
+        # Preserve the operator's broken-but-recoverable file, not an empty
+        # substitute that a later transaction could publish over it.
         raise
-    header = _extract_header(text)
+    # PyYAML uses None for empty/comment-only documents and explicit null.
+    # Do not use a truthiness fallback: false, zero and [] are still invalid.
+    if doc is None:
+        doc = {}
     if not isinstance(doc, dict):
-        return {}, header
-    return doc, header
+        raise ValueError("identities.yaml root must be a mapping — refusing to overwrite")
+    if "people" in doc:
+        if doc["people"] is None:
+            doc["people"] = []
+        elif not isinstance(doc["people"], list):
+            raise ValueError("identities.yaml people must be a list — refusing to overwrite")
+    return doc, _extract_header(text)
 
 
 def _strip_value(v: Any) -> Any:
@@ -275,6 +283,80 @@ def _atomic_write_identities(yaml_path: Path, header: str, doc: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
+    """Keep CLI parse errors actionable while using the shared YAML loader."""
+    try:
+        doc, header = _load_yaml(yaml_path)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"identities.yaml parse failed: {exc}") from exc
+    # The shared loader validates existing fields and normalizes null people.
+    # Initialize an absent field, including the fresh, missing-file case.
+    doc.setdefault("people", [])
+    return doc, header
+
+
+@_serialized_identities_write
+def add_identity_alias(
+    home: Path, canonical: str, alias: str,
+    display_name: str | None = None, notes: str | None = None,
+) -> None:
+    """Add an operator alias in one locked read-modify-write transaction."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc["people"]
+    for entry in people:
+        for existing_alias in entry.get("aliases") or []:
+            if existing_alias == alias and entry.get("canonical") != canonical:
+                raise ValueError(
+                    f"alias {alias!r} already maps to canonical "
+                    f"{entry.get('canonical')!r}; remove it first or use a "
+                    f"different alias"
+                )
+
+    target = next((e for e in people if e.get("canonical") == canonical), None)
+    if target is None:
+        target = {"canonical": canonical, "aliases": []}
+        people.append(target)
+    if display_name:
+        target["display_name"] = display_name
+    if notes:
+        target["notes"] = notes
+    aliases = target.setdefault("aliases", [])
+    if alias not in aliases:
+        aliases.append(alias)
+    _atomic_write_identities(yaml_path, header, doc)
+
+
+@_serialized_identities_write
+def remove_identity(home: Path, alias: str | None, canonical: str | None) -> str | None:
+    """Remove a canonical or alias, returning the CLI's result message."""
+    yaml_path = home / "state" / "identities.yaml"
+    doc, header = _load_cli_identities(yaml_path)
+    people: list = doc.get("people") or []
+    if canonical:
+        before = len(people)
+        people[:] = [p for p in people if p.get("canonical") != canonical]
+        if len(people) == before:
+            return f"(no identity with canonical {canonical!r})"
+        doc["people"] = people
+        _atomic_write_identities(yaml_path, header, doc)
+        return f"removed identity: {canonical}"
+    if alias:
+        for entry in people:
+            aliases = entry.get("aliases") or []
+            if alias in aliases:
+                aliases.remove(alias)
+                if not aliases:
+                    canonical = entry.get("canonical")
+                    people[:] = [p for p in people if p is not entry]
+                    _atomic_write_identities(yaml_path, header, doc)
+                    return f"removed alias: {alias} (and {canonical}: no aliases remained)"
+                _atomic_write_identities(yaml_path, header, doc)
+                return f"removed alias: {alias} (from {entry.get('canonical')})"
+        return f"(alias {alias!r} not found)"
+    return None
 
 
 def _default_web_key() -> str:

@@ -13,7 +13,9 @@ from pathlib import Path
 import yaml
 
 from ..identities import WEB_KEY_ALIAS_PREFIX, IdentityResolver, web_key_labels
-from ..identities_populator import approve_pairing, approve_pairing_code
+from ..identities_populator import (
+    add_identity_alias, approve_pairing, approve_pairing_code, remove_identity,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -37,21 +39,6 @@ def _identities_load(yaml_path: Path) -> dict:
     if not isinstance(data.get("people"), list):
         data["people"] = []
     return data
-
-
-def _identities_save(yaml_path: Path, data: dict) -> None:
-    """Atomic write via ``<file>.tmp + rename``. Same pattern as scheduler.yaml.
-
-    Note: this loses the comment header from the starter template. Once
-    the operator runs the CLI, the file becomes machine-managed; the
-    schema documentation lives in ``mimir/identities.py`` and
-    FUTURE_WORK §6.1 instead.
-    """
-    yaml_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = yaml_path.with_suffix(".yaml.tmp")
-    body = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-    tmp.write_text(body, encoding="utf-8")
-    tmp.rename(yaml_path)
 
 
 def _identities_list_cmd(yaml_path: Path) -> None:
@@ -79,86 +66,24 @@ def _identities_list_cmd(yaml_path: Path) -> None:
 
 
 def _identities_add_cmd(
-    yaml_path: Path,
+    home: Path,
     canonical: str,
     alias: str,
     display_name: str | None,
     notes: str | None,
 ) -> None:
-    data = _identities_load(yaml_path)
-    people: list = data.setdefault("people", [])
-
-    # Reject if alias is already claimed by a different canonical — collisions
-    # in the alias map are last-wins at load, but the operator probably wants
-    # the CLI to surface the conflict instead of silently overwriting.
-    for entry in people:
-        for existing_alias in entry.get("aliases") or []:
-            if existing_alias == alias and entry.get("canonical") != canonical:
-                raise ValueError(
-                    f"alias {alias!r} already maps to canonical "
-                    f"{entry.get('canonical')!r}; remove it first or use a "
-                    f"different alias"
-                )
-
-    target = next((e for e in people if e.get("canonical") == canonical), None)
-    if target is None:
-        target = {"canonical": canonical, "aliases": []}
-        people.append(target)
-
-    if display_name:
-        target["display_name"] = display_name
-    if notes:
-        target["notes"] = notes
-    aliases = target.setdefault("aliases", [])
-    if alias not in aliases:
-        aliases.append(alias)
-
-    _identities_save(yaml_path, data)
+    add_identity_alias(home, canonical, alias, display_name, notes)
     print(f"added: {canonical} ← {alias}")
 
 
 def _identities_remove_cmd(
-    yaml_path: Path,
+    home: Path,
     alias: str | None,
     canonical: str | None,
 ) -> None:
-    data = _identities_load(yaml_path)
-    people: list = data.get("people") or []
-
-    if canonical:
-        before = len(people)
-        people[:] = [p for p in people if p.get("canonical") != canonical]
-        if len(people) == before:
-            print(f"(no identity with canonical {canonical!r})")
-            return
-        data["people"] = people
-        _identities_save(yaml_path, data)
-        print(f"removed identity: {canonical}")
-        return
-
-    if alias:
-        for entry in people:
-            aliases = entry.get("aliases") or []
-            if alias in aliases:
-                aliases.remove(alias)
-                # Drop the entire identity when its last alias is gone —
-                # otherwise the entry sits in state/identities.yaml as a
-                # canonical-only stub that the resolver loads as a
-                # no-op and that future `add` calls treat as a real
-                # pre-existing identity.
-                if not aliases:
-                    canonical = entry.get("canonical")
-                    people[:] = [p for p in people if p is not entry]
-                    _identities_save(yaml_path, data)
-                    print(
-                        f"removed alias: {alias} (and {canonical}: "
-                        "no aliases remained)"
-                    )
-                    return
-                _identities_save(yaml_path, data)
-                print(f"removed alias: {alias} (from {entry.get('canonical')})")
-                return
-        print(f"(alias {alias!r} not found)")
+    message = remove_identity(home, alias, canonical)
+    if message is not None:
+        print(message)
 
 
 def _identities_resolve_cmd(home: Path, author: str) -> None:
@@ -347,7 +272,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             _identities_list_cmd(yaml_path)
         elif args.identities_action == "add":
             _identities_add_cmd(
-                yaml_path,
+                home,
                 canonical=args.canonical,
                 alias=args.alias,
                 display_name=args.display_name,
@@ -355,7 +280,7 @@ def dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             )
         elif args.identities_action == "remove":
             _identities_remove_cmd(
-                yaml_path,
+                home,
                 alias=args.alias,
                 canonical=args.canonical,
             )
