@@ -173,6 +173,22 @@ def _publish_attested_lease_result(
     if context is None:
         return
     scope = state.action_scope
+    from ..access_control import _github_repo_from_remote
+
+    # The failed command may contain remote server text. Bind that text to our
+    # origin and the exact allowed refs before inheriting the lease verdict.
+    from ..repo_tools import _PROTECTED_BRANCH_REFS
+
+    if (
+        scope.head_remote != "origin"
+        or scope.head_repo != scope.canonical_repo
+        or _github_repo_from_remote(scope.canonical_origin) != scope.canonical_repo
+        or not scope.destination_ref.startswith("refs/heads/")
+        or scope.destination_ref != f"refs/heads/{scope.head_ref}"
+        or f"refs/heads/{scope.base_ref}" not in _PROTECTED_BRANCH_REFS
+        or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
+    ):
+        return
     if not _attested_pr_checkout_lease(context, scope, state.checkout_lease):
         return
     _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
@@ -242,6 +258,7 @@ def _execute(
     operation: Any,
 ) -> dict[str, Any]:
     git_tools: RepoGitTools | None = None
+    state: RepoReviewState | None = None
     try:
         retained = _retained_scope(runtime, repository, pull_request)
         if retained is not None:
@@ -286,8 +303,7 @@ def _execute(
                     state.action_scope.canonical_repo, state.action_scope.pr_number,
                     previous_head,
                 )
-        if result["ok"]:
-            _publish_attested_lease_result(runtime, state)
+        _publish_attested_lease_result(runtime, state)
         return result
     except (GitRefusal, ToolException, RuntimeError, ValueError) as exc:
         cause_code = getattr(exc, "code", None)
@@ -310,6 +326,8 @@ def _execute(
         cause = f" [{cause_code}]" if cause_code else ""
         detail = _redact_git_output(str(exc))
         message = f"repository operation rejected ({code}){cause}: {detail}"
+        if execution_started and state is not None:
+            _publish_attested_lease_result(runtime, state)
         raise _tool_refusal(
             message,
             exc,
@@ -342,6 +360,7 @@ def repo_checkout(
         )
     except (OSError, RuntimeError, ValueError) as exc:
         detail = _redact_git_output(str(exc))
+        _publish_attested_lease_result(runtime, state)
         raise ToolException(f"repository checkout rejected: {detail}") from exc
     scope = state.action_scope
     # Record only turn-local authority, never trust in checkout-controlled metadata.
@@ -380,6 +399,7 @@ def repo_cleanup(
     lease = state.checkout_lease
     if lease is None:
         raise ToolPolicyRefusal("repository cleanup rejected: no active checkout lease")
+    _publish_attested_lease_result(runtime, state)
     try:
         removed = cleanup_pr_checkout_lease(lease, review_state=state)
     except (OSError, RuntimeError, ValueError) as exc:
@@ -431,6 +451,7 @@ async def repo_test(
     incident's Chainlink issue id.
     """
     try:
+        state: RepoReviewState | None = None
         retained = _retained_scope(runtime, repository, pull_request)
         if retained is not None:
             home_value = os.environ.get("MIMIR_HOME", "").strip()
@@ -474,13 +495,19 @@ async def repo_test(
                 "summary": {**failure_summary, "head": state.action_scope.observed_head_sha},
                 "remediation_guidance": (
                     "The summary lists failing node ids. Prefer reading the lease's test source "
-                    "and rerunning selected ids. include_output=true reveals raw output, "
-                    "marks the turn untrusted, and blocks further repo_test runs this turn."
+                    "and rerunning selected ids. include_output=true reveals bounded raw output."
                 ),
             }
         result["remediation_guidance"] = _remediation_test_guidance(result["code"], scoped=bool(selectors))
         return result
     except (ProjectTestRefusal, RuntimeError, ValueError) as exc:
+        if state is not None and (
+            not isinstance(exc, ProjectTestRefusal) or exc.execution_started
+        ) and not (
+            isinstance(exc, ProjectTestRefusal) and exc.fixed_message
+            and str(exc) in _FIXED_TEST_REFUSALS.get(exc.code, ())
+        ):
+            _publish_attested_lease_result(runtime, state)
         code = getattr(exc, "code", "project_test_failed")
         message = f"project test rejected ({code}): {exc}"
         message += "\n" + _remediation_test_guidance(code, scoped=bool(selectors))

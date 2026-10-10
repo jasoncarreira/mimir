@@ -106,6 +106,7 @@ def test_ci_run_projects_only_bounded_metadata():
         "id": 42, "name": "C" * 300, "display_title": "D" * 300,
         "status": "completed", "conclusion": "failure", "event": "push",
         "head_branch": "branch" * 40, "head_sha": "a" * 40,
+        "head_repository": {"full_name": "owner/repo"},
         "run_attempt": 2, "workflow_id": 7,
         "created_at": "created", "updated_at": "updated", "run_started_at": "started",
         "html_url": "private", "url": "private", "jobs_url": "private",
@@ -118,6 +119,7 @@ def test_ci_run_projects_only_bounded_metadata():
         "id": 42, "name": "C" * 200, "display_title": "D" * 200,
         "status": "completed", "conclusion": "failure", "event": "push",
         "head_branch": ("branch" * 40)[:200], "head_sha": "a" * 40,
+        "head_repository": "owner/repo",
         "run_attempt": 2, "workflow_id": 7,
         "created_at": "created", "updated_at": "updated", "run_started_at": "started",
     }

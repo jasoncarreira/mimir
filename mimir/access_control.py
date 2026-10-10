@@ -11127,61 +11127,33 @@ def _result_matches_policy_refusal(result: Any, refusal: "ToolPolicyRefusal") ->
     return content in {refusal_text, f"Error: {refusal_text}"}
 
 
-def _bounded_repo_test_failure(
-    result: Any, expected_head: str, lease_root: Path | None, scope_id: str,
-) -> bool:
-    """Only the output-free, structured completed-failure envelope is attestable."""
+def _log_retained_repository_failure(tool_name: str, result: Any, repository: str,
+                                     pull_request: int | None, head: str | None) -> None:
+    """Emit only bounded identifiers, never failure content or server error text."""
     from langchain_core.messages import ToolMessage
 
-    if isinstance(result, ToolMessage):
-        result = result.content
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except ValueError:
-            return False
-    if not isinstance(result, dict) or set(result) != {
-        "ok", "code", "exit_code", "suite", "selectors", "summary",
-        "remediation_guidance",
-    }:
-        return False
-    from .project_tests import _PYTEST_FAILING_BYTES, recorded_node_inventory, validated_pytest_node
+    try:
+        from .event_logger import log_event_sync
 
-    # Reuse the inventory the runner captured before execution: re-scanning
-    # here would block the event loop. A miss trusts nothing, not even a
-    # summary with an empty ``failing`` list.
-    inventory = recorded_node_inventory(lease_root, scope_id) if lease_root is not None else None
-    if inventory is None:
-        return False
-    summary = result["summary"]
-    return (
-        result["ok"] is False and result["code"] == "tests_failed"
-        and type(result["exit_code"]) is int and result["exit_code"] != 0
-        and isinstance(summary, dict)
-        and set(summary) == {"failed", "errors", "passed", "skipped", "failing", "failing_dropped", "head"}
-        and all(value is None or type(value) is int and value >= 0
-                for value in (summary[key] for key in ("failed", "errors", "passed", "skipped")))
-        and type(summary["failing_dropped"]) is int and summary["failing_dropped"] >= 0
-        and isinstance(summary["failing"], list) and len(summary["failing"]) <= 50
-        and all(isinstance(node, str) and validated_pytest_node(node, inventory) == node
-                for node in summary["failing"])
-        and sum(len(node) for node in summary["failing"]) <= _PYTEST_FAILING_BYTES
-        and isinstance(summary["head"], str)
-        and summary["head"] == expected_head
-        and re.fullmatch(r"[0-9a-f]{40,64}", summary["head"], re.ASCII)
-        and isinstance(result["suite"], str)
-        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", result["suite"], re.ASCII)
-        and isinstance(result["selectors"], list)
-        and len(result["selectors"]) <= 32
-        and all(isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9._/,:+=-]{1,256}", item, re.ASCII)
-                for item in result["selectors"])
-        and isinstance(result["remediation_guidance"], str)
-        and result["remediation_guidance"] == (
-            "The summary lists failing node ids. Prefer reading the lease's test source "
-            "and rerunning selected ids. include_output=true reveals raw output, "
-            "marks the turn untrusted, and blocks further repo_test runs this turn."
+        code = None
+        if isinstance(result, dict):
+            code = result.get("code")
+        elif isinstance(result, ToolMessage):
+            try:
+                payload = json.loads(result.content) if isinstance(result.content, str) else None
+                code = payload.get("code") if isinstance(payload, dict) else None
+            except (ValueError, TypeError):
+                pass
+        if not isinstance(code, str) or code not in {
+            "tests_failed", "merge_conflict", "rebase_conflict", "push_rejected",
+        }:
+            code = "tool_error"
+        log_event_sync(
+            "repository_failure_provenance_retained", tool=tool_name,
+            code=code, repository=repository, pull_request=pull_request, head=head,
         )
-    )
+    except Exception:  # noqa: BLE001 — telemetry must not change classification
+        pass
 
 
 def classify_protected_result(
@@ -11275,7 +11247,7 @@ def classify_protected_result(
         principal = getattr(auth_context, "canonical_principal", None)
         if getattr(auth_context, "is_service", False) and principal:
             principal = f"service:{principal}"
-        labels = InformationFlowLabels().with_source(protected_result_source(
+        source = protected_result_source(
             auth_context,
             principal=principal,
             domain="repository",
@@ -11287,7 +11259,23 @@ def classify_protected_result(
                 + ("/jobs" if tool_name == "ci_run_jobs" else "")
             ),
             bridge_instance="forge",
-        ))
+        )
+        if provenance is not None and provenance.sources and all(
+            item.domain == source.domain
+            and item.resource_id == source.resource_id
+            and item.principal == source.principal
+            and item.bridge_instance == source.bridge_instance
+            and item.sensitivity == source.sensitivity
+            and item.authorized_principals == source.authorized_principals
+            and item.source_kind == source.source_kind
+            and item.integrity_effect == source.integrity_effect
+            and item.integrity == "trusted"
+            for item in provenance.sources
+        ):
+            source = replace(source, integrity="trusted")
+            if failed:
+                _log_retained_repository_failure(tool_name, result, repo.lower(), None, None)
+        labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
     if descriptor and descriptor.result_origin & ResultOriginKind.REPOSITORY:
@@ -11317,33 +11305,7 @@ def classify_protected_result(
             # publish exact-scope, server-attested provenance for every author.
             integrity_effect="active_ingest",
         )
-        lease_root = None
-        if failed and tool_name == "repo_test":
-            cache = getattr(auth_context, "server_discovered_pr_states", None)
-            review_state = cache.resolve(scope.canonical_repo, scope.pr_number) if cache is not None else None
-            registry = getattr(auth_context, "repo_pr_scope_registry", None)
-            if review_state is None and registry is not None:
-                review_state = registry.resolve(scope.canonical_repo, scope.pr_number)
-            if review_state is None:
-                review_state = getattr(auth_context, "repo_review_state", None)
-            lease = getattr(review_state, "checkout_lease", None)
-            if (getattr(review_state, "action_scope", None) == scope
-                    and getattr(lease, "is_active", False)
-                    and getattr(lease, "scope_id", None) == scope.scope_id
-                    and (
-                        getattr(lease, "head_sha", None) == scope.observed_head_sha
-                        # #1934: a lease advanced by clean-lineage commits or a
-                        # verified rebase stays attested; its failed runs must
-                        # stay trusted too, or fix-and-rerun stalls again.
-                        or _attested_pr_checkout_lease(auth_context, scope, lease)
-                    )):
-                lease_root = Path(lease.path)
-        if (
-            (not failed or tool_name == "repo_test" and lease_root is not None and _bounded_repo_test_failure(
-                result, scope.observed_head_sha, lease_root, scope.scope_id,
-            ))
-            and provenance is not None and provenance.sources
-        ):
+        if provenance is not None and provenance.sources:
             if all(
                 item.domain == source.domain
                 and item.domain_qualifier == source.domain_qualifier
@@ -11363,6 +11325,11 @@ def classify_protected_result(
                         else "untrusted"
                     ),
                 )
+                if failed and source.integrity == "trusted":
+                    _log_retained_repository_failure(
+                        tool_name, result, scope.canonical_repo, scope.pr_number,
+                        scope.observed_head_sha,
+                    )
         labels = InformationFlowLabels().with_source(source)
         channel = getattr(auth_context, "channel_id", None)
         return labels.with_channel(channel) if channel else labels
