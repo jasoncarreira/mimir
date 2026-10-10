@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .background_tasks import cancel_background_tasks, spawn_background
+from .bridges._mentions import neutralize_display_name
 from .bridges.bench import BenchBridge
 from .bridges.web_chat import WebChatBridge
 from .channel_registry import ChannelRegistry
@@ -191,7 +192,7 @@ class _PairingNotifier:
         self._operator_pending.append(
             {
                 "canonical": canonical,
-                "display": display.strip() or canonical,
+                "display": neutralize_display_name(display) or canonical,
                 "platform": platform.strip() or "unknown",
                 "channel_id": channel_id.strip(),
                 "delivery": delivery,
@@ -1389,15 +1390,27 @@ def build_app(config: Config) -> web.Application:
     # paths under attachments/outbound/ — created lazily on first use.
     attachments_inbound = config.home / "attachments" / "inbound"
 
+    # A rejected operator policy disables BOTH chat bridges. Never fall back
+    # to unrestricted intake for either one after a configuration error.
+    from .config import load_channel_scopes
+    try:
+        channel_scopes = load_channel_scopes(config.home)
+    except (ValueError, OSError, RuntimeError) as exc:
+        scope_path = os.environ.get("MIMIR_CHANNEL_SCOPE_FILE", "/etc/mimir/channel-scope.yaml")
+        log.error("channel scope rejected at %s: %s", scope_path, exc)
+        log_event_sync("channel_scope_config_rejected", path=scope_path, reason=str(exc))
+        channel_scopes = None
+
     # DiscordBridge — opt-in via DISCORD_TOKEN. Import is deferred so absent
     # discord-py doesn't crash deployments that don't use Discord.
-    if config.discord_token:
+    if config.discord_token and channel_scopes is not None:
         try:
             from .bridges.discord import DiscordBridge
 
             channels.register(
                 DiscordBridge(
                     token=config.discord_token,
+                    channel_scope=channel_scopes["discord"],
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
                     attachments_dir=attachments_inbound,
@@ -1415,13 +1428,14 @@ def build_app(config: Config) -> web.Application:
     # SlackBridge — opt-in via SLACK_BOT_TOKEN + SLACK_APP_TOKEN. Both required
     # because we use Socket Mode (no public webhook needed). Same deferred-
     # import pattern as Discord.
-    if config.slack_bot_token and config.slack_app_token:
+    if config.slack_bot_token and config.slack_app_token and channel_scopes is not None:
         try:
             from .bridges.slack import SlackBridge
 
             channels.register(
                 SlackBridge(
                     bot_token=config.slack_bot_token,
+                    channel_scope=channel_scopes["slack"],
                     app_token=config.slack_app_token,
                     enqueue=dispatcher.enqueue,
                     admit=dispatcher.intake_admits,
@@ -1436,7 +1450,7 @@ def build_app(config: Config) -> web.Application:
                 "skipping SlackBridge. Install with `pip install mimir[slack]`.",
                 exc,
             )
-    elif config.slack_bot_token or config.slack_app_token:
+    elif channel_scopes is not None and (config.slack_bot_token or config.slack_app_token):
         log.warning(
             "Slack tokens partially configured (bot=%s, app=%s) — both required for "
             "Socket Mode. Skipping SlackBridge.",

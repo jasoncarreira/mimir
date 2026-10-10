@@ -55,7 +55,6 @@ from .commands.setup import (  # noqa: E402
 # callers that import the private helpers from mimir.cli).
 from .commands.identities import (  # noqa: E402
     _identities_load,
-    _identities_save,
     _identities_list_cmd,
     _identities_add_cmd,
     _identities_remove_cmd,

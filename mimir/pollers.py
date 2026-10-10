@@ -825,6 +825,31 @@ def _github_framework_trigger_is_trusted(
     )
 
 
+def _drop_superseded_github_framework_items(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Discard stale framework snapshots after our own verified fast-forward."""
+    from .repo_tools import was_superseded_by_own_push
+
+    from .event_logger import log_event_sync
+
+    retained = []
+    for item in batch:
+        extras = item["extras"]
+        if (
+            extras.get("event_type") in _GITHUB_FRAMEWORK_TRIGGER_EVENT_TYPES
+            and isinstance(extras.get("repo"), str)
+            and type(extras.get("number")) is int
+            and isinstance(extras.get("head_sha"), str)
+            and was_superseded_by_own_push(extras["repo"], extras["number"], extras["head_sha"])
+        ):
+            log_event_sync(
+                "github_stale_trigger_dropped", stage="poller_fire",
+                reason="superseded_by_verified_own_push",
+            )
+            continue
+        retained.append(item)
+    return retained
+
+
 # Pollers manifest schema version history:
 #
 #   v1 (2026-05-26, chainlink #91): introduced the ``schema_version`` field.
@@ -3081,6 +3106,10 @@ async def run_poller(
     authority = poller.resolved_authority()
     service_principal = f"service:{authority.canonical}"
     for batch_idx, batch in enumerate(batches):
+        if poller.name == "github-activity":
+            batch = _drop_superseded_github_framework_items(batch)
+            if not batch:
+                continue
         content = _render_batch(poller.name, batch, batch_idx, len(batches))
         # Apply the prompt cap once more on the assembled batch — even
         # with per-item caps, ``batch_size × cap`` could exceed the

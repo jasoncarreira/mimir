@@ -266,6 +266,7 @@ def _execute(
         state = _state(runtime, repository, pull_request)
         git_tools = RepoGitTools(
             state,
+            auth_context=getattr(runtime, "context", None) if runtime is not None else None,
             enforce=_enforcement_enabled(
                 runtime,
                 repository=repository,
@@ -356,8 +357,7 @@ def repo_checkout(
         if authors == (scope.pull_request_author,) and scope.pull_request_author:
             verdict = _author_verdict(context, scope, scope.pull_request_author, client)
             context.ifc_state.pr_checkout_author_trust[scope.scope_id] = verdict
-    if context.ifc_state.pr_checkout_author_trust[scope.scope_id] is True:
-        _publish_attested_scope_result(runtime, scope, lease.head_sha)
+    _publish_attested_lease_result(runtime, state)
     return {
         "status": "resumed" if candidates else "checked_out",
         "path": str(lease.path),

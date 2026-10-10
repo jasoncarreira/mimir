@@ -17,6 +17,7 @@ from tests.timing import HANG_GUARD_SECONDS
 pytest.importorskip("slack_bolt")
 
 from mimir.bridges.base import Bridge, MessageUpdate, SendResult
+from mimir.bridges._mentions import neutralize_slack_broadcasts
 from mimir.bridges.slack import (
     SLACK_MESSAGE_CHAR_LIMIT,
     SlackBridge,
@@ -321,6 +322,83 @@ async def test_send_can_post_threaded_block_kit_panel(bridge_with_fake_app):
     assert sent[0]["blocks"] == blocks
 
 
+def test_neutralize_slack_broadcasts_keeps_single_user_channels_and_links():
+    ordinary = "build passed for PR #2319 — see <https://github.com/x/y/pull/1|PR>"
+    assert neutralize_slack_broadcasts(ordinary) == ordinary
+    assert neutralize_slack_broadcasts("<@U123> <#C123|general> <https://example.com|link>") == (
+        "<@U123> <#C123|general> <https://example.com|link>"
+    )
+    assert neutralize_slack_broadcasts("<!here|<!subteam^S123>>") == "@here"
+
+
+@pytest.mark.asyncio
+async def test_send_neutralizes_slack_broadcasts_in_text_and_nested_blocks(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+    text = "hi <!channel> and <!here|here> and <!everyone> and <!subteam^S123|@devs>"
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "<!here> <@U123>"},
+               "fields": [{"type": "plain_text", "text": "<!SUBTEAM^S123|@devs>"}]}]
+    assert (await bridge.send("slack-C01ABC", text, blocks=blocks)).sent
+    assert sent[0]["text"] == "hi @channel and @here and @everyone and @subteam"
+    assert sent[0]["blocks"][0]["text"]["text"] == "@here <@U123>"
+    assert sent[0]["blocks"][0]["fields"][0]["text"] == "@subteam"
+    assert blocks[0]["text"]["text"] == "<!here> <@U123>"  # caller's payload is not mutated
+    assert "link_names" not in sent[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["send", "edit"])
+@pytest.mark.parametrize("broadcast_range", ["here", "channel", "everyone"])
+async def test_rich_text_group_mentions_are_inert_on_send_and_edit(
+    bridge_with_fake_app, operation, broadcast_range,
+):
+    from copy import deepcopy
+
+    bridge, _, sent = bridge_with_fake_app
+    safe_elements = [
+        {"type": "text", "text": "build passed"},
+        {"type": "user", "user_id": "U123"},
+        {"type": "channel", "channel_id": "C123"},
+        {"type": "link", "url": "https://example.com", "text": "link"},
+    ]
+    blocks = [{"type": "rich_text", "elements": [
+        {"type": "rich_text_section", "elements": [
+            {"type": "broadcast", "range": broadcast_range}, *safe_elements,
+        ]},
+        {"type": "rich_text_list", "style": "bullet", "elements": [
+            {"type": "rich_text_section", "elements": [
+                {"type": "usergroup", "usergroup_id": "S123"},
+            ]},
+        ]},
+    ]}]
+    original = deepcopy(blocks)
+    if operation == "send":
+        result = await bridge.send("slack-C01ABC", "build passed", blocks=blocks)
+        outgoing = sent[0]
+    else:
+        result = await bridge.edit_message(
+            "slack-C01ABC", "123.001", MessageUpdate(text="build passed", blocks=blocks),
+        )
+        outgoing = bridge._app._updates[0]
+    assert result.sent
+    elements = outgoing["blocks"][0]["elements"]
+    assert elements[0]["elements"] == [
+        {"type": "text", "text": "@broadcast"}, *safe_elements,
+    ]
+    assert elements[1]["elements"][0]["elements"] == [
+        {"type": "text", "text": "@subteam"},
+    ]
+    assert blocks == original
+
+
+@pytest.mark.asyncio
+async def test_send_slack_ordinary_text_is_unchanged(bridge_with_fake_app):
+    bridge, _, sent = bridge_with_fake_app
+    ordinary = "build passed for PR #2319 — see <https://github.com/x/y/pull/1|PR>"
+    assert (await bridge.send("slack-C01ABC", ordinary)).sent
+    assert sent[0]["text"] == ordinary
+    assert "link_names" not in sent[0]
+
+
 @pytest.mark.asyncio
 async def test_send_missing_attachment_returns_failure(bridge_with_fake_app, tmp_path: Path):
     bridge, _, _ = bridge_with_fake_app
@@ -396,6 +474,27 @@ async def test_edit_message_calls_chat_update_with_blocks(bridge_with_fake_app):
             "blocks": blocks,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_edit_neutralizes_slack_broadcasts_in_text_and_blocks(bridge_with_fake_app):
+    bridge, _, _ = bridge_with_fake_app
+    blocks = [{"type": "actions", "elements": [
+        {"type": "button", "text": {"type": "plain_text", "text": "<!channel|channel>"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "<!subteam^S123> <!HERE>"}},
+    ]}]
+    result = await bridge.edit_message("slack-C01ABC", "123.001", MessageUpdate(
+        text="<!everyone> <!here|here> <@U123> <#C123|general> <https://example.com|link>",
+        blocks=blocks,
+    ))
+    assert result.sent
+    updated = bridge._app._updates[0]
+    assert updated["text"] == (
+        "@everyone @here <@U123> <#C123|general> <https://example.com|link>"
+    )
+    assert updated["blocks"][0]["elements"][0]["text"]["text"] == "@channel"
+    assert updated["blocks"][0]["elements"][1]["text"]["text"] == "@subteam @here"
+    assert "link_names" not in updated
 
 
 @pytest.mark.asyncio
@@ -850,11 +949,12 @@ async def test_on_message_skips_self(bridge_with_fake_app):
 @pytest.mark.asyncio
 async def test_on_message_skips_self_bot_id_when_user_id_unresolved(bridge_with_fake_app):
     """Own bot messages are dropped even when auth_test has not resolved
-    the bot user id and respond_to_bots is enabled."""
+    the bot user id and channel scope allows other bots."""
     bridge, enqueued, _ = bridge_with_fake_app
     bridge._bot_user_id = None
     bridge._bot_id = None
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
 
     await bridge.send("slack-C01ENG", "outbound")
     assert bridge._bot_id == "BSELF123"
@@ -1031,9 +1131,8 @@ async def test_file_share_download_respects_intake_admission(
 
 @pytest.mark.asyncio
 async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
-    """A non-self bot is dropped unless ``respond_to_bots=True``."""
+    """A non-self bot is dropped unless channel scope sets ``allow_bots="all"``."""
     bridge, enqueued, _ = bridge_with_fake_app
-    bridge.respond_to_bots = False
     await bridge._on_message(
         {
             "user": "UOTHERBOT",
@@ -1045,7 +1144,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_app):
     )
     assert enqueued == []
 
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
     await bridge._on_message(
         {
             "user": "UOTHERBOT",

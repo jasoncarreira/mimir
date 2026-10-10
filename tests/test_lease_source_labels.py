@@ -175,13 +175,33 @@ def _real_attested_lease(tmp_path: Path):
     lease = SimpleNamespace(
         path=checkout, scope_id=scope.scope_id, canonical_repo=scope.canonical_repo,
         pr_number=scope.pr_number, head_sha=head, owner=scope.principal,
-        is_active=True,
+        is_active=True, base_sha=head,
     )
+    (checkout / ".git" / "mimir-pr-checkout-lease.json").write_text(json.dumps({
+        "scope_id": scope.scope_id, "canonical_repo": scope.canonical_repo,
+        "pr_number": scope.pr_number, "head_sha": head,
+        "base_sha": lease.base_sha, "lineage": {},
+    }))
     auth = _auth(scope=scope)
     state = RepoReviewState(scope)
     state.attach_checkout_lease(lease)
     object.__setattr__(auth, "repo_review_state", state)
     return auth, scope, lease, target, (DEFAULT_USER_NAME, DEFAULT_USER_EMAIL)
+
+
+def _record_clean_head(lease, *commits: str) -> None:
+    if commits:
+        lease.head_sha = subprocess.run(
+            ["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+    path = lease.path / ".git" / "mimir-pr-checkout-lease.json"
+    raw = json.loads(path.read_text())
+    raw["scope_id"] = lease.scope_id
+    raw["head_sha"] = lease.head_sha
+    raw["base_sha"] = lease.base_sha
+    raw["lineage"].update({commit: True for commit in commits})
+    path.write_text(json.dumps(raw))
 
 
 def test_attested_lease_head_accepts_only_server_identity_descendants(
@@ -210,6 +230,10 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
     state = auth.repo_review_state
     assert state is not None
     state.record_git_head(scope.scope_id, server_head)
+    _record_clean_head(lease, server_head)
+    assert access_control_module._lease_has_clean_lineage(
+        lease.path, lease, scope, scope.observed_head_sha, server_head,
+    )
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
 
     target.write_text("foreign commit\n", encoding="utf-8")
@@ -260,6 +284,7 @@ def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     state.record_git_head(scope.scope_id, server_head)
+    _record_clean_head(lease, server_head)
 
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
     assert len(calls) == 2
@@ -853,6 +878,9 @@ def test_checkout_records_native_author_trust_for_file_reads(
     lease = active_pr_checkout_lease_for_path(target)
     assert lease is not None
     state = RepoReviewState(action_scope=scope)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setattr(access_control_module, "_observed_checkout_state",
+                        lambda _: (scope.head_ref, scope.observed_head_sha))
     auth.server_discovered_pr_states.remember(state)
     monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *args: (state, None))
     monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
@@ -990,6 +1018,9 @@ def test_checkout_bot_attestation_requires_exact_operator_login(
     monkeypatch.setenv("MIMIR_PR_CHECKOUT_LEASE_ROOT", str(root))
     lease = active_pr_checkout_lease_for_path(target)
     state = RepoReviewState(scope)
+    state.attach_checkout_lease(lease)
+    monkeypatch.setattr(access_control_module, "_observed_checkout_state",
+                        lambda _: (scope.head_ref, scope.observed_head_sha))
     auth.server_discovered_pr_states.remember(state)
     monkeypatch.setattr(forge, "remediation_checkout_preflight", lambda *_: (state, None))
     monkeypatch.setattr(repo, "acquire_pr_checkout_lease", lambda *args, **kwargs: (lease, ()))
@@ -1075,6 +1106,11 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
     head = subprocess.run(["git", "-C", str(lease.path), "rev-parse", "HEAD"], check=True,
                           capture_output=True, text=True).stdout.strip()
     state.record_git_head(scope.scope_id, head)
+    descendants = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-list", head, "--not", attested, base],
+        check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    _record_clean_head(lease, *descendants)
     object.__setattr__(auth, "repo_review_state", state)
     assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
     from mimir import pr_checkout_lease
@@ -1094,8 +1130,9 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
     assert not access_control_module._lease_head_is_author_attested(
         lease.path, "other-branch", original.observed_head_sha, head,
         scope=scope, lease=lease, ifc_state=auth.ifc_state,
+        observed_state=("main", head),
     )
-    unprotected = replace(scope, destination_ref="refs/heads/main-copy")
+    unprotected = replace(scope, destination_ref="refs/heads/main-copy", base_ref="other")
     assert not access_control_module._lease_head_is_author_attested(
         lease.path, "main", original.observed_head_sha, head,
         scope=unprotected, lease=lease, ifc_state=auth.ifc_state,

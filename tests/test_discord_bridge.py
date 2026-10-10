@@ -26,6 +26,7 @@ from mimir.bridges.discord import (
     _channel_to_id,
     _channel_visibility,
     _chunk_message,
+    _DiscordClient,
 )
 from mimir.event_logger import init_logger
 from mimir.config import Config
@@ -139,6 +140,22 @@ def test_channel_visibility_dm_is_private():
 
 
 # ---- bridge surface ------------------------------------------------------
+
+
+def _assert_safe_mentions(value):
+    import discord
+
+    assert isinstance(value, discord.AllowedMentions)
+    assert value.everyone is False
+    assert value.roles is False
+    assert value.users is True
+    assert value.replied_user is True
+
+
+def test_discord_client_defaults_block_broadcasts_and_roles():
+    bridge = DiscordBridge(token="TEST", enqueue=AsyncMock())
+    client = _DiscordClient(bridge)
+    _assert_safe_mentions(client.allowed_mentions)
 
 
 @pytest.fixture
@@ -255,6 +272,45 @@ async def test_send_chunks_long_text(bridge_with_fake_client):
     assert result.chunks == 3  # 2*limit + 100 → 3 chunks under the limit
     # All chunks landed on the right channel.
     assert all(item["channel_id"] == 1 for item in sent)
+
+
+@pytest.mark.asyncio
+async def test_send_text_chunks_block_broadcasts_and_roles(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    text = "build passed" + "x" * (DISCORD_MESSAGE_CHAR_LIMIT * 2)
+    assert (await bridge.send("discord-1", text)).sent
+    assert len(sent) > 1
+    assert "".join(item["content"] for item in sent) == text
+    for item in sent:
+        _assert_safe_mentions(item["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_files_only_blocks_broadcasts_and_roles(bridge_with_fake_client, tmp_path):
+    bridge, _, sent = bridge_with_fake_client
+    attachment = tmp_path / "file.txt"
+    attachment.write_text("hello")
+    assert (await bridge.send("discord-1", "", attachment_paths=[attachment])).sent
+    assert sent[0]["content"] == ""
+    assert len(sent[0]["files"]) == 1
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_reply_blocks_broadcasts_and_keeps_user_ping(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    assert (await bridge.send("discord-1", "hi <@123> @everyone <@&456>",
+                              reply_to_message_id="999")).sent
+    assert sent[0]["content"] == "hi <@123> @everyone <@&456>"
+    assert sent[0]["reference"].id == 999
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
+
+
+@pytest.mark.asyncio
+async def test_send_discord_ordinary_text_is_unchanged(bridge_with_fake_client):
+    bridge, _, sent = bridge_with_fake_client
+    assert (await bridge.send("discord-1", "build passed")).sent
+    assert sent[0]["content"] == "build passed"
 
 
 @pytest.mark.asyncio
@@ -725,6 +781,7 @@ async def test_send_passes_embed_and_reply_reference(bridge_with_fake_client):
     assert sent[0]["reference"].id == 999
     assert sent[0]["embed"].title == "Working"
     assert sent[0]["embed"].description == "[ ] Working"
+    _assert_safe_mentions(sent[0]["allowed_mentions"])
 
 
 @pytest.mark.asyncio
@@ -736,14 +793,12 @@ async def test_edit_message_calls_message_edit_with_embed(bridge_with_fake_clien
 
     assert result.sent is True
     assert result.message_id == "1001"
-    assert bridge._client._edits == [  # type: ignore[union-attr]
-        {
-            "channel_id": 1,
-            "message_id": 1001,
-            "content": "updated",
-            "embed": embed,
-        }
-    ]
+    assert len(bridge._client._edits) == 1
+    edited = bridge._client._edits[0]
+    _assert_safe_mentions(edited.pop("allowed_mentions"))
+    assert edited == {
+        "channel_id": 1, "message_id": 1001, "content": "updated", "embed": embed,
+    }
 
 
 @pytest.mark.asyncio
@@ -922,11 +977,10 @@ async def test_on_message_skips_self(bridge_with_fake_client):
 
 @pytest.mark.asyncio
 async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
-    """A non-self bot message is dropped unless ``respond_to_bots=True``."""
+    """A non-self bot message is dropped unless channel scope sets ``allow_bots="all"``."""
     import discord
 
     bridge, enqueued, _ = bridge_with_fake_client
-    bridge.respond_to_bots = False
 
     channel = SimpleNamespace(
         id=1, type=getattr(discord.ChannelType, "text", None), name="g"
@@ -938,7 +992,8 @@ async def test_on_message_skips_bot_unless_opted_in(bridge_with_fake_client):
     await bridge._on_message(msg)
     assert enqueued == []
 
-    bridge.respond_to_bots = True
+    from mimir.bridges.channel_scope import ChannelScope
+    bridge.channel_scope = ChannelScope(allow_bots="all")
     await bridge._on_message(msg)
     assert len(enqueued) == 1
     assert enqueued[0].author_id == "999"
