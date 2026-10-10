@@ -222,6 +222,92 @@ async def test_discord_role_grant_cannot_configure_admin(tmp_path, override):
     assert access["roles"] == ["user"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoked", [False, True])
+async def test_operator_approval_takes_ownership_of_discord_role_entry(tmp_path, revoked):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    if revoked:
+        assert not await disp._authorize_bridge_event(_role_event(roles=()))
+    assert approve_pairing(tmp_path, "discord-9")
+    path = tmp_path / "state" / "identities.yaml"
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access == {"roles": ["user"]}
+    before = path.read_bytes()
+    assert disp.intake_admits(_role_event(roles=()))
+    assert await disp._authorize_bridge_event(_role_event(roles=()))
+    assert path.read_bytes() == before
+    assert resolver.access_metadata("discord-9").roles == ("user",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,author,channel", [
+    ("slack", "slack-U9", "slack-C9"),
+    ("web", "web-user9", "web-session9"),
+    ("http_event", "discord-9", "discord-10"),
+])
+@pytest.mark.parametrize("enforced", [False, True])
+async def test_discord_role_grant_does_not_authorize_other_sources(tmp_path, source, author, channel, enforced):
+    import yaml
+    from mimir.identities_populator import approve_pairing
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=enforced), resolver=resolver)
+    assert await disp._authorize_bridge_event(_role_event())
+    path = tmp_path / "state" / "identities.yaml"
+    doc = yaml.safe_load(path.read_text())
+    doc["people"][0]["aliases"].append(author)
+    path.write_text(yaml.safe_dump(doc))
+    event = _role_event(author=author)
+    event.source, event.channel_id = source, channel
+    before = path.read_bytes()
+    assert not disp.intake_admits(event)
+    assert not await disp._authorize_bridge_event(event)
+    assert path.read_bytes() == before
+    # This is source isolation, not a global revocation of the Discord grant.
+    assert await disp._authorize_bridge_event(_role_event())
+    assert approve_pairing(tmp_path, "discord-9")
+    assert disp.intake_admits(event)
+    assert await disp._authorize_bridge_event(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["grant", "unchanged_grant", "revoke"])
+async def test_discord_role_writers_leave_event_loop_responsive(tmp_path, monkeypatch, operation):
+    import threading
+    from mimir import identities_populator as pop
+
+    resolver = _resolver(tmp_path, _role_policy())
+    disp = Dispatcher(_make_config(tmp_path, access_control_enforced=True), resolver=resolver)
+    if operation != "grant":
+        assert await disp._authorize_bridge_event(_role_event())
+    name = "revoke_role_admission" if operation == "revoke" else "grant_role_admission"
+    original = getattr(pop, name)
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    heartbeat = threading.Event()
+    observed = []
+
+    def blocked_writer(*args):
+        # Synchronize inside the actual synchronous write call. The loop must
+        # run its callback while this worker is waiting, not after it returns.
+        observed.append(threading.get_ident())
+        loop.call_soon_threadsafe(heartbeat.set)
+        if not heartbeat.wait(2):
+            raise RuntimeError("role writer stalled the event loop")
+        return original(*args)
+
+    monkeypatch.setattr(pop, name, blocked_writer)
+    event = _role_event(roles=() if operation == "revoke" else ("222",))
+    assert await disp._authorize_bridge_event(event) is (operation != "revoke")
+    assert heartbeat.is_set()
+    assert len(observed) == 1 and observed[0] != loop_thread
+
+
 def test_dispatcher_callbacks_and_runner_can_be_cleared(tmp_path: Path):
     async def callback(*args) -> None:
         return None

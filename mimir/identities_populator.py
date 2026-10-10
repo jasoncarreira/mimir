@@ -102,6 +102,11 @@ def _approve_entry(match: dict[str, Any], roles: list[str]) -> bool:
         access["roles"] = roles
         match["access"] = access
         changed = True
+    # An explicit operator grant takes ownership even if the roles are unchanged.
+    for key in ("source", "granted_by", "revoked_at"):
+        if key in access:
+            del access[key]
+            changed = True
     pairing = match.get("pairing")
     if isinstance(pairing, dict):
         if pairing.pop("request_id", None) is not None:
@@ -278,7 +283,8 @@ def grant_role_admission(
     *, roles: Sequence[str] = ("user",),
 ) -> tuple[bool, str | None]:
     """Persist a Discord-only user grant; return (changed, canonical)."""
-    assert list(roles) == DISCORD_ADMISSION_ROLES
+    if list(roles) != DISCORD_ADMISSION_ROLES:
+        raise ValueError("Discord role admission can only grant user access")
     if not author or not author.startswith("discord-") or not author[8:].isdigit():
         return False, None
     path = home / "state" / "identities.yaml"

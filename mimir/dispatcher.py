@@ -384,6 +384,14 @@ class Dispatcher:
         is_http_ingress = self._is_http_ingress(event)
         if event.trigger != "user_message" and not is_http_ingress:
             return None
+        # Role grants belong to the Discord gateway, not other aliases/sources.
+        resolver = self._identity_resolver
+        if resolver is not None:
+            resolver.reload_if_changed()
+        identity = resolver.identity(event.author) if resolver is not None else None
+        if identity is not None and identity.access_source == "discord_role" and event.source != "discord":
+            decision = authorize_inbound(event, resolver, enforce=True)
+            return replace(decision, allowed=False, status=AccessStatus.DENIED)
         if (event.source or "").strip().lower() in TRUSTED_INTERNAL_SOURCES and not is_http_ingress:
             return None
         decision = authorize_inbound(
@@ -412,11 +420,13 @@ class Dispatcher:
 
             try:
                 if match is not None:
-                    changed, canonical = grant_role_admission(
-                        self._config.home, event.author, *match,
+                    changed, canonical = await asyncio.to_thread(
+                        grant_role_admission, self._config.home, event.author, *match,
                     )
                 elif managed:
-                    changed, canonical = revoke_role_admission(self._config.home, event.author)
+                    changed, canonical = await asyncio.to_thread(
+                        revoke_role_admission, self._config.home, event.author,
+                    )
                 else:
                     changed, canonical = False, None
                 if changed:

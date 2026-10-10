@@ -1033,7 +1033,7 @@ def test_discord_role_writer_preserves_header_and_refuses_admin(tmp_path):
     path = tmp_path / "state" / "identities.yaml"
     path.parent.mkdir()
     path.write_text("# policy header\npeople: []\n")
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="only grant user"):
         grant_role_admission(tmp_path, "discord-1", "11", "22", roles=["admin"])
     assert grant_role_admission(tmp_path, "discord-1", "11", "22") == (True, "discord-1")
     text = path.read_text()
@@ -1048,6 +1048,70 @@ def test_discord_role_writer_preserves_header_and_refuses_admin(tmp_path):
     revoked = yaml.safe_load(path.read_text())["people"][0]["access"]
     assert revoked["roles"] == [] and revoked["revoked_at"]
     assert revoke_role_admission(tmp_path, "discord-1") == (False, "discord-1")
+
+
+@pytest.mark.parametrize("writer", ["approve_pairing", "approve_pairing_code", "issue_web_key"])
+@pytest.mark.parametrize("revoked", [False, True])
+def test_operator_grant_paths_remove_discord_role_management(tmp_path, writer, revoked):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    from mimir import identities_populator as pop
+
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("people: []\n")
+    assert pop.grant_role_admission(tmp_path, "discord-9", "111", "222")[0]
+    if revoked:
+        assert pop.revoke_role_admission(tmp_path, "discord-9")[0]
+    doc = yaml.safe_load(path.read_text())
+    entry = doc["people"][0]
+    entry["access"]["operator_note"] = "preserve"
+    if writer == "approve_pairing_code":
+        code, salt = "ABCDEFGH", bytes(range(16))
+        entry["pairing"] = {
+            "status": "pending", "code_salt": salt.hex(),
+            "code_hash": hashlib.sha256(salt + code.encode("ascii")).hexdigest(),
+            "code_expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+        }
+    path.write_text(yaml.safe_dump(doc))
+    if writer == "approve_pairing":
+        assert pop.approve_pairing(tmp_path, "discord-9")
+    elif writer == "approve_pairing_code":
+        assert pop.approve_pairing_code(tmp_path, code)
+    else:
+        assert pop.issue_web_key(tmp_path, "discord-9", roles=["user"], key_factory=lambda: "ownership-test")
+    access = yaml.safe_load(path.read_text())["people"][0]["access"]
+    assert access["roles"] == ["user"]
+    assert not {"source", "granted_by", "revoked_at"}.intersection(access)
+    if writer != "issue_web_key":
+        assert access["operator_note"] == "preserve"
+    before = path.read_bytes()
+    assert pop.revoke_role_admission(tmp_path, "discord-9") == (False, None)
+    assert pop.grant_role_admission(tmp_path, "discord-9", "111", "222") == (False, None)
+    assert path.read_bytes() == before
+
+
+def test_discord_role_writer_refuses_admin_with_optimization(tmp_path):
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", "\n".join([
+            "import sys",
+            "from pathlib import Path",
+            "from mimir.identities_populator import grant_role_admission",
+            "try:",
+            "    grant_role_admission(Path(sys.argv[1]), 'discord-9', '111', '222', roles=['admin'])",
+            "except ValueError:",
+            "    print('rejected')",
+            "else:",
+            "    raise RuntimeError('optimized interpreter accepted admin roles')",
+        ]), str(tmp_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "rejected"
+    assert not (tmp_path / "state" / "identities.yaml").exists()
 
 
 def test_discord_role_writer_never_modifies_operator_identity(tmp_path):
