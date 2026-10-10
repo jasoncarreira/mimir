@@ -10920,8 +10920,11 @@ def _bounded_repo_test_failure(
     from .project_tests import _PYTEST_FAILING_BYTES, recorded_node_inventory, validated_pytest_node
 
     # Reuse the inventory the runner captured before execution: re-scanning
-    # here would block the event loop, and a miss trusts nothing.
-    inventory = recorded_node_inventory(lease_root, scope_id) if lease_root is not None else frozenset()
+    # here would block the event loop. A miss trusts nothing, not even a
+    # summary with an empty ``failing`` list.
+    inventory = recorded_node_inventory(lease_root, scope_id) if lease_root is not None else None
+    if inventory is None:
+        return False
     summary = result["summary"]
     return (
         result["ok"] is False and result["code"] == "tests_failed"

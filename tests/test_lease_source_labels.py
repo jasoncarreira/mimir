@@ -607,7 +607,8 @@ def test_failed_pr_rerequest_review_keeps_native_non_repository_labelling():
 @pytest.mark.parametrize("change", ["stdout", "stderr", "git_context", "wrong_head",
     "wrong_scope", "raw_code", "no_summary", "bad_node", "bad_suite", "bad_selector",
     "missing_definition", "parameter_prose", "total_bytes", "inactive_lease", "zero_exit",
-    "non_ascii_node", "lease_head_moved", "inventory_not_recorded"])
+    "non_ascii_node", "lease_head_moved", "inventory_not_recorded",
+    "inventory_not_recorded_empty_failing"])
 def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_path):
     from copy import deepcopy
     from mimir.access_control import ProtectedResultProvenance
@@ -684,7 +685,12 @@ def test_failed_repo_test_provenance_requires_exact_bounded_summary(change, tmp_
         lease.head_sha = "c" * 40
     elif change == "inventory_not_recorded":
         from mimir import project_tests
-        project_tests._NODE_INVENTORIES.pop((str(lease.path), scope.scope_id), None)
+        project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
+    elif change == "inventory_not_recorded_empty_failing":
+        # Empty ``failing`` must not pass vacuously when no run recorded an inventory.
+        from mimir import project_tests
+        project_tests._NODE_INVENTORIES.pop(project_tests._inventory_key(lease.path, scope.scope_id), None)
+        altered["summary"]["failing"] = []
     if change == "wrong_scope":
         source = replace(source, resource_id="owner/repo#pull/7@" + "b" * 40)
     assert integrity(altered, source) == "untrusted"

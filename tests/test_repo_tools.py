@@ -3738,3 +3738,57 @@ def test_project_test_timeout_can_actually_run_this_repository_suite() -> None:
     headroom.
     """
     assert _TIMEOUT_SECONDS >= 1200.0
+
+
+
+@pytest.mark.asyncio
+async def test_runner_records_inventory_under_the_classifier_key(repo_tools, tmp_path, monkeypatch):
+    """Pin the real runner -> classifier wiring for failed-run attestation.
+
+    The classifier trusts failing node ids only from the inventory the runner
+    recorded before execution. If the runner stopped recording it, or recorded
+    it under a different key, every real red run would silently become
+    untrusted while unit tests that seed the cache by hand stay green.
+    """
+    from mimir.access_control import _bounded_repo_test_failure
+    from mimir.project_tests import recorded_node_inventory
+
+    _origin, _source, scope, state, _tools = repo_tools
+    home = tmp_path / "home"
+    _configure_test_suites(home, state)
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    lease = state.checkout_lease
+    tests_dir = lease.path / "tests"
+    tests_dir.mkdir(exist_ok=True)
+    (tests_dir / "test_wired.py").write_text("def test_red():\n    assert False\n")
+    output = (
+        b"F\n=== short test summary info ===\n"
+        b"FAILED tests/test_wired.py::test_red - assert False\n"
+        b"1 failed in 0.01s\n"
+    )
+
+    async def runner(argv, directory, env, projections, **kwargs):
+        return CollectedExecutionResult(1, output, b"", False, False, len(output), 0)
+
+    result = await RepoProjectTests(
+        state, runner=runner, checkout_factory=_test_checkout_factory,
+    ).execute(("tests/test_wired.py",), suite="python")
+    assert result.code == "tests_failed"
+    assert result.failure_summary["failing"] == ["tests/test_wired.py::test_red"]
+    # Read back exactly as classify_protected_result does: Path(lease.path) + scope_id.
+    assert "tests/test_wired.py::test_red" in (
+        recorded_node_inventory(Path(lease.path), scope.scope_id) or frozenset()
+    )
+    envelope = {
+        "ok": False, "code": "tests_failed", "exit_code": 1, "suite": "python",
+        "selectors": ["tests/test_wired.py"],
+        "summary": {**result.failure_summary, "head": scope.observed_head_sha},
+        "remediation_guidance": (
+            "The summary lists failing node ids. Prefer reading the lease's test source "
+            "and rerunning selected ids. include_output=true reveals raw output, "
+            "marks the turn untrusted, and blocks further repo_test runs this turn."
+        ),
+    }
+    assert _bounded_repo_test_failure(
+        envelope, scope.observed_head_sha, Path(lease.path), scope.scope_id,
+    ) is True

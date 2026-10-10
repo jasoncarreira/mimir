@@ -148,18 +148,28 @@ _NODE_INVENTORY_CACHE_SIZE = 32
 _NODE_INVENTORIES: OrderedDict[tuple[str, str], frozenset[str]] = OrderedDict()
 
 
+def _inventory_key(root: Path, scope_id: str) -> tuple[str, str]:
+    # Normalise so the runner's resolved root and the classifier's lease path
+    # always agree; a mismatch would silently make every failure untrusted.
+    return (str(Path(root).resolve()), scope_id)
+
+
 def remember_node_inventory(root: Path, scope_id: str, inventory: frozenset[str]) -> None:
     """Record the inventory captured before a run for the result classifier."""
-    key = (str(root), scope_id)
+    key = _inventory_key(root, scope_id)
     _NODE_INVENTORIES[key] = inventory
     _NODE_INVENTORIES.move_to_end(key)
     while len(_NODE_INVENTORIES) > _NODE_INVENTORY_CACHE_SIZE:
         _NODE_INVENTORIES.popitem(last=False)
 
 
-def recorded_node_inventory(root: Path, scope_id: str) -> frozenset[str]:
-    """Return the pre-run inventory, or an empty one (nothing trusted) on a miss."""
-    return _NODE_INVENTORIES.get((str(root), scope_id), frozenset())
+def recorded_node_inventory(root: Path, scope_id: str) -> frozenset[str] | None:
+    """Return the pre-run inventory, or ``None`` when no run recorded one.
+
+    ``None`` is distinct from an empty inventory: a miss must make the whole
+    result untrusted, including a summary whose ``failing`` list is empty.
+    """
+    return _NODE_INVENTORIES.get(_inventory_key(root, scope_id))
 
 
 def validated_pytest_node(candidate: str, inventory: frozenset[str]) -> str | None:

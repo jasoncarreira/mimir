@@ -132,6 +132,25 @@ def test_recorded_inventory_is_bounded_and_misses_trust_nothing(tmp_path):
     for index in range(project_tests._NODE_INVENTORY_CACHE_SIZE + 5):
         project_tests.remember_node_inventory(tmp_path, f"scope-{index}", frozenset({f"n{index}"}))
     assert len(project_tests._NODE_INVENTORIES) == project_tests._NODE_INVENTORY_CACHE_SIZE
-    assert project_tests.recorded_node_inventory(tmp_path, "scope-0") == frozenset()
+    assert project_tests.recorded_node_inventory(tmp_path, "scope-0") is None
     last = project_tests._NODE_INVENTORY_CACHE_SIZE + 4
     assert project_tests.recorded_node_inventory(tmp_path, f"scope-{last}") == frozenset({f"n{last}"})
+
+
+def test_recorded_empty_inventory_is_distinct_from_a_miss(tmp_path):
+    from mimir import project_tests
+
+    project_tests.remember_node_inventory(tmp_path, "scope-empty", frozenset())
+    assert project_tests.recorded_node_inventory(tmp_path, "scope-empty") == frozenset()
+    assert project_tests.recorded_node_inventory(tmp_path, "scope-never") is None
+
+
+def test_recorded_inventory_key_normalises_symlinked_roots(tmp_path):
+    from mimir import project_tests
+
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real)
+    project_tests.remember_node_inventory(alias, "scope-alias", frozenset({"tests/test_a.py::test_a"}))
+    assert project_tests.recorded_node_inventory(real, "scope-alias") == frozenset({"tests/test_a.py::test_a"})
