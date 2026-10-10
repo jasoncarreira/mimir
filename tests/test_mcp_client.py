@@ -50,19 +50,19 @@ def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) ->
         "tool_id": "tool-1", "server_config_id": "server-1",
         "original_tool_name": "search", "config_digest": "config-a",
         "schema_digest": "schema-a", "is_tombstoned": False,
-        "classification": "", "result_integrity": "untrusted",
+        "classification": "",
         "argument_egress": "taint_gated",
     }})
 
     approved = store.update_tool_policy(
         "tool-1",
         classification="open",
-        result_integrity="trusted",
         argument_egress="allowed",
         expected_config_digest="config-a",
         expected_schema_digest="schema-a",
     )
     assert approved["policy_version"] == "ui-v1"
+    assert "result_integrity" not in approved
     configs = MCPManager._apply_stored_policies(store.load_server_configs(), store.load())
     assert configs[0].tool_policies[0].argument_egress == "allowed"
     assert not hasattr(configs[0].tool_policies[0], "result_integrity")
@@ -71,7 +71,6 @@ def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) ->
         store.update_tool_policy(
             "tool-1",
             classification="open",
-            result_integrity="trusted",
             argument_egress="allowed",
             expected_config_digest="stale",
             expected_schema_digest="schema-a",
@@ -79,7 +78,7 @@ def test_operator_store_binds_policy_and_tombstones_on_remove(tmp_path: Path) ->
     assert store.remove_server("server-1") is True
     tombstone = store.load()["tool-1"]
     assert tombstone["is_tombstoned"] is True
-    assert tombstone["result_integrity"] == "untrusted"
+    assert "result_integrity" not in tombstone
     assert tombstone["argument_egress"] == "taint_gated"
 
 
@@ -212,6 +211,34 @@ class TestMCPServerConfigFromDict:
         assert cfg.tool_policies[0].argument_egress == "allowed"
         assert not hasattr(cfg.tool_policies[0], "result_integrity")
         assert "invalid MCP argument_egress" in caplog.text
+
+
+@pytest.mark.parametrize("key", ["result_integrity", "resultIntegrity"])
+def test_retired_result_integrity_warns_once_per_server_without_values(
+    key: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    common = {
+        "classification": "open", "adapter_name": "adapter", "adapter_version": "1",
+        "approval_version": "approval", "policy_version": "policy",
+        "config_digest": "config", "schema_digest": "schema",
+        "argument_egress": "allowed",
+    }
+    with caplog.at_level("WARNING"):
+        configs = parse_mcp_server_configs([
+            {"name": name, "command": "x", "tool_policies": [
+                {**common, "tool_name": "first", key: "untrusted"},
+                {**common, "tool_name": "second", key: "private-retired-value"},
+            ]}
+            for name in ("docs", "search")
+        ])
+    warnings = [record.message for record in caplog.records if "retired" in record.message]
+    assert len(warnings) == 2
+    assert "MCP server docs:" in warnings[0]
+    assert "MCP server search:" in warnings[1]
+    assert all("result_integrity" in message for message in warnings)
+    assert "private-retired-value" not in caplog.text
+    assert all(len(config.tool_policies) == 2 for config in configs)
+    assert all(not hasattr(policy, "result_integrity") for config in configs for policy in config.tool_policies)
 
 
 # ─── parse_mcp_server_configs ──────────────────────────────────────

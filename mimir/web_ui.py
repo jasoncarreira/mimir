@@ -2053,7 +2053,6 @@ def register_routes(
             if existing.get("server_config_id") == server_id:
                 existing.update({
                     "classification": "",
-                    "result_integrity": "untrusted",
                     "argument_egress": "taint_gated",
                     "is_tombstoned": True,
                 })
@@ -2067,7 +2066,6 @@ def register_routes(
                     "adapter_version": "1",
                     "approval_version": str(uuid.uuid4()),
                     "policy_version": str(record["policy_version"]),
-                    "result_integrity": "untrusted",
                     "argument_egress": "taint_gated",
                     "is_tombstoned": False,
                 })
@@ -2126,7 +2124,6 @@ def register_routes(
                 _mcp_store().update_tool_policy,
                 request.match_info.get("tool_id", ""),
                 classification=str(body.get("classification", "")),
-                result_integrity=str(body.get("result_integrity", "")),
                 argument_egress=str(body.get("argument_egress", "")),
                 expected_config_digest=str(body.get("config_digest", "")),
                 expected_schema_digest=str(body.get("schema_digest", "")),

@@ -465,6 +465,16 @@ class MCPServerConfig:
         ) if isinstance(raw_adapters, list) else ()
         tool_policies: list[MCPToolPolicy] = []
         if isinstance(raw_policies, list):
+            if any(
+                isinstance(item, dict)
+                and ("result_integrity" in item or "resultIntegrity" in item)
+                for item in raw_policies
+            ):
+                log.warning(
+                    "MCP server %s: retired tool_policies key result_integrity "
+                    "(resultIntegrity) is ignored; configuring a server now trusts "
+                    "successful results by default", name,
+                )
             for item in raw_policies:
                 if not isinstance(item, dict):
                     log.warning("Ignoring invalid non-object MCP tool policy for %s", name)
@@ -648,7 +658,6 @@ class MCPPolicyStore:
                 if record.get("server_config_id") == server_id:
                     record["is_tombstoned"] = True
                     record["classification"] = ""
-                    record["result_integrity"] = "untrusted"
                     record["argument_egress"] = "taint_gated"
             atomic_write_json(self.path, document)
             return removed
@@ -658,15 +667,12 @@ class MCPPolicyStore:
         tool_id: str,
         *,
         classification: str,
-        result_integrity: str,
         argument_egress: str,
         expected_config_digest: str,
         expected_schema_digest: str,
     ) -> dict[str, Any]:
         if classification not in {"open", "resource_scoped", "admin_required"}:
             raise ValueError("invalid authorization tier")
-        if result_integrity not in {"trusted", "untrusted"}:
-            raise ValueError("invalid result_integrity")
         if argument_egress not in {"allowed", "taint_gated"}:
             raise ValueError("invalid argument_egress")
         with _MCP_POLICY_STORE_LOCK:
@@ -691,7 +697,6 @@ class MCPPolicyStore:
                 "adapter_version": "1",
                 "approval_version": str(uuid.uuid4()),
                 "policy_version": policy_version,
-                "result_integrity": result_integrity,
                 "argument_egress": argument_egress,
             })
             atomic_write_json(self.path, document)
@@ -713,7 +718,6 @@ def _provenance_record(tool: StructuredTool, provenance: MCPProvenance) -> dict[
         "adapter_version": provenance.adapter_version,
         "approval_version": provenance.approval_version,
         "policy_version": provenance.policy_version,
-        "result_integrity": provenance.result_integrity,
         "argument_egress": provenance.argument_egress,
         "is_tombstoned": provenance.is_tombstoned,
     }

@@ -14,7 +14,7 @@ const envelope = (data: unknown) => ({ ok: true, version: "v1", data });
 const tool = {
   tool_id: "tool-1", server_config_id: "server-1", original_tool_name: "search",
   display_name: "mcp_docs_search", config_digest: "config-a", schema_digest: "schema-a",
-  classification: "", result_integrity: "untrusted", argument_egress: "taint_gated",
+  classification: "", argument_egress: "taint_gated",
   policy_version: "", is_tombstoned: false
 };
 const server = {
@@ -42,11 +42,30 @@ describe("McpServersView", () => {
     expect(await screen.findByText("search")).toBeTruthy();
     expect((screen.getByLabelText("Authorization tier") as HTMLSelectElement).value).toBe("admin_required");
 
-    fireEvent.change(screen.getByLabelText("Result integrity"), { target: { value: "trusted" } });
+    expect(screen.queryByLabelText(/result integrity/i)).toBeNull();
+    expect(screen.queryByText("Result integrity")).toBeNull();
+    expect((screen.getByRole("button", { name: "Save policy" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByRole("checkbox")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Argument egress"), { target: { value: "allowed" } });
     expect((screen.getByRole("button", { name: "Save policy" }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByText(/I understand this trusts external output/i));
+    fireEvent.click(screen.getByText(/I understand this permits tainted arguments/i));
     fireEvent.click(screen.getByRole("button", { name: "Save policy" }));
-    await waitFor(() => expect(api.saveMCPToolPolicy).toHaveBeenCalled());
+    await waitFor(() => expect(api.saveMCPToolPolicy).toHaveBeenCalledWith(tool, {
+      classification: "admin_required", argument_egress: "allowed"
+    }));
+  });
+
+  it("keeps drifted tools disabled without exposing a result-integrity control", async () => {
+    api.listMCPServers.mockResolvedValue(envelope({ restart_required: true, servers: [
+      { ...server, tools: [{ ...tool, is_tombstoned: true }] }
+    ] }));
+    renderView();
+    await screen.findByText("docs");
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(await screen.findByText("drifted")).toBeTruthy();
+    expect(screen.queryByLabelText(/result integrity/i)).toBeNull();
+    expect((screen.getByRole("button", { name: "Save policy" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("adds a stdio server via the modal and parses args and environment", async () => {

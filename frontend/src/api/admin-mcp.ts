@@ -4,7 +4,6 @@ import type {
   ApiSuccessEnvelope,
   MCPArgumentEgress,
   MCPAuthorizationTier,
-  MCPResultIntegrity,
   MCPToolRecord
 } from "./generated/contracts";
 
@@ -50,7 +49,6 @@ export function saveMCPToolPolicy(
   tool: MCPToolRecord,
   policy: {
     classification: MCPAuthorizationTier;
-    result_integrity: MCPResultIntegrity;
     argument_egress: MCPArgumentEgress;
   },
   options?: ApiClientOptions & RequestInit

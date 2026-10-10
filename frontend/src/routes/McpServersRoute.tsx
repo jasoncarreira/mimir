@@ -11,7 +11,6 @@ import {
 import type {
   MCPArgumentEgress,
   MCPAuthorizationTier,
-  MCPResultIntegrity,
   MCPServerRecord,
   MCPToolRecord
 } from "../api/generated/contracts";
@@ -29,7 +28,6 @@ import {
 
 const CLOSED_POLICY = {
   classification: "admin_required" as MCPAuthorizationTier,
-  result_integrity: "untrusted" as MCPResultIntegrity,
   argument_egress: "taint_gated" as MCPArgumentEgress
 };
 
@@ -50,10 +48,9 @@ function ToolPolicyEditor({ tool, busy, onSave }: {
 }) {
   const [policy, setPolicy] = React.useState<ToolPolicy>({
     classification: tool.classification || CLOSED_POLICY.classification,
-    result_integrity: tool.result_integrity,
     argument_egress: tool.argument_egress
   });
-  const widening = policy.result_integrity === "trusted" || policy.argument_egress === "allowed";
+  const widening = policy.argument_egress === "allowed";
   const [confirmed, setConfirmed] = React.useState(false);
 
   return (
@@ -70,12 +67,6 @@ function ToolPolicyEditor({ tool, busy, onSave }: {
           <option value="open">open</option>
         </select>
       </label>
-      <label>Result integrity
-        <select className="ui-input" value={policy.result_integrity} onChange={(event) => { setConfirmed(false); setPolicy({ ...policy, result_integrity: event.target.value as MCPResultIntegrity }); }}>
-          <option value="untrusted">untrusted</option>
-          <option value="trusted">trusted</option>
-        </select>
-      </label>
       <label>Argument egress
         <select className="ui-input" value={policy.argument_egress} onChange={(event) => { setConfirmed(false); setPolicy({ ...policy, argument_egress: event.target.value as MCPArgumentEgress }); }}>
           <option value="taint_gated">taint gated</option>
@@ -85,7 +76,7 @@ function ToolPolicyEditor({ tool, busy, onSave }: {
       {widening ? (
         <label className="mcp-tool__warning">
           <input checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" />
-          I understand this trusts external output or permits tainted arguments to leave Mimir.
+          I understand this permits tainted arguments to leave Mimir.
         </label>
       ) : null}
       <Button disabled={busy || tool.is_tombstoned || (widening && !confirmed)} onClick={() => onSave(tool, policy)} variant="primary">
@@ -147,7 +138,7 @@ function ServerFormDialog({ server, busy, error, onSubmit, onSavePolicy, onClose
           <Button onClick={onClose} type="button">Cancel</Button>
         </div>
       </form>
-      <p className="app-copy">Tools are enumerated immediately. New and changed tools remain admin-only, untrusted, and taint-gated until saved. Changes apply after restart.</p>
+      <p className="app-copy">Tools are enumerated immediately. Configuring a server trusts successful results; do not configure servers that relay outside content. New tools remain admin-only and argument-taint-gated until saved. Drifted tools, failed calls, and unresolved resources remain untrusted. Changes apply after restart.</p>
       {localError || error ? <ErrorState title="Action failed">{localError || error}</ErrorState> : null}
       {editing ? (
         <div className="mcp-tools">
@@ -201,7 +192,7 @@ export function McpServersView() {
     <div className="mcp-route">
       <Panel
         title="Servers"
-        subtitle="stdio MCP servers. Each discovered tool is bound to an explicit authorization tier and IFC posture. Changes apply after restart."
+        subtitle="Configured stdio MCP servers trust successful results. Tool policy controls authorization and argument egress. Changes apply after restart."
         actions={<Button disabled={busy} onClick={openAdd} variant="primary">Add server</Button>}
       >
         {query.isLoading ? <LoadingState label="Loading MCP servers" /> : null}
