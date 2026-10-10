@@ -152,8 +152,8 @@ def _extract_header(text: str) -> str:
 def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
     """Read identities.yaml; return ``(doc, header_text)``.
 
-    ``doc`` is the parsed YAML mapping (empty dict for missing /
-    non-mapping files). ``header_text`` is the leading comment block —
+    ``doc`` is the parsed YAML mapping (empty dict only for a missing
+    file). ``header_text`` is the leading comment block —
     every line from the start of the file through the last consecutive
     comment / blank line before the first document content. The header
     is preserved verbatim and prepended on write back, so the
@@ -171,23 +171,25 @@ def _load_yaml(path: Path) -> tuple[dict[str, Any], str]:
       a new dependency, deferred until a real use case shows up.
     - Only a missing file is treated as empty. Read errors propagate so
       every transaction aborts rather than replacing unreadable state.
-      Invalid YAML also aborts the transaction.
+      Invalid YAML, a non-mapping root, or a present non-list ``people``
+      field also aborts the transaction before any writer can reset state.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}, ""
     try:
-        doc = yaml.safe_load(text) or {}
+        doc = yaml.safe_load(text)
     except yaml.YAMLError:
         log.warning("identities.yaml parse failed — refusing to overwrite")
-        # Returning a sentinel telling the caller to abort (preserve the
-        # operator's broken-but-recoverable file rather than nuke it).
+        # Preserve the operator's broken-but-recoverable file, not an empty
+        # substitute that a later transaction could publish over it.
         raise
-    header = _extract_header(text)
     if not isinstance(doc, dict):
-        return {}, header
-    return doc, header
+        raise ValueError("identities.yaml root must be a mapping — refusing to overwrite")
+    if "people" in doc and not isinstance(doc["people"], list):
+        raise ValueError("identities.yaml people must be a list — refusing to overwrite")
+    return doc, _extract_header(text)
 
 
 def _strip_value(v: Any) -> Any:
@@ -278,8 +280,9 @@ def _load_cli_identities(yaml_path: Path) -> tuple[dict, str]:
         doc, header = _load_yaml(yaml_path)
     except yaml.YAMLError as exc:
         raise ValueError(f"identities.yaml parse failed: {exc}") from exc
-    if not isinstance(doc.get("people"), list):
-        doc["people"] = []
+    # The shared loader validates any existing field; only an absent field
+    # may be initialized (including the fresh, missing-file case).
+    doc.setdefault("people", [])
     return doc, header
 
 

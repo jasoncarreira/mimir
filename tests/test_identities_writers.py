@@ -55,6 +55,78 @@ def test_unreadable_identities_abort_without_replacing_state(tmp_path, monkeypat
     assert not list(path.parent.glob(".identities-*.tmp"))
 
 
+_INVALID_STATE_OPERATIONS = [
+    "add", "remove:canonical", "remove:alias", "capture", "web-key", "pairing",
+]
+
+
+def _edit_invalid_state(home: Path, operation: str) -> None:
+    if operation == "add":
+        identity_cmd._identities_add_cmd(home, "eve", "slack-U3", None, None)
+    elif operation == "remove:canonical":
+        identity_cmd._identities_remove_cmd(home, None, "alice")
+    elif operation == "remove:alias":
+        identity_cmd._identities_remove_cmd(home, "slack-U1", None)
+    elif operation == "capture":
+        pop.capture_dm_channel(home, "slack-U1", "slack", "dm-slack-D1")
+    elif operation == "web-key":
+        pop.issue_web_key(home, "alice")
+    else:
+        assert operation == "pairing"
+        pop.request_pairing_with_code(home, "slack-U1", "slack", channel_id="dm-slack-D1", is_dm=True)
+
+
+@pytest.mark.parametrize("operation", _INVALID_STATE_OPERATIONS)
+def test_malformed_yaml_aborts_identity_transactions(tmp_path, operation):
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    original = b"# Keep this repairable file verbatim.\npeople: [unterminated\n"
+    path.write_bytes(original)
+    error = ValueError if operation.startswith(("add", "remove:")) else yaml.YAMLError
+    with pytest.raises(error):
+        _edit_invalid_state(tmp_path, operation)
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(".identities-*.tmp"))
+
+
+@pytest.mark.parametrize("operation", _INVALID_STATE_OPERATIONS)
+@pytest.mark.parametrize("document, message", [
+    ("- just\n- a list\n", "root must be a mapping"),
+    ("[]\n", "root must be a mapping"),
+    ("scalar\n", "root must be a mapping"),
+    ("0\n", "root must be a mapping"),
+    ("false\n", "root must be a mapping"),
+    ("null\n", "root must be a mapping"),
+    ("", "root must be a mapping"),
+    ("people: {alice: {aliases: [slack-U1]}}\n", "people must be a list"),
+    ("people: scalar\n", "people must be a list"),
+    ("people: null\n", "people must be a list"),
+    ("people: false\n", "people must be a list"),
+])
+def test_wrong_yaml_shape_aborts_identity_transactions(tmp_path, operation, document, message):
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    original = ("# Preserve the invalid document for operator repair.\n" + document).encode()
+    path.write_bytes(original)
+    with pytest.raises(ValueError, match=message):
+        _edit_invalid_state(tmp_path, operation)
+    assert path.read_bytes() == original
+    assert not list(path.parent.glob(".identities-*.tmp"))
+
+
+@pytest.mark.parametrize("document", [None, "{}\n", "intake: {policy: pairing}\n", "people: []\n"])
+def test_add_initializes_only_missing_people_in_valid_mapping(tmp_path, document):
+    path = tmp_path / "state" / "identities.yaml"
+    path.parent.mkdir()
+    if document is not None:
+        path.write_text(document, encoding="utf-8")
+    identity_cmd._identities_add_cmd(tmp_path, "alice", "slack-U1", None, None)
+    doc = yaml.safe_load(path.read_text())
+    assert doc["people"] == [{"canonical": "alice", "aliases": ["slack-U1"]}]
+    if document is not None and "intake:" in document:
+        assert doc["intake"] == {"policy": "pairing"}
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses mode-000 read permissions")
 @pytest.mark.parametrize("operation", ["add", "remove:canonical", "remove:alias", "populator"])
 def test_mode_000_identities_preserved(tmp_path, operation):
