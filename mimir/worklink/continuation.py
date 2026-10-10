@@ -866,6 +866,34 @@ def _load_evidence_records(home: Path, issue_id: int | None) -> list[EvidenceMet
     return out
 
 
+def issue_bound_to_pr(home: Path, repository: str, pull_request: int) -> int | None:
+    """Find the unique server-recorded issue for an exact PR URL, or fail closed."""
+    target = _normalize_pr_url(
+        f"https://github.com/{repository}/pull/{pull_request}"
+    )
+    if target is None:
+        return None
+    root = home / "state" / "worklink" / "evidence"
+    if not root.is_dir():
+        return None
+    matches: set[int] = set()
+    examined: set[int] = set()
+    for path in root.glob("*.json"):
+        match = re.fullmatch(r"([1-9][0-9]*)-[^/]+\.json", path.name)
+        if match is None:
+            continue
+        issue_id = int(match.group(1))
+        if issue_id in examined:
+            continue
+        examined.add(issue_id)
+        # Use the same loader as continuation, including its URL normalization.
+        if any(record.pr_url == target for record in _load_evidence_records(home, issue_id)):
+            matches.add(issue_id)
+            if len(matches) > 1:
+                return None
+    return next(iter(matches)) if matches else None
+
+
 def _validate_issue_from_evidence(
     home: Path,
     issue_ids: Sequence[int],

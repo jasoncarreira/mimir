@@ -58,6 +58,7 @@ from mimir.tools.forge import (
     pr_files,
     pr_inline_review_comment,
     pr_metadata,
+    pr_spec,
     pr_list,
     pr_rerequest_review,
     pr_review_requests,
@@ -1225,6 +1226,189 @@ def _runtime_for_scopes(*scopes: RepoPRActionScope) -> ToolRuntime[AuthContext]:
         state={}, context=context, config={}, stream_writer=lambda _: None,
         tool_call_id="forge-tool-test", store=None,
     )
+
+
+@pytest.mark.parametrize("binary_override", [None, "/opt/custom/bin/chainlink"])
+def test_pr_spec_uses_only_evidence_and_projects_armed_description(tmp_path, monkeypatch, binary_override):
+    from mimir.worklink.continuation import issue_bound_to_pr
+
+    if binary_override is None:
+        monkeypatch.delenv("CHAINLINK_BIN", raising=False)
+    else:
+        monkeypatch.setenv("CHAINLINK_BIN", binary_override)
+    root = tmp_path / "state" / "worklink" / "evidence"
+    root.mkdir(parents=True)
+    (root / "42-build.json").write_text(json.dumps({
+        "branch": "issue/41-a1", "pr_url": "https://GITHUB.com/OWNER/REPO/pull/17/",
+    }))
+    assert issue_bound_to_pr(tmp_path, "owner/repo", 17) == 42
+    assert issue_bound_to_pr(tmp_path, "owner/repo", 18) is None
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    client = FakeForge()
+    monkeypatch.setattr(client, "get_pull_request", lambda _: SimpleNamespace(
+        title="Worklink #41", head_ref="issue/41-a1", body="Closes chainlink #41",
+    ))
+    monkeypatch.setattr("mimir.tools.forge._default_client", client)
+    calls = []
+    payload = {"id": 42, "title": "Issue B", "status": "open", "labels": ["worklink:ready"],
+               "description": "trusted spec", "comments": [{"body": "COMMENT_MARKER"}]}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        kwargs["stdout"].write(json.dumps(payload).encode())
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("mimir.tools.forge.subprocess.run", run)
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    assert pr_spec.func("owner/repo", 17, runtime=runtime) == {
+        "id": 42, "title": "Issue B", "status": "open",
+        "labels": ["worklink:ready"], "description": "trusted spec",
+    }
+    assert calls == [[binary_override or "chainlink", "issue", "show", "42", "--json"]]
+    payload["labels"] = ["todo"]
+    assert pr_spec.func("owner/repo", 17, runtime=runtime) == {"error": "spec_not_armed"}
+    (root / "43-build.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }))
+    assert pr_spec.func("owner/repo", 17, runtime=runtime) == {"error": "no_bound_spec"}
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "oversize", "wrong_id"])
+def test_pr_spec_chainlink_failures_are_fixed(tmp_path, monkeypatch, failure):
+    root = tmp_path / "state" / "worklink" / "evidence"
+    root.mkdir(parents=True)
+    (root / "42-build.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+
+    def run(argv, **kwargs):
+        assert kwargs["timeout"] == 5
+        if failure == "timeout":
+            raise __import__("subprocess").TimeoutExpired(argv, 5)
+        payload = {"id": 41 if failure == "wrong_id" else 42, "title": "secret",
+                   "status": "open", "labels": ["worklink:ready"], "description": "secret"}
+        if failure == "oversize":
+            payload["description"] = "secret" * 22_000
+        kwargs["stdout"].write(json.dumps(payload).encode())
+        return SimpleNamespace(returncode=1 if failure == "exit" else 0)
+
+    monkeypatch.setattr("mimir.tools.forge.subprocess.run", run)
+    assert pr_spec.func("owner/repo", 17, runtime=_runtime(_scope(RepoPRAction.INSPECT))) == {
+        "error": "spec_read_failed",
+    }
+
+
+def test_pr_spec_provenance_allows_subsequent_repo_write(tmp_path, monkeypatch):
+    from mimir.access_control import SinkCategory, SinkGate
+
+    root = tmp_path / "state" / "worklink" / "evidence"
+    root.mkdir(parents=True)
+    (root / "42-build.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+
+    def run(argv, **kwargs):
+        kwargs["stdout"].write(json.dumps({
+            "id": 42, "title": "spec", "status": "open", "labels": ["worklink:ready"],
+            "description": "do the work",
+        }).encode())
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("mimir.tools.forge.subprocess.run", run)
+    scope = _scope(RepoPRAction.INSPECT, RepoPRAction.WRITE)
+    runtime = _runtime(scope)
+    token = access_control.begin_protected_result_capture()
+    try:
+        result = pr_spec.func("owner/repo", 17, runtime=runtime)
+    finally:
+        provenance = access_control.end_protected_result_capture(token)
+    labels = access_control.classify_protected_result(
+        "pr_spec", {"repository": "owner/repo", "pull_request": 17}, runtime.context,
+        access_control.ToolAuthorization(tool_name="pr_spec", decision="resource_scoped",
+                                         allowed=True, repo_pr_action_scope=scope),
+        result=result, provenance=provenance,
+    )
+    assert labels.sources[0].integrity == "trusted"
+    assert not labels.has_untrusted_active_ingest
+    assert SinkGate.check_sink_flow(
+        "repo_stage", "owner/repo", labels, runtime.context, enforce=True,
+        sink_category=SinkCategory.FORGE, repo_pr_action_scope=scope,
+    ).allowed
+
+
+def test_pr_spec_refuses_other_pr_even_with_evidence(tmp_path, monkeypatch):
+    root = tmp_path / "state" / "worklink" / "evidence"
+    root.mkdir(parents=True)
+    (root / "42-build.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/18",
+    }))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_REPOS", "owner/repo")
+    runtime = _runtime(_scope(RepoPRAction.INSPECT))
+    assert pr_spec.func("owner/repo", 17, runtime=runtime) == {"error": "no_bound_spec"}
+    with pytest.raises(ToolException, match="pull_request=18"):
+        pr_spec.func("owner/repo", 18, runtime=runtime)
+
+
+def test_pr_spec_refuses_outsider_pr_and_nonadmin_user(tmp_path, monkeypatch):
+    client = FakeForge()
+    _configure_live_review(monkeypatch, client)
+    client.snapshot_author = "outsider"
+    monkeypatch.setattr(client, "author_is_trusted", lambda *args: False, raising=False)
+    admin = _production_auth_context(tmp_path, "operator_user")
+    with pytest.raises(ToolException, match="withheld"):
+        pr_spec.func("owner/repo", 1291, runtime=Runtime(context=admin))
+
+    user = replace(admin, roles=("user",), canonical_principal="ordinary")
+    decision = access_control.ToolRegistry().authorize_tool(
+        "pr_spec", user, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 1291},
+    )
+    assert not decision.allowed
+
+
+def test_shipped_poller_can_read_only_bound_pr_spec(tmp_path, monkeypatch):
+    from mimir.pollers import _parse_poller_authority
+
+    manifest = Path(__file__).parents[1] / "mimir/optional-skills/github-poller/pollers.json"
+    record = json.loads(manifest.read_text())["pollers"][0]
+    authority = _parse_poller_authority(
+        record["authority"], name=record["name"], persist_dir=tmp_path,
+        state_root=None, manifest_path=manifest,
+    )
+    event = AgentEvent(
+        trigger="poller", channel_id=authority.canonical,
+        service_principal=authority.canonical, service_authority=authority,
+    )
+    scope = _scope(RepoPRAction.INSPECT)
+    context = replace(access_control.create_auth_context(
+        event, IdentityResolver(tmp_path), enforce=True, ifc_labels=InformationFlowLabels(),
+    ), repo_pr_scope_registry=RepoPRScopeRegistry((RepoReviewState(scope),)))
+    registry = access_control.ToolRegistry()
+    arguments = {"repository": "owner/repo", "pull_request": 17}
+    assert registry.authorize_tool("pr_spec", context, enforce=True, arguments=arguments).allowed
+    assert not registry.authorize_tool(
+        "pr_spec", context, enforce=True,
+        arguments={"repository": "owner/repo", "pull_request": 18},
+    ).allowed
+    root = tmp_path / "state" / "worklink" / "evidence"
+    root.mkdir(parents=True)
+    (root / "42-build.json").write_text(json.dumps({
+        "pr_url": "https://github.com/owner/repo/pull/17",
+    }))
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+
+    def run(argv, **kwargs):
+        kwargs["stdout"].write(json.dumps({
+            "id": 42, "title": "spec", "status": "open", "labels": ["worklink:ready"],
+            "description": "do the work",
+        }).encode())
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("mimir.tools.forge.subprocess.run", run)
+    assert pr_spec.func(**arguments, runtime=Runtime(context=context))["description"] == "do the work"
 
 
 class FakeForge:
