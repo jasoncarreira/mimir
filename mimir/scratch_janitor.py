@@ -14,8 +14,10 @@ Safety properties:
 - Roots are **home-relative paths** (no absolute paths, no ``..``) and
   must resolve inside the home — the sweep can never reach outside it.
   Missing roots are skipped silently.
-- Only *top-level* entries of a root are deletion candidates; a directory
-  is removed as a unit or kept as a unit.
+- Top-level entries of a root are deletion candidates; a directory is
+  removed as a unit or kept as a unit. The real ``scratch/turns`` container
+  is retained and its children are independent retention units instead.
+  Live turn workspaces are protected even when their mtimes exceed the TTL.
 - A directory is "recent" if **any** file inside it (lstat, symlinks not
   followed) is newer than the cutoff — a six-week-old clone the agent
   touched yesterday survives. The recency walk early-exits on the first
@@ -35,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ._rmtree import rmtree_missing_ok
-from ._context import idle_turn_eviction_guard
+from ._context import idle_turn_eviction_guard, turn_scratch_eviction_guard
 
 __all__ = [
     "DEFAULT_SCRATCH_TTL_DAYS",
@@ -285,7 +287,19 @@ def sweep_scratch_roots(
         except OSError as exc:
             errors.append(f"{name}: {exc}")
             continue
+        # The turns container is not one retention unit: a fresh turn must not
+        # pin every older workspace. Keep the container and sweep each child
+        # with the same newest-mtime/TTL rules as other top-level entries.
+        candidates: list[Path] = []
         for entry in entries:
+            if entry == home / "scratch" / "turns" and not entry.is_symlink() and entry.is_dir():
+                try:
+                    candidates.extend(sorted(entry.iterdir()))
+                except OSError as exc:
+                    errors.append(f"scratch/turns: {exc}")
+            else:
+                candidates.append(entry)
+        for entry in candidates:
             try:
                 if _entry_is_protected(entry, protected_paths):
                     kept += 1
@@ -303,7 +317,16 @@ def sweep_scratch_roots(
                 )
                 # Protect body, sidecar and extracted text through the entire
                 # turn, including the gap between fetch_url and read_file.
-                guard = idle_turn_eviction_guard() if touches_cache else nullcontext(True)
+                turns_root = home / "scratch" / "turns"
+                touches_turns = (
+                    entry == turns_root or turns_root in entry.parents
+                    or entry in turns_root.parents
+                )
+                guard = (
+                    idle_turn_eviction_guard() if touches_cache
+                    else turn_scratch_eviction_guard(entry) if touches_turns
+                    else nullcontext(True)
+                )
                 with guard as idle:
                     if not idle:
                         kept += 1

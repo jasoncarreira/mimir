@@ -1154,6 +1154,41 @@ async def test_turn_creates_scratch_before_model_and_advertises_it(
     assert len(model.invocations) == 1
 
 
+@pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
+async def test_reused_scratch_protected_during_setup(tmp_path, monkeypatch, trigger):
+    import time
+    import mimir.agent as agent_module
+    from mimir.scratch_janitor import sweep_scratch_roots
+
+    turn_id = "reused-old-turn"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path / "home"))
+    model = _FakeAgent([AIMessage(content="done")])
+    agent = _build_agent(tmp_path, fake_agent=model)
+    turn = agent._config.home / "scratch" / "turns" / turn_id
+    turn.mkdir(parents=True)
+    turn.chmod(0o755)
+    old = time.time() - 5 * 86400
+    os.utime(turn, (old, old))
+    original = agent_module.ensure_turn_scratch
+    inspections = []
+
+    def sweep_during_ensure(home, requested_id):
+        result = sweep_scratch_roots(home)
+        assert result.protected == (f"scratch/turns/{turn_id}",)
+        assert turn.exists()
+        inspections.append(result)
+        return original(home, requested_id)
+
+    monkeypatch.setattr(agent_module, "ensure_turn_scratch", sweep_during_ensure)
+    record = await agent.run_turn(AgentEvent(
+        trigger=trigger, channel_id="ch-1", content="hello",
+    ), turn_id=turn_id)
+    assert record.error is None
+    assert len(model.invocations) == 1
+    assert len(inspections) == 1
+    assert turn.stat().st_mode & 0o777 == 0o700
+
+
 @pytest.mark.parametrize("component", ["scratch", "turns", "turn"])
 @pytest.mark.parametrize("trigger", ["user_message", "saga_session_end"])
 async def test_turn_refuses_preplanted_scratch_without_advertising(

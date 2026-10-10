@@ -2204,10 +2204,15 @@ class Agent:
                 auth_context=auth_ctx,
                 ifc_labels=initial_ifc_labels,
             )
-            # Both ordinary and synthesis turns share this setup. The workspace
-            # must exist before prompt construction or any model tool can run.
-            turn_scratch = ensure_turn_scratch(self._config.home, ctx.turn_id)
-            ctx.turn_scratch_path = turn_scratch
+            # Both ordinary and synthesis turns share this setup. Register the
+            # intended workspace before validating/repairing it so the janitor
+            # cannot evict an old reused directory during setup. No prompt or
+            # tool sees this provisional path; refusal clears it before either.
+            ctx.turn_scratch_path = (
+                self._config.home.resolve() / "scratch" / "turns" / ctx.turn_id
+            )
+            ctx_token = set_current_turn(ctx)
+            ctx.turn_scratch_path = ensure_turn_scratch(self._config.home, ctx.turn_id)
             ctx.turn_event_emitter = emitter
             emitter.bind_information_flow(ctx.ifc_labels, ctx.auth_context)
             # WikiBacklinksHook pre-snapshot — capture mtimes of every
@@ -2218,8 +2223,6 @@ class Agent:
             # invariant from the SDK build. Empty dict when the wiki dir
             # doesn't exist; finalize early-returns in that case.
             ctx.wiki_mtime_snapshot = await self._snapshot_wiki_mtimes_async()
-
-            ctx_token = set_current_turn(ctx)
             # Populate the module-global current_channel_id as a fallback
             # for the claude-code path. ChatClaudeCode dispatches tools
             # via the ClaudeSDKClient subprocess; the SDK round-trips back

@@ -60,16 +60,109 @@ def test_old_dir_removed_fresh_dir_kept(tmp_path: Path):
     assert result.errors == ()
 
 
-def test_created_turn_scratch_is_swept_after_ttl(tmp_path: Path):
+def test_old_turn_dirs_swept_independently_of_fresh_siblings(tmp_path: Path):
     now = time.time()
-    turn = ensure_turn_scratch(tmp_path, "old-turn")
-    assert turn is not None
-    (turn / "note.txt").write_text("ephemeral")
-    for path in (turn / "note.txt", turn, turn.parent):
-        _age(path, 2, now=now)
+    turns = tmp_path / "scratch" / "turns"
+    old = [_make_tree(turns, f"old-{i}", days=5, now=now) for i in range(3)]
+    fresh = ensure_turn_scratch(tmp_path, "fresh-turn")
+    assert fresh is not None
     result = sweep_scratch_roots(tmp_path, now=now)
-    assert "scratch/turns" in result.removed
-    assert not turn.exists()
+    assert set(result.removed) == {f"scratch/turns/old-{i}" for i in range(3)}
+    assert all(not path.exists() for path in old)
+    assert turns.is_dir() and fresh.is_dir()
+    assert result.kept == 1
+    assert result.errors == ()
+
+
+def test_turn_dir_with_fresh_nested_file_survives(tmp_path: Path):
+    now = time.time()
+    turns = tmp_path / "scratch" / "turns"
+    old = _make_tree(turns, "old", days=5, now=now)
+    used = _make_tree(turns, "used", days=5, now=now)
+    (used / "sub" / "payload.bin").touch()
+    result = sweep_scratch_roots(tmp_path, now=now)
+    assert result.removed == ("scratch/turns/old",)
+    assert not old.exists() and used.exists()
+
+
+@pytest.mark.parametrize("roots", [("scratch",), ("scratch/turns",)])
+async def test_active_turn_dir_survives_ttl_in_worker(tmp_path, roots):
+    from mimir._context import set_current_turn, reset_current_turn
+
+    now = time.time()
+    turns = tmp_path / "scratch" / "turns"
+    active = _make_tree(turns, "active", days=5, now=now)
+    old = _make_tree(turns, "old", days=5, now=now)
+    token = set_current_turn(SimpleNamespace(turn_id="active", turn_scratch_path=active))
+    try:
+        result = await asyncio.to_thread(sweep_scratch_roots, tmp_path, roots=roots, now=now)
+        assert result.protected == ("scratch/turns/active",)
+        assert active.is_dir() and not old.exists()
+    finally:
+        reset_current_turn(token)
+    result = sweep_scratch_roots(tmp_path, roots=roots, now=now)
+    assert result.removed == ("scratch/turns/active",)
+    assert turns.is_dir()
+
+
+async def test_turn_admitted_after_age_check_is_protected(tmp_path, monkeypatch):
+    from mimir import scratch_janitor
+    from mimir._context import set_current_turn, reset_current_turn
+
+    now = time.time()
+    turn = _make_tree(tmp_path / "scratch" / "turns", "admitted", days=5, now=now)
+    inspected = Event()
+    proceed = Event()
+    original = scratch_janitor._tree_newest_mtime_and_size
+
+    def pause_after_inspection(path, cutoff):
+        result = original(path, cutoff)
+        if path == turn:
+            inspected.set()
+            assert proceed.wait(5)
+        return result
+
+    monkeypatch.setattr(scratch_janitor, "_tree_newest_mtime_and_size", pause_after_inspection)
+    sweep = asyncio.create_task(asyncio.to_thread(sweep_scratch_roots, tmp_path, now=now))
+    token = None
+    try:
+        assert await asyncio.to_thread(inspected.wait, 5)
+        token = set_current_turn(SimpleNamespace(turn_id="admitted", turn_scratch_path=turn))
+        proceed.set()
+        result = await sweep
+        assert result.protected == ("scratch/turns/admitted",)
+        assert turn.is_dir()
+    finally:
+        proceed.set()
+        await sweep
+        if token is not None:
+            reset_current_turn(token)
+
+
+def test_turn_symlink_unlinked_without_sweeping_target(tmp_path):
+    now = time.time()
+    turns = tmp_path / "scratch" / "turns"
+    turns.mkdir(parents=True)
+    target = _make_tree(tmp_path, "outside", days=5, now=now)
+    link = turns / "old-link"
+    link.symlink_to(target)
+    _age(link, 5, now=now)
+    result = sweep_scratch_roots(tmp_path, now=now)
+    assert result.removed == ("scratch/turns/old-link",)
+    assert not link.is_symlink() and target.exists()
+
+
+def test_symlink_turns_container_never_traversed(tmp_path):
+    now = time.time()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    target = _make_tree(tmp_path, "outside", days=5, now=now)
+    link = scratch / "turns"
+    link.symlink_to(target)
+    _age(link, 5, now=now)
+    result = sweep_scratch_roots(tmp_path, now=now)
+    assert result.removed == ("scratch/turns",)
+    assert target.exists()
 
 
 def test_nested_fresh_file_keeps_stale_looking_dir(tmp_path: Path):

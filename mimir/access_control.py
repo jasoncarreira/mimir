@@ -917,6 +917,10 @@ def _turn_scratch_path(home: Path, turn_id: object, *, create: bool) -> Path | N
                 return None
             os.close(fd)
             fd = next_fd
+            if index == 2 and create:
+                # Repair pre-existing owned workspaces through the validated fd,
+                # never a pathname that could be replaced with a symlink.
+                os.fchmod(fd, 0o700)
         return root / "scratch" / "turns" / turn_id
     except (OSError, RuntimeError) as exc:
         if create:

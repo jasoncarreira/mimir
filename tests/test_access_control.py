@@ -503,9 +503,28 @@ def test_turn_scratch_refuses_non_directory(tmp_path, component):
 def test_turn_scratch_refuses_other_owner_and_reuses_owned_directory(tmp_path, monkeypatch):
     path = tmp_path / "scratch" / "turns" / "one"
     path.mkdir(parents=True, mode=0o755)
+    path.chmod(0o755)  # Independent of the invoking process umask.
     assert access_control.ensure_turn_scratch(tmp_path, "one") == path
+    assert path.stat().st_mode & 0o7777 == 0o700
     monkeypatch.setattr(access_control.os, "getuid", lambda: path.stat().st_uid + 1)
     assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+
+
+def test_turn_scratch_refuses_when_private_mode_cannot_be_enforced(tmp_path, monkeypatch):
+    path = tmp_path / "scratch" / "turns" / "one"
+    path.mkdir(parents=True)
+    path.chmod(0o755)
+
+    def refuse_chmod(fd, mode):
+        assert (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (
+            path.stat().st_dev, path.stat().st_ino,
+        )
+        assert mode == 0o700
+        raise PermissionError("mode change refused")
+
+    monkeypatch.setattr(access_control.os, "fchmod", refuse_chmod)
+    assert access_control.ensure_turn_scratch(tmp_path, "one") is None
+    assert path.stat().st_mode & 0o777 == 0o755
 
 
 def test_turn_scratch_refuses_component_replaced_between_stat_and_open(tmp_path, monkeypatch):
