@@ -1262,6 +1262,95 @@ def test_worklink_incident_read_boundary_distinguishes_missing_from_denied(
         reset_current_turn(token)
 
 
+@pytest.fixture
+def worklink_incident_github_read_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
+):
+    home = (tmp_path / "home").resolve()
+    state = home / "state"
+    scratch = home / "scratch"
+    (state / "sub").mkdir(parents=True)
+    (state / "pollers" / "worklink-ready-queue").mkdir(parents=True)
+    scratch.mkdir()
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    monkeypatch.delenv("MIMIR_MCP_SERVERS_PATH", raising=False)
+    manifest = (
+        Path(__file__).parents[1] / "mimir" / "optional-skills"
+        / "chainlink-orchestrator" / "pollers.json"
+    )
+    entry = next(
+        item for item in json.loads(manifest.read_text(encoding="utf-8"))["pollers"]
+        if item["name"] == "worklink-ready-queue"
+    )
+    service = _parse_poller_authority(
+        entry["authority"], name=entry["name"], persist_dir=state / "pollers" / entry["name"],
+        state_root=state / "pollers", manifest_path=manifest,
+    )
+    # Shared scratch itself is deliberately stripped from static grants; use
+    # an explicit child root so the sibling is genuinely admitted.
+    (scratch / "incident").mkdir()
+    service = replace(service, filesystem_read_roots=(str(state), str(scratch / "incident")))
+    context = create_auth_context(AgentEvent(
+        trigger="poller", channel_id=service.canonical,
+        service_principal=service.canonical, service_authority=service,
+    ), enforce=request.getfixturevalue("enforce"), ifc_labels=InformationFlowLabels())
+    return home, service, context
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_worklink_incident_missing_read_cannot_escape_into_sibling_root(
+    worklink_incident_github_read_context, enforce: bool,
+) -> None:
+    home, service, context = worklink_incident_github_read_context
+    predicate = access_control._trigger_service_read_target_is_allowed
+    registry = ToolRegistry()
+    missing = home / "scratch" / "incident" / "x.json"
+    escape = (
+        home / "state" / "sub" / "missing" / ".." / ".." / ".."
+        / "scratch" / "incident" / "x.json"
+    )
+    assert not missing.exists()
+    assert escape.resolve(strict=False) == missing
+    # The first existing ancestor is in state, and the resolved target is in
+    # another granted root. Only selected-lexical-root containment rejects it.
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed and not decision.would_block, decision.reason
+    for file_path in (str(escape), str(escape.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert not predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed is (not enforce), decision.reason
+        assert decision.would_block and decision.reason == "read_scope"
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_worklink_incident_missing_operator_secret_is_denied(
+    worklink_incident_github_read_context, monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    home, service, context = worklink_incident_github_read_context
+    missing = home / "state" / "sub" / "record.json"
+    assert not missing.exists()
+    predicate = access_control._trigger_service_read_target_is_allowed
+    registry = ToolRegistry()
+    # This ordinary basename is admitted until configured as an exact secret;
+    # the shared protected-path helper enforces the configured-secret policy.
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed and not decision.would_block, decision.reason
+    monkeypatch.setenv("MIMIR_MCP_SERVERS_PATH", str(missing))
+    for file_path in (str(missing), str(missing.relative_to(home))):
+        arguments = {"file_path": file_path}
+        assert not predicate(service, "read_file", arguments, auth_context=context)
+        decision = registry.authorize_tool("read_file", context, enforce=enforce, arguments=arguments)
+        assert decision.allowed is (not enforce), decision.reason
+        assert decision.would_block and decision.reason == "read_scope"
+
+
 def test_github_activity_repo_read_and_scratch_write_scopes_are_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

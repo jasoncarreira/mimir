@@ -5457,12 +5457,12 @@ def _trigger_service_read_target_is_allowed(
     resolved_is_artifact = artifact_root is not None and root == artifact_root
     if resolved_is_artifact:
         return True
+    # _has_protected_read_name includes exact operator-configured secret
+    # paths, even when absent; do not duplicate that policy check here.
     if (
         _is_service_protected_read_path(service, root, relative)
         or _has_protected_read_name(resolved)
     ):
-        return False
-    if is_operator_secret_read_path(resolved):
         return False
     if home:
         home_root = Path(home).resolve()
