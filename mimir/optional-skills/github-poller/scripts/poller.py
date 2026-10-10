@@ -25,8 +25,8 @@ network error on one repo's endpoint silently drops events in that
 cursor window. The alternative — pinning the cursor on partial
 failure — wedges polling indefinitely if one repo is persistently
 broken, so this is the deliberate tradeoff. Persistent failures
-surface as ``poller_stderr`` events for the affected endpoints, so
-operator audit can grep for them.
+surface as content-free ``poller_stderr`` diagnostics, so operator audit can
+detect the failure without persisting an untrusted response or endpoint.
 
 Exception — review-requests (chainlink #299): that "advance regardless"
 tradeoff covers POLL-side (gh-api) failures, NOT the downstream review
@@ -149,6 +149,7 @@ _ensure_mimir_import_path()
 from mimir.pollers import _github_author_is_trusted, _github_content_author
 from mimir.ci_logs import capture_job_log, clean_log_tail
 from mimir.ci_attention import classify_cancelled_run
+from mimir.github_withhold import partition, sanitize_login, sanitize_url
 
 STATE_DIR = Path(os.environ.get("STATE_DIR", Path(__file__).parent.parent))
 CURSOR_FILE = STATE_DIR / "cursor.json"
@@ -747,7 +748,7 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefus
                 # ``_refused_window`` below.
                 budget.note_truncation("gh_api_refused", 1)
                 print(
-                    f"gh api {endpoint} skipped: tick budget exhausted",
+                    "gh api request skipped: tick budget exhausted",
                     file=sys.stderr,
                 )
                 return _GH_API_BUDGET_REFUSED
@@ -760,13 +761,12 @@ def _gh_api(endpoint: str, token: str) -> list | dict | None | _GhApiBudgetRefus
             return json.loads(result.stdout)
         if result.returncode != 0:
             print(
-                f"gh api {endpoint} returned {result.returncode}: "
-                f"{result.stderr.strip()[:200]}",
+                f"gh api request returned {result.returncode}",
                 file=sys.stderr,
             )
     except (FileNotFoundError, subprocess.TimeoutExpired,
             json.JSONDecodeError) as exc:
-        print(f"gh api {endpoint} failed: {exc}", file=sys.stderr)
+        print(f"gh api request failed: {type(exc).__name__}", file=sys.stderr)
     return None
 
 
@@ -1139,6 +1139,71 @@ def _pr_author_is_trusted(
     return trust_cache[trust_key] is True
 
 
+def _partition_activity(
+    repo: str, token: str, items: list[dict], kind: str, me: str,
+    trust_cache: dict[tuple[str, object], object] | None,
+    tick_budget: TickBudget | None, pass_name: str, *,
+    pr_author: bool = False, since_window: bool = True,
+) -> tuple[list[dict], list]:
+    """Attest before reading any text from an item; never persist missing verdicts."""
+    cache = trust_cache if trust_cache is not None else {}
+    projected = [dict(item, kind=kind, repository=repo) for item in items]
+
+    def verdict(author: str) -> bool | None:
+        # Deleted/unlinked users cannot become attributable on a later tick.
+        # Withhold them without spending API budget or holding the watermark.
+        if not isinstance(author, str) or not author:
+            return False
+        if me and author == me:
+            return True
+        if pr_author:
+            item = projected[0]
+            number = item.get("number")
+            if not isinstance(number, int) or isinstance(number, bool):
+                return None
+            return _pr_author_is_trusted(
+                repo, number, item.get("html_url", ""), token, cache,
+                tick_budget=tick_budget,
+            )
+        key = (repo, author)
+        if key not in cache:
+            allowed = (tick_budget.call_timeout(ceiling=TRUST_ATTESTATION_TIMEOUT_SECONDS)
+                       if tick_budget is not None else TRUST_ATTESTATION_TIMEOUT_SECONDS)
+            if allowed is None:
+                return None
+            try:
+                with _wall_clock_deadline(allowed):
+                    trusted = _github_author_is_trusted(repo, author, token)
+            except _DeadlineExceeded:
+                return None
+            if trusted is None:
+                return None
+            cache[key] = trusted
+        return cache[key] is True
+
+    kept, withheld = partition(
+        projected, lambda item: (item.get("user") or {}).get("login", ""), verdict,
+    )
+    if since_window and tick_budget is not None and any(
+        item.reason == "attestation_unavailable" for item in withheld
+    ):
+        tick_budget.hard_truncated = True
+        tick_budget.note_truncation(pass_name, 1)
+    return kept, withheld
+
+
+def _trusted_pr(
+    repo: str, token: str, pr: dict, me: str,
+    cache: dict[tuple[str, object], object] | None,
+    budget: TickBudget | None, pass_name: str, *, since_window: bool = True,
+) -> bool:
+    kept, _ = _partition_activity(
+        repo, token, [pr], "pull_request", me, cache, budget, pass_name,
+        pr_author=True, since_window=since_window,
+    )
+    return bool(kept)
+
+
 def _review_requested(pr: dict, me: str) -> bool:
     return bool(me) and any(
         isinstance(reviewer, dict) and reviewer.get("login") == me
@@ -1182,7 +1247,10 @@ def _emit_pr_synchronize(
     *,
     pr: dict | None = None,
     related_comment: str = "",
-) -> bool:
+    trust_cache: dict | None = None,
+    tick_budget: TickBudget | None = None,
+) -> bool | None:
+    """Return None only when a real commit author's attestation is unavailable."""
     compare = _gh_api(
         f"repos/{repo}/compare/{previous_head}...{current_head}", token,
     )
@@ -1191,21 +1259,47 @@ def _emit_pr_synchronize(
     if isinstance(compare, dict):
         commits = compare.get("commits") or []
         total_commits = compare.get("ahead_by") or len(commits)
+    trusted_commits = []
+    withheld_count = 0
+    for commit in commits:
+        user = commit.get("author") or commit.get("committer") or {}
+        login = user.get("login") if isinstance(user, dict) else None
+        if not isinstance(login, str) or not login:
+            # Unlinked commit emails are permanently unattributable, not a
+            # retryable API failure. Never send an empty login to attestation.
+            withheld_count += 1
+            continue
+        kept, withheld = _partition_activity(
+            repo, token, [dict(commit, user=user)], "comment", "",
+            trust_cache, tick_budget, "push_commit_trust", since_window=False,
+        )
+        if any(item.reason == "attestation_unavailable" for item in withheld):
+            return None
+        if kept:
+            trusted_commits.append(commit)
+        else:
+            withheld_count += 1
     head_commit = commits[-1] if commits else {}
     push_author = None
-    for user in (head_commit.get("committer"), head_commit.get("author")):
-        login = user.get("login") if isinstance(user, dict) else None
-        if isinstance(login, str) and login and login != "web-flow":
-            push_author = login
-            break
+    if trusted_commits and trusted_commits[-1] is head_commit:
+        for user in (head_commit.get("committer"), head_commit.get("author")):
+            login = user.get("login") if isinstance(user, dict) else None
+            if isinstance(login, str) and login and login != "web-flow":
+                push_author = sanitize_login(login)
+                break
     if total_commits and commits:
         subjects = [
             (commit.get("commit") or {}).get("message", "").split("\n")[0][:72]
-            for commit in commits[:3]
+            for commit in trusted_commits[:3]
         ]
         bullets = "\n".join(f"  • {subject}" for subject in subjects if subject)
-        remaining = total_commits - sum(1 for subject in subjects if subject)
+        remaining = total_commits - withheld_count - sum(1 for subject in subjects if subject)
         commit_block = f"{total_commits} commit(s):\n{bullets}"
+        if withheld_count:
+            commit_block += (
+                f"\n  • {withheld_count} commit subject(s) withheld "
+                "(non-collaborator or unattributable)"
+            )
         if remaining > 0:
             commit_block += f"\n  • … ({remaining} more)"
     else:
@@ -1240,6 +1334,7 @@ def _surface_untrusted_pr_once(
     number: int,
     url: str,
     surfaced_untrusted: set[str],
+    author: str = "",
 ) -> int:
     key = str(number)
     if key in surfaced_untrusted:
@@ -1248,7 +1343,8 @@ def _surface_untrusted_pr_once(
         "pr_auto_review_skipped_untrusted_author",
         repo=repo,
         number=number,
-        url=url,
+        url=sanitize_url(url, repo),
+        author=sanitize_login(author),
     )
     surfaced_untrusted.add(key)
     return 1
@@ -1259,7 +1355,8 @@ def _surface_untrusted_pr_once(
 
 def _check_issues(
     repo: str, since: str, token: str, me: str,
-    *, tick_budget: "TickBudget | None" = None,
+    *, trust_cache: dict | None = None, surfaced_outsiders: set[str] | None = None,
+    tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New issues (NOT PRs — GitHub's /issues endpoint returns both;
     we filter PRs out via the ``pull_request`` field)."""
@@ -1275,11 +1372,27 @@ def _check_issues(
     for issue in data:
         if issue.get("pull_request"):
             continue  # PRs handled by _check_prs
-        if me and issue.get("user", {}).get("login") == me:
+        if me and (issue.get("user") or {}).get("login") == me:
             continue
         if (issue.get("created_at", "") or "") <= since:
             continue
-        author = issue.get("user", {}).get("login", "unknown")
+        kept, withheld = _partition_activity(
+            repo, token, [issue], "issue", me, trust_cache, tick_budget, "issues_trust",
+        )
+        if not kept:
+            if withheld and withheld[0].reason != "attestation_unavailable":
+                number = issue.get("number")
+                key = str(number)
+                if (isinstance(number, int) and not isinstance(number, bool)
+                        and surfaced_outsiders is not None and key not in surfaced_outsiders):
+                    _emit_signal(
+                        "github_outsider_issue_withheld", repo=repo, number=number,
+                        author=withheld[0].author, url=withheld[0].html_url,
+                    )
+                    surfaced_outsiders.add(key)
+                    count += 1
+            continue
+        author = (issue.get("user") or {}).get("login", "unknown")
         number = issue.get("number")
         title = issue.get("title", "")
         url = issue.get("html_url", "")
@@ -1323,11 +1436,11 @@ def _check_prs(
     review_context = review_context if review_context is not None else {}
     count = 0
     for pr in data:
-        if me and pr.get("user", {}).get("login") == me:
+        if me and (pr.get("user") or {}).get("login") == me:
             continue
         if (pr.get("created_at", "") or "") <= since:
             continue
-        author = pr.get("user", {}).get("login", "unknown")
+        author = (pr.get("user") or {}).get("login", "unknown")
         number = pr.get("number")
         if not isinstance(number, int):
             continue
@@ -1337,19 +1450,17 @@ def _check_prs(
         # author. Do not also report them as skipped automatic reviews.
         if _review_requested(pr, me):
             continue
-        trusted = _pr_author_is_trusted(
-            repo, number, url, token, trust_cache, tick_budget=tick_budget,
+        kept, withheld = _partition_activity(
+            repo, token, [pr], "pull_request", me, trust_cache, tick_budget,
+            "prs_trust", pr_author=True,
         )
-        if trusted is None:
-            # No budget left to resolve trust. Skip without classifying, and
-            # hold the watermark so this PR is reconsidered next tick.
-            if tick_budget is not None:
-                tick_budget.hard_truncated = True
-                tick_budget.note_truncation("prs_trust", 1)
+        if withheld and withheld[0].reason == "attestation_unavailable":
+            # The partition held the watermark; reconsider on the next tick.
             continue
-        if not trusted:
+        if not kept:
+            attested_author = trust_cache.get((repo, number), author)
             count += _surface_untrusted_pr_once(
-                repo, number, url, surfaced_untrusted,
+                repo, number, url, surfaced_untrusted, attested_author,
             )
             continue
         body = _truncate(pr.get("body") or "")
@@ -1382,6 +1493,7 @@ def _collect_issue_comment_context(
     token: str,
     me: str,
     *,
+    trust_cache: dict | None = None,
     tick_budget: "TickBudget | None" = None,
 ) -> tuple[list[dict] | None, dict[str, str]]:
     """Fetch comments once and collect recent PR prose for review prompts."""
@@ -1394,8 +1506,9 @@ def _collect_issue_comment_context(
         _refused_window(tick_budget, data, "issue_comment_context_window")
         return None, {}
     context: dict[str, str] = {}
+    omitted: dict[str, list[str]] = {}
     for comment in data:
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
@@ -1404,13 +1517,27 @@ def _collect_issue_comment_context(
             continue
         issue_url = comment.get("issue_url", "")
         issue_num = issue_url.rstrip("/").split("/")[-1] if issue_url else "?"
-        author = comment.get("user", {}).get("login", "unknown")
+        kept, withheld = _partition_activity(
+            repo, token, [comment], "comment", me, trust_cache,
+            tick_budget, "comment_context_trust",
+        )
+        if not kept:
+            for item in withheld:
+                if item.reason != "attestation_unavailable":
+                    omitted.setdefault(issue_num, []).append(
+                        f"{item.author} {item.html_url or ''}".strip()
+                    )
+            continue
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         rendered = f"@{author}: {body}\n{url}"
         if issue_num in context:
             context[issue_num] = f"{context[issue_num]}\n\n{rendered}"
         else:
             context[issue_num] = rendered
+    for number, entries in omitted.items():
+        note = f"{len(entries)} comment(s) by non-collaborators withheld ({', '.join(entries)})"
+        context[number] = f"{context[number]}\n\n{note}" if number in context else note
     return data, context
 
 def _check_issue_comments(
@@ -1421,6 +1548,8 @@ def _check_issue_comments(
     *,
     review_needed_pr_numbers: set[str] | None = None,
     comments: list[dict] | None = None,
+    trust_cache: dict | None = None,
+    review_context: dict[str, str] | None = None,
     tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New issue + PR conversation comments.
@@ -1437,8 +1566,8 @@ def _check_issue_comments(
     Parent type comes from the authoritative issue resource's ``pull_request``
     marker rather than the comment's presentation URL. Ordinary issue comments
     keep the existing edge-triggered behaviour regardless of issue state. If the
-    live parent lookup fails, fail open and emit the comment rather than silently
-    losing a potentially actionable signal.
+    live PR parent lookup fails, hold the watermark and retry rather than
+    admitting a potentially outsider-authored PR into a prompt.
     """
     data = comments
     if data is None:
@@ -1455,11 +1584,17 @@ def _check_issue_comments(
     for comment in data:
         if _hard_stop(tick_budget, "issue_comments"):
             break
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
-        author = comment.get("user", {}).get("login", "unknown")
+        kept, _ = _partition_activity(
+            repo, token, [comment], "comment", me, trust_cache,
+            tick_budget, "issue_comments_trust",
+        )
+        if not kept:
+            continue
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
         issue_url = comment.get("issue_url", "")
@@ -1475,14 +1610,36 @@ def _check_issue_comments(
             )
         parent = parent_cache[issue_num]
         is_pr_comment = isinstance(parent, dict) and bool(parent.get("pull_request"))
-        if is_pr_comment:
+        if presentation_is_pr and not isinstance(parent, dict):
+            # A failed parent lookup cannot reclassify a PR comment as an
+            # ordinary issue comment; the PR author might be an outsider.
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("comment_parent_trust", 1)
+            continue
+        if is_pr_comment or presentation_is_pr:
             if issue_num in (review_needed_pr_numbers or set()):
                 continue
-            if parent.get("state") != "open":
+            if is_pr_comment and parent.get("state") != "open":
+                continue
+            pr = _gh_api(f"repos/{repo}/pulls/{issue_num}", token)
+            if not isinstance(pr, dict):
+                if tick_budget is not None:
+                    tick_budget.hard_truncated = True
+                    tick_budget.note_truncation("comment_pr_lookup", 1)
+                continue
+            if not _trusted_pr(
+                repo, token, pr, me, trust_cache, tick_budget, "comment_pr_trust",
+            ):
                 continue
         prompt = (
             f"New comment on {repo} #{issue_num} by @{author}: {body}\n{url}"
         )
+        if is_pr_comment or presentation_is_pr:
+            notes = [line for line in (review_context or {}).get(issue_num, "").splitlines()
+                     if " comment(s) by non-collaborators withheld (" in line]
+            if notes:
+                prompt += "\n" + "\n".join(notes)
         if is_pr_comment or presentation_is_pr:
             emitted = _emit_pr_review_needed(
                 prompt,
@@ -1506,7 +1663,7 @@ def _check_issue_comments(
 
 def _check_pr_review_comments(
     repo: str, since: str, token: str, me: str,
-    *, tick_budget: "TickBudget | None" = None,
+    *, trust_cache: dict | None = None, tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New PR review comments — these are INLINE diff comments,
     distinct from issue/PR conversation comments. The bulk of code
@@ -1522,15 +1679,31 @@ def _check_pr_review_comments(
         return 0
     count = 0
     for comment in data:
-        if me and comment.get("user", {}).get("login") == me:
+        if me and (comment.get("user") or {}).get("login") == me:
             continue
         if (comment.get("created_at", "") or "") <= since:
             continue
-        author = comment.get("user", {}).get("login", "unknown")
+        kept, _ = _partition_activity(
+            repo, token, [comment], "review_comment", me, trust_cache,
+            tick_budget, "review_comments_trust",
+        )
+        if not kept:
+            continue
+        author = (comment.get("user") or {}).get("login", "unknown")
         body = _truncate(comment.get("body") or "")
         url = comment.get("html_url", "")
         pr_url = comment.get("pull_request_url", "")
         pr_num = pr_url.rstrip("/").split("/")[-1] if pr_url else "?"
+        parent = _gh_api(f"repos/{repo}/pulls/{pr_num}", token)
+        if not isinstance(parent, dict):
+            if tick_budget is not None:
+                tick_budget.hard_truncated = True
+                tick_budget.note_truncation("review_comment_pr_lookup", 1)
+            continue
+        if not _trusted_pr(
+            repo, token, parent, me, trust_cache, tick_budget, "review_comment_pr_trust",
+        ):
+            continue
         path = comment.get("path", "")
         location = f" on {path}" if path else ""
         prompt = (
@@ -1646,7 +1819,7 @@ def _check_pr_pushes(
         # NOTE: this filter does NOT apply to review-request detection
         # below — the agent CAN be added as a reviewer to a PR it
         # authored (rare, but legal) and we'd want to surface that.
-        pr_author = pr.get("user", {}).get("login")
+        pr_author = (pr.get("user") or {}).get("login")
         number = pr.get("number")
         if not number:
             continue
@@ -1656,15 +1829,11 @@ def _check_pr_pushes(
         title = pr.get("title", "")
         url = pr.get("html_url", "")
         explicitly_requested = _review_requested(pr, me)
-        trusted_author = _pr_author_is_trusted(
-            repo, number, url, token, trust_cache, tick_budget=tick_budget,
+        kept, withheld = _partition_activity(
+            repo, token, [pr], "pull_request", me, trust_cache, tick_budget,
+            "pushes_trust", pr_author=True, since_window=False,
         )
-        if trusted_author is None and explicitly_requested:
-            # An explicit request is actionable regardless of author trust. Keep
-            # the unresolved author fail-closed for automatic push review while
-            # still allowing review-request reconciliation below.
-            trusted_author = False
-        if trusted_author is None:
+        if withheld and withheld[0].reason == "attestation_unavailable":
             # Unresolved for lack of budget or a transport failure. Carry the
             # prior head forward — a dropped key would make the next tick treat
             # this PR as first-seen
@@ -1680,11 +1849,14 @@ def _check_pr_pushes(
             if tick_budget is not None:
                 tick_budget.note_truncation("pushes_trust", 1)
             continue
-        if not trusted_author:
-            if not explicitly_requested and (not me or pr_author != me):
-                count += _surface_untrusted_pr_once(
-                    repo, number, url, surfaced_untrusted,
-                )
+        if not kept:
+            attested_author = trust_cache.get((repo, number), pr_author)
+            count += _surface_untrusted_pr_once(
+                repo, number, url, surfaced_untrusted, attested_author or "",
+            )
+            if key in pr_heads:
+                new_heads[key] = pr_heads[key]
+            continue
 
         # ─── pr_synchronize (push detection) ───
         current_sha = (pr.get("head") or {}).get("sha")
@@ -1694,25 +1866,17 @@ def _check_pr_pushes(
                 # First sighting — record, do not emit.
                 new_heads[key] = current_sha
             elif prev_sha != current_sha:
-                if not trusted_author:
-                    new_heads[key] = current_sha
-                else:
-                    emitted = _emit_pr_synchronize(
-                        repo,
-                        number,
-                        title,
-                        url,
-                        prev_sha,
-                        current_sha,
-                        token,
-                        me,
-                        pr=pr,
-                        related_comment=review_context.get(key, ""),
-                    )
-                    if emitted:
-                        count += 1
-                        review_needed_pr_numbers.add(key)
-                    new_heads[key] = current_sha
+                emitted = _emit_pr_synchronize(
+                    repo, number, title, url, prev_sha, current_sha, token, me,
+                    pr=pr, related_comment=review_context.get(key, ""),
+                    trust_cache=trust_cache, tick_budget=tick_budget,
+                )
+                if emitted:
+                    count += 1
+                    review_needed_pr_numbers.add(key)
+                # A normal non-emit (already reviewed) is settled. Only a
+                # missing attestation for a real login needs another tick.
+                new_heads[key] = prev_sha if emitted is None else current_sha
             else:
                 new_heads[key] = current_sha
 
@@ -2274,6 +2438,7 @@ def _check_own_changes_requested(
     reminder_interval: timedelta = CHANGES_REQUESTED_REMINDER_INTERVAL,
     tick_budget: TickBudget | None = None,
     rotate_offset: int = 0,
+    trust_cache: dict | None = None,
 ) -> tuple[int, dict[str, object]]:
     """State-reconciling reminder for the agent's OWN open PRs stuck at
     CHANGES_REQUESTED (chainlink #449).
@@ -2356,6 +2521,14 @@ def _check_own_changes_requested(
         if not isinstance(reviews, list):
             # Cannot determine review state — preserve the dedupe entry
             # so a transient failure doesn't cause a duplicate reminder.
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reviews, withheld = _partition_activity(
+            repo, token, reviews, "review", me, trust_cache, tick_budget,
+            "changes_requested_review_trust", since_window=False,
+        )
+        if any(item.reason == "attestation_unavailable" for item in withheld):
             if key in prior:
                 new[key] = prior[key]
             continue
@@ -2678,6 +2851,7 @@ def _check_pr_ci_failures(
     now: datetime | None = None,
     tick_budget: TickBudget | None = None,
     rotate_offset: int = 0,
+    trust_cache: dict | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Route newly completed check failures and unexplained cancellations.
 
@@ -2733,6 +2907,17 @@ def _check_pr_ci_failures(
         if pr.get("state") != "open" or pr.get("merged") is True or pr.get("merged_at"):
             new.pop(attention_key, None)
             new.pop(review_ci_key, None)
+            continue
+        if not _trusted_pr(repo, token, pr, me, trust_cache, tick_budget,
+                           "ci_pr_trust", since_window=False):
+            # Hold the CI watermark on unresolved authors so a later verdict
+            # can still deliver their checks; outsider PRs have no CI lane.
+            cache = trust_cache if trust_cache is not None else {}
+            verdict = cache.get((repo, (pr.get("user") or {}).get("login")))
+            if verdict is not False:
+                collection_complete = False
+                if key in prior:
+                    new[key] = prior[key]
             continue
         head = pr.get("head") or {}
         head_sha = head.get("sha") or ""
@@ -3014,6 +3199,7 @@ def _check_own_mergeability(
     retry_interval: timedelta = MERGEABILITY_RETRY_INTERVAL,
     tick_budget: TickBudget | None = None,
     rotate_offset: int = 0,
+    trust_cache: dict | None = None,
 ) -> tuple[int, dict[str, object]]:
     """Reconcile non-review merge failures on the agent's own open PRs.
 
@@ -3084,6 +3270,14 @@ def _check_own_mergeability(
 
         reviews = _gh_api(f"repos/{repo}/pulls/{number}/reviews", token)
         if not isinstance(reviews, list):
+            if key in prior:
+                new[key] = prior[key]
+            continue
+        reviews, withheld = _partition_activity(
+            repo, token, reviews, "review", me, trust_cache, tick_budget,
+            "mergeability_review_trust", since_window=False,
+        )
+        if any(item.reason == "attestation_unavailable" for item in withheld):
             if key in prior:
                 new[key] = prior[key]
             continue
@@ -3176,7 +3370,7 @@ def _check_own_mergeability(
                 and (review.get("user") or {}).get("login")
                 and (review.get("user") or {}).get("login") != me
             } | {
-                reviewer.get("login")
+                sanitize_login(reviewer.get("login"))
                 for reviewer in (pr.get("requested_reviewers") or [])
                 if isinstance(reviewer, dict)
                 and reviewer.get("login")
@@ -3219,7 +3413,7 @@ def _check_own_mergeability(
 
 def _check_pr_reviews(
     repo: str, since: str, token: str, me: str,
-    *, tick_budget: "TickBudget | None" = None,
+    *, trust_cache: dict | None = None, tick_budget: "TickBudget | None" = None,
 ) -> int:
     """New PR reviews (approve / changes-requested / commented).
     No ``since=`` query on reviews endpoint — walk open PRs + filter
@@ -3242,13 +3436,15 @@ def _check_pr_reviews(
             continue
         if _hard_stop(tick_budget, "pr_reviews"):
             break
+        if not _trusted_pr(repo, token, pr, me, trust_cache, tick_budget, "review_pr_trust"):
+            continue
         reviews = _gh_api(f"repos/{repo}/pulls/{pr_number}/reviews", token)
         if not isinstance(reviews, list):
             if _refused_window(tick_budget, reviews, "pr_reviews_window"):
                 break
             continue
         for review in reviews:
-            if me and review.get("user", {}).get("login") == me:
+            if me and (review.get("user") or {}).get("login") == me:
                 continue
             submitted = review.get("submitted_at", "") or ""
             if not submitted or submitted <= since:
@@ -3256,7 +3452,13 @@ def _check_pr_reviews(
             state = (review.get("state") or "").upper()
             if state == "PENDING":
                 continue
-            reviewer_login = review.get("user", {}).get("login", "unknown")
+            kept, _ = _partition_activity(
+                repo, token, [review], "review", me, trust_cache,
+                tick_budget, "pr_reviews_trust",
+            )
+            if not kept:
+                continue
+            reviewer_login = (review.get("user") or {}).get("login", "unknown")
             body = _truncate(review.get("body") or "")
             url = review.get("html_url", "")
             pr_title = pr.get("title", "")
@@ -3389,19 +3591,29 @@ def main() -> None:
     mergeability_attempt_budget = [1]
     untrusted_all: dict = cursor.get("pr_untrusted_authors", {}) or {}
     new_untrusted_all: dict[str, list[str]] = {}
+    outsider_issues_all: dict = cursor.get("github_outsider_issues", {}) or {}
+    new_outsider_issues_all: dict[str, list[str]] = {}
     trust_cache: dict[tuple[str, object], object] = {}
 
     total = 0
     for repo in repos:
         print(f"Checking {repo} since {since}...", file=sys.stderr)
-        total += _check_issues(repo, since, token, me, tick_budget=budget)
+        surfaced_issues = {
+            str(value) for value in (outsider_issues_all.get(repo, []) or [])
+            if isinstance(value, (str, int)) and not isinstance(value, bool)
+        }
+        total += _check_issues(
+            repo, since, token, me, trust_cache=trust_cache,
+            surfaced_outsiders=surfaced_issues, tick_budget=budget,
+        )
+        new_outsider_issues_all[repo] = sorted(surfaced_issues)
         surfaced_untrusted = {
             str(value) for value in (untrusted_all.get(repo, []) or [])
             if isinstance(value, (str, int)) and not isinstance(value, bool)
         }
         review_needed_pr_numbers: set[str] = set()
         issue_comments, review_context = _collect_issue_comment_context(
-            repo, since, token, me, tick_budget=budget,
+            repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
         )
         pr_opened_count = _check_prs(
             repo, since, token, me, trust_cache, surfaced_untrusted,
@@ -3411,9 +3623,11 @@ def main() -> None:
         )
         total += pr_opened_count
         total += _check_pr_review_comments(
-            repo, since, token, me, tick_budget=budget,
+            repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
         )
-        total += _check_pr_reviews(repo, since, token, me, tick_budget=budget)
+        total += _check_pr_reviews(
+            repo, since, token, me, trust_cache=trust_cache, tick_budget=budget,
+        )
         repo_heads = pr_heads_all.get(repo, {}) or {}
         repo_rr = _coerce_review_requests(rr_all.get(repo))
         push_count, new_repo_heads, new_repo_rr = _check_pr_pushes(
@@ -3432,6 +3646,8 @@ def main() -> None:
             me,
             review_needed_pr_numbers=review_needed_pr_numbers,
             comments=issue_comments,
+            trust_cache=trust_cache,
+            review_context=review_context,
             tick_budget=budget,
         )
         new_pr_heads_all[repo] = new_repo_heads
@@ -3446,6 +3662,7 @@ def main() -> None:
             repo, token, me, repo_cr,
             tick_budget=budget,
             rotate_offset=repo_offset,
+            trust_cache=trust_cache,
         )
         total += cr_count
         new_cr_all[repo] = new_repo_cr
@@ -3455,6 +3672,7 @@ def main() -> None:
             attempt_budget=mergeability_attempt_budget,
             tick_budget=budget,
             rotate_offset=repo_offset,
+            trust_cache=trust_cache,
         )
         total += mergeability_count
         new_mergeability_all[repo] = new_repo_mergeability
@@ -3463,6 +3681,7 @@ def main() -> None:
             repo, since, token, me, repo_ci,
             tick_budget=budget,
             rotate_offset=repo_offset,
+            trust_cache=trust_cache,
         )
         total += ci_count
         new_ci_failures_all[repo] = new_repo_ci
@@ -3503,6 +3722,7 @@ def main() -> None:
     cursor["pr_mergeability"] = new_mergeability_all
     cursor["pr_ci_failures"] = new_ci_failures_all
     cursor["pr_untrusted_authors"] = new_untrusted_all
+    cursor["github_outsider_issues"] = new_outsider_issues_all
     set_active_tick_budget(None)
     _save_cursor(cursor)
     print(

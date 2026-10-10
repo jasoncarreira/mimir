@@ -19,6 +19,7 @@ def _run(run_id, conclusion="success", status="completed", days=0):
         "status": status,
         "conclusion": conclusion,
         "workflowName": "CI",
+        "event": "push",
         "createdAt": (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),
         "url": f"https://github.com/o/r/actions/runs/{run_id}",
     }

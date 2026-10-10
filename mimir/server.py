@@ -1387,11 +1387,17 @@ def build_app(config: Config) -> web.Application:
     pairing_notifier = _PairingNotifier(config, channels)
 
     dispatcher = Dispatcher(config, resolver=identity_resolver)
+    async def github_outsider_notice(text: str) -> None:
+        channel = (config.operator_alert_channel or "").strip()
+        if channel:
+            await channels.send(channel, text, final=True)
+
     scheduler = Scheduler(
         scheduler_yaml=config.home / "scheduler.yaml",
         enqueue=dispatcher.enqueue,
         home=config.home,
         scheduler_tz=config.scheduler_tz,
+        operator_notice=github_outsider_notice,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:

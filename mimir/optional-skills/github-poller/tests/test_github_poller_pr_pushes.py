@@ -1132,7 +1132,7 @@ def test_coerce_review_requests_migrates_and_validates():
 # ── commit-enrichment tests ───────────────────────────────────────────────────
 
 
-def _make_commit(message: str, author: str | None = None) -> dict:
+def _make_commit(message: str, author: str | None = "alice") -> dict:
     commit = {"commit": {"message": message}, "sha": "aabbccdd"}
     if author is not None:
         commit["author"] = {"login": author}
