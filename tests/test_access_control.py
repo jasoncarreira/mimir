@@ -63,6 +63,223 @@ from mimir.pr_checkout_lease import PRCheckoutLease, _metadata
 from mimir.tool_descriptors import TOOL_DESCRIPTORS
 
 
+def _egress_shadow_auth(*, tainted: bool = True) -> AuthContext:
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="owner", domain="channel", resource_id="web:origin",
+        bridge_instance="web", sensitivity="private",
+        authorized_principals=frozenset({"owner"}), source_kind="channel",
+        integrity="untrusted" if tainted else "trusted",
+        integrity_effect="active_ingest",
+    ))
+    return AuthContext(
+        principal="owner", canonical_principal="owner", roles=("user",),
+        event_ingress=None, trigger="user_message", channel_id="web:origin",
+        interactivity=TurnInteractivity.INTERACTIVE, ifc_labels=labels,
+        ifc_state=InformationFlowState(labels),
+    )
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_egress_shadow_verdicts_and_original_decisions(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append({"type": kind, **fields}))
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    url = "https://unapproved.example/private?token=do-not-log#fragment-do-not-log"
+    approved = "https://approved.example/data"
+    cases = [
+        ("fetch_url", url, None, True),
+        ("web_search", url, None, True),
+        ("webhook", url, None, True),
+        ("http_request", url, None, True),
+        ("send_message", "web:other", SinkCategory.CROSS_CHANNEL, True),
+        ("send_message", "web:other", None, True),
+        ("send_message", "web:someone", SinkCategory.DIRECT_MESSAGE, True),
+        ("send_message", "web:origin", SinkCategory.SAME_CHANNEL, False),
+        ("send_message", "web:origin", SinkCategory.CROSS_CHANNEL, False),
+        ("fetch_url", approved, None, False),
+        ("fetch_url", "https://verbatim.example/read", None, False),
+    ]
+    fixed = access_control._fixed_web_search_url()
+    if fixed:
+        cases.append(("web_search", fixed, None, False))
+    for tool, target, category, expected in cases:
+        auth = _egress_shadow_auth()
+        auth.egress_state.approve_url(approved)
+        auth.ingested_url_state.add("https://verbatim.example/read")
+        kwargs = {"enforce": enforce, **({"sink_category": category} if category else {})}
+        with monkeypatch.context() as without_helper:
+            without_helper.setattr(access_control, "_egress_veto_shadow_verdict", lambda *args: None)
+            baseline = SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, **kwargs)
+        before = len(events)
+        decision = SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, **kwargs)
+        assert decision == baseline, (tool, target)
+        if tool == "fetch_url" and target == url:
+            assert decision.allowed is (not enforce)
+        assert len(events) - before == expected, (tool, target)
+        if expected:
+            event = events[-1]
+            assert event["type"] == "egress_veto_would_block"
+            assert event["actual_allowed"] is decision.allowed
+            assert event["source"] == {
+                "domain": "channel", "resource_id": "web:origin", "source_kind": "channel",
+            }
+            if tool != "send_message":
+                assert event["destination_host"] == "unapproved.example"
+                assert "do-not-log" not in json.dumps(event)
+                assert "https://" not in json.dumps(event)
+        clean = _egress_shadow_auth(tainted=False)
+        before = len(events)
+        SinkGate.check_sink_flow(tool, target, clean.ifc_labels, clean, **kwargs)
+        assert len(events) == before, tool
+
+
+@pytest.mark.parametrize("resource_id,expected", [
+    ("owner/repo#pull/2318@abc123", "owner/repo#pull/2318@abc123"),
+    ("opaque?part#attribution", "opaque?part#attribution"),
+    ("https://source.example/private?secret=hidden#hidden", "source.example"),
+])
+def test_egress_shadow_preserves_opaque_source_attribution(
+    monkeypatch: pytest.MonkeyPatch, resource_id: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    source = replace(auth.ifc_labels.sources[0], resource_id=resource_id)
+    labels = InformationFlowLabels().with_source(source)
+    auth = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    SinkGate.check_sink_flow("fetch_url", "https://other.example/", labels, auth)
+    assert len(events) == 1
+    assert events[0]["source"]["resource_id"] == expected
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("bücher.example", "xn--bcher-kva.example"),
+    ("xn--bcher-kva.example", "xn--bcher-kva.example"),
+    ("a" * 64 + ".example", "a" * 64 + ".example"),
+])
+def test_egress_shadow_normalises_idn_hosts_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch, host: str, expected: str,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    SinkGate.check_sink_flow("fetch_url", f"https://{host}/private?hidden=yes", auth.ifc_labels, auth)
+    assert len(events) == 1
+    assert events[0]["destination_host"] == expected
+    assert events[0]["origin"] == "tool_call"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_egress_shadow_channel_resolution_failure_preserves_decision(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool,
+) -> None:
+    auth = _egress_shadow_auth()
+    baseline = SinkGate._check_sink_flow_decision(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    )
+    monkeypatch.setattr(SinkGate, "_check_sink_flow_decision", lambda *args, **kwargs: baseline)
+
+    def fail_resolution(*args: object) -> None:
+        raise RuntimeError("shadow channel resolution unavailable")
+
+    monkeypatch.setattr(access_control.ChannelResourceAdapter, "_resolve_channel", fail_resolution)
+    assert SinkGate.check_sink_flow(
+        "send_message", "web:other", auth.ifc_labels, auth, enforce=enforce,
+    ) == baseline
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+@pytest.mark.parametrize("category", [SinkCategory.CROSS_CHANNEL, None])
+def test_egress_shadow_cross_channel_sink_approval_is_exempt(
+    monkeypatch: pytest.MonkeyPatch, enforce: bool, category: SinkCategory | None,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    auth = _egress_shadow_auth()
+    assert auth.ifc_state.approve_sink_once(
+        fallback=auth.ifc_labels, sink_category=(category or SinkCategory.SAME_CHANNEL).value,
+        destination="web:other", canonical_principal="owner",
+        lifetime_seconds=60, durable_audit=lambda *_: True,
+    )
+    decision = SinkGate.check_sink_flow(
+        "send_message", "web:other", auth.ifc_labels, auth,
+        enforce=enforce, **({"sink_category": category} if category else {}),
+    )
+    assert decision.reason == "ifc_declassification_approved"
+    assert decision.allowed
+    assert not events
+
+
+def test_egress_shadow_poller_approved_urls_exemption(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    service = build_trigger_service_principal(
+        canonical="poller:research", trigger="poller", profile="research",
+        tier=CapabilityTier.SCOPED_WITH_PROVENANCE, capabilities=("fetch_url",),
+        approved_urls=("https://poller.example/",), creation_path="test",
+    )
+    labels = _egress_shadow_auth().ifc_labels
+    auth = _service_auth(service, labels)
+    target = "https://poller.example/read"
+    assert access_control.fetch_url_is_approved(target, auth)
+    SinkGate.check_sink_flow("fetch_url", target, labels, auth, enforce=False)
+    assert not events
+    SinkGate.check_sink_flow("fetch_url", "https://other.example/read", labels, auth, enforce=False)
+    assert len(events) == 1
+    assert events[0]["service_principal"] == "poller:research"
+    assert events[0]["poller"] == "research"
+
+
+def test_egress_shadow_cross_channel_requires_private_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    labels = InformationFlowLabels().with_source(SourceLabel(
+        principal="owner", domain="channel", resource_id="web:origin",
+        bridge_instance="web", sensitivity="public",
+        authorized_principals=frozenset({"owner"}), source_kind="channel",
+        integrity="untrusted", integrity_effect="active_ingest",
+    ))
+    auth = replace(_egress_shadow_auth(), ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    assert labels.has_untrusted_active_ingest
+    SinkGate.check_sink_flow("send_message", "web:other", labels, auth, enforce=False)
+    assert not events
+
+
+def test_egress_shadow_configured_webhook_and_operator_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import event_logger
+
+    events: list[dict] = []
+    monkeypatch.setattr(event_logger, "log_event_sync", lambda kind, **fields: events.append(fields))
+    monkeypatch.setenv("MIMIR_EGRESS_APPROVED_URLS", '["https://approved.example/notify"]')
+    monkeypatch.setenv("MIMIR_OPERATOR_ALERT_CHANNEL", "web:operator")
+    auth = _egress_shadow_auth()
+    SinkGate.check_sink_flow(
+        "webhook", "https://approved.example/notify", auth.ifc_labels, auth,
+        enforce=False,
+    )
+    operator_delivery = SinkGate.check_sink_flow(
+        "send_message", "web:operator", auth.ifc_labels, auth, enforce=False,
+    )
+    assert operator_delivery.reason == "ifc_allowed"
+    assert not events
+
+
 @pytest.fixture(autouse=True)
 def _isolate_operator_repository_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tests opt into repository inventories explicitly, never from the host."""

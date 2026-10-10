@@ -669,6 +669,54 @@ def test_stats_cli_renders_recent_data(tmp_path: Path, capsys: pytest.CaptureFix
     assert "cache hit 90%" in out
 
 
+def test_stats_egress_shadow_report_is_read_only_and_groups_fixture(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    import json
+
+    home = tmp_path / "agent"
+    logs = home / "logs"
+    logs.mkdir(parents=True)
+    events = logs / "events.jsonl"
+    records = [
+        {"type": "egress_veto_would_block", "timestamp": "2026-10-08T09:00:00+00:00",
+         "tool": "fetch_url", "destination_host": "old.example", "trigger": "poller",
+         "poller": "news", "reason": "egress_destination_not_approved"},
+        *[dict(type="egress_veto_would_block", timestamp="2026-10-09T10:00:00Z",
+               tool="fetch_url", destination_host="new.example", trigger="poller",
+               poller="news", reason="egress_destination_not_approved") for _ in range(2)],
+        {"type": "egress_veto_would_block", "timestamp": "2026-10-09T10:01:00Z",
+         "tool": "send_message", "destination_host": None, "trigger": "user_message",
+         "reason": "private_source_cross_channel"},
+        *[dict(type="egress_veto_would_block", timestamp="2026-10-09T10:01:00Z",
+               tool="send_message", destination_host=None, trigger="user_message",
+               reason="private_source_cross_channel", origin=origin)
+          for origin in ("harness", "tool_call")],
+        {"type": "tool_call", "timestamp": "2026-10-09T10:01:00Z"},
+    ]
+    events.write_text("\n".join(json.dumps(record) for record in records) + "\ninvalid\n")
+    before = events.read_bytes()
+    main(["stats", "--home", str(home), "--egress-shadow", "--since", "2026-10-09T09:00:00Z"])
+    out = capsys.readouterr().out
+    assert "2  tool=fetch_url host=new.example trigger=poller poller=news reason=egress_destination_not_approved" in out
+    for origin in ("-", "harness", "tool_call"):
+        assert ("1  tool=send_message host=- trigger=user_message poller=- "
+                f"reason=private_source_cross_channel origin={origin}") in out
+    assert "3  tool=send_message" not in out
+    assert "old.example" not in out
+    assert events.read_bytes() == before
+    assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == [
+        "logs", "logs/events.jsonl",
+    ]
+
+
+def test_stats_since_requires_egress_shadow(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["stats", "--since", "2026-10-09T00:00:00Z"])
+    assert exc.value.code == 2
+    assert "--since requires --egress-shadow" in capsys.readouterr().err
+
+
 def test_main_setup_subcommand_runs(tmp_path: Path, capsys: pytest.CaptureFixture):
     home = tmp_path / "agent"
     main(["setup", "--home", str(home)])

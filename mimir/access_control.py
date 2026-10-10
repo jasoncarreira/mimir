@@ -6126,6 +6126,79 @@ def _turn_has_untrusted_active_ingest(auth_context: Any, ifc_labels: Any) -> boo
     )
 
 
+def _egress_veto_shadow_verdict(
+    tool_name: str, sink_category: SinkCategory, target: str | None,
+    ifc_labels: Any, auth_context: Any, decision: "ToolAuthorization",
+) -> tuple[str, str] | None:
+    """Compute #1903's proposed veto without participating in authorization."""
+    if not _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
+        return None
+    if not target or decision.reason == "ifc_declassification_approved":
+        return None
+    if tool_name == "fetch_url" and sink_category is SinkCategory.NETWORK:
+        if _target_is_verbatim_ingest_url(target, auth_context):
+            return None
+        if fetch_url_is_approved(target, auth_context):
+            return None
+        return "egress_destination_not_approved", "verbatim_ingest_url,approved_urls"
+    if tool_name == "web_search" and sink_category is SinkCategory.NETWORK:
+        fixed = _fixed_web_search_url()
+        if fixed is not None and normalize_sink_destination(sink_category, target) == fixed:
+            return None
+        return "egress_destination_not_approved", "fixed_web_search_url"
+    if tool_name in {"webhook", "http_request"} and sink_category is SinkCategory.HTTP_WEBHOOK:
+        if _target_matches_approved_url(target, "MIMIR_EGRESS_APPROVED_URLS"):
+            return None
+        return "egress_destination_not_approved", "MIMIR_EGRESS_APPROVED_URLS"
+    if tool_name == "send_message" and sink_category in {
+        SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE,
+    }:
+        if (ChannelResourceAdapter._resolve_channel(target)
+                == ChannelResourceAdapter._resolve_channel(
+                    getattr(auth_context, "channel_id", None))):
+            return None
+        if decision.reason in {"ifc_allowed", "no_labels"}:
+            return None
+        state = getattr(auth_context, "ifc_state", None)
+        current = getattr(state, "current", None)
+        try:
+            labels = current(ifc_labels) if callable(current) else ifc_labels
+        except Exception:
+            labels = ifc_labels
+        if not any(getattr(source, "sensitivity", None) in {
+            "private", "confidential", "internal",
+        } for source in getattr(labels, "sources", ())):
+            return None
+        # Cross-channel/DM flow has no implicit ACL grant. A consumed operator
+        # approval is recognized above from the original decision, not re-consumed.
+        return "private_source_cross_channel", "source_acl,declassification_or_sink_approval"
+    return None
+
+
+def _egress_shadow_source(auth_context: Any, ifc_labels: Any) -> dict[str, str | None]:
+    state = getattr(auth_context, "ifc_state", None)
+    current = getattr(state, "current", None)
+    try:
+        labels = current(ifc_labels) if callable(current) else ifc_labels
+    except Exception:
+        labels = ifc_labels
+    source = next((item for item in getattr(labels, "sources", ())
+                   if getattr(item, "has_untrusted_active_ingest", False)), None)
+    resource_id = getattr(source, "resource_id", None)
+    # Opaque IDs retain attribution, including repository #pull/N@sha suffixes.
+    # Only actual URLs are reduced to hosts to avoid logging URL secrets.
+    if isinstance(resource_id, str) and "://" in resource_id:
+        try:
+            resource_id = urlsplit(resource_id).hostname
+        except ValueError:
+            resource_id = None
+    return {
+        "domain": getattr(source, "domain", None),
+        "resource_id": resource_id,
+        "source_kind": getattr(source, "source_kind", None),
+    }
+
+
 def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuthorization":
     return ToolAuthorization(
         tool_name=tool_name, decision=OperationDecision.ADMIN_REQUIRED,
@@ -6754,6 +6827,65 @@ class SinkGate:
 
     @classmethod
     def check_sink_flow(
+        cls, tool_name: str, target: str | None, ifc_labels: Any,
+        auth_context: Any, *, origin: str = "tool_call", **kwargs: Any,
+    ) -> "ToolAuthorization":
+        """Audit the proposed egress veto after the unchanged sink decision."""
+        decision = cls._check_sink_flow_decision(
+            tool_name, target, ifc_labels, auth_context, **kwargs,
+        )
+        try:
+            category = kwargs.get("sink_category") or get_sink_category(tool_name)
+            shadow_category = category
+            # send_message's descriptor is SAME_CHANNEL; classify its target
+            # only for telemetry, inside the fail-safe boundary.
+            if (tool_name == "send_message" and category is SinkCategory.SAME_CHANNEL
+                    and target and ChannelResourceAdapter._resolve_channel(target)
+                    != ChannelResourceAdapter._resolve_channel(
+                        getattr(auth_context, "channel_id", None))):
+                shadow_category = SinkCategory.CROSS_CHANNEL
+            if (tool_name in {"fetch_url", "web_search", "webhook", "http_request", "send_message"}
+                    and shadow_category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK,
+                                            SinkCategory.CROSS_CHANNEL, SinkCategory.DIRECT_MESSAGE}):
+                verdict = _egress_veto_shadow_verdict(
+                    tool_name, shadow_category, target, ifc_labels, auth_context, decision,
+                )
+                if verdict is not None:
+                    from .event_logger import log_event_sync
+
+                    service = get_trusted_service_from_auth_context(auth_context)
+                    principal = service.canonical if service is not None else None
+                    host = None
+                    if category in {SinkCategory.NETWORK, SinkCategory.HTTP_WEBHOOK}:
+                        try:
+                            host = urlsplit(target or "").hostname
+                            if host is not None:
+                                try:
+                                    host = host.encode("idna").decode("ascii").lower()
+                                except UnicodeError:
+                                    pass
+                        except ValueError:
+                            pass
+                    log_event_sync(
+                        "egress_veto_would_block",
+                        tool=tool_name, sink_category=shadow_category.value,
+                        origin=origin,
+                        trigger=getattr(auth_context, "trigger", None),
+                        service_principal=principal,
+                        poller=(principal.removeprefix("poller:")
+                                if principal and principal.startswith("poller:") else None),
+                        destination_host=host,
+                        reason=verdict[0], exemption_missed=verdict[1],
+                        source=_egress_shadow_source(auth_context, ifc_labels),
+                        actual_allowed=decision.allowed,
+                    )
+        except Exception:
+            # Best-effort telemetry must never alter the returned decision.
+            log.debug("egress shadow audit unavailable", exc_info=True)
+        return decision
+
+    @classmethod
+    def _check_sink_flow_decision(
         cls,
         tool_name: str,
         target: str | None,
