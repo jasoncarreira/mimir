@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import uuid
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -1553,7 +1554,7 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
             "next": "implementation",
         }
     )
-    handle = LaunchHandle("local_subprocess", "worker-job", 99, shim_pid=4321)
+    handle = LaunchHandle("local_subprocess", str(uuid.uuid4()), 99, shim_pid=4321)
     save_factory_record(
         tmp_path,
         FactoryRunRecord(
@@ -1579,7 +1580,8 @@ def test_factory_stop_finds_production_record_and_cancels_verified_handle(
         cancelled.append(selected)
 
     monkeypatch.setattr(control, "factory_process_is_alive", lambda record: True)
-    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    from mimir.worklink.worker_client import WorkerClient
+    monkeypatch.setattr(WorkerClient, "cancel_factory_handle", cancel)
     monkeypatch.setattr(
         control, "_runner", lambda home, binary: (
             lambda args: commands.append(list(args))
@@ -1662,8 +1664,8 @@ def test_factory_stop_refuses_unverified_or_reused_process_identity(
                      id="null-ticks-dead-esrch"),
         pytest.param(99, None, False, None, False, id="unreadable-observed-ticks"),
         pytest.param(99, None, False, ProcessLookupError(errno.ESRCH, "gone"), True, id="dead"),
-        pytest.param(99, 99, False, PermissionError(errno.EPERM, "denied"), False,
-                     id="permission-error"),
+        pytest.param(99, None, False, PermissionError(errno.EPERM, "denied"), False,
+                     id="permission-error-unreadable-ticks"),
     ],
 )
 def test_stop_cli_reports_rejected_factory_identity(

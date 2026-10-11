@@ -33,6 +33,7 @@ from .worker_client import (
     _validate_identifier,
     WORKLINK_CHECKOUT_ROOT,
 )
+from .run_state import process_start_ticks
 
 HOME_ROOT = Path("/var/lib/mimir-worklink/homes")
 REPO_TEST_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/repo-test-checkouts")
@@ -41,7 +42,7 @@ REPO_TEST_UV_CACHE = Path("/opt/mimir-worklink/uv-cache")
 MAX_FDS = 3
 # Deliberately not imported from worker_client: this value must describe the
 # immutable executor installed in the root-owned image, not mutable controller code.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-scope"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
 EXECUTOR_SOURCE_COMMIT_PATH = Path("/opt/mimir-worklink/executor-source-commit")
 _STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
@@ -70,6 +71,8 @@ _PATH_LAUNCH_FIELDS = frozenset({
     "executor_identity",
 })
 _CANCEL_FIELDS = frozenset({"version", "op", "id", "executor_identity"})
+_FACTORY_CANCEL_FIELDS = frozenset({"version", "op", "executor_identity", "handle"})
+_FACTORY_HANDLE_FIELDS = frozenset({"substrate", "identifier", "process_start_ticks", "shim_pid"})
 _IDENTITY_FIELDS = frozenset({"version", "op", "executor_identity"})
 _FACTORY_WRITE_FIELDS = frozenset({
     "version", "op", "executor_identity", "path", "issue", "attempt", "run_uid",
@@ -984,6 +987,39 @@ def _handle_cancel(connection: socket.socket, request: dict[str, Any], fds: list
     _send(connection, {"id": identifier, "status": "cancelled"})
 
 
+def _handle_cancel_factory_handle(
+    connection: socket.socket, request: dict[str, Any], fds: list[int],
+) -> None:
+    if fds or set(request) != _FACTORY_CANCEL_FIELDS:
+        raise RuntimeError("factory cancel request must carry the exact contract and no FDs")
+    _validate_executor_identity(request)
+    handle = request["handle"]
+    if not isinstance(handle, dict) or set(handle) != _FACTORY_HANDLE_FIELDS:
+        raise RuntimeError("invalid factory handle")
+    identifier = handle["identifier"]
+    if not isinstance(identifier, str):
+        raise RuntimeError("invalid factory handle")
+    _validate_identifier(identifier)
+    pid = handle["shim_pid"]
+    ticks = handle["process_start_ticks"]
+    if (
+        handle["substrate"] != "local_subprocess"
+        or type(pid) is not int or pid <= 0
+        or type(ticks) is not int or ticks < 0
+    ):
+        raise RuntimeError("invalid factory handle")
+    with _jobs_lock:
+        proc = _jobs.get(identifier)
+    if not isinstance(proc, _FactoryProcess) or proc.pid != pid:
+        raise RuntimeError("factory handle does not match an active executor job")
+    if process_start_ticks(pid) != ticks:
+        raise RuntimeError("refusing to cancel: recorded process identity no longer matches")
+    proc.stop()
+    if not proc.done.is_set() or proc.error is not None:
+        raise RuntimeError("factory exit could not be verified")
+    _send(connection, {"id": identifier, "status": "exited"})
+
+
 def _wait_with_output_limits(
     proc: subprocess.Popen[bytes],
     timeout_s: float,
@@ -1258,6 +1294,8 @@ def handle_connection(connection: socket.socket) -> None:
             _handle_launch_factory(connection, request, fds)
         elif request.get("op") == "cancel":
             _handle_cancel(connection, request, fds)
+        elif request.get("op") == "cancel_factory_handle":
+            _handle_cancel_factory_handle(connection, request, fds)
         elif request.get("op") == "identity":
             _handle_identity(connection, request, fds)
         elif request.get("op") in {"write_file", "edit_file", "replace_file"}:

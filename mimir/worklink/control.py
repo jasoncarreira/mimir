@@ -362,8 +362,14 @@ def stop_worklink(
                 problem = None
                 if factory_process_is_alive(factory) and factory.handle is not None:
                     try:
-                        asyncio.run(LocalSubprocessComputeBackend().cancel(factory.handle))
-                    except (KeyError, RuntimeError, OSError) as exc:
+                        handle = factory.handle
+                        if handle.shim_pid is not None:
+                            from .worker_client import WorkerClient
+
+                            asyncio.run(WorkerClient(None).cancel_factory_handle(handle))
+                        else:
+                            asyncio.run(LocalSubprocessComputeBackend().cancel(handle))
+                    except (KeyError, RuntimeError, OSError, ValueError) as exc:
                         problem = f"factory {factory.run_id}: cancellation failed: {exc}"
                 else:
                     problem = (

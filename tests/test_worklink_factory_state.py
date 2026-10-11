@@ -94,7 +94,7 @@ def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Pa
                      ProcessLookupError(errno.ESRCH, "missing"), False, 456, False,
                      id="kill-process-lookup-error"),
         pytest.param(LaunchHandle("local_subprocess", "123", 456, 789),
-                     PermissionError(errno.EPERM, "denied"), False, 456, False,
+                     PermissionError(errno.EPERM, "denied"), False, 456, True,
                      id="kill-permission-error"),
         pytest.param(LaunchHandle("local_subprocess", "123", 456, 789),
                      OSError(errno.EIO, "unavailable"), False, 456, False, id="kill-os-error"),
@@ -140,7 +140,7 @@ def test_factory_process_is_alive(
     else:
         pid = handle.shim_pid if handle.shim_pid is not None else int(handle.identifier)
         kill.assert_called_once_with(pid, 0)
-        if kill_error is not None:
+        if kill_error is not None and not isinstance(kill_error, PermissionError):
             is_zombie.assert_not_called()
             start_ticks.assert_not_called()
         else:
@@ -160,7 +160,7 @@ def test_factory_process_is_alive(
         pytest.param(None, True, None, True, True, id="signalable-zombie"),
         pytest.param(None, False, 456, False, False, id="live-matching-ticks"),
         pytest.param(None, False, None, False, False, id="unreadable-ticks"),
-        pytest.param(PermissionError(errno.EPERM, "denied"), False, 457, False, False,
+        pytest.param(PermissionError(errno.EPERM, "denied"), False, 457, True, False,
                      id="permission-error"),
         pytest.param(OSError(errno.EIO, "unavailable"), False, 457, False, False,
                      id="os-error"),
@@ -195,9 +195,11 @@ def test_factory_process_is_verified_dead(
         value, allow_missing_start_ticks=True,
     ) is expected
     kill.assert_called_once_with(789, 0)
-    if kill_error is not None:
+    if kill_error is not None and not isinstance(kill_error, PermissionError):
         is_zombie.assert_not_called()
         start_ticks.assert_not_called()
+    else:
+        start_ticks.assert_called_once_with(789)
 
 
 @pytest.mark.parametrize(
