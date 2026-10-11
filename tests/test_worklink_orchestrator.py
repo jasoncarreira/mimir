@@ -8002,12 +8002,14 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     ("snapshot_published", "cancellation_stops_driver"),
     [(True, True), (False, True), (True, False)],
 )
+@pytest.mark.parametrize("idle", [False, True])
 def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
     snapshot_published: bool,
     cancellation_stops_driver: bool,
+    idle: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -8019,6 +8021,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     lifecycle: list[str] = []
     transitions: list[dict[str, object]] = []
     terminal_reasons: list[str] = []
+    terminal_times: list[float] = []
     parked = False
     parked_status_reads = 0
     snapshot = str(sandbox / ".factory" / ".parked" / "700")
@@ -8101,13 +8104,16 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
             assert stopped.is_set(), "live driver was parked"
             lifecycle.append("terminal")
             terminal_reasons.append(reason)
+            terminal_times.append(factory_clock.now)
             parked = True
 
     async def advance(delay: float) -> None:
         factory_clock.now += delay
         await asyncio.sleep(0)
 
-    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10000.0 if idle else 20.0)
+    if idle:
+        monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     def run() -> WorklinkRunResult:
         return asyncio.run(
@@ -8127,7 +8133,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     if not cancellation_stops_driver:
         with pytest.raises(
             WorklinkError,
-            match="factory driver survived cancellation before budget park",
+            match="factory driver survived cancellation before park",
         ):
             run()
         assert lifecycle == ["cancel", "cleanup"]
@@ -8139,16 +8145,25 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert result.status == "needs-human"
     assert lifecycle == ["cancel", "terminal", "cleanup"]
     reason = terminal_reasons[0]
-    assert "budget exhausted at observe-slice:be-retained-recovery-service" in reason
-    assert "9 of 13 slices merged, 1 in review, 3 pending" in reason
-    assert "gates: implementation=passed" in reason
-    assert (
-        f"factory resume 700 --session session-1 --repo {sandbox}" in reason
-    )
+    if idle:
+        assert terminal_times == [7200.0]
+        assert reason.startswith("factory driver idle: no progress since ")
+        assert datetime.fromisoformat(
+            reason.removeprefix("factory driver idle: no progress since ")
+        ).tzinfo == UTC
+    else:
+        assert "budget exhausted at observe-slice:be-retained-recovery-service" in reason
+        assert "9 of 13 slices merged, 1 in review, 3 pending" in reason
+        assert "gates: implementation=passed" in reason
+        assert f"factory resume 700 --session session-1 --repo {sandbox}" in reason
     retained = load_factory_record(tmp_path, "700")
     assert retained is not None and retained.controller_phase == "parked"
+    assert retained.attempt == 1
+    assert retained.controller_error is not None
+    assert retained.controller_error.startswith(reason)
     assert retained.status is not None and retained.status.is_parked
     assert transitions[0]["status"] == "blocked"
+    assert transitions[0]["attempt"] == 1
     report = str(transitions[0]["reason"])
     if snapshot_published:
         assert retained.status.park_snapshot == snapshot
@@ -8256,6 +8271,9 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def terminal(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("dead process must take the existing failure path")
+
     with pytest.raises(WorklinkError, match="OpenCode process exited"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
@@ -8273,6 +8291,7 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
 
     retained = load_factory_record(tmp_path, "700")
     assert retained is not None
+    assert retained.controller_phase == "running"
     assert retained.transcript is not None
     transcript_path = Path(retained.transcript)
     assert transcript_path.parent == tmp_path / "state" / "worklink" / "transcripts"
@@ -8305,7 +8324,7 @@ def _run_factory_progress_case(
     transcript_writes: tuple[tuple[float, str], ...] = (),
     stop_at: float,
     rewrite: tuple[str, str] | None = None,
-) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]], WorklinkRunResult | None]:
     import mimir.worklink.orchestrator as orchestrator
     from mimir.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
@@ -8333,6 +8352,8 @@ def _run_factory_progress_case(
     transcript.parent.mkdir(parents=True)
     transcript.touch(mode=0o600)
     running = _factory_lifecycle_status(sandbox, status="running")
+    parked = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot="snapshot")
+    parked_by_controller = False
 
     class CaseFinished(RuntimeError):
         pass
@@ -8357,10 +8378,16 @@ def _run_factory_progress_case(
         def status(self, *args: object, **kwargs: object) -> Any:
             if factory_clock.now >= stop_at:
                 raise CaseFinished
-            return running
+            return parked if parked_by_controller else running
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
+
+        def terminal(self, run_id: str, status: str, *, reason: str, **kwargs: object) -> None:
+            nonlocal parked_by_controller
+            assert (run_id, status) == ("700", "needs-human")
+            assert reason.startswith("factory driver idle: no progress since ")
+            parked_by_controller = True
 
     async def advance(delay: float) -> None:
         factory_clock.now += delay
@@ -8385,8 +8412,9 @@ def _run_factory_progress_case(
         orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
     )
 
-    with pytest.raises(CaseFinished):
-        asyncio.run(
+    result = None
+    try:
+        result = asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
@@ -8400,7 +8428,9 @@ def _run_factory_progress_case(
                 autonomous=True,
             )
         )
-    return load_failure_state(dispatch_failure_state_dir(tmp_path)), events
+    except CaseFinished:
+        pass
+    return load_failure_state(dispatch_failure_state_dir(tmp_path)), events, result
 
 
 @pytest.mark.parametrize(
@@ -8438,7 +8468,7 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
         pending_failure_alerts,
     )
 
-    state, _ = _run_factory_progress_case(
+    state, _, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
@@ -8449,10 +8479,36 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
 
     assert occurrence
     assert state.get("issues", {}).get("700") is None
+    assert result is None
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
-def test_factory_dead_without_any_liveness_signal_escalates_within_two_windows(
+@pytest.mark.parametrize("stale_after", [900.0, 1800.0])
+def test_factory_alive_without_activity_parks_at_separate_idle_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    stale_after: float,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: stale_after)
+    idle_after = max(7200.0, 8 * stale_after)
+    state, events, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=idle_after + 900
+    )
+    assert result is not None and result.status == "needs-human"
+    assert result.reason is not None and result.reason.startswith(
+        "factory driver idle: no progress since "
+    )
+    assert factory_clock.now == idle_after
+    assert state.get("issues", {}).get("700") is None
+    assert [name for name, _ in events if "stale_status" in name] == [
+        "worklink_factory_stale_status", "worklink_factory_stale_status_ended"
+    ]
+
+
+def test_factory_long_silent_generation_is_not_parked_or_reported_as_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8462,16 +8518,17 @@ def test_factory_dead_without_any_liveness_signal_escalates_within_two_windows(
         pending_failure_alerts,
     )
 
-    state, _ = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    state, events, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=3660
     )
-
-    incident = state["issues"]["700"]
-    assert incident["active"] is True
-    assert incident["terminal_error"] == "factory emitted no liveness signals"
-    blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
-    assert blocked == {700}
-    assert len(alerts) == 1
+    # Four diagnostic windows without a transcript write or an exit marker is
+    # still compatible with a healthy long model generation.
+    assert factory_clock.now == 3660
+    assert result is None
+    assert state.get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    stale = [name for name, _ in events if "stale_status" in name]
+    assert stale == ["worklink_factory_stale_status", "worklink_factory_stale_status_ended"]
 
 
 def test_factory_logging_without_productivity_runs_to_its_budget(
@@ -8479,7 +8536,7 @@ def test_factory_logging_without_productivity_runs_to_its_budget(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    state, _ = _run_factory_progress_case(
+    state, _, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
@@ -8489,9 +8546,10 @@ def test_factory_logging_without_productivity_runs_to_its_budget(
     )
 
     assert state.get("issues", {}).get("700") is None
+    assert result is None
 
 
-def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
+def test_factory_unreadable_work_snapshot_does_not_prevent_idle_park(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8499,13 +8557,11 @@ def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
     import mimir.worklink.orchestrator as orchestrator
 
     monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda _sandbox: None)
-    state, _ = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    state, _, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=8100
     )
-
-    incident = state["issues"]["700"]
-    assert incident["active"] is True
-    assert incident["terminal_error"] == "factory emitted no liveness signals"
+    assert result is not None and result.status == "needs-human"
+    assert state.get("issues", {}).get("700") is None
 
 
 def test_factory_transcript_snapshot_requires_controller_read_access(
@@ -8533,7 +8589,7 @@ def test_factory_transcript_snapshot_requires_controller_read_access(
     assert _factory_transcript_snapshot(root, 701, 1) == {}
 
 
-def test_factory_work_advance_releases_a_stale_incident(
+def test_factory_work_advance_keeps_driver_active(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8543,18 +8599,19 @@ def test_factory_work_advance_releases_a_stale_incident(
         pending_failure_alerts,
     )
 
-    state, events = _run_factory_progress_case(
+    state, events, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
-        writes=((1860, "validation-report.md", "now complete"),),
+        writes=((840, "validation-report.md", "now complete"), (1740, "review.md", "done")),
         stop_at=1920,
     )
 
-    assert state["issues"]["700"]["active"] is False
+    assert state.get("issues", {}).get("700") is None
+    assert result is None
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
     ended = [fields for name, fields in events if name.endswith("stale_status_ended")]
-    assert ended[-1]["end_reason"] == "liveness_observed"
+    assert ended == []
 
 
 def test_factory_work_snapshot_does_not_depend_on_private_run_state(
@@ -8667,7 +8724,7 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
         )
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
-    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 5.0)
     monkeypatch.setattr(
         orchestrator,
         "_epic_run_timeout_s",
@@ -8751,6 +8808,9 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def terminal(self, *args: object, **kwargs: object) -> None:
+            raise WorklinkError("factory terminal exception")
+
     async def supervise_actual(**kwargs: Any) -> WorklinkRunResult:
         supervisor = kwargs.pop("_supervisor")
         kwargs["backend"] = Backend(kwargs["factory_record"])
@@ -8762,7 +8822,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
         raise OSError("disk full")
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
-    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 5.0)
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10.0)
     monkeypatch.setattr(orchestrator, "_record_run_failure", disk_failure)
     monkeypatch.setattr(
@@ -8782,9 +8842,9 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
             release_signals=scans,
         )
 
-    # Two complete quiet windows are required before the incident write.
-    assert status_calls == 3
-    assert writes == ["factory emitted no liveness signals"]
+    # Incident persistence failure retains the claim and run state.
+    assert status_calls == 5
+    assert writes == ["factory terminal exception"]
     assert lifecycle == ["cancel", "cleanup"]
     assert releases == []
     assert scans == []
@@ -8794,12 +8854,10 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
     assert Path(retained.transcript).is_file()
 
 
-@pytest.mark.parametrize("ending", ["parked", "newer-incident"])
-def test_factory_stale_status_events_are_bounded_per_episode(
+def test_factory_live_transcript_prevents_idle_park(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
-    ending: str,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -8813,6 +8871,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     claim_heartbeats: list[ClaimRecord] = []
     running = _factory_lifecycle_status(sandbox, status="running")
     changed = replace(running, next="review")
+    transcript = tmp_path / "state" / "worklink" / "transcripts" / "feature_factory-700-a1-live.stderr.log"
+    transcript.parent.mkdir(parents=True)
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -8837,7 +8897,7 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         def status(self, *args: object, **kwargs: object) -> Any:
             self.status_calls += 1
             assert factory_clock.now <= 4000
-            if factory_clock.now == 4000 and ending in {"parked", "newer-incident"}:
+            if factory_clock.now == 4000:
                 return _factory_lifecycle_status(sandbox, status="needs-human")
             return running if factory_clock.now < 2000 else changed
 
@@ -8851,6 +8911,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     async def advance(delay: float) -> None:
         delays.append(delay)
         factory_clock.now += delay
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("driver activity\n")
         await asyncio.sleep(0)
 
     monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
@@ -8863,86 +8925,26 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     monkeypatch.setattr(
         orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
     )
-    if ending == "newer-incident":
-        import mimir.worklink.dispatch_failures as dispatch_failures
-
-        real_resolve = dispatch_failures.resolve_failure_if_current
-        resolve_calls = 0
-
-        def race_newer(
-            state_dir: Path,
-            issue_id: int,
-            signature: str,
-            occurrence_id: str,
-        ) -> bool:
-            nonlocal resolve_calls
-            resolve_calls += 1
-            if resolve_calls == 2:
-                dispatch_failures.record_failure(
-                    state_dir,
-                    issue_id=issue_id,
-                    attempt=2,
-                    exit_status=1,
-                    error="newer terminal factory failure",
-                    log_path="newer.log",
-                )
-            return real_resolve(state_dir, issue_id, signature, occurrence_id)
-
-        monkeypatch.setattr(
-            dispatch_failures, "resolve_failure_if_current", race_newer
-        )
     backend = Backend()
-    with (
-        pytest.raises(WorklinkError, match="factory exceeded run timeout")
-        if ending == "timeout" else nullcontext()
-    ):
-        result = asyncio.run(
-            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
-                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-                claims=Claims(),
-                backend=backend,
-                compute=Compute(),
-                factory_record=_factory_lifecycle_record(sandbox, handle),
-                test_cmd="pytest -q",
-                runner=lambda args: cp(args),
-                started_at=datetime.now(UTC),
-                autonomous=True,
-            )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=backend,
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+            autonomous=True,
         )
-        assert result.status == "needs-human"
+    )
+    assert result.status == "needs-human"
 
     stale_events = [(name, fields) for name, fields in events if "stale_status" in name]
-    # Each episode has over a thousand stale polls, but only entry and end emit.
-    assert [name for name, _ in stale_events] == [
-        "worklink_factory_stale_status",
-        "worklink_factory_stale_status_ended",
-    ] * 2
-    for episode in (1, 2):
-        entry = stale_events[(episode - 1) * 2][1]
-        end = stale_events[(episode - 1) * 2 + 1][1]
-        for fields in (entry, end):
-            assert fields["issue_id"] == 700
-            assert fields["attempt"] == 1
-            assert fields["run_id"] == "700"
-            assert fields["stale_episode"] == episode
-            assert fields["diagnostic_after_s"] == 900
-        assert entry["lock"] == "fresh"
-        assert entry["process_alive"] is True
-        assert entry["unchanged_for_s"] == 900
-        assert entry["stale_duration_s"] == 0
-        assert end["unchanged_for_s"] == 2000
-        assert end["stale_duration_s"] == 1100
-        assert end["stale_started_at"] == entry["stale_started_at"]
-        assert datetime.fromisoformat(entry["stale_started_at"]).tzinfo == UTC
-        assert end["end_reason"] == (
-            "supervision_ended"
-            if episode == 2 and ending == "timeout"
-            else "liveness_observed"
-        )
-    assert backend.status_calls == backend.heartbeat_calls == (
-        4001 if ending in {"parked", "newer-incident"} else 4000
-    )
+    assert stale_events == []
+    assert backend.status_calls == backend.heartbeat_calls == 4001
     assert delays == [1.0] * 4000
     assert len(claim_heartbeats) == 4000
     assert lifecycle == ["cancel", "cleanup"]
@@ -8952,19 +8954,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         pending_failure_alerts,
     )
 
-    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
-    if ending == "parked":
-        assert incident["active"] is False
-        assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
-    elif ending == "newer-incident":
-        assert incident["active"] is True
-        assert incident["terminal_error"] == "newer terminal factory failure"
-        assert incident["attempt"] == 2
-    else:
-        assert incident["active"] is True
-        blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
-        assert blocked == {700}
-        assert len(alerts) == 1
+    assert load_failure_state(dispatch_failure_state_dir(tmp_path)).get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence"])
@@ -9680,6 +9671,7 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
 )
 @pytest.mark.parametrize("local_compute", [False, True], ids=["fake", "local"])
+@pytest.mark.parametrize("idle_park", [False, True], ids=["operator-park", "idle-park"])
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9687,6 +9679,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     dead_lock: bool,
     action: str | None,
     local_compute: bool,
+    idle_park: bool,
 ) -> None:
     from mimir.worklink.compute import LocalSubprocessComputeBackend
     from mimir.worklink.run_state import process_start_ticks
@@ -9826,7 +9819,7 @@ print(json.dumps([str(path) for path in pruned]))
             assert spec.local_argv is not None
             session_index = tuple(spec.local_argv).index("--session")
             assert spec.local_argv[session_index + 1] == "session-1"
-            assert spec.local_argv[-1].split()[-1] == "700"
+            assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -9892,6 +9885,10 @@ print(json.dumps([str(path) for path in pruned]))
         status=status("needs-human", lock),
         observed_at="2026-08-18T12:00:00+00:00",
         controller_phase="parked",
+        controller_error=(
+            "factory driver idle: no progress since 2026-08-18T11:45:00+00:00"
+            if idle_park else None
+        ),
     )
     claim = ClaimRecord(
         700, attempt, "agent", datetime.now(UTC),

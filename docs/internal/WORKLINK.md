@@ -159,8 +159,16 @@ executor together by rebuilding the executor image before enabling this layout.
 - **Concurrency and liveness**: Same-issue exclusivity comes only from the atomic
   Worklink claim. `MIMIR_FACTORY_MAX_CONCURRENT` is a separate factory cap with
   default/fallback `1`; leaf concurrency remains `2`. The 12-hour timeout is a
-  process liveness backstop. The 900-second stale threshold emits diagnostics
-  only and never dispatches, steals, cancels, or deletes work.
+  process liveness backstop. The 900-second stale threshold is diagnostic only:
+  a healthy model generation may be silent longer than that. The separate idle
+  backstop is at least two hours (or eight stale windows, whichever is longer).
+  A running manifest with no transition, readable sandbox progress, or live
+  stderr transcript growth for that entire interval is parked if the OpenCode
+  process is still alive. This is a conservative timeout, not proof of an exited
+  agent loop. Worklink cancels and verifies the process group before recording
+  `needs-human`, then retains the same attempt for recovery. A dead process
+  still follows the existing failure path; ongoing transcript writes keep the
+  driver active.
 - **Recovery**: A parked or interrupted run retains its sandbox. The parked report
   includes the `park_snapshot` path when the factory published a complete current
   diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
@@ -169,7 +177,14 @@ executor together by rebuilding the executor image before enabling this layout.
   the retained identities, including resolving a factory clone through its local
   lease checkout, reads status, obtains a run-ID-first lock only when justified,
   rereads owner/history, and resumes and relaunches OpenCode with one session
-  identity. `terminal_result` is opaque context; its `reason` never selects an
+  identity. Fresh and recovery launches preserve the bare run-id `/feature`
+  request after the leading option prefix; controller context must not be appended
+  because the adapter uses those bytes for run selection and story content.
+  **Unresolved (#1952):** verified resumed-driver context still needs an
+  out-of-band adapter mechanism or a fresh-session lock handoff. Reusing the
+  parked session alone does not solve that context ambiguity. Idleness parks
+  through the same `needs-human` recovery path and does not consume an attempt.
+  `terminal_result` is opaque context; its `reason` never selects an
   action. `needs-human` and lock-refusal exits are parked and resumable, not
   terminal. A relaunch never archives, replaces, or removes a retained run.
 - **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
@@ -916,7 +931,7 @@ closed when `WORKLINK_REPO` is absent.
 ### Parking and resuming a factory run by hand
 
 The controller parks a run itself when its budget is nearly spent
-(`park_for_budget`), and that is the path to prefer. `scripts/factory_park.py`
+(`park_for_reason`), and that is the path to prefer. `scripts/factory_park.py`
 and `scripts/factory_resume.py` cover the case where an operator needs to park
 sooner — to preserve an approved spec, an approved decomposition and slice
 reviews that a budget kill would otherwise sweep. Resume recomputes the deadline
