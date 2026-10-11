@@ -312,6 +312,35 @@ _HOST_ONLY_ENV = frozenset(
 # Inheriting them is not merely noisy -- ``STATE_DIR`` is where
 # ``_record_run_failure`` writes dispatch failures, so a test running under an
 # inherited value writes into the live poller store.
+# Git reads these before any repository config. A test that creates commits must
+# own its author, committer and repository, so none of them may be inherited.
+_INHERITED_GIT_ENV = frozenset({
+    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+})
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _clear_inherited_git_environment():
+    """Pop inherited Git identity and repository redirection for the session.
+
+    A feature-factory run exports ``GIT_AUTHOR_*`` and ``GIT_COMMITTER_*`` (the
+    dispatch identity) to everything it launches, including repository
+    verification. Fixture commits then carry that identity instead of the
+    repository's configured ``user.name``, and lease attestation correctly
+    refuses them: six ``tests/test_lease_source_labels.py`` cases failed only
+    inside factory run ``chainlink-1947``, while passing in CI and locally.
+    Inherited ``GIT_DIR``/``GIT_WORK_TREE`` can likewise redirect a fixture's Git
+    commands away from the repository it owns (chainlink #1945). Tests that
+    exercise these variables set them explicitly with ``monkeypatch``.
+    """
+    saved = {name: os.environ.pop(name) for name in _INHERITED_GIT_ENV if name in os.environ}
+    yield
+    os.environ.update(saved)
+
+
 _POLLER_INJECTED_ENV = frozenset({"STATE_DIR", "POLLER_NAME", "MIMIR_HOME"})
 
 
