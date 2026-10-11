@@ -7,6 +7,8 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 import inspect
+import hashlib
+from pathlib import Path
 
 import pytest
 
@@ -22,8 +24,14 @@ from mimir.worklink.dispatch_failures import (
     record_failure,
 )
 from mimir.worklink.orchestrator import IssueContext, WorklinkRunner
-from tests.test_worklink_orchestrator import _factory_lifecycle_record, _factory_lifecycle_status, cp
-from mimir.worklink.compute import LaunchHandle
+from tests.test_worklink_orchestrator import (
+    _factory_lifecycle_record,
+    _factory_lifecycle_status,
+    _run_factory_preflight_case,
+    cp,
+)
+from mimir.worklink.compute import ComputeResult, LaunchHandle
+from mimir.worklink.poller_hooks import report_live_delivery_receipts
 
 
 ENDING_NOTICES = {
@@ -151,3 +159,122 @@ def test_factory_stop_ledger_failure_preserves_result_and_labels(tmp_path, monke
     assert len(transitions) == 1 and transitions[0][1]["status"] == "blocked"
     assert transitions[0][1]["review_ready"] is False
     assert not load_failure_state(dispatch_failure_state_dir(tmp_path)).get("factory_transitions")
+
+
+@pytest.mark.parametrize("autonomous", [False, True])
+@pytest.mark.parametrize("ending", ["needs-human", "blocked", "partial"])
+def test_real_factory_stop_is_live_receipt_for_manual_and_autonomous_runs(
+    tmp_path, monkeypatch, autonomous, ending,
+):
+    """Use the public epic path, real supervisor/ending/writer, and receipt reader."""
+    original_supervise = WorklinkRunner._supervise_factory_070
+    lifecycle = []
+
+    async def supervise_actual(_supervisor, **kwargs):
+        current = kwargs["factory_record"]
+        status = replace(
+            _factory_lifecycle_status(Path(current.sandbox), status=ending),
+            run_id=current.run_id, branch=current.branch,
+            terminal_result={"reason": f"{ending} needs a decision"},
+        )
+        stopped = asyncio.Event()
+
+        class Compute:
+            async def wait(self, handle, timeout_s):
+                await stopped.wait()
+                return ComputeResult(-15, "", "cancelled", handle=handle)
+
+            async def cancel(self, handle):
+                lifecycle.append("cancel")
+                stopped.set()
+
+            async def cleanup(self, handle):
+                lifecycle.append("cleanup")
+
+            def job_alive(self, handle):
+                return not stopped.is_set()
+
+        class Backend:
+            poll_interval_s = 1
+
+            def status(self, *args, **kwargs):
+                return status
+
+            def heartbeat(self, *args, **kwargs):
+                pass
+
+        kwargs.update(backend=Backend(), compute=Compute())
+        return await original_supervise(_supervisor, **kwargs)
+
+    result, launched, _, _ = _run_factory_preflight_case(
+        tmp_path, monkeypatch, credentials={"GITHUB_TOKEN": "github-token"},
+        autonomous=autonomous, outcome=ending, terminal=supervise_actual,
+        sync_entrypoint=True,
+    )
+    assert result.status == ending
+    assert len(launched) == 1
+    assert lifecycle == ["cancel", "cleanup"]
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    entries = list(load_failure_state(state_dir)["factory_transitions"].values())
+    stop_kind = {
+        "needs-human": "factory_needs_human",
+        "blocked": "factory_blocked",
+        "partial": "factory_partial",
+    }[ending]
+    # Stop notices intentionally include operator-launched (non-autonomous) runs;
+    # only the start/success informational milestones have the autonomous gate.
+    assert [entry["kind"] for entry in entries] == (
+        (["factory_start"] if autonomous else []) + [stop_kind]
+    )
+    # Keep an unrelated live incident in the same ledger: a malformed stop
+    # would abort the whole reader and lose both this and all milestones.
+    incident = record_failure(
+        state_dir, issue_id=701, attempt=1, exit_status=1,
+        error="unrelated live failure", log_path=None, run_id="701",
+    )
+    incident_key = (
+        f"worklink-run-failure:701:{incident['signature']}:{incident['occurrence_id']}"
+    )
+    expected_live = {
+        hashlib.sha256(key.encode()).hexdigest()
+        for key in [incident_key, *(entry["delivery_key"] for entry in entries)]
+    }
+    reported = []
+    report_live_delivery_receipts(state_dir, tmp_path, lambda live: reported.append(set(live)))
+    assert reported == [expected_live]
+    assert entries[-1]["status"] == ending
+    assert isinstance(entries[-1]["sandbox"], str)
+    assert isinstance(entries[-1]["record_path"], str)
+
+
+@pytest.mark.parametrize("kind", sorted(FACTORY_STOP_KINDS))
+@pytest.mark.parametrize("projection", ["missing_record", "missing_status", "stale_status"])
+def test_stop_writer_normalizes_optional_or_stale_projection(tmp_path, kind, projection):
+    record = _factory_lifecycle_record(
+        tmp_path / "sandbox", LaunchHandle("local_subprocess", "123", 456),
+    )
+    # FactoryRunRecord requires an absolute sandbox; the no-record fallback
+    # still needs a string rather than None in the delivery ledger.
+    if projection == "missing_record":
+        record = None
+    elif projection == "stale_status":
+        record = record.observed(
+            _factory_lifecycle_status(tmp_path / "sandbox", status="running"),
+            datetime.now(UTC).isoformat(),
+        )
+    orchestrator._record_factory_milestone(
+        tmp_path, kind=kind, issue=IssueContext(700, "epic", "build", set()),
+        run_id="700", attempt=1, factory_record=record,
+    )
+    state_dir = dispatch_failure_state_dir(tmp_path)
+    entry, = load_failure_state(state_dir)["factory_transitions"].values()
+    assert entry["status"] == {
+        "factory_needs_human": "needs-human",
+        "factory_blocked": "blocked",
+        "factory_partial": "partial",
+    }[kind]
+    assert entry["sandbox"] == ("" if record is None else record.sandbox)
+    assert isinstance(entry["record_path"], str)
+    reported = []
+    report_live_delivery_receipts(state_dir, tmp_path, lambda live: reported.append(set(live)))
+    assert reported == [{hashlib.sha256(entry["delivery_key"].encode()).hexdigest()}]

@@ -5776,25 +5776,31 @@ def _record_factory_milestone(
 
     try:
         stop_fields: dict[str, Any] = {}
-        if factory_record is not None:
+        stop_status = {
+            "factory_needs_human": "needs-human",
+            "factory_blocked": "blocked",
+            "factory_partial": "partial",
+        }.get(kind)
+        if stop_status is not None:
             from .factory_state import factory_record_path
 
-            status = factory_record.status
+            status = factory_record.status if factory_record is not None else None
             terminal_result = status.terminal_result if status is not None else None
             factory_reason = terminal_result.get("reason") if terminal_result else None
+            controller_error = factory_record.controller_error if factory_record is not None else None
             stop_fields = {
-                "status": "needs-human" if kind == "factory_needs_human" else status.status,
+                # The delivery kind, not an optional/stale factory projection,
+                # defines the receipt validator's status contract.
+                "status": stop_status,
                 "reason": (
                     factory_reason
                     if isinstance(factory_reason, str) and factory_reason.strip()
                     else None
-                ) or factory_record.controller_error or (
-                    f"factory status: {status.status if status is not None else 'needs-human'}"
-                ),
+                ) or controller_error or f"factory status: {stop_status}",
                 "terminal_result": terminal_result,
                 "record_path": str(factory_record_path(home, run_id)),
                 "park_snapshot": status.park_snapshot if status is not None else None,
-                "sandbox": factory_record.sandbox,
+                "sandbox": (factory_record.sandbox or "") if factory_record is not None else "",
             }
         record_factory_transition(
             dispatch_failure_state_dir(home), kind=kind,

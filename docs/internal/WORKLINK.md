@@ -205,7 +205,9 @@ executor together by rebuilding the executor image before enabling this layout.
   terminal result for the same attempt gets a new delivery key; a re-scan does
   not re-prompt. The agent reads the preserved record and requests an operator
   decision via `operator_alert` when needed; it does not resume the run or edit
-  the issue. These prompts complement the independent operator park alerts.
+  the issue. Stop notices are recorded for both autonomous and operator-launched
+  runs; unlike `factory_start` and `factory_success`, they are not gated by
+  `autonomous`. These prompts complement the independent operator park alerts.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and
