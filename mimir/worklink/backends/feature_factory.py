@@ -680,6 +680,7 @@ class FeatureFactoryBackend:
         test_command: str,
         session: str | None = None,
         run_id: str | None = None,
+        recovery_next: str | None = None,
     ) -> WorkSpec:
         try:
             resolution = resolve_worklink_opencode_invocation(order.env)
@@ -704,6 +705,7 @@ class FeatureFactoryBackend:
             run_id,
             invocation.model,
             session=session,
+            recovery_next=recovery_next,
         )
         return WorkSpec(
             issue_id=order.issue_id,
@@ -737,11 +739,16 @@ class FeatureFactoryBackend:
         model: str,
         *,
         session: str | None = None,
+        recovery_next: str | None = None,
     ) -> tuple[str, ...]:
         if _RUN_ID.fullmatch(run_id) is None:
             raise FactoryContractError("factory launch run_id has an invalid shape")
         if session is not None and (not session.strip() or "\x00" in session):
             raise FactoryContractError("factory launch session is invalid")
+        if recovery_next is not None and (
+            session is None or not recovery_next.strip() or "\x00" in recovery_next
+        ):
+            raise FactoryContractError("factory recovery next action is invalid")
         retries = _factory_max_retries()
         # The budget is frozen into run state by ``factory init``, so record what
         # this launch actually resolved rather than what the environment intended.
@@ -749,6 +756,13 @@ class FeatureFactoryBackend:
         # feature-factory 0.7.5 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
         session_args = ("--session", session) if session is not None else ()
+        directive = (
+            "\n\nRESUMED DRIVER: The operator resumed factory run "
+            f"{run_id}. This OpenCode session holds the factory lock. "
+            f"Continue from status.next ({recovery_next}); do not re-check driver ownership "
+            "or wait for another driver."
+            if recovery_next is not None else ""
+        )
         return (
             "opencode",
             "run",
@@ -762,7 +776,7 @@ class FeatureFactoryBackend:
             str(operator_checkout),
             "--command",
             "feature",
-            f" --autonomous --max-retries {retries} {run_id}",
+            f" --autonomous --max-retries {retries} {run_id}{directive}",
         )
 
     def _control(

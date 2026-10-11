@@ -1138,6 +1138,20 @@ def test_recovery_launch_binds_opencode_to_factory_session(
     assert argv[argv.index("--session") + 1] == "session-1"
 
 
+@pytest.mark.parametrize(
+    ("session", "recovery_next"),
+    [(None, "implementation"), ("session-1", " "), ("session-1", "step\x00injected")],
+)
+def test_recovery_directive_requires_a_bound_session_and_valid_next(
+    tmp_path: Path, session: str | None, recovery_next: str,
+) -> None:
+    with pytest.raises(FactoryContractError, match="factory recovery next action is invalid"):
+        FeatureFactoryBackend.opencode_argv(
+            tmp_path, "chainlink-1551", "openai/model",
+            session=session, recovery_next=recovery_next,
+        )
+
+
 @pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
 def test_recovery_launch_uses_retained_legacy_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
@@ -1157,7 +1171,7 @@ def test_recovery_launch_uses_retained_legacy_run_id(
         run_id="1551",
     )
 
-    assert (spec.local_argv or ())[-1].split()[-1] == "1551"
+    assert (spec.local_argv or ())[-1] == " --autonomous --max-retries 5 1551"
 
 
 def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:
