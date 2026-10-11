@@ -223,9 +223,23 @@ async def test_remediation_publication_decision_table(monkeypatch, code, scoped,
         assert "commit, push" not in guidance
 
 
+def _fixture_git_env() -> dict[str, str]:
+    # A test's source, origin and lease must not follow the runner's Git
+    # redirections (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_COUNT, etc.).
+    return {
+        **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "maintenance.auto",
+        "GIT_CONFIG_VALUE_0": "false",
+    }
+
+
 def _git(cwd: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True,
+        env=_fixture_git_env(),
     )
     return result.stdout.strip()
 
@@ -234,12 +248,14 @@ def _repo_scope_and_state(
     tmp_path: Path, *, event_type: str = "pr_changes_requested_stale",
 ) -> tuple[Path, Path, RepoPRActionScope, RepoReviewState]:
     origin = tmp_path / "origin.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    git_env = _fixture_git_env()
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=git_env)
     source = tmp_path / "source"
-    subprocess.run(["git", "clone", "-q", str(origin), str(source)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True, env=git_env)
+    _git(source, "remote", "add", "origin", str(origin.resolve()))
     _git(source, "config", "user.name", "test")
     _git(source, "config", "user.email", "test@example.com")
-    _git(source, "checkout", "-q", "-b", "main")
+    _git(source, "config", "commit.gpgsign", "false")
     (source / "tracked.txt").write_text("base\n", encoding="utf-8")
     _git(source, "add", "tracked.txt")
     _git(source, "commit", "-q", "-m", "base")
@@ -250,6 +266,8 @@ def _repo_scope_and_state(
     _git(source, "commit", "-qam", "pull request")
     head = _git(source, "rev-parse", "HEAD")
     _git(source, "push", "-q", "origin", "HEAD:worklink/7")
+    assert _git(origin, "rev-parse", "--verify", "refs/heads/main") == base
+    assert _git(origin, "rev-parse", "--verify", "refs/heads/worklink/7") == head
     scope = RepoPRActionScope(
         provenance="poller_payload",
         canonical_repo="owner/repo",
@@ -269,7 +287,27 @@ def _repo_scope_and_state(
     leases = tmp_path / "leases"
     leases.mkdir()
     state = RepoReviewState(scope)
-    create_pr_checkout_lease(scope, owner="mimir-bot", lease_root=leases, review_state=state)
+    create_pr_checkout_lease(
+        scope, owner="mimir-bot", lease_root=leases, review_state=state,
+        runner=lambda args: subprocess.run(
+            args, capture_output=True, text=True, check=False, env=git_env,
+        ),
+    )
+    lease = state.checkout_lease
+    if lease is None:
+        pytest.fail("PR checkout fixture did not attach a lease")
+    checkout_head = subprocess.run(
+        ["git", "-C", str(lease.path), "rev-parse", "--verify", "HEAD^{commit}"],
+        capture_output=True, text=True, check=False, env=git_env,
+    )
+    if checkout_head.returncode != 0:
+        pytest.fail(f"PR checkout fixture cloned an empty lease: {checkout_head.stderr.strip()}")
+    if checkout_head.stdout.strip() != scope.observed_head_sha or lease.head_sha != scope.observed_head_sha:
+        pytest.fail(
+            "PR checkout fixture head differs from scoped PR head: "
+            f"checkout={checkout_head.stdout.strip()}, lease={lease.head_sha}, "
+            f"scope={scope.observed_head_sha}"
+        )
     return origin, source, scope, state
 
 
@@ -295,6 +333,26 @@ def _lineage_turn(scope, state, *, tainted=False):
         enforcement_enabled=not tainted, ifc_labels=labels, ifc_state=ifc,
         repo_pr_action_scope=scope, repo_review_state=state,
     )
+
+
+def test_repo_scope_fixture_ignores_inherited_git_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    foreign = tmp_path / "foreign.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(foreign)],
+        check=True, env=_fixture_git_env(),
+    )
+    monkeypatch.setenv("GIT_DIR", str(foreign))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+
+    origin, _source, scope, state = _repo_scope_and_state(tmp_path)
+    assert _git(origin, "rev-parse", "--verify", scope.destination_ref) == scope.observed_head_sha
+    assert _git(state.checkout_lease.path, "rev-parse", "HEAD") == scope.observed_head_sha
+    assert not (foreign / "refs" / "heads" / "worklink" / "7").exists()
 
 
 def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(tmp_path: Path) -> None:
