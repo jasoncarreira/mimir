@@ -172,6 +172,16 @@ executor together by rebuilding the executor image before enabling this layout.
   identity. `terminal_result` is opaque context; its `reason` never selects an
   action. `needs-human` and lock-refusal exits are parked and resumable, not
   terminal. A relaunch never archives, replaces, or removes a retained run.
+- **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
+  independently of the optional TTL reaper. A `parked` / `needs-human` record
+  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` and, when
+  `NTFY_TOPIC` is set, a priority-4 ntfy push. The notice names the Chainlink
+  issue, run and attempt, and points to its `WORKLINK_BLOCKED` comment or
+  `mimir worklink status <id>` for the decision; it never quotes the factory
+  reason. `<home>/state/worklink/factory-park-alerts.json` remembers delivered
+  sinks per run/attempt/terminal-result identity across server restarts. A new
+  park alerts again; with neither destination configured, the server records
+  one `worklink_factory_park_unrouted` event per park. No agent turn is started.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and
