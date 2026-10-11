@@ -201,6 +201,17 @@ executor together by rebuilding the executor image before enabling this layout.
   sinks per run/attempt/terminal-result identity across server restarts. A new
   park alerts again; with neither destination configured, the server records
   one `worklink_factory_park_unrouted` event per park. No agent turn is started.
+- **Agent stop notices**: Factory `needs-human` parks (including budget, idle and
+  lock refusal), `blocked`, and `partial` endings also write durable milestones
+  to the Worklink dispatch ledger. The ready-queue poller delivers each as an
+  acknowledged prompt with the bounded terminal reason, retained factory record,
+  park snapshot, sandbox, and `WORKLINK_BLOCKED` comment pointer. A distinct
+  terminal result for the same attempt gets a new delivery key; a re-scan does
+  not re-prompt. The agent reads the preserved record and requests an operator
+  decision via `operator_alert` when needed; it does not resume the run or edit
+  the issue. Stop notices are recorded for both autonomous and operator-launched
+  runs; unlike `factory_start` and `factory_success`, they are not gated by
+  `autonomous`. These prompts complement the independent operator park alerts.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and

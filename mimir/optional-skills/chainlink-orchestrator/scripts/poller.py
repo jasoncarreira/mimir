@@ -386,7 +386,7 @@ def _dispatch(
 
 
 def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> None:
-    """Offer informational milestones until the framework acknowledges them."""
+    """Offer factory milestones until the framework acknowledges them."""
     with failure_state_transaction(state_dir) as state:
         for delivery_key, entry in state.get("factory_transitions", {}).items():
             if entry["notified"]:
@@ -396,13 +396,32 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
                 continue
             if tick_budget.hard_exhausted():
                 return
-            milestone = "started" if entry["kind"] == "factory_start" else "succeeded"
-            detail = (
-                "A build slot is now occupied by this epic."
-                if entry["kind"] == "factory_start" else "The epic completed successfully."
-            )
-            _emit({
-                "prompt": (
+            if entry["kind"] in {"factory_needs_human", "factory_blocked", "factory_partial"}:
+                reason = entry.get("reason") or "(reason unavailable; inspect retained record)"
+                if len(reason) > 2000:
+                    reason = reason[:2000] + " [reason truncated; read retained record]"
+                prompt = (
+                    f"Worklink factory stopped for issue {entry['issue_id']}: "
+                    f"{entry.get('issue_title') or '(title unavailable)'}\n"
+                    f"Kind: {entry['kind']}\nRun: {entry['run_id']}\n"
+                    f"Attempt: {entry['attempt']}\nStatus: {entry['status']}\n"
+                    f"Reason: {reason}\n"
+                    f"Retained factory record: {entry['record_path'] or '(unavailable)'}\n"
+                    f"Park snapshot: {entry['park_snapshot'] or '(none published)'}\n"
+                    f"Sandbox: {entry['sandbox'] or '(unavailable)'}\n"
+                    f"WORKLINK_BLOCKED comment: Chainlink issue #{entry['issue_id']}\n\n"
+                    "Read the WORKLINK_BLOCKED comment and the retained record. "
+                    "If the run asks for an operator decision or needs a human, call operator_alert "
+                    "with the issue, run, attempt, the exact decision requested, and the preserved-work "
+                    "pointers. Do not resume, re-arm, steal locks, start fresh work, or edit the issue yourself."
+                )
+            else:
+                milestone = "started" if entry["kind"] == "factory_start" else "succeeded"
+                detail = (
+                    "A build slot is now occupied by this epic."
+                    if entry["kind"] == "factory_start" else "The epic completed successfully."
+                )
+                prompt = (
                     f"Worklink factory {milestone} for issue {entry['issue_id']}"
                     f": {entry.get('issue_title') or '(title unavailable)'}. "
                     f"{detail} Informational status update only.\n\n"
@@ -410,7 +429,9 @@ def _deliver_factory_transitions(state_dir: Path, tick_budget: TickBudget) -> No
                     f"Run: {entry['run_id']}\n"
                     f"Attempt: {entry['attempt']}\n"
                     f"PR: {entry['pr_url'] or '(none)'}"
-                ),
+                )
+            _emit({
+                "prompt": prompt,
                 "source_id": delivery_key,
                 "delivery_key": delivery_key,
                 "kind": entry["kind"],
