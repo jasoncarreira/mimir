@@ -3012,7 +3012,7 @@ class WorklinkRunner:
             or _opaque_json_bytes(resumed.terminal_result) != historical_result
         ):
             raise WorklinkError("factory resume did not return an owned running status")
-        recovery_next = resumed.require_recovery_next()
+        resumed.require_recovery_next()
         _verify_factory_recovery_binding(
             runner=self,
             issue=issue,
@@ -3047,7 +3047,6 @@ class WorklinkRunner:
             test_command=test_cmd,
             session=session,
             run_id=retained.run_id,
-            recovery_next=recovery_next,
         )
         if isinstance(compute, LocalSubprocessComputeBackend):
             # Authorization stays at the original inner checkout; --dir still
@@ -3117,6 +3116,10 @@ class WorklinkRunner:
         startup_timeout = _factory_startup_status_timeout_s()
         startup_deadline = min(deadline, loop.time() + startup_timeout)
         stale_after = _epic_stale_heartbeat_s()
+        # Silence during a model generation is not proof that the loop exited.
+        # Keep the short stale diagnostic distinct from the conservative idle
+        # backstop (at least two hours, and eight diagnostic windows).
+        idle_after = max(7200.0, 8 * stale_after)
         last_status: FactoryStatus | None = None
         last_change = loop.time()
         last_change_at = datetime.now(UTC).isoformat()
@@ -3418,11 +3421,19 @@ class WorklinkRunner:
                                     lock=status.lock,
                                     process_alive=compute.job_alive(handle),
                                 )
-                            if status.status == "running" and compute.job_alive(handle):
+                            if (
+                                status.status == "running"
+                                and now - last_change >= idle_after
+                                and compute.job_alive(handle)
+                            ):
                                 reason = f"factory driver idle: no progress since {last_change_at}"
                                 end_stale_episode("driver_idle")
                                 return await park_for_reason(status, reason)
-                    if stale_failure is None and dead_windows >= 2:
+                    if (
+                        stale_failure is None
+                        and dead_windows >= 2
+                        and not compute.job_alive(handle)
+                    ):
                         try:
                             incident = incident_owner.record(
                                 producer="factory_stall",

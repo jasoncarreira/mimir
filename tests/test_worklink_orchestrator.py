@@ -8111,9 +8111,9 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         factory_clock.now += delay
         await asyncio.sleep(0)
 
-    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 100.0 if idle else 20.0)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10000.0 if idle else 20.0)
     if idle:
-        monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 10.0)
+        monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     def run() -> WorklinkRunResult:
         return asyncio.run(
@@ -8146,7 +8146,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert lifecycle == ["cancel", "terminal", "cleanup"]
     reason = terminal_reasons[0]
     if idle:
-        assert terminal_times == [10.0]
+        assert terminal_times == [7200.0]
         assert reason.startswith("factory driver idle: no progress since ")
         assert datetime.fromisoformat(
             reason.removeprefix("factory driver idle: no progress since ")
@@ -8483,23 +8483,52 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
-def test_factory_alive_without_activity_parks_at_stale_threshold(
+@pytest.mark.parametrize("stale_after", [900.0, 1800.0])
+def test_factory_alive_without_activity_parks_at_separate_idle_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
+    stale_after: float,
 ) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: stale_after)
+    idle_after = max(7200.0, 8 * stale_after)
     state, events, result = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+        tmp_path, monkeypatch, factory_clock, stop_at=idle_after + 900
     )
     assert result is not None and result.status == "needs-human"
     assert result.reason is not None and result.reason.startswith(
         "factory driver idle: no progress since "
     )
-    assert factory_clock.now == 900
+    assert factory_clock.now == idle_after
     assert state.get("issues", {}).get("700") is None
     assert [name for name, _ in events if "stale_status" in name] == [
         "worklink_factory_stale_status", "worklink_factory_stale_status_ended"
     ]
+
+
+def test_factory_long_silent_generation_is_not_parked_or_reported_as_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+) -> None:
+    from mimir.worklink.dispatch_failures import (
+        dispatch_failure_state_dir,
+        pending_failure_alerts,
+    )
+
+    state, events, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=3660
+    )
+    # Four diagnostic windows without a transcript write or an exit marker is
+    # still compatible with a healthy long model generation.
+    assert factory_clock.now == 3660
+    assert result is None
+    assert state.get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    stale = [name for name, _ in events if "stale_status" in name]
+    assert stale == ["worklink_factory_stale_status", "worklink_factory_stale_status_ended"]
 
 
 def test_factory_logging_without_productivity_runs_to_its_budget(
@@ -8529,7 +8558,7 @@ def test_factory_unreadable_work_snapshot_does_not_prevent_idle_park(
 
     monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda _sandbox: None)
     state, _, result = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+        tmp_path, monkeypatch, factory_clock, stop_at=8100
     )
     assert result is not None and result.status == "needs-human"
     assert state.get("issues", {}).get("700") is None
@@ -9790,13 +9819,7 @@ print(json.dumps([str(path) for path in pruned]))
             assert spec.local_argv is not None
             session_index = tuple(spec.local_argv).index("--session")
             assert spec.local_argv[session_index + 1] == "session-1"
-            assert spec.local_argv[-1] == (
-                " --autonomous --max-retries 5 700\n\n"
-                "RESUMED DRIVER: The operator resumed factory run 700. "
-                "This OpenCode session holds the factory lock. "
-                "Continue from status.next (implementation); do not re-check driver ownership "
-                "or wait for another driver."
-            )
+            assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:

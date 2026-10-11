@@ -1138,18 +1138,18 @@ def test_recovery_launch_binds_opencode_to_factory_session(
     assert argv[argv.index("--session") + 1] == "session-1"
 
 
-@pytest.mark.parametrize(
-    ("session", "recovery_next"),
-    [(None, "implementation"), ("session-1", " "), ("session-1", "step\x00injected")],
-)
-def test_recovery_directive_requires_a_bound_session_and_valid_next(
-    tmp_path: Path, session: str | None, recovery_next: str,
+@pytest.mark.parametrize("session", [None, "session-1"])
+@pytest.mark.parametrize("run_id", ["chainlink-1947", "1947"])
+def test_factory_request_bytes_are_the_bare_run_id_after_leading_options(
+    tmp_path: Path, session: str | None, run_id: str,
 ) -> None:
-    with pytest.raises(FactoryContractError, match="factory recovery next action is invalid"):
-        FeatureFactoryBackend.opencode_argv(
-            tmp_path, "chainlink-1551", "openai/model",
-            session=session, recovery_next=recovery_next,
-        )
+    argv = FeatureFactoryBackend.opencode_argv(
+        tmp_path, run_id, "openai/model", session=session,
+    )
+    # This pins the byte-level adapter boundary; it is NOT an execution of
+    # the external adapter's parser or a proof of resumed-driver context.
+    assert argv[-3:-1] == ("--command", "feature")
+    assert argv[-1] == f" --autonomous --max-retries 5 {run_id}"
 
 
 @pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
