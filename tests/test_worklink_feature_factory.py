@@ -1033,6 +1033,9 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         sandbox=sandbox,
         launcher=entrypoint,
     )
+    backend.lock(
+        "1551", "release", session="session-1", sandbox=sandbox, launcher=entrypoint,
+    )
     backend.terminal(
         "1551",
         "needs-human",
@@ -1046,6 +1049,7 @@ def test_controls_are_absolute_run_id_first_and_resume_reads_status(tmp_path: Pa
         ("status", "1551", "--repo", str(sandbox), "--json"),
         ("heartbeat", "1551", "--session", "session-1", "--repo", str(sandbox)),
         ("lock", "1551", "steal", "--session", "session-1", "--repo", str(sandbox)),
+        ("lock", "1551", "release", "--session", "session-1", "--repo", str(sandbox)),
         (
             "terminal",
             "1551",

@@ -120,9 +120,9 @@ executor together by rebuilding the executor image before enabling this layout.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
   Worklink admits the launcher only after package/adapter 0.10.14 verification and
   all 16 nonmutating structural command probes. Status is read with `status
-  <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
-  session; lock actions use `lock <run-id> <claim|steal|release> --session
-  <session> --repo <sandbox>`.
+  <run-id> --repo <sandbox> --json`; resume uses the retained session, while
+  heartbeat uses the newly claimed session after recovery; lock actions use
+  `lock <run-id> <claim|steal|release> --session <session> --repo <sandbox>`.
 - **Status contract**: Factory status responses are bounded whole JSON payloads
   with required, typed known fields; additive top-level fields are ignored.
   `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null;
@@ -168,8 +168,14 @@ executor together by rebuilding the executor image before enabling this layout.
   The snapshot is not resumable: recovery uses the retained sandbox manifest. Recovery binds
   the retained identities, including resolving a factory clone through its local
   lease checkout, reads status, obtains a run-ID-first lock only when justified,
-  rereads owner/history, and resumes and relaunches OpenCode with one session
-  identity. `terminal_result` is opaque context; its `reason` never selects an
+  rereads owner/history, and resumes with the retained session. It then releases
+  that session's lock, verifies qualified status reports an absent, ownerless
+  lock, and launches OpenCode in a fresh session with the unchanged bare run-ID
+  request. The adapter claims the lock through Step 0 and continues from
+  `status.next`; Worklink persists the new owner on its first fresh-lock status
+  and heartbeats that session. A failed or unverifiable release parks the run
+  without launching, and an absent lock beyond the startup deadline fails
+  supervision. `terminal_result` is opaque context; its `reason` never selects an
   action. `needs-human` and lock-refusal exits are parked and resumable, not
   terminal. A relaunch never archives, replaces, or removes a retained run.
 - **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
@@ -999,7 +1005,11 @@ scripts/factory_resume.py --run-id chainlink-1783 \
 mimir's recovery path performs the whole transition as one operation — it
 requires the retained process to be verifiably dead, steals or claims the
 session lock using the *recorded* session, resumes, verifies the result is owned
-and running, validates the recovery binding, relaunches and enters supervision.
+and running with a recovery `next`, releases the retained lock and verifies it
+is absent and ownerless, validates the recovery binding, relaunches in a fresh
+OpenCode session and enters supervision. The adapter claims through Step 0
+from `status.next`, and supervision persists the new lock owner for subsequent
+heartbeats and recovery.
 Unparking from outside spends the `needs-human` transition that path is gated on,
 after which it refuses the run with `factory resume requires current status
 needs-human` and the attempt is lost. So the script reports which recovery
