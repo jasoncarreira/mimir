@@ -7,6 +7,26 @@ automated contributor needs and a human reading CONTRIBUTING.md would not.
 Everything below is recorded because it has already cost a run, a false diagnosis,
 or a bad merge.
 
+## UI design language
+
+Cultivate's UI (the `plugins/cultivate/` frontend bundle, its theme and its pages) follows
+[brand/design.md](./brand/design.md), the SquashMerge design language. Read it before any
+Cultivate UI work. Core Mimir's UI keeps its existing skins and conventions; do not restyle
+core to the brand unless an issue asks for it.
+
+Brand assets in `brand/` are not under the MIT or BSL licenses (see `brand/LICENSE`).
+Use them unmodified: never recolour, trace, crop or retype the logos or wordmarks.
+
+## UI design language
+
+Cultivate's UI (the `plugins/cultivate/` frontend bundle, its theme and its pages) follows
+[brand/design.md](./brand/design.md), the SquashMerge design language. Read it before any
+Cultivate UI work. Core Mimir's UI keeps its existing skins and conventions; do not restyle
+core to the brand unless an issue asks for it.
+
+Brand assets in `brand/` are not under the MIT or BSL licenses (see `brand/LICENSE`).
+Use them unmodified: never recolour, trace, crop or retype the logos or wordmarks.
+
 ## Evidence
 
 **Run both suites, and require both green.** A scoped run is not evidence:

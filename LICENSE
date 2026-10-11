@@ -1,3 +1,13 @@
+This repository is licensed under the MIT License below, except for:
+
+- directories that contain their own LICENSE file, such as plugins/cultivate/,
+  which are licensed under the terms in that file; and
+- the brand/ directory and copies of its files elsewhere in this repository or
+  in packages built from it, which are not licensed under the MIT License. See
+  brand/LICENSE.
+
+-----------------------------------------------------------------------------
+
 MIT License
 
 Copyright (c) 2026 Jason Carreira

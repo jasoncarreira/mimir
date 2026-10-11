@@ -10,11 +10,13 @@ Licensor:             Jason Carreira
 Licensed Work:        mimir-cultivate, the mimir coding plugin: the contents
                       of the plugins/cultivate/ directory of the mimir
                       repository, distributed as the mimir-cultivate
-                      package. The
-                      Licensed Work is (c) 2026 Jason Carreira. The
-                      Licensed Work excludes third-party material that
-                      carries its own license, which remains under its
-                      original terms.
+                      package. The Licensed Work is (c) 2026 Jason
+                      Carreira. The Licensed Work excludes third-party
+                      material that carries its own license, which remains
+                      under its original terms, and SquashMerge brand assets
+                      such as logos and wordmarks, including copies of files
+                      from the repository's brand/ directory, which are
+                      covered by brand/LICENSE.
 
 Additional Use Grant: You may make production use of the Licensed Work, free
                       of charge, if (a) you are an individual, or you use the
