@@ -581,6 +581,44 @@ class RepositoryAuthorTrustCache:
 
 
 @dataclass
+class IngestAcknowledgement:
+    """Bounded human trust only: no labels, ACLs, capabilities or sensitivities.
+
+    Chat cells expire after one idle hour and are also bounded by the owner's
+    channel cache. ACP cells are owned by (and die with) their session.
+    """
+
+    MAX_SOURCES = 1024
+    IDLE_SECONDS = 60 * 60
+    _acknowledged_ingest: frozenset[str] = field(default_factory=frozenset)
+    arrival_ordinal: int = 0
+    acknowledged_ordinal: int = 0
+    last_used: float = field(default_factory=time.monotonic)
+    _lock: Any = field(default_factory=threading.RLock, repr=False, compare=False)
+
+    @staticmethod
+    def source_identity(source: SourceLabel) -> str:
+        # Stable fixed-size identity; do not retain source content, ACLs or IDs.
+        attestation = source.owner_attestation
+        record = [source.principal, source.domain, source.domain_qualifier,
+                  source.resource_id, source.bridge_instance, str(source.sensitivity),
+                  sorted(source.authorized_principals), str(source.source_kind),
+                  str(source.integrity), str(source.integrity_effect),
+                  [attestation.canonical_principal, attestation.raw_author]
+                  if attestation is not None else None]
+        return hashlib.sha256(json.dumps(record, ensure_ascii=True).encode()).hexdigest()
+
+    def touch(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if now - self.last_used >= self.IDLE_SECONDS:
+                self._acknowledged_ingest = frozenset()
+                # Expiry also invalidates outstanding snapshots.
+                self.arrival_ordinal += 1
+            self.last_used = now
+
+
+@dataclass
 class InformationFlowState:
     """Turn-local monotonic IFC state shared by frozen runtime carriers."""
 
@@ -603,10 +641,8 @@ class InformationFlowState:
         default_factory=dict, repr=False, compare=False,
     )
     _source_arrival_ordinal: int = field(default=0, repr=False, compare=False)
-    _untrusted_ingest_arrival_ordinal: int = field(default=0, repr=False, compare=False)
-    _acknowledged_untrusted_ordinal: int = field(default=0, repr=False, compare=False)
-    _acknowledged_ingest: InformationFlowLabels | None = field(
-        default=None, repr=False, compare=False,
+    ingest_acknowledgement: IngestAcknowledgement = field(
+        default_factory=IngestAcknowledgement, repr=False, compare=False,
     )
     _receipt_identity: Any = field(default_factory=object, repr=False, compare=False)
     # Bound once from the server-issued approval request. This lives on the
@@ -645,15 +681,17 @@ class InformationFlowState:
         self, fallback: InformationFlowLabels | None = None,
     ) -> bool:
         """Uncovered active ingest in the live carrier (labels remain append-only)."""
-        with self._lock:
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
             current = self.labels if self.labels is not None else fallback
+            ack = self.ingest_acknowledgement
             return bool(
                 isinstance(current, InformationFlowLabels)
-                and (self._untrusted_ingest_arrival_ordinal > self._acknowledged_untrusted_ordinal
+                and current.has_untrusted_active_ingest
+                and (ack.arrival_ordinal > ack.acknowledged_ordinal
                      or any(source.has_untrusted_active_ingest
-                        and source not in (self._acknowledged_ingest.sources
-                                           if self._acknowledged_ingest is not None else ())
-                        for source in current.sources))
+                            and ack.source_identity(source) not in ack._acknowledged_ingest
+                            for source in current.sources))
             )
 
     def source_arrival_ordinal(self) -> int:
@@ -664,38 +702,49 @@ class InformationFlowState:
         self, fallback: InformationFlowLabels | None = None,
     ) -> bool:
         """The same effective taint as every other live sink gate."""
-        with self._lock:
-            current = self.labels if self.labels is not None else fallback
-            return (
-                not isinstance(current, InformationFlowLabels)
-                or self._untrusted_ingest_arrival_ordinal > self._acknowledged_untrusted_ordinal
-                or any(source.has_untrusted_active_ingest
-                       and source not in (self._acknowledged_ingest.sources
-                                          if self._acknowledged_ingest is not None else ())
-                       for source in current.sources)
-            )
+        current = self.current(fallback)
+        return (not isinstance(current, InformationFlowLabels)
+                or self.has_untrusted_active_ingest(fallback))
 
     def acknowledge_ingest_snapshot(
         self, *, expected: InformationFlowLabels, durable_audit: Any,
         expected_ordinal: int | None = None,
     ) -> bool:
-        """Audit and acknowledge exactly the snapshot reviewed by a human."""
-        with self._lock:
+        """Acknowledge reviewed untrusted ingest; intervening trusted reads are OK."""
+        with self._lock, self.ingest_acknowledgement._lock:
+            ack = self.ingest_acknowledgement
+            ack.touch()
             current = self.labels
-            if (not isinstance(current, InformationFlowLabels) or current != expected
+            reviewed = frozenset(source for source in expected.sources
+                                 if source.has_untrusted_active_ingest)
+            if (not isinstance(current, InformationFlowLabels)
+                    or any(source.has_untrusted_active_ingest and source not in reviewed
+                           and ack.source_identity(source) not in ack._acknowledged_ingest
+                           for source in current.sources)
                     or (expected_ordinal is not None
-                        and self._source_arrival_ordinal != expected_ordinal)):
+                        and ack.arrival_ordinal != expected_ordinal)):
                 return False
-            covered = self._acknowledged_ingest.sources if self._acknowledged_ingest else ()
-            sources = tuple(source for source in current.sources
-                            if source.has_untrusted_active_ingest and source not in covered)
-            if not sources and self._untrusted_ingest_arrival_ordinal <= self._acknowledged_untrusted_ordinal:
+            sources = tuple(source for source in reviewed
+                            if ack.source_identity(source) not in ack._acknowledged_ingest)
+            if not reviewed or (not sources and ack.arrival_ordinal <= ack.acknowledged_ordinal):
                 return False
-            if not durable_audit(sources):
+            covered = ack._acknowledged_ingest | frozenset(
+                ack.source_identity(source) for source in reviewed
+            )
+            if len(covered) > ack.MAX_SOURCES or not durable_audit(sources):
                 return False
-            self._acknowledged_ingest = current
-            self._acknowledged_untrusted_ordinal = self._untrusted_ingest_arrival_ordinal
+            ack._acknowledged_ingest = covered
+            ack.acknowledged_ordinal = ack.arrival_ordinal
             return True
+
+    def ingest_snapshot(
+        self, fallback: InformationFlowLabels | None = None,
+    ) -> tuple[InformationFlowLabels | None, int]:
+        """Human request snapshot bound to untrusted arrivals only."""
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
+            current = self.labels if self.labels is not None else fallback
+            return current, self.ingest_acknowledgement.arrival_ordinal
 
     def source_snapshot(
         self, fallback: InformationFlowLabels | None = None,
@@ -721,7 +770,8 @@ class InformationFlowState:
         event_identity: Any = None,
         fresh_untrusted_ingest: bool = False,
     ) -> tuple[InformationFlowLabels, "SourceFoldReceipt"]:
-        with self._lock:
+        with self._lock, self.ingest_acknowledgement._lock:
+            self.ingest_acknowledgement.touch()
             current = self.labels if self.labels is not None else fallback
             merged = current if isinstance(current, InformationFlowLabels) else InformationFlowLabels()
             if isinstance(added, InformationFlowLabels):
@@ -748,11 +798,13 @@ class InformationFlowState:
                 if (fresh_untrusted_ingest or (
                     isinstance(added, InformationFlowLabels)
                     and any(source.has_untrusted_active_ingest
+                            and self.ingest_acknowledgement.source_identity(source)
+                            not in self.ingest_acknowledgement._acknowledged_ingest
                             and (not isinstance(current, InformationFlowLabels)
                                  or source not in current.sources)
                             for source in added.sources)
                 )):
-                    self._untrusted_ingest_arrival_ordinal += 1
+                    self.ingest_acknowledgement.arrival_ordinal += 1
             if changed and current is not None:
                 self._declassification = None
             if (changed and current is not None) or source_arrived:

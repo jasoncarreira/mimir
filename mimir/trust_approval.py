@@ -119,7 +119,7 @@ def register_chat_request(ctx: Any, auth: Any) -> str | None:
             or not _is_authenticated_operator(ctx.operator_ingress_event,
                                                ctx.identity_resolver, allow_web=True)):
         return None
-    expected, ordinal = auth.ifc_state.source_snapshot(auth.ifc_labels)
+    expected, ordinal = auth.ifc_state.ingest_snapshot(auth.ifc_labels)
     if not isinstance(expected, InformationFlowLabels) or not auth.ifc_state.has_untrusted_active_ingest():
         return None
     existing = next((item for item in approval_requests.pending(auth.channel_id)

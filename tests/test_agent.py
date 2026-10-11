@@ -1980,6 +1980,55 @@ async def test_server_session_idle_event_reaches_live_synthesis_middleware(
     assert fake_agent.handler_calls == 1, str(fake_agent.result.content)
 
 
+async def test_chat_turns_share_only_bounded_human_acknowledgement(tmp_path):
+    seen = []
+
+    class Probe(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            seen.append(context.ifc_state)
+            if len(seen) == 1:
+                context.ifc_state.merge(InformationFlowLabels().with_source(SourceLabel(
+                    principal="external", domain="web", resource_id="old-private",
+                    bridge_instance="remote", sensitivity="private",
+                    authorized_principals=frozenset({"alice"}),
+                    source_kind="protected_tool", integrity="untrusted",
+                    integrity_effect="active_ingest",
+                )))
+            else:
+                assert all(s.resource_id != "old-private"
+                           for s in context.ifc_state.current().sources)
+            async for snapshot in super().astream(state, config=config, context=context,
+                                                  stream_mode=stream_mode):
+                yield snapshot
+
+    agent = _build_agent(tmp_path, fake_agent=Probe([AIMessage(content="done")]), fake_saga=None)
+    agent._identity_resolver = _resolver(agent._config.home, """
+    people:
+      - canonical: alice
+        aliases: [discord-99]
+        access: {roles: [admin]}
+    """)
+    event = AgentEvent(trigger="user_message", source="discord", author="discord-99",
+                       channel_id="discord-room", content="continue")
+    for _ in range(2):
+        record = await agent.run_turn(event)
+        assert record.error is None
+    assert seen[0] is not seen[1]
+    assert seen[0].ingest_acknowledgement is seen[1].ingest_acknowledgement
+    assert not seen[1].has_untrusted_active_ingest()
+    from mimir.models import IngestAcknowledgement
+
+    for i in range(256):
+        agent._chat_ingest_acknowledgements[(f"other-{i}", "alice")] = IngestAcknowledgement()
+    # Make all synthetic entries idle, proving actual Agent wiring prunes them.
+    for cell in agent._chat_ingest_acknowledgements.values():
+        cell.last_used -= cell.IDLE_SECONDS + 1
+    record = await agent.run_turn(event)
+    assert record.error is None
+    assert len(agent._chat_ingest_acknowledgements) == 1
+    assert seen[2].ingest_acknowledgement is not seen[1].ingest_acknowledgement
+
+
 async def test_run_turn_forked_tool_uses_merged_ifc_labels_from_auth_carrier(
     tmp_path: Path,
 ):

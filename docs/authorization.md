@@ -478,10 +478,18 @@ generic HTTP events and service identities cannot clear or receive a notice.
 The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit event
 with only fixed-taxonomy source counts; Keep writes a separate declined event.
 
-Clear covers the exact current ingest snapshot for that ACP session or chat
-channel, including the running turn. Labels remain append-only and still
-restrict sensitivity and audiences. The previously vetoed call is not replayed;
-retry it explicitly. New untrusted sources re-taint. ACP also advances the
+Clear covers the reviewed untrusted ingest snapshot for that ACP session or
+chat channel and operator, including the running turn. Trusted arrivals while
+the human decides do not expire the request; any new untrusted arrival does,
+including a fresh read of an already reviewed source. Only the human
+acknowledgement persists between turns: labels, sensitivities, audience ACLs,
+egress grants and sink capabilities remain per-turn. Acknowledgements cover at
+most 1,024 sources and expire after one idle hour; chat retains at most 256
+channel/operator cells (oldest idle cell evicted first). ACP cells also end with
+the session. Reaching the source cap fails closed and needs a new session or
+idle expiry. Labels remain append-only within the turn and still restrict
+sensitivity and audiences. The previously vetoed call is not replayed; retry it
+explicitly. New untrusted sources re-taint. ACP also advances the
 proxy ingest boundary, invalidating existing `allow_session` Hands grants;
 the next Hands call still needs a fresh human response. This is separate from
 egress `approve_declassification` and does not itself grant execution permission.

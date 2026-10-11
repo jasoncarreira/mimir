@@ -90,6 +90,7 @@ from .models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    IngestAcknowledgement,
     IngestedURLState,
     Integrity,
     IntegrityEffect,
@@ -1305,9 +1306,8 @@ class Agent:
         # is found.
         self._saga_store: Any = None
         self._sessions = session_manager
-        # The operator's chat-channel ingest boundary outlives short SAGA idle/
-        # turn-count sessions. It is never shared across channel IDs.
-        self._chat_ingest_states: dict[str, InformationFlowState] = {}
+        # Only bounded human acknowledgements persist, never turn IFC labels.
+        self._chat_ingest_acknowledgements: dict[tuple[str, str], IngestAcknowledgement] = {}
         self._server_discovered_pr_scope_store = ServerDiscoveredPRScopeStore()
         self._scheduler = scheduler
         self._channels = channel_registry
@@ -2131,9 +2131,17 @@ class Agent:
                     and _is_authenticated_operator(event, self._identity_resolver, allow_web=True)
                     and initial_auth_context.event_ingress is None
                     and isinstance(event.channel_id, str) and event.channel_id):
-                chat_ifc_state = self._chat_ingest_states.setdefault(
-                    event.channel_id, InformationFlowState(),
-                )
+                key = (event.channel_id, initial_auth_context.canonical_principal)
+                cache = self._chat_ingest_acknowledgements
+                now = time.monotonic()
+                for stale in [k for k, cell in cache.items()
+                              if now - cell.last_used >= cell.IDLE_SECONDS]:
+                    del cache[stale]
+                if key not in cache and len(cache) >= 256:
+                    del cache[min(cache, key=lambda k: cache[k].last_used)]
+                acknowledgement = cache.setdefault(key, IngestAcknowledgement())
+                acknowledgement.touch()
+                chat_ifc_state = InformationFlowState(ingest_acknowledgement=acknowledgement)
             turn_interactivity = classify_turn_interactivity(
                 event.channel_id,
                 event.trigger,

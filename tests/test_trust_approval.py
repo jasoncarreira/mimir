@@ -30,6 +30,8 @@ def operator(tmp_path):
              "access": {"roles": ["admin"]}},
             {"canonical": "stranger", "aliases": ["discord-98"],
              "access": {"roles": ["user"]}},
+            {"canonical": "other-admin", "aliases": ["discord-97"],
+             "access": {"roles": ["admin"]}},
         ],
     }))
     resolver = IdentityResolver(tmp_path)
@@ -328,7 +330,7 @@ def test_covered_channel_and_turn_history_do_not_retaint_but_new_read_does():
     # the append-only label carrier deduplicates its source identity.
     channel_state.merge_with_receipt(previous, fresh_untrusted_ingest=True)
     assert channel_state.has_untrusted_active_ingest()
-    snapshot, ordinal = channel_state.source_snapshot()
+    snapshot, ordinal = channel_state.ingest_snapshot()
     assert not channel_state.acknowledge_ingest_snapshot(
         expected=snapshot, expected_ordinal=ordinal - 1,
         durable_audit=lambda _sources: True,
@@ -346,3 +348,115 @@ def test_covered_channel_and_turn_history_do_not_retaint_but_new_read_does():
         expected=previous, durable_audit=lambda _sources: True,
     )
     assert channel_state.has_untrusted_active_ingest()
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_chat_pending_trust_allows_trusted_arrival_rejects_new_untrusted(
+    operator, monkeypatch, trusted,
+):
+    monkeypatch.setattr(trust_approval, "log_durable_event_sync", lambda *_a, **_kw: None)
+    ctx, auth = _turn(operator)
+
+    async def send(*_args):
+        pass
+
+    ctx.trust_notice_sender = send
+    request_id = trust_approval.register_chat_request(ctx, auth)
+    auth.ifc_state.merge(InformationFlowLabels().with_source(replace(
+        auth.ifc_labels.sources[0], domain="memory", resource_id="intervening",
+        integrity="trusted" if trusted else "untrusted",
+    )))
+    reply = AgentEvent(trigger="user_message", author="discord-99", source="discord",
+                       channel_id=ctx.channel_id, content=f"trust {request_id}")
+    resolution = approval_requests.resolve(reply, operator)
+    text = await trust_approval.complete_reply(reply, resolution, operator)
+    assert text.startswith("trusted") is trusted
+    assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+
+
+async def test_different_authenticated_admin_cannot_complete_request(operator, monkeypatch):
+    ctx, auth = _turn(operator)
+
+    async def send(*_args):
+        pass
+
+    ctx.trust_notice_sender = send
+    request_id = trust_approval.register_chat_request(ctx, auth)
+    valid = AgentEvent(trigger="user_message", author="discord-99", source="discord",
+                       channel_id=ctx.channel_id, content=f"trust {request_id}")
+    resolution = approval_requests.resolve(valid, operator)
+    other = replace(valid, author="discord-97", extra=dict(valid.extra))
+    assert trust_approval._is_authenticated_operator(other, operator, allow_web=True)
+    monkeypatch.setattr(trust_approval, "log_durable_event_sync", lambda *_a, **_kw: None)
+    assert await trust_approval.complete_reply(other, resolution, operator) == "no pending request"
+    assert auth.ifc_state.has_untrusted_active_ingest()
+    approval_requests.cancel(request_id)
+
+
+async def test_unsupported_chat_surface_cannot_register_request(operator):
+    ctx, auth = _turn(operator)
+    ctx.channel_source = "api"
+
+    async def send(*_args):
+        pytest.fail("unsupported surface posted a notice")
+
+    ctx.trust_notice_sender = send
+    assert trust_approval.register_chat_request(ctx, auth) is None
+
+
+@pytest.mark.parametrize("origin,surface", [("acp_session", "chat"), (None, "acp")])
+async def test_operator_ingest_authority_is_bound_to_surface(operator, origin, surface):
+    _ctx, auth = _turn(operator, origin_trigger=origin)
+    assert not trust_approval.operator_ingest_allowed(auth, surface=surface)
+
+
+def test_acknowledgement_only_persistence_does_not_carry_privacy_or_capabilities():
+    from mimir.models import IngestAcknowledgement
+
+    untrusted = SourceLabel(principal="external", domain="web", resource_id="read",
+                            bridge_instance="web", sensitivity="private",
+                            authorized_principals=frozenset({"operator"}),
+                            source_kind="protected_tool", integrity="untrusted",
+                            integrity_effect="active_ingest")
+    old_labels = InformationFlowLabels().with_source(untrusted).with_label("old-private")
+    ack = IngestAcknowledgement()
+    first = InformationFlowState(labels=old_labels, ingest_acknowledgement=ack)
+    snapshot, ordinal = first.ingest_snapshot()
+    assert first.acknowledge_ingest_snapshot(expected=snapshot, expected_ordinal=ordinal,
+                                            durable_audit=lambda _sources: True)
+    later = InformationFlowState(ingest_acknowledgement=ack)
+    baseline = InformationFlowState()
+    trusted = replace(untrusted, resource_id="new-trusted", integrity="trusted",
+                      authorized_principals=frozenset({"other"}))
+    labels = InformationFlowLabels().with_source(trusted)
+    assert later.merge(labels) == baseline.merge(labels)
+    assert later.current() == labels
+    assert later._sink_category_capabilities == baseline._sink_category_capabilities == {}
+    assert not later.has_untrusted_active_ingest()
+    later.merge(old_labels)
+    assert not later.has_untrusted_active_ingest()
+    later.merge_with_receipt(old_labels, fresh_untrusted_ingest=True)
+    assert later.has_untrusted_active_ingest()
+    assert ack._acknowledged_ingest == frozenset({ack.source_identity(untrusted)})
+    assert all(isinstance(identity, str) and len(identity) == 64
+               for identity in ack._acknowledged_ingest)
+
+
+def test_acknowledgement_idle_expiry_and_source_cap_fail_closed(monkeypatch):
+    from mimir.models import IngestAcknowledgement
+
+    ack = IngestAcknowledgement()
+    source = SourceLabel(principal="external", domain="web", resource_id="read",
+                         bridge_instance="web", sensitivity="public",
+                         source_kind="protected_tool", integrity="untrusted",
+                         integrity_effect="active_ingest")
+    state = InformationFlowState(labels=InformationFlowLabels().with_source(source),
+                                 ingest_acknowledgement=ack)
+    monkeypatch.setattr(IngestAcknowledgement, "MAX_SOURCES", 0)
+    assert not state.acknowledge_ingest_snapshot(expected=state.current(), durable_audit=lambda _: True)
+    monkeypatch.setattr(IngestAcknowledgement, "MAX_SOURCES", 1024)
+    assert state.acknowledge_ingest_snapshot(expected=state.current(), durable_audit=lambda _: True)
+    assert not state.has_untrusted_active_ingest()
+    ack.last_used -= ack.IDLE_SECONDS + 1
+    assert state.has_untrusted_active_ingest()
+    assert not ack._acknowledged_ingest

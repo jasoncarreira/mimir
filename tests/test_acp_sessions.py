@@ -3290,10 +3290,11 @@ async def test_human_ingest_trust_persists_for_acp_session_until_new_source(
         state.merge(ingress_labels)
         auth = dataclasses.replace(auth, ifc_labels=ingress_labels)
         turn_number = len(seen)
-        if turn_number in (0, 2):
+        if turn_number in (0, 1, 2):
+            # Fold covered history into a fresh turn; no other labels persist.
             state.merge(InformationFlowLabels().with_source(SourceLabel(
                 principal="operator", domain="web",
-                resource_id=f"https://hostile.example/private-{turn_number}",
+                resource_id=f"https://hostile.example/private-{0 if turn_number == 1 else turn_number}",
                 bridge_instance="remote", sensitivity="public",
                 authorized_principals=frozenset({"operator"}),
                 source_kind="protected_tool", integrity="untrusted",
@@ -3352,12 +3353,54 @@ async def test_human_ingest_trust_persists_for_acp_session_until_new_source(
                     raise turn_errors[-1]
                 raise
             assert response.stop_reason == "end_turn"
-        assert len(client.trust_requests) == 2
+        assert len(client.trust_requests) == (2 if outcome == "allow_once" else 3)
         assert all(request[1]["options"] == [
             {"optionId": "allow_once", "name": "Clear", "kind": "allow_once"},
             {"optionId": "reject_once", "name": "Keep", "kind": "reject_once"},
         ] for request in client.trust_requests)
     finally:
+        await agent.on_transport_closed(generation)
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_acp_pending_trust_allows_trusted_arrival_rejects_new_untrusted(tmp_path: Path, trusted):
+    from mimir.acp.agent import ActivePrompt
+
+    bundle, _core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    generation = agent.on_connect(McpClient())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
+    try:
+        session = agent._sessions[session_id]
+        auth = agent._auth_context_for(session)
+        source = SourceLabel(principal="external", domain="web", resource_id="read",
+                             bridge_instance="remote", sensitivity="public",
+                             source_kind="protected_tool", integrity="untrusted",
+                             integrity_effect="active_ingest")
+        auth.ifc_state.merge(InformationFlowLabels().with_source(source))
+
+        class Peer:
+            async def request_tool_permission(self, *_args):
+                auth.ifc_state.merge(InformationFlowLabels().with_source(dataclasses.replace(
+                    source, resource_id="intervening", domain="memory",
+                    integrity="trusted" if trusted else "untrusted",
+                )))
+                return sdk.PermissionCompletion("allow_once")
+
+        session.provider = SimpleNamespace(peer=Peer())
+        prompt = SimpleNamespace(session=session, _is_current=lambda: True,
+                                 trust_requested_ordinal=-1,
+                                 _audit_and_advance_ingest=lambda *_args: True)
+        await ActivePrompt.offer_ingest_trust(prompt, auth)
+        assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+        later = agent._auth_context_for(session)
+        assert later.ifc_state is not auth.ifc_state
+        assert later.ifc_state.current() is None
+        assert later.ifc_state.ingest_acknowledgement is auth.ifc_state.ingest_acknowledgement
+    finally:
+        # Restore the actual provider for transport cleanup.
+        session.provider = None
         await agent.on_transport_closed(generation)
 
 

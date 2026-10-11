@@ -18,7 +18,7 @@ import mimir
 from mimir.access_control import create_auth_context
 from mimir.channel_audience import ServerChannelAudienceProvider
 from mimir.event_logger import safe_log_event
-from mimir.models import AgentEvent, InformationFlowLabels, InformationFlowState
+from mimir.models import AgentEvent, IngestAcknowledgement, InformationFlowLabels, InformationFlowState
 from mimir.tools.client_provider import (
     ClientProviderResultError,
     MIMIR_HANDS_V1,
@@ -135,9 +135,7 @@ class SessionState:
     active_prompt: ActivePrompt | None = None
     dirty: bool = False
     ingest_acknowledgement: str | None = None
-    ifc_state: InformationFlowState = field(default_factory=InformationFlowState)
-    trust_requested_snapshot: InformationFlowLabels | None = None
-    trust_requested_ordinal: int = -1
+    ingest_trust: IngestAcknowledgement = field(default_factory=IngestAcknowledgement)
 
 
 @dataclass
@@ -173,6 +171,7 @@ class ActivePrompt:
     progress_tokens: dict[str, ProgressTokenOwnership] = field(default_factory=dict)
     replaced: bool = False
     final_text_delivery_failure: str | None = None
+    trust_requested_ordinal: int = -1
 
     def report_final_text_delivery_failure(self, reason: str) -> None:
         if self.final_text_delivery_failure is None:
@@ -191,17 +190,15 @@ class ActivePrompt:
         )
 
         if (not self._is_current() or not operator_ingest_allowed(auth, surface="acp")
-                or self.session.ifc_state is not auth.ifc_state):
+                or self.session.ingest_trust is not auth.ifc_state.ingest_acknowledgement):
             return
-        state = self.session.ifc_state
-        snapshot, ordinal = state.source_snapshot(auth.ifc_labels)
+        state = auth.ifc_state
+        snapshot, ordinal = state.ingest_snapshot(auth.ifc_labels)
         if (not isinstance(snapshot, InformationFlowLabels)
                 or not state.has_untrusted_active_ingest(auth.ifc_labels)
-                or (snapshot == self.session.trust_requested_snapshot
-                    and ordinal == self.session.trust_requested_ordinal)):
+                or ordinal == self.trust_requested_ordinal):
             return
-        self.session.trust_requested_snapshot = snapshot
-        self.session.trust_requested_ordinal = ordinal
+        self.trust_requested_ordinal = ordinal
         provider = self.session.provider
         if provider is None or provider.peer is None:
             return
@@ -214,9 +211,7 @@ class ActivePrompt:
             completion = await provider.peer.request_tool_permission(
                 self.session.record.session_id, permission,
             )
-            current, current_ordinal = state.source_snapshot(auth.ifc_labels)
-            if (not self._is_current() or current != snapshot
-                    or current_ordinal != ordinal):
+            if not self._is_current():
                 return
             if completion.error is None and completion.decision == "allow_once":
                 state.acknowledge_ingest_snapshot(
@@ -1265,7 +1260,7 @@ class MimirAcpAgent:
             channel_id=thread_id,
             resource_id=thread_id,
             origin_trigger="acp_session",
-            ifc_state=state.ifc_state,
+            ifc_state=InformationFlowState(ingest_acknowledgement=state.ingest_trust),
         )
 
     def _display_name_for(self, state: SessionState) -> str | None:
