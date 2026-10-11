@@ -15,6 +15,8 @@ from typing import Callable, Collection
 
 from ..models import AgentEvent
 from .dispatch_failures import (
+    FACTORY_STOP_KINDS,
+    FACTORY_TRANSITION_KINDS,
     STATE_FILE,
     _validate_merge_reconciliations,
     dispatch_failure_state_dir,
@@ -93,13 +95,35 @@ def report_live_delivery_receipts(
                     issue = entry.get("issue_id")
                     run = entry.get("run_id")
                     attempt = entry.get("attempt")
-                    if (kind not in ("factory_start", "factory_success")
+                    if not isinstance(kind, str):
+                        return
+
+                    if kind in FACTORY_STOP_KINDS:
+                        prefix = f"worklink-{kind}:{issue}:{run}:{attempt}:"
+                        valid_key = (key.startswith(prefix) and len(key) == len(prefix) + 64
+                                     and all(c in "0123456789abcdef" for c in key[len(prefix):]))
+                        valid_fields = (
+                            entry.get("status") == {
+                                "factory_needs_human": "needs-human",
+                                "factory_blocked": "blocked",
+                                "factory_partial": "partial",
+                            }[kind]
+                            and isinstance(entry.get("reason"), str)
+                            and isinstance(entry.get("record_path"), str)
+                            and isinstance(entry.get("sandbox"), str)
+                            and (entry.get("park_snapshot") is None
+                                 or isinstance(entry.get("park_snapshot"), str))
+                        )
+                    else:
+                        valid_key = key == f"worklink-{kind}:{issue}:{run}:{attempt}"
+                        valid_fields = True
+                    if (kind not in FACTORY_TRANSITION_KINDS
                             or type(issue) is not int
                             or not isinstance(run, str) or not run
                             or type(attempt) is not int
                             or type(entry.get("notified")) is not bool
                             or not (entry.get("pr_url") is None or isinstance(entry["pr_url"], str))
-                            or key != f"worklink-{kind}:{issue}:{run}:{attempt}"
+                            or not valid_key or not valid_fields
                             or entry.get("delivery_key") != key):
                         return
                     if not entry["notified"]:

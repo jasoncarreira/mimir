@@ -5534,9 +5534,11 @@ def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autono
     )
     assert result.status == ({"completed": "review_ready", "failure": "failed", "release-failure": "failed"}.get(ending, ending)), result.reason
     entries = list(load_failure_state(dispatch_failure_state_dir(tmp_path)).get("factory_transitions", {}).values())
+    stop_kind = {"blocked": "factory_blocked", "partial": "factory_partial",
+                 "needs-human": "factory_needs_human"}.get(ending)
     assert [entry["kind"] for entry in entries] == (
         ["factory_start", "factory_success"] if autonomous and ending == "completed"
-        else ["factory_start"] if autonomous else []
+        else (["factory_start"] if autonomous else []) + ([stop_kind] if stop_kind else [])
     )
     if autonomous and ending == "completed":
         assert entries[1] == {
@@ -8164,6 +8166,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert retained.status is not None and retained.status.is_parked
     assert transitions[0]["status"] == "blocked"
     assert transitions[0]["attempt"] == 1
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
+    assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
+    assert reason in notices[0]["reason"]
     report = str(transitions[0]["reason"])
     if snapshot_published:
         assert retained.status.park_snapshot == snapshot
@@ -10502,6 +10508,10 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
     assert sandbox.is_dir()
     assert retained is not None and retained.controller_phase == "parked"
     assert transitions[0]["status"] == "blocked"
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
+    assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
+    assert notices[0]["status"] == "needs-human"
     assert not any("push" in call for call in git_calls)
 
 

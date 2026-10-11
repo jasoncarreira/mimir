@@ -3507,6 +3507,11 @@ class WorklinkRunner:
                             sandbox=factory_record.sandbox,
                             reason=detail[:300] or reason,
                         )
+                        _record_factory_milestone(
+                            self.home, kind="factory_needs_human", issue=issue,
+                            run_id=factory_record.run_id, attempt=factory_record.attempt,
+                            factory_record=factory_record,
+                        )
                         failed = False
                         return WorklinkRunResult(
                             issue.issue_id,
@@ -3605,6 +3610,11 @@ class WorklinkRunner:
                 reason=result.reason,
                 sandbox=factory_record.sandbox,
             )
+            _record_factory_milestone(
+                self.home, kind="factory_needs_human", issue=issue,
+                run_id=factory_record.run_id, attempt=factory_record.attempt,
+                factory_record=factory_record,
+            )
             return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(
@@ -3632,6 +3642,11 @@ class WorklinkRunner:
                 review_ready=result.review_ready,
                 pr_url=result.pr_url,
                 reason=result.reason,
+            )
+            _record_factory_milestone(
+                self.home, kind=f"factory_{status.status}", issue=issue,
+                run_id=factory_record.run_id, attempt=factory_record.attempt,
+                factory_record=factory_record,
             )
             return result
         evidence_path, pr_url = await _verify_factory_completion(
@@ -5747,20 +5762,45 @@ def _run(
 def _record_factory_milestone(
     home: Path,
     *,
-    kind: Literal["factory_start", "factory_success"],
+    kind: Literal[
+        "factory_start", "factory_success", "factory_needs_human", "factory_blocked", "factory_partial"
+    ],
     issue: IssueContext,
     run_id: str,
     attempt: int,
     pr_url: str | None = None,
+    factory_record: FactoryRunRecord | None = None,
 ) -> None:
     """Informational delivery must not cancel work or replace its result."""
     from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition, terminal_error
 
     try:
+        stop_fields: dict[str, Any] = {}
+        if factory_record is not None:
+            from .factory_state import factory_record_path
+
+            status = factory_record.status
+            terminal_result = status.terminal_result if status is not None else None
+            factory_reason = terminal_result.get("reason") if terminal_result else None
+            stop_fields = {
+                "status": "needs-human" if kind == "factory_needs_human" else status.status,
+                "reason": (
+                    factory_reason
+                    if isinstance(factory_reason, str) and factory_reason.strip()
+                    else None
+                ) or factory_record.controller_error or (
+                    f"factory status: {status.status if status is not None else 'needs-human'}"
+                ),
+                "terminal_result": terminal_result,
+                "record_path": str(factory_record_path(home, run_id)),
+                "park_snapshot": status.park_snapshot if status is not None else None,
+                "sandbox": factory_record.sandbox,
+            }
         record_factory_transition(
             dispatch_failure_state_dir(home), kind=kind,
             issue_id=issue.issue_id, issue_title=issue.title,
             run_id=run_id, attempt=attempt, pr_url=pr_url,
+            **stop_fields,
         )
     except Exception as exc:
         # The log sink may share the failed/full filesystem with the ledger.

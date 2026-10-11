@@ -26,6 +26,8 @@ MAX_NOTIFIED_SIGNATURES = 32
 AUTO_RESUMABLE_FAILURE_KINDS = frozenset({"tests_failed", "quota_exhausted"})
 MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
+FACTORY_STOP_KINDS = frozenset({"factory_needs_human", "factory_blocked", "factory_partial"})
+FACTORY_TRANSITION_KINDS = FACTORY_STOP_KINDS | {"factory_start", "factory_success"}
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
     ("cannot lock ref",),
@@ -568,19 +570,30 @@ def is_transient_contention(error: str) -> bool:
 def record_factory_transition(
     state_dir: Path,
     *,
-    kind: Literal["factory_start", "factory_success"],
+    kind: Literal[
+        "factory_start", "factory_success", "factory_needs_human", "factory_blocked", "factory_partial"
+    ],
     issue_id: int,
     run_id: str,
     issue_title: str = "",
     attempt: int,
     pr_url: str | None = None,
+    status: str | None = None,
+    reason: str | None = None,
+    terminal_result: dict[str, Any] | None = None,
+    record_path: str | None = None,
+    park_snapshot: str | None = None,
+    sandbox: str | None = None,
 ) -> dict[str, Any]:
     """Record an immutable factory milestone, independently of incidents."""
-    if kind not in {"factory_start", "factory_success"}:
+    if kind not in FACTORY_TRANSITION_KINDS:
         raise ValueError(f"invalid factory transition kind: {kind}")
     delivery_key = f"worklink-{kind}:{issue_id}:{run_id}:{attempt}"
+    if kind in FACTORY_STOP_KINDS:
+        canonical = json.dumps(terminal_result, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        delivery_key += ":" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     with failure_state_transaction(state_dir) as state:
-        entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, {
+        payload = {
             "kind": kind,
             "issue_id": issue_id,
             "issue_title": issue_title,
@@ -589,7 +602,11 @@ def record_factory_transition(
             "pr_url": pr_url,
             "delivery_key": delivery_key,
             "notified": False,
-        })
+        }
+        if kind in FACTORY_STOP_KINDS:
+            payload.update(status=status, reason=reason, record_path=record_path,
+                           park_snapshot=park_snapshot, sandbox=sandbox)
+        entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, payload)
     return entry
 
 

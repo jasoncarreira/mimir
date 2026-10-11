@@ -5792,6 +5792,103 @@ def test_factory_transition_tick_budget_and_locked_emission(
     assert failures.load_failure_state(state)["factory_transitions"][entry["delivery_key"]]["notified"] is True
 
 
+@pytest.mark.parametrize("kind,status", [
+    ("factory_needs_human", "needs-human"), ("factory_blocked", "blocked"),
+    ("factory_partial", "partial"),
+])
+def test_factory_stop_prompt_result_identity_truncation_and_ack(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch, kind, status,
+):
+    failures, state, _, _ = worklink_receipts
+    reason = "R" * 5000
+    fields = dict(kind=kind, issue_id=42, issue_title="Decision needed", run_id="run-42",
+                  attempt=2, status=status, reason=reason,
+                  terminal_result={"reason": reason}, record_path="/home/factory-runs/run-42.json",
+                  park_snapshot="/home/.factory/.parked/run-42", sandbox="/home/sandbox")
+    first = failures.record_factory_transition(state, **fields)
+    key = first["delivery_key"]
+    assert key.startswith(f"worklink-{kind}:42:run-42:2:")
+    emitted = []
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted.append)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 1
+    notice = emitted[0]
+    assert "prompt" in notice and "signal" not in notice
+    assert notice["source_id"] == notice["delivery_key"] == key
+    prompt = notice["prompt"]
+    for text in ("42", "Decision needed", "run-42", "Attempt: 2", f"Status: {status}",
+                 "R" * 2000, "[reason truncated; read retained record]",
+                 fields["record_path"], fields["park_snapshot"], fields["sandbox"],
+                 "WORKLINK_BLOCKED comment", "Read the WORKLINK_BLOCKED comment and the retained record.",
+                 "call operator_alert with the issue, run, attempt, the exact decision requested",
+                 "Do not resume, re-arm, steal locks, start fresh work, or edit the issue yourself."):
+        assert text in prompt
+    assert "R" * 2001 not in prompt
+    _write_delivery_receipt(state, key)
+    receipt = state / ".delivery-receipts" / hashlib.sha256(key.encode()).hexdigest()
+    # Pending stop notices protect their receipt until the consumer acknowledges it.
+    _, _, cfg, _ = worklink_receipts
+    home = state.parent.parent.parent
+    _prune_delivery_receipts(cfg, home)
+    assert receipt.exists()
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is True
+    _prune_delivery_receipts(cfg, home)
+    assert not receipt.exists()
+    assert failures.record_factory_transition(state, **{**fields, "reason": "changed"}) == {
+        **first, "notified": True,
+    }
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 1
+    changed = failures.record_factory_transition(
+        state, **{**fields, "reason": "new decision", "terminal_result": {"reason": "new decision"}}
+    )
+    assert changed["delivery_key"] != key
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 2 and emitted[1]["prompt"].find("new decision") != -1
+
+
+@pytest.mark.parametrize("broken", [
+    "status", "key", "key_prefix", "key_length", "record_path", "reason",
+    "sandbox", "park_snapshot",
+])
+def test_factory_stop_receipt_pruning_refuses_corrupt_identity(
+    home, worklink_receipts, broken,
+):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_factory_transition(
+        state, kind="factory_needs_human", issue_id=42, run_id="run-42", attempt=1,
+        status="needs-human", reason="decision", terminal_result={"reason": "decision"},
+        record_path="/home/factory-runs/run-42.json", sandbox="/home/sandbox",
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    with failures.failure_state_transaction(state) as ledger:
+        current = ledger["factory_transitions"].pop(key)
+        current["notified"] = True
+        if broken == "status":
+            current["status"] = "blocked"
+        elif broken == "key":
+            key = key[:-1] + "z"
+            current["delivery_key"] = key
+        elif broken == "key_prefix":
+            key = "x" + key[1:]
+            current["delivery_key"] = key
+        elif broken == "key_length":
+            key += "a"
+            current["delivery_key"] = key
+        elif broken == "record_path":
+            current["record_path"] = None
+        else:
+            current[broken] = 42
+        ledger["factory_transitions"][key] = current
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists(), "corrupt stop identity must abort the entire sweep"
+
+
 def test_merge_notice_identity_and_durability(worklink_receipts):
     failures, state, _, _ = worklink_receipts
     identity = {
