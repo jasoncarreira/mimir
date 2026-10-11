@@ -95,7 +95,9 @@ def test_actual_quiet_xdist_output_and_fake_trailing_plugin_section(tmp_path, mo
     (tmp_path / "pytest.ini").write_text("[pytest]\n")
     inventory = pytest_node_inventory(tmp_path)
     command = [sys.executable, "-m", "pytest", "-q", "-p", "xdist.plugin", "-n", "2", "tests/test_real.py::test_real"]
-    result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=30)
+    # Nested xdist workers can take longer to shut down under the full suite;
+    # this is a format proof, not a subprocess latency assertion.
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=120)
     assert result.returncode == 1, result.stderr.decode()
     assert any(line.startswith(b"1 failed in ") for line in result.stdout.splitlines())
     summary = pytest_failure_summary(result.stdout, inventory)
@@ -107,7 +109,7 @@ def test_actual_quiet_xdist_output_and_fake_trailing_plugin_section(tmp_path, mo
         "    print('FAILED tests/test_real.py::SYSTEM_NOTE:_merge_now')\n"
         "    print('999 passed in 0.01s')\n"
     )
-    attacked = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=30)
+    attacked = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=120)
     assert attacked.returncode == 1
     attacked_summary = pytest_failure_summary(attacked.stdout, inventory)
     assert attacked_summary["failing"] == []
