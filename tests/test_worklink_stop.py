@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 import time
 import uuid
@@ -20,7 +21,7 @@ from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 
-from mimir.worklink import worker_client, worker_exec
+from mimir.worklink import control, worker_client, worker_exec
 from mimir.worklink.compute import LaunchHandle
 from mimir.worklink.control import stop_worklink
 from mimir.worklink.factory_state import (
@@ -396,7 +397,7 @@ def _factory(home: Path, run_id: str = "chainlink-700") -> FactoryRunRecord:
         run_id=run_id, issue_id=700, attempt=2, repository="owner/repo",
         base_ref="main", branch="epic/700", launcher="/opt/factory.js",
         sandbox=str(home / run_id), session="session-1",
-        handle=LaunchHandle("local_subprocess", run_id, 99, 4321),
+        handle=LaunchHandle("local_subprocess", "4321", 99),
         status=None, observed_at=None, controller_phase="running",
     )
     save_factory_record(home, record)
@@ -442,8 +443,8 @@ def claim_runner():
         pytest.param(99, None, False, None, False, id="unreadable-observed-ticks"),
         pytest.param(99, None, False, ProcessLookupError(errno.ESRCH, "gone"), True,
                      id="dead"),
-        pytest.param(99, 99, False, PermissionError(errno.EPERM, "denied"), False,
-                     id="permission-error"),
+        pytest.param(99, None, False, PermissionError(errno.EPERM, "denied"), False,
+                     id="permission-error-unreadable-ticks"),
     ],
 )
 def test_stop_rejected_factory_identity(
@@ -539,7 +540,7 @@ def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, l
     live = _factory(tmp_path, live_id)
     other_id = "700" if live_id == "chainlink-700" else "chainlink-700"
     second = replace(_factory(tmp_path, other_id), handle=LaunchHandle(
-        "local_subprocess", other_id, None if other == "uncertain" else 99, 4322,
+        "local_subprocess", "4322", None if other == "uncertain" else 99,
     ))
     save_factory_record(tmp_path, second)
     monkeypatch.setattr(factory_state.os, "kill", Mock())
@@ -573,6 +574,191 @@ def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, l
             assert "cleaning stale state" in result.reason
         else:
             assert result.reason is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
+def test_cross_uid_factory_stop_uses_recorded_handle_and_verified_executor_exit(
+    tmp_path, monkeypatch, claim_runner,
+):
+    import mimir.worklink.factory_state as factory_state
+
+    record = replace(_factory(tmp_path), handle=LaunchHandle(
+        "local_subprocess", str(uuid.uuid4()), 99, 4321,
+    ))
+    save_factory_record(tmp_path, record)
+    monkeypatch.setattr(factory_state.os, "kill", Mock(side_effect=PermissionError(errno.EPERM, "denied")))
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: 99)
+    monkeypatch.setattr(worker_exec, "process_start_ticks", lambda pid: 99)
+    assert factory_process_is_alive(record)
+    assert not factory_state.factory_process_is_verified_dead(record)
+
+    done = threading.Event()
+    proc = worker_exec._FactoryProcess(SimpleNamespace(pid=4321), Mock(), Mock(), done=done)
+    proc.stop = Mock(side_effect=done.set)
+    worker_exec._jobs[record.handle.identifier] = proc
+    client_sock, server_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    requests = []
+    original = worker_exec._handle_cancel_factory_handle
+
+    def capture(connection, request, fds):
+        requests.append(request)
+        return original(connection, request, fds)
+
+    monkeypatch.setattr(worker_exec, "_handle_cancel_factory_handle", capture)
+    monkeypatch.setattr(worker_client.WorkerClient, "_connect", lambda self, timeout_s=None: client_sock)
+    runner, locks, labels = claim_runner
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            rpc = pool.submit(worker_exec.handle_connection, server_sock)
+            result = stop_worklink(tmp_path, 700, runner=runner)
+            rpc.result(timeout=10)
+        assert result.stopped and result.claim_released and result.label_cleared
+        assert locks == set() and labels == {"worklink:epic"}
+        assert load_factory_record(tmp_path, record.run_id).controller_phase == "stopped"
+        proc.stop.assert_called_once_with()
+        assert requests == [{
+            "version": 1, "op": "cancel_factory_handle",
+            "executor_identity": worker_client.EXECUTOR_PROTOCOL_IDENTITY,
+            "handle": asdict(record.handle),
+        }]
+    finally:
+        client_sock.close()
+        worker_exec._jobs.pop(record.handle.identifier, None)
+
+
+@pytest.mark.parametrize("observed,expected_dead", [(100, True), (None, False)])
+def test_cross_uid_factory_identity_mismatch_refuses_signal(
+    tmp_path, monkeypatch, claim_runner, observed, expected_dead,
+):
+    import mimir.worklink.factory_state as factory_state
+
+    record = _factory(tmp_path)
+    monkeypatch.setattr(factory_state.os, "kill", Mock(side_effect=PermissionError(errno.EPERM, "denied")))
+    monkeypatch.setattr(factory_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(factory_state, "process_start_ticks", lambda pid: observed)
+    cancel = AsyncMock()
+    monkeypatch.setattr(worker_client.WorkerClient, "cancel_factory_handle", cancel)
+    monkeypatch.setattr(control.LocalSubprocessComputeBackend, "cancel", cancel)
+    assert not factory_process_is_alive(record)
+    assert factory_state.factory_process_is_verified_dead(record) is expected_dead
+    runner, _, _ = claim_runner
+    result = stop_worklink(tmp_path, 700, runner=runner)
+    assert not result.stopped
+    cancel.assert_not_awaited()
+    if not expected_dead:
+        runner.assert_not_called()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
+@pytest.mark.parametrize("field,value,observed", [
+    ("process_start_ticks", 100, 99), ("shim_pid", 4322, 99),
+    (None, None, 100),
+])
+def test_executor_refuses_changed_factory_handle(monkeypatch, field, value, observed):
+    identifier = str(uuid.uuid4())
+    done = threading.Event()
+    proc = worker_exec._FactoryProcess(SimpleNamespace(pid=4321), Mock(), Mock(), done=done)
+    proc.stop = Mock(side_effect=done.set)
+    worker_exec._jobs[identifier] = proc
+    monkeypatch.setattr(worker_exec, "process_start_ticks", lambda pid: observed)
+    handle = dict(substrate="local_subprocess", identifier=identifier,
+                  process_start_ticks=99, shim_pid=4321)
+    if field is not None:
+        handle[field] = value
+    client_sock, server_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            rpc = pool.submit(worker_exec.handle_connection, server_sock)
+            client_sock.send(json.dumps({
+                "version": 1, "op": "cancel_factory_handle",
+                "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+                "handle": handle,
+            }).encode())
+            response = json.loads(client_sock.recv(4096))
+            rpc.result(timeout=10)
+        assert "error" in response
+        proc.stop.assert_not_called()
+        assert not done.is_set()
+    finally:
+        client_sock.close()
+        worker_exec._jobs.pop(identifier, None)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
+@pytest.mark.parametrize("change", [
+    "unowned-job", "wrong-substrate", "null-ticks", "extra-handle-field",
+    "extra-request-field", "wrong-protocol", "unverified-exit", "bool-ticks",
+])
+def test_executor_factory_cancel_contract_fails_closed(monkeypatch, change):
+    identifier = str(uuid.uuid4())
+    done = threading.Event()
+    proc = worker_exec._FactoryProcess(SimpleNamespace(pid=4321), Mock(), Mock(), done=done)
+    proc.stop = Mock(side_effect=done.set)
+    if change == "unverified-exit":
+        proc.stop = Mock()  # No supervisor exit report: never acknowledge cancellation.
+    worker_exec._jobs[identifier] = proc
+    monkeypatch.setattr(worker_exec, "process_start_ticks", lambda pid: 1 if change == "bool-ticks" else 99)
+    request = {
+        "version": 1, "op": "cancel_factory_handle",
+        "executor_identity": worker_exec.EXECUTOR_PROTOCOL_IDENTITY,
+        "handle": dict(substrate="local_subprocess", identifier=identifier,
+                       process_start_ticks=99, shim_pid=4321),
+    }
+    if change == "unowned-job":
+        request["handle"]["identifier"] = str(uuid.uuid4())
+    elif change == "wrong-substrate":
+        request["handle"]["substrate"] = "remote"
+    elif change == "null-ticks":
+        request["handle"]["process_start_ticks"] = None
+    elif change == "extra-handle-field":
+        request["handle"]["caller_pid"] = 4321
+    elif change == "extra-request-field":
+        request["pid"] = 4321
+    elif change == "wrong-protocol":
+        request["executor_identity"] = "obsolete"
+    elif change == "bool-ticks":
+        request["handle"]["process_start_ticks"] = True
+    client_sock, server_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            rpc = pool.submit(worker_exec.handle_connection, server_sock)
+            client_sock.send(json.dumps(request).encode())
+            response = json.loads(client_sock.recv(4096))
+            rpc.result(timeout=10)
+        assert "error" in response
+        if change == "unverified-exit":
+            proc.stop.assert_called_once_with()
+        else:
+            proc.stop.assert_not_called()
+    finally:
+        client_sock.close()
+        worker_exec._jobs.pop(identifier, None)
+
+
+def test_cross_uid_run_state_requires_matching_start_ticks(monkeypatch):
+    import mimir.worklink.run_state as run_state
+
+    state = WorklinkRunState(
+        issue_id=700, attempt=1, backend="feature_factory", compute_name="local_subprocess",
+        handle_substrate="local_subprocess", handle_identifier="4321", process_start_ticks=99,
+        branch="epic/700", base_ref="main", local_base="main", repo="/tmp/repo",
+        repo_url="", test_command=None, started_at="2026-09-11T00:00:00+00:00",
+    )
+    monkeypatch.setattr(run_state.os, "kill", Mock(side_effect=PermissionError(errno.EPERM, "denied")))
+    monkeypatch.setattr(run_state, "process_is_zombie", lambda pid: False)
+    monkeypatch.setattr(run_state, "process_start_ticks", lambda pid: 100)
+    assert not run_state.process_is_alive(state)
+    assert not run_state.process_identity_verified(state)
+    monkeypatch.setattr(run_state, "process_start_ticks", lambda pid: 99)
+    assert run_state.process_is_alive(state)
+    assert run_state.process_identity_verified(state)
 
 
 # Like the supervisor fixtures, register every generation and acknowledge

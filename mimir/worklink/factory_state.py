@@ -666,7 +666,9 @@ def factory_process_is_alive(record: FactoryRunRecord) -> bool:
             return False
     try:
         os.kill(pid, 0)
-    except (OSError, ProcessLookupError):
+    except PermissionError:
+        pass  # EPERM proves existence, not identity; check the birth marker below.
+    except OSError:
         return False
     if process_is_zombie(pid) or handle.process_start_ticks is None:
         return False
@@ -698,7 +700,9 @@ def factory_process_is_verified_dead(
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
-    except (PermissionError, OSError):
+    except PermissionError:
+        pass  # Still compare birth markers; EPERM alone cannot verify exit.
+    except OSError:
         return False
     observed = process_start_ticks(pid)
     return process_is_zombie(pid) or (
