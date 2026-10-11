@@ -226,6 +226,109 @@ def test_advanced_head_refusal_branch(attested, monkeypatch, case, reason):
     assert result == ac.LeaseAttestation(False, reason)
 
 
+def test_cached_false_preserves_reason_without_git_reverification(attested, monkeypatch):
+    auth, scope, lease = attested
+    head = _ahead(attested, monkeypatch)
+    object.__setattr__(scope, "destination_ref", "refs/heads/main")
+    lease.base_sha = scope.observed_base_sha
+    calls = []
+
+    def git(_path, args, **_kwargs):
+        calls.append(args)
+        if args[0] == "merge-base":
+            return GitProcessResult(0)
+        if args[0] == "log":
+            return GitProcessResult(0, "\x00".join((
+                head, scope.observed_head_sha, DEFAULT_USER_NAME, DEFAULT_USER_EMAIL,
+                "foreign", DEFAULT_USER_EMAIL, "",
+            )))
+        pytest.fail(f"unexpected git command: {args[0]}")
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", git)
+    expected = ac.LeaseAttestation(False, "commit_identity_mismatch")
+    assert ac.pr_checkout_lease_attestation(auth, scope, lease) == expected
+    assert [args[0] for args in calls] == ["merge-base", "merge-base", "log"]
+    assert auth.repo_review_state._author_attestation_verdicts[
+        (scope.scope_id, head)
+    ] == (False, "commit_identity_mismatch")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("cached refusal must not launch a diagnostic git subprocess")
+
+    # The live branch/HEAD and lineage checks remain in place, stubbed by _ahead;
+    # only the expensive author verification is cached, exactly as before.
+    monkeypatch.setattr(repo_tools, "hardened_git_command", forbidden)
+    monkeypatch.setattr(ac.subprocess, "run", forbidden)
+    assert ac.pr_checkout_lease_attestation(auth, scope, lease) == expected
+    assert not ac._attested_pr_checkout_lease(auth, scope, lease)
+    assert [args[0] for args in calls] == ["merge-base", "merge-base", "log"]
+
+
+@pytest.mark.parametrize("flag", ["timed_out", "output_limited"])
+def test_status_exit_zero_preserves_attestation_despite_diagnostic_flags(
+    attested, monkeypatch, flag,
+):
+    auth, scope, lease = attested
+    auth.repo_review_state._author_attestation_verdicts.clear()
+
+    def git(_path, args, **_kwargs):
+        assert args[0] == "status"
+        return GitProcessResult(0, (
+            f"# branch.oid {scope.observed_head_sha}\n# branch.head {scope.head_ref}\n"
+        ), **{flag: True})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", git)
+    assert ac.pr_checkout_lease_attestation(auth, scope, lease) == ac.LeaseAttestation(True, "ok")
+    # The uncached/reconstructed path must keep the same exit-status predicate.
+    object.__setattr__(auth, "repo_review_state", None)
+    assert ac.pr_checkout_lease_attestation(auth, scope, lease) == ac.LeaseAttestation(True, "ok")
+
+
+@pytest.mark.parametrize("flag", ["timed_out", "output_limited"])
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_patch_replay_merge_base_preserves_exit_status_predicate(
+    attested, monkeypatch, flag, exit_code,
+):
+    auth, scope, lease = attested
+    head = _ahead(attested, monkeypatch)
+    base = scope.observed_base_sha
+    object.__setattr__(scope, "destination_ref", "refs/heads/main")
+    lease.base_sha = base
+    commands = []
+
+    def git(_path, args, **_kwargs):
+        commands.append(args[0])
+        if args[0] == "merge-base" and "--is-ancestor" in args:
+            return GitProcessResult(0)
+        if args[0] == "merge-base":
+            return GitProcessResult(exit_code, base + "\n", **{flag: True})
+        if args[0] == "log":
+            return GitProcessResult(0, "\x00".join((
+                head, base, "human", DEFAULT_USER_EMAIL,
+                DEFAULT_USER_NAME, DEFAULT_USER_EMAIL, "",
+            )))
+        if args[0] == "rev-list":
+            return GitProcessResult(0, scope.observed_head_sha + "\n")
+        if args[0] == "show":
+            return GitProcessResult(0, "identical patch")
+        pytest.fail(f"unexpected git command: {args[0]}")
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", git)
+    patch_calls = []
+
+    def patch(*args, **kwargs):
+        patch_calls.append(kwargs["input"])
+        return SimpleNamespace(returncode=0, stdout=f"{'a' * 40} {'b' * 40}\n")
+
+    monkeypatch.setattr(ac.subprocess, "run", patch)
+    expected = ac.LeaseAttestation(True, "ok") if exit_code == 0 else ac.LeaseAttestation(
+        False, "git_timeout" if flag == "timed_out" else "git_output_limit",
+    )
+    assert ac.pr_checkout_lease_attestation(auth, scope, lease) == expected
+    assert ("rev-list" in commands) is (exit_code == 0)
+    assert len(patch_calls) == (2 if exit_code == 0 else 0)
+
+
 def test_reason_codes_are_closed_against_source_and_cases():
     # Source and test inventory are independent: merging enum values, adding an
     # untested reason or leaving a dead reason fails this test.

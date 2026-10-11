@@ -10614,8 +10614,8 @@ class LeaseAttestation:
     reason: str
 
 
-_lease_refusal_reason: ContextVar[LeaseAttestationReason] = ContextVar(
-    "lease_refusal_reason", default=LeaseAttestationReason.REVIEW_STATE_MISMATCH,
+_lease_refusal_reason: ContextVar[LeaseAttestationReason | None] = ContextVar(
+    "lease_refusal_reason", default=None,
 )
 
 
@@ -10635,8 +10635,8 @@ def _lease_git_ok(result: Any) -> bool:
 
 
 def _lease_ancestor_ok(result: Any) -> bool:
-    # These ancestry predicates historically inspected only the exit status.
-    # Preserve that authorization decision while diagnosing failed commands.
+    # Ancestry, status and replay merge-base historically inspected only the
+    # exit status. Preserve that decision while diagnosing failed commands.
     if result.returncode == 0:
         return True
     _lease_git_ok(result)
@@ -10664,7 +10664,7 @@ def pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
     """Diagnose a lease refusal without exposing checkout or Git output."""
-    token = _lease_refusal_reason.set(LeaseAttestationReason.REVIEW_STATE_MISMATCH)
+    token = _lease_refusal_reason.set(None)
     try:
         return _pr_checkout_lease_attestation(auth_context, scope, lease)
     finally:
@@ -10701,7 +10701,8 @@ def _pr_checkout_lease_attestation(
     auth_context: "AuthContext | None", scope: Any, lease: Any,
 ) -> LeaseAttestation:
     def verdict(ok: bool, reason: LeaseAttestationReason | None = None) -> LeaseAttestation:
-        code = LeaseAttestationReason.OK if ok else reason or _lease_refusal_reason.get()
+        code = (LeaseAttestationReason.OK if ok else
+                reason or _lease_refusal_reason.get() or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
         return LeaseAttestation(ok, code.value)
 
     ifc_state = getattr(auth_context, "ifc_state", None)
@@ -10763,8 +10764,7 @@ def _pr_checkout_lease_attestation(
     observed_state = _observed_checkout_state(path)
     if observed_state is None:
         reason = _lease_refusal_reason.get()
-        return verdict(False, LeaseAttestationReason.CHECKOUT_STATE_MISMATCH
-                       if reason == LeaseAttestationReason.REVIEW_STATE_MISMATCH else reason)
+        return verdict(False, reason or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
     observed_branch, observed_head = observed_state
     if observed_branch != expected_branch or observed_head != recorded_head.lower():
         # The checkout can be mutated by processes outside the typed repository
@@ -10775,22 +10775,16 @@ def _pr_checkout_lease_attestation(
         if not _lease_has_clean_lineage(path, lease, scope, expected_head, observed_head):
             return verdict(False)
 
-    def verify() -> bool:
-        return _lease_head_is_author_attested(
+    def verify() -> tuple[bool, str]:
+        attestation = verdict(_lease_head_is_author_attested(
             path, expected_branch, expected_head, observed_head,
             observed_state=observed_state,
             scope=scope, lease=lease, ifc_state=ifc_state,
-        )
+        ))
+        return attestation.ok, attestation.reason
 
-    ok = review_state.author_attestation_verdict(
-        observed_head,
-        verify,
-    )
-    if not ok and _lease_refusal_reason.get() == LeaseAttestationReason.REVIEW_STATE_MISMATCH:
-        # A cached False has no reason attached; recheck only to diagnose it.
-        # The cached boolean remains authoritative even if a later probe succeeds.
-        verify()
-    return verdict(ok)
+    ok, reason = review_state.author_attestation_verdict(observed_head, verify)
+    return LeaseAttestation(ok, reason)
 
 
 def _lease_has_clean_lineage(
@@ -10864,7 +10858,7 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
     except (OSError, subprocess.SubprocessError) as error:
         _lease_refuse(_lease_exception_reason(error))
         return None
-    if not _lease_git_ok(result):
+    if not _lease_ancestor_ok(result):
         return None
     fields = {}
     for line in result.stdout.splitlines():
@@ -11000,7 +10994,7 @@ def _lease_head_is_author_attested(
                 return _lease_refuse(LeaseAttestationReason.ANCESTRY_FAILURE)
             if original_patches is None:
                 merge_base = run("merge-base", expected_head, base)
-                if not _lease_git_ok(merge_base):
+                if not _lease_ancestor_ok(merge_base):
                     return False
                 # Read one beyond the budget so oversized ranges fail closed
                 # before any per-commit show/patch-id subprocess is launched.
@@ -11018,7 +11012,7 @@ def _lease_head_is_author_attested(
                         original_patches[original_patch] += 1
             replayed_patch = patch_id(commit)
             if replayed_patch is None or original_patches[replayed_patch] <= 0:
-                if _lease_refusal_reason.get() != LeaseAttestationReason.REVIEW_STATE_MISMATCH:
+                if _lease_refusal_reason.get() is not None:
                     return False
                 return _lease_refuse(LeaseAttestationReason.PATCH_ID_MISMATCH)
             original_patches[replayed_patch] -= 1
