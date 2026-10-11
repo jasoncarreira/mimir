@@ -1053,12 +1053,27 @@ async def test_permission_wait_survives_until_answer_or_prompt_cleanup(
                     # Cancel only the model, without first withdrawing peer handles.
                     active.model_task.cancel()
                 elif ending == "replace":
-                    agent.on_connect(Client())
-                    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
-                    # Exercise the patched 0.01s retirement grace, not just
-                    # eventual cleanup: both a 20s sleep and the unpatched 2s
-                    # default must exceed this response guard.
-                    await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 1.0)
+                    slept: list[float] = []
+                    real_sleep = asyncio.sleep
+
+                    async def recording_sleep(delay: float, *args: Any, **kwargs: Any) -> Any:
+                        slept.append(delay)
+                        return await real_sleep(delay, *args, **kwargs)
+
+                    # A retirement that only finishes via the cancel-window
+                    # timeout and force path would now take 60s, so the 15s guard
+                    # below discriminates by structure and tolerates a loaded run.
+                    monkeypatch.setattr(agent_module, "ACP_GENERATION_RETIRE_CANCEL_SECONDS", 60.0)
+                    monkeypatch.setattr(agent_module.asyncio, "sleep", recording_sleep)
+                    try:
+                        agent.on_connect(Client())
+                        await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+                        await asyncio.wait_for(asyncio.gather(*agent._retirement_tasks), 15.0)
+                    finally:
+                        monkeypatch.setattr(agent_module.asyncio, "sleep", real_sleep)
+                    # The patched grace (not the 2.0s default) is what retirement
+                    # waited on, proven from the recorded delay, not wall clock.
+                    assert agent_module.ACP_GENERATION_RETIRE_GRACE_SECONDS in slept
                 else:
                     if ending == "shutdown":
                         await transport.incoming.put(None)
