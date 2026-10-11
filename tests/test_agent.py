@@ -2029,6 +2029,128 @@ async def test_chat_turns_share_only_bounded_human_acknowledgement(tmp_path):
     assert seen[2].ingest_acknowledgement is not seen[1].ingest_acknowledgement
 
 
+async def test_chat_trust_acknowledgement_is_keyed_by_authenticated_principal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    from mimir import approval_requests, trust_approval
+
+    monkeypatch.setattr(trust_approval, "log_durable_event_sync", lambda *_a, **_kw: None)
+    source = SourceLabel(
+        principal="external", domain="web", resource_id="reviewed-source",
+        bridge_instance="remote", sensitivity="public",
+        authorized_principals=frozenset({"alice", "bob"}),
+        source_kind="protected_tool", integrity="untrusted",
+        integrity_effect="active_ingest",
+    )
+    seen = []
+
+    class Probe(_FakeAgent):
+        async def astream(self, state, *, config, context=None, stream_mode="values"):
+            # Re-present the same reviewed source, not a fresh acquisition. A
+            # newly read untrusted source must re-taint even the same admin.
+            context.ifc_state.merge(InformationFlowLabels().with_source(source))
+            seen.append((context.canonical_principal,
+                         context.ifc_state.ingest_acknowledgement,
+                         context.ifc_state.has_untrusted_active_ingest()))
+            if len(seen) == 1:
+                delivered = asyncio.get_running_loop().create_future()
+
+                async def send(*_args):
+                    delivered.set_result(None)
+
+                from mimir._context import get_current_turn
+
+                turn = get_current_turn()
+                assert turn is not None
+                turn.trust_notice_sender = send
+                request_id = trust_approval.register_chat_request(turn, context)
+                assert request_id is not None
+                try:
+                    await asyncio.wait_for(delivered, HANG_GUARD_SECONDS)
+                    reply = AgentEvent(
+                        trigger="user_message", source="discord", author="discord-99",
+                        channel_id=context.channel_id, content=f"trust {request_id}",
+                    )
+                    resolution = approval_requests.resolve(reply, turn.identity_resolver)
+                    assert resolution.entry is not None
+                    assert "trusted" in await trust_approval.complete_reply(
+                        reply, resolution, turn.identity_resolver,
+                    )
+                    assert not context.ifc_state.has_untrusted_active_ingest()
+                finally:
+                    approval_requests.cancel(request_id)
+            async for snapshot in super().astream(state, config=config, context=context,
+                                                  stream_mode=stream_mode):
+                yield snapshot
+
+    agent = _build_agent(tmp_path, fake_agent=Probe([AIMessage(content="done")]), fake_saga=None)
+    agent._identity_resolver = _resolver(agent._config.home, """
+    people:
+      - canonical: alice
+        aliases: [discord-99]
+        access: {roles: [admin]}
+      - canonical: bob
+        aliases: [discord-97]
+        access: {roles: [admin]}
+    """)
+    for author in ("discord-99", "discord-97", "discord-99"):
+        record = await agent.run_turn(AgentEvent(
+            trigger="user_message", source="discord", author=author,
+            channel_id="discord-room", content="continue",
+        ))
+        assert record.error is None
+    assert [(principal, tainted) for principal, _cell, tainted in seen] == [
+        ("alice", True), ("bob", True), ("alice", False),
+    ]
+    assert seen[0][1] is seen[2][1]
+    assert seen[1][1] is not seen[0][1]
+
+
+async def test_chat_acknowledgement_257th_cell_evicts_least_recently_used(
+    tmp_path: Path,
+):
+    from mimir.models import IngestAcknowledgement
+
+    agent = _build_agent(tmp_path, fake_agent=_FakeAgent([AIMessage(content="done")]),
+                         fake_saga=None)
+    agent._identity_resolver = _resolver(agent._config.home, """
+    people:
+      - canonical: alice
+        aliases: [discord-99]
+        access: {roles: [admin]}
+    """)
+    now = time.monotonic()
+    cells = {
+        (f"discord-room-{i}", "alice"): IngestAcknowledgement(last_used=now - 100)
+        for i in range(256)
+    }
+    # Neither LRU is first in insertion order; all entries are non-idle.
+    refreshed_key = ("discord-room-42", "alice")
+    evicted_key = ("discord-room-17", "alice")
+    cells[refreshed_key].last_used = now - 500
+    cells[evicted_key].last_used = now - 400
+    agent._chat_ingest_acknowledgements.update(cells)
+
+    async def run(channel):
+        record = await agent.run_turn(AgentEvent(
+            trigger="user_message", source="discord", author="discord-99",
+            channel_id=channel, content="continue",
+        ))
+        assert record.error is None
+
+    await run(refreshed_key[0])
+    cache = agent._chat_ingest_acknowledgements
+    assert len(cache) == 256
+    assert cache[refreshed_key] is cells[refreshed_key]
+    assert cache[refreshed_key].last_used > now
+    new_key = ("discord-room-256", "alice")
+    await run(new_key[0])
+    assert len(cache) == 256
+    assert set(cache) == (set(cells) - {evicted_key}) | {new_key}
+    assert all(cache[key] is cell for key, cell in cells.items() if key != evicted_key)
+    assert all(cache[new_key] is not cell for cell in cells.values())
+
+
 async def test_run_turn_forked_tool_uses_merged_ifc_labels_from_auth_carrier(
     tmp_path: Path,
 ):
