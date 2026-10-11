@@ -5231,6 +5231,47 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
         github_module.GitHubForgeClient(token="a-second-token").verify_identity("factory-owner")
 
 
+def _stub_factory_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve the launch identity offline: the recovery tests own the launch, not GitHub."""
+    import mimir.worklink.orchestrator as orchestrator
+
+    class Forge:
+        def __init__(self, *, token: str) -> None:
+            assert token == "factory-token"
+
+        def verify_identity(self, login: str) -> str:
+            assert login == "factory-owner"
+            return login
+
+    monkeypatch.setattr(
+        orchestrator, "_read_checkout_git_identity",
+        lambda checkout, runner: ("Factory Bot", "factory@example.invalid"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_read_factory_publishing_identity",
+        lambda repo: ("factory-owner", ".factory.json"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_resolve_factory_github_credential",
+        lambda environ: ("factory-token", {"GH_TOKEN": "factory-token"}),
+    )
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", Forge)
+
+
+def _assert_fresh_driver_launch(spec: WorkSpec, operator_checkout: Path, run_id: str) -> None:
+    """A fresh-session relaunch must look like the initial launch to /feature intake."""
+    from mimir.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+
+    argv = spec.local_argv
+    assert argv is not None and "--session" not in argv
+    assert argv[argv.index("--dir") + 1] == str(operator_checkout)
+    assert spec.local_checkout == operator_checkout
+    assert json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])["run_id"] == run_id
+    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "factory-owner"
+    assert spec.env["GH_TOKEN"] == "factory-token"
+    assert spec.env["GIT_AUTHOR_EMAIL"] == spec.env["GIT_COMMITTER_EMAIL"] == "factory@example.invalid"
+
+
 def _configure_opencode_oauth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9756,6 +9797,11 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     retained_session: str,
     idle_park: bool,
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
+    import mimir.worklink.orchestrator as orchestrator
+
+    # This harness retains run "700"; derive the issue's work item to match it.
+    monkeypatch.setattr(orchestrator, "epic_run_id", lambda issue_id: str(issue_id))
     from mimir.worklink.compute import LocalSubprocessComputeBackend
     from mimir.worklink.run_state import process_start_ticks
 
@@ -9896,6 +9942,7 @@ print(json.dumps([str(path) for path in pruned]))
             assert spec.local_argv is not None
             assert "--session" not in spec.local_argv
             assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
+            _assert_fresh_driver_launch(spec, sandbox.parent.parent, "700")
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -10034,7 +10081,8 @@ print(json.dumps([str(path) for path in pruned]))
         assert compute.spec.issue_id == retained.issue_id == 700
         assert compute.spec.attempt == retained.attempt == 3
         argv = tuple(compute.spec.local_argv or ())
-        assert argv[argv.index("--dir") + 1] == str(sandbox)
+        # A fresh driver launches from the operator checkout, as on the initial launch.
+        assert argv[argv.index("--dir") + 1] == str(original_checkout)
 
 
 @pytest.mark.parametrize(
@@ -10045,6 +10093,8 @@ print(json.dumps([str(path) for path in pruned]))
         ("changed_history", ["status", "lock:claim", "status"]),
         ("missing_next", ["status", "resume", "status"]),
         ("live_process", ["status"]),
+        # Identity is resolved before any lock or resume, so a refusal changes nothing.
+        ("identity_refused", ["status"]),
         ("release_failed", ["status", "resume", "status", "lock:release"]),
         ("release_held", ["status", "resume", "status", "lock:release", "status"]),
         ("release_owner", ["status", "resume", "status", "lock:release", "status"]),
@@ -10059,7 +10109,18 @@ def test_factory_recovery_rejection_command_matrix(
     case: str,
     expected: list[str],
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.orchestrator as orchestrator
+
+    if case == "identity_refused":
+        class RefusingForge:
+            def __init__(self, *, token: str) -> None:
+                pass
+
+            def verify_identity(self, login: str) -> str:
+                raise orchestrator.GitHubIdentityVerificationError("credential is not factory-owner")
+
+        monkeypatch.setattr(orchestrator, "GitHubForgeClient", RefusingForge)
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -10197,6 +10258,7 @@ def test_factory_recovery_rejection_command_matrix(
                 base="main",
                 test_cmd="pytest -q",
                 runner=lambda args: cp(args),
+                work_item_json=json.dumps({"run_id": "700", "title": "epic", "body": "build"}),
         )
 
     if case.startswith("release_"):
@@ -10229,6 +10291,7 @@ def test_factory_recovery_launch_start(
     existing_start: bool,
     write_failure: str | None,
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.dispatch_failures as failures
     import mimir.worklink.orchestrator as orchestrator
 
@@ -10324,6 +10387,7 @@ def test_factory_recovery_launch_start(
         base="main",
         test_cmd="pytest -q",
         runner=lambda args: cp(args),
+        work_item_json=json.dumps({"run_id": "700", "title": "epic", "body": "build"}),
         autonomous=autonomous,
     )
     if write_failure == "record":
@@ -10341,6 +10405,7 @@ def test_factory_recovery_launch_start(
 def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
@@ -10407,6 +10472,7 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
             base="main",
             test_cmd="pytest -q",
             runner=lambda args: cp(args),
+            work_item_json=json.dumps({"run_id": "700", "title": "epic", "body": "build"}),
         )
     )
 
