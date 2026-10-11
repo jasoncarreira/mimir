@@ -7,9 +7,10 @@ Parameters
 
 Licensor:             Jason Carreira
 
-Licensed Work:        The mimir coding plugin: the contents of the
-                      plugins/coding/ directory of the mimir repository,
-                      distributed as the mimir-coding package. The
+Licensed Work:        mimir-cultivate, the mimir coding plugin: the contents
+                      of the plugins/cultivate/ directory of the mimir
+                      repository, distributed as the mimir-cultivate
+                      package. The
                       Licensed Work is (c) 2026 Jason Carreira. The
                       Licensed Work excludes third-party material that
                       carries its own license, which remains under its
