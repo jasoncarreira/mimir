@@ -8,6 +8,68 @@ All notable changes will land here. Format loosely follows
 
 Changes awaiting release are recorded in [changelog.d/](changelog.d/).
 
+## [0.9.9] — 2026-10-11
+
+- Measure proposed post-ingest egress vetoes with shadow-only `egress_veto_would_block` telemetry and a read-only `mimir stats --egress-shadow` report; authorization behavior is unchanged.
+
+- Retry the authenticated pinned Chainlink CLI CI install and skip pytest evidence uploads cleanly when setup fails early (#1916).
+
+- Independently attest scoped check/server projections so parallel read order does not taint an attested PR; keep post-push forge scope unchanged, preserve successful writes when follow-up attestation is unavailable without trusting their results, and distinguish content-free in-progress log refusals from untrusted adapter errors.
+
+- Persist active-ingest taint sources ahead of informational feedback in turn records, with per-category counts and taint domains (#1918).
+
+- Close SSE streams and start dispatcher drain during HTTP shutdown so container stops write a clean marker within the supervisor grace.
+
+- Point Worklink incident turns at build evidence and report missing in-root records as not found instead of access denied.
+
+- Give macOS pytest jobs more headroom, log runner capacity and slow tests, rebalance xdist workers, and shorten the recovery test's configured polling wait (#1922).
+
+- Keep author-attested checkout provenance on bounded `repo_test` failure summaries, allowing fix-and-rerun while keeping requested raw failure output untrusted. Validate failing ids against controller-owned test definitions before execution and again at classification; strip bounded parameter suffixes, cap total id bytes, and parse undecorated pytest `-q` counts. Counts remain output observations, not independently attested run totals.
+- The credential-material snapshot-refusal assertion in `tests/test_repo_tools.py` was inverted: the controller's fixed diagnostic now raises an unlabelled `ToolPolicyRefusal`, rather than tainting the turn. Arbitrary diagnostics remain untrusted.
+- Make the ACP cancellation-order regression release the resistant runner before asserting ordering, so an ordering violation fails rather than hangs.
+
+- Return 404 for missing dashboard assets and recover once from stale lazy-loaded chunks after a deploy (#1924).
+
+- Prevent broadcast and role/group pings in Discord and Slack outbound messages and neutralize display names in pairing alerts (#1925).
+
+- Enforce operator-configured Discord and Slack channel scope before inbound intake, with protected file or process-environment settings and content-free drop events.
+
+- Discord and Slack denied DM senders now receive one-time pairing codes by default; operators can approve with `mimir identities approve-pairing --code <CODE>`.
+
+- Allow admins to approve or reject pending Discord and Slack pairings from the Users page or by request ID in the operator channel.
+
+- Warn when enforced Discord/Slack pairing has no operator alert channel, and list chat, dashboard, and CLI approval paths in pairing digests.
+
+- Add per-platform DM/channel unknown-sender intake policy in identities.yaml, with silent ignore and private decline modes.
+
+- Add opt-in Discord guild-role admission with per-message rechecks and automatic user-role revocation.
+
+- Serialize identity CLI edits and setup seeding with server writes to prevent lost identities and pairing state, and abort identity transactions on read errors, malformed YAML, or invalid document shapes instead of overwriting recoverable files; accept empty/comment-only documents and null `people` while preserving the comment header.
+
+- Pull the Python base image from the ECR Public Docker Official Images mirror by default in the deployment and scaffolded Dockerfiles, with a `BASE_IMAGE` build-arg override (#1933).
+
+- Preserve trusted PR checkout leases across clean local commits and verified protected-base rebases, while refusing tainted or unrecorded lineage and dropping stale own-push remediation triggers.
+
+- Keep attested own-repository Git, forge, test, and CI output trusted across failures so remediation can continue after conflicts.
+
+- Refuse model tool calls that write code or live state after untrusted active ingest, regardless of enforcement mode, including repository execution/publication, ACP hands and SAGA mutations; retain scratch and gated operator-reviewed proposals, keep egress approvals from unlocking writes, close scratch-backed live loaders, and preserve server-owned continuation, offload and retrieval bookkeeping (#1937).
+
+- Add shared content-free GitHub author withholding helpers and pin untrusted GitHub URL fetch provenance (#1938).
+
+- Withhold non-collaborator GitHub PRs and thread content before scoped tools can read them.
+
+- Withhold outsider GitHub issues, PR activity, reviews and CI content from poller prompts; surface content-free operator notices instead.
+
+- Create a private per-turn scratch directory before agent tools run and refuse symlinked scratch paths.
+
+- Replace the model-callable ingest-taint clear with authenticated operator Clear/Keep requests in ACP and one-shot trust replies in chat; keep source provenance append-only and re-taint on new untrusted content (#1942).
+
+- Trust successful results from configured MCP servers by default while keeping drift, failure, and unresolved results untrusted; remove the retired per-tool result-integrity control from the admin UI and policy API, and warn when hand-written server policies still include it.
+
+- Add a scoped, trusted `pr_spec` read of the armed Chainlink spec bound to a pull request by Worklink evidence.
+
+- **social-cli skill:** the `social-cli-notifications` and `social-cli-feed` pollers grant `approved_urls: ["https://public.api.bsky.app/"]` (Bluesky's public read-only API), so their routine `fetch_url` reads are an approved destination for the egress veto (#1903). Installed homes pick this up with `mimir skills update social-cli --apply`.
+
 ## [0.9.8] — 2026-10-09
 
 - Fix false scheduler-wedge alarms and preserve mapping-form scheduler.yaml when merging new default jobs (#1915).
