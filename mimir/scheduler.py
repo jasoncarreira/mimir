@@ -3182,6 +3182,21 @@ class Scheduler:
 
     # ---- Worklink TTL reaper cron (slice-3 autonomy, #444) -----------
 
+    def add_worklink_factory_park_alert_job(
+        self, home: Path, channel: str, channels: Any,
+    ) -> bool:
+        """Check retained factory parks every five minutes without a model turn."""
+        from .worklink.park_alerts import alert_parked_factory_runs
+
+        async def _fire() -> None:
+            await alert_parked_factory_runs(home, channel, channels)
+
+        return self.register_callable(
+            name="worklink-factory-park-alert", fn=_fire,
+            default_cron="*/5 * * * *", job_id="worklink-factory-park-alert",
+            max_instances=1, coalesce=True,
+        )
+
     def add_worklink_reaper_job(
         self,
         home: Path,

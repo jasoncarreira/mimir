@@ -1999,6 +1999,14 @@ def build_app(config: Config) -> web.Application:
         except ValueError as exc:
             await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-reaper")
 
+        # A parked factory run needs an operator even when the TTL reaper is off.
+        try:
+            scheduler.add_worklink_factory_park_alert_job(
+                config.home, config.operator_alert_channel, channels,
+            )
+        except ValueError as exc:
+            await log_event("scheduler_invalid_cron", error=str(exc), job="worklink-factory-park-alert")
+
         # Enforce each PR checkout lease's recorded expiry. The root itself is
         # opt-in, but configured deployments get a default-on periodic sweep.
         lease_root_value = os.environ.get("MIMIR_PR_CHECKOUT_LEASE_ROOT", "").strip()
