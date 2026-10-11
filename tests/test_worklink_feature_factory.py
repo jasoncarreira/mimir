@@ -1142,6 +1142,20 @@ def test_recovery_launch_binds_opencode_to_factory_session(
     assert argv[argv.index("--session") + 1] == "session-1"
 
 
+@pytest.mark.parametrize("session", [None, "session-1"])
+@pytest.mark.parametrize("run_id", ["chainlink-1947", "1947"])
+def test_factory_request_bytes_are_the_bare_run_id_after_leading_options(
+    tmp_path: Path, session: str | None, run_id: str,
+) -> None:
+    argv = FeatureFactoryBackend.opencode_argv(
+        tmp_path, run_id, "openai/model", session=session,
+    )
+    # This pins the byte-level adapter boundary; it is NOT an execution of
+    # the external adapter's parser or a proof of resumed-driver context.
+    assert argv[-3:-1] == ("--command", "feature")
+    assert argv[-1] == f" --autonomous --max-retries 5 {run_id}"
+
+
 @pytest.mark.parametrize("ambient_model", ["codex-plus:gpt-5.6-luna", "claude-code:sonnet"])
 def test_recovery_launch_uses_retained_legacy_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ambient_model: str
@@ -1161,7 +1175,7 @@ def test_recovery_launch_uses_retained_legacy_run_id(
         run_id="1551",
     )
 
-    assert (spec.local_argv or ())[-1].split()[-1] == "1551"
+    assert (spec.local_argv or ())[-1] == " --autonomous --max-retries 5 1551"
 
 
 def test_status_before_sandbox_creation_returns_not_ready(tmp_path: Path) -> None:

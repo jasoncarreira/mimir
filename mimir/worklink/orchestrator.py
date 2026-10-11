@@ -3151,8 +3151,13 @@ class WorklinkRunner:
         startup_timeout = _factory_startup_status_timeout_s()
         startup_deadline = min(deadline, loop.time() + startup_timeout)
         stale_after = _epic_stale_heartbeat_s()
+        # Silence during a model generation is not proof that the loop exited.
+        # Keep the short stale diagnostic distinct from the conservative idle
+        # backstop (at least two hours, and eight diagnostic windows).
+        idle_after = max(7200.0, 8 * stale_after)
         last_status: FactoryStatus | None = None
         last_change = loop.time()
+        last_change_at = datetime.now(UTC).isoformat()
         work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
         transcript_root = self.home / "state" / "worklink" / "transcripts"
         transcript_snapshot = _factory_transcript_snapshot(
@@ -3214,13 +3219,12 @@ class WorklinkRunner:
             cancel_attempted = True
             await compute.cancel(handle)
 
-        async def park_for_budget(current: FactoryStatus) -> WorklinkRunResult:
+        async def park_for_reason(current: FactoryStatus, reason: str) -> WorklinkRunResult:
             nonlocal factory_record, failed, wait_result
-            reason = _factory_budget_park_reason(current, factory_record)
             await cancel_once()
             wait_result = await _finish_factory_wait_task(wait_task)
             if compute.job_alive(handle):
-                raise WorklinkError("factory driver survived cancellation before budget park")
+                raise WorklinkError("factory driver survived cancellation before park")
             retain_result(wait_result, "needs-human")
             await asyncio.to_thread(
                 backend.terminal,
@@ -3334,7 +3338,9 @@ class WorklinkRunner:
         try:
             while True:
                 if last_status is not None and loop.time() >= park_deadline:
-                    return await park_for_budget(last_status)
+                    return await park_for_reason(
+                        last_status, _factory_budget_park_reason(last_status, factory_record)
+                    )
                 if recovery_session is not None and loop.time() >= startup_deadline:
                     raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
                 if status is None:
@@ -3346,7 +3352,9 @@ class WorklinkRunner:
                     if remaining <= 0:
                         if last_status is None:
                             raise WorklinkError("factory never initialised before startup deadline")
-                        return await park_for_budget(last_status)
+                        return await park_for_reason(
+                            last_status, _factory_budget_park_reason(last_status, factory_record)
+                        )
                     try:
                         status = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -3362,7 +3370,9 @@ class WorklinkRunner:
                             raise WorklinkError(
                                 "factory never initialised before startup deadline"
                             ) from exc
-                        return await park_for_budget(last_status)
+                        return await park_for_reason(
+                            last_status, _factory_budget_park_reason(last_status, factory_record)
+                        )
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
@@ -3432,6 +3442,7 @@ class WorklinkRunner:
                             end_stale_episode("liveness_observed")
                             dead_windows = 0
                             last_change = now
+                            last_change_at = datetime.now(UTC).isoformat()
                             work_snapshot = current_work
                             transcript_snapshot = current_transcript
                             status_changed_in_window = False
@@ -3462,7 +3473,19 @@ class WorklinkRunner:
                                     lock=status.lock,
                                     process_alive=compute.job_alive(handle),
                                 )
-                    if stale_failure is None and dead_windows >= 2:
+                            if (
+                                status.status == "running"
+                                and now - last_change >= idle_after
+                                and compute.job_alive(handle)
+                            ):
+                                reason = f"factory driver idle: no progress since {last_change_at}"
+                                end_stale_episode("driver_idle")
+                                return await park_for_reason(status, reason)
+                    if (
+                        stale_failure is None
+                        and dead_windows >= 2
+                        and not compute.job_alive(handle)
+                    ):
                         try:
                             incident = incident_owner.record(
                                 producer="factory_stall",
@@ -3551,7 +3574,9 @@ class WorklinkRunner:
                     )
                 if loop.time() >= park_deadline:
                     assert last_status is not None
-                    return await park_for_budget(last_status)
+                    return await park_for_reason(
+                        last_status, _factory_budget_park_reason(last_status, factory_record)
+                    )
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
                 if pre_manifest or recovery_session is not None:

@@ -749,6 +749,8 @@ class FeatureFactoryBackend:
         # feature-factory 0.7.5 stages the workflow inside the run directory, so
         # OpenCode --auto must not bypass it.
         session_args = ("--session", session) if session is not None else ()
+        # /feature preserves the request after leading options byte-for-byte
+        # for run selection. Never append controller context to those bytes.
         return (
             "opencode",
             "run",
