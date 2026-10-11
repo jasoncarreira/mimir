@@ -80,22 +80,54 @@ def test_runtime_preloads_jemalloc_via_arch_independent_symlink() -> None:
     assert "-linux-gnu/libjemalloc" not in text, "LD_PRELOAD must not hardcode an arch path"
 
 
-@pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")
-# Hang guard above the 300s build subprocess bound, so that bound reports first.
-@pytest.mark.timeout(420)
+def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess[str]:
+    """Execute the actual early-stage shell program, without a registry pull.
+
+    Docker can fail fetching its base before executing any RUN instruction.
+    Keep the validation proof offline; the positive built-image test below
+    remains the end-to-end Docker integration proof.
+    """
+    stage = _text().split("FROM ${BASE_IMAGE} AS provenance-validation\n", 1)[1]
+    stage = stage.split("FROM provenance-validation AS base\n", 1)[0]
+    names = ("MIMIR_GIT_REF", "MIMIR_CONTROLLER_COMMIT", "MIMIR_EXECUTOR_COMMIT")
+    for name in names:
+        assert f"ARG {name}\n" in stage
+    program = stage.split("RUN ", 1)[1].strip().replace("\\\n", "\n")
+    # Docker's unset ARGs are empty, regardless of the test process environment.
+    env = {**os.environ, **dict.fromkeys(names, ""), **build_args}
+    return subprocess.run(
+        ["/bin/sh", "-c", program], cwd=ROOT, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=30,
+    )
+
+
 def test_build_without_provenance_args_fails_with_named_error() -> None:
     """The canonical root image must never build without pinned provenance."""
-    result = subprocess.run(
-        ["docker", "build", "--progress=plain", "."],
-        cwd=ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-        timeout=300,
-    )
-    assert result.returncode != 0
+    result = _run_provenance_validation()
+    assert result.returncode == 2
     assert "MIMIR_GIT_REF is required" in result.stdout
+
+
+@pytest.mark.parametrize("build_args,error", [
+    ({"MIMIR_GIT_REF": "main"}, "MIMIR_GIT_REF must be a fully qualified"),
+    ({"MIMIR_GIT_REF": "refs/heads/main"}, "MIMIR_CONTROLLER_COMMIT must be a full"),
+    ({"MIMIR_GIT_REF": "refs/heads/main", "MIMIR_CONTROLLER_COMMIT": "a" * 40},
+     "MIMIR_EXECUTOR_COMMIT must be a full"),
+    ({"MIMIR_GIT_REF": "refs/heads/main", "MIMIR_CONTROLLER_COMMIT": "a" * 40,
+      "MIMIR_EXECUTOR_COMMIT": "b" * 40}, "MIMIR_EXECUTOR_COMMIT must equal"),
+])
+def test_provenance_validation_rejects_invalid_args(build_args, error) -> None:
+    result = _run_provenance_validation(**build_args)
+    assert result.returncode == 2
+    assert error in result.stdout
+
+
+def test_provenance_validation_accepts_pinned_args() -> None:
+    result = _run_provenance_validation(
+        MIMIR_GIT_REF="refs/heads/main", MIMIR_CONTROLLER_COMMIT="a" * 40,
+        MIMIR_EXECUTOR_COMMIT="a" * 40,
+    )
+    assert result.returncode == 0, result.stdout
 
 
 @pytest.mark.skipif(shutil.which("docker") is None, reason="Docker is unavailable")

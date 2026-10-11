@@ -357,13 +357,28 @@ def test_repo_scope_fixture_ignores_inherited_git_context(
     assert not (foreign / "refs" / "heads" / "worklink" / "7").exists()
 
 
-def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(tmp_path: Path) -> None:
+def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import inspect
 
-    from mimir import access_control
+    from mimir import access_control, repo_tools
     from mimir.access_control import SinkGate
     from mimir.models import SourceLabel
 
+    # This proves taint precedence over a genuinely attested checkout, not Git
+    # latency. Loaded macOS runners can exceed the production five-second
+    # fail-closed bound. Keep the real hardened Git proof but give this test's
+    # subprocess a loose hang guard; timeout refusal is tested separately in
+    # test_lease_attestation_reasons.py. Production bounds remain unchanged.
+    hardened_git = repo_tools.hardened_git_command
+
+    def policy_test_git(root, arguments, **kwargs):
+        assert arguments == ("status", "--porcelain=v2", "--branch", "--untracked-files=no")
+        assert kwargs["timeout"] == 5
+        return hardened_git(root, arguments, **{**kwargs, "timeout": 30})
+
+    monkeypatch.setattr(repo_tools, "hardened_git_command", policy_test_git)
     _origin, _source, scope, state = _repo_scope_and_state(tmp_path)
     lease = state.checkout_lease
     assert lease is not None and lease.head_sha == scope.observed_head_sha
