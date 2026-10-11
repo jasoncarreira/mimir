@@ -80,6 +80,83 @@ def test_runtime_preloads_jemalloc_via_arch_independent_symlink() -> None:
     assert "-linux-gnu/libjemalloc" not in text, "LD_PRELOAD must not hardcode an arch path"
 
 
+def _assert_provenance_stage_ancestry(text: str) -> None:
+    """Every build target must inherit the validation RUN, not merely copy it."""
+    # Join Docker continuation lines before reading instructions. FROM supports
+    # an optional platform flag and optional alias; unnamed stages still have
+    # numeric indexes that later FROM instructions may inherit.
+    logical_lines = re.sub(r"\\\r?\n", " ", text).splitlines()
+    stages: list[tuple[str, str | None]] = []
+    for line in logical_lines:
+        if not re.match(r"^\s*FROM\b", line, re.IGNORECASE):
+            continue
+        match = re.fullmatch(
+            r"\s*FROM\s+(?:--platform=\S+\s+)?(?P<parent>\S+)"
+            r"(?:\s+AS\s+(?P<alias>[\w.-]+))?\s*",
+            line, re.IGNORECASE,
+        )
+        assert match is not None, f"unparsed FROM instruction: {line}"
+        stages.append((match["parent"], match["alias"]))
+
+    assert stages, "Dockerfile has no image stages"
+    assert stages[0] == ("${BASE_IMAGE}", "provenance-validation"), (
+        "provenance-validation must be the sole external-image root"
+    )
+    validated: set[str] = set()
+    aliases: set[str] = set()
+    for index, (parent, alias) in enumerate(stages):
+        if index:
+            assert parent.lower() in validated, (
+                f"stage {alias or index} bypasses provenance-validation: FROM {parent}"
+            )
+        if alias is not None:
+            normalized = alias.lower()
+            assert normalized not in aliases, f"duplicate stage alias: {alias}"
+            aliases.add(normalized)
+            validated.add(normalized)
+        validated.add(str(index))
+    # The final stage is Docker's default build target, including when unnamed.
+    assert str(len(stages) - 1) in validated, "default target bypasses provenance-validation"
+
+
+def test_every_image_stage_inherits_provenance_validation() -> None:
+    _assert_provenance_stage_ancestry(_text())
+
+
+def test_provenance_stage_ancestry_accepts_transitive_and_numeric_parents() -> None:
+    _assert_provenance_stage_ancestry(
+        "FROM ${BASE_IMAGE} AS provenance-validation\n"
+        "from --platform=$BUILDPLATFORM provenance-validation as base\n"
+        "FROM base AS runtime\n"
+        "FROM 2\n"
+    )
+
+
+@pytest.mark.parametrize("mutation", [
+    "appended_base_image", "appended_external_image", "appended_scratch",
+    "detached_intermediate", "copy_only", "missing_validation", "duplicate_alias",
+])
+def test_provenance_stage_ancestry_rejects_bypass_mutations(monkeypatch, mutation) -> None:
+    text = _text()
+    if mutation == "appended_base_image":
+        text += "\nFROM ${BASE_IMAGE} AS unvalidated-runtime\nRUN true\n"
+    elif mutation == "appended_external_image":
+        text += "\nFROM python:3.11-slim AS unvalidated-runtime\nRUN true\n"
+    elif mutation == "appended_scratch":
+        text += "\nFROM scratch\n"
+    elif mutation == "detached_intermediate":
+        text = text.replace("FROM provenance-validation AS base", "FROM ${BASE_IMAGE} AS base")
+    elif mutation == "copy_only":
+        text += "\nFROM scratch AS copied-runtime\nCOPY --from=base /opt /opt\n"
+    elif mutation == "missing_validation":
+        text = text.replace("AS provenance-validation", "AS unvalidated")
+    else:
+        text += "\nFROM base AS provenance-validation\n"
+    monkeypatch.setattr(f"{__name__}._text", lambda: text)
+    with pytest.raises(AssertionError, match="provenance-validation|duplicate stage alias"):
+        test_every_image_stage_inherits_provenance_validation()
+
+
 def _run_provenance_validation(**build_args: str) -> subprocess.CompletedProcess[str]:
     """Execute the actual early-stage shell program, without a registry pull.
 
