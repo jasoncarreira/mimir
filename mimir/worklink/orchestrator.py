@@ -728,6 +728,13 @@ def render_work_item(issue: IssueContext) -> str:
     )
 
 
+def _bind_work_item_run_id(payload: str, run_id: str) -> str:
+    """Return the rendered work item naming ``run_id``, in the renderer's encoding."""
+    work_item = json.loads(payload)
+    work_item["run_id"] = run_id
+    return json.dumps(work_item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     """Validate the rendered factory payload and return its declared run ID."""
     try:
@@ -2986,9 +2993,12 @@ class WorklinkRunner:
         # The sandbox lives at <operator checkout>/.factory-sandboxes/<run id>.
         operator_checkout = sandbox.parent.parent
         # Resolve identity before touching the lock, so a refusal leaves the run as found.
+        # Legacy retained runs use the numeric id; bind the work item to the retained
+        # id _verify_factory_recovery_target accepted rather than the canonical render.
         order, publishing_identity = self._factory_launch_order(
             issue=issue, checkout=operator_checkout,
-            work_item_json=work_item_json, runner=runner,
+            work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
+            runner=runner,
         )
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
