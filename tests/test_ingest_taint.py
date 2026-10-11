@@ -4,15 +4,14 @@ import asyncio
 import json
 import time
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
 from mimir import access_control
 from mimir._context import reset_current_turn, set_current_turn
 from mimir.models import (
-    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState,
-    SourceKind, SourceLabel, TurnContext, TurnInteractivity,
+    AuthContext, InformationFlowLabels, InformationFlowState,
+    SourceLabel, TurnContext, TurnInteractivity,
 )
 
 
@@ -35,6 +34,26 @@ def _auth(**changes) -> AuthContext:
     ), **changes)
 
 
+def test_human_acknowledgement_trusts_record_without_removing_provenance():
+    from mimir.agent import _effective_persisted_integrity
+
+    auth = _auth()
+    labels = auth.ifc_state.current()
+    assert labels.persisted_integrity == "untrusted"
+    assert _effective_persisted_integrity(labels, auth) == "untrusted"
+    assert auth.ifc_state.acknowledge_ingest_snapshot(
+        expected=labels, durable_audit=lambda _sources: True,
+    )
+    assert labels.persisted_integrity == "untrusted"  # Immutable source labels.
+    assert _effective_persisted_integrity(labels, auth) == "trusted"
+    assert not auth.ifc_state.permission_has_untrusted_active_ingest(labels)
+    auth.ifc_state.merge(InformationFlowLabels().with_source(replace(
+        labels.sources[0], resource_id="/private/new-secret.txt",
+    )))
+    assert _effective_persisted_integrity(auth.ifc_state.current(), auth) == "untrusted"
+    assert auth.ifc_state.permission_has_untrusted_active_ingest(labels)
+
+
 @pytest.fixture
 def live_turn(middleware_event_logger):
     auth = _auth()
@@ -47,47 +66,6 @@ def live_turn(middleware_event_logger):
         yield turn
     finally:
         reset_current_turn(token)
-
-
-@pytest.mark.parametrize(("changes", "reason"), [
-    ({"roles": ("user",)}, "admin_required"),
-    ({"roles": (), "trigger": "poller"}, "admin_required"),
-    ({"principal": ""}, "missing_authenticated_admin"),
-    ({"canonical_principal": None}, "missing_authenticated_admin"),
-    ({"is_service": True}, "service_identity_forbidden"),
-    ({"roles": ("admin", "service")}, "service_identity_forbidden"),
-    ({"service_authority": object()}, "service_identity_forbidden"),
-    ({"principal": "service:poller"}, "service_identity_forbidden"),
-    ({"trigger": "poller"}, "user_origin_required"),
-    ({"origin_trigger": "scheduled_tick"}, "user_origin_required"),
-    ({"event_ingress": "http_event"}, "user_origin_required"),
-    ({"ifc_state": None}, "missing_ifc_state"),
-])
-def test_clear_refuses_non_admin_service_and_poller(live_turn, changes, reason):
-    auth = replace(live_turn.auth_context, **changes)
-    live_turn.auth_context = auth
-    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (False, reason)
-    if isinstance(auth.ifc_state, InformationFlowState):
-        assert auth.ifc_state.permission_has_untrusted_active_ingest()
-
-
-@pytest.mark.parametrize("case", ["auth", "turn", "id", "blank_id", "carrier", "turn_auth"])
-def test_clear_requires_matching_live_turn(live_turn, case, monkeypatch):
-    auth = live_turn.auth_context
-    turn_id = live_turn.turn_id
-    if case == "auth":
-        auth = None
-    elif case == "id":
-        turn_id = "other"
-    elif case == "blank_id":
-        turn_id = ""
-    elif case == "carrier":
-        auth = _auth()
-    elif case == "turn_auth":
-        live_turn.auth_context = None
-    if case == "turn":
-        monkeypatch.setattr("mimir._context.get_current_turn", lambda: None)
-    assert access_control.clear_live_ingest_taint(auth, turn_id=turn_id)[0] is False
 
 
 @pytest.mark.parametrize(("changes", "reason"), [
@@ -186,124 +164,6 @@ def test_operator_declassification_then_fetch(live_turn, origin):
     assert auth.egress_state.is_url_approved(destination)
     assert invoke("fetch_url", {"url": destination}).status == "success"
     assert calls == ["fetch_url"]
-
-
-@pytest.mark.parametrize(("source_kind", "expected_kind"), [
-    *((kind.value, kind.value) for kind in SourceKind),
-    ("secret contents", "other"),
-    ("operator_command", "other"),  # Archival metadata, not a SourceKind.
-])
-def test_clear_audit_is_private_and_failure_is_atomic(
-    live_turn, tmp_path, monkeypatch, source_kind, expected_kind,
-):
-    auth = live_turn.auth_context
-    original = auth.ifc_state.current()
-    hostile = SourceLabel.from_record(dict(
-        original.sources[0].__dict__, domain="/private/domain", source_kind=source_kind,
-    ))
-    auth.ifc_state.merge(InformationFlowLabels().with_source(hostile))
-    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (True, "cleared")
-    events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
-    audit = next(event for event in events if event["type"] == "ifc_ingest_taint_cleared")
-    assert audit["turn_id"] == "untaint-turn"
-    assert audit["source_count"] == 2
-    assert audit["source_groups"] == [
-        {"domain": "filesystem", "source_kind": "protected_tool", "count": 1},
-        {"domain": "other", "source_kind": expected_kind, "count": 1},
-    ]
-    assert "private/" not in json.dumps(audit)
-    assert "secret" not in json.dumps(audit)
-    assert "arguments" not in audit
-    assert "sources" not in audit
-    auth.ifc_state.merge(original)
-
-    def unavailable(*args, **kwargs):
-        raise OSError("audit unavailable")
-
-    monkeypatch.setattr("mimir.event_logger.log_durable_event_sync", unavailable)
-    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (False, "clear_failed")
-    assert auth.ifc_state.permission_has_untrusted_active_ingest()
-
-
-def test_clear_only_affects_permission_taint_and_repeats(live_turn):
-    auth = live_turn.auth_context
-    state = auth.ifc_state
-    original = state.current()
-    for _ in range(3):
-        assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)[0]
-        assert not state.permission_has_untrusted_active_ingest()
-        assert state.current() is original
-        assert state.has_untrusted_active_ingest()
-        assert access_control.saga_mutation_taint_refusal(auth) is not None
-        assert original.persisted_integrity == "untrusted"
-        assert original.persisted_integrity_effect == "active_ingest"
-        state.merge(original)
-        assert state.permission_has_untrusted_active_ingest()
-    state.merge(InformationFlowLabels().with_source(replace(original.sources[0], resource_id="new")))
-    assert state.permission_has_untrusted_active_ingest()
-
-
-@pytest.mark.parametrize("current", [True, False])
-def test_acp_clear_publishes_session_boundary_before_untainting(live_turn, monkeypatch, current):
-    from mimir.acp.agent import ActivePrompt
-
-    session = SimpleNamespace(ingest_acknowledgement=None)
-    active = SimpleNamespace(session=session, _is_current=lambda: current)
-    broker = SimpleNamespace(acknowledge_ingest=lambda: ActivePrompt.acknowledge_ingest(active))
-    monkeypatch.setattr(
-        "mimir.tools.client_provider.get_turn_capability_context",
-        lambda: SimpleNamespace(permission_broker=broker),
-    )
-    auth = replace(live_turn.auth_context, origin_trigger="acp_session")
-    live_turn.auth_context = auth
-    result = access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)
-    assert result[0] is current
-    assert auth.ifc_state.permission_has_untrusted_active_ingest() is not current
-    boundary = session.ingest_acknowledgement
-    if current:
-        assert isinstance(boundary, str) and len(boundary) == 32
-        assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)[0]
-        assert session.ingest_acknowledgement == boundary  # No-op clears retain consent.
-    else:
-        assert boundary is None
-
-
-def test_acp_clear_without_broker_keeps_taint(live_turn, monkeypatch):
-    monkeypatch.setattr("mimir.tools.client_provider.get_turn_capability_context", lambda: None)
-    auth = replace(live_turn.auth_context, origin_trigger="acp_session")
-    live_turn.auth_context = auth
-    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id) == (
-        False, "clear_failed",
-    )
-    assert auth.ifc_state.permission_has_untrusted_active_ingest()
-
-
-def test_clear_requires_labels_and_snapshot_match():
-    state = InformationFlowState()
-    assert state.permission_has_untrusted_active_ingest()
-    assert not state.clear_ingest_taint(fallback=None, durable_audit=lambda _: True)
-    state.merge(_labels())
-    assert state.clear_ingest_taint(fallback=None, durable_audit=lambda _: True)
-    state.labels = state.labels.with_label("confidential")
-    assert state.permission_has_untrusted_active_ingest()
-
-
-def test_continuation_clear_does_not_mutate_bound_turn(live_turn):
-    from mimir.agent import _initialize_ifc_labels
-
-    bound = live_turn.auth_context
-    labels = _initialize_ifc_labels(AgentEvent(
-        trigger="user_message", channel_id=bound.channel_id, source="web",
-        content="continue", ifc_labels=bound.ifc_state.current(),
-        continuation_auth_context=bound,
-    ))
-    # Same fresh state construction as CoreAgent.run_turn explicit_session_binding.
-    continued = replace(bound, ifc_labels=labels, ifc_state=InformationFlowState(labels))
-    live_turn.auth_context = continued
-    assert access_control.clear_live_ingest_taint(continued, turn_id=live_turn.turn_id)[0]
-    assert not continued.ifc_state.permission_has_untrusted_active_ingest()
-    assert bound.ifc_state.permission_has_untrusted_active_ingest()
-    assert bound.ifc_state.current() is bound.ifc_labels
 
 
 @pytest.mark.parametrize(("tool", "target"), [
@@ -451,10 +311,14 @@ async def test_egress_still_requires_declassification(live_turn, tool, target, t
     auth = live_turn.auth_context
     before = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
     assert not before.allowed
-    assert access_control.clear_live_ingest_taint(auth, turn_id=live_turn.turn_id)[0]
+    snapshot = auth.ifc_state.current()
+    assert auth.ifc_state.acknowledge_ingest_snapshot(
+        expected=snapshot, durable_audit=lambda _sources: True,
+    )
     after = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
     assert not after.allowed
-    assert after.reason == before.reason
+    if tool == "write_file":
+        assert after.reason != "write_blocked_by_untrusted_ingest"
     assert not auth.ifc_state.consume_sink_approval(
         current=auth.ifc_labels, sink_category=access_control.get_sink_category(tool).value,
         destination=target, canonical_principal=auth.canonical_principal,
@@ -488,8 +352,7 @@ async def test_egress_still_requires_declassification(live_turn, tool, target, t
         )[0]
         approved = access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True)
         if tool == "write_file":
-            assert not approved.allowed and approved.reason == "write_blocked_by_untrusted_ingest"
-            assert approved.refusal_detail == access_control._TAINTED_WRITE_REFUSAL
-        else:
             assert approved.allowed and approved.reason == "ifc_declassification_approved"
+        else:
+            assert not approved.allowed  # Network destination remains separately gated.
         assert not access_control.SinkGate.check_sink_flow(tool, target, auth.ifc_labels, auth, enforce=True).allowed

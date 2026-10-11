@@ -60,7 +60,7 @@ import yaml
 
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
-from ..models import AuthContext
+from ..models import AuthContext, InformationFlowState
 from ..redaction import redact_text
 from ..tool_descriptors import (
     FetchAuthorizationKind,
@@ -77,7 +77,6 @@ from ..access_control import (
     SinkCategory,
     ToolAuthorization,
     approve_live_declassification,
-    clear_live_ingest_taint,
     approved_fetch_urls,
     fetch_url_is_approved,
     classify_protected_result,
@@ -2069,8 +2068,6 @@ def _validated_arguments(request: ToolCallRequest) -> dict[str, Any] | None:
     tool_name = _tool_name_from_request(request)
     if tool_name in {"hands_read", "hands_edit", "hands_shell", "hands_python", "hands_request_scope"}:
         return validate_hands_wrapper_arguments(tool_name, arguments)
-    if tool_name == "clear_ingest_taint":
-        return {} if not arguments else None
     tool = getattr(request, "tool", None)
     schema = getattr(tool, "tool_call_schema", None)
     if schema is None:
@@ -2235,7 +2232,16 @@ def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     """Monotonically taint the exact turn and rebind harness egress."""
     if auth_context is None or added is None:
         return
-    merged = auth_context.ifc_state.merge(added, fallback=auth_context.ifc_labels)
+    was_tainted = _live_untrusted_active_ingest(auth_context, auth_context.ifc_labels)
+    if isinstance(auth_context.ifc_state, InformationFlowState):
+        merged, _receipt = auth_context.ifc_state.merge_with_receipt(
+            added, fallback=auth_context.ifc_labels,
+            fresh_untrusted_ingest=getattr(added, "has_untrusted_active_ingest", False),
+        )
+    else:
+        merged = auth_context.ifc_state.merge(added, fallback=auth_context.ifc_labels)
+    if was_tainted is False and _live_untrusted_active_ingest(auth_context, merged) is True:
+        _offer_acp_ingest_trust(auth_context)
     active_ctx = _get_current_turn_context()
     if active_ctx is None:
         return
@@ -2249,6 +2255,29 @@ def _merge_result_labels(auth_context: AuthContext | None, added: Any) -> None:
     emitter = getattr(active_ctx, "turn_event_emitter", None)
     if emitter is not None:
         emitter.bind_information_flow(merged, active_ctx.auth_context)
+
+
+def _offer_acp_ingest_trust(auth_context: AuthContext | None) -> None:
+    """Schedule a server-originated permission; no model argument chooses its outcome."""
+    from ..trust_approval import operator_ingest_allowed
+    from .client_provider import get_turn_capability_context
+
+    if not operator_ingest_allowed(auth_context, surface="acp"):
+        return
+    context = get_turn_capability_context()
+    broker = getattr(context, "permission_broker", None)
+    loop = getattr(broker, "permission_owner_loop", None)
+    if broker is None or loop is None or not loop.is_running():
+        return
+
+    def schedule() -> None:
+        if not broker._is_current():
+            return
+        task = loop.create_task(broker.offer_ingest_trust(auth_context))
+        broker.permission_tasks.add(task)
+        task.add_done_callback(broker.permission_tasks.discard)
+
+    loop.call_soon_threadsafe(schedule)
 
 
 def _merge_result_labels_from_result(
@@ -2675,27 +2704,6 @@ def _emit_tool_call_sync(
         _emit_event_sync("tool_error", **error_payload)
 
 
-def _execute_clear_ingest_taint_action(
-    request: ToolCallRequest, auth_context: AuthContext | None,
-) -> ToolMessage:
-    turn = _get_current_turn_context()
-    cleared, outcome = clear_live_ingest_taint(
-        auth_context, turn_id=getattr(turn, "turn_id", None),
-    )
-    content = (
-        "Accumulated ingest taint acknowledged for this turn; source labels are unchanged."
-        if cleared else f"clear_ingest_taint denied: {outcome}"
-    )
-    _emit_tool_call_sync(
-        "clear_ingest_taint", ok=cleared,
-        error=None if cleared else content, denied=not cleared,
-    )
-    return ToolMessage(
-        content=content, tool_call_id=_tool_call_id(request),
-        name="clear_ingest_taint", status="success" if cleared else "error",
-    )
-
-
 def _execute_declassification_action(
     request: ToolCallRequest,
     auth_context: AuthContext | None,
@@ -2842,6 +2850,10 @@ _ACP_DELIVERY_INSTRUCTION = (
 _ACP_SEND_MESSAGE_REFUSAL = (
     "send_message is unavailable on ACP turns; use the ACP bridge"
 )
+_INGEST_TRUST_CLEARED_INSTRUCTION = (
+    "The human operator cleared the reviewed untrusted ingest for this session. "
+    "The refused tool call was not executed; you may retry it explicitly."
+)
 _PERMISSION_REASON_KEY_RE = re.compile(r"[A-Za-z0-9_.:-]{1,200}\Z")
 
 
@@ -2886,6 +2898,32 @@ def _request_for_acp_model(request: Any) -> Any:
         if content is not None:
             system_message = system_message.model_copy(update={"content": content})
     return request.override(tools=tools, system_message=system_message)
+
+
+def _request_with_ingest_trust_notice(request: Any) -> Any:
+    """Tell the running model about a completed server-originated human decision."""
+    turn = _get_current_turn_context()
+    if turn is None or not getattr(turn, "trust_cleared_notice", False):
+        return request
+    auth = getattr(turn, "auth_context", None)
+    turn.trust_cleared_notice = False
+    if _live_untrusted_active_ingest(auth, getattr(turn, "ifc_labels", None)) is not False:
+        return request  # New ingest after the acknowledgement has re-tainted it.
+    from langchain_core.messages import SystemMessage
+
+    system_message = getattr(request, "system_message", None)
+    if system_message is None:
+        system_message = SystemMessage(content=_INGEST_TRUST_CLEARED_INSTRUCTION)
+    else:
+        content = system_message.content
+        if isinstance(content, str):
+            content = f"{content}\n\n{_INGEST_TRUST_CLEARED_INSTRUCTION}"
+        elif isinstance(content, list):
+            content = [*content, {"type": "text", "text": _INGEST_TRUST_CLEARED_INSTRUCTION}]
+        else:
+            return request
+        system_message = system_message.model_copy(update={"content": content})
+    return request.override(system_message=system_message)
 
 
 def _malformed_arguments_refusal(
@@ -3420,6 +3458,9 @@ def _prepare_tool_call_execution(
             arguments=arguments,
         )
     ifc_labels = _current_ifc_labels(auth_context)
+    if (tool_name in {"hands_edit", "hands_shell", "hands_python"}
+            and _live_untrusted_active_ingest(auth_context, ifc_labels) is True):
+        _offer_acp_ingest_trust(auth_context)
     operator_shell_preparation = _prepare_operator_shell_execution(
         request, tool_name, auth_context, ifc_labels,
     )
@@ -3470,6 +3511,15 @@ def _prepare_tool_call_execution(
     if mutation_refusal is not None:
         return mutation_refusal
     if admin_denial is not None:
+        if (authorization is not None
+                and authorization.reason == "write_blocked_by_untrusted_ingest"):
+            _offer_acp_ingest_trust(auth_context)
+            from ..trust_approval import register_chat_request
+
+            request_id = register_chat_request(_get_current_turn_context(), auth_context)
+            if request_id is not None:
+                admin_denial += (f" A server-owned trust request ({request_id}) was posted; "
+                                 "the refused call was not executed. After trust, retry it explicitly.")
         if (
             operator_shell_preparation is not None
             and operator_shell_preparation.outcome is OperatorShellPreparationOutcome.SOFT_UNBOUND
@@ -3495,12 +3545,10 @@ def _prepare_tool_call_execution(
             call, _argument_validation_refusal(request), arguments=None,
             operator_shell_audit=operator_shell_audit, record_outcome=True,
         )
-    if tool_name in {"approve_declassification", "clear_ingest_taint"}:
+    if tool_name == "approve_declassification":
         denial = _check_and_increment_or_deny(tool_name)
         if denial is not None:
             return _tool_call_refusal(call, denial, arguments=arguments)
-        if tool_name == "clear_ingest_taint":
-            return _execute_clear_ingest_taint_action(request, auth_context)
         return _execute_declassification_action(request, auth_context, arguments)
 
     try:
@@ -3915,6 +3963,7 @@ class BudgetGateMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         request = _request_for_acp_model(request)
+        request = _request_with_ingest_trust_notice(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return handler(request)
 
@@ -3924,6 +3973,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
         request = _request_for_acp_model(request)
+        request = _request_with_ingest_trust_notice(request)
         get_tool_registry().register_runtime_tools(getattr(request, "tools", ()))
         return await handler(request)
 

@@ -3248,54 +3248,29 @@ async def test_permission_outcome_after_execute_result(
         await agent.on_transport_closed(generation)
 
 
-@pytest.mark.parametrize("wrapper", ["hands_edit", "hands_shell", "hands_python"])
-async def test_model_clear_requires_fresh_proxy_session_grant_after_ingest(
-    tmp_path: Path, middleware_event_logger: None, wrapper: str,
+@pytest.mark.parametrize("enforced", [False, True])
+@pytest.mark.parametrize("outcome", ["allow_once", "reject_once", "cancelled", "timeout"])
+async def test_human_ingest_trust_persists_for_acp_session_until_new_source(
+    tmp_path: Path, middleware_event_logger: None, enforced: bool, outcome: str,
 ) -> None:
     from langchain.agents.middleware import ToolCallRequest
     from langgraph.runtime import Runtime
-
-    from mimir.acp.proxy import ProxyRouter
-    from mimir.models import Integrity, IntegrityEffect
-    from mimir.tools import clear_ingest_taint
+    from mimir.access_control import SinkGate
     from mimir.tools.budget_gate import BudgetGateMiddleware
-    from mimir.tools.client_provider import (
-        client_authorized_host_execution_metadata,
-        issue_client_authorized_host_execution,
-    )
-
-    class Writer:
-        def __init__(self) -> None:
-            self.messages: list[dict[str, Any]] = []
-
-        def write(self, data: bytes) -> None:
-            self.messages.append(json.loads(data))
-
-        async def drain(self) -> None:
-            pass
-
-    client_wire, daemon_wire = Writer(), Writer()
-    router = ProxyRouter(client_wire, daemon_wire, "secret")
 
     class PermissionClient(McpClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trust_requests = []
+            self.requested = asyncio.Event()
+
         async def request_tool_permission(self, session_id: str, snapshot: Any) -> Any:
-            request_id = len(daemon_wire.messages) + 1
-            await router.route_daemon({
-                "jsonrpc": "2.0", "id": request_id,
-                "method": "session/request_permission",
-                "params": sdk.permission_request_params(session_id, snapshot),
-            })
-            if request_id in (1, 2, 4, 5, 7):
-                assert client_wire.messages[-1]["id"] == request_id
-                await router.route_client({
-                    "jsonrpc": "2.0", "id": request_id,
-                    "result": {"outcome": {"outcome": "selected", "optionId":
-                        "allow_once" if request_id == 4 else "allow_session"}},
-                })
-            else:
-                assert client_wire.messages[-1]["id"] != request_id
-            assert daemon_wire.messages[-1]["id"] == request_id
-            return sdk.PermissionCompletion.from_response(daemon_wire.messages[-1]["result"])
+            self.trust_requests.append((session_id, sdk.permission_request_params(session_id, snapshot)))
+            self.requested.set()
+            assert snapshot.wrapper_name == "ingest_trust"
+            assert "https://" not in snapshot.title
+            return (sdk.PermissionCompletion("reject_once", TimeoutError())
+                    if outcome == "timeout" else sdk.PermissionCompletion(outcome))
 
     bundle, core = _bundle(tmp_path)
     agent = MimirAcpAgent(bundle)
@@ -3303,113 +3278,157 @@ async def test_model_clear_requires_fresh_proxy_session_grant_after_ingest(
     generation = agent.on_connect(client)
     await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
     session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
-    router._active_sessions.add(session_id)
-    arguments = {
-        "hands_edit": {"path": "/private/notes.txt", "old_text": "old", "new_text": "new"},
-        "hands_shell": {"command": "private command"},
-        "hands_python": {"code": "private_value = 1"},
-    }[wrapper]
-
-    turn_count = 0
+    seen = []
+    turn_errors = []
 
     async def integrated_turn(event: Any, **kwargs: Any) -> None:
-        nonlocal turn_count
-        turn_count += 1
-        labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
-        state = InformationFlowState(labels=labels)
-        ingest = InformationFlowLabels().with_source(SourceLabel(
-            principal="external", domain="web", resource_id="https://private.example",
-            bridge_instance=None, sensitivity="public", source_kind="protected_tool",
-            integrity=Integrity.UNTRUSTED, integrity_effect=IntegrityEffect.ACTIVE_INGEST,
-        ))
         auth = dataclasses.replace(
-            event.continuation_auth_context, interactivity=TurnInteractivity.INTERACTIVE,
-            ifc_labels=labels, ifc_state=state, saga_session_id=kwargs["saga_session_id"],
+            event.continuation_auth_context, enforcement_enabled=enforced,
         )
-        turn = TurnContext(
-            turn_id=kwargs["turn_id"], session_id=session_id, trigger="user_message",
-            channel_id=event.channel_id, started_at=time.monotonic(), auth_context=auth,
+        state = auth.ifc_state
+        ingress_labels = _initialize_ifc_labels(event, resolver=bundle.core.identity_resolver)
+        state.merge(ingress_labels)
+        auth = dataclasses.replace(auth, ifc_labels=ingress_labels)
+        turn_number = len(seen)
+        if turn_number in (0, 1, 2):
+            # Fold covered history into a fresh turn; no other labels persist.
+            state.merge(InformationFlowLabels().with_source(SourceLabel(
+                principal="operator", domain="web",
+                resource_id=f"https://hostile.example/private-{0 if turn_number == 1 else turn_number}",
+                bridge_instance="remote", sensitivity="public",
+                authorized_principals=frozenset({"operator"}),
+                source_kind="protected_tool", integrity="untrusted",
+                integrity_effect="active_ingest",
+            )))
+        labels = state.current()
+        target = str(tmp_path / "notes.md")
+        before = SinkGate.check_sink_flow(
+            "write_file", target, labels, auth, enforce=enforced,
         )
-        token = set_current_turn(turn)
-        try:
-            active = agent._active_prompts[session_id]
-            marker = issue_client_authorized_host_execution(
-                request_identity=object(), auth_context_identity=auth,
-                wrapper_name=wrapper, tainted=False,
+        seen.append(before.reason)
+        active = agent._active_prompts[session_id]
+        if turn_number in (0, 2):
+            client.requested.clear()
+            tool_call = ToolCallRequest(
+                tool_call={"name": "write_file", "args": {"file_path": target, "content": "write"},
+                           "id": f"veto-{turn_number}", "type": "tool_call"},
+                tool=None, state=None, runtime=Runtime(context=auth),
             )
-            assert marker is not None
-            steps = range(7) if turn_count == 1 else range(7, 9)
-            for index in steps:
-                tainted = index == 3
-                if index in (1, 3, 6):
-                    # Even a repeated, deduplicated source is a new ingest.
-                    state.merge(ingest)
-                if index in (1, 4, 6):
-                    # Model follows injected instructions before the proxy has
-                    # observed taint. Clearing is not an operator approval.
-                    request = ToolCallRequest(
-                        tool_call={"name": "clear_ingest_taint", "args": {},
-                                   "id": f"clear-{index}", "type": "tool_call"},
-                        tool=clear_ingest_taint, state=None, runtime=Runtime(context=auth),
-                    )
 
-                    async def unreachable_handler(call: ToolCallRequest) -> Any:
-                        pytest.fail("clear must be handled by authorization middleware")
+            async def must_not_execute(_request):
+                pytest.fail("the vetoed call must not be replayed")
 
-                    result = await BudgetGateMiddleware().awrap_tool_call(request, unreachable_handler)
-                    assert result.status == "success", result.content
-                if index == 6:
-                    # No post-clear permission request in this turn. The next
-                    # clean turn must still invalidate the standing grant.
-                    continue
-                assert state.has_untrusted_active_ingest() is (1 <= index <= 5)
-                assert state.permission_has_untrusted_active_ingest() is tainted
-                assert client_authorized_host_execution_metadata(marker) == (wrapper, tainted)
-                tool_id = f"hands-{index}"
-                active.dispatcher.enqueue({
-                    "type": "tool_call", "phase": "start", "id": tool_id,
-                    "tool_name": wrapper, "args": arguments,
-                })
-                decision = await active.request_permission(PermissionEligibility(
-                    tool_id, wrapper, "other", arguments, marker,
-                ))
-                assert decision == (
-                    PermissionDecision.ALLOW_SESSION if index in (0, 1, 4, 7)
-                    else PermissionDecision.ALLOW_ONCE
-                )
-                assert router._grants.allows(session_id, wrapper)
-        finally:
-            reset_current_turn(token)
+            refused = await BudgetGateMiddleware().awrap_tool_call(tool_call, must_not_execute)
+            assert refused.status == "error"
+            await asyncio.wait_for(client.requested.wait(), 3)
+        await active.offer_ingest_trust(auth)
+        after = SinkGate.check_sink_flow(
+            "write_file", target, state.current(), auth, enforce=enforced,
+        )
+        if turn_number == 0:
+            assert before.reason == "write_blocked_by_untrusted_ingest"
+            assert state.has_untrusted_active_ingest() is (outcome != "allow_once")
+            if outcome == "allow_once":
+                assert after.reason != "write_blocked_by_untrusted_ingest"
+        elif turn_number == 1:
+            assert (before.reason == "write_blocked_by_untrusted_ingest") is (outcome != "allow_once")
+        else:
+            assert before.reason == "write_blocked_by_untrusted_ingest"
+            assert state.has_untrusted_active_ingest() is (outcome != "allow_once")
 
-    core.run_turn = integrated_turn
+    async def diagnosed_turn(event: Any, **kwargs: Any) -> None:
+        try:
+            await integrated_turn(event, **kwargs)
+        except Exception as exc:
+            turn_errors.append(exc)
+            raise
+
+    core.run_turn = diagnosed_turn
     try:
-        response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="review ingest")])
-        assert response.stop_reason == "end_turn"
-        response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="continue")])
-        assert response.stop_reason == "end_turn"
-        assert [message["id"] for message in client_wire.messages] == [1, 2, 4, 5, 7]
-        events = [json.loads(line) for line in (tmp_path / "middleware-events.jsonl").read_text().splitlines()]
-        outcomes = [event for event in events if event["type"] == "acp_permission_outcome"]
-        payloads = [{key: event[key] for key in (
-            "wrapper_name", "tainted", "resource_resolvable", "outcome",
-        )} for event in outcomes]
-        assert payloads == [
-            {"wrapper_name": wrapper, "tainted": tainted,
-             "resource_resolvable": wrapper == "hands_edit", "outcome": outcome}
-            for tainted, outcome in ((False, "operator_allow"), (False, "operator_allow"),
-                                     (False, "session_grant"), (True, "operator_allow"),
-                                     (False, "operator_allow"), (False, "session_grant"),
-                                     (False, "operator_allow"), (False, "session_grant"))
-        ]
-        clears = [event for event in events if event["type"] == "ifc_ingest_taint_cleared"]
-        assert len(clears) == 3
-        assert all(event["source_count"] == 1 for event in clears)
-        assert all(event["authenticated_admin"] == {
-            "principal": "operator", "canonical_principal": "operator",
-        } for event in clears)
-        print(json.dumps({"acp_permission_outcome": payloads}, sort_keys=True))
+        for _ in range(3):
+            try:
+                response = await agent.prompt(session_id, [sdk.TextContentBlock(type="text", text="continue")])
+            except Exception:
+                if turn_errors:
+                    raise turn_errors[-1]
+                raise
+            assert response.stop_reason == "end_turn"
+        assert len(client.trust_requests) == (2 if outcome == "allow_once" else 3)
+        assert all(request[1]["options"] == [
+            {"optionId": "allow_once", "name": "Clear", "kind": "allow_once"},
+            {"optionId": "reject_once", "name": "Keep", "kind": "reject_once"},
+        ] for request in client.trust_requests)
     finally:
-        await router.close()
+        await agent.on_transport_closed(generation)
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+async def test_acp_pending_trust_allows_trusted_arrival_rejects_new_untrusted(tmp_path: Path, trusted):
+    from mimir.acp.agent import ActivePrompt
+
+    bundle, _core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    generation = agent.on_connect(McpClient())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    session_id = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
+    try:
+        session = agent._sessions[session_id]
+        auth = agent._auth_context_for(session)
+        source = SourceLabel(principal="external", domain="web", resource_id="read",
+                             bridge_instance="remote", sensitivity="public",
+                             source_kind="protected_tool", integrity="untrusted",
+                             integrity_effect="active_ingest")
+        auth.ifc_state.merge(InformationFlowLabels().with_source(source))
+
+        class Peer:
+            async def request_tool_permission(self, *_args):
+                auth.ifc_state.merge(InformationFlowLabels().with_source(dataclasses.replace(
+                    source, resource_id="intervening", domain="memory",
+                    integrity="trusted" if trusted else "untrusted",
+                )))
+                return sdk.PermissionCompletion("allow_once")
+
+        session.provider = SimpleNamespace(peer=Peer())
+        prompt = SimpleNamespace(session=session, _is_current=lambda: True,
+                                 trust_requested_ordinal=-1,
+                                 _audit_and_advance_ingest=lambda *_args: True)
+        await ActivePrompt.offer_ingest_trust(prompt, auth)
+        assert auth.ifc_state.has_untrusted_active_ingest() is (not trusted)
+        later = agent._auth_context_for(session)
+        assert later.ifc_state is not auth.ifc_state
+        assert later.ifc_state.current() is None
+        assert later.ifc_state.ingest_acknowledgement is auth.ifc_state.ingest_acknowledgement
+    finally:
+        # Restore the actual provider for transport cleanup.
+        session.provider = None
+        await agent.on_transport_closed(generation)
+
+
+async def test_acp_ingest_acknowledgement_is_not_shared_between_sessions(tmp_path: Path):
+    bundle, _core = _bundle(tmp_path)
+    agent = MimirAcpAgent(bundle)
+    generation = agent.on_connect(McpClient())
+    await agent.authenticate("mimir-web-key", **{"mimir.webKey": "secret"})
+    first = (await agent.new_session(str(tmp_path), mcp_servers=_hands("server"))).session_id
+    second = (await agent.new_session(str(tmp_path), mcp_servers=_hands("other-server"))).session_id
+    try:
+        first_auth = agent._auth_context_for(agent._sessions[first])
+        second_auth = agent._auth_context_for(agent._sessions[second])
+        assert first_auth.ifc_state is not second_auth.ifc_state
+        source = SourceLabel(
+            principal="external", domain="web", resource_id="https://hostile.example",
+            bridge_instance="remote", sensitivity="public", source_kind="protected_tool",
+            integrity="untrusted", integrity_effect="active_ingest",
+        )
+        labels = InformationFlowLabels().with_source(source)
+        first_auth.ifc_state.merge(labels)
+        second_auth.ifc_state.merge(labels)
+        assert first_auth.ifc_state.acknowledge_ingest_snapshot(
+            expected=first_auth.ifc_state.current(), durable_audit=lambda _sources: True,
+        )
+        assert not first_auth.ifc_state.has_untrusted_active_ingest()
+        assert second_auth.ifc_state.has_untrusted_active_ingest()
+    finally:
         await agent.on_transport_closed(generation)
 
 

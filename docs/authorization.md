@@ -469,23 +469,30 @@ veto requires a separate operator decision.
 
 ### Ingest acknowledgement
 
-`clear_ingest_taint` is a model tool for an authenticated, non-service admin on
-a live user-origin turn, including ACP. Ask Mimir to invoke it after reviewing
-the current ingest. It requires the exact live turn and its server-owned IFC
-state; a scheduler, poller, generic HTTP event, or detached call cannot use it.
-The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit record;
-if that write fails, the acknowledgement is refused.
+Only a human operator can acknowledge ingest: in ACP through the daemon's
+**Clear / Keep** permission request; in authenticated Discord, Slack or web
+chat through the server's `trust trust-xxxx` / `keep trust-xxxx` reply. The
+model has no clear tool. The reply is bound to an authenticated non-service
+admin, its originating channel and one pending request ID. Pollers, schedules,
+generic HTTP events and service identities cannot clear or receive a notice.
+The acknowledgement requires a durable `ifc_ingest_taint_cleared` audit event
+with only fixed-taxonomy source counts; Keep writes a separate declined event.
 
-Despite its name, this is **not general untainting**. It acknowledges the current
-ingest snapshot only for the ACP permission prompt. Acknowledging untrusted
-ingest invalidates existing `allow_session` grants: the next wrapper call needs
-a fresh human response, and a new `allow_session` response can then be reused.
-The tool call itself is not evidence of operator consent. It does not grant a
-new permission, remove source or sensitivity labels, or change sink and
-durable-memory decisions. It is not `approve_declassification`. Later untrusted
-active ingest re-arms the prompt, even when it is a reread of an already recorded
-source. Successful cwd-scoped Hands reads do not add untrusted active ingest;
-Hands shell and Python output still do.
+Clear covers the reviewed untrusted ingest snapshot for that ACP session or
+chat channel and operator, including the running turn. Trusted arrivals while
+the human decides do not expire the request; any new untrusted arrival does,
+including a fresh read of an already reviewed source. Only the human
+acknowledgement persists between turns: labels, sensitivities, audience ACLs,
+egress grants and sink capabilities remain per-turn. Acknowledgements cover at
+most 1,024 sources and expire after one idle hour; chat retains at most 256
+channel/operator cells (oldest idle cell evicted first). ACP cells also end with
+the session. Reaching the source cap fails closed and needs a new session or
+idle expiry. Labels remain append-only within the turn and still restrict
+sensitivity and audiences. The previously vetoed call is not replayed; retry it
+explicitly. New untrusted sources re-taint. ACP also advances the
+proxy ingest boundary, invalidating existing `allow_session` Hands grants;
+the next Hands call still needs a fresh human response. This is separate from
+egress `approve_declassification` and does not itself grant execution permission.
 
 ## Configuration
 

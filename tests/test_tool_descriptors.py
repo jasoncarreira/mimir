@@ -96,7 +96,7 @@ _OLD_SINK_DESTINATIONS = {
 }
 
 _OLD_NON_INGESTING = {
-    "hands_request_scope", "approve_declassification", "clear_ingest_taint",
+    "hands_request_scope", "approve_declassification",
     "request_operator_approval", "memory_store", "memory_propose", "open_proposal",
     "submit_proposal", "abandon_proposal", "saga_feedback",
     "saga_mark_contributions", "saga_end_session", "saga_record_skill_learning",

@@ -252,17 +252,23 @@ def clear_channel(channel_id: str) -> None:
 
 
 def _is_authenticated_operator(
-    event: "AgentEvent", resolver: "IdentityResolver | None",
+    event: "AgentEvent", resolver: "IdentityResolver | None", *, allow_web: bool = False,
 ) -> bool:
     if (
         resolver is None
         or event.trigger != "user_message"
         or not event.author
         or not (event.source or "").strip()
-        or (event.source or "").strip().lower() in {"api", "stdin", "web"}
+        or (event.source or "").strip().lower() in {"api", "stdin"}
+        or ((event.source or "").strip().lower() == "web" and not allow_web)
         or event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY) == HTTP_EVENT_INGRESS_EXTRA_VALUE
     ):
         return False
+    if (event.source or "").strip().lower() == "web":
+        from .bridges.web_chat import _web_channel_for
+
+        if event.channel_id != _web_channel_for(event.author):
+            return False
     access = resolver.access_metadata(event.author)
     return access.is_admin and not access.is_service and resolver.resolve(event.author) is not None
 

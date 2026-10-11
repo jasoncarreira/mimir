@@ -195,7 +195,6 @@ _TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
     # Declassification mutates the live authorization carrier but does not itself
     # read protected data or emit it; the subsequent exact sink remains gated.
     "approve_declassification": ToolFlowDirection.NEITHER,
-    "clear_ingest_taint": ToolFlowDirection.NEITHER,
     "request_operator_approval": ToolFlowDirection.NEITHER,
     "memory_query": ToolFlowDirection.SOURCE,
     "memory_get": ToolFlowDirection.SOURCE,
@@ -6182,7 +6181,7 @@ def saga_mutation_taint_refusal(
     if (
         not isinstance(labels, InformationFlowLabels)
         or not labels.sources
-        or labels.has_untrusted_active_ingest
+        or _has_untrusted_active_ingest(auth_context, labels, missing_is_tainted=True)
     ):
         return _saga_taint_refusal_for_turn(auth_context)
     return None
@@ -8267,101 +8266,6 @@ def resolve_sink_target(
     return json.dumps(argv, ensure_ascii=True) if argv else None
 
 
-def clear_live_ingest_taint(
-    auth_context: Any, *, turn_id: str | None,
-) -> tuple[bool, str]:
-    """Acknowledge accumulated ingest taint on the exact live admin turn."""
-    from ._context import get_current_turn
-    from .models import AuthContext, InformationFlowState, SourceLabel
-
-    if not isinstance(auth_context, AuthContext):
-        return False, "missing_auth_context"
-    if "admin" not in auth_context.roles:
-        return False, "admin_required"
-    principal = auth_context.principal
-    canonical = auth_context.canonical_principal
-    if not all(isinstance(value, str) and value.strip() for value in (principal, canonical)):
-        return False, "missing_authenticated_admin"
-    if (
-        auth_context.is_service
-        or "service" in auth_context.roles
-        or auth_context.service_authority is not None
-        or any(value.strip().lower().startswith("service:") for value in (principal, canonical))
-    ):
-        return False, "service_identity_forbidden"
-    if (
-        auth_context.trigger != "user_message"
-        or auth_context.origin_trigger not in (None, "user_message", "acp_session")
-        or auth_context.event_ingress is not None
-    ):
-        return False, "user_origin_required"
-    state = auth_context.ifc_state
-    if not isinstance(state, InformationFlowState):
-        return False, "missing_ifc_state"
-    turn = get_current_turn()
-    if (
-        not isinstance(turn_id, str)
-        or not turn_id.strip()
-        or turn is None
-        or turn.turn_id != turn_id
-        or not isinstance(getattr(turn, "auth_context", None), AuthContext)
-        or turn.auth_context.ifc_state is not state
-    ):
-        return False, "missing_live_turn"
-
-    def durable_audit(sources: tuple[SourceLabel, ...]) -> bool:
-        # Source metadata is not trusted text. Only fixed taxonomy values may
-        # reach the audit; resource IDs, content and source principals never do.
-        domains = {
-            "filesystem", "channel", "repository", "client_provider", "mcp",
-            "shell", "web", "memory", "saga", "channel_history",
-            "channel_metadata", "schedule_metadata", "shell_jobs", "turn_history",
-            "commitments", "worklink", "coding_worker",
-            "usage", "schedules", "self_state", "recent_activity", "channel_memory",
-            "proposals", "identities", "skills", "feedback",
-        }
-        kinds = set(SourceKind)
-        groups: dict[tuple[str, str], int] = {}
-        for source in sources:
-            domain = (
-                source.domain
-                if source.domain in domains and source.domain_qualifier is None
-                else "other"
-            )
-            kind = source.source_kind if source.source_kind in kinds else "other"
-            key = (domain, kind)
-            groups[key] = groups.get(key, 0) + 1
-        try:
-            from .event_logger import log_durable_event_sync
-
-            log_durable_event_sync(
-                "ifc_ingest_taint_cleared",
-                turn_id=turn_id,
-                source_groups=[
-                    {"domain": domain, "source_kind": kind, "count": count}
-                    for (domain, kind), count in sorted(groups.items())
-                ],
-                source_count=len(sources),
-                authenticated_admin={"principal": principal, "canonical_principal": canonical},
-            )
-            if sources and auth_context.origin_trigger == "acp_session":
-                from .tools.client_provider import get_turn_capability_context
-
-                # Publish the boundary before clearing, including when no more
-                # permission requests occur in this turn. Failure leaves taint.
-                context = get_turn_capability_context()
-                context.permission_broker.acknowledge_ingest()
-        except Exception:
-            log.warning("ifc ingest taint clear audit failed")
-            return False
-        return True
-
-    cleared = state.clear_ingest_taint(
-        fallback=auth_context.ifc_labels, durable_audit=durable_audit,
-    )
-    return (True, "cleared") if cleared else (False, "clear_failed")
-
-
 def approve_live_declassification(
     auth_context: Any,
     *,
@@ -8862,7 +8766,6 @@ class OperationCatalog:
         "issue_comment",
         "operator_alert",
         "approve_declassification",
-        "clear_ingest_taint",
         "list_channels",
         "list_schedules",
         "add_schedule",

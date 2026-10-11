@@ -90,6 +90,7 @@ from .models import (
     AuthContext,
     InformationFlowLabels,
     InformationFlowState,
+    IngestAcknowledgement,
     IngestedURLState,
     Integrity,
     IntegrityEffect,
@@ -367,6 +368,18 @@ def _merge_ifc_labels(
 
 
 def _persisted_integrity(ifc_labels: InformationFlowLabels) -> Integrity:
+    return ifc_labels.persisted_integrity
+
+
+def _effective_persisted_integrity(
+    ifc_labels: InformationFlowLabels, auth_context: AuthContext | None,
+) -> Integrity:
+    """Record the human-cleared turn as trusted without rewriting provenance."""
+    from .access_control import _turn_has_untrusted_active_ingest
+
+    if (auth_context is not None and ifc_labels.sources
+            and not _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+        return Integrity.TRUSTED
     return ifc_labels.persisted_integrity
 
 
@@ -1293,6 +1306,8 @@ class Agent:
         # is found.
         self._saga_store: Any = None
         self._sessions = session_manager
+        # Only bounded human acknowledgements persist, never turn IFC labels.
+        self._chat_ingest_acknowledgements: dict[tuple[str, str], IngestAcknowledgement] = {}
         self._server_discovered_pr_scope_store = ServerDiscoveredPRScopeStore()
         self._scheduler = scheduler
         self._channels = channel_registry
@@ -1936,7 +1951,7 @@ class Agent:
         )
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
-        if _is_authenticated_operator(event, self._identity_resolver) and (named_reply or bare_reply):
+        if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
             sync_pending(self._config.home)
             await asyncio.to_thread(
                 sync_pairings, self._config.home,
@@ -1956,7 +1971,10 @@ class Agent:
                 resolution = None
             if resolution is not None and ((resolution.entry is not None and not resolution.entry.inject_into_turn)
                     or (resolution.entry is None and (named_reply or bare_reply))):
-                if resolution.entry is not None and resolution.entry.kind == "pair":
+                if resolution.entry is not None and resolution.entry.kind == "trust":
+                    from .trust_approval import complete_reply as complete_trust_reply
+                    notice = await complete_trust_reply(event, resolution, self._identity_resolver)
+                elif resolution.entry is not None and resolution.entry.kind == "pair":
                     notice = await complete_pairing_reply(
                         self._config.home, getattr(self._config, "operator_alert_channel", ""),
                         event, resolution, self._identity_resolver,
@@ -1999,10 +2017,14 @@ class Agent:
             bound_auth_context = _require_auth_context(event.continuation_auth_context)
             if not bound_auth_context.enforcement_enabled:
                 raise ValueError("bound turns require enforced authorization")
+            acp_state = (bound_auth_context.ifc_state
+                         if bound_auth_context.origin_trigger == "acp_session" else None)
+            if acp_state is not None:
+                acp_state.merge(initial_ifc_labels)
             initial_auth_context = replace(
                 bound_auth_context,
                 ifc_labels=initial_ifc_labels,
-                ifc_state=InformationFlowState(labels=initial_ifc_labels),
+                ifc_state=acp_state or InformationFlowState(labels=initial_ifc_labels),
                 ingested_url_state=IngestedURLState(),
                 saga_session_id=saga_session_id,
             )
@@ -2077,6 +2099,7 @@ class Agent:
             )
             saga_session_id = saga_session_id if explicit_session_binding else None
             session_egress_state = initial_auth_context.egress_state
+            chat_ifc_state = None
             if not explicit_session_binding and event.trigger == "saga_session_end":
                 saga_session_id = (event.extra or {}).get("saga_session_id")
             elif not explicit_session_binding and self._sessions is not None:
@@ -2102,6 +2125,23 @@ class Agent:
                 stamped_ingress = event.extra.get(HTTP_EVENT_INGRESS_EXTRA_KEY)
                 if isinstance(stamped_ingress, str):
                     event_ingress = stamped_ingress or None
+            if (not explicit_session_binding
+                    and event_ingress is None
+                    and event.source in {"discord", "slack", "web"}
+                    and _is_authenticated_operator(event, self._identity_resolver, allow_web=True)
+                    and initial_auth_context.event_ingress is None
+                    and isinstance(event.channel_id, str) and event.channel_id):
+                key = (event.channel_id, initial_auth_context.canonical_principal)
+                cache = self._chat_ingest_acknowledgements
+                now = time.monotonic()
+                for stale in [k for k, cell in cache.items()
+                              if now - cell.last_used >= cell.IDLE_SECONDS]:
+                    del cache[stale]
+                if key not in cache and len(cache) >= 256:
+                    del cache[min(cache, key=lambda k: cache[k].last_used)]
+                acknowledgement = cache.setdefault(key, IngestAcknowledgement())
+                acknowledgement.touch()
+                chat_ifc_state = InformationFlowState(ingest_acknowledgement=acknowledgement)
             turn_interactivity = classify_turn_interactivity(
                 event.channel_id,
                 event.trigger,
@@ -2158,8 +2198,11 @@ class Agent:
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:
+                if chat_ifc_state is not None:
+                    chat_ifc_state.merge(initial_ifc_labels)
                 auth_ctx = replace(
                     auth_ctx,
+                    ifc_state=chat_ifc_state or auth_ctx.ifc_state,
                     interactivity=turn_interactivity,
                     saga_session_id=saga_session_id,
                     egress_state=session_egress_state,
@@ -2217,6 +2260,15 @@ class Agent:
                 # Frozen authorization context (chainlink #864).
                 auth_context=auth_ctx,
                 ifc_labels=initial_ifc_labels,
+                operator_ingress_event=event if chat_ifc_state is not None else None,
+                trust_notice_sender=(
+                    self._dispatcher._send_approval_notice
+                    if self._dispatcher is not None
+                    and hasattr(self._dispatcher, "_send_approval_notice")
+                    else (lambda channel, notice: self._channels.send(channel, notice, final=True))
+                    if self._channels is not None else None
+                ),
+                trust_owner_loop=asyncio.get_running_loop(),
             )
             # Both ordinary and synthesis turns share this setup. Register the
             # intended workspace before validating/repairing it so the janitor
@@ -2835,7 +2887,7 @@ class Agent:
                     content=clean_text,
                     msg_id=getattr(result, "message_id", None),
                     source=getattr(bridge, "name", None),
-                    integrity=_persisted_integrity(ctx.ifc_labels),
+                    integrity=_effective_persisted_integrity(ctx.ifc_labels, ctx.auth_context),
                 )
                 await self._buffer.append(msg)
             except Exception:  # noqa: BLE001
@@ -3543,8 +3595,12 @@ class Agent:
             saga_calls=saga_calls,
             interactivity=getattr(ctx, "interactivity", None),
             tool_call_count=ctx.tool_call_count,
-            integrity=final_labels.persisted_integrity,
-            integrity_effect=final_labels.persisted_integrity_effect,
+            integrity=_effective_persisted_integrity(final_labels, ctx.auth_context),
+            integrity_effect=(
+                IntegrityEffect.INFORMATIONAL
+                if not ctx.auth_context.ifc_state.has_untrusted_active_ingest(final_labels)
+                else final_labels.persisted_integrity_effect
+            ),
             integrity_sources=integrity_sources,
             integrity_source_counts=integrity_source_counts,
             untrusted_active_ingest_domains=untrusted_active_ingest_domains,

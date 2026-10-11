@@ -8086,7 +8086,8 @@ async def test_shell_continuation_is_not_a_fresh_operator_request(
     ingress_resolver: IdentityResolver,
 ) -> None:
     from mimir._context import reset_current_turn, set_current_turn
-    from mimir.access_control import can_resolve_forge_review_scope, clear_live_ingest_taint
+    from mimir.access_control import can_resolve_forge_review_scope
+    from mimir.trust_approval import operator_ingest_allowed
     from mimir.models import TurnContext
     from mimir.tools.registry import request_operator_approval
 
@@ -8121,15 +8122,15 @@ async def test_shell_continuation_is_not_a_fresh_operator_request(
     monkeypatch.setattr("mimir.event_logger.log_durable_event_sync", lambda *a, **kw: None)
     token = set_current_turn(turn)
     try:
-        assert clear_live_ingest_taint(auth, turn_id=turn.turn_id) == (
-            False, "user_origin_required",
-        )
+        assert not operator_ingest_allowed(auth, surface="chat")
         refusal = await request_operator_approval.coroutine(
             tool_name="shell_exec", target="pwd", reason="continue",
         )
         assert refusal == "request_operator_approval refused: no interactive operator turn"
         turn.auth_context = origin
-        assert clear_live_ingest_taint(origin, turn_id=turn.turn_id) == (True, "cleared")
+        assert operator_ingest_allowed(origin, surface=(
+            "acp" if origin_trigger == "acp_session" else "chat"
+        ))
     finally:
         reset_current_turn(token)
 
