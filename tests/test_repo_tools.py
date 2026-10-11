@@ -31,6 +31,8 @@ import pytest
 import yaml
 from langchain_core.tools import ToolException
 
+from tests.lease_attestation_helper import assert_lease_attested
+
 from mimir.contained_execution import (
     CollectedExecutionResult,
     SensitiveMaterialScrubber,
@@ -366,7 +368,7 @@ def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(tmp_path: Path
     lease = state.checkout_lease
     assert lease is not None and lease.head_sha == scope.observed_head_sha
     auth = _lineage_turn(scope, state)
-    assert access_control._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
     outsider = SourceLabel(
         principal="outsider", domain="repository", resource_id="outside-comment",
         bridge_instance="forge", sensitivity="public", source_kind="protected_tool",
@@ -375,7 +377,7 @@ def test_clean_attested_lease_cannot_relax_tainted_commit_or_push(tmp_path: Path
     labels = auth.ifc_labels.with_source(outsider)
     auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
     auth = replace(auth, ifc_labels=labels)
-    assert access_control._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
     for name in ("repo_commit", "repo_push"):
         decision = SinkGate.check_sink_flow(
             name, "owner/repo#pull/7", labels, auth,
@@ -468,7 +470,10 @@ def test_resumed_local_commit_requires_clean_producing_turn(
     assert resumed.head_sha == head
     assert second.git_expected_head == head
     trusted = lineage == "clean"
-    assert access_control._attested_pr_checkout_lease(turn2, scope, resumed) is trusted
+    if trusted:
+        assert_lease_attested(turn2, scope, resumed)
+    else:
+        assert not access_control._attested_pr_checkout_lease(turn2, scope, resumed)
     checkout_labels = classify_protected_result(
         "repo_checkout", {"repository": "owner/repo", "pull_request": 7}, turn2,
         ToolAuthorization(tool_name="repo_checkout", decision="resource_scoped", allowed=True,
@@ -548,7 +553,7 @@ def test_rebase_onto_live_advanced_protected_base_stays_attested(tmp_path: Path)
     RepoGitTools(state, auth_context=turn).execute(GitRebase())
     lease = state.checkout_lease
     assert lease.base_sha == lease.verified_base_sha == advanced
-    assert access_control._attested_pr_checkout_lease(turn, scope, lease)
+    assert_lease_attested(turn, scope, lease)
     from mimir.pr_checkout_lease import _METADATA
     record = json.loads((lease.path / _METADATA).read_text())
     record["verified_base_sha"] = scope.observed_base_sha
@@ -623,7 +628,7 @@ def test_fresh_lease_revert_refreshes_head_and_keeps_clean_lineage(tmp_path: Pat
     tools.execute(GitRevert(scope.observed_head_sha))
     lease = state.checkout_lease
     assert state.git_expected_head == _git(lease.path, "rev-parse", "HEAD")
-    assert access_control._attested_pr_checkout_lease(turn, scope, lease)
+    assert_lease_attested(turn, scope, lease)
 
 
 @pytest.fixture
@@ -4157,7 +4162,7 @@ async def test_failed_repo_test_on_lineage_advanced_lease_stays_trusted(tmp_path
         _git(source, "add", "base-change.txt"); _git(source, "commit", "-qm", "base update")
         _git(source, "push", "-q", "origin", "HEAD:main")
         RepoGitTools(state, auth_context=turn).execute(GitRebase())
-    assert access_control._attested_pr_checkout_lease(turn, scope, lease) is True
+    assert_lease_attested(turn, scope, lease)
     integ, allowed = await _red_run_after_lineage(monkeypatch, scope, state, turn)
     assert integ == "trusted"
     assert allowed is True

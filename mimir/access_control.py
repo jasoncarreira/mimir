@@ -10580,31 +10580,150 @@ _UNTRUSTED_REFERENCE_SUBTREES = frozenset({("state", "pollers")})
 _PR_CHECKOUT_LEASE_ROOT_ENV = "MIMIR_PR_CHECKOUT_LEASE_ROOT"
 
 
+class LeaseAttestationReason(StrEnum):
+    OK = "ok"
+    NO_AUTHOR_TRUST = "no_author_trust"
+    SCOPE_LEASE_MISMATCH = "scope_lease_mismatch"
+    INACTIVE_LEASE = "inactive_lease"
+    MISSING_EXPECTED_HEAD_OR_BRANCH = "missing_expected_head_or_branch"
+    REVIEW_STATE_MISMATCH = "review_state_mismatch"
+    MISSING_RECORDED_HEAD = "missing_recorded_head"
+    CHECKOUT_STATE_MISMATCH = "checkout_state_mismatch"
+    GIT_TIMEOUT = "git_timeout"
+    GIT_NONZERO_EXIT = "git_nonzero_exit"
+    GIT_MISSING_BINARY = "git_missing_binary"
+    GIT_OUTPUT_LIMIT = "git_output_limit"
+    GIT_MALFORMED_OUTPUT = "git_malformed_output"
+    GIT_SUBPROCESS_ERROR = "git_subprocess_error"
+    LINEAGE_HEAD_MISMATCH = "lineage_head_mismatch"
+    LINEAGE_METADATA_MISMATCH = "lineage_metadata_mismatch"
+    LINEAGE_RECORD_MISSING = "lineage_record_missing"
+    LINEAGE_COMMIT_MISMATCH = "lineage_commit_mismatch"
+    LINEAGE_READ_ERROR = "lineage_read_error"
+    ANCESTRY_FAILURE = "ancestry_failure"
+    COMMIT_IDENTITY_MISMATCH = "commit_identity_mismatch"
+    MERGE_IDENTITY_MISMATCH = "merge_identity_mismatch"
+    MERGE_PARENT_MISMATCH = "merge_parent_mismatch"
+    PATCH_BUDGET_EXCEEDED = "patch_budget_exceeded"
+    PATCH_ID_MISMATCH = "patch_id_mismatch"
+
+
+@dataclass(frozen=True)
+class LeaseAttestation:
+    ok: bool
+    reason: str
+
+
+_lease_refusal_reason: ContextVar[LeaseAttestationReason | None] = ContextVar(
+    "lease_refusal_reason", default=None,
+)
+
+
+def _lease_refuse(reason: LeaseAttestationReason) -> bool:
+    _lease_refusal_reason.set(reason)
+    return False
+
+
+def _lease_git_ok(result: Any) -> bool:
+    if getattr(result, "timed_out", False):
+        return _lease_refuse(LeaseAttestationReason.GIT_TIMEOUT)
+    if getattr(result, "output_limited", False):
+        return _lease_refuse(LeaseAttestationReason.GIT_OUTPUT_LIMIT)
+    if result.returncode != 0:
+        return _lease_refuse(LeaseAttestationReason.GIT_NONZERO_EXIT)
+    return True
+
+
+def _lease_ancestor_ok(result: Any) -> bool:
+    # Ancestry, status and replay merge-base historically inspected only the
+    # exit status. Preserve that decision while diagnosing failed commands.
+    if result.returncode == 0:
+        return True
+    _lease_git_ok(result)
+    return False
+
+
+def _lease_exception_reason(error: BaseException) -> LeaseAttestationReason:
+    if isinstance(error, FileNotFoundError):
+        return LeaseAttestationReason.GIT_MISSING_BINARY
+    if isinstance(error, subprocess.TimeoutExpired):
+        return LeaseAttestationReason.GIT_TIMEOUT
+    return LeaseAttestationReason.GIT_SUBPROCESS_ERROR
+
+
 def _attested_pr_checkout_lease(
     auth_context: "AuthContext | None",
     scope: Any,
     lease: Any,
 ) -> bool:
     """Return whether the lease still contains only author-attested content."""
+    return pr_checkout_lease_attestation(auth_context, scope, lease).ok
+
+
+def pr_checkout_lease_attestation(
+    auth_context: "AuthContext | None", scope: Any, lease: Any,
+) -> LeaseAttestation:
+    """Diagnose a lease refusal without exposing checkout or Git output."""
+    token = _lease_refusal_reason.set(None)
+    try:
+        return _pr_checkout_lease_attestation(auth_context, scope, lease)
+    finally:
+        _lease_refusal_reason.reset(token)
+
+
+def log_pr_checkout_lease_attestation_refused(
+    auth_context: "AuthContext | None", scope: Any, reason: str,
+) -> None:
+    """Log only the scope identifier and fixed reason, once per turn and reason."""
+    scope_id = getattr(scope, "scope_id", None)
+    ifc_state = getattr(auth_context, "ifc_state", None)
+    if ifc_state is not None:
+        with getattr(ifc_state, "_lock", threading.Lock()):
+            seen = getattr(ifc_state, "_lease_attestation_refusals", None)
+            if seen is None:
+                seen = set()
+                setattr(ifc_state, "_lease_attestation_refusals", seen)
+            if (scope_id, reason) in seen:
+                return
+            seen.add((scope_id, reason))
+    from .event_logger import log_event_sync
+
+    try:
+        log_event_sync(
+            "pr_checkout_lease_attestation_refused", scope_id=scope_id, reason=reason,
+        )
+    except RuntimeError:
+        # Standalone policy callers may not initialize the process event logger.
+        pass
+
+
+def _pr_checkout_lease_attestation(
+    auth_context: "AuthContext | None", scope: Any, lease: Any,
+) -> LeaseAttestation:
+    def verdict(ok: bool, reason: LeaseAttestationReason | None = None) -> LeaseAttestation:
+        code = (LeaseAttestationReason.OK if ok else
+                reason or _lease_refusal_reason.get() or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+        return LeaseAttestation(ok, code.value)
+
     ifc_state = getattr(auth_context, "ifc_state", None)
     author_trust = getattr(ifc_state, "pr_checkout_author_trust", {})
     scope_id = getattr(scope, "scope_id", None)
-    if (
-        lease is None
-        or author_trust.get(scope_id) is not True
-        or scope_id != getattr(lease, "scope_id", None)
+    if author_trust.get(scope_id) is not True:
+        return verdict(False, LeaseAttestationReason.NO_AUTHOR_TRUST)
+    if (lease is None or scope_id != getattr(lease, "scope_id", None)
         or getattr(scope, "canonical_repo", "").lower()
         != getattr(lease, "canonical_repo", "").lower()
         or getattr(scope, "pr_number", None) != getattr(lease, "pr_number", None)
-        or not getattr(lease, "is_active", False)
     ):
-        return False
+        return verdict(False, LeaseAttestationReason.SCOPE_LEASE_MISMATCH)
+    if not getattr(lease, "is_active", False):
+        return verdict(False, LeaseAttestationReason.INACTIVE_LEASE)
 
     expected_head = getattr(scope, "observed_head_sha", "").lower()
     expected_branch = getattr(scope, "head_ref", None)
     path = getattr(lease, "path", None)
     if not expected_head or not expected_branch or path is None:
-        return False
+        return verdict(False, LeaseAttestationReason.MISSING_EXPECTED_HEAD_OR_BRANCH)
 
     registry = getattr(auth_context, "repo_pr_scope_registry", None)
     review_state = (
@@ -10621,10 +10740,10 @@ def _attested_pr_checkout_lease(
         # A file read reconstructs the same lease from metadata. With no local
         # HEAD advance, the immutable observed commit still suffices; the real
         # checkout/branch are inspected by the author-attestation predicate.
-        return _lease_head_is_author_attested(
+        return verdict(_lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
             scope=scope, lease=lease, ifc_state=ifc_state,
-        )
+        ))
     if review_state is None or attached is None or any(
         getattr(attached, key, None) != getattr(lease, key, None) for key in (
             "path", "scope_id", "head_sha", "base_sha", "recovery_id",
@@ -10633,34 +10752,39 @@ def _attested_pr_checkout_lease(
     ):
         # Synthetic callers without the runtime's RepoReviewState do not get the
         # cache, but still fail closed against the immutable attested head.
-        return getattr(lease, "head_sha", "").lower() == expected_head and _lease_head_is_author_attested(
+        if getattr(lease, "head_sha", "").lower() != expected_head:
+            return verdict(False, LeaseAttestationReason.REVIEW_STATE_MISMATCH)
+        return verdict(_lease_head_is_author_attested(
             path, expected_branch, expected_head, expected_head,
             scope=scope, lease=lease, ifc_state=ifc_state,
-        )
+        ))
     recorded_head = getattr(review_state, "git_expected_head", None)
     if not recorded_head:
-        return False
+        return verdict(False, LeaseAttestationReason.MISSING_RECORDED_HEAD)
     observed_state = _observed_checkout_state(path)
     if observed_state is None:
-        return False
+        reason = _lease_refusal_reason.get()
+        return verdict(False, reason or LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
     observed_branch, observed_head = observed_state
     if observed_branch != expected_branch or observed_head != recorded_head.lower():
         # The checkout can be mutated by processes outside the typed repository
         # tools. Never reuse a verdict unless the real branch and HEAD still
         # match the server's recorded state.
-        return False
-    if (observed_head != expected_head or getattr(lease, "head_sha", "").lower() != expected_head) and not _lease_has_clean_lineage(
-        path, lease, scope, expected_head, observed_head,
-    ):
-        return False
-    return review_state.author_attestation_verdict(
-        observed_head,
-        lambda: _lease_head_is_author_attested(
+        return verdict(False, LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
+    if observed_head != expected_head or getattr(lease, "head_sha", "").lower() != expected_head:
+        if not _lease_has_clean_lineage(path, lease, scope, expected_head, observed_head):
+            return verdict(False)
+
+    def verify() -> tuple[bool, str]:
+        attestation = verdict(_lease_head_is_author_attested(
             path, expected_branch, expected_head, observed_head,
             observed_state=observed_state,
             scope=scope, lease=lease, ifc_state=ifc_state,
-        ),
-    )
+        ))
+        return attestation.ok, attestation.reason
+
+    ok, reason = review_state.author_attestation_verdict(observed_head, verify)
+    return LeaseAttestation(ok, reason)
 
 
 def _lease_has_clean_lineage(
@@ -10672,15 +10796,18 @@ def _lease_has_clean_lineage(
 
     try:
         raw = json.loads((path / _METADATA).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
+    try:
         if current_head != getattr(lease, "head_sha", "").lower():
-            return False
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_HEAD_MISMATCH)
         if not isinstance(raw, dict) or any(raw.get(key) != getattr(lease, key) for key in (
             "scope_id", "canonical_repo", "pr_number", "head_sha", "base_sha",
         )):
-            return False
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_METADATA_MISMATCH)
         lineage = _recorded_lineage(raw)
         if lineage is None:
-            return False
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_RECORD_MISSING)
         base = getattr(lease, "base_sha", "").lower()
         verified_base = _recorded_verified_base(raw)
         protected = (
@@ -10691,20 +10818,24 @@ def _lease_has_clean_lineage(
             ancestor = hardened_git_command(
                 path, ("merge-base", "--is-ancestor", scope.observed_base_sha, base), timeout=5,
             )
-            if ancestor.returncode != 0 or ancestor.timed_out or ancestor.output_limited:
+            if not _lease_git_ok(ancestor):
                 return False
         result = hardened_git_command(
             path, ("rev-list", "--max-count=501", current_head, "--not", expected_head,
                    *((base,) if protected else ()), "--"), timeout=5,
         )
-        if result.returncode != 0 or result.timed_out or result.output_limited:
+        if not _lease_git_ok(result):
             return False
         commits = result.stdout.splitlines()
-        return bool(commits) and len(commits) <= 500 and all(
+        if not (bool(commits) and len(commits) <= 500 and all(
             lineage.get(commit) is True for commit in commits
-        )
-    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
-        return False
+        )):
+            return _lease_refuse(LeaseAttestationReason.LINEAGE_COMMIT_MISMATCH)
+        return True
+    except (OSError, subprocess.SubprocessError) as error:
+        return _lease_refuse(_lease_exception_reason(error))
+    except (ValueError, TypeError):
+        return _lease_refuse(LeaseAttestationReason.LINEAGE_READ_ERROR)
 
 
 def _scope_has_protected_base(scope: Any, protected_refs: frozenset[str]) -> bool:
@@ -10724,9 +10855,10 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
             ("status", "--porcelain=v2", "--branch", "--untracked-files=no"),
             timeout=5,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        _lease_refuse(_lease_exception_reason(error))
         return None
-    if result.returncode != 0:
+    if not _lease_ancestor_ok(result):
         return None
     fields = {}
     for line in result.stdout.splitlines():
@@ -10742,6 +10874,7 @@ def _observed_checkout_state(path: Path) -> tuple[str, str] | None:
         or len(head) != 40
         or any(character not in "0123456789abcdef" for character in head)
     ):
+        _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
         return None
     return branch, head
 
@@ -10775,7 +10908,7 @@ def _lease_head_is_author_attested(
         # --stable discards whitespace (including semantic Python indentation).
         # Require --verbatim; unsupported Git versions fail closed.
         diff = run("show", "--format=", "--root", "--no-ext-diff", "--no-textconv", commit, "--")
-        if diff.returncode != 0 or diff.timed_out or diff.output_limited:
+        if not _lease_git_ok(diff):
             return None
         result = subprocess.run(
             [str(_DEFAULT_GIT), *_BASE_CONFIG, "patch-id", "--verbatim"],
@@ -10783,14 +10916,21 @@ def _lease_head_is_author_attested(
             env=_sanitized_git_env(),
         )
         fields = result.stdout.split()
-        if result.returncode != 0 or len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+        if not _lease_git_ok(result):
+            return None
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40}", fields[0]):
+            _lease_refuse(LeaseAttestationReason.PATCH_ID_MISMATCH)
             return None
         return fields[0]
 
     try:
         actual_state = observed_state or _observed_checkout_state(path)
-        if actual_state != (expected_branch, current_head.lower()):
+        if actual_state is None:
+            # Keep the status subprocess reason from the uncached/reconstructed
+            # lease path instead of masking it as a branch mismatch.
             return False
+        if actual_state != (expected_branch, current_head.lower()):
+            return _lease_refuse(LeaseAttestationReason.CHECKOUT_STATE_MISMATCH)
         if current_head.lower() == expected_head.lower():
             return True
         base = getattr(scope, "observed_base_sha", "").lower()
@@ -10802,61 +10942,69 @@ def _lease_head_is_author_attested(
                 or (
                     base == getattr(lease, "scope_base_sha", "").lower()
                     and getattr(lease, "verified_base_sha", None) == getattr(lease, "base_sha", None)
-                    and run("merge-base", "--is-ancestor", base, lease.base_sha).returncode == 0
+                    and _lease_ancestor_ok(run("merge-base", "--is-ancestor", base, lease.base_sha))
                 )
             )
         )
         if protected_base:
             base = lease.base_sha.lower()
-        head_ancestor = run("merge-base", "--is-ancestor", expected_head, current_head).returncode == 0
-        base_ancestor = protected_base and run(
+        head_ancestor = _lease_ancestor_ok(run("merge-base", "--is-ancestor", expected_head, current_head))
+        base_ancestor = protected_base and _lease_ancestor_ok(run(
             "merge-base", "--is-ancestor", base, current_head,
-        ).returncode == 0
+        ))
         if not head_ancestor and not base_ancestor:
-            return False
+            if _lease_refusal_reason.get() in {
+                LeaseAttestationReason.GIT_TIMEOUT, LeaseAttestationReason.GIT_OUTPUT_LIMIT,
+            }:
+                return False
+            return _lease_refuse(LeaseAttestationReason.ANCESTRY_FAILURE)
         commits = run(
             "log", "-z", "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce",
             current_head, "--not", expected_head, *((base,) if base_ancestor else ()), "--",
         )
-        if commits.returncode != 0 or commits.timed_out or commits.output_limited:
+        if not _lease_git_ok(commits):
             return False
         fields = commits.stdout.split("\x00")
         if fields[-1] != "":
-            return False
+            return _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
         fields.pop()
         if len(fields) % 6:
-            return False
+            return _lease_refuse(LeaseAttestationReason.GIT_MALFORMED_OUTPUT)
         original_patches: Counter[str] | None = None
         for index in range(0, len(fields), 6):
             commit, parents, author, email, committer, committer_email = fields[index:index + 6]
             if [committer, committer_email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
-                return False
+                return _lease_refuse(LeaseAttestationReason.COMMIT_IDENTITY_MISMATCH)
             if len(parents.split()) > 1:
                 # Only a server-authored merge of the exact protected base may
                 # introduce another ancestry. Never accept arbitrary side merges.
                 if not base_ancestor or [author, email] != [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
-                    return False
-                if any(parent != base and run("merge-base", "--is-ancestor", expected_head, parent).returncode != 0
+                    return _lease_refuse(LeaseAttestationReason.MERGE_IDENTITY_MISMATCH)
+                if any(parent != base and not _lease_ancestor_ok(run("merge-base", "--is-ancestor", expected_head, parent))
                        for parent in parents.split()):
-                    return False
+                    if _lease_refusal_reason.get() in {
+                        LeaseAttestationReason.GIT_TIMEOUT, LeaseAttestationReason.GIT_OUTPUT_LIMIT,
+                    }:
+                        return False
+                    return _lease_refuse(LeaseAttestationReason.MERGE_PARENT_MISMATCH)
                 continue
             if [author, email] == [DEFAULT_USER_NAME, DEFAULT_USER_EMAIL]:
                 continue
             if not base_ancestor:
-                return False
+                return _lease_refuse(LeaseAttestationReason.ANCESTRY_FAILURE)
             if original_patches is None:
                 merge_base = run("merge-base", expected_head, base)
-                if merge_base.returncode != 0:
+                if not _lease_ancestor_ok(merge_base):
                     return False
                 # Read one beyond the budget so oversized ranges fail closed
                 # before any per-commit show/patch-id subprocess is launched.
                 original = run("rev-list", "--no-merges", "--max-count=501",
                                f"{merge_base.stdout.strip()}..{expected_head}", "--")
-                if original.returncode != 0 or original.timed_out or original.output_limited:
+                if not _lease_git_ok(original):
                     return False
                 original_commits = original.stdout.splitlines()
                 if len(original_commits) > 500:
-                    return False
+                    return _lease_refuse(LeaseAttestationReason.PATCH_BUDGET_EXCEEDED)
                 original_patches = Counter()
                 for original_commit in original_commits:
                     original_patch = patch_id(original_commit)
@@ -10864,11 +11012,13 @@ def _lease_head_is_author_attested(
                         original_patches[original_patch] += 1
             replayed_patch = patch_id(commit)
             if replayed_patch is None or original_patches[replayed_patch] <= 0:
-                return False
+                if _lease_refusal_reason.get() is not None:
+                    return False
+                return _lease_refuse(LeaseAttestationReason.PATCH_ID_MISMATCH)
             original_patches[replayed_patch] -= 1
         return True
-    except (OSError, subprocess.SubprocessError):
-        return False
+    except (OSError, subprocess.SubprocessError) as error:
+        return _lease_refuse(_lease_exception_reason(error))
 
 
 @dataclass(frozen=True)
@@ -10989,7 +11139,15 @@ def protected_result_source(
                 scope = getattr(review_state, "action_scope", None)
         # Acquired from head-bound native PR metadata and the same turn-local
         # author verdict cache as forge reads. No network lookup on file reads.
-        trusted_lease = _attested_pr_checkout_lease(auth_context, scope, lease)
+        trusted_lease = False
+        if scope is not None or lease is not None:
+            lease_attestation = pr_checkout_lease_attestation(auth_context, scope, lease)
+            trusted_lease = lease_attestation.ok
+            if not trusted_lease:
+                log_pr_checkout_lease_attestation_refused(
+                    auth_context, scope if scope is not None else lease,
+                    lease_attestation.reason,
+                )
         retained_checkout = False
         service = get_trusted_service_from_auth_context(auth_context)
         if _is_worklink_retained_checkout_service(
