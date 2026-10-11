@@ -35,6 +35,7 @@ from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
 from mimir.worklink.backends.feature_factory import (
     _FACTORY_PERMISSION,
+    FactoryContractError,
     FeatureFactoryBackend,
     parse_factory_status,
 )
@@ -9108,6 +9109,78 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     assert factory_clock.now == 30.0
 
 
+@pytest.mark.parametrize("lock_owner", [None, "session-1"])
+def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_clock: SimpleNamespace,
+    lock_owner: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    released = _factory_lifecycle_status(
+        sandbox, status="running", lock="absent", session=None,
+    )
+    record = replace(_factory_lifecycle_record(sandbox, handle), session="session-1")
+    status_calls = 0
+    lifecycle: list[str] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 1
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal status_calls
+            assert factory_clock.now < 3.0
+            status_calls += 1
+            if lock_owner is not None:
+                return _factory_lifecycle_status(
+                    sandbox, status="running", lock="fresh", session=lock_owner,
+                )
+            return released
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("the retired session must not heartbeat")
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += delay
+
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "3")
+    expected = (
+        "factory recovery lock handoff changed unexpectedly"
+        if lock_owner else "did not acquire the run lock before startup deadline"
+    )
+    with pytest.raises(WorklinkError, match=expected):
+        asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=object(), backend=Backend(), compute=Compute(),
+            factory_record=record, test_cmd="pytest -q",
+            runner=lambda args: cp(args), started_at=datetime.now(UTC),
+            initial_status=released, recovery_session="session-1",
+        ))
+    assert status_calls == (1 if lock_owner else 2)
+    assert lifecycle == ["cancel", "cleanup"]
+    assert load_factory_record(tmp_path, "700").session == "session-1"
+
+
 @pytest.mark.parametrize("after_valid", [False, True])
 def test_factory_supervision_immediately_refuses_other_invalid_statuses(
     tmp_path: Path,
@@ -9671,6 +9744,7 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
 )
 @pytest.mark.parametrize("local_compute", [False, True], ids=["fake", "local"])
+@pytest.mark.parametrize("retained_session", ["session-1", "session-2"])
 @pytest.mark.parametrize("idle_park", [False, True], ids=["operator-park", "idle-park"])
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
@@ -9679,6 +9753,7 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     dead_lock: bool,
     action: str | None,
     local_compute: bool,
+    retained_session: str,
     idle_park: bool,
 ) -> None:
     from mimir.worklink.compute import LocalSubprocessComputeBackend
@@ -9717,7 +9792,7 @@ print(json.dumps([str(path) for path in pruned]))
         return json.loads(child.stdout)
     historical = {"reason": "opaque and nonauthoritative"}
 
-    def status(value: str, lock_value: str, next_value: str | None = None):
+    def status(value: str, lock_value: str, next_value: str | None = None, owner: str | None = None):
         payload: dict[str, Any] = {
             "run_id": "700",
             "issue_key": "700",
@@ -9730,7 +9805,7 @@ print(json.dumps([str(path) for path in pruned]))
             "pr_draft": False,
             "lock": lock_value,
             "dead_lock": dead_lock if lock_value == lock else False,
-            "lock_session": None if lock_value == "absent" else "session-1",
+            "lock_session": None if lock_value == "absent" else owner or retained_session,
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
             "slices": [{
@@ -9757,7 +9832,9 @@ print(json.dumps([str(path) for path in pruned]))
         statuses.append(status("needs-human", "fresh"))
     statuses.extend([
         status("running", "fresh", "implementation"),
-        status("needs-human", "fresh"),
+        status("running", "absent", "implementation"),
+        status("running", "absent", "implementation"),
+        status("needs-human", "fresh", owner="session-3"),
     ])
     calls: list[tuple[str, ...]] = []
 
@@ -9817,8 +9894,7 @@ print(json.dumps([str(path) for path in pruned]))
                 assert self.process.poll() is None
                 assert sandbox.is_dir()
             assert spec.local_argv is not None
-            session_index = tuple(spec.local_argv).index("--session")
-            assert spec.local_argv[session_index + 1] == "session-1"
+            assert "--session" not in spec.local_argv
             assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
             return self.handle
 
@@ -9880,7 +9956,7 @@ print(json.dumps([str(path) for path in pruned]))
         branch="epic/700",
         launcher="/opt/factory/bin/factory.js",
         sandbox=str(sandbox),
-        session="session-1",
+        session=retained_session,
         handle=LaunchHandle("local_subprocess", "99999999", 456),
         status=status("needs-human", lock),
         observed_at="2026-08-18T12:00:00+00:00",
@@ -9932,15 +10008,18 @@ print(json.dumps([str(path) for path in pruned]))
     expected = [("status", "700", str(sandbox), retained.launcher)]
     if action is not None:
         expected.extend([
-            ("lock", "700", action, "session-1", str(sandbox)),
+            ("lock", "700", action, retained_session, str(sandbox)),
             ("status", "700", str(sandbox), retained.launcher),
         ])
     expected.extend([
-        ("resume", "700", "session-1", str(sandbox)),
+        ("resume", "700", retained_session, str(sandbox)),
+        ("status", "700", str(sandbox), retained.launcher),
+        ("lock", "700", "release", retained_session, str(sandbox)),
         ("status", "700", str(sandbox), retained.launcher),
     ])
     assert calls[:len(expected)] == expected
-    assert calls[-1] == ("heartbeat", "700", "session-1", str(sandbox))
+    assert calls[-1] == ("heartbeat", "700", "session-3", str(sandbox))
+    assert load_factory_record(tmp_path, "700").session == "session-3"
     assert compute.cancelled and compute.cleaned
     assert compute.launches == 1
     if local_compute:
@@ -9966,6 +10045,12 @@ print(json.dumps([str(path) for path in pruned]))
         ("changed_history", ["status", "lock:claim", "status"]),
         ("missing_next", ["status", "resume", "status"]),
         ("live_process", ["status"]),
+        ("release_failed", ["status", "resume", "status", "lock:release"]),
+        ("release_held", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_owner", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_history", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_status", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_next", ["status", "resume", "status", "lock:release", "status"]),
     ],
 )
 def test_factory_recovery_rejection_command_matrix(
@@ -10023,11 +10108,23 @@ def test_factory_recovery_rejection_command_matrix(
                 next_present=False,
             ),
         ]
+    elif case.startswith("release_"):
+        statuses = [
+            status(lock="fresh", owner="session-1"),
+            status(lock="fresh", owner="session-1", current="running"),
+            status(
+                lock="fresh" if case == "release_held" else "absent",
+                owner="session-1" if case == "release_owner" else None,
+                current="needs-human" if case == "release_status" else "running",
+                changed_history=case == "release_history",
+                next_present=case != "release_next",
+            ),
+        ]
     else:
         statuses = [status(lock="fresh", owner="session-1")]
     events: list[str] = []
 
-    class Backend:
+    class Backend(FeatureFactoryBackend):
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
@@ -10036,6 +10133,8 @@ def test_factory_recovery_rejection_command_matrix(
 
         def lock(self, run_id: str, action: str, **kwargs: object) -> None:
             events.append(f"lock:{action}")
+            if case == "release_failed":
+                raise FactoryContractError("release refused")
 
         def resume(self, run_id: str, **kwargs: object) -> Any:
             events.append("resume")
@@ -10071,13 +10170,25 @@ def test_factory_recovery_rejection_command_matrix(
         "factory_process_is_verified_dead",
         lambda record: case != "live_process",
     )
+    if case.startswith("release_"):
+        _configure_opencode_oauth(tmp_path, monkeypatch)
+        monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kwargs: "https://github.com/owner/repo.git")
+        monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+        monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda repo: ())
 
-    with pytest.raises(Exception):
-        asyncio.run(
-            WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            assert issue_id == 700
+            assert kwargs == {
+                "status": "blocked", "review_ready": False, "attempt": 1,
+                "reason": f"factory recovery could not verify the retained lock was released; retained sandbox: {sandbox}",
+            }
+
+    async def recover() -> WorklinkRunResult:
+        return await WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-                claims=object(),
+                claims=Claims(),
                 backend=Backend(),
                 compute=Compute(),
                 retained=retained,
@@ -10086,8 +10197,16 @@ def test_factory_recovery_rejection_command_matrix(
                 base="main",
                 test_cmd="pytest -q",
                 runner=lambda args: cp(args),
-            )
         )
+
+    if case.startswith("release_"):
+        result = asyncio.run(recover())
+        assert result.status == "needs-human"
+        assert result.reason == "factory recovery could not verify the retained lock was released"
+        assert load_factory_record(tmp_path, "700").controller_phase == "parked"
+    else:
+        with pytest.raises(Exception):
+            asyncio.run(recover())
 
     assert events == expected
 
@@ -10118,6 +10237,7 @@ def test_factory_recovery_launch_start(
     sandbox.mkdir()
     pre = _factory_lifecycle_status(sandbox, status="needs-human")
     resumed = _factory_lifecycle_status(sandbox, status="running")
+    released = parse_factory_status({**resumed.to_json(), "lock": "absent", "lock_session": None})
     retained = replace(
         _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
         attempt=3,
@@ -10143,15 +10263,20 @@ def test_factory_recovery_launch_start(
 
     class Backend(FeatureFactoryBackend):
         def status(self, *args: object, **kwargs: object) -> Any:
-            return pre
+            return released if "released" in events else pre
 
         def resume(self, *args: object, **kwargs: object) -> Any:
             return resumed
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            assert action == "release" and kwargs["session"] == retained.session
+            events.append("released")
 
     class Compute:
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             events.append("launch")
             assert spec.attempt == retained.attempt
+            assert "--session" not in (spec.local_argv or ())
             return handle
 
         async def cancel(self, selected: LaunchHandle) -> None:
@@ -10204,13 +10329,13 @@ def test_factory_recovery_launch_start(
     if write_failure == "record":
         with pytest.raises(OSError, match="recovery persistence failed"):
             asyncio.run(recovery)
-        assert events == ["launch", "cancel", "cleanup"]
+        assert events == ["released", "launch", "cancel", "cleanup"]
         assert not failures.load_failure_state(state_dir).get("factory_transitions")
         saved = load_factory_record(tmp_path, "700")
         assert saved.handle == retained.handle
     else:
         assert asyncio.run(recovery) == "supervised"
-        assert events == ["launch", "supervise"]
+        assert events == ["released", "launch", "supervise"]
 
 
 def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or_resume(

@@ -3013,6 +3013,40 @@ class WorklinkRunner:
         ):
             raise WorklinkError("factory resume did not return an owned running status")
         resumed.require_recovery_next()
+        release_failure = "factory recovery could not verify the retained lock was released"
+        try:
+            backend.lock(
+                retained.run_id, "release", session=session,
+                sandbox=sandbox, launcher=retained.launcher,
+            )
+            released = backend.status(
+                retained.run_id, sandbox=sandbox, launcher=retained.launcher,
+            )
+            _require_factory_status(released, retained)
+            if (
+                released.status != "running"
+                or released.lock != "absent"
+                or released.lock_session is not None
+                or _opaque_json_bytes(released.terminal_result) != historical_result
+            ):
+                raise WorklinkError(release_failure)
+            released.require_recovery_next()
+        except Exception:
+            parked = replace(
+                retained.observed(resumed, datetime.now(UTC).isoformat()),
+                controller_phase="parked",
+                controller_error=_factory_controller_error(release_failure),
+            )
+            save_factory_record(self.home, parked)
+            claims.transition_issue(
+                issue.issue_id, status="blocked", review_ready=False,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason=f"{release_failure}; retained sandbox: {retained.sandbox}",
+            )
+            return WorklinkRunResult(
+                issue.issue_id, retained.attempt, "needs-human",
+                checkout=sandbox, branch=retained.branch, reason=release_failure,
+            )
         _verify_factory_recovery_binding(
             runner=self,
             issue=issue,
@@ -3045,7 +3079,6 @@ class WorklinkRunner:
             base_ref=retained.base_ref,
             branch=retained.branch,
             test_command=test_cmd,
-            session=session,
             run_id=retained.run_id,
         )
         if isinstance(compute, LocalSubprocessComputeBackend):
@@ -3056,7 +3089,7 @@ class WorklinkRunner:
         spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
         handle = await compute.launch(spec)
         relaunched = replace(
-            retained.observed(resumed, datetime.now(UTC).isoformat()),
+            retained.observed(released, datetime.now(UTC).isoformat()),
             handle=handle,
             controller_phase="running",
             transcript=None,
@@ -3081,7 +3114,8 @@ class WorklinkRunner:
             test_cmd=test_cmd,
             runner=runner,
             started_at=datetime.now(UTC),
-            initial_status=resumed,
+            initial_status=released,
+            recovery_session=session,
             autonomous=autonomous,
         )
 
@@ -3098,6 +3132,7 @@ class WorklinkRunner:
         runner: Runner,
         started_at: datetime,
         initial_status: FactoryStatus | None = None,
+        recovery_session: str | None = None,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
         incident_owner = self._incident_owner or self._begin_incident_invocation(
@@ -3306,6 +3341,8 @@ class WorklinkRunner:
                     return await park_for_reason(
                         last_status, _factory_budget_park_reason(last_status, factory_record)
                     )
+                if recovery_session is not None and loop.time() >= startup_deadline:
+                    raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
                 if status is None:
                     remaining = (
                         startup_deadline - loop.time()
@@ -3346,13 +3383,28 @@ class WorklinkRunner:
                         raise WorklinkError("factory never initialised before startup deadline")
                 else:
                     _require_factory_status(status, factory_record)
+                    handoff_claimed = False
+                    if recovery_session is not None:
+                        if status.lock == "absent" and status.lock_session is None:
+                            if loop.time() >= startup_deadline:
+                                raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                        elif (
+                            status.lock == "fresh"
+                            and not status.dead_lock
+                            and status.lock_session is not None
+                            and status.lock_session != recovery_session
+                        ):
+                            recovery_session = None
+                            handoff_claimed = True
+                        else:
+                            raise WorklinkError("factory recovery lock handoff changed unexpectedly")
                     if status != last_status:
                         status_changed_in_window = last_status is not None
                         last_status = status
                     if factory_record.session is not None and status.lock_session not in {
                         None,
                         factory_record.session,
-                    }:
+                    } and not handoff_claimed:
                         raise WorklinkError("factory lock owner changed")
                     factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
                     phase = (
@@ -3527,7 +3579,7 @@ class WorklinkRunner:
                     )
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
-                if pre_manifest:
+                if pre_manifest or recovery_session is not None:
                     poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
                 else:
                     poll_delay = min(poll_delay, max(0, park_deadline - loop.time()))
