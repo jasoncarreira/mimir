@@ -29,6 +29,7 @@ from mimir.models import (
     TurnInteractivity,
 )
 from mimir.pr_checkout_lease import active_pr_checkout_lease_for_path
+from tests.lease_attestation_helper import assert_lease_attested
 
 
 @pytest.fixture(autouse=True)
@@ -213,7 +214,7 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
     )
     auth, scope, lease, target, server_identity = _real_attested_lease(tmp_path)
 
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
 
     target.write_text("server remediation\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
@@ -234,7 +235,7 @@ def test_attested_lease_head_accepts_only_server_identity_descendants(
     assert access_control_module._lease_has_clean_lineage(
         lease.path, lease, scope, scope.observed_head_sha, server_head,
     )
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
 
     target.write_text("foreign commit\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
@@ -267,8 +268,8 @@ def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
         access_control_module, "_lease_head_is_author_attested", verify,
     )
 
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
     assert len(calls) == 1
 
     target.write_text("server remediation\n", encoding="utf-8")
@@ -286,7 +287,7 @@ def test_attested_lease_verdict_is_cached_until_checkout_head_changes(
     state.record_git_head(scope.scope_id, server_head)
     _record_clean_head(lease, server_head)
 
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
     assert len(calls) == 2
 
 
@@ -298,7 +299,7 @@ def test_attested_lease_cached_verdict_rejects_unrecorded_foreign_commit(
     )
     auth, scope, lease, target, _identity = _real_attested_lease(tmp_path)
 
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
 
     target.write_text("foreign commit\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
@@ -316,7 +317,7 @@ def test_attested_lease_rejects_unrecorded_server_identity_commit(
 ) -> None:
     auth, scope, lease, target, server_identity = _real_attested_lease(tmp_path)
 
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
 
     target.write_text("unrecorded server remediation\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(lease.path), "add", "work.py"], check=True)
@@ -865,11 +866,18 @@ def test_failed_git_operation_keeps_only_attested_origin(
         auth.ifc_labels, auth, enforce=False, repo_pr_action_scope=scope,
     )
     assert decision.allowed is verdict
-    assert len(events) == 1
     if not verdict:
         assert decision.reason == "write_blocked_by_untrusted_ingest"
         assert decision.refusal_detail == access_control_module._TAINTED_WRITE_REFUSAL
-        assert events == [("write_blocked_by_untrusted_ingest", {"tool": "repo_test"})]
+        assert events == [
+            ("pr_checkout_lease_attestation_refused", {
+                "scope_id": scope.scope_id, "reason": "no_author_trust",
+            }),
+            ("write_blocked_by_untrusted_ingest", {"tool": "repo_test"}),
+        ]
+    else:
+        assert len(events) == 1
+        assert events[0][0] == "repository_failure_provenance_retained"
     assert "distinctive" not in str(events)
 
 
@@ -1500,7 +1508,7 @@ def test_protected_base_lineage_keeps_results_and_file_reads_trusted(
     ).stdout.splitlines()
     _record_clean_head(lease, *descendants)
     object.__setattr__(auth, "repo_review_state", state)
-    assert access_control_module._attested_pr_checkout_lease(auth, scope, lease)
+    assert_lease_attested(auth, scope, lease)
     from mimir import pr_checkout_lease
 
     monkeypatch.setattr(pr_checkout_lease, "active_pr_checkout_lease_for_path", lambda _: lease)
