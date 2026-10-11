@@ -576,6 +576,9 @@ def test_stop_checks_both_factory_records(tmp_path, monkeypatch, claim_runner, l
             assert result.reason is None
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
 def test_cross_uid_factory_stop_uses_recorded_handle_and_verified_executor_exit(
     tmp_path, monkeypatch, claim_runner,
 ):
@@ -649,6 +652,9 @@ def test_cross_uid_factory_identity_mismatch_refuses_signal(
         runner.assert_not_called()
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
 @pytest.mark.parametrize("field,value,observed", [
     ("process_start_ticks", 100, 99), ("shim_pid", 4322, 99),
     (None, None, 100),
@@ -683,6 +689,9 @@ def test_executor_refuses_changed_factory_handle(monkeypatch, field, value, obse
         worker_exec._jobs.pop(identifier, None)
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux only: executor RPC requires AF_UNIX SOCK_SEQPACKET"
+)
 @pytest.mark.parametrize("change", [
     "unowned-job", "wrong-substrate", "null-ticks", "extra-handle-field",
     "extra-request-field", "wrong-protocol", "unverified-exit", "bool-ticks",
