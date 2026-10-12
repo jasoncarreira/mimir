@@ -264,3 +264,24 @@ def test_result_and_read_views_are_frozen_core_projections() -> None:
         policy._PROTECTED_RESULT_DOMAINS["other"] = "filesystem"
     with pytest.raises(TypeError):
         policy._OPERATION_READABLE_DOMAIN["other"] = "filesystem"
+
+
+def test_sink_and_taint_views_are_exact_registry_memberships() -> None:
+    tools = core_policy_registry().tools
+    for membership, view in (
+        ("fixed_service_sinks", policy._FIXED_SERVICE_SINK_OPERATIONS),
+        ("taint_independent_egress", policy._TAINT_INDEPENDENT_EGRESS_TOOLS),
+        ("worklink_build_tools", policy._WORKLINK_BUILD_TOOLS),
+        ("repo_publish_tools", policy._REPO_PUBLISH_TOOLS),
+        ("tainted_writes", policy._TAINTED_TURN_WRITE_TOOLS),
+        ("tainted_file_writes", policy._TAINTED_FILE_WRITE_TOOLS),
+        ("schedule_writes", policy._SCHEDULE_WRITE_TOOLS),
+        ("saga_mutations", policy._SAGA_MUTATION_OPERATIONS),
+    ):
+        assert view == frozenset(
+            name for name, tool in tools.items() if membership in tool.memberships
+        ), membership
+    assert tools["upload"].descriptor is None
+    assert "upload" not in core_policy_registry().flow
+    assert policy._FIXED_SERVICE_SINK_OPERATIONS == {"rebuild_index"}
+    assert policy._TAINT_INDEPENDENT_EGRESS_TOOLS == {"fetch_url", "web_search"}

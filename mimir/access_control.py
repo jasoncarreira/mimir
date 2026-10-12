@@ -5727,23 +5727,21 @@ _ACTIVE_SERVICE_SINK_DESTINATIONS: dict[SinkCategory, str] = {
 # Taint gating still applies upstream at the capability-tier gate; membership
 # here bypasses only destination checks. Keep membership narrow: a candidate
 # must accept no caller-selected target and write only fixed derived destinations.
-_FIXED_SERVICE_SINK_OPERATIONS = frozenset({"rebuild_index"})
+_FIXED_SERVICE_SINK_OPERATIONS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "fixed_service_sinks" in tool.memberships
+)
 
 
-_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset({
-    "fetch_url",
-    # Deliberate single-operator exception: the model-composed search query is
-    # an accepted outbound channel, permitted on a tainted turn because it goes
-    # to one operator-fixed trusted service. Search results are untrusted active
-    # ingest, so gating this channel would make the first search taint the turn
-    # and cap every research turn at one search.
-    # Unlike a fetch_url ``/*`` scope, there is no model-chosen destination and
-    # thus no exact-URL mitigation analogue. This is unsafe if untrusted
-    # multi-user chat is enabled: induced queries could encode other data. The
-    # trusted-operator shell_exec/file allowance below has the same deployment
-    # condition; neither exception may be carried into that posture unchanged.
-    "web_search",
-})
+# Deliberate single-operator exception: the model-composed web_search query
+# goes to one operator-fixed trusted service. Search results are untrusted
+# active ingest, so gating this channel would cap research at one search.
+# Unlike fetch_url, there is no model-chosen destination or exact-URL mitigation.
+# This and the trusted-operator shell/file allowance require a trusted deployment.
+_TAINT_INDEPENDENT_EGRESS_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "taint_independent_egress" in tool.memberships
+)
 
 
 def _egress_target_requires_taint_gate(
@@ -5875,9 +5873,10 @@ def _has_untrusted_active_ingest(
     )
 
 
-_SCHEDULE_WRITE_TOOLS = frozenset({
-    "add_schedule", "set_schedule_priority", "remove_schedule", "set_poller_overrides",
-})
+_SCHEDULE_WRITE_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "schedule_writes" in tool.memberships
+)
 _SCHEDULE_WRITE_REFUSAL = (
     "Scheduled work and autonomous instruction surfaces cannot be changed after "
     "untrusted ingest; propose this change with open_proposal/submit_proposal; "
@@ -6016,10 +6015,14 @@ def _scheduled_write_denial(tool_name: str, *, skill: bool = False) -> "ToolAuth
     )
 
 
-_WORKLINK_BUILD_TOOLS = frozenset({"worklink_run", "worklink_resume"})
-_REPO_PUBLISH_TOOLS = frozenset({
-    "repo_commit", "repo_merge", "repo_rebase", "repo_revert", "repo_push",
-})
+_WORKLINK_BUILD_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "worklink_build_tools" in tool.memberships
+)
+_REPO_PUBLISH_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "repo_publish_tools" in tool.memberships
+)
 _REPO_PUBLISH_INGEST_REFUSAL = (
     "This turn read untrusted outside content, so it cannot create or publish commits. "
     "Describe the intended change in a PR comment (pr_comment) or a message to the "
@@ -6027,17 +6030,14 @@ _REPO_PUBLISH_INGEST_REFUSAL = (
 )
 
 
-_TAINTED_TURN_WRITE_TOOLS = frozenset({
-    "repo_stage", "repo_commit", "repo_merge", "repo_rebase", "repo_revert",
-    "repo_push", "repo_test", "hands_edit", "hands_shell", "hands_python",
-    "memory_store", "saga_feedback", "saga_mark_contributions", "saga_end_session",
-    "saga_forget", "saga_record_skill_learning",
-})
-_TAINTED_FILE_WRITE_TOOLS = frozenset({
-    "write_file", "edit_file", "replace_file", "upload",
-    "awrite_file", "aedit_file", "areplace_file", "aupload",
-    "write", "edit", "replace", "awrite", "aedit", "areplace",
-})
+_TAINTED_TURN_WRITE_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "tainted_writes" in tool.memberships
+)
+_TAINTED_FILE_WRITE_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "tainted_file_writes" in tool.memberships
+)
 _TAINTED_WRITE_REFUSAL = (
     "This turn read untrusted outside content, so it cannot directly write code "
     "or live state. Use scratch/ and a proposal PR via open_proposal/submit_proposal "
@@ -11407,14 +11407,10 @@ _OPERATION_READABLE_DOMAIN: Mapping[str, str] = MappingProxyType({
     if tool.readable_domain is not None
 })
 
-_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
-    "memory_store",
-    "saga_feedback",
-    "saga_mark_contributions",
-    "saga_end_session",
-    "saga_record_skill_learning",
-    "saga_forget",
-})
+_SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "saga_mutations" in tool.memberships
+)
 
 
 class CapabilityMatrixError(Exception):
