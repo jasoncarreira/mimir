@@ -12,7 +12,7 @@ from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
-    builtin_trigger_service_principal, get_service_principal,
+    builtin_trigger_service_principal, classify_protected_result, get_service_principal,
     get_trusted_service_from_auth_context, service_can_invoke_operation,
 )
 from mimir.models import (
@@ -22,7 +22,7 @@ from mimir.models import (
 )
 from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
-from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+from mimir.tool_descriptors import ResultOriginKind, SinkCategory, get_tool_descriptor
 from mimir.tools.budget_gate import BudgetGateMiddleware, _authorize_tool_call
 
 
@@ -387,6 +387,83 @@ def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
     )
     assert blocked.reason == "missing_ifc_labels" and denial is not None
     assert BudgetGateMiddleware(policy)._policy is policy
+
+
+def test_plugin_result_domain_comes_from_authorizing_policy(policy):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value}),
+    )))
+    args = {"repository": "acme/widget", "pull_request": 7}
+    decision = ToolRegistry().authorize_tool(
+        "example_repo", auth, enforce=True, arguments=args, policy=policy,
+    )
+    assert decision.allowed
+    assert get_tool_descriptor("example_repo", policy=policy) is policy.tools["example_repo"].descriptor
+    labels = classify_protected_result("example_repo", args, auth, decision, result="outside data")
+    assert {source.domain for source in labels.sources} == {"repository"}
+    assert labels.has_untrusted_active_ingest
+    assert all(source.integrity == "untrusted" for source in labels.sources)
+    assert get_tool_descriptor("example_repo") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value}),
+    )))
+    request = ToolCallRequest(
+        tool_call={"name": "example_repo", "args": {
+            "repository": "acme/widget", "pull_request": 7,
+        }, "id": "plugin-result", "type": "tool_call"},
+        tool=policy.tools["example_repo"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+
+    def handler(_request):
+        return ToolMessage(content="outside data", tool_call_id="plugin-result")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(policy)
+    result = (
+        await gate.awrap_tool_call(request, async_handler) if asynchronous
+        else gate.wrap_tool_call(request, handler)
+    )
+    assert result.status != "error"
+    labels = auth.ifc_state.current(auth.ifc_labels)
+    assert labels.has_untrusted_active_ingest
+    assert any(source.domain == "repository" for source in labels.sources)
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_plugin_result_taint_vetoes_subsequent_write(policy, enforce):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value, RepoPRAction.WRITE.value}),
+    )))
+    args = {"repository": "acme/widget", "pull_request": 7}
+    read = ToolRegistry().authorize_tool(
+        "example_repo", auth, enforce=enforce, arguments=args, policy=policy,
+    )
+    labels = classify_protected_result("example_repo", args, auth, read, result="outside data")
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    decision = ToolRegistry().authorize_tool(
+        "example_write", auth, enforce=enforce, arguments=args, policy=policy,
+    )
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_plugin_sink_target_cannot_be_missing_or_spoofed(policy, enforce):
+    auth = _auth()
+    for target, args in ((None, {}), ("scheduler:own", {"channel_id": "scheduler:other"})):
+        decision = ToolRegistry().authorize_tool(
+            "example_channel", auth, enforce=enforce, target_channel=target,
+            arguments=args, policy=policy,
+        )
+        assert decision.would_block and decision.allowed is not enforce
 
 
 def test_plugin_channel_rejects_ambiguous_extractor_targets(policy):
