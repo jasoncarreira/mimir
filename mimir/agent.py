@@ -1858,7 +1858,10 @@ class Agent:
                 self._agent_tools is None
                 or coding_enabled != self._cached_coding_enabled
             ):
-                self._agent_tools = all_mimir_tools(coding_enabled=coding_enabled)
+                self._agent_tools = all_mimir_tools(
+                    coding_enabled=coding_enabled,
+                    policy=self._config.plugin_manager.policy,
+                )
 
             # Skills surfaced via SkillsMiddleware: pass operator +
             # bundled source paths as discovery sources. The framework
@@ -1905,7 +1908,7 @@ class Agent:
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
-                    ServiceToolSurfaceMiddleware(),
+                     ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(skill_sources),

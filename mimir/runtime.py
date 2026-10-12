@@ -349,7 +349,12 @@ async def create_agent_runtime(
                 notify_current=True,
             )
             initialize_github_forge_identity()
-        all_mimir_tools(coding_enabled=coding_enabled)
+        manager = getattr(config, "plugin_manager", None)
+        if manager is None:
+            all_mimir_tools(coding_enabled=coding_enabled)
+        else:
+            all_mimir_tools(coding_enabled=coding_enabled, policy=manager.policy,
+                            materialize_plugins=False)
 
         from .agent import Agent
         from .commitments import CommitmentsStore

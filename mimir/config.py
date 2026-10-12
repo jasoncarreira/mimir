@@ -1495,6 +1495,7 @@ class Config:
                 _env_bool("MIMIR_ACCESS_CONTROL_ENFORCED", False),
                 model_spec=model_spec,
                 coding_enabled=coding_enabled_value,
+                policy=plugin_manager.policy,
             ),
             open_bridge=_env_bool("MIMIR_OPEN_BRIDGE", False),
 

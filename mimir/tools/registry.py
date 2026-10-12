@@ -3105,6 +3105,8 @@ def all_mimir_tools(
     *,
     coding_enabled: bool = False,
     require_coding_available: bool = True,
+    policy: "PolicyRegistry | None" = None,
+    materialize_plugins: bool = True,
 ) -> list:
     """Return the full mimir tool surface for create_deep_agent.
 
@@ -3130,7 +3132,9 @@ def all_mimir_tools(
     """
     from ..plugins.core import core_policy_registry, core_runtime_names
     from .web import web_tools_enabled
-    registry = core_policy_registry()
+    registry = policy if policy is not None else core_policy_registry()
+    if not registry.frozen:
+        raise ValueError("tool assembly requires a frozen policy")
 
     def materialize(surface: str) -> list:
         return [registry.tools[name].factory() for name in core_runtime_names(surface)]
@@ -3185,6 +3189,16 @@ def all_mimir_tools(
         coding_enabled = not github_identity_is_degraded()
     if coding_enabled:
         tools.extend(materialize("coding"))
+    for declared in registry.tools.values() if materialize_plugins else ():
+        if declared.owner == "core" or declared.factory is None:
+            continue
+        tool = declared.factory()
+        if getattr(tool, "name", None) != declared.name:
+            raise ValueError(
+                f"plugin {declared.owner}: factory for {declared.name} returned "
+                f"{getattr(tool, 'name', None)!r}"
+            )
+        tools.append(tool)
     # MCP-bridged tools (populated by server.py:_on_startup after the
     # MCP servers come up; empty when MCP is unconfigured).
     from .mcp import get_mcp_tools
