@@ -174,10 +174,13 @@ def _resolve_standing_review(
     tool_name: str,
     auth_context: AuthContext | None,
     arguments: Mapping[str, Any] | None,
+    *,
+    policy: Any = None,
 ) -> str | None:
     """Resolve safe review authority before resource and IFC authorization."""
     if (
-        tool_name not in _STANDING_REVIEW_TOOLS
+        (tool_name not in _STANDING_REVIEW_TOOLS
+         and not _plugin_membership(tool_name, "standing_review", policy))
         or auth_context is None
         or not isinstance(arguments, Mapping)
     ):
@@ -1028,7 +1031,8 @@ def _authorized_fetch_urls_for_tool(
         approved = set(approved_fetch_urls(auth_context))
         approved.update(
             url for url in ingested_fetch_urls(auth_context)
-            if fetch_url_is_approved(url, auth_context)
+            if _plugin_tool(tool_name, policy) is not None
+            or fetch_url_is_approved(url, auth_context)
         )
         if target is not None and fetch_url_is_approved(target, auth_context):
             normalized = normalize_sink_destination(SinkCategory.NETWORK, target)
@@ -3489,7 +3493,10 @@ def _prepare_tool_call_execution(
         return _tool_call_refusal(
             call, review_denial, arguments=arguments, record_outcome=True,
         )
-    if arguments is None and tool_name in _STANDING_REVIEW_TOOLS:
+    if arguments is None and (
+        tool_name in _STANDING_REVIEW_TOOLS
+        or _plugin_membership(tool_name, "standing_review", policy)
+    ):
         return _tool_call_refusal(
             call, _argument_validation_refusal(request), arguments=None,
             record_outcome=True,
@@ -3595,6 +3602,23 @@ def _prepare_tool_call_execution(
             call, _argument_validation_refusal(request), arguments=None,
             operator_shell_audit=operator_shell_audit, record_outcome=True,
         )
+    registered = _plugin_tool(tool_name, policy)
+    if registered is not None and registered.descriptor is not None:
+        fetch_kind = registered.descriptor.fetch_authorization
+        if fetch_kind is not FetchAuthorizationKind.NONE:
+            target = _extract_sink_target(request, auth_context, policy)
+            allowed_urls = _authorized_fetch_urls_for_tool(
+                tool_name, auth_context, target, policy,
+            )
+            normalized = (
+                normalize_sink_destination(SinkCategory.NETWORK, target)
+                if isinstance(target, str) else None
+            )
+            if normalized is None or allowed_urls is None or normalized not in allowed_urls:
+                return _tool_call_refusal(
+                    call, "fetch destination is not approved", arguments=None,
+                    record_outcome=True,
+                )
     if tool_name == "approve_declassification":
         denial = _check_and_increment_or_deny(tool_name, policy=policy)
         if denial is not None:
@@ -4042,6 +4066,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             return review
         review_denial = _resolve_standing_review(
             review.tool_name, review.auth_context, review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
         )
         call = _prepare_tool_call_execution(review, review_denial, policy=self._policy)
         if not isinstance(call, _PreparedToolCall):
@@ -4091,6 +4116,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             review.tool_name,
             review.auth_context,
             review.arguments,
+            **({"policy": self._policy} if self._policy is not None else {}),
         )
         jev_candidates: list[str] = []
         call = _prepare_tool_call_execution(
