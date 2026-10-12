@@ -2060,6 +2060,7 @@ async def test_factory_rollback_task_timeout_continues_reverse_closers_and_rerai
     )
     monkeypatch.setattr(runtime, "RUNTIME_RESOURCE_CLOSE_TIMEOUT_SECONDS", 0.01)
     config = _config(tmp_path)
+    config.coding_enabled = True
     config.operator_alert_channel = "ops"
     adapters = _adapters(events)
 
