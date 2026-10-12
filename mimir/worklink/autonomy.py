@@ -50,9 +50,11 @@ from .dispatch_failures import _find_latest_evidence_file_for_issue
 from .factory_state import (
     LIVE_CONTROLLER_PHASES,
     RETAINED_CONTROLLER_PHASES,
+    FACTORY_STOP_GRACE_S,
     factory_checkout_interlock,
-    factory_process_is_alive,
     factory_process_is_verified_dead,
+    factory_run_still_going,
+    factory_run_stopped_since,
     list_factory_records,
 )
 from .run_state import (
@@ -227,9 +229,16 @@ def check_concurrency(
 
 
 
-def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
+def _attempt_is_active(
+    child: Path, records: Sequence[object] = (), *, now: datetime | None = None,
+) -> bool:
     resolved = child.resolve()
+    now = now or datetime.now(timezone.utc)
     for candidate in records:
+        matches_attempt = (
+            f"{getattr(candidate, 'issue_id', None)}-"
+            f"{getattr(candidate, 'attempt', None)}" == child.name
+        )
         sandbox = getattr(candidate, "sandbox", None)
         if not isinstance(sandbox, str):
             continue
@@ -241,9 +250,15 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
             return True
         if phase not in LIVE_CONTROLLER_PHASES | RETAINED_CONTROLLER_PHASES:
             return True
-        if factory_process_is_alive(candidate):
-            return True
         status = getattr(candidate, "status", None)
+        if factory_run_still_going(candidate, status, now=now):
+            return True
+        stopped = factory_run_stopped_since(candidate, status)
+        if (
+            matches_attempt and stopped is not None
+            and now < stopped + timedelta(seconds=FACTORY_STOP_GRACE_S)
+        ):
+            return True
         if status is not None and status.is_parked:
             return True
         if status is not None and status.is_terminal:
@@ -365,7 +380,7 @@ def prune_stale_attempt_checkouts_for_home(
             now=now,
             is_active=lambda child: (
                 child.resolve() in retained_run_paths
-                or _attempt_is_active(child, factory_records)
+                or _attempt_is_active(child, factory_records, now=now)
                 or _attempt_held_by_factory_observation(
                     child,
                     factory_records,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 import errno
 import json
 from pathlib import Path
@@ -18,6 +19,8 @@ from mimir.worklink.factory_state import (
     archive_factory_record,
     archive_factory_record_for_issue,
     factory_manifest_candidates,
+    factory_run_still_going,
+    factory_run_stopped_since,
     load_factory_records_for_issue,
     list_factory_records,
     load_factory_record,
@@ -70,6 +73,23 @@ def record(tmp_path: Path) -> FactoryRunRecord:
         observed_at="2026-08-18T12:00:00+00:00",
         controller_phase="running",
     )
+
+
+@pytest.mark.parametrize("minutes,going", [(5, True), (15, False)])
+def test_factory_still_going_checks_heartbeat_after_verified_death(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, minutes: int, going: bool,
+) -> None:
+    import mimir.worklink.factory_state as state
+
+    now = datetime.now(UTC)
+    value = record(tmp_path)
+    value = replace(value, observed_at=(now - timedelta(minutes=minutes)).isoformat())
+    monkeypatch.setattr(state, "factory_process_is_verified_dead", lambda *_args: True)
+    assert factory_run_still_going(value, value.status, now=now) is going
+    assert factory_run_stopped_since(value, value.status) == now - timedelta(minutes=minutes)
+    monkeypatch.setattr(state, "factory_process_is_verified_dead", lambda *_args: False)
+    assert factory_run_still_going(value, None, now=now) is True
+    assert factory_run_stopped_since(value, None) is None
 
 
 def test_factory_record_round_trip_is_atomic_and_has_no_cost_fields(tmp_path: Path) -> None:

@@ -1478,10 +1478,11 @@ def test_prune_does_not_extend_checkout_for_another_attempt(tmp_path: Path) -> N
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
 
 
-@pytest.mark.parametrize("status", ["completed", "blocked", "partial"])
+@pytest.mark.parametrize("status", [None, "completed", "blocked", "partial"])
+@pytest.mark.parametrize("minutes,retained", [(5, True), (15, False)])
 @pytest.mark.usefixtures("factory_process_ticks")
-def test_prune_terminal_factory_does_not_wait_for_observation(
-    tmp_path: Path, status: str,
+def test_prune_stopped_factory_waits_for_grace_floor(
+    tmp_path: Path, status: str | None, minutes: int, retained: bool,
 ) -> None:
     _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
     repo = tmp_path / "repo"
@@ -1492,10 +1493,11 @@ def test_prune_terminal_factory_does_not_wait_for_observation(
     os.utime(child, (0, 0))
     save_factory_record(tmp_path, _factory_record(
         sandbox, phase="failed", status=status, process="dead",
-        observed_at=datetime.now(UTC).isoformat(),
+        observed_at=(datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(),
     ))
 
-    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == ([] if retained else [child])
+    assert child.exists() is retained
 
 
 @pytest.mark.usefixtures("factory_process_ticks")

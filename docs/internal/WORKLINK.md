@@ -169,6 +169,23 @@ executor together by rebuilding the executor image before enabling this layout.
   `needs-human`, then retains the same attempt for recovery. A dead process
   still follows the existing failure path; ongoing transcript writes keep the
   driver active.
+- **Supervision errors and reclamation**: A status command, parse/binding,
+  record-write, heartbeat, or snapshot error during a live factory poll is a
+  missed observation: the controller logs one scrubbed, bounded
+  `worklink_factory_supervision_error` per episode, retains its previous status,
+  and continues polling under the existing startup, idle and budget deadlines.
+  Thirty consecutive failing polls create one non-terminal, agent-facing
+  incident; they do not cancel the driver. Only verified driver death, explicit
+  factory terminal/park, budget/idle park, operator stop, or a proven fresh
+  foreign lock owner ends supervision. The executor supervisor intentionally
+  tears down the driver if its controller socket closes; the controller must
+  therefore keep supervising across errors. Attempt pruning retains a matching
+  factory checkout while its process identity is unverifiable, its process is
+  alive, or its last observed session heartbeat is current. After verified
+  death, even a terminal or status-less record gets at least 900 seconds from
+  its last durable observation before deletion (and resumable runs retain their
+  longer observation window). If no valid stop time exists, the usual checkout
+  mtime TTL applies.
 - **Recovery**: A parked or interrupted run retains its sandbox. The parked report
   includes the `park_snapshot` path when the factory published a complete current
   diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
