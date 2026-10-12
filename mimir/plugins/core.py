@@ -192,6 +192,47 @@ _WRITE_RESOURCE_OPERATIONS = _WRITE_OPERATIONS | _names("worklink_run worklink_r
 _READ_RESOURCE_OPERATIONS = _names(
     "read_file aread ls als glob aglob grep agrep file_search get_turn mimir_get_turn"
 )
+_RESULT_DOMAINS = {
+    "channel_history": _names("fetch_channel_history"),
+    "channel_metadata": _names("list_channels"),
+    "schedule_metadata": _names("list_schedules"),
+    "shell_jobs": _names("bash_jobs_list bash_job_output"),
+    "filesystem": _names("read_file proposal_diff aread ls als glob aglob grep agrep download_files adownload_files Read Glob Grep file_search"),
+    "turn_history": _names("get_turn mimir_get_turn"),
+    "saga": _names("memory_query memory_get saga_forget"),
+    "commitments": _names("commitment_list"),
+    "shell": _names("shell_exec execute"),
+    "web": _names("web_search"),
+    "worklink": _names("worklink_run worklink_resume"),
+    "coding_worker": _names("spawn_open_code"),
+    "repository": _names("""pr_metadata pr_spec pr_list pr_files pr_diff
+        pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs
+        pr_reviews pr_comments pr_review_requests repo_checkout repo_fetch
+        repo_status repo_test repo_diff repo_unmerged pr_submit_review
+        pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
+        repo_revert repo_revert_abort repo_push"""),
+    "client_provider": _names("hands_read hands_edit hands_shell hands_python"),
+}
+_READABLE_DOMAINS = {
+    "repository": _names("""pr_list ci_run_jobs ci_run ci_recent_runs
+        pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks
+        pr_job_log pr_reviews pr_comments pr_review_requests repo_checkout
+        repo_fetch repo_status repo_test repo_diff repo_unmerged"""),
+    "channel_metadata": _names("list_channels"),
+    "schedule_metadata": _names("list_schedules"),
+    "shell_jobs": _names("bash_jobs_list bash_job_output"),
+    "filesystem": _names("read_file proposal_diff aread ls als glob aglob grep agrep file_search"),
+    "turn_history": _names("get_turn mimir_get_turn"),
+    "saga": _names("memory_query memory_get"),
+    "client_provider": _names("hands_read hands_python"),
+}
+_READ_BACKEND = _names("""pr_job_log ci_run_jobs ci_run ci_recent_runs Read Glob
+    Grep read_file proposal_diff aread ls als glob aglob grep agrep fetch_url
+    pr_metadata pr_spec pr_list pr_files pr_diff pr_file_content pr_checks
+    pr_reviews pr_comments pr_review_requests repo_checkout repo_fetch
+    repo_status repo_test repo_diff repo_unmerged hands_read""")
+_ACP_HANDS_RESULTS = _names("hands_read hands_edit hands_shell hands_python")
 _CATALOG_OPEN = _names("""commitment_list memory_query memory_get web_search fetch_url
     write_todos defer_injected_message request_operator_approval commitment_complete
     commitment_snooze commitment_dismiss""")
@@ -227,6 +268,10 @@ def register_core_tools(registry: PolicyRegistry) -> None:
     }
     if sum(map(len, _FLOWS.values())) != len(flow_by_name):
         raise ValueError("duplicate core tool flow classification")
+    result_domains = {name: domain for domain, names in _RESULT_DOMAINS.items() for name in names}
+    readable_domains = {name: domain for domain, names in _READABLE_DOMAINS.items() for name in names}
+    if sum(map(len, _RESULT_DOMAINS.values())) != len(result_domains) or sum(map(len, _READABLE_DOMAINS.values())) != len(readable_domains):
+        raise ValueError("duplicate core result or readable domain")
 
     for name, descriptor in _CORE_DESCRIPTOR_DECLARATIONS.items():
         operation_class = (
@@ -241,6 +286,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("write_resource_operations", _WRITE_RESOURCE_OPERATIONS),
             ("protected_metadata_operations", _PROTECTED_METADATA),
             ("catalog_admin_builtin", _CATALOG_ADMIN_BUILTIN),
+            ("read_resource_operations", _READ_RESOURCE_OPERATIONS),
+            ("acp_hands_result_tools", _ACP_HANDS_RESULTS),
         ):
             if name in names:
                 memberships.add(member)
@@ -250,7 +297,7 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             flow=flow_by_name.get(name),
             tier=next((tier for tier, names in _TIERS.items() if name in names), None),
             operation_class=operation_class,
-            result_domain=None,
+            result_domain=result_domains.get(name),
             result_origin=descriptor.result_origin,
             sink_category=descriptor.sink_category,
             sink_destination=descriptor.sink_destination,
@@ -262,7 +309,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             budget_exempt=descriptor.budget_exempt,
             writes_code_or_state=False,
             profiles=tuple(profile for profile, names in _PROFILES.items() if name in names),
-            read_backend=False,
+            read_backend=name in _READ_BACKEND,
+            readable_domain=readable_domains.get(name),
             memberships=memberships,
         )
 
@@ -279,13 +327,18 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             memberships.add("catalog_admin_builtin")
         if name in _PROTECTED_METADATA:
             memberships.add("protected_metadata_operations")
+        if name in _READ_RESOURCE_OPERATIONS:
+            memberships.add("read_resource_operations")
+        if name in _ACP_HANDS_RESULTS:
+            memberships.add("acp_hands_result_tools")
         registry.register_tool(
             name=name, policy_only=True, descriptor_registered=False,
             flow=flow_by_name[name], tier=None, operation_class=operation_class,
-            result_domain=None, result_origin=ResultOriginKind.NONE,
+            result_domain=result_domains.get(name), result_origin=ResultOriginKind.NONE,
             sink_category=None, sink_destination=None,
             sink_target_extractor=None, sink_payload_extractor=None,
-            writes_code_or_state=False, profiles=(), read_backend=False,
+            writes_code_or_state=False, profiles=(), read_backend=name in _READ_BACKEND,
+            readable_domain=readable_domains.get(name),
             memberships=memberships,
         )
 
