@@ -392,6 +392,7 @@ def _initialize_ifc_labels(
     *,
     preloaded_labels: InformationFlowLabels | None = None,
     resolver: Any = None,
+    policy: Any = None,
 ) -> InformationFlowLabels:
     """Initialize monotonic IFC labels before prompt/model construction.
 
@@ -408,7 +409,11 @@ def _initialize_ifc_labels(
     continuation_auth = _shell_continuation_auth_context(event)
     canonical_principal = event.author
     source_kind = "channel"
-    registered_service = get_event_service_principal(event)
+    registered_service = get_event_service_principal(event, policy=policy)
+    if HTTP_EVENT_INGRESS_EXTRA_KEY in (
+        event.extra if isinstance(event.extra, dict) else {}
+    ):
+        registered_service = None
     poller_own_channel = (
         event.trigger == "poller"
         and registered_service is not None
@@ -568,6 +573,7 @@ def _create_turn_auth_context(
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
     server_discovered_pr_scope_store: ServerDiscoveredPRScopeStore | None = None,
+    policy: Any = None,
 ) -> AuthContext:
     inherited = _shell_continuation_auth_context(event)
     if inherited is None:
@@ -579,6 +585,7 @@ def _create_turn_auth_context(
             ifc_labels=ifc_labels,
             audience_provider=audience_provider,
             cross_platform_pull=cross_platform_pull,
+            policy=policy,
         )
     else:
         context = replace(
@@ -1610,6 +1617,7 @@ class Agent:
             event,
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
+            policy=self._config.plugin_manager.policy,
         )
         await self._append_inbound_to_buffer(event, ifc_labels)
 
@@ -2020,6 +2028,7 @@ class Agent:
             event,
             event.attachment_names,
             resolver=getattr(self, "_identity_resolver", None),
+            policy=self._config.plugin_manager.policy,
         )
         if explicit_session_binding:
             bound_auth_context = _require_auth_context(event.continuation_auth_context)
@@ -2046,6 +2055,7 @@ class Agent:
                 audience_provider=self._audience_provider,
                 cross_platform_pull=self._config.cross_platform_pull,
                 server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
+                policy=self._config.plugin_manager.policy,
             )
         if explicit_session_binding:
             _seed_trigger_ingested_urls(event, initial_ifc_labels, initial_auth_context)
@@ -2203,6 +2213,7 @@ class Agent:
                     ifc_labels=initial_ifc_labels,
                     audience_provider=self._audience_provider,
                     cross_platform_pull=self._config.cross_platform_pull,
+                    policy=self._config.plugin_manager.policy,
                 )
             # Update auth_ctx with the actual interactivity classification
             if auth_ctx is not None:

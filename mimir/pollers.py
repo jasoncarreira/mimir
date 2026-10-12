@@ -93,7 +93,10 @@ from concurrent.futures import ThreadPoolExecutor
 from .background_io import run_in_pool
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+if TYPE_CHECKING:
+    from .plugins.registry import PolicyRegistry
 
 from .billing import Priority, normalize_priority
 from .config import trusted_github_bot_logins
@@ -1186,8 +1189,13 @@ def _parse_poller_authority(
     persist_dir: Path,
     state_root: Path | None,
     manifest_path: Path,
+    policy: PolicyRegistry | None = None,
 ) -> ServicePrincipal:
     """Strictly resolve one manifest authority declaration or raise ValueError."""
+    if policy is not None and not policy.frozen:
+        raise ValueError("poller authority requires a frozen policy")
+    profiles = policy.authority_profiles if policy is not None else TRIGGER_AUTHORITY_PROFILES
+    tiers = policy.tiers if policy is not None else TRIGGER_CAPABILITY_TIERS
     _validate_poller_identity(name, manifest_path)
     if not isinstance(raw, dict):
         raise ValueError("authority must be an object")
@@ -1199,7 +1207,7 @@ def _parse_poller_authority(
         raise ValueError(f"missing authority fields: {', '.join(sorted(missing))}")
 
     profile = raw["profile"]
-    if not isinstance(profile, str) or profile not in TRIGGER_AUTHORITY_PROFILES:
+    if not isinstance(profile, str) or profile not in profiles:
         raise ValueError(f"unknown authority profile: {profile!r}")
     proposal_surface = raw.get("proposal_surface", "wiki")
     if not isinstance(proposal_surface, str) or proposal_surface not in ("wiki", "social-outbox"):
@@ -1252,10 +1260,10 @@ def _parse_poller_authority(
             raise ValueError("fetch_url requires non-empty authority approved_urls")
         if approved_urls and "fetch_url" not in capabilities:
             capabilities += ("fetch_url",)
-    unknown_caps = set(capabilities) - set(TRIGGER_CAPABILITY_TIERS)
+    unknown_caps = set(capabilities) - set(tiers)
     if unknown_caps:
         raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown_caps))}")
-    outside_profile = set(capabilities) - TRIGGER_AUTHORITY_PROFILES[profile]
+    outside_profile = set(capabilities) - profiles[profile]
     if outside_profile:
         raise ValueError(
             f"capabilities outside {profile!r} profile: {', '.join(sorted(outside_profile))}"
@@ -1272,15 +1280,18 @@ def _parse_poller_authority(
         if name == "session-boundary" and _TIER_RANK[tier] > _TIER_RANK[CapabilityTier.SCOPED_WITH_PROVENANCE]:
             raise ValueError("session-boundary manifest cannot widen the built-in tier")
     # Generic fetches are unbounded, but these profiles bind a destination adapter.
-    bounded_profile_capabilities = BOUNDED_PROFILE_CAPABILITIES.get(profile, frozenset())
+    bounded_profile_capabilities = (
+        policy.profiles[profile].bounded_capabilities if policy is not None
+        else BOUNDED_PROFILE_CAPABILITIES.get(profile, frozenset())
+    )
     if any(
-        _TIER_RANK[TRIGGER_CAPABILITY_TIERS[cap]] > _TIER_RANK[tier]
+        _TIER_RANK[CapabilityTier(tiers[cap])] > _TIER_RANK[tier]
         for cap in capabilities
         if cap not in bounded_profile_capabilities
     ):
         raise ValueError(f"capability exceeds declared tier {tier.value!r}")
     if tier is CapabilityTier.UNBOUNDED or any(
-        TRIGGER_CAPABILITY_TIERS[cap] is CapabilityTier.UNBOUNDED for cap in capabilities
+        CapabilityTier(tiers[cap]) is CapabilityTier.UNBOUNDED for cap in capabilities
         if cap not in bounded_profile_capabilities
     ):
         raise ValueError("skill pollers cannot declare unbounded authority")
@@ -1359,6 +1370,7 @@ def _parse_poller_authority(
         approved_urls=tuple(approved_urls),
         proposal_surface=proposal_surface,
         creation_path=f"mimir.pollers.run_poller:{manifest_path}",
+        policy=policy,
     )
 
 #: Recognized string spellings for boolean overrides. YAML 1.1 already maps
@@ -1685,6 +1697,7 @@ def discover_pollers(
     invalid_manifests: list[tuple[Path, str]] | None = None,
     invalid_entries: list[tuple[Path, str, str]] | None = None,
     overrides_path: Path | None = None,
+    policy: PolicyRegistry | None = None,
 ) -> list[PollerConfig]:
     """Walk ``skills_dir/**/pollers.json`` and parse out poller configs.
 
@@ -2057,6 +2070,7 @@ def discover_pollers(
                         persist_dir=persist_dir or skill_dir,
                         state_root=state_root,
                         manifest_path=pollers_file,
+                        policy=policy,
                     )
                 except (OSError, ValueError) as exc:
                     log.warning(

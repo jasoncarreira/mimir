@@ -310,14 +310,33 @@ def build_trigger_service_principal(
     approved_urls: tuple[str, ...] = (),
     proposal_surface: str = "wiki",
     creation_path: str,
+    policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Build one immutable instance principal from already-validated authority."""
+    selected = policy if policy is not None else _core_profiles
+    if not selected.frozen:
+        raise ValueError("service principal requires a frozen policy")
+    if policy is not None and profile not in selected.profiles:
+        raise ValueError(f"unknown authority profile: {profile!r}")
     if profile == "research":
         capabilities = tuple(cap for cap in capabilities if cap != "fetch_url")
         if approved_urls:
             capabilities += ("fetch_url",)
     capability_set = set(capabilities)
-    missing = _missing_capability_companions(capability_set, profile=profile)
+    if policy is not None:
+        outside = capability_set - selected.authority_profiles[profile]
+        if outside:
+            raise ValueError(f"capabilities outside {profile!r} profile: {', '.join(sorted(outside))}")
+        unknown = capability_set - selected.tiers.keys()
+        if unknown:
+            raise ValueError(f"unknown capabilities: {', '.join(sorted(unknown))}")
+    companions = dict(selected.capability_companions)
+    if profile in selected.profiles:
+        companions.update(selected.profiles[profile].capability_companions)
+    missing = {
+        companion for capability in capability_set
+        for companion in companions.get(capability, ()) if companion not in capability_set
+    }
     if missing:
         raise ValueError(
             "capabilities require companions: "
@@ -361,10 +380,11 @@ def build_trigger_service_principal(
     sink_destinations: set[str] = set()
     policies: list[ServiceSinkPolicy] = []
     for operation in operations:
-        domain = _OPERATION_READABLE_DOMAIN.get(operation)
+        tool = selected.tools.get(operation)
+        domain = tool.readable_domain if tool is not None else _OPERATION_READABLE_DOMAIN.get(operation)
         if domain:
             readable_domains.add(domain)
-        descriptor = get_tool_descriptor(operation)
+        descriptor = selected.descriptors.get(operation)
         destination = descriptor.sink_destination if descriptor else None
         if destination:
             sink_destinations.add(destination)
@@ -433,9 +453,14 @@ def build_trigger_service_principal(
 
 def builtin_trigger_service_principal(
     profile: str, home: Path, *, scheduler_job_name: str | None = None,
+    policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal:
     """Return the authoritative built-in grant; manifests cannot replace it."""
-    config = _BUILTIN_TRIGGER_PROFILE_CONFIG.get(profile)
+    selected = policy if policy is not None else _core_profiles
+    if not selected.frozen:
+        raise ValueError("built-in principal requires a frozen policy")
+    declared = selected.profiles.get(profile)
+    config = declared.builtin_trigger_config if declared is not None else None
     if config is None:
         raise ValueError(f"unknown built-in authority profile: {profile!r}")
     root_parts = config["root_parts"]
@@ -452,12 +477,13 @@ def builtin_trigger_service_principal(
         canonical=config["canonical"],
         trigger=config["trigger"],
         profile=profile,
-        tier=config["tier"],
-        capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES[profile])),
+        tier=CapabilityTier(config["tier"]),
+        capabilities=tuple(sorted(selected.authority_profiles[profile])),
         roots=roots,
         channel_memory_directory=channel_memory_directory,
         creation_path=config["creation_path"],
         saga_full_corpus_read=config["saga_full_corpus_read"],
+        policy=selected,
     )
 
 
@@ -9551,7 +9577,7 @@ class ToolRegistry:
             else catalog.get_decision(tool_name, auth_context)
         )
         preliminary_service = (
-            get_trusted_service_from_auth_context(auth_context)
+            get_trusted_service_from_auth_context(auth_context, policy=policy)
             if auth_context is not None
             else None
         )
@@ -9715,10 +9741,10 @@ class ToolRegistry:
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not service_can_invoke_operation(preliminary_service, tool_name)
+            and not service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         service_allowed_preliminary = (
-            service_can_invoke_operation(preliminary_service, tool_name)
+            service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         if (
             preliminary_service is not None
@@ -9813,14 +9839,14 @@ class ToolRegistry:
         service_principal = None
 
         if auth_context is not None:
-            service_principal = get_trusted_service_from_auth_context(auth_context)
+            service_principal = get_trusted_service_from_auth_context(auth_context, policy=policy)
 
         required_tier = AccessTier.USER
         reason = None
         is_shadow = False
         would_block = False
         service_allowed = (
-            service_can_invoke_operation(service_principal, tool_name)
+            service_can_invoke_operation(service_principal, tool_name, policy=policy)
         )
 
         if decision == OperationDecision.OPEN:
@@ -11896,12 +11922,19 @@ def get_capability_matrix_report() -> dict[str, dict[str, Any]]:
     return report
 
 
-def get_service_principal(trigger: str) -> ServicePrincipal | None:
+def get_service_principal(
+    trigger: str, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
     """Get a service principal by trigger."""
-    return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    selected = policy if policy is not None else _core_profiles
+    if policy is None:
+        return _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+    return selected.service_principals.get(trigger) if selected.frozen else None
 
 
-def get_event_service_principal(event: Any) -> ServicePrincipal | None:
+def get_event_service_principal(
+    event: Any, *, policy: "PolicyRegistry | None" = None,
+) -> ServicePrincipal | None:
     """Resolve static built-ins or an exact per-instance event authority."""
     carried = getattr(event, "service_authority", None)
     if (
@@ -11910,7 +11943,7 @@ def get_event_service_principal(event: Any) -> ServicePrincipal | None:
         and carried.canonical == getattr(event, "service_principal", None)
     ):
         return carried
-    return _TRUSTED_SERVICE_PRINCIPALS.get(getattr(event, "trigger", None))
+    return get_service_principal(getattr(event, "trigger", None), policy=policy)
 
 
 def is_admin(auth_context: Any) -> bool:
@@ -12013,6 +12046,7 @@ def can_resolve_forge_review_scope(
 
 def get_trusted_service_from_auth_context(
     auth_context: Any,
+    *, policy: "PolicyRegistry | None" = None,
 ) -> ServicePrincipal | None:
     """Resolve a registered service from the server-owned auth carrier.
 
@@ -12032,7 +12066,7 @@ def get_trusted_service_from_auth_context(
             trigger = getattr(auth_context, "origin_trigger", None)
         if not isinstance(trigger, str):
             return None
-        service = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
+        service = get_service_principal(trigger, policy=policy)
     if service is None or getattr(auth_context, "canonical_principal", None) != service.canonical:
         return None
     return service
@@ -12046,14 +12080,23 @@ def is_trusted_service(auth_context: Any) -> bool:
 def service_can_invoke_operation(
     service: ServicePrincipal | None,
     operation: str,
+    *, policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Check an exact service capability and its declared flow constraints."""
-    if service is None or not service.has_capability(operation):
+    selected = policy if policy is not None else _core_profiles
+    if not selected.frozen or service is None or not service.has_capability(operation):
         return False
-    required_domain = _OPERATION_READABLE_DOMAIN.get(operation)
+    if (policy is not None and operation not in selected.capabilities
+            and operation not in selected.tools
+            and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS):
+        return False
+    if policy is None and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS:
+        return False
+    tool = selected.tools.get(operation)
+    required_domain = tool.readable_domain if tool is not None else None
     if required_domain and not service.can_read_domain(required_domain):
         return False
-    descriptor = get_tool_descriptor(operation)
+    descriptor = selected.descriptors.get(operation)
     required_sink = descriptor.sink_destination if descriptor else None
     if required_sink and not service.can_write_sink(required_sink):
         return False
@@ -12238,6 +12281,7 @@ def create_auth_context(
     ifc_labels: "InformationFlowLabels | None" = None,
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
+    policy: "PolicyRegistry | None" = None,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -12271,7 +12315,10 @@ def create_auth_context(
         roles = access.roles if event_ingress is None else ()
         is_service = access.is_service
 
-    registered_service = get_event_service_principal(event)
+    registered_service = (
+        get_event_service_principal(event, policy=policy)
+        if policy is not None else get_event_service_principal(event)
+    )
     if (
         registered_service is not None
         and event.service_principal == registered_service.canonical

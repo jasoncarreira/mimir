@@ -9740,3 +9740,81 @@ def test_poller_instance_issues_only_explicit_capabilities(tmp_path: Path) -> No
     assert access_control.service_can_invoke_operation(service, "read_file")
     assert not access_control.service_can_invoke_operation(service, "send_message")
     assert not access_control.service_can_invoke_operation(service, "shell_exec")
+
+
+@pytest.mark.asyncio
+async def test_selected_policy_named_pollers_issue_distinct_manifest_grants(
+    tmp_path: Path, home: Path,
+) -> None:
+    from mimir.plugins.core import register_core_tools
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.scheduler import Scheduler
+    from mimir.tool_descriptors import ResultOriginKind
+
+    policy = PolicyRegistry()
+    register_core_tools(policy)
+    registrar = policy.registrar("sample")
+    for name, tier in (("sample_read", "scope-contained"), ("sample_execute", "code-execution")):
+        registrar.register_tool(
+            name=name, factory=lambda: object(), flow="source", tier=tier,
+            operation_class="admin_required", result_domain="sample",
+            result_origin=ResultOriginKind.EXTERNAL, sink_category=None,
+            sink_destination=None, sink_target_extractor=None,
+            sink_payload_extractor=None, writes_code_or_state=False,
+            profiles=("sample",), read_backend=False, readable_domain="sample",
+        )
+        registrar.register_capability(name)
+    registrar.register_authority_profile(
+        "sample", capabilities=("sample_read", "sample_execute"),
+    )
+    policy.freeze()
+
+    skills = tmp_path / "skills"
+    skill = skills / "sample"
+    _install_script(skill, "emit.py", 'print(\'{"prompt": "sample data"}\')\n')
+    def entry(name, capabilities, tier="scope-contained", profile="sample"):
+        return {
+            "name": name, "command": f"{sys.executable} emit.py", "cron": "* * * * *",
+            "authority": {
+                "profile": profile, "tier": tier, "capabilities": capabilities,
+                "scoped_roots": ["state"],
+            },
+        }
+
+    entries = [
+        entry("first", ["sample_read"]),
+        entry("second", ["sample_execute"], tier="code-execution"),
+        entry("missing", [], profile="custom"),
+        entry("unknown", ["sample_unknown"]),
+        entry("other", ["sample_read"], profile="custom"),
+        entry("too-low", ["sample_execute"]),
+    ]
+    _write_pollers_json(skill, entries)
+    scheduler = Scheduler(
+        home / "scheduler.yaml", lambda event: None, home=home, policy=policy,
+    )
+    scheduler._pollers_dir = skills
+    discovered, _, rejected = scheduler._discover_pollers_io()
+    assert {poller.name for poller in discovered} == {"first", "second", "missing"}
+    assert {name for _, name, _ in rejected} == {"unknown", "other", "too-low"}
+    assert any("exceeds declared tier" in reason for _, name, reason in rejected if name == "too-low")
+    assert {poller.name for poller in discover_pollers(skills, state_root=home / "state" / "pollers")} == {"missing"}
+
+    events = []
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    for poller in discovered:
+        await run_poller(poller, enqueue=enqueue, home=home)
+    by_name = {event.service_principal: event for event in events}
+    assert set(by_name) == {"poller:first", "poller:second", "poller:missing"}
+    for name, permitted in (("first", "sample_read"), ("second", "sample_execute")):
+        service = by_name[f"poller:{name}"].service_authority
+        assert service.capabilities == (permitted,)
+        assert access_control.service_can_invoke_operation(service, permitted, policy=policy)
+        assert not access_control.service_can_invoke_operation(
+            service, "sample_execute" if name == "first" else "sample_read", policy=policy,
+        )
+    assert by_name["poller:missing"].service_authority.capabilities == ()
+    assert access_control.get_service_principal("poller", policy=policy) is None

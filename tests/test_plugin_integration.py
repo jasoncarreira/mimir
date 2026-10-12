@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.runtime import Runtime
 
-from mimir.access_control import ToolRegistry
+from mimir.access_control import (
+    HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
+    builtin_trigger_service_principal, get_service_principal,
+    get_trusted_service_from_auth_context, service_can_invoke_operation,
+)
 from mimir.models import (
-    AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
     RepoPRActionScope, RepoPRScopeRegistry,
     RepoReviewState, RetainedFactoryScope,
 )
-from mimir.plugins.core import register_core_tools
+from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
 from mimir.tool_descriptors import ResultOriginKind, SinkCategory
 from mimir.tools.budget_gate import BudgetGateMiddleware, _authorize_tool_call
@@ -83,6 +89,225 @@ def _state(operations):
         head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
         observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
     ))
+
+
+@pytest.fixture
+def principal_policy():
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("example")
+    registrar.register_tool(
+        name="example_inspect", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_inspect", description="Read example state",
+        ),
+        flow="source", tier="scope-contained", operation_class="admin_required",
+        result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
+        sink_category=None, sink_destination=None, sink_target_extractor=None,
+        sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
+        readable_domain="repository", read_backend=False,
+    )
+    registrar.register_capability("example_inspect")
+    registrar.add_to_profile("heartbeat", "example_inspect")
+    registrar.add_to_profile("session-boundary", "example_inspect")
+    registrar.register_tool(
+        name="example_deliver", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_deliver", description="Deliver example result",
+        ),
+        flow="sink", tier="scope-contained", operation_class="admin_required",
+        result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
+        sink_category=SinkCategory.FILE, sink_destination="filesystem",
+        sink_target_extractor=None, sink_payload_extractor=None,
+        writes_code_or_state=False, profiles=(), read_backend=False,
+    )
+    registrar.register_capability("example_deliver")
+    registrar.add_to_profile("heartbeat", "example_deliver")
+    registrar.register_service_principal(ServicePrincipal(
+        canonical="example:worker", trigger="example_worker",
+        authority_profile="heartbeat", capability_tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("example_inspect", "example_deliver"), readable_domains=("repository",),
+        sink_destinations=("filesystem",), creation_path="example.worker:run",
+    ))
+    return registry.freeze()
+
+
+def test_selected_builtin_issues_only_profile_membership(principal_policy, tmp_path):
+    core = builtin_trigger_service_principal("heartbeat", tmp_path)
+    selected = builtin_trigger_service_principal(
+        "heartbeat", tmp_path, policy=principal_policy,
+    )
+    assert set(selected.capabilities) == set(core.capabilities) | {
+        "example_inspect", "example_deliver",
+    }
+    assert not service_can_invoke_operation(core, "example_inspect", policy=principal_policy)
+    assert service_can_invoke_operation(selected, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(selected, "example_inspect")
+    assert not service_can_invoke_operation(selected, "example_unregistered", policy=principal_policy)
+    assert not service_can_invoke_operation(
+        replace(selected, readable_domains=()), "example_inspect", policy=principal_policy,
+    )
+
+
+def test_static_plugin_principal_and_explicit_instance_grants(principal_policy, tmp_path):
+    assert get_service_principal("example_worker") is None
+    static = get_service_principal("example_worker", policy=principal_policy)
+    assert static is not None
+    assert service_can_invoke_operation(static, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(static, "read_file", policy=principal_policy)
+    assert service_can_invoke_operation(static, "example_deliver", policy=principal_policy)
+    assert not service_can_invoke_operation(
+        replace(static, sink_destinations=()), "example_deliver", policy=principal_policy,
+    )
+    instance = build_trigger_service_principal(
+        canonical="poller:example", trigger="poller", profile="heartbeat",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
+        roots=(tmp_path,), creation_path="example.poller:manifest", policy=principal_policy,
+    )
+    assert service_can_invoke_operation(instance, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(instance, "read_file", policy=principal_policy)
+    assert get_service_principal("poller", policy=principal_policy) is None
+    with pytest.raises(ValueError, match="outside.*profile"):
+        build_trigger_service_principal(
+            canonical="poller:example", trigger="poller", profile="custom",
+            tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
+            creation_path="example.poller:manifest", policy=principal_policy,
+        )
+
+
+def test_static_plugin_event_reaches_agent_ifc_surface_and_tool_gate(principal_policy):
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+
+    event = AgentEvent(
+        trigger="example_worker", channel_id="scheduler:example",
+        service_principal="example:worker", content="run",
+    )
+    labels = _initialize_ifc_labels(event, policy=principal_policy)
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        policy=principal_policy,
+    )
+    assert auth.is_service and auth.service_authority is get_service_principal(
+        "example_worker", policy=principal_policy,
+    )
+    assert any(source.principal == "service:example:worker" for source in labels.sources)
+    tool = principal_policy.tools["example_inspect"].factory()
+    surface = ServiceToolSurfaceMiddleware(principal_policy)
+
+    def visible(context):
+        request = ModelRequest(
+            model=SimpleNamespace(), messages=[], tools=[tool], runtime=Runtime(context=context),
+        )
+        return [item.name for item in surface._filter_request(request).tools]
+
+    assert visible(replace(auth, service_authority=None)) == ["example_inspect"]
+    assert ToolRegistry().authorize_tool(
+        "example_inspect", auth, enforce=True, policy=principal_policy,
+    ).allowed
+    admitted, denial = _authorize_tool_call(
+        "example_inspect", auth, None, labels, policy=principal_policy,
+    )
+    assert admitted.allowed and denial is None
+
+    unselected = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    assert not unselected.is_service
+    assert get_trusted_service_from_auth_context(unselected, policy=principal_policy) is None
+    assert not ToolRegistry().authorize_tool(
+        "example_inspect", unselected, enforce=True, policy=principal_policy,
+    ).allowed
+    ingress = replace(event, extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http"})
+    ingress_labels = _initialize_ifc_labels(ingress, policy=principal_policy)
+    public = _create_turn_auth_context(
+        ingress, None, policy_version=None, enforce=True, ifc_labels=ingress_labels,
+        policy=principal_policy,
+    )
+    assert not public.is_service and public.service_authority is None
+    assert get_trusted_service_from_auth_context(public, policy=principal_policy) is None
+    assert not any(source.principal == "service:example:worker" for source in ingress_labels.sources)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fire_uses_selected_profile_grant(principal_policy, tmp_path, monkeypatch):
+    from mimir.scheduler import Scheduler, SchedulerJob
+
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    async def record(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr("mimir.scheduler.log_event", record)
+    job = SchedulerJob(name="heartbeat", prompt="tick", authority_profile="heartbeat")
+    selected = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path, policy=principal_policy)
+    default = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    await selected._fire(job=job)
+    await default._fire(job=job)
+    assert len(events) == 2
+    assert service_can_invoke_operation(
+        events[0].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[1].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[0].service_authority, "example_unregistered", policy=principal_policy,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_dispatch_uses_selected_profile_grant(principal_policy, tmp_path, monkeypatch):
+    from mimir.runtime import dispatch_session_synthesis
+
+    monkeypatch.setattr("mimir.agent._filter_session_turns", lambda *args, **kwargs: ["turn"])
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    async def record(*args, **kwargs):
+        pass
+
+    session = SimpleNamespace(
+        saga_session_id="session", channel_id="scheduler:heartbeat", source_acl=None,
+    )
+    config = SimpleNamespace(
+        turns_log=tmp_path / "turns.jsonl", saga_session_idle_minutes=5,
+        plugin_manager=SimpleNamespace(policy=principal_policy),
+    )
+    for selected in (config, SimpleNamespace(
+        turns_log=config.turns_log, saga_session_idle_minutes=5,
+    )):
+        assert await dispatch_session_synthesis(
+            session, config=selected, dispatcher=SimpleNamespace(enqueue=enqueue),
+            log_event_fn=record,
+        )
+    assert service_can_invoke_operation(
+        events[0].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[1].service_authority, "example_inspect", policy=principal_policy,
+    )
+
+
+def test_server_session_event_uses_selected_profile_grant(principal_policy):
+    from mimir.server import _session_synthesis_event
+
+    session = SimpleNamespace(
+        saga_session_id="session", channel_id="scheduler:heartbeat", source_acl=None,
+    )
+    selected = _session_synthesis_event(session, policy=principal_policy)
+    default = _session_synthesis_event(session)
+    assert service_can_invoke_operation(
+        selected.service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        default.service_authority, "example_inspect", policy=principal_policy,
+    )
 
 
 @pytest.mark.parametrize("enforce", [True, False])

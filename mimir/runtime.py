@@ -68,7 +68,11 @@ async def dispatch_session_synthesis(
         )
         return False
 
-    authority = builtin_trigger_service_principal("session-boundary", Path("."))
+    manager = getattr(config, "plugin_manager", None)
+    authority = builtin_trigger_service_principal(
+        "session-boundary", Path("."),
+        **({"policy": manager.policy} if manager is not None else {}),
+    )
     synth_event = AgentEvent(
         trigger="saga_session_end",
         channel_id=session.channel_id,
