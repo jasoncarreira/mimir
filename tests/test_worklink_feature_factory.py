@@ -1480,3 +1480,33 @@ def test_usable_factory_retry_budget_is_silent(
     with caplog.at_level(logging.WARNING, logger="mimir.worklink.backends.feature_factory"):
         assert _factory_max_retries() == 8
     assert not caplog.records, caplog.text
+
+
+@pytest.mark.parametrize(
+    ("detail", "contended"),
+    [
+        ("timed out waiting for run.json lock at /w/.factory/chainlink-7/run-json.lock", True),
+        ("factory control exited 1", False),
+        ("run.json is malformed", False),
+    ],
+)
+def test_status_classifies_only_the_run_lock_timeout_as_contention(
+    monkeypatch, tmp_path: Path, detail: str, contended: bool,
+) -> None:
+    """status waits 1s on a lock a live driver holds for whole transitions."""
+    from mimir.worklink.backends.feature_factory import (
+        FactoryContractError,
+        FactoryStatusContended,
+    )
+
+    def refused(self, launcher, args, *, sandbox):
+        assert args[0] == "status"
+        raise FactoryContractError(detail)
+
+    monkeypatch.setattr(FeatureFactoryBackend, "_control", refused)
+    with pytest.raises(FactoryContractError) as raised:
+        FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js").status(
+            "chainlink-7", sandbox=tmp_path, launcher="/opt/factory/bin/factory.js",
+        )
+    assert isinstance(raised.value, FactoryStatusContended) is contended
+    assert str(raised.value) == detail

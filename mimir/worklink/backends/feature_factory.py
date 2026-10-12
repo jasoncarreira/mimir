@@ -113,6 +113,19 @@ class FactoryContractError(RuntimeError):
     pass
 
 
+class FactoryStatusContended(FactoryContractError):
+    """``factory status`` gave up waiting on the held run-state lock.
+
+    The factory runs every run-scoped command's whole handler under that lock,
+    so a live driver can legitimately hold it for minutes (merge/verify), while
+    ``status`` waits only its 1s default. This is no observation, not a fault.
+    """
+
+
+# feature-factory core/run-lock.js: "timed out waiting for <state> lock at <dir>".
+_RUN_LOCK_TIMEOUT = re.compile(r"\btimed out waiting for \S+ lock at \S")
+
+
 @dataclass(frozen=True)
 class FactoryStatus:
     run_id: str
@@ -798,11 +811,16 @@ class FeatureFactoryBackend:
         return result
 
     def status(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> FactoryStatus:
-        result = self._control(
-            launcher,
-            ("status", run_id, "--repo", str(sandbox), "--json"),
-            sandbox=sandbox,
-        )
+        try:
+            result = self._control(
+                launcher,
+                ("status", run_id, "--repo", str(sandbox), "--json"),
+                sandbox=sandbox,
+            )
+        except FactoryContractError as exc:
+            if _RUN_LOCK_TIMEOUT.search(str(exc)):
+                raise FactoryStatusContended(str(exc)) from exc
+            raise
         stdout = result.stdout if result.stdout is not None else b""
         return parse_factory_status(stdout)
 

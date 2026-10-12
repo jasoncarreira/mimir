@@ -85,6 +85,7 @@ from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FactoryStatus,
+    FactoryStatusContended,
     FeatureFactoryBackend,
     epic_run_id,
 )
@@ -3310,8 +3311,11 @@ class WorklinkRunner:
                         controller_error=_factory_controller_error(reason),
                     )
                     save_factory_record(self.home, factory_record)
+                    snapshot_failure = "factory status reports park_snapshot null"
                     if parked.park_snapshot is not None:
                         break
+                except FactoryStatusContended:
+                    snapshot_failure = "factory run state stayed locked"
                 except TimeoutError:
                     snapshot_failure = "factory status verification timed out"
                     break
@@ -3384,6 +3388,7 @@ class WorklinkRunner:
                 )
                 stale_failure = None
 
+        status_contended = False
         try:
             while True:
                 if last_status is not None and loop.time() >= park_deadline:
@@ -3422,6 +3427,29 @@ class WorklinkRunner:
                         return await park_for_reason(
                             last_status, _factory_budget_park_reason(last_status, factory_record)
                         )
+                    except FactoryStatusContended:
+                        # A writer holds run state through a whole transition. That is
+                        # no observation: keep the last one so liveness, stall and park
+                        # deadlines still govern. A dead holder's lock reads as stale.
+                        if not status_contended:
+                            status_contended = True
+                            _log_event(
+                                "worklink_factory_status_contended",
+                                issue_id=issue.issue_id,
+                                run_id=factory_record.run_id,
+                                attempt=factory_record.attempt,
+                            )
+                        if last_status is None:
+                            await asyncio.sleep(
+                                min(
+                                    max(0.01, float(backend.poll_interval_s)),
+                                    max(0, startup_deadline - loop.time()),
+                                )
+                            )
+                            continue
+                        status = last_status
+                    else:
+                        status_contended = False
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
