@@ -10,6 +10,7 @@ import pytest
 
 from mimir.plugins.discovery import PluginDiscoveryError
 from mimir.plugins.manager import load_plugins
+from mimir.plugins.core import ServicePrincipal
 from mimir.tool_descriptors import ResultOriginKind
 
 
@@ -70,6 +71,30 @@ def test_selected_plugin_freeze_failure_names_owner_and_cause(monkeypatch, regis
         load_plugins(enable="alpha")
     assert "enabled plugin(s) 'alpha':" in str(error.value)
     assert cause in str(error.value)
+
+
+def test_principal_freeze_failure_names_only_its_provider(monkeypatch):
+    def invalid_principal(registrar):
+        registrar.register_service_principal(ServicePrincipal(
+            canonical="alpha-service", trigger="alpha-trigger",
+            capabilities=("read_file",), readable_domains=("filesystem",),
+            sink_destinations=("filesystem",), creation_path="provider-alpha",
+            authority_profile="missing-profile",
+        ))
+
+    def candidate(name, register):
+        return SimpleNamespace(
+            name=name, distribution="provider-" + name,
+            entry_point=SimpleNamespace(load=lambda: SimpleNamespace(register=register)),
+        )
+
+    selected = (candidate("alpha", invalid_principal), candidate("beta", lambda registrar: None))
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: selected)
+    with pytest.raises(PluginDiscoveryError) as error:
+        load_plugins(enable="alpha,beta")
+    assert "enabled plugin(s) 'alpha':" in str(error.value)
+    assert "beta" not in str(error.value)
+    assert "alpha-trigger: unknown authority profile missing-profile" in str(error.value)
 
 
 def test_disabled_provider_is_not_imported_by_loader_in_child_process(tmp_path):

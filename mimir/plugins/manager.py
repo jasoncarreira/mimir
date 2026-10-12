@@ -70,7 +70,7 @@ def load_plugins(*, enable: str) -> PluginManager:
         profile = policy.profiles.get(subject)
         owner = (tool.owner if tool is not None else
                  profile.owner if profile is not None else
-                 policy.capabilities.get(subject))
+                 policy.capabilities.get(subject) or policy._principal_owners.get(subject))
         if owner is not None and owner != "core":
             names = (owner,)
         else:
