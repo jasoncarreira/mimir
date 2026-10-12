@@ -1,0 +1,1 @@
+- Add metadata-only plugin inventory and operator-owned plugin enablement documentation (#1947).

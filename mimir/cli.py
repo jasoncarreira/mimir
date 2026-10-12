@@ -304,6 +304,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .commands import skills as _skills_cmd
     skills_p = _skills_cmd.add_argparse(sub)
 
+    # Static metadata only; do not construct Config or the runtime for listing.
+    from .commands import plugins as _plugins_cmd
+    plugins_p = _plugins_cmd.add_argparse(sub)
+
     # `mimir scaffold-docker`
     scaffold_docker_p = sub.add_parser(
         "scaffold-docker",
@@ -689,6 +693,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "skills":
         sys.exit(_skills_cmd.dispatch(args, skills_p))
+
+    if args.command == "plugins":
+        code = _plugins_cmd.dispatch(args, plugins_p)
+        if code:
+            sys.exit(code)
+        return
 
     if args.command == "scaffold-docker":
         # _scaffold_docker was already imported at subparser-registration

@@ -24,8 +24,8 @@ their own skill subprocesses.
 - **Process environment wins.** Anything exported into the process (your shell,
   a Docker `compose.env`, a systemd unit) takes precedence.
 - **`<MIMIR_HOME>/.env` supplies defaults** for anything not already in the
-  process environment, except channel scope keys (operator-only). It's loaded
-  once at startup; the process env overrides it.
+  process environment, except channel scope keys and `MIMIR_PLUGINS`
+  (operator-only). It's loaded once at startup; the process env overrides it.
 - **Unset optional flags fall back to the defaults below.**
 
 To confirm what a running agent actually resolved, read `Config.from_env()` or
@@ -130,6 +130,12 @@ remain available. Disabled providers are inspected through package metadata, not
 imported. Set a comma-separated list of manifest names or `all` to enable them.
 Invalid or duplicate disabled providers are diagnosed in the plugin listing;
 selected missing, duplicate, invalid or incompatible providers fail startup.
+Set `MIMIR_PLUGINS` in the supervisor's process environment (for example,
+`compose.env` or a systemd unit), never in `<MIMIR_HOME>/.env`: the agent can
+write its home. The selection is captured at startup and cannot be changed by
+chat, tools or a home dotenv. `mimir plugins list [--json]` inspects installed
+metadata and the current process selection without starting the runtime; it
+reports disabled-manifest diagnostics. See [plugins](plugins.md).
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
