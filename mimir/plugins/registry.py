@@ -99,6 +99,8 @@ class PolicyRegistry:
         self._tools: dict[str, ToolPolicy] = {}
         self._capabilities: dict[str, str] = {}
         self._capability_tiers: dict[str, str] = {}
+        self._capability_companions: dict[str, frozenset[str]] = {}
+        self._legacy_service_sink_tiers: dict[str, str] = {}
         self._profiles: dict[str, AuthorityProfile] = {}
         self._shell_profiles: dict[str, str] = {}
         self._principals: dict[str, Any] = {}
@@ -124,6 +126,14 @@ class PolicyRegistry:
     @property
     def capabilities(self) -> Mapping[str, str]:
         return MappingProxyType(self._capabilities)
+
+    @property
+    def capability_companions(self) -> Mapping[str, frozenset[str]]:
+        return MappingProxyType(self._capability_companions)
+
+    @property
+    def legacy_service_sink_tiers(self) -> Mapping[str, str]:
+        return MappingProxyType(self._legacy_service_sink_tiers)
 
     @property
     def profiles(self) -> Mapping[str, AuthorityProfile]:
@@ -263,11 +273,21 @@ class PolicyRegistry:
             shell_process, declared_memberships,
         )
 
-    def register_capability(self, name: str, *, owner: str = "core", tier: str | None = None) -> None:
+    def register_capability(
+        self, name: str, *, owner: str = "core", tier: str | None = None,
+        companions: Iterable[str] = (), legacy_service_sink_tier: str | None = None,
+    ) -> None:
         self._writable()
         name = _name(name, "capability")
         if name in self._capabilities:
             raise PolicyRegistrationError(f"duplicate capability: {name}")
+        declared_companions = frozenset(_name(item, "companion") for item in companions)
+        if declared_companions:
+            self._capability_companions[name] = declared_companions
+        if legacy_service_sink_tier is not None:
+            if owner != "core" or legacy_service_sink_tier not in _TIERS:
+                raise PolicyRegistrationError(f"{owner}: invalid legacy sink tier for {name}")
+            self._legacy_service_sink_tiers[name] = legacy_service_sink_tier
         if tier is not None:
             if tier not in _TIERS or owner != "core":
                 raise PolicyRegistrationError(f"{owner}: capability {name}: invalid core-only tier")
@@ -325,6 +345,9 @@ class PolicyRegistry:
         from mimir.tool_descriptors import validate_tool_descriptors
 
         validate_tool_descriptors(self.descriptors)
+        for name, companions in self._capability_companions.items():
+            if not companions <= self._capabilities.keys():
+                raise PolicyRegistrationError(f"{name}: unknown companion capability")
         for name, tool in self._tools.items():
             for profile in tool.profiles:
                 if profile not in self._profiles or name not in self._profiles[profile].capabilities:
@@ -344,7 +367,12 @@ class PolicyRegistry:
                     raise PolicyRegistrationError(f"{tool.owner}: tool {capability}: undeclared profile membership {name}")
                 if profile.owner != "core" and (tool is None or tool.owner != profile.owner):
                     raise PolicyRegistrationError(f"{name}: plugin profile cannot add foreign capability {capability}")
-            if not profile.bounded_capabilities <= profile.capabilities:
+            # Historic session-boundary fetch_url is bounded but not granted.
+            legacy_bound = (
+                frozenset({"fetch_url"})
+                if name == "session-boundary" and profile.owner == "core" else frozenset()
+            )
+            if not profile.bounded_capabilities - legacy_bound <= profile.capabilities:
                 raise PolicyRegistrationError(f"{name}: bounded capability outside profile")
             for capability, companions in profile.capability_companions.items():
                 if capability not in profile.capabilities or not companions <= profile.capabilities:

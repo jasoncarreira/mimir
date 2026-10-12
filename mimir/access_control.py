@@ -37,6 +37,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .coding import coding_enabled
@@ -414,101 +415,19 @@ class ServicePrincipal:
         )
 
 
-# This catalog is the executable tier table for trigger authority. Manifest
-# parsing imports it rather than maintaining a second list of grantable names.
-TRIGGER_CAPABILITY_TIERS: dict[str, CapabilityTier] = {
-    "write_file": CapabilityTier.SCOPE_CONTAINED,
-    "edit_file": CapabilityTier.SCOPE_CONTAINED,
-    "replace_file": CapabilityTier.SCOPE_CONTAINED,
-    "rebuild_index": CapabilityTier.SCOPE_CONTAINED,
-    "shell_exec": CapabilityTier.SCOPE_CONTAINED,
-    "bash_async": CapabilityTier.SCOPE_CONTAINED,
-    "bash_jobs_list": CapabilityTier.SCOPE_CONTAINED,
-    "bash_job_output": CapabilityTier.SCOPE_CONTAINED,
-    "read_file": CapabilityTier.SCOPE_CONTAINED,
-    "proposal_diff": CapabilityTier.SCOPE_CONTAINED,
-    "aread": CapabilityTier.SCOPE_CONTAINED,
-    "ls": CapabilityTier.SCOPE_CONTAINED,
-    "als": CapabilityTier.SCOPE_CONTAINED,
-    "glob": CapabilityTier.SCOPE_CONTAINED,
-    "aglob": CapabilityTier.SCOPE_CONTAINED,
-    "grep": CapabilityTier.SCOPE_CONTAINED,
-    "agrep": CapabilityTier.SCOPE_CONTAINED,
-    "file_search": CapabilityTier.SCOPE_CONTAINED,
-    "get_turn": CapabilityTier.SCOPE_CONTAINED,
-    "mimir_get_turn": CapabilityTier.SCOPE_CONTAINED,
-    "memory_get": CapabilityTier.SCOPE_CONTAINED,
-    "send_message": CapabilityTier.SCOPE_CONTAINED,
-    "operator_alert": CapabilityTier.SCOPE_CONTAINED,
-    "memory_store": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "memory_propose": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "open_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "submit_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "abandon_proposal": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_feedback": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_mark_contributions": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_end_session": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "saga_record_skill_learning": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "worklink_run": CapabilityTier.CODE_EXECUTION,
-    "worklink_resume": CapabilityTier.CODE_EXECUTION,
-    "spawn_open_code": CapabilityTier.CODE_EXECUTION,
-    "fetch_url": CapabilityTier.UNBOUNDED,
-    "web_search": CapabilityTier.UNBOUNDED,
-    "webhook": CapabilityTier.UNBOUNDED,
-    "http_request": CapabilityTier.UNBOUNDED,
-    "ntfy_send": CapabilityTier.UNBOUNDED,
-    "task": CapabilityTier.SCOPE_CONTAINED,
-    "list_schedules": CapabilityTier.SCOPE_CONTAINED,
-    "pr_metadata": CapabilityTier.SCOPE_CONTAINED,
-    "pr_spec": CapabilityTier.SCOPE_CONTAINED,
-    "pr_list": CapabilityTier.SCOPE_CONTAINED,
-    "pr_files": CapabilityTier.SCOPE_CONTAINED,
-    "pr_diff": CapabilityTier.SCOPE_CONTAINED,
-    "pr_file_content": CapabilityTier.SCOPE_CONTAINED,
-    "pr_checks": CapabilityTier.SCOPE_CONTAINED,
-    "pr_job_log": CapabilityTier.SCOPE_CONTAINED,
-    "ci_run_jobs": CapabilityTier.SCOPE_CONTAINED,
-    "ci_run": CapabilityTier.SCOPE_CONTAINED,
-    "ci_recent_runs": CapabilityTier.SCOPE_CONTAINED,
-    "pr_reviews": CapabilityTier.SCOPE_CONTAINED,
-    "pr_comments": CapabilityTier.SCOPE_CONTAINED,
-    "pr_review_requests": CapabilityTier.SCOPE_CONTAINED,
-    "pr_review_others": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_submit_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_inline_review_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_edit_body": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "issue_comment": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "pr_rerequest_review": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "unsupported_operation": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_checkout": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_cleanup": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_fetch": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_test": CapabilityTier.CODE_EXECUTION,
-    "repo_status": CapabilityTier.SCOPE_CONTAINED,
-    "repo_diff": CapabilityTier.SCOPE_CONTAINED,
-    "repo_unmerged": CapabilityTier.SCOPE_CONTAINED,
-    "repo_stage": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_commit": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_merge": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_merge_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_rebase": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_rebase_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_revert": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_revert_abort": CapabilityTier.SCOPED_WITH_PROVENANCE,
-    "repo_push": CapabilityTier.SCOPED_WITH_PROVENANCE,
-}
+from .plugins.core import core_policy_registry, OPERATOR_SHELL_PROFILE
 
-_CAPABILITY_COMPANIONS: dict[str, frozenset[str]] = {
-    "shell_exec": frozenset({"bash_jobs_list", "bash_job_output"}),
-    "bash_async": frozenset({"bash_jobs_list", "bash_job_output"}),
-}
+_core_profiles = core_policy_registry()
+TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = MappingProxyType({
+    name: CapabilityTier(tier) for name, tier in _core_profiles.tiers.items()
+})
 
-_PROFILE_CAPABILITY_COMPANIONS: dict[str, dict[str, frozenset[str]]] = {
-    "heartbeat": {
-        "worklink_run": frozenset({"read_file", "ls", "shell_exec"}),
-    },
-}
+_CAPABILITY_COMPANIONS: Mapping[str, frozenset[str]] = _core_profiles.capability_companions
+
+_PROFILE_CAPABILITY_COMPANIONS: Mapping[str, Mapping[str, frozenset[str]]] = MappingProxyType({
+    name: profile.capability_companions for name, profile in _core_profiles.profiles.items()
+    if profile.capability_companions
+})
 
 
 def _missing_capability_companions(
@@ -526,111 +445,40 @@ def _missing_capability_companions(
 # Built-in services predate manifest-declarable trigger authority. Keep their
 # explicitly declared, review-bounded proposal workflow classified without
 # making those capabilities grantable to custom trigger manifests.
-_LEGACY_SERVICE_SINK_TIERS: dict[str, CapabilityTier] = {
-    "open_proposal": CapabilityTier.SCOPE_CONTAINED,
-    "submit_proposal": CapabilityTier.SCOPE_CONTAINED,
-    "abandon_proposal": CapabilityTier.SCOPE_CONTAINED,
-}
+_LEGACY_SERVICE_SINK_TIERS: Mapping[str, CapabilityTier] = MappingProxyType({
+    name: CapabilityTier(tier) for name, tier in _core_profiles.legacy_service_sink_tiers.items()
+})
 
-TRIGGER_AUTHORITY_PROFILES: dict[str, frozenset[str]] = {
-    "research": frozenset({
-        "write_file", "edit_file", "replace_file", "read_file", "aread", "ls", "als",
-        "glob", "aglob", "grep", "agrep", "file_search", "memory_store",
-        "memory_propose",
-        "saga_feedback", "saga_mark_contributions", "send_message",
-        "saga_record_skill_learning", "operator_alert", "shell_exec",
-        "bash_jobs_list", "bash_job_output", "fetch_url",
-        "open_proposal", "submit_proposal", "abandon_proposal",
-    }),
-    "github": frozenset({
-        "worklink_run", "worklink_resume", "write_file", "edit_file", "replace_file", "shell_exec",
-        "bash_async", "bash_jobs_list", "bash_job_output", "read_file",
-        "aread", "ls", "als", "glob", "aglob", "grep", "agrep",
-        "file_search", "get_turn", "mimir_get_turn", "send_message",
-        "operator_alert", "task", "memory_store", "saga_mark_contributions",
-        "saga_end_session", "saga_record_skill_learning", "fetch_url",
-        "pr_metadata", "pr_spec", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "pr_submit_review",
-        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body", "pr_review_others", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
-        "issue_comment",
-        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
-        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
-        "repo_revert", "repo_revert_abort", "repo_push",
-    }),
-    # Custom profiles remain tier-validated and cannot request unbounded sinks.
-    "custom": frozenset(TRIGGER_CAPABILITY_TIERS) - {
-        "issue_comment", "open_proposal", "submit_proposal", "abandon_proposal",
-        "proposal_diff",
-    },
-    "heartbeat": frozenset({
-        "write_file", "edit_file", "replace_file", "shell_exec", "bash_async",
-        "bash_jobs_list", "bash_job_output", "read_file", "aread", "ls",
-        "als", "glob", "aglob", "grep", "agrep", "file_search",
-        "get_turn", "mimir_get_turn", "memory_store", "saga_feedback",
-        "saga_mark_contributions", "worklink_run", "send_message",
-        "operator_alert", "fetch_url", "task", "list_schedules",
-        "pr_metadata", "pr_spec", "pr_list", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-        "pr_comments", "pr_review_requests", "pr_submit_review",
-        "pr_inline_review_comment", "pr_comment", "pr_rerequest_review",
-        "pr_edit_body",
-        "unsupported_operation", "repo_checkout", "repo_cleanup", "repo_fetch",
-        "repo_status", "repo_test", "repo_diff", "repo_unmerged", "repo_stage", "repo_commit",
-        "repo_merge", "repo_merge_abort", "repo_rebase", "repo_rebase_abort",
-        "repo_revert", "repo_revert_abort", "repo_push",
-    }),
-    "session-boundary": frozenset({
-        "memory_get", "mimir_get_turn", "saga_feedback", "saga_end_session",
-        "write_file",
-    }),
-}
+TRIGGER_AUTHORITY_PROFILES: Mapping[str, frozenset[str]] = _core_profiles.authority_profiles
 
 # Scheduler records may opt into these built-in profiles. Keeping this set
 # separate prevents a scheduler entry from selecting a profile whose trigger
 # semantics require additional manifest data (for example a poller profile).
-SCHEDULER_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+SCHEDULER_AUTHORITY_PROFILES = frozenset(
+    name for name, profile in _core_profiles.profiles.items() if profile.scheduler
+)
 
-_BUILTIN_TRIGGER_PROFILE_CONFIG: dict[str, dict[str, Any]] = {
-    "heartbeat": {
-        "canonical": "heartbeat",
-        "trigger": "scheduled_tick",
-        "tier": CapabilityTier.UNBOUNDED,
-        "root_parts": ("state", "triggers", "heartbeat"),
-        "channel_memory_directory": "scheduler:heartbeat",
-        "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
-        # Heartbeat is an autonomous agent turn that recalls accumulated memory.
-        # This broadens SAGA reads only; its capabilities and sinks stay profile-bound.
-        "saga_full_corpus_read": True,
-    },
-    "session-boundary": {
-        "canonical": "synthesis",
-        "trigger": "saga_session_end",
-        "tier": CapabilityTier.SCOPED_WITH_PROVENANCE,
-        "root_parts": None,
-        "channel_memory_directory": None,
-        "creation_path": "mimir.server._on_session_idle",
-        "saga_full_corpus_read": True,
-    },
-}
+_BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = MappingProxyType({
+    name: MappingProxyType({
+        **profile.builtin_trigger_config,
+        "tier": CapabilityTier(profile.builtin_trigger_config["tier"]),
+    })
+    for name, profile in _core_profiles.profiles.items()
+    if profile.builtin_trigger_config is not None
+})
 
-_SHELL_PROFILE_BY_AUTHORITY_PROFILE = {
-    "github": "repo_review",
-    "heartbeat": "maintenance",
-    "session-boundary": "session_boundary",
-}
-OPERATOR_SHELL_PROFILE = "scheduler_read_only"
-_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = {
-    "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
-    "github": ("github_pr_api", "GITHUB_REPOS"),
-    "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
-}
-BOUNDED_PROFILE_CAPABILITIES: dict[str, frozenset[str]] = {
-    "research": frozenset({"fetch_url"}),
-    "github": frozenset({"fetch_url"}),
-    "session-boundary": frozenset({"fetch_url"}),
-}
-_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset({"heartbeat"})
+_SHELL_PROFILE_BY_AUTHORITY_PROFILE = _core_profiles.shell_profile_mappings
+_FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = MappingProxyType({
+    name: profile.fetch_url_policy for name, profile in _core_profiles.profiles.items()
+    if profile.fetch_url_policy is not None
+})
+BOUNDED_PROFILE_CAPABILITIES: Mapping[str, frozenset[str]] = MappingProxyType({
+    name: profile.bounded_capabilities for name, profile in _core_profiles.profiles.items()
+    if profile.bounded_capabilities
+})
+_PR_REVIEW_SCOPE_AUTHORITY_PROFILES = frozenset(
+    name for name, profile in _core_profiles.profiles.items() if profile.pr_review_scope
+)
 
 _CAPABILITY_TIER_RANK = {
     CapabilityTier.SCOPE_CONTAINED: 0,

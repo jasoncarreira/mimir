@@ -9,6 +9,100 @@ if TYPE_CHECKING:
     from .registry import PolicyRegistry
 
 
+def _names(value: str) -> frozenset[str]:
+    return frozenset(value.split())
+
+
+_TIERS = {
+    "scope-contained": _names("""write_file edit_file replace_file rebuild_index shell_exec
+        bash_async bash_jobs_list bash_job_output read_file proposal_diff aread ls als
+        glob aglob grep agrep file_search get_turn mimir_get_turn memory_get
+        send_message operator_alert task list_schedules pr_metadata pr_spec pr_list
+        pr_files pr_diff pr_file_content pr_checks pr_job_log ci_run_jobs ci_run
+        ci_recent_runs pr_reviews pr_comments pr_review_requests repo_status
+        repo_diff repo_unmerged"""),
+    "scoped-with-provenance": _names("""memory_store memory_propose open_proposal
+        submit_proposal abandon_proposal saga_feedback saga_mark_contributions
+        saga_end_session saga_record_skill_learning pr_review_others pr_submit_review
+        pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        pr_rerequest_review unsupported_operation repo_checkout repo_cleanup repo_fetch
+        repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort
+        repo_revert repo_revert_abort repo_push"""),
+    "code-execution": _names("worklink_run worklink_resume spawn_open_code repo_test"),
+    "unbounded": _names("fetch_url web_search webhook http_request ntfy_send"),
+}
+_PROFILES = {
+    "research": _names("""write_file edit_file replace_file read_file aread ls als glob aglob
+        grep agrep file_search memory_store memory_propose saga_feedback
+        saga_mark_contributions send_message saga_record_skill_learning operator_alert
+        shell_exec bash_jobs_list bash_job_output fetch_url open_proposal
+        submit_proposal abandon_proposal"""),
+    "github": _names("""worklink_run worklink_resume write_file edit_file replace_file
+        shell_exec bash_async bash_jobs_list bash_job_output read_file aread ls als glob
+        aglob grep agrep file_search get_turn mimir_get_turn send_message operator_alert
+        task memory_store saga_mark_contributions saga_end_session
+        saga_record_skill_learning fetch_url pr_metadata pr_spec pr_list pr_files
+        pr_diff pr_file_content pr_checks pr_reviews pr_comments pr_review_requests
+        pr_submit_review pr_inline_review_comment pr_comment pr_rerequest_review
+        pr_edit_body pr_review_others pr_job_log ci_run_jobs ci_run ci_recent_runs
+        issue_comment unsupported_operation repo_checkout repo_cleanup repo_fetch
+        repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
+        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort
+        repo_push"""),
+    "custom": frozenset.union(*_TIERS.values()) - _names(
+        "issue_comment open_proposal submit_proposal abandon_proposal proposal_diff"
+    ),
+    "heartbeat": _names("""write_file edit_file replace_file shell_exec bash_async
+        bash_jobs_list bash_job_output read_file aread ls als glob aglob grep agrep
+        file_search get_turn mimir_get_turn memory_store saga_feedback
+        saga_mark_contributions worklink_run send_message operator_alert fetch_url
+        task list_schedules pr_metadata pr_spec pr_list pr_files pr_diff
+        pr_file_content pr_checks pr_reviews pr_comments pr_review_requests
+        pr_submit_review pr_inline_review_comment pr_comment pr_rerequest_review
+        pr_edit_body unsupported_operation repo_checkout repo_cleanup repo_fetch
+        repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge
+        repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort
+        repo_push"""),
+    "session-boundary": _names(
+        "memory_get mimir_get_turn saga_feedback saga_end_session write_file"
+    ),
+}
+_BOUNDS = {name: _names("fetch_url") for name in ("research", "github", "session-boundary")}
+_COMPANIONS = {
+    "shell_exec": _names("bash_jobs_list bash_job_output"),
+    "bash_async": _names("bash_jobs_list bash_job_output"),
+}
+_LEGACY_SINK_TIERS = {
+    name: "scope-contained" for name in _names("open_proposal submit_proposal abandon_proposal")
+}
+_TRIGGERS = {
+    "heartbeat": {
+        "canonical": "heartbeat", "trigger": "scheduled_tick", "tier": "unbounded",
+        "root_parts": ("state", "triggers", "heartbeat"),
+        "channel_memory_directory": "scheduler:heartbeat",
+        "creation_path": "mimir.scheduler.Scheduler._fire:heartbeat",
+        "saga_full_corpus_read": True,
+    },
+    "session-boundary": {
+        "canonical": "synthesis", "trigger": "saga_session_end",
+        "tier": "scoped-with-provenance", "root_parts": None,
+        "channel_memory_directory": None,
+        "creation_path": "mimir.server._on_session_idle",
+        "saga_full_corpus_read": True,
+    },
+}
+OPERATOR_SHELL_PROFILE = "scheduler_read_only"
+_SHELL = {
+    "github": "repo_review", "heartbeat": "maintenance",
+    "session-boundary": "session_boundary",
+}
+_FETCH = {
+    "heartbeat": ("approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"),
+    "github": ("github_pr_api", "GITHUB_REPOS"),
+    "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
+}
+
+
 def register_core_tools(registry: PolicyRegistry) -> None:
     """Register core descriptors; later policy families add their own metadata here."""
     from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS
@@ -18,7 +112,7 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             name=name,
             policy_only=True,
             flow=None,
-            tier=None,
+            tier=next((tier for tier, names in _TIERS.items() if name in names), None),
             operation_class=None,
             result_domain=None,
             result_origin=descriptor.result_origin,
@@ -31,9 +125,29 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ifc_delegation=descriptor.ifc_delegation,
             budget_exempt=descriptor.budget_exempt,
             writes_code_or_state=False,
-            profiles=(),
+            profiles=tuple(profile for profile, names in _PROFILES.items() if name in names),
             read_backend=False,
         )
+
+    for tier, names in _TIERS.items():
+        for name in names:
+            registry.register_capability(
+                name, tier=tier, companions=_COMPANIONS.get(name, ()),
+                legacy_service_sink_tier=_LEGACY_SINK_TIERS.get(name),
+            )
+    for name, capabilities in _PROFILES.items():
+        registry.register_authority_profile(
+            name, capabilities=capabilities, bounded_capabilities=_BOUNDS.get(name, ()),
+            capability_companions=(
+                {"worklink_run": _names("read_file ls shell_exec")}
+                if name == "heartbeat" else {}
+            ),
+            scheduler=name == "heartbeat", fetch_url_policy=_FETCH.get(name),
+            pr_review_scope=name == "heartbeat",
+            builtin_trigger_config=_TRIGGERS.get(name),
+        )
+    for profile, shell in _SHELL.items():
+        registry.register_shell_profile_mapping(profile, shell)
 
 
 @lru_cache(maxsize=1)

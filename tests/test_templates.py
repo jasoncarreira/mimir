@@ -438,20 +438,22 @@ class TestRenderSagaSessionEnd:
                 prompt,
             )
 
-    def test_rendered_tool_list_follows_capability_changes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        current = access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
-        monkeypatch.setitem(
-            access_control.TRIGGER_AUTHORITY_PROFILES,
-            "session-boundary",
-            current | {"new_boundary_tool"},
-        )
+    def test_rendered_tool_list_follows_registered_capabilities(self) -> None:
+        from mimir.plugins.core import core_policy_registry
+
+        registered = core_policy_registry().authority_profiles["session-boundary"]
+        assert access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"] == registered
+        with pytest.raises(TypeError):
+            access_control.TRIGGER_AUTHORITY_PROFILES["session-boundary"] = (
+                registered | {"new_boundary_tool"}
+            )
         for turns in (self._turns_with_atoms(), self._turns_no_atoms()):
             prompt = render_saga_session_end(
                 channel_id="chan-1", saga_session_id="saga-1", idle_minutes=10,
                 turns_window=turns, prompts_dir=None,
             )
-            assert "- `new_boundary_tool`\n" in prompt
-            assert all(f"- `{tool}`\n" in prompt for tool in current)
+            assert "- `new_boundary_tool`\n" not in prompt
+            assert all(f"- `{tool}`\n" in prompt for tool in registered)
 
 
 # ─── chainlink #388: malformed operator template must not crash synthesis ──
