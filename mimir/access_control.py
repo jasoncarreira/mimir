@@ -12087,6 +12087,7 @@ def service_can_invoke_operation(
     if not selected.frozen or service is None or not service.has_capability(operation):
         return False
     if (policy is not None and operation not in selected.capabilities
+            and operation not in selected.tools
             and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS):
         return False
     if policy is None and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS:
@@ -12280,6 +12281,7 @@ def create_auth_context(
     ifc_labels: "InformationFlowLabels | None" = None,
     audience_provider: Any = None,
     cross_platform_pull: bool = True,
+    policy: "PolicyRegistry | None" = None,
 ) -> "AuthContext":
     """Create a frozen AuthContext from an inbound event (chainlink #864).
 
@@ -12313,7 +12315,10 @@ def create_auth_context(
         roles = access.roles if event_ingress is None else ()
         is_service = access.is_service
 
-    registered_service = get_event_service_principal(event)
+    registered_service = (
+        get_event_service_principal(event, policy=policy)
+        if policy is not None else get_event_service_principal(event)
+    )
     if (
         registered_service is not None
         and event.service_principal == registered_service.canonical

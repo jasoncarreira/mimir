@@ -5,17 +5,18 @@ from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
+from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
-    CapabilityTier, ToolRegistry, build_trigger_service_principal,
+    HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
     builtin_trigger_service_principal, get_service_principal,
-    service_can_invoke_operation,
+    get_trusted_service_from_auth_context, service_can_invoke_operation,
 )
 from mimir.models import (
-    AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
+    AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
     RepoPRActionScope, RepoPRScopeRegistry,
     RepoReviewState, RetainedFactoryScope,
 )
@@ -99,7 +100,7 @@ def principal_policy():
         name="example_inspect", factory=lambda: StructuredTool.from_function(
             _plugin_tool, name="example_inspect", description="Read example state",
         ),
-        flow="source", tier="scope-contained", operation_class="open",
+        flow="source", tier="scope-contained", operation_class="admin_required",
         result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
         sink_category=None, sink_destination=None, sink_target_extractor=None,
         sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
@@ -170,6 +171,60 @@ def test_static_plugin_principal_and_explicit_instance_grants(principal_policy, 
             tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
             creation_path="example.poller:manifest", policy=principal_policy,
         )
+
+
+def test_static_plugin_event_reaches_agent_ifc_surface_and_tool_gate(principal_policy):
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.tools.service_tool_surface import ServiceToolSurfaceMiddleware
+
+    event = AgentEvent(
+        trigger="example_worker", channel_id="scheduler:example",
+        service_principal="example:worker", content="run",
+    )
+    labels = _initialize_ifc_labels(event, policy=principal_policy)
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+        policy=principal_policy,
+    )
+    assert auth.is_service and auth.service_authority is get_service_principal(
+        "example_worker", policy=principal_policy,
+    )
+    assert any(source.principal == "service:example:worker" for source in labels.sources)
+    tool = principal_policy.tools["example_inspect"].factory()
+    surface = ServiceToolSurfaceMiddleware(principal_policy)
+
+    def visible(context):
+        request = ModelRequest(
+            model=SimpleNamespace(), messages=[], tools=[tool], runtime=Runtime(context=context),
+        )
+        return [item.name for item in surface._filter_request(request).tools]
+
+    assert visible(replace(auth, service_authority=None)) == ["example_inspect"]
+    assert ToolRegistry().authorize_tool(
+        "example_inspect", auth, enforce=True, policy=principal_policy,
+    ).allowed
+    admitted, denial = _authorize_tool_call(
+        "example_inspect", auth, None, labels, policy=principal_policy,
+    )
+    assert admitted.allowed and denial is None
+
+    unselected = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=True, ifc_labels=labels,
+    )
+    assert not unselected.is_service
+    assert get_trusted_service_from_auth_context(unselected, policy=principal_policy) is None
+    assert not ToolRegistry().authorize_tool(
+        "example_inspect", unselected, enforce=True, policy=principal_policy,
+    ).allowed
+    ingress = replace(event, extra={HTTP_EVENT_INGRESS_EXTRA_KEY: "http"})
+    ingress_labels = _initialize_ifc_labels(ingress, policy=principal_policy)
+    public = _create_turn_auth_context(
+        ingress, None, policy_version=None, enforce=True, ifc_labels=ingress_labels,
+        policy=principal_policy,
+    )
+    assert not public.is_service and public.service_authority is None
+    assert get_trusted_service_from_auth_context(public, policy=principal_policy) is None
+    assert not any(source.principal == "service:example:worker" for source in ingress_labels.sources)
 
 
 @pytest.mark.asyncio

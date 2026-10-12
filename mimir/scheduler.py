@@ -2166,6 +2166,7 @@ class Scheduler:
                     self._home / "pollers-overrides.yaml"
                     if self._home is not None else None
                 ),
+                policy=self._policy,
             )
         )
         return discovered, invalid_manifests, invalid_entries
