@@ -5849,6 +5849,81 @@ def test_factory_stop_prompt_result_identity_truncation_and_ack(
     assert len(emitted) == 2 and emitted[1]["prompt"].find("new decision") != -1
 
 
+@pytest.mark.parametrize("kind", [
+    "leaf_blocked", "leaf_attempts_exhausted", "leaf_template_invalid", "leaf_claim_reaped",
+])
+def test_leaf_milestone_prompt_dedup_ack_and_new_occurrence(
+    worklink_receipts, worklink_receipt_consumer, monkeypatch, kind,
+):
+    failures, state, cfg, _ = worklink_receipts
+    fields = dict(kind=kind, issue_id=42, issue_title="Decision needed", attempt=2,
+                  reason="R" * 3000, evidence_path="/evidence.json", transcript_path="/trace.json",
+                  checkout="/checkout", branch="worklink/42")
+    entry = failures.record_leaf_transition(state, **fields)
+    key = entry["delivery_key"]
+    assert key.startswith(f"worklink-{kind}:42:2:")
+    emitted = []
+    monkeypatch.setattr(worklink_receipt_consumer, "_emit", emitted.append)
+    budget = SimpleNamespace(hard_exhausted=lambda: False)
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 1
+    notice = emitted[0]
+    assert "prompt" in notice and "signal" not in notice
+    prompt = notice["prompt"]
+    for value in ("42", "Decision needed", kind, "Attempt: 2", "R" * 2000,
+                  "[reason truncated; inspect issue/evidence]", "/evidence.json", "/trace.json",
+                  "/checkout", "worklink/42", "call operator_alert", "Do not re-arm, reset claims"):
+        assert value in prompt
+    assert "R" * 2001 not in prompt
+    _write_delivery_receipt(state, key)
+    home = state.parent.parent.parent
+    _prune_delivery_receipts(cfg, home)
+    assert failures.delivery_receipt_exists(state, key)
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert failures.load_failure_state(state)["factory_transitions"][key]["notified"] is True
+    _prune_delivery_receipts(cfg, home)
+    assert not failures.delivery_receipt_exists(state, key)
+    assert failures.record_leaf_transition(state, **fields)["notified"] is True
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 1
+    changed = failures.record_leaf_transition(state, **{**fields, "reason": "new decision"})
+    assert changed["delivery_key"] != key
+    worklink_receipt_consumer._deliver_factory_transitions(state, budget)
+    assert len(emitted) == 2 and "new decision" in emitted[1]["prompt"]
+
+
+@pytest.mark.parametrize("broken", ["key", "reason", "evidence_path"])
+def test_leaf_receipt_pruning_refuses_corrupt_identity(home, worklink_receipts, broken):
+    failures, state, cfg, record = worklink_receipts
+    incident, _, obsolete = record()
+    failures.mark_failure_notified(state, 42, incident["signature"], incident["occurrence_id"])
+    entry = failures.record_leaf_transition(
+        state, kind="leaf_blocked", issue_id=42, attempt=1, reason="blocked",
+    )
+    key = entry["delivery_key"]
+    _write_delivery_receipt(state, key)
+    with failures.failure_state_transaction(state) as ledger:
+        current = ledger["factory_transitions"].pop(key)
+        current["notified"] = True
+        if broken == "key":
+            key = key[:-1] + "z"
+            current["delivery_key"] = key
+        else:
+            current[broken] = None
+        ledger["factory_transitions"][key] = current
+    _prune_delivery_receipts(cfg, home)
+    assert obsolete.exists()
+
+
+def test_leaf_milestone_rejects_unknown_kind(worklink_receipts):
+    failures, state, _, _ = worklink_receipts
+    with pytest.raises(ValueError, match="invalid leaf transition kind"):
+        failures.record_leaf_transition(
+            state, kind="leaf_unknown", issue_id=42, attempt=0, reason="unknown",
+        )
+    assert not failures.load_failure_state(state).get("factory_transitions")
+
+
 @pytest.mark.parametrize("broken", [
     "status", "key", "key_prefix", "key_length", "record_path", "reason",
     "sandbox", "park_snapshot",

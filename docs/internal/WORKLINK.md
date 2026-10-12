@@ -212,6 +212,16 @@ executor together by rebuilding the executor image before enabling this layout.
   the issue. Stop notices are recorded for both autonomous and operator-launched
   runs; unlike `factory_start` and `factory_success`, they are not gated by
   `autonomous`. These prompts complement the independent operator park alerts.
+- **Leaf decision notices**: A blocked leaf result, exhausted attempt budget
+  (leaf or epic), invalid ready-leaf template, and stale leaf claim re-arm each
+  record a best-effort milestone in the same dispatch ledger. The ready-queue
+  poller delivers an acknowledged prompt with issue, attempt, bounded reason,
+  and available evidence, transcript, checkout and branch pointers. Identical
+  occurrences deduplicate; a new reason or attempt prompts again. The agent
+  inspects the evidence and issue and calls `operator_alert` if a spec repair,
+  unblock or attempt grant is needed; it does not re-arm, reset claims, edit
+  the issue body or start work. Failed leaves already use incident prompts;
+  review-ready PRs, operator stops and scheduled quota holds are exempt.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and

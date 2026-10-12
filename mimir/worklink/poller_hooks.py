@@ -17,6 +17,7 @@ from ..models import AgentEvent
 from .dispatch_failures import (
     FACTORY_STOP_KINDS,
     FACTORY_TRANSITION_KINDS,
+    LEAF_TRANSITION_KINDS,
     STATE_FILE,
     _validate_merge_reconciliations,
     dispatch_failure_state_dir,
@@ -98,7 +99,17 @@ def report_live_delivery_receipts(
                     if not isinstance(kind, str):
                         return
 
-                    if kind in FACTORY_STOP_KINDS:
+                    if kind in LEAF_TRANSITION_KINDS:
+                        prefix = f"worklink-{kind}:{issue}:{attempt}:"
+                        valid_key = (key.startswith(prefix) and len(key) == len(prefix) + 64
+                                     and all(c in "0123456789abcdef" for c in key[len(prefix):]))
+                        valid_fields = (
+                            isinstance(entry.get("reason"), str)
+                            and all(isinstance(entry.get(field), str) for field in (
+                                "evidence_path", "transcript_path", "checkout", "branch",
+                            ))
+                        )
+                    elif kind in FACTORY_STOP_KINDS:
                         prefix = f"worklink-{kind}:{issue}:{run}:{attempt}:"
                         valid_key = (key.startswith(prefix) and len(key) == len(prefix) + 64
                                      and all(c in "0123456789abcdef" for c in key[len(prefix):]))
@@ -117,7 +128,7 @@ def report_live_delivery_receipts(
                     else:
                         valid_key = key == f"worklink-{kind}:{issue}:{run}:{attempt}"
                         valid_fields = True
-                    if (kind not in FACTORY_TRANSITION_KINDS
+                    if (kind not in FACTORY_TRANSITION_KINDS | LEAF_TRANSITION_KINDS
                             or type(issue) is not int
                             or not isinstance(run, str) or not run
                             or type(attempt) is not int
