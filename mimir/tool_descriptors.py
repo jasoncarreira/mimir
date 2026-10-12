@@ -286,7 +286,7 @@ _E = ResultOriginKind.EXTERNAL
 _R = ResultOriginKind.REPOSITORY
 _N = ResultOriginKind.NON_INGESTING
 
-TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
+_CORE_DESCRIPTOR_DECLARATIONS: Mapping[str, ToolDescriptor] = MappingProxyType({
     "Bash": _D(SinkCategory.SHELL_PROCESS, _generic_target, "shell_process"),
     "Edit": _D(SinkCategory.FILE, _generic_target, "filesystem"),
     "Write": _D(SinkCategory.FILE, _generic_target, "filesystem"),
@@ -397,14 +397,12 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = MappingProxyType({
 })
 
 
-def get_tool_descriptor(tool_name: str) -> ToolDescriptor | None:
-    return TOOL_DESCRIPTORS.get(tool_name)
-
-
 def validate_tool_descriptors(
-    descriptors: Mapping[str, ToolDescriptor] = TOOL_DESCRIPTORS,
+    descriptors: Mapping[str, ToolDescriptor] | None = None,
 ) -> None:
     """Reject categorized sinks whose target or external payload was not considered."""
+    if descriptors is None:
+        descriptors = TOOL_DESCRIPTORS
     missing = sorted(
         name
         for name, descriptor in descriptors.items()
@@ -436,4 +434,11 @@ def validate_tool_descriptors(
         )
 
 
+from .plugins.core import core_policy_registry
+
+TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = core_policy_registry().descriptors
 validate_tool_descriptors()
+
+
+def get_tool_descriptor(tool_name: str) -> ToolDescriptor | None:
+    return TOOL_DESCRIPTORS.get(tool_name)

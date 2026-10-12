@@ -9,7 +9,10 @@ import pytest
 from mimir.access_control import ServicePrincipal
 from mimir.models import RepoPRAction
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
-from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+from mimir.tool_descriptors import (
+    ResultOriginKind, SinkCategory, _PAYLOAD_EXTRACTOR_UNDECLARED,
+    _TARGET_EXTRACTOR_UNDECLARED,
+)
 
 
 def tool_fields(**overrides):
@@ -224,3 +227,31 @@ def test_external_sink_requires_explicit_payload_and_target():
         sink_category=SinkCategory.NETWORK, sink_destination="network",
     ))
     assert registry.freeze().descriptors["sample"].sink_payload_extractor is None
+
+
+@pytest.mark.parametrize("field,sentinel", [
+    ("sink_target_extractor", _TARGET_EXTRACTOR_UNDECLARED),
+    ("sink_payload_extractor", _PAYLOAD_EXTRACTOR_UNDECLARED),
+])
+def test_only_core_can_preserve_undeclared_descriptor_extractors(field, sentinel):
+    registry = PolicyRegistry()
+    registry.register_tool(**tool_fields(factory=None, policy_only=True, **{field: sentinel}))
+    assert getattr(registry.freeze().descriptors["sample"], field) is sentinel
+
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="invalid .* extractor"):
+        registry.registrar("example").register_tool(**tool_fields(**{field: sentinel}))
+    assert not registry.tools
+
+
+def test_only_core_can_preserve_targetless_sink_destination():
+    registry = PolicyRegistry()
+    registry.register_tool(**tool_fields(
+        factory=None, policy_only=True, sink_category=SinkCategory.SAME_CHANNEL,
+    ))
+    assert registry.freeze().descriptors["sample"].sink_destination is None
+
+    with pytest.raises(PolicyRegistrationError, match="invalid sink destination"):
+        PolicyRegistry().registrar("example").register_tool(**tool_fields(
+            sink_category=SinkCategory.SAME_CHANNEL,
+        ))
