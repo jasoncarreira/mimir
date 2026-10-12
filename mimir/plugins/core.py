@@ -13,6 +13,36 @@ def _names(value: str) -> frozenset[str]:
     return frozenset(value.split())
 
 
+_FLOWS = {
+    "neither": _names("""approve_declassification request_operator_approval write_todos
+        task hands_request_scope"""),
+    "source": _names("""memory_query memory_get proposal_diff file_search mimir_get_turn
+        get_turn bash_jobs_list bash_job_output fetch_channel_history list_channels
+        list_schedules commitment_list read_file aread ls als glob aglob grep agrep
+        hands_read Read Glob Grep pr_metadata pr_spec pr_list pr_files pr_diff
+        pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs
+        pr_reviews pr_comments pr_review_requests repo_status repo_diff
+        repo_unmerged"""),
+    "sink": _names("""memory_store memory_propose open_proposal submit_proposal
+        abandon_proposal saga_feedback saga_mark_contributions saga_end_session
+        saga_forget saga_record_skill_learning rebuild_index send_message
+        operator_alert react defer_injected_message add_schedule
+        set_schedule_priority remove_schedule set_poller_overrides reload_pollers
+        commitment_complete commitment_snooze commitment_dismiss
+        request_mimir_update post_message webhook ntfy_send write_file edit_file
+        replace_file Write Edit harness_auto_deliver harness_resend_nudge
+        activity_panel_post activity_panel_edit pr_submit_review
+        pr_inline_review_comment pr_comment pr_edit_body issue_comment
+        pr_rerequest_review unsupported_operation repo_cleanup repo_stage repo_commit
+        repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert
+        repo_revert_abort repo_push"""),
+    "both": _names("""shell_exec bash_async worklink_run worklink_resume web_search
+        fetch_url http_request spawn_open_code download_files adownload_files
+        Bash bash bash_exec execute aexecute shell hands_edit hands_shell hands_python
+        repo_checkout repo_fetch repo_test"""),
+}
+
+
 _TIERS = {
     "scope-contained": _names("""write_file edit_file replace_file rebuild_index shell_exec
         bash_async bash_jobs_list bash_job_output read_file proposal_diff aread ls als
@@ -91,7 +121,6 @@ _TRIGGERS = {
         "saga_full_corpus_read": True,
     },
 }
-OPERATOR_SHELL_PROFILE = "scheduler_read_only"
 _SHELL = {
     "github": "repo_review", "heartbeat": "maintenance",
     "session-boundary": "session_boundary",
@@ -105,13 +134,19 @@ _FETCH = {
 
 def register_core_tools(registry: PolicyRegistry) -> None:
     """Register core descriptors; later policy families add their own metadata here."""
-    from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS
+    from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS, ResultOriginKind
+
+    flow_by_name = {
+        name: flow for flow, names in _FLOWS.items() for name in names
+    }
+    if sum(map(len, _FLOWS.values())) != len(flow_by_name):
+        raise ValueError("duplicate core tool flow classification")
 
     for name, descriptor in _CORE_DESCRIPTOR_DECLARATIONS.items():
         registry.register_tool(
             name=name,
             policy_only=True,
-            flow=None,
+            flow=flow_by_name.get(name),
             tier=next((tier for tier, names in _TIERS.items() if name in names), None),
             operation_class=None,
             result_domain=None,
@@ -127,6 +162,18 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             writes_code_or_state=False,
             profiles=tuple(profile for profile, names in _PROFILES.items() if name in names),
             read_backend=False,
+        )
+
+    # Framework aliases and native operations without descriptors still require
+    # an explicit IFC decision; they are not candidates for runtime factories.
+    for name in sorted(flow_by_name.keys() - _CORE_DESCRIPTOR_DECLARATIONS.keys()):
+        registry.register_tool(
+            name=name, policy_only=True, descriptor_registered=False,
+            flow=flow_by_name[name], tier=None, operation_class=None,
+            result_domain=None, result_origin=ResultOriginKind.NONE,
+            sink_category=None, sink_destination=None,
+            sink_target_extractor=None, sink_payload_extractor=None,
+            writes_code_or_state=False, profiles=(), read_backend=False,
         )
 
     for tier, names in _TIERS.items():
@@ -148,6 +195,7 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         )
     for profile, shell in _SHELL.items():
         registry.register_shell_profile_mapping(profile, shell)
+    registry.register_operator_shell_profile("scheduler_read_only")
 
 
 @lru_cache(maxsize=1)

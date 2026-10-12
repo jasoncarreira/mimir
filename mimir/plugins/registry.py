@@ -103,6 +103,7 @@ class PolicyRegistry:
         self._legacy_service_sink_tiers: dict[str, str] = {}
         self._profiles: dict[str, AuthorityProfile] = {}
         self._shell_profiles: dict[str, str] = {}
+        self._operator_shell_profile: str | None = None
         self._principals: dict[str, Any] = {}
         self._principal_owners: dict[str, str] = {}
         self._frozen = False
@@ -142,6 +143,10 @@ class PolicyRegistry:
     @property
     def shell_profile_mappings(self) -> Mapping[str, str]:
         return MappingProxyType(self._shell_profiles)
+
+    @property
+    def operator_shell_profile(self) -> str | None:
+        return self._operator_shell_profile
 
     @property
     def service_principals(self) -> Mapping[str, Any]:
@@ -325,6 +330,14 @@ class PolicyRegistry:
         if profile in self._shell_profiles:
             raise PolicyRegistrationError(f"duplicate shell profile mapping: {profile}")
         self._shell_profiles[profile] = _name(shell_profile, "shell profile")
+
+    def register_operator_shell_profile(self, shell_profile: str, *, owner: str = "core") -> None:
+        self._writable()
+        if owner != "core":
+            raise PolicyRegistrationError(f"{owner}: operator shell profile is core-only")
+        if self._operator_shell_profile is not None:
+            raise PolicyRegistrationError("duplicate operator shell profile")
+        self._operator_shell_profile = _name(shell_profile, "operator shell profile")
 
     def register_service_principal(self, principal: Any, *, owner: str = "core") -> None:
         self._writable()

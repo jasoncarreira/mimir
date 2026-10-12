@@ -69,6 +69,7 @@ from .tool_descriptors import (
     TOOL_DESCRIPTORS,
     get_tool_descriptor,
 )
+from .plugins.core import core_policy_registry
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
@@ -189,138 +190,9 @@ def _author_attestation_note(auth_context: Any) -> str:
         )
     return ""
 
-_TOOL_FLOW_MAP: dict[str, ToolFlowDirection] = {
-    # Native model tools. This is intentionally exhaustive rather than derived
-    # from the sink map: startup checks the assembled surface against this map,
-    # so adding a tool without making an IFC decision fails closed.
-    # Declassification mutates the live authorization carrier but does not itself
-    # read protected data or emit it; the subsequent exact sink remains gated.
-    "approve_declassification": ToolFlowDirection.NEITHER,
-    "request_operator_approval": ToolFlowDirection.NEITHER,
-    "memory_query": ToolFlowDirection.SOURCE,
-    "memory_get": ToolFlowDirection.SOURCE,
-    "memory_store": ToolFlowDirection.SINK,
-    "memory_propose": ToolFlowDirection.SINK,
-    "open_proposal": ToolFlowDirection.SINK,
-    "proposal_diff": ToolFlowDirection.SOURCE,
-    "submit_proposal": ToolFlowDirection.SINK,
-    "abandon_proposal": ToolFlowDirection.SINK,
-    "saga_feedback": ToolFlowDirection.SINK,
-    "saga_mark_contributions": ToolFlowDirection.SINK,
-    "saga_end_session": ToolFlowDirection.SINK,
-    "saga_forget": ToolFlowDirection.SINK,
-    "saga_record_skill_learning": ToolFlowDirection.SINK,
-    "file_search": ToolFlowDirection.SOURCE,
-    "rebuild_index": ToolFlowDirection.SINK,
-    "mimir_get_turn": ToolFlowDirection.SOURCE,
-    "get_turn": ToolFlowDirection.SOURCE,
-    "shell_exec": ToolFlowDirection.BOTH,
-    "bash_async": ToolFlowDirection.BOTH,
-    "bash_jobs_list": ToolFlowDirection.SOURCE,
-    "bash_job_output": ToolFlowDirection.SOURCE,
-    "send_message": ToolFlowDirection.SINK,
-    "operator_alert": ToolFlowDirection.SINK,
-    "react": ToolFlowDirection.SINK,
-    "fetch_channel_history": ToolFlowDirection.SOURCE,
-    "list_channels": ToolFlowDirection.SOURCE,
-    "defer_injected_message": ToolFlowDirection.SINK,
-    "list_schedules": ToolFlowDirection.SOURCE,
-    "add_schedule": ToolFlowDirection.SINK,
-    "set_schedule_priority": ToolFlowDirection.SINK,
-    "remove_schedule": ToolFlowDirection.SINK,
-    "set_poller_overrides": ToolFlowDirection.SINK,
-    "reload_pollers": ToolFlowDirection.SINK,
-    "commitment_complete": ToolFlowDirection.SINK,
-    "commitment_snooze": ToolFlowDirection.SINK,
-    "commitment_dismiss": ToolFlowDirection.SINK,
-    "commitment_list": ToolFlowDirection.SOURCE,
-    "worklink_run": ToolFlowDirection.BOTH,
-    "worklink_resume": ToolFlowDirection.BOTH,
-    "request_mimir_update": ToolFlowDirection.SINK,
-    "web_search": ToolFlowDirection.BOTH,
-    "fetch_url": ToolFlowDirection.BOTH,
-    "post_message": ToolFlowDirection.SINK,
-    "webhook": ToolFlowDirection.SINK,
-    "http_request": ToolFlowDirection.BOTH,
-    "ntfy_send": ToolFlowDirection.SINK,
-    "spawn_open_code": ToolFlowDirection.BOTH,
-    # Deepagents model-bound built-ins and their async/compatibility aliases.
-    "read_file": ToolFlowDirection.SOURCE,
-    "aread": ToolFlowDirection.SOURCE,
-    "ls": ToolFlowDirection.SOURCE,
-    "als": ToolFlowDirection.SOURCE,
-    "glob": ToolFlowDirection.SOURCE,
-    "aglob": ToolFlowDirection.SOURCE,
-    "grep": ToolFlowDirection.SOURCE,
-    "agrep": ToolFlowDirection.SOURCE,
-    "write_file": ToolFlowDirection.SINK,
-    "edit_file": ToolFlowDirection.SINK,
-    "replace_file": ToolFlowDirection.SINK,
-    "download_files": ToolFlowDirection.BOTH,
-    "adownload_files": ToolFlowDirection.BOTH,
-    "write_todos": ToolFlowDirection.NEITHER,
-    # Built-in subagents remain inside the current IFC carrier; delegation
-    # propagation is handled separately and is not an external sink itself.
-    "task": ToolFlowDirection.NEITHER,
-    "Bash": ToolFlowDirection.BOTH,
-    "bash": ToolFlowDirection.BOTH,
-    "bash_exec": ToolFlowDirection.BOTH,
-    "execute": ToolFlowDirection.BOTH,
-    "aexecute": ToolFlowDirection.BOTH,
-    "shell": ToolFlowDirection.BOTH,
-    "hands_request_scope": ToolFlowDirection.NEITHER,
-    "hands_read": ToolFlowDirection.SOURCE,
-    "hands_edit": ToolFlowDirection.BOTH,
-    "hands_shell": ToolFlowDirection.BOTH,
-    "hands_python": ToolFlowDirection.BOTH,
-    "Write": ToolFlowDirection.SINK,
-    "Edit": ToolFlowDirection.SINK,
-    "Read": ToolFlowDirection.SOURCE,
-    "Glob": ToolFlowDirection.SOURCE,
-    "Grep": ToolFlowDirection.SOURCE,
-    # Harness egress is not model-bound but shares the same gate.
-    "harness_auto_deliver": ToolFlowDirection.SINK,
-    "harness_resend_nudge": ToolFlowDirection.SINK,
-    "activity_panel_post": ToolFlowDirection.SINK,
-    "activity_panel_edit": ToolFlowDirection.SINK,
-    "pr_metadata": ToolFlowDirection.SOURCE,
-    "pr_spec": ToolFlowDirection.SOURCE,
-    "pr_list": ToolFlowDirection.SOURCE,
-    "pr_files": ToolFlowDirection.SOURCE,
-    "pr_diff": ToolFlowDirection.SOURCE,
-    "pr_file_content": ToolFlowDirection.SOURCE,
-    "pr_checks": ToolFlowDirection.SOURCE,
-    "pr_job_log": ToolFlowDirection.SOURCE,
-    "ci_run_jobs": ToolFlowDirection.SOURCE,
-    "ci_run": ToolFlowDirection.SOURCE,
-    "ci_recent_runs": ToolFlowDirection.SOURCE,
-    "pr_reviews": ToolFlowDirection.SOURCE,
-    "pr_comments": ToolFlowDirection.SOURCE,
-    "pr_review_requests": ToolFlowDirection.SOURCE,
-    "pr_submit_review": ToolFlowDirection.SINK,
-    "pr_inline_review_comment": ToolFlowDirection.SINK,
-    "pr_comment": ToolFlowDirection.SINK,
-    "pr_edit_body": ToolFlowDirection.SINK,
-    "issue_comment": ToolFlowDirection.SINK,
-    "pr_rerequest_review": ToolFlowDirection.SINK,
-    "unsupported_operation": ToolFlowDirection.SINK,
-    "repo_checkout": ToolFlowDirection.BOTH,
-    "repo_cleanup": ToolFlowDirection.SINK,
-    "repo_fetch": ToolFlowDirection.BOTH,
-    "repo_status": ToolFlowDirection.SOURCE,
-    "repo_test": ToolFlowDirection.BOTH,
-    "repo_diff": ToolFlowDirection.SOURCE,
-    "repo_unmerged": ToolFlowDirection.SOURCE,
-    "repo_stage": ToolFlowDirection.SINK,
-    "repo_commit": ToolFlowDirection.SINK,
-    "repo_merge": ToolFlowDirection.SINK,
-    "repo_merge_abort": ToolFlowDirection.SINK,
-    "repo_rebase": ToolFlowDirection.SINK,
-    "repo_rebase_abort": ToolFlowDirection.SINK,
-    "repo_revert": ToolFlowDirection.SINK,
-    "repo_revert_abort": ToolFlowDirection.SINK,
-    "repo_push": ToolFlowDirection.SINK,
-}
+_TOOL_FLOW_MAP: Mapping[str, ToolFlowDirection] = MappingProxyType({
+    name: ToolFlowDirection(flow) for name, flow in core_policy_registry().flow.items()
+})
 
 IFC_POLICY_VERSION = "ifc-v1"
 DECLASSIFICATION_LIFETIME_SECONDS = 30.0
@@ -415,8 +287,6 @@ class ServicePrincipal:
         )
 
 
-from .plugins.core import core_policy_registry, OPERATOR_SHELL_PROFILE
-
 _core_profiles = core_policy_registry()
 TRIGGER_CAPABILITY_TIERS: Mapping[str, CapabilityTier] = MappingProxyType({
     name: CapabilityTier(tier) for name, tier in _core_profiles.tiers.items()
@@ -468,6 +338,7 @@ _BUILTIN_TRIGGER_PROFILE_CONFIG: Mapping[str, Mapping[str, Any]] = MappingProxyT
 })
 
 _SHELL_PROFILE_BY_AUTHORITY_PROFILE = _core_profiles.shell_profile_mappings
+OPERATOR_SHELL_PROFILE = _core_profiles.operator_shell_profile
 _FETCH_URL_POLICY_BY_AUTHORITY_PROFILE = MappingProxyType({
     name: profile.fetch_url_policy for name, profile in _core_profiles.profiles.items()
     if profile.fetch_url_policy is not None

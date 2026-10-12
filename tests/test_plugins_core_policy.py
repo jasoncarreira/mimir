@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import fields
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -12,6 +13,7 @@ from mimir import access_control as policy
 from mimir.plugins.core import core_policy_registry, register_core_tools
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir.tool_descriptors import (
+    ResultOriginKind,
     TOOL_DESCRIPTORS,
     _PAYLOAD_EXTRACTOR_UNDECLARED,
     _TARGET_EXTRACTOR_UNDECLARED,
@@ -33,7 +35,7 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
     )["descriptors"]
     registry = core_policy_registry()
     assert registry.frozen
-    assert len(registry.tools) == len(registry.descriptors) == len(expected) == 100
+    assert len(registry.descriptors) == len(expected) == 100
     assert set(registry.descriptors) == set(TOOL_DESCRIPTORS) == set(expected)
     for name, descriptor in TOOL_DESCRIPTORS.items():
         tool = registry.tools[name]
@@ -51,6 +53,43 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
                 value = int(value)
             row[field.name] = value
         assert row == expected[name], name
+
+
+def test_core_flow_registration_includes_native_aliases_and_descriptorless_tools() -> None:
+    registry = core_policy_registry()
+    expected = json.loads(
+        (Path(__file__).parent / "fixtures" / "plugin_core_policy_baseline.json").read_text()
+    )["tables"]["flow"]
+    assert dict(registry.flow) == expected
+    assert set(policy._TOOL_FLOW_MAP) == set(expected)
+    descriptorless = set(expected) - set(TOOL_DESCRIPTORS)
+    assert descriptorless
+    for name in descriptorless:
+        assert registry.tools[name].descriptor is None
+        assert policy.get_tool_flow_direction(name).value == expected[name]
+    for name in ("Bash", "aread", "hands_shell", "harness_auto_deliver"):
+        assert policy.get_tool_flow_direction(name).value == expected[name]
+    assert policy.get_tool_flow_direction("not_registered") is policy.ToolFlowDirection.UNKNOWN
+    with pytest.raises(TypeError):
+        policy._TOOL_FLOW_MAP["other"] = policy.ToolFlowDirection.SINK
+
+
+def test_registered_flow_lookup_uses_projected_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registry.registrar("example").register_tool(
+        name="example_flow", policy_only=True, flow="source", tier="scope-contained",
+        operation_class="open", result_domain="example",
+        result_origin=ResultOriginKind.NONE, sink_category=None, sink_destination=None,
+        sink_target_extractor=None, sink_payload_extractor=None,
+        writes_code_or_state=False, profiles=(), read_backend=False,
+    )
+    projected = MappingProxyType({
+        name: policy.ToolFlowDirection(flow) for name, flow in registry.freeze().flow.items()
+    })
+    monkeypatch.setattr(policy, "_TOOL_FLOW_MAP", projected)
+    assert policy.get_tool_flow_direction("example_flow") is policy.ToolFlowDirection.SOURCE
+    assert policy.get_tool_flow_direction("example_missing") is policy.ToolFlowDirection.UNKNOWN
 
 
 def test_public_descriptors_are_the_core_registry_projection() -> None:
@@ -72,6 +111,7 @@ def test_authority_profile_views_are_frozen_registry_projections() -> None:
     assert "fetch_url" not in policy.TRIGGER_AUTHORITY_PROFILES["session-boundary"]
     assert policy._SHELL_PROFILE_BY_AUTHORITY_PROFILE == registry.shell_profile_mappings
     assert policy._SHELL_PROFILE_BY_AUTHORITY_PROFILE["github"] == "repo_review"
+    assert policy.OPERATOR_SHELL_PROFILE == registry.operator_shell_profile == "scheduler_read_only"
     assert policy._FETCH_URL_POLICY_BY_AUTHORITY_PROFILE["heartbeat"] == (
         "approved_urls", "MIMIR_HEARTBEAT_APPROVED_URLS"
     )
@@ -102,3 +142,13 @@ def test_legacy_bound_exception_does_not_apply_to_other_core_profiles() -> None:
     registry.register_authority_profile("other", bounded_capabilities={"fetch_url"})
     with pytest.raises(PolicyRegistrationError, match="other: bounded capability outside profile"):
         registry.freeze()
+
+
+def test_operator_shell_profile_registration_is_unique_and_frozen() -> None:
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    with pytest.raises(PolicyRegistrationError, match="duplicate operator shell profile"):
+        registry.register_operator_shell_profile("other")
+    registry.freeze()
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry.register_operator_shell_profile("other")

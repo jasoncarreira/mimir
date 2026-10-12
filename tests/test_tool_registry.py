@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -1283,10 +1283,12 @@ def test_enforcement_enablement_rejects_read_backend_flow_misclassification(
 ) -> None:
     import mimir.access_control as access_control
 
-    monkeypatch.setitem(
-        access_control._TOOL_FLOW_MAP,
-        "read_file",
-        access_control.ToolFlowDirection.SINK,
+    monkeypatch.setattr(
+        access_control, "_TOOL_FLOW_MAP",
+        MappingProxyType({
+            **access_control._TOOL_FLOW_MAP,
+            "read_file": access_control.ToolFlowDirection.SINK,
+        }),
     )
 
     with pytest.raises(
