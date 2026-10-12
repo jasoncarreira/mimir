@@ -8,13 +8,17 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.runtime import Runtime
 
-from mimir.access_control import ToolRegistry
+from mimir.access_control import (
+    CapabilityTier, ToolRegistry, build_trigger_service_principal,
+    builtin_trigger_service_principal, get_service_principal,
+    service_can_invoke_operation,
+)
 from mimir.models import (
     AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
     RepoPRActionScope, RepoPRScopeRegistry,
     RepoReviewState, RetainedFactoryScope,
 )
-from mimir.plugins.core import register_core_tools
+from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
 from mimir.tool_descriptors import ResultOriginKind, SinkCategory
 from mimir.tools.budget_gate import BudgetGateMiddleware, _authorize_tool_call
@@ -83,6 +87,87 @@ def _state(operations):
         head_repo="acme/widget", head_remote="origin", destination_ref="refs/heads/fix",
         observed_head_sha="a" * 40, base_ref="main", observed_base_sha="b" * 40,
     ))
+
+
+@pytest.fixture
+def principal_policy():
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("example")
+    registrar.register_tool(
+        name="example_inspect", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_inspect", description="Read example state",
+        ),
+        flow="source", tier="scope-contained", operation_class="open",
+        result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
+        sink_category=None, sink_destination=None, sink_target_extractor=None,
+        sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
+        readable_domain="repository", read_backend=False,
+    )
+    registrar.register_capability("example_inspect")
+    registrar.add_to_profile("heartbeat", "example_inspect")
+    registrar.register_tool(
+        name="example_deliver", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_deliver", description="Deliver example result",
+        ),
+        flow="sink", tier="scope-contained", operation_class="admin_required",
+        result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
+        sink_category=SinkCategory.FILE, sink_destination="filesystem",
+        sink_target_extractor=None, sink_payload_extractor=None,
+        writes_code_or_state=False, profiles=(), read_backend=False,
+    )
+    registrar.register_capability("example_deliver")
+    registrar.add_to_profile("heartbeat", "example_deliver")
+    registrar.register_service_principal(ServicePrincipal(
+        canonical="example:worker", trigger="example_worker",
+        authority_profile="heartbeat", capability_tier=CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("example_inspect", "example_deliver"), readable_domains=("repository",),
+        sink_destinations=("filesystem",), creation_path="example.worker:run",
+    ))
+    return registry.freeze()
+
+
+def test_selected_builtin_issues_only_profile_membership(principal_policy, tmp_path):
+    core = builtin_trigger_service_principal("heartbeat", tmp_path)
+    selected = builtin_trigger_service_principal(
+        "heartbeat", tmp_path, policy=principal_policy,
+    )
+    assert set(selected.capabilities) == set(core.capabilities) | {
+        "example_inspect", "example_deliver",
+    }
+    assert not service_can_invoke_operation(core, "example_inspect", policy=principal_policy)
+    assert service_can_invoke_operation(selected, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(selected, "example_inspect")
+    assert not service_can_invoke_operation(selected, "example_unregistered", policy=principal_policy)
+    assert not service_can_invoke_operation(
+        replace(selected, readable_domains=()), "example_inspect", policy=principal_policy,
+    )
+
+
+def test_static_plugin_principal_and_explicit_instance_grants(principal_policy, tmp_path):
+    assert get_service_principal("example_worker") is None
+    static = get_service_principal("example_worker", policy=principal_policy)
+    assert static is not None
+    assert service_can_invoke_operation(static, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(static, "read_file", policy=principal_policy)
+    assert service_can_invoke_operation(static, "example_deliver", policy=principal_policy)
+    assert not service_can_invoke_operation(
+        replace(static, sink_destinations=()), "example_deliver", policy=principal_policy,
+    )
+    instance = build_trigger_service_principal(
+        canonical="poller:example", trigger="poller", profile="heartbeat",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
+        roots=(tmp_path,), creation_path="example.poller:manifest", policy=principal_policy,
+    )
+    assert service_can_invoke_operation(instance, "example_inspect", policy=principal_policy)
+    assert not service_can_invoke_operation(instance, "read_file", policy=principal_policy)
+    assert get_service_principal("poller", policy=principal_policy) is None
+    with pytest.raises(ValueError, match="outside.*profile"):
+        build_trigger_service_principal(
+            canonical="poller:example", trigger="poller", profile="custom",
+            tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
+            creation_path="example.poller:manifest", policy=principal_policy,
+        )
 
 
 @pytest.mark.parametrize("enforce", [True, False])
