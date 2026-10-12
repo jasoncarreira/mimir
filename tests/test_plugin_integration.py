@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from langchain.agents.middleware import ToolCallRequest
@@ -106,6 +107,7 @@ def principal_policy():
     )
     registrar.register_capability("example_inspect")
     registrar.add_to_profile("heartbeat", "example_inspect")
+    registrar.add_to_profile("session-boundary", "example_inspect")
     registrar.register_tool(
         name="example_deliver", factory=lambda: StructuredTool.from_function(
             _plugin_tool, name="example_deliver", description="Deliver example result",
@@ -168,6 +170,89 @@ def test_static_plugin_principal_and_explicit_instance_grants(principal_policy, 
             tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("example_inspect",),
             creation_path="example.poller:manifest", policy=principal_policy,
         )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fire_uses_selected_profile_grant(principal_policy, tmp_path, monkeypatch):
+    from mimir.scheduler import Scheduler, SchedulerJob
+
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    async def record(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr("mimir.scheduler.log_event", record)
+    job = SchedulerJob(name="heartbeat", prompt="tick", authority_profile="heartbeat")
+    selected = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path, policy=principal_policy)
+    default = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path)
+    await selected._fire(job=job)
+    await default._fire(job=job)
+    assert len(events) == 2
+    assert service_can_invoke_operation(
+        events[0].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[1].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[0].service_authority, "example_unregistered", policy=principal_policy,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_dispatch_uses_selected_profile_grant(principal_policy, tmp_path, monkeypatch):
+    from mimir.runtime import dispatch_session_synthesis
+
+    monkeypatch.setattr("mimir.agent._filter_session_turns", lambda *args, **kwargs: ["turn"])
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    async def record(*args, **kwargs):
+        pass
+
+    session = SimpleNamespace(
+        saga_session_id="session", channel_id="scheduler:heartbeat", source_acl=None,
+    )
+    config = SimpleNamespace(
+        turns_log=tmp_path / "turns.jsonl", saga_session_idle_minutes=5,
+        plugin_manager=SimpleNamespace(policy=principal_policy),
+    )
+    for selected in (config, SimpleNamespace(
+        turns_log=config.turns_log, saga_session_idle_minutes=5,
+    )):
+        assert await dispatch_session_synthesis(
+            session, config=selected, dispatcher=SimpleNamespace(enqueue=enqueue),
+            log_event_fn=record,
+        )
+    assert service_can_invoke_operation(
+        events[0].service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        events[1].service_authority, "example_inspect", policy=principal_policy,
+    )
+
+
+def test_server_session_event_uses_selected_profile_grant(principal_policy):
+    from mimir.server import _session_synthesis_event
+
+    session = SimpleNamespace(
+        saga_session_id="session", channel_id="scheduler:heartbeat", source_acl=None,
+    )
+    selected = _session_synthesis_event(session, policy=principal_policy)
+    default = _session_synthesis_event(session)
+    assert service_can_invoke_operation(
+        selected.service_authority, "example_inspect", policy=principal_policy,
+    )
+    assert not service_can_invoke_operation(
+        default.service_authority, "example_inspect", policy=principal_policy,
+    )
 
 
 @pytest.mark.parametrize("enforce", [True, False])

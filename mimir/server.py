@@ -21,7 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -52,6 +52,9 @@ from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
 from . import web_ui
 from .http_shutdown import HTTP_SHUTDOWN, HTTPShutdown
+
+if TYPE_CHECKING:
+    from .plugins.registry import PolicyRegistry
 
 log = logging.getLogger(__name__)
 
@@ -583,9 +586,11 @@ def _publish_runtime(
     state.runtime_published = True
 
 
-def _session_synthesis_event(session: ChannelSession) -> AgentEvent:
+def _session_synthesis_event(
+    session: ChannelSession, *, policy: PolicyRegistry | None = None,
+) -> AgentEvent:
     """Build the server-owned session synthesis event."""
-    authority = builtin_trigger_service_principal("session-boundary", Path("."))
+    authority = builtin_trigger_service_principal("session-boundary", Path("."), policy=policy)
     return AgentEvent(
         trigger="saga_session_end",
         channel_id=session.channel_id,
@@ -1501,6 +1506,7 @@ def build_app(config: Config) -> web.Application:
         home=config.home,
         scheduler_tz=config.scheduler_tz,
         operator_notice=github_outsider_notice,
+        policy=config.plugin_manager.policy,
     )
     set_on_channel_drained = getattr(dispatcher, "set_on_channel_drained", None)
     if set_on_channel_drained is not None:

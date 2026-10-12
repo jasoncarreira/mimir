@@ -9577,7 +9577,7 @@ class ToolRegistry:
             else catalog.get_decision(tool_name, auth_context)
         )
         preliminary_service = (
-            get_trusted_service_from_auth_context(auth_context)
+            get_trusted_service_from_auth_context(auth_context, policy=policy)
             if auth_context is not None
             else None
         )
@@ -9741,10 +9741,10 @@ class ToolRegistry:
         service_capability_denied = (
             preliminary_service is not None
             and preliminary_decision == OperationDecision.ADMIN_REQUIRED
-            and not service_can_invoke_operation(preliminary_service, tool_name)
+            and not service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         service_allowed_preliminary = (
-            service_can_invoke_operation(preliminary_service, tool_name)
+            service_can_invoke_operation(preliminary_service, tool_name, policy=policy)
         )
         if (
             preliminary_service is not None
@@ -9839,14 +9839,14 @@ class ToolRegistry:
         service_principal = None
 
         if auth_context is not None:
-            service_principal = get_trusted_service_from_auth_context(auth_context)
+            service_principal = get_trusted_service_from_auth_context(auth_context, policy=policy)
 
         required_tier = AccessTier.USER
         reason = None
         is_shadow = False
         would_block = False
         service_allowed = (
-            service_can_invoke_operation(service_principal, tool_name)
+            service_can_invoke_operation(service_principal, tool_name, policy=policy)
         )
 
         if decision == OperationDecision.OPEN:
@@ -12086,7 +12086,8 @@ def service_can_invoke_operation(
     selected = policy if policy is not None else _core_profiles
     if not selected.frozen or service is None or not service.has_capability(operation):
         return False
-    if policy is not None and operation not in selected.capabilities:
+    if (policy is not None and operation not in selected.capabilities
+            and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS):
         return False
     if policy is None and operation not in _TOOL_FLOW_MAP and operation not in TRIGGER_CAPABILITY_TIERS:
         return False
