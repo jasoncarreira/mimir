@@ -8636,7 +8636,7 @@ def _run_factory_progress_case(
     parked = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot="snapshot")
     parked_by_controller = False
 
-    class CaseFinished(RuntimeError):
+    class CaseFinished(BaseException):
         pass
 
     class Compute:
@@ -8972,7 +8972,7 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
             )
             if status_calls <= 2 or terminal == "timeout":
                 return running
-            if terminal == "exception":
+            if terminal == "exception" and status_calls == 3:
                 raise WorklinkError("factory terminal exception")
             if status_calls == 3:
                 return replace(running, next="review")
@@ -9031,8 +9031,8 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
         assert incident["terminal_error"] == "factory terminal failed"
         assert status_calls == 4
     elif terminal == "exception":
-        assert "factory terminal exception" in incident["terminal_error"]
-        assert status_calls == 3
+        assert incident["terminal_error"] == "factory terminal failed"
+        assert status_calls == 4
     else:
         assert "factory exceeded run timeout" in incident["terminal_error"]
 
@@ -9239,8 +9239,8 @@ def test_factory_live_transcript_prevents_idle_park(
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
-@pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence"])
-def test_factory_supervision_cancels_and_cleans_on_every_failure(
+@pytest.mark.parametrize("failure", ["status", "parse", "binding", "heartbeat", "persistence", "snapshot", "persistent"])
+def test_factory_supervision_keeps_polling_after_controller_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
@@ -9253,6 +9253,9 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
     lifecycle: list[str] = []
+    events: list[tuple[str, dict[str, Any]]] = []
+    incidents: list[dict[str, Any]] = []
+    status_calls = 0
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -9263,6 +9266,7 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
             return not stopped.is_set()
 
         async def cancel(self, selected: LaunchHandle) -> None:
+            assert status_calls >= (32 if failure == "persistent" else 3)
             lifecycle.append("cancel")
             stopped.set()
 
@@ -9273,32 +9277,53 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
         poll_interval_s = 0.01
 
         def status(self, *args: object, **kwargs: object) -> Any:
-            if failure == "status":
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 2 and failure == "status":
+                raise RuntimeError("control command failed")
+            if status_calls == 2 and failure == "parse":
                 raise ValueError("malformed status")
-            return _factory_lifecycle_status(sandbox, status="running")
+            if failure == "persistent" and 2 <= status_calls <= 31:
+                raise RuntimeError("control command failed")
+            if status_calls == 2 and failure == "binding":
+                return replace(_factory_lifecycle_status(sandbox, status="running"), valid=False)
+            return _factory_lifecycle_status(
+                sandbox, status="needs-human" if status_calls >= (32 if failure == "persistent" else 3) else "running",
+            )
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
-            if failure == "heartbeat":
+            if failure == "heartbeat" and status_calls == 2:
                 raise RuntimeError("heartbeat failed")
-            if failure == "timeout":
-                assert factory_clock.now == 0.0, "supervision continued after run deadline"
-                factory_clock.now = 20.0
 
     if failure == "persistence":
+        original_save = orchestrator.save_factory_record
+        def save(home: Path, record: FactoryRunRecord) -> Any:
+            if status_calls == 2:
+                raise OSError("persist failed")
+            return original_save(home, record)
         monkeypatch.setattr(
             orchestrator,
             "save_factory_record",
-            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("persist failed")),
+            save,
         )
-    if failure == "timeout":
-        monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
+    if failure == "snapshot":
+        snapshot_calls = 0
 
-    with pytest.raises(
-        (ValueError, RuntimeError, OSError, orchestrator.WorklinkError),
-        match="factory exceeded run timeout" if failure == "timeout" else None,
-    ):
-        asyncio.run(
-            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+        def snapshot(path: Path) -> bytes:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            if snapshot_calls == 1:
+                raise OSError("work snapshot failed")
+            return b"unchanged"
+
+        monkeypatch.setattr(orchestrator, "_factory_work_snapshot", snapshot)
+    monkeypatch.setattr(orchestrator, "_log_event", lambda name, **kw: events.append((name, kw)))
+    async def finish(self: WorklinkRunner, **kw: Any) -> WorklinkRunResult:
+        return WorklinkRunResult(700, 1, "needs-human")
+    monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+    owner = SimpleNamespace(record=lambda **kw: incidents.append(kw), release=lambda **kw: None)
+    result = asyncio.run(
+            WorklinkRunner(home=tmp_path, repo=tmp_path, _incident_owner=owner)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
                 claims=object(),
@@ -9310,7 +9335,19 @@ def test_factory_supervision_cancels_and_cleans_on_every_failure(
                 started_at=datetime.now(UTC),
             )
         )
-
+    assert result.status == "needs-human"
+    assert status_calls == (32 if failure == "persistent" else 3)
+    errors = [fields for name, fields in events if name == "worklink_factory_supervision_error"]
+    assert len(errors) == 1
+    assert errors[0]["error_class"] == (
+        "OSError" if failure in {"persistence", "snapshot"} else
+        "WorklinkError" if failure == "binding" else
+        "ValueError" if failure == "parse" else "RuntimeError"
+    )
+    assert len(incidents) == (1 if failure == "persistent" else 0)
+    if incidents:
+        assert incidents[0]["terminal"] is False
+        assert "control command failed" in incidents[0]["error"]
     assert lifecycle == ["cancel", "cleanup"]
 
 
@@ -9443,10 +9480,7 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "3")
-    expected = (
-        "factory recovery lock handoff changed unexpectedly"
-        if lock_owner else "did not acquire the run lock before startup deadline"
-    )
+    expected = "did not acquire the run lock before startup deadline"
     with pytest.raises(WorklinkError, match=expected):
         asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
             issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
@@ -9456,13 +9490,13 @@ def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
             runner=lambda args: cp(args), started_at=datetime.now(UTC),
             initial_status=released, recovery_session="session-1",
         ))
-    assert status_calls == (1 if lock_owner else 2)
+    assert status_calls >= 2
     assert lifecycle == ["cancel", "cleanup"]
     assert load_factory_record(tmp_path, "700").session == "session-1"
 
 
 @pytest.mark.parametrize("after_valid", [False, True])
-def test_factory_supervision_immediately_refuses_other_invalid_statuses(
+def test_factory_supervision_skips_other_invalid_statuses(
     tmp_path: Path,
     after_valid: bool,
 ) -> None:
@@ -9472,6 +9506,7 @@ def test_factory_supervision_immediately_refuses_other_invalid_statuses(
     sandbox.mkdir()
     handle = LaunchHandle("local_subprocess", "123", 456)
     stopped = asyncio.Event()
+    cancelled: list[int] = []
     invalid = replace(
         _factory_lifecycle_status(sandbox, status="running"),
         valid=False,
@@ -9481,6 +9516,7 @@ def test_factory_supervision_immediately_refuses_other_invalid_statuses(
         if after_valid
         else [invalid]
     )
+    statuses.append(_factory_lifecycle_status(sandbox, status="needs-human"))
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -9491,6 +9527,8 @@ def test_factory_supervision_immediately_refuses_other_invalid_statuses(
             return not stopped.is_set()
 
         async def cancel(self, selected: LaunchHandle) -> None:
+            assert statuses == []
+            cancelled.append(1)
             stopped.set()
 
         async def cleanup(self, selected: LaunchHandle) -> None:
@@ -9505,8 +9543,12 @@ def test_factory_supervision_immediately_refuses_other_invalid_statuses(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
 
-    with pytest.raises(orchestrator.WorklinkError, match="factory status is invalid"):
-        asyncio.run(
+    async def finish(self: WorklinkRunner, **kw: Any) -> WorklinkRunResult:
+        return WorklinkRunResult(700, 1, "needs-human")
+    # This assertion concerns poll interpretation, not final publication.
+    from unittest.mock import patch
+    with patch.object(WorklinkRunner, "_finish_factory_070", finish):
+        result = asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
@@ -9519,6 +9561,61 @@ def test_factory_supervision_immediately_refuses_other_invalid_statuses(
                 started_at=datetime.now(UTC),
             )
         )
+    assert result.status == "needs-human"
+    assert cancelled == [1]
+
+
+def test_factory_supervision_refuses_proven_fresh_foreign_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    cancelled: list[str] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            cancelled.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            cancelled.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 0.01
+        calls = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            self.calls += 1
+            return _factory_lifecycle_status(
+                sandbox, status="running" if self.calls == 1 else "needs-human",
+                session="foreign" if self.calls == 1 else "session-1",
+            )
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    async def finish(self: WorklinkRunner, **kw: Any) -> WorklinkRunResult:
+        return WorklinkRunResult(700, 1, "needs-human")
+
+    monkeypatch.setattr(WorklinkRunner, "_finish_factory_070", finish)
+    with pytest.raises(WorklinkError, match="factory lock owner changed"):
+        asyncio.run(asyncio.wait_for(WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=object(), backend=Backend(), compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q", runner=lambda args: cp(args), started_at=datetime.now(UTC),
+        ), timeout=2))
+    assert cancelled == ["cancel", "cleanup"]
 
 
 def _completion_record(sandbox: Path) -> FactoryRunRecord:
@@ -10309,7 +10406,10 @@ print(json.dumps([str(path) for path in pruned]))
         assert finalized.controller_phase == "parked"
         assert prune_in_child() == []
         assert sandbox.is_dir()
-        save_factory_record(tmp_path, replace(finalized, status=None, controller_phase="failed"))
+        save_factory_record(tmp_path, replace(
+            finalized, status=None, controller_phase="failed",
+            observed_at=(datetime.now(UTC) - timedelta(minutes=16)).isoformat(),
+        ))
         assert prune_in_child() == [str(original_checkout)]
         assert not original_checkout.exists()
         assert compute.spec.local_checkout == original_checkout
