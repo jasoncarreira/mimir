@@ -191,7 +191,7 @@ def readonly_filesystem_permissions() -> list[FilesystemPermission]:
     return [FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")]
 
 
-def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
+def build_mimir_subagents(*, home: Path | None = None, policy: Any = None) -> list[dict]:
     """Build explicit Mimir subagent specs for ``create_deep_agent``.
 
     Both child agents explicitly carry the authorization/budget gate because
@@ -209,7 +209,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             "middleware": [
                 TodoListMiddleware(),
                 IterationGateMiddleware(),
-                ServiceToolSurfaceMiddleware(),
+                ServiceToolSurfaceMiddleware(policy),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
             ],
@@ -231,7 +231,7 @@ def build_mimir_subagents(*, home: Path | None = None) -> list[dict]:
             "middleware": [
                 _NoTodoListMiddleware(),
                 IterationGateMiddleware(),
-                ServiceToolSurfaceMiddleware(),
+                ServiceToolSurfaceMiddleware(policy),
                 BudgetGateMiddleware(),
                 *ingestion_middleware,
                 StructuredOutputRetryMiddleware(),

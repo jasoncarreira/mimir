@@ -1908,7 +1908,7 @@ class Agent:
                 self._agent_middleware = (
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
-                     ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
+                    ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
                     BudgetGateMiddleware(),
                     FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(skill_sources),
@@ -1932,7 +1932,9 @@ class Agent:
                 backend=self._backend,
                 skills=skill_sources or None,
                 middleware=self._agent_middleware,
-                subagents=build_mimir_subagents(home=self._config.home),
+                subagents=build_mimir_subagents(
+                    home=self._config.home, policy=self._config.plugin_manager.policy,
+                ),
                 context_schema=AuthContext,
             )
             self._cached_system_prompt = system_prompt

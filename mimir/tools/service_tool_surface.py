@@ -80,6 +80,14 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
                  or service.can_write_sink(descriptor.sink_destination))
         )
 
+    def _available(self, name: str, service: Any, context: Any, catalog: Any) -> bool:
+        if self._policy is not None:
+            declared = self._policy.tools.get(name)
+            if declared is not None and declared.owner != "core":
+                return self._plugin_available(name, service)
+        return (catalog.get_decision(name, context) == OperationDecision.OPEN
+                or service_can_invoke_operation(service, name))
+
     def _filter_request(self, request: ModelRequest) -> ModelRequest:
         context = getattr(request.runtime, "context", None)
         if not _is_service(context):
@@ -96,16 +104,10 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
                     _tool_name(tool) == "read_file"
                     or (
                         service.has_capability(_tool_name(tool))
-                        and (
-                            catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
-                     or service_can_invoke_operation(service, _tool_name(tool))
-                     or self._plugin_available(_tool_name(tool), service)
-                        )
+                        and self._available(_tool_name(tool), service, context, catalog)
                     )
                 ) if service.authority_profile == "session-boundary" else (
-                    catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
-                    or service_can_invoke_operation(service, _tool_name(tool))
-                    or self._plugin_available(_tool_name(tool), service)
+                    self._available(_tool_name(tool), service, context, catalog)
                 )
             )
         ]
