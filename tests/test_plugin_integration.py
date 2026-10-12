@@ -3,10 +3,15 @@ from __future__ import annotations
 from dataclasses import replace
 
 import pytest
+from langchain.agents.middleware import ToolCallRequest
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import StructuredTool
+from langgraph.runtime import Runtime
 
 from mimir.access_control import ToolRegistry
 from mimir.models import (
-    AuthContext, InformationFlowLabels, RepoPRAction, RepoPRActionScope, RepoPRScopeRegistry,
+    AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
+    RepoPRActionScope, RepoPRScopeRegistry,
     RepoReviewState, RetainedFactoryScope,
 )
 from mimir.plugins.core import register_core_tools
@@ -23,6 +28,15 @@ def _repo_target(_name, arguments, _context):
     return (arguments.get("repository"),)
 
 
+def _plugin_tool(
+    channel_id: str | None = None,
+    repository: str | None = None,
+    pull_request: int | None = None,
+) -> str:
+    """Return a harmless result; middleware tests supply an observable handler."""
+    return "result"
+
+
 @pytest.fixture
 def policy():
     registry = PolicyRegistry()
@@ -35,7 +49,11 @@ def policy():
         ("example_write", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.WRITE, True),
     ):
         registrar.register_tool(
-            name=name, factory=lambda: None, flow=flow, tier="scope-contained",
+            name=name,
+            factory=lambda name=name: StructuredTool.from_function(
+                _plugin_tool, name=name, description="Example registered plugin tool",
+            ),
+            flow=flow, tier="scope-contained",
             operation_class="resource_scoped", resource_scope=scope,
             typed_action=action, result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
             sink_category=category if flow == "sink" else None,
@@ -51,7 +69,7 @@ def _auth(**updates):
         principal=None, canonical_principal=None, roles=("user",),
         event_ingress=None, trigger="user_message", channel_id="scheduler:own",
         interactivity=None, enforcement_enabled=True,
-        ifc_labels=InformationFlowLabels(),
+        ifc_labels=InformationFlowLabels(), ifc_state=InformationFlowState(),
     )
     return replace(auth, **updates)
 
@@ -181,3 +199,131 @@ def test_plugin_write_veto_applies_in_shadow_and_enforced(policy, enforce, monke
     )
     assert not decision.allowed
     assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["parent", "general-purpose"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_selected_plugin_resource_calls_cross_model_middleware_boundary(
+    policy, tmp_path, monkeypatch, surface, asynchronous, enforce,
+    middleware_event_logger,
+):
+    import deepagents
+
+    from mimir.agent import Agent
+    from mimir.config import Config
+    from mimir.history import MessageBuffer
+    from mimir.index import IndexGenerator
+    from mimir.plugins.manager import PluginManager
+    from mimir.turn_logger import TurnLogger
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    config = replace(Config.from_env(), plugin_manager=PluginManager(policy, ()))
+    agent = Agent(
+        config=config, turn_logger=TurnLogger(config.turns_log),
+        message_buffer=MessageBuffer(history_path=tmp_path / "messages.jsonl"),
+        index_generator=IndexGenerator(tmp_path),
+    )
+    monkeypatch.setattr(agent, "_current_system_prompt", lambda **_kwargs: "test prompt")
+    monkeypatch.setattr("mimir.agent.resolve_model_from_config", lambda *args, **kwargs: object())
+    captured = []
+    graph = object()
+    monkeypatch.setattr(deepagents, "create_deep_agent", lambda **kwargs: captured.append(kwargs) or graph)
+    assert await agent._build_agent_if_needed() is graph
+    assembly = captured[0]
+    middleware = (
+        assembly["middleware"] if surface == "parent"
+        else next(child for child in assembly["subagents"]
+                  if child["name"] == "general-purpose")["middleware"]
+    )
+    gate = next(item for item in middleware if isinstance(item, BudgetGateMiddleware))
+    assert gate._policy is policy
+    decisions = []
+    shadow_decisions = []
+    original_authorize = ToolRegistry.authorize_tool
+    original_shadow = ToolRegistry._emit_shadow_decision
+
+    def observe_authorization(self, *args, **kwargs):
+        decision = original_authorize(self, *args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    def observe_shadow(self, decision, **kwargs):
+        shadow_decisions.append(decision)
+        return original_shadow(self, decision, **kwargs)
+
+    monkeypatch.setattr(ToolRegistry, "authorize_tool", observe_authorization)
+    monkeypatch.setattr(ToolRegistry, "_emit_shadow_decision", observe_shadow)
+
+    inspect = _auth(
+        enforcement_enabled=enforce,
+        repo_pr_scope_registry=RepoPRScopeRegistry((
+            _state({RepoPRAction.INSPECT.value}),
+        )),
+    )
+    comment = _auth(
+        enforcement_enabled=enforce,
+        repo_pr_scope_registry=RepoPRScopeRegistry((
+            _state({RepoPRAction.PR_COMMENT.value}),
+        )),
+    )
+    retained = RetainedFactoryScope(
+        issue_id=7, signature="sig", occurrence_id="occ", run_id="run", attempt=1,
+        session="session", repository="acme/widget", branch="fix", sandbox=str(tmp_path),
+    )
+    cases = (
+        ("example_channel", {"channel_id": "scheduler:own"}, inspect, None),
+        ("example_channel", {}, inspect, "channel_target_required"),
+        ("example_channel", {"channel_id": "scheduler:other"}, inspect, "cross_channel_scope"),
+        ("example_repo", {"repository": "acme/widget", "pull_request": 7}, inspect, None),
+        ("example_pr", {"repository": "acme/widget", "pull_request": 7}, comment, None),
+        ("example_repo", {"repository": "acme/other", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
+        ("example_repo", {"repository": "acme/widget", "pull_request": 8}, inspect, "repo_pr_scope_denied"),
+        ("example_pr", {"repository": "acme/widget", "pull_request": 7}, inspect, "repo_pr_scope_denied"),
+        ("example_repo", {"repository": "acme/widget", "pull_request": 7},
+         _auth(enforcement_enabled=enforce, retained_factory_scope=retained), "repo_pr_scope_denied"),
+    )
+    for index, (name, args, context, refusal_reason) in enumerate(cases):
+        called = []
+        request = ToolCallRequest(
+            tool_call={"name": name, "args": args, "id": f"plugin-{index}", "type": "tool_call"},
+            tool=policy.tools[name].factory(), state=None, runtime=Runtime(context=context),
+        )
+
+        def handler(tool_request):
+            called.append(tool_request.tool_call["id"])
+            return ToolMessage(content="executed", tool_call_id=tool_request.tool_call["id"])
+
+        async def async_handler(tool_request):
+            return handler(tool_request)
+
+        result = (
+            await gate.awrap_tool_call(request, async_handler)
+            if asynchronous else gate.wrap_tool_call(request, handler)
+        )
+        decision = decisions[-1]
+        expected_reason = (
+            "same_scope_channel" if name == "example_channel" and refusal_reason is None
+            else "ifc_label_blocked:same_channel" if index in {1, 2} and enforce
+            else refusal_reason
+        )
+        assert decision.reason == expected_reason
+        if refusal_reason is None or not enforce:
+            assert result.status != "error"
+            assert called == [f"plugin-{index}"]
+        else:
+            assert result.status == "error"
+            assert called == []
+            assert expected_reason in str(result.content)
+        if refusal_reason is not None:
+            assert decision.would_block
+            assert decision.is_shadow_decision is not enforce
+            if not enforce:
+                assert shadow_decisions[-1].would_block
+                assert shadow_decisions[-1].tool_name == name
+                assert shadow_decisions[-1].reason == (
+                    "ifc_label_blocked:same_channel" if index in {1, 2}
+                    else refusal_reason
+                )
