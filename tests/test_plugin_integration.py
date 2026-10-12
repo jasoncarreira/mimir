@@ -13,12 +13,13 @@ from langgraph.runtime import Runtime
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
     builtin_trigger_service_principal, classify_protected_result, get_service_principal,
-    get_trusted_service_from_auth_context, service_can_invoke_operation,
+    get_trusted_service_from_auth_context, normalize_sink_destination,
+    service_can_invoke_operation,
 )
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
     RepoPRActionScope, RepoPRScopeRegistry,
-    RepoReviewState, RetainedFactoryScope,
+    RepoReviewState, RetainedFactoryScope, SourceLabel,
 )
 from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
@@ -469,6 +470,78 @@ def test_plugin_sink_target_cannot_be_missing_or_spoofed(policy, enforce):
             arguments=args, policy=policy,
         )
         assert decision.would_block and decision.allowed is not enforce
+
+
+@pytest.mark.parametrize("operation_class", ["open", "admin_required"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_non_channel_plugin_sink_checks_target_and_ifc(operation_class, enforce, monkeypatch):
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+
+    def destinations(_name, arguments, _context):
+        return tuple(arguments.get("destinations", (arguments.get("endpoint"),)))
+
+    def payload(_name, arguments, _context):
+        return (arguments["body"],) if isinstance(arguments.get("body"), str) else ()
+
+    registry.registrar("example").register_tool(
+        name="example_webhook", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_webhook", description="Example outbound tool",
+        ),
+        flow="sink", tier="scope-contained", operation_class=operation_class,
+        result_domain="repository", result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.NETWORK, sink_destination="network",
+        sink_target_extractor=destinations, sink_payload_extractor=payload,
+        writes_code_or_state=False, profiles=(), read_backend=False,
+    )
+    selected = registry.freeze()
+    assert selected.descriptors["example_webhook"].sink_payload_extractor(
+        "example_webhook", {"body": "payload"}, None,
+    ) == ("payload",)
+
+    auth = _auth(roles=("admin",))
+    tools = ToolRegistry()
+    shadows = []
+    monkeypatch.setattr(tools, "_emit_shadow_decision", lambda decision, **_kwargs: shadows.append(decision))
+    endpoint = "https://example.test/hook"
+
+    def decide(arguments, *, context=auth, target=None):
+        return tools.authorize_tool(
+            "example_webhook", context, enforce=enforce, arguments=arguments,
+            target_channel=target, policy=selected,
+        )
+
+    exact = decide({"endpoint": endpoint, "body": "payload"})
+    assert exact.allowed and not exact.would_block
+    assert exact.resolved_sink_target == normalize_sink_destination(SinkCategory.NETWORK, endpoint)
+
+    for arguments, target in (
+        ({"body": "payload"}, None),
+        ({"endpoint": endpoint, "body": "payload"}, "https://other.test/hook"),
+        ({"destinations": (endpoint, "https://other.test/hook"), "body": "payload"}, None),
+    ):
+        denial = decide(arguments, target=target)
+        assert denial.reason == "sink_target_required"
+        assert denial.would_block and denial.allowed is not enforce
+        assert denial.is_shadow_decision is not enforce
+        if not enforce:
+            assert shadows[-1] is denial
+
+    source = SourceLabel(
+        principal="outsider", domain="web", resource_id="https://outside.test/data",
+        bridge_instance="web", sensitivity="internal",
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    tainted = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    refused = decide({"endpoint": endpoint, "body": "payload"}, context=tainted)
+    if enforce:
+        assert refused.reason == "ifc_label_blocked:network"
+        assert refused.would_block and not refused.allowed
+    else:
+        assert refused.allowed
+        assert shadows[-1].reason == "ifc_label_blocked:network"
+        assert shadows[-1].would_block and shadows[-1].is_shadow_decision
 
 
 @pytest.mark.asyncio
