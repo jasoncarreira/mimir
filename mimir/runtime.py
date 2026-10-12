@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 import time
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
@@ -243,11 +244,6 @@ async def create_agent_runtime(
         _clear_runtime_globals()
 
         from .tools import all_mimir_tools
-        from .tools.forge import (
-            github_identity_recovery_pending,
-            initialize_github_forge_identity,
-            set_github_identity_degraded_callback,
-        )
 
         degradation_recorded = False
         degradation_alert_scheduled = False
@@ -340,13 +336,18 @@ async def create_agent_runtime(
             else:
                 runtime_loop.call_soon_threadsafe(schedule_alert)
 
-        set_github_identity_degraded_callback(
-            github_identity_degraded,
-            notify_current=True,
-        )
-
         coding_enabled = getattr(config, "coding_enabled", False)
         if coding_enabled:
+            from .tools.forge import (
+                github_identity_recovery_pending,
+                initialize_github_forge_identity,
+                set_github_identity_degraded_callback,
+            )
+
+            set_github_identity_degraded_callback(
+                github_identity_degraded,
+                notify_current=True,
+            )
             initialize_github_forge_identity()
         all_mimir_tools(coding_enabled=coding_enabled)
 
@@ -640,7 +641,7 @@ async def create_agent_runtime(
         nonlocal degradation_recorded, degradation_alert_scheduled
         nonlocal transient_failures, next_identity_retry_at
         if (
-            getattr(config, "coding_enabled", False)
+            coding_enabled
             and github_identity_recovery_pending()
             and time.monotonic() >= next_identity_retry_at
         ):
@@ -724,14 +725,8 @@ def _clear_runtime_globals() -> None:
     from . import tools
     from .history import set_global_buffer
     from .tools import web as web_tools
-    from .tools.forge import (
-        set_forge_client,
-        set_github_identity_degraded_callback,
-    )
 
     resetters: tuple[Callable[[], None], ...] = (
-        lambda: set_github_identity_degraded_callback(None),
-        lambda: set_forge_client(None),
         lambda: tools.set_memory_client(None),
         lambda: tools.set_indexer(None),
         lambda: tools.set_index_generator(None),
@@ -749,6 +744,18 @@ def _clear_runtime_globals() -> None:
         lambda: web_tools.set_home(None),
         lambda: tools.set_mcp_tools([]),
     )
+    forge = sys.modules.get("mimir.tools.forge")
+    if forge is not None:
+        from .tools.forge import (
+            set_forge_client,
+            set_github_identity_degraded_callback,
+        )
+
+        resetters = (
+            lambda: set_github_identity_degraded_callback(None),
+            lambda: set_forge_client(None),
+            *resetters,
+        )
     errors = _run_sync_cleanup(resetters)
     if errors:
         raise ExceptionGroup("agent runtime global reset failed", errors)
