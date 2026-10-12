@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values, load_dotenv
@@ -27,6 +28,9 @@ from .access_control import resolve_access_control_enforcement
 from .billing import BillingMode, detect_billing_mode
 from .coding import coding_enabled
 from .env import _ENV_BOOL_FALSY, _ENV_BOOL_TRUTHY, env_bool
+
+if TYPE_CHECKING:
+    from .plugins.manager import PluginManager
 
 # Single source of the shipped default. ``mimir setup`` writes this same
 # spec via ``detect_route(None)``, so a setup-created home and a home that
@@ -76,16 +80,21 @@ def _load_home_dotenv(home: Path) -> list[str]:
         return []
 
     before = set(os.environ)
-    for key in sorted(dotenv_values(env_path, interpolate=False).keys() & _SCOPE_ENV_KEYS):
-        log.warning("ignoring operator-only scope key %s in %s", key, env_path)
+    process_plugins = os.environ.get("MIMIR_PLUGINS")
     # Preserve load_dotenv's empty-value and process-first interpolation
-    # semantics. Remove only scope keys introduced by the home defaults;
-    # operator scope values already present in the process remain untouched.
+    # semantics. Restore process-only selections even if loading fails.
     try:
+        operator_only = _SCOPE_ENV_KEYS | {"MIMIR_PLUGINS"}
+        for key in sorted(dotenv_values(env_path, interpolate=False).keys() & operator_only):
+            log.warning("ignoring operator-only scope key %s in %s", key, env_path)
         load_dotenv(env_path, override=False)
     finally:
         for key in _SCOPE_ENV_KEYS - before:
             os.environ.pop(key, None)
+        if process_plugins is None:
+            os.environ.pop("MIMIR_PLUGINS", None)
+        else:
+            os.environ["MIMIR_PLUGINS"] = process_plugins
     loaded = sorted(
         key for key in set(os.environ) - before
         if os.environ.get(key, "") != ""
@@ -838,6 +847,13 @@ def _parse_chat_skill_allowlist(raw: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _core_plugin_manager() -> PluginManager:
+    from .plugins.core import core_policy_registry
+    from .plugins.manager import PluginManager
+
+    return PluginManager(core_policy_registry(), ())
+
+
 @dataclass
 class Config:
     home: Path
@@ -1324,9 +1340,15 @@ class Config:
     acp_journal_ttl_days: int = 7
     # Per-process cap for concurrent web-chat SSE subscribers.
     chat_stream_max_subscribers: int = 8
+    plugin_manager: PluginManager = field(default_factory=_core_plugin_manager, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.plugin_manager.policy.frozen:
+            raise ValueError("Config requires a frozen plugin policy")
 
     @classmethod
     def from_env(cls) -> "Config":
+        process_plugins = os.environ.get("MIMIR_PLUGINS", "")
         raw_home = _env("MIMIR_HOME")
         if not raw_home:
             # `mimir run` gates on this and refuses to start; this fallback
@@ -1340,6 +1362,9 @@ class Config:
             )
         home = Path(raw_home or Path.cwd()).resolve()
         _load_home_dotenv(home)
+        from .plugins.manager import load_plugins
+
+        plugin_manager = load_plugins(enable=process_plugins)
         if "MIMIR_UNAUTHORIZED_USER_BEHAVIOR" in os.environ and not getattr(cls, "_retired_intake_warned", False):
             log.warning("MIMIR_UNAUTHORIZED_USER_BEHAVIOR is retired; use intake.unknown_senders in identities.yaml")
             cls._retired_intake_warned = True
@@ -1377,6 +1402,7 @@ class Config:
             )
 
         return cls(
+            plugin_manager=plugin_manager,
             home=home,
             agent_id=_env("MIMIR_AGENT_ID", "mimir"),
             model=_env("MIMIR_MODEL", "claude-opus-4-7"),
