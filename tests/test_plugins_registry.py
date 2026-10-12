@@ -134,12 +134,39 @@ def test_profile_sink_requires_bounded_adapter():
         registry.freeze()
 
     registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="invalid service sink adapter"):
+        registry.registrar("example").register_tool(**tool_fields(
+            sink_category=SinkCategory.FILE, sink_destination="filesystem",
+            service_sink_adapter="unregistered_adapter",
+        ))
+        registry.freeze()
+
+    registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match="invalid service sink destination"):
         registry.registrar("example").register_tool(**tool_fields(
             sink_category=SinkCategory.FILE, sink_destination="network",
             service_sink_adapter="trigger_service_write_roots",
         ))
         registry.freeze()
+
+
+@pytest.mark.parametrize("category,destination", [
+    (SinkCategory.EXTERNAL_MCP, "external_mcp"),
+    (SinkCategory.PROPOSAL, "proposal"),
+])
+def test_profile_granted_sink_without_executable_adapter_cannot_freeze(category, destination):
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_tool(**tool_fields(
+        flow="sink", result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=category, sink_destination=destination,
+        profiles=("worker",),
+    ))
+    plugin.register_capability("sample")
+    plugin.register_authority_profile("worker", capabilities=("sample",))
+    with pytest.raises(PolicyRegistrationError, match="profile sink has no executable service sink adapter"):
+        registry.freeze()
+    assert not registry.frozen
 
 
 def test_factory_or_explicit_policy_only_required():

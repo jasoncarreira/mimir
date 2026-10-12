@@ -414,6 +414,10 @@ class PolicyRegistry:
         for name, tool in self._tools.items():
             if tool.owner != "core":
                 category = tool.descriptor.sink_category if tool.descriptor else None
+                if tool.profiles and category in {SinkCategory.EXTERNAL_MCP, SinkCategory.PROPOSAL}:
+                    raise PolicyRegistrationError(
+                        f"{tool.owner}: tool {name}: profile sink has no executable service sink adapter"
+                    )
                 expected = service_adapters.get(category)
                 if tool.service_sink_adapter is not None and tool.service_sink_adapter != expected:
                     raise PolicyRegistrationError(f"{tool.owner}: tool {name}: invalid service sink adapter {tool.service_sink_adapter!r}")

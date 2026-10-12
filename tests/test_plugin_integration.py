@@ -331,6 +331,54 @@ async def test_scheduler_sink_grant_reaches_tool_registry_and_middleware(
     )
     assert denied.would_block and not denied.allowed
 
+    other_service = build_trigger_service_principal(
+        canonical="poller:other", trigger="poller", profile="github",
+        tier=CapabilityTier.SCOPE_CONTAINED, capabilities=("read_file",),
+        roots=(tmp_path / "state" / "pollers" / "other",),
+        creation_path="example.poller:manifest", policy=principal_policy,
+    )
+    assert "read_file" in other_service.capabilities
+    assert "example_deliver" not in other_service.capabilities
+    assert other_service.sink_policy_for("example_deliver") is None
+    other_event = AgentEvent(
+        trigger=other_service.trigger, channel_id="scheduler:session",
+        service_principal=other_service.canonical, service_authority=other_service,
+        content="synthesize",
+    )
+    other_auth = _create_turn_auth_context(
+        other_event, None, policy_version=None, enforce=enforce,
+        ifc_labels=_initialize_ifc_labels(other_event, policy=principal_policy),
+        policy=principal_policy,
+    )
+    assert other_auth.service_authority is other_service
+    assert not service_can_invoke_operation(other_service, "example_deliver", policy=principal_policy)
+    denied = ToolRegistry().authorize_tool(
+        "example_deliver", other_auth, enforce=True, target_channel=target,
+        arguments=args, policy=principal_policy,
+    )
+    assert denied.would_block and not denied.allowed
+    assert denied.reason == "admin_required"
+    other_request = ToolCallRequest(
+        tool_call={"name": "example_deliver", "args": args, "id": "other", "type": "tool_call"},
+        tool=principal_policy.tools["example_deliver"].factory(), state=None,
+        runtime=Runtime(context=other_auth),
+    )
+    shadows = []
+    monkeypatch.setattr(
+        ToolRegistry, "_emit_shadow_decision",
+        lambda _registry, decision, **_kwargs: shadows.append(decision),
+    )
+    called = []
+    refusal = BudgetGateMiddleware(principal_policy).wrap_tool_call(
+        other_request, lambda _: called.append(True) or ToolMessage(content="ok", tool_call_id="other"),
+    )
+    if enforce:
+        assert refusal.status == "error" and not called
+        assert "admin_required" in str(refusal.content)
+    else:
+        assert refusal.status != "error" and called == [True]
+        assert any(item.tool_name == "example_deliver" and item.would_block for item in shadows)
+
 
 @pytest.mark.asyncio
 async def test_runtime_session_dispatch_uses_selected_profile_grant(principal_policy, tmp_path, monkeypatch):
