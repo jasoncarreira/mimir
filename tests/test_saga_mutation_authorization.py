@@ -6,7 +6,7 @@ import importlib
 import json
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -28,6 +28,15 @@ from mimir.models import (
 from mimir.saga.client import SagaStore
 from mimir.saga.ownership import AuthorizationScope
 from mimir.saga.triples import retrieve_by_entity, store_triples
+
+
+def _install_test_service(monkeypatch: pytest.MonkeyPatch, service: ServicePrincipal) -> None:
+    import mimir.access_control as access_control
+
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        MappingProxyType({**_TRUSTED_SERVICE_PRINCIPALS, service.trigger: service}),
+    )
 
 
 def _auth(principal: str, *, admin: bool = False) -> AuthContext:
@@ -161,27 +170,24 @@ def test_saga_mutation_admin_allowed_and_regular_user_denied(operation: str) -> 
     assert can_write_saga(_auth("alice"), operation) is False
 
 
-def test_saga_mutation_service_requires_declared_sink() -> None:
+def test_saga_mutation_service_requires_declared_sink(monkeypatch: pytest.MonkeyPatch) -> None:
     trigger = "test_missing_saga_sink"
-    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+    _install_test_service(monkeypatch, ServicePrincipal(
         canonical="missing-saga-sink",
         trigger=trigger,
         capabilities=("memory_store",),
         readable_domains=("saga",),
         sink_destinations=(),
         creation_path="test",
+    ))
+    auth_context = _service_auth(trigger, "missing-saga-sink")
+    middleware = ToolRegistry().authorize_tool(
+        "memory_store", auth_context, enforce=True
     )
-    try:
-        auth_context = _service_auth(trigger, "missing-saga-sink")
-        middleware = ToolRegistry().authorize_tool(
-            "memory_store", auth_context, enforce=True
-        )
 
-        assert middleware.allowed is False
-        assert middleware.reason == "admin_required"
-        assert can_write_saga(auth_context, "memory_store") is False
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
+    assert middleware.allowed is False
+    assert middleware.reason == "admin_required"
+    assert can_write_saga(auth_context, "memory_store") is False
 
 
 def _session_row(client: SagaStore, session_id: str):
@@ -401,33 +407,26 @@ async def test_service_missing_capability_emits_one_distinguishable_refusal(
 ) -> None:
     atom_id = await _atom(client, "service target", owner="service:telemetry-test")
     trigger = "test_saga_refusal_telemetry"
-    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+    _install_test_service(monkeypatch, ServicePrincipal(
         canonical="telemetry-test",
         trigger=trigger,
         capabilities=("memory_store",),
         readable_domains=("saga",),
         sink_destinations=("saga",),
         creation_path="test",
-    )
+    ))
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "mimir.event_logger.log_event_sync",
         lambda event_type, **payload: events.append((event_type, payload)),
     )
     auth_context = _service_auth(trigger, "telemetry-test")
-    try:
-        refused = await client.feedback(
-            [atom_id], "reply", feedback="positive", auth_context=auth_context
-        )
-        nothing_requested = await client.feedback(
-            [], "reply", feedback="positive", auth_context=auth_context
-        )
-    finally:
-        if original is None:
-            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
-        else:
-            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+    refused = await client.feedback(
+        [atom_id], "reply", feedback="positive", auth_context=auth_context
+    )
+    nothing_requested = await client.feedback(
+        [], "reply", feedback="positive", auth_context=auth_context
+    )
 
     assert refused["status"] == "refused"
     assert "status" not in nothing_requested
@@ -815,32 +814,26 @@ async def test_forgeable_read_scopes_cannot_authorize_mutation(
 @pytest.mark.asyncio
 async def test_platform_service_full_read_does_not_widen_mutation_scope(
     client: SagaStore,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """A platform service still cannot mutate an atom outside its domains."""
     denied = await _atom(client, "tenant b", owner="owner-b", domain="tenant:b")
     trigger = "test_platform_saga_service"
-    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+    _install_test_service(monkeypatch, ServicePrincipal(
         canonical="test-platform-service",
         trigger=trigger,
         capabilities=("saga_feedback",),
         readable_domains=("tenant:a",),
         sink_destinations=("saga",),
         creation_path="test",
-    )
+    ))
     auth_context = _service_auth(trigger, "test-platform-service")
-    try:
-        result = await client.feedback(
-            [denied],
-            "reply",
-            feedback="positive",
-            auth_context=auth_context,
-        )
-    finally:
-        if original is None:
-            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
-        else:
-            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+    result = await client.feedback(
+        [denied],
+        "reply",
+        feedback="positive",
+        auth_context=auth_context,
+    )
 
     assert result["status"] == "refused"
     assert result["reason"] == "atom_outside_scope"
@@ -849,6 +842,7 @@ async def test_platform_service_full_read_does_not_widen_mutation_scope(
 @pytest.mark.asyncio
 async def test_trusted_service_readable_domain_does_not_authorize_mutation(
     client: SagaStore,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     allowed = await _atom(
         client,
@@ -858,34 +852,27 @@ async def test_trusted_service_readable_domain_does_not_authorize_mutation(
     )
     denied = await _atom(client, "tenant a", owner="owner-a", domain="tenant:a")
     trigger = "test_saga_service"
-    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+    _install_test_service(monkeypatch, ServicePrincipal(
         canonical="test-service",
         trigger=trigger,
         capabilities=("saga_feedback",),
         readable_domains=("tenant:a",),
         sink_destinations=("saga",),
         creation_path="test",
-    )
+    ))
     auth_context = _service_auth(trigger, "test-service")
-    try:
-        allowed_result = await client.feedback(
-            [allowed],
-            "reply",
-            feedback="positive",
-            auth_context=auth_context,
-        )
-        denied_result = await client.feedback(
-            [denied],
-            "reply",
-            feedback="positive",
-            auth_context=auth_context,
-        )
-    finally:
-        if original is None:
-            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
-        else:
-            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+    allowed_result = await client.feedback(
+        [allowed],
+        "reply",
+        feedback="positive",
+        auth_context=auth_context,
+    )
+    denied_result = await client.feedback(
+        [denied],
+        "reply",
+        feedback="positive",
+        auth_context=auth_context,
+    )
 
     assert allowed_result["marked"] == 1
     assert denied_result["status"] == "refused"
@@ -895,45 +882,39 @@ async def test_trusted_service_readable_domain_does_not_authorize_mutation(
 @pytest.mark.asyncio
 async def test_non_platform_service_can_read_and_forget_own_domainless_write(
     client: SagaStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trigger = "test_external_saga_service"
     canonical = "external-saga-service"
-    original = _TRUSTED_SERVICE_PRINCIPALS.get(trigger)
-    _TRUSTED_SERVICE_PRINCIPALS[trigger] = ServicePrincipal(
+    _install_test_service(monkeypatch, ServicePrincipal(
         canonical=canonical,
         trigger=trigger,
         capabilities=("saga_forget",),
         readable_domains=("tenant:a",),
         sink_destinations=("saga",),
         creation_path="test",
-    )
+    ))
     auth_context = _service_auth(trigger, canonical)
-    try:
-        provenance = get_provenance_from_auth_context(auth_context)
-        stored = await client.store(
-            "external service owned memory",
-            owner_principal=provenance["created_by"],
-            origin_domain=None,
-            visibility="service",
-            provenance=provenance,
-        )
-        atom_id = stored["atom_id"]
+    provenance = get_provenance_from_auth_context(auth_context)
+    stored = await client.store(
+        "external service owned memory",
+        owner_principal=provenance["created_by"],
+        origin_domain=None,
+        visibility="service",
+        provenance=provenance,
+    )
+    atom_id = stored["atom_id"]
 
-        read_result = await client.get_atoms([atom_id], auth_context=auth_context)
-        forget_preview = await client.forget(
-            dry_run=True,
-            auth_context=auth_context,
-        )
-        forget_result = await client.forget(
-            dry_run=False,
-            min_retrievals=1,
-            auth_context=auth_context,
-        )
-    finally:
-        if original is None:
-            _TRUSTED_SERVICE_PRINCIPALS.pop(trigger, None)
-        else:
-            _TRUSTED_SERVICE_PRINCIPALS[trigger] = original
+    read_result = await client.get_atoms([atom_id], auth_context=auth_context)
+    forget_preview = await client.forget(
+        dry_run=True,
+        auth_context=auth_context,
+    )
+    forget_result = await client.forget(
+        dry_run=False,
+        min_retrievals=1,
+        auth_context=auth_context,
+    )
 
     row = client._ensure_conn().execute(
         "SELECT owner_principal, origin_domain, tombstoned FROM atoms WHERE id = ?",

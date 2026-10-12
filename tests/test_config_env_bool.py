@@ -134,6 +134,9 @@ class TestConfigBoolFieldsUniform:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from types import MappingProxyType
+
+        import mimir.access_control as access_control
         from mimir.access_control import (
             CapabilityMatrixError,
             ServicePrincipal,
@@ -143,26 +146,26 @@ class TestConfigBoolFieldsUniform:
         _clear_env(monkeypatch)
         monkeypatch.setenv("MIMIR_MODEL_SPEC", "codex-plus:gpt-5.3-codex")
         monkeypatch.setenv("MIMIR_ACCESS_CONTROL_ENFORCED", "true")
-        original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
-        try:
-            scheduler = original_principals["scheduled_tick"]
-            _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
-                canonical=scheduler.canonical,
-                trigger=scheduler.trigger,
-                capabilities=scheduler.capabilities,
-                readable_domains=tuple(
-                    domain for domain in scheduler.readable_domains
-                    if domain != "filesystem"
+        scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+        monkeypatch.setattr(
+            access_control, "_TRUSTED_SERVICE_PRINCIPALS", MappingProxyType({
+                **_TRUSTED_SERVICE_PRINCIPALS,
+                "scheduled_tick": ServicePrincipal(
+                    canonical=scheduler.canonical,
+                    trigger=scheduler.trigger,
+                    capabilities=scheduler.capabilities,
+                    readable_domains=tuple(
+                        domain for domain in scheduler.readable_domains
+                        if domain != "filesystem"
+                    ),
+                    sink_destinations=scheduler.sink_destinations,
+                    creation_path=scheduler.creation_path,
                 ),
-                sink_destinations=scheduler.sink_destinations,
-                creation_path=scheduler.creation_path,
-            )
+            }),
+        )
 
-            with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
-                Config.from_env()
-        finally:
-            _TRUSTED_SERVICE_PRINCIPALS.clear()
-            _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+        with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+            Config.from_env()
 
     @pytest.mark.parametrize(
         "model_spec",
