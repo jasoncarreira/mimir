@@ -34,7 +34,7 @@ from .channel_registry import ChannelRegistry
 from .config import Config
 from .dispatcher import Dispatcher
 from .event_logger import init_logger, log_durable_event_sync, log_event, log_event_sync
-from .http_ingress import sanitize_http_extra
+from .http_ingress import sanitize_http_extra, stamp_http_event_ingress_extra
 from .models import AgentEvent, make_process_session_id
 from .access_control import builtin_trigger_service_principal, repo_binding_startup_alerts
 from .rate_limits import RateLimitStore
@@ -50,9 +50,6 @@ from .skill_defs import (
 from .chainlink_bootstrap import ensure_chainlink_initialized
 from .prompt_templates import seed_prompts
 from .subagent_defs import seed_subagent_defs
-from .worklink.continuation import (
-    stamp_http_event_ingress_extra,
-)
 from . import web_ui
 from .http_shutdown import HTTP_SHUTDOWN, HTTPShutdown
 

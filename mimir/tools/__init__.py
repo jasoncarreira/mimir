@@ -51,7 +51,6 @@ from .registry import (
     set_identity_resolver,
     set_scheduler,
     set_spawn_config,
-    spawn_open_code,
     worklink_run,
     worklink_resume,
 )
@@ -79,36 +78,33 @@ from .saga_ops import (
     saga_mark_contributions,
     saga_record_skill_learning,
 )
-from .forge import (
-    pr_checks,
-    pr_job_log,
-    ci_run_jobs,
-    ci_run,
-    ci_recent_runs,
-    pr_comment,
-    pr_comments,
-    pr_diff,
-    pr_file_content,
-    pr_edit_body,
-    pr_files,
-    pr_inline_review_comment,
-    pr_metadata,
-    pr_spec,
-    pr_list,
-    pr_rerequest_review,
-    pr_review_requests,
-    pr_reviews,
-    pr_submit_review,
-    register_forge_client,
-    set_forge_client,
-    unsupported_operation,
-)
-from .repo import (
-    repo_checkout, repo_cleanup, repo_fetch, repo_status, repo_test, repo_diff,
-    repo_unmerged, repo_stage, repo_commit, repo_merge, repo_merge_abort,
-    repo_rebase, repo_rebase_abort, repo_revert, repo_revert_abort, repo_push,
-)
 from .proposals import proposal_diff
+
+_CODING_EXPORTS = {
+    "spawn_open_code": "registry",
+    **{name: "forge" for name in (
+        "pr_checks", "pr_job_log", "ci_run_jobs", "ci_run", "ci_recent_runs",
+        "pr_comment", "pr_comments", "pr_diff", "pr_file_content", "pr_edit_body",
+        "pr_files", "pr_inline_review_comment", "pr_metadata", "pr_spec", "pr_list",
+        "pr_rerequest_review", "pr_review_requests", "pr_reviews", "pr_submit_review",
+        "register_forge_client", "set_forge_client", "unsupported_operation",
+    )},
+    **{name: "repo" for name in (
+        "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
+        "repo_diff", "repo_unmerged", "repo_stage", "repo_commit", "repo_merge",
+        "repo_merge_abort", "repo_rebase", "repo_rebase_abort", "repo_revert",
+        "repo_revert_abort", "repo_push",
+    )},
+}
+
+
+def __getattr__(name: str):
+    module = _CODING_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from importlib import import_module
+
+    return getattr(import_module(f".{module}", __name__), name)
 
 __all__ = [
     # Core tools (callable by the agent)

@@ -68,7 +68,7 @@ from ..tool_descriptors import (
     get_tool_descriptor,
 )
 from .refusals import ToolPolicyRefusal
-from ..worklink.continuation import HTTP_EVENT_INGRESS_EXTRA_VALUE
+from ..http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 from ..access_control import (
     AccessTier,
     OperationDecision,
