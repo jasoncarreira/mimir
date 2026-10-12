@@ -186,6 +186,37 @@ _FETCH = {
     "session-boundary": ("github_pr_api", "GITHUB_REPOS"),
 }
 
+_CHANNEL_OPERATIONS = _names("send_message react fetch_channel_history")
+_WRITE_OPERATIONS = _names("write_file edit_file replace_file")
+_WRITE_RESOURCE_OPERATIONS = _WRITE_OPERATIONS | _names("worklink_run worklink_resume")
+_READ_RESOURCE_OPERATIONS = _names(
+    "read_file aread ls als glob aglob grep agrep file_search get_turn mimir_get_turn"
+)
+_CATALOG_OPEN = _names("""commitment_list memory_query memory_get web_search fetch_url
+    write_todos defer_injected_message request_operator_approval commitment_complete
+    commitment_snooze commitment_dismiss""")
+_CATALOG_REPO_PR = _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content
+    pr_checks pr_job_log pr_reviews pr_comments pr_review_requests pr_submit_review
+    pr_inline_review_comment pr_comment pr_edit_body pr_rerequest_review
+    unsupported_operation repo_checkout repo_cleanup repo_fetch repo_status repo_test
+    repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort
+    repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push""")
+_CATALOG_RESOURCE = (_READ_RESOURCE_OPERATIONS | _WRITE_RESOURCE_OPERATIONS
+                     | _CATALOG_REPO_PR
+                     | _names("hands_read ci_run_jobs ci_run ci_recent_runs"))
+_CATALOG_ADMIN = _names("""pr_list issue_comment operator_alert
+    approve_declassification list_channels list_schedules add_schedule
+    set_schedule_priority remove_schedule reload_pollers open_proposal proposal_diff
+    submit_proposal abandon_proposal request_mimir_update shell_exec bash_async
+    bash_jobs_list bash_job_output spawn_open_code task memory_store memory_propose
+    saga_feedback saga_mark_contributions saga_end_session saga_record_skill_learning
+    saga_forget set_poller_overrides download_files adownload_files rebuild_index
+    hands_edit hands_shell hands_python hands_request_scope""")
+_PROTECTED_METADATA = _names("list_channels list_schedules bash_jobs_list bash_job_output")
+_CATALOG_ADMIN_BUILTIN = _names(
+    "Bash bash bash_exec execute aexecute shell Write Edit Read Glob Grep download_files"
+)
+
 
 def register_core_tools(registry: PolicyRegistry) -> None:
     """Register core descriptors; later policy families add their own metadata here."""
@@ -198,12 +229,27 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         raise ValueError("duplicate core tool flow classification")
 
     for name, descriptor in _CORE_DESCRIPTOR_DECLARATIONS.items():
+        operation_class = (
+            "open" if name in _CATALOG_OPEN else
+            "resource_scoped" if name in _CATALOG_RESOURCE else
+            "admin_required" if name in _CATALOG_ADMIN else None
+        )
+        memberships = set()
+        for member, names in (
+            ("channel_operations", _CHANNEL_OPERATIONS),
+            ("write_operations", _WRITE_OPERATIONS),
+            ("write_resource_operations", _WRITE_RESOURCE_OPERATIONS),
+            ("protected_metadata_operations", _PROTECTED_METADATA),
+            ("catalog_admin_builtin", _CATALOG_ADMIN_BUILTIN),
+        ):
+            if name in names:
+                memberships.add(member)
         registry.register_tool(
             name=name,
             policy_only=True,
             flow=flow_by_name.get(name),
             tier=next((tier for tier, names in _TIERS.items() if name in names), None),
-            operation_class=None,
+            operation_class=operation_class,
             result_domain=None,
             result_origin=descriptor.result_origin,
             sink_category=descriptor.sink_category,
@@ -217,18 +263,30 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             writes_code_or_state=False,
             profiles=tuple(profile for profile, names in _PROFILES.items() if name in names),
             read_backend=False,
+            memberships=memberships,
         )
 
     # Framework aliases and native operations without descriptors still require
     # an explicit IFC decision; they are not candidates for runtime factories.
     for name in sorted(flow_by_name.keys() - _CORE_DESCRIPTOR_DECLARATIONS.keys()):
+        operation_class = (
+            "open" if name in _CATALOG_OPEN else
+            "resource_scoped" if name in _CATALOG_RESOURCE else
+            "admin_required" if name in _CATALOG_ADMIN else None
+        )
+        memberships = set()
+        if name in _CATALOG_ADMIN_BUILTIN:
+            memberships.add("catalog_admin_builtin")
+        if name in _PROTECTED_METADATA:
+            memberships.add("protected_metadata_operations")
         registry.register_tool(
             name=name, policy_only=True, descriptor_registered=False,
-            flow=flow_by_name[name], tier=None, operation_class=None,
+            flow=flow_by_name[name], tier=None, operation_class=operation_class,
             result_domain=None, result_origin=ResultOriginKind.NONE,
             sink_category=None, sink_destination=None,
             sink_target_extractor=None, sink_payload_extractor=None,
             writes_code_or_state=False, profiles=(), read_backend=False,
+            memberships=memberships,
         )
 
     for tier, names in _TIERS.items():
