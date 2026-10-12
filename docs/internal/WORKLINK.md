@@ -193,8 +193,9 @@ executor together by rebuilding the executor image before enabling this layout.
   terminal. A relaunch never archives, replaces, or removes a retained run.
 - **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
   independently of the optional TTL reaper. A `parked` / `needs-human` record
-  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` and, when
-  `NTFY_TOPIC` is set, a priority-4 ntfy push. The notice names the Chainlink
+  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` only. It never
+  sends an ntfy push: parks also reach the agent as stop notices, and a phone
+  push is reserved for decisions the agent escalates. The notice names the Chainlink
   issue, run and attempt, and points to its `WORKLINK_BLOCKED` comment or
   `mimir worklink status <id>` for the decision; it never quotes the factory
   reason. `<home>/state/worklink/factory-park-alerts.json` remembers delivered
