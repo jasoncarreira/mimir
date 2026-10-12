@@ -38,6 +38,7 @@ def _plugin_tool(
     channel_id: str | None = None,
     repository: str | None = None,
     pull_request: int | None = None,
+    payload: str | None = None,
 ) -> str:
     """Return a harmless result; middleware tests supply an observable handler."""
     return "result"
@@ -64,7 +65,11 @@ def policy():
             typed_action=action, result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
             sink_category=category if flow == "sink" else None,
             sink_destination="message" if flow == "sink" else None,
-            sink_target_extractor=extractor, sink_payload_extractor=None,
+            sink_target_extractor=extractor,
+            sink_payload_extractor=(
+                lambda _name, args, _context: (args["payload"],)
+                if isinstance(args.get("payload"), str) else ()
+            ) if name == "example_channel" else None,
             writes_code_or_state=writes, profiles=(), read_backend=False,
         )
     return registry.freeze()
@@ -464,6 +469,59 @@ def test_plugin_sink_target_cannot_be_missing_or_spoofed(policy, enforce):
             arguments=args, policy=policy,
         )
         assert decision.would_block and decision.allowed is not enforce
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("privacy_enforced", [False, True])
+async def test_plugin_payload_privacy_scans_selected_descriptor(
+    policy, tmp_path, monkeypatch, asynchronous, privacy_enforced,
+):
+    from mimir.tools import budget_gate
+
+    private_term = "42 Maplewood Drive"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(private_term + "\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1" if privacy_enforced else "0")
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    auth = _auth()
+    request = ToolCallRequest(
+        tool_call={"name": "example_channel", "args": {
+            "channel_id": "scheduler:own", "payload": private_term,
+        }, "id": "plugin-privacy", "type": "tool_call"},
+        tool=policy.tools["example_channel"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    executed = []
+
+    def handler(_request):
+        executed.append(True)
+        return ToolMessage(content="executed", tool_call_id="plugin-privacy")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(policy)
+    assert get_tool_descriptor("example_channel", policy=policy).sink_payload_extractor(
+        "example_channel", request.tool_call["args"], auth,
+    ) == (private_term,)
+    result = (
+        await gate.awrap_tool_call(request, async_handler) if asynchronous
+        else gate.wrap_tool_call(request, handler)
+    )
+    assert result.status == ("error" if privacy_enforced else "success"), events
+    assert executed == ([] if privacy_enforced else [True])
+    event_name = "hard_boundary_denied" if privacy_enforced else "shadow_tool_decision"
+    assert any(
+        event == event_name and fields.get("reason") == "outbound_private_term"
+        for event, fields in events
+    ), events
+    assert private_term not in str(result.content)
+    assert private_term not in str(events)
 
 
 def test_plugin_channel_rejects_ambiguous_extractor_targets(policy):

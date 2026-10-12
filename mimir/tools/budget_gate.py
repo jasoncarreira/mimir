@@ -850,10 +850,16 @@ def _outbound_privacy_refusal(
     include_jev: bool = True,
     jev_candidates: list[str] | None = None,
     findings_override: Sequence[Any] | None = None,
+    policy: Any = None,
 ) -> str | None:
     """Scan an external write and emit value-free shadow or denial evidence."""
     descriptor_name, _ = _outbound_privacy_tool_name(tool_name)
-    descriptor = get_tool_descriptor(descriptor_name)
+    registered = policy.tools.get(descriptor_name) if policy is not None else None
+    descriptor = (
+        get_tool_descriptor(descriptor_name, policy=policy)
+        if registered is not None and registered.owner != "core"
+        else get_tool_descriptor(descriptor_name)
+    )
     extractor = descriptor.sink_payload_extractor if descriptor is not None else None
     texts: tuple[str, ...] = ()
     if callable(extractor):
@@ -3571,6 +3577,7 @@ def _prepare_tool_call_execution(
             auth_context,
             include_jev=include_jev,
             jev_candidates=jev_candidates,
+            policy=policy,
         )
     except Exception as exc:
         exception_type = type(exc).__name__
@@ -4077,6 +4084,7 @@ class BudgetGateMiddleware(AgentMiddleware):
                         call.auth_context,
                         include_jev=False,
                         findings_override=findings,
+                        policy=self._policy,
                     )
                     if findings
                     else None
