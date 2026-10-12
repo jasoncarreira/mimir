@@ -625,15 +625,21 @@ def record_leaf_transition(
     transcript_path: str | None = None,
     checkout: str | None = None,
     branch: str | None = None,
+    occurrence_id: str = "",
 ) -> dict[str, Any]:
-    """Record a decision-needed ending in the milestone delivery ledger."""
+    """Record an ending; producers supply durable identity for repeatable endings."""
     if kind not in LEAF_TRANSITION_KINDS:
         raise ValueError(f"invalid leaf transition kind: {kind}")
-    digest = hashlib.sha256(reason.encode("utf-8")).hexdigest()
+    # Keep legacy identities for kinds whose attempt/reason already identify
+    # an occurrence. Reset generations and template demotions need an anchor
+    # independent of their (potentially identical) reason and attempt count.
+    identity = json.dumps([occurrence_id, reason], ensure_ascii=False) if occurrence_id else reason
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     delivery_key = f"worklink-{kind}:{issue_id}:{attempt}:{digest}"
     payload = {
         "kind": kind, "issue_id": issue_id, "issue_title": issue_title,
         "run_id": str(issue_id), "attempt": attempt, "pr_url": None,
+        "occurrence_id": occurrence_id,
         "reason": reason[:2000] + (" [reason truncated; inspect issue/evidence]" if len(reason) > 2000 else ""),
         "evidence_path": evidence_path or "", "transcript_path": transcript_path or "",
         "checkout": checkout or "", "branch": branch or "",

@@ -840,10 +840,14 @@ def _demote_template_invalid_ready_leaf(
         return
 
     issue_id = str(issue.issue_id)
+    # Persist the occurrence anchor in the authoritative demotion comment. A
+    # later re-arm can fail with identical text, but is a new demotion.
+    demoted_at = datetime.now(UTC).isoformat()
     comment = (
         "WORKLINK_BLOCKED leaf template validation failed before dispatch; "
         f"{reason}. Re-plan this issue, then remove worklink:blocked and "
-        "re-add worklink:ready when the required checklist is present."
+        "re-add worklink:ready when the required checklist is present. "
+        f"Demoted at: {demoted_at}"
     )
     commands = (
         (chainlink_bin, "issue", "unlabel", issue_id, "worklink:ready"),
@@ -878,6 +882,7 @@ def _demote_template_invalid_ready_leaf(
     record_leaf_transition_best_effort(
         home, kind="leaf_template_invalid", issue_id=issue.issue_id,
         issue_title=issue.title, attempt=0, reason=reason,
+        occurrence_id=f"template-demoted-at:{demoted_at}",
     )
 
 

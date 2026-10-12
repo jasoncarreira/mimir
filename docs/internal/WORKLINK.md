@@ -217,7 +217,11 @@ executor together by rebuilding the executor image before enabling this layout.
   record a best-effort milestone in the same dispatch ledger. The ready-queue
   poller delivers an acknowledged prompt with issue, attempt, bounded reason,
   and available evidence, transcript, checkout and branch pointers. Identical
-  occurrences deduplicate; a new reason or attempt prompts again. The agent
+  occurrences deduplicate; a new reason or attempt prompts again. Exhaustion
+  notices also key on the honoured claim-reset generation; template notices
+  key on the demotion timestamp persisted in the issue comment. Thus a reset
+  followed by re-exhaustion, or a re-armed leaf demoted for the same defect,
+  prompts again even with an unchanged reason and attempt count. The agent
   inspects the evidence and issue and calls `operator_alert` if a spec repair,
   unblock or attempt grant is needed; it does not re-arm, reset claims, edit
   the issue body or start work. Failed leaves already use incident prompts;

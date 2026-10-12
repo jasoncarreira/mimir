@@ -483,8 +483,10 @@ class ChainlinkClaims:
             attempts_used = self.attempts_used(comments)
             if attempts_used >= self.max_attempts:
                 self.release_issue(issue_id)
-                self._attempts_exhausted(issue_id, attempts_used, issue_title=issue_title,
-                                         home=claim_home)
+                self._attempts_exhausted(
+                    issue_id, attempts_used, issue_title=issue_title, home=claim_home,
+                    generation=_scan_claim_comments(comments)[1],
+                )
                 return ClaimResult(False, attempts_exhausted=True, reason="attempts_exhausted")
 
             if max_active_locks is not None:
@@ -1415,6 +1417,7 @@ class ChainlinkClaims:
 
     def _attempts_exhausted(
         self, issue_id: int, attempts: int, *, issue_title: str = "", home: Path | None = None,
+        generation: int = 0,
     ) -> None:
         self._run("issue", "unlabel", str(issue_id), "worklink:ready", check=False)
         self._run("issue", "unlabel", str(issue_id), "worklink:in-progress", check=False)
@@ -1438,11 +1441,12 @@ class ChainlinkClaims:
             "leaf_attempts_exhausted", issue_id, attempts,
             reason=f"attempts exhausted: {attempts} of {self.max_attempts} allowed attempts used",
             issue_title=issue_title, home=home,
+            occurrence_id=f"claim-reset-generation:{generation}",
         )
 
     def _record_leaf_ending(
         self, kind: str, issue_id: int, attempt: int, *, reason: str,
-        issue_title: str = "", home: Path | None = None,
+        issue_title: str = "", home: Path | None = None, occurrence_id: str = "",
     ) -> None:
         home = home or self.home_path
         if home is None:
@@ -1467,7 +1471,7 @@ class ChainlinkClaims:
             pass
         record_leaf_transition_best_effort(
             home, kind=kind, issue_id=issue_id, issue_title=issue_title,
-            attempt=attempt, reason=reason,
+            attempt=attempt, reason=reason, occurrence_id=occurrence_id,
             evidence_path=str(evidence_path) if evidence_path else None,
             transcript_path=evidence.get("transcript"),
             checkout=evidence.get("checkout"), branch=evidence.get("branch"),
