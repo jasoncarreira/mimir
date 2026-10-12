@@ -10470,6 +10470,162 @@ def test_factory_recovery_launch_start(
         assert events == ["released", "launch", "supervise"]
 
 
+@pytest.mark.parametrize(
+    ("initial_status", "initial_lock", "case", "expected"),
+    [
+        ("running", "fresh", "ok", [
+            "status", "terminal", "status", "resume", "status", "lock:release", "status", "launch", "supervise",
+        ]),
+        ("running", "stale", "ok", [
+            "status", "lock:steal", "status", "terminal", "status", "resume", "status",
+            "lock:release", "status", "launch", "supervise",
+        ]),
+        ("needs-human", "fresh", "ok", [
+            "status", "resume", "status", "lock:release", "status", "launch", "supervise",
+        ]),
+        ("running", "fresh", "terminal_failure", ["status", "terminal"]),
+        ("running", "fresh", "bad_status", ["status", "terminal", "status"]),
+        ("running", "fresh", "bad_next", ["status", "terminal", "status"]),
+        ("running", "fresh", "bad_owner", ["status", "terminal", "status"]),
+        ("running", "fresh", "live", ["status"]),
+        ("running", "fresh", "unverified", ["status"]),
+        ("running", "fresh", "foreign", ["status"]),
+    ],
+)
+def test_factory_recovery_parks_running_before_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    initial_status: str, initial_lock: str, case: str, expected: list[str],
+) -> None:
+    _stub_factory_launch_identity(monkeypatch)
+    import mimir.worklink.orchestrator as orchestrator
+
+    _configure_opencode_oauth(tmp_path, monkeypatch)
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    expected_park_reason = (
+        "controller recovery: retained driver verified dead while factory status "
+        "was running; parked for fresh-session resume"
+    )
+    state: dict[str, Any] = {
+        "status": initial_status,
+        "lock": initial_lock,
+        "owner": "foreign" if case == "foreign" else "session-1",
+        "next": "implementation",
+        "terminal_result": None,
+    }
+    events: list[str] = []
+
+    def snapshot() -> Any:
+        return parse_factory_status({
+            **_factory_lifecycle_status(sandbox, status=state["status"]).to_json(),
+            "lock": state["lock"], "lock_session": state["owner"],
+            "dead_lock": state["lock"] == "stale",
+            "next": state["next"], "terminal_result": state["terminal_result"],
+        })
+
+    pre = snapshot()
+    retained = replace(
+        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
+        status=pre, observed_at="2026-08-18T12:00:00+00:00",
+    )
+    save_factory_record(tmp_path, retained)
+
+    class Backend(FeatureFactoryBackend):
+        def status(self, *args: object, **kwargs: object) -> Any:
+            events.append("status")
+            return snapshot()
+
+        def terminal(self, run_id: str, status: str, *, reason: str, **kwargs: object) -> None:
+            events.append("terminal")
+            assert (run_id, status, reason) == ("700", "needs-human", expected_park_reason)
+            assert kwargs == {"sandbox": sandbox, "launcher": retained.launcher}
+            if case == "terminal_failure":
+                raise FactoryContractError("terminal refused")
+            state["status"] = "running" if case == "bad_status" else "needs-human"
+            state["terminal_result"] = {"reason": reason}
+            if case == "bad_next":
+                state["next"] = "changed-step"
+            if case == "bad_owner":
+                state["owner"] = "foreign"
+
+        def resume(self, run_id: str, **kwargs: object) -> Any:
+            events.append("resume")
+            if state["status"] != "needs-human":
+                raise FactoryContractError("factory resume requires current status needs-human")
+            if initial_status == "running":
+                saved = load_factory_record(tmp_path, "700")
+                assert saved.status is not None
+                assert saved.status.status == "needs-human"
+                assert saved.status.terminal_result == {"reason": expected_park_reason}
+            state["status"] = "running"
+            return self.status(run_id, **kwargs)
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            events.append(f"lock:{action}")
+            assert kwargs["session"] == retained.session
+            if action == "steal":
+                state["lock"] = "fresh"
+            else:
+                assert action == "release"
+                state["lock"] = "absent"
+                state["owner"] = None
+
+    class Compute:
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            events.append("launch")
+            _assert_fresh_driver_launch(spec, sandbox.parent.parent, "700")
+            return LaunchHandle("local_subprocess", "999999998", 2)
+
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            assert issue_id == 700
+            assert kwargs == {
+                "status": "blocked", "review_ready": False, "attempt": 1,
+                "reason": (
+                    "factory recovery could not verify the running factory was parked; "
+                    f"retained sandbox: {sandbox}"
+                ),
+            }
+
+    async def supervise(self: object, **kwargs: Any) -> str:
+        events.append("supervise")
+        return "supervised"
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kwargs: sandbox)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda record: case == "live")
+    monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda record: case != "unverified")
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kwargs: "https://github.com/owner/repo.git")
+    monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+    monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda repo: ())
+    monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+    issue = IssueContext(700, "epic", "build", {"worklink:epic"})
+
+    async def recover() -> Any:
+        return await WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+            issue=issue,
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(), backend=Backend(entrypoint=retained.launcher), compute=Compute(),
+            retained=retained, launcher=Path(retained.launcher), repo_slug="owner/repo",
+            base="main", test_cmd="pytest -q", runner=lambda args: cp(args),
+            work_item_json=orchestrator.render_work_item(issue),
+        )
+
+    if case == "ok":
+        assert asyncio.run(recover()) == "supervised"
+    elif case in {"live", "unverified", "foreign"}:
+        with pytest.raises(WorklinkError):
+            asyncio.run(recover())
+    else:
+        result = asyncio.run(recover())
+        assert result.status == "needs-human"
+        assert result.reason == "factory recovery could not verify the running factory was parked"
+        saved = load_factory_record(tmp_path, "700")
+        assert saved.controller_phase == "parked"
+        assert saved.status is not None and saved.status.next == pre.next
+        assert saved.status.lock_session == retained.session
+    assert events == expected
+
+
 @pytest.mark.parametrize("run_id", ["chainlink-700", "700"], ids=["canonical", "legacy"])
 def test_factory_recovery_binds_work_item_to_retained_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str,

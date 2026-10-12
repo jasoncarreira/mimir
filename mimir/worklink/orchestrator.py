@@ -3059,6 +3059,46 @@ class WorklinkRunner:
             or _opaque_json_bytes(locked.terminal_result) != historical_result
         ):
             raise WorklinkError("factory recovery lock reconciliation failed")
+        if pre.status == "running":
+            park_failure = "factory recovery could not verify the running factory was parked"
+            try:
+                backend.terminal(
+                    retained.run_id, "needs-human",
+                    reason=(
+                        "controller recovery: retained driver verified dead while factory status "
+                        "was running; parked for fresh-session resume"
+                    ),
+                    sandbox=sandbox, launcher=retained.launcher,
+                )
+                parked_status = backend.status(
+                    retained.run_id, sandbox=sandbox, launcher=retained.launcher,
+                )
+                _require_factory_status(parked_status, retained)
+                if (
+                    parked_status.status != "needs-human"
+                    or parked_status.next != pre.next
+                    or parked_status.lock_session != locked.lock_session
+                ):
+                    raise WorklinkError(park_failure)
+            except Exception:
+                parked = replace(
+                    retained.observed(locked, datetime.now(UTC).isoformat()),
+                    controller_phase="parked",
+                    controller_error=_factory_controller_error(park_failure),
+                )
+                save_factory_record(self.home, parked)
+                claims.transition_issue(
+                    issue.issue_id, status="blocked", review_ready=False,
+                    attempt=claim_record.budget_attempt or claim_record.attempt,
+                    reason=f"{park_failure}; retained sandbox: {retained.sandbox}",
+                )
+                return WorklinkRunResult(
+                    issue.issue_id, retained.attempt, "needs-human",
+                    checkout=sandbox, branch=retained.branch, reason=park_failure,
+                )
+            retained = retained.observed(parked_status, datetime.now(UTC).isoformat())
+            save_factory_record(self.home, retained)
+            historical_result = _opaque_json_bytes(parked_status.terminal_result)
         resumed = backend.resume(
             retained.run_id,
             session=session,
