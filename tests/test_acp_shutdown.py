@@ -968,25 +968,36 @@ assert fired == ([True] if sys.argv[1] == 'expire' else [])
 
 
 @pytest.mark.asyncio
-async def test_shutdown_diagnostics_locate_signal_before_journal_flush(tmp_path: Path) -> None:
+async def test_shutdown_diagnostics_locate_signal_before_journal_flush(
+    tmp_path: Path,
+) -> None:
     progress = tmp_path / "child-progress"
     source = _journal_source(progress) + r'''
 import asyncio
 from types import SimpleNamespace
 
 def blocked_ack():
-    # Simulate the surviving pre-marker stall, after the first handler succeeded.
+    # Locate the repeated dispatch's pre-marker stall, after the first handler
+    # has completed.
+    assert hooks._signal_dispatched
     faulthandler.dump_traceback(file=_stack_fd)
     os.write(1, b'flush-blocked\n')
     threading.Event().wait()
 
 async def run():
+    global hooks
     hooks = proxy._ShutdownHooks(SimpleNamespace(terminate_owned_children=lambda: None))
     hooks.install()
     proxy.threading.Timer = InputTimer
-    os.kill(os.getpid(), signal.SIGTERM)
+    # Process-directed os.kill may deliver on a worker and return before
+    # Python dispatch. Direct delivery to main and acknowledge completion
+    # before replacing the wait, or we can stall the FIRST handler instead.
+    signal.raise_signal(signal.SIGTERM)
+    assert hooks._signal_dispatched
+    with open(_journal_path, 'rb') as journal:
+        assert f'signal-enter:{signal.SIGTERM}\n'.encode() in journal.read()
     _tee_ack.wait = blocked_ack
-    os.kill(os.getpid(), signal.SIGINT)
+    signal.raise_signal(signal.SIGINT)
 
 asyncio.run(run())
 '''
@@ -1008,6 +1019,7 @@ asyncio.run(run())
         assert f"signal-enter:{signal.SIGTERM}\n" in message
         assert f"signal-enter:{signal.SIGINT}\n" not in message
         assert f"signal-dispatch:{signal.SIGINT} interrupted=run:" in message
+        assert f"wakeup-byte:{signal.SIGINT}" in message
         assert "flush-sent" in message
         assert "in blocked_ack" in message
         assert "in _journal_flush" in message
