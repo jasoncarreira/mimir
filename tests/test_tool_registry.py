@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 from dataclasses import FrozenInstanceError, replace
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
@@ -111,6 +113,39 @@ def test_coding_tool_is_absent_when_gate_is_unset_even_if_cli_exists(
     monkeypatch.setattr("mimir.providers.opencode_available", lambda: True)
 
     assert "spawn_open_code" not in {tool.name for tool in all_mimir_tools()}
+
+
+def test_core_runtime_surface_materializes_registered_factories() -> None:
+    from mimir.plugins.core import core_policy_registry, core_runtime_names
+    from mimir.tools import all_mimir_tools
+    from mimir.tools.web import web_tools_enabled
+
+    registry = core_policy_registry()
+    tools = all_mimir_tools(model_spec="openai:test")
+    assert "send_message" in {tool.name for tool in tools}
+    web_search_on, fetch_url_on = web_tools_enabled("openai:test")
+    expected = (*core_runtime_names("default"),)
+    if web_search_on:
+        expected += core_runtime_names("web_search")
+    if fetch_url_on:
+        expected += core_runtime_names("fetch_url")
+    assert tuple(tool.name for tool in tools) == expected
+    assert all(tool is registry.tools[tool.name].factory() for tool in tools)
+
+
+def test_default_surface_does_not_import_coding_modules() -> None:
+    script = """\
+import sys
+from mimir.tools.registry import all_mimir_tools
+all_mimir_tools(model_spec='openai:test')
+for name in ('mimir.tools.forge', 'mimir.tools.repo', 'mimir.forge',
+             'mimir.repo_tools', 'mimir.pr_checkout_lease'):
+    assert name not in sys.modules, name
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_coding_tool_is_registered_only_when_enabled_and_available(

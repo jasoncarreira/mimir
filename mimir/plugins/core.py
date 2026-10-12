@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from dataclasses import dataclass
 from enum import StrEnum
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -280,8 +281,51 @@ _TYPED_ERROR_SIGNAL = _names("""bash_job_output fetch_url get_turn mimir_get_tur
     shell_exec web_search worklink_run""")
 
 
+# The order is the historical model-bound tool order. A module/collection is
+# resolved only when its surface is selected; in particular the coding modules
+# must not be imported by a core-only policy or tool inventory.
+_RUNTIME_SURFACES = {
+    "default": (
+        ("mimir.tools.registry", "approve_declassification request_operator_approval"),
+        ("mimir.tools.memory", "memory_query memory_get"),
+        ("mimir.tools.store", "memory_store"),
+        ("mimir.tools.memory_propose", "memory_propose"),
+        ("mimir.tools.proposals", "open_proposal proposal_diff submit_proposal abandon_proposal"),
+        ("mimir.tools.saga_ops", "saga_feedback saga_mark_contributions saga_end_session saga_forget saga_record_skill_learning"),
+        ("mimir.tools.extra", "file_search rebuild_index mimir_get_turn get_turn shell_exec"),
+        ("mimir.tools.shell_async", "bash_async bash_jobs_list bash_job_output"),
+        ("mimir.tools.operator_alert", "operator_alert"),
+        ("mimir.tools.registry", "send_message react fetch_channel_history list_channels defer_injected_message list_schedules add_schedule set_schedule_priority remove_schedule set_poller_overrides reload_pollers commitment_complete commitment_snooze commitment_dismiss commitment_list worklink_run worklink_resume request_mimir_update"),
+        ("mimir.tools.client_provider:HANDS_TOOLS", "hands_read hands_edit hands_shell hands_python hands_request_scope"),
+    ),
+    "web_search": (("mimir.tools.web", "web_search"),),
+    "fetch_url": (("mimir.tools.web", "fetch_url"),),
+    "coding": (
+        ("mimir.tools.registry", "spawn_open_code"),
+        ("mimir.tools.forge:FORGE_TOOLS", "pr_list pr_metadata pr_spec pr_files pr_diff pr_file_content pr_checks pr_job_log ci_run_jobs ci_run ci_recent_runs pr_reviews pr_comments pr_review_requests pr_submit_review pr_inline_review_comment pr_comment pr_edit_body issue_comment pr_rerequest_review unsupported_operation"),
+        ("mimir.tools.repo:REPO_TOOLS", "repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff repo_unmerged repo_stage repo_commit repo_merge repo_merge_abort repo_rebase repo_rebase_abort repo_revert repo_revert_abort repo_push"),
+    ),
+}
+
+
+def core_runtime_names(surface: str) -> tuple[str, ...]:
+    return tuple(name for _, names in _RUNTIME_SURFACES[surface] for name in names.split())
+
+
+def _tool_factory(module_path: str, name: str):
+    module_name, _, collection = module_path.partition(":")
+
+    def materialize():
+        module = import_module(module_name)
+        if collection:
+            return next(tool for tool in getattr(module, collection) if tool.name == name)
+        return getattr(module, name)
+
+    return materialize
+
+
 def register_core_tools(registry: PolicyRegistry) -> None:
-    """Register core descriptors; later policy families add their own metadata here."""
+    """Register core tool policy and lazy runtime factories."""
     from mimir.tool_descriptors import _CORE_DESCRIPTOR_DECLARATIONS, ResultOriginKind
 
     flow_by_name = {
@@ -293,6 +337,17 @@ def register_core_tools(registry: PolicyRegistry) -> None:
     readable_domains = {name: domain for domain, names in _READABLE_DOMAINS.items() for name in names}
     if sum(map(len, _RESULT_DOMAINS.values())) != len(result_domains) or sum(map(len, _READABLE_DOMAINS.values())) != len(readable_domains):
         raise ValueError("duplicate core result or readable domain")
+
+    factories = {
+        name: _tool_factory(module, name)
+        for groups in _RUNTIME_SURFACES.values()
+        for module, names in groups
+        for name in names.split()
+    }
+    if len(factories) != sum(len(core_runtime_names(surface)) for surface in _RUNTIME_SURFACES):
+        raise ValueError("duplicate core runtime factory")
+    if not factories.keys() <= _CORE_DESCRIPTOR_DECLARATIONS.keys() | flow_by_name.keys():
+        raise ValueError("core runtime factory has no policy declaration")
 
     for name, descriptor in _CORE_DESCRIPTOR_DECLARATIONS.items():
         operation_class = (
@@ -325,7 +380,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
                 memberships.add(member)
         registry.register_tool(
             name=name,
-            policy_only=True,
+            factory=factories.get(name),
+            policy_only=name not in factories,
             flow=flow_by_name.get(name),
             tier=next((tier for tier, names in _TIERS.items() if name in names), None),
             operation_class=operation_class,
@@ -379,7 +435,8 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             if name in names:
                 memberships.add(member)
         registry.register_tool(
-            name=name, policy_only=True, descriptor_registered=False,
+            name=name, factory=factories.get(name), policy_only=name not in factories,
+            descriptor_registered=False,
             flow=flow_by_name[name], tier=None, operation_class=operation_class,
             result_domain=result_domains.get(name), result_origin=ResultOriginKind.NONE,
             sink_category=None, sink_destination=None,
