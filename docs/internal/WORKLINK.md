@@ -1282,9 +1282,10 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
   local-subprocess: {}      # the built-in default; accept-the-risk fallback
 ```
 
-`defaults.factory_resumable_retention_s` is a positive integer (default 86400,
-at least `reaper_ttl_s`). A checkout with a verified-dead factory record and a
-non-terminal, non-parked status is pruned only after both the checkout TTL and
+`defaults.factory_resumable_retention_s` is a positive integer. When omitted,
+it defaults to `max(86400, reaper_ttl_s)` using the effective, timeout-clamped
+TTL; an explicit value must be at least that TTL. A checkout with a verified-dead
+factory record and a non-terminal, non-parked status is pruned only after both the checkout TTL and
 this window since `FactoryRunRecord.observed_at` have elapsed. While held, each
 prune pass emits `worklink_attempt_checkout_retained` with its `prunable_after`
 timestamp. A missing or invalid observation falls back to checkout mtime and

@@ -1389,11 +1389,10 @@ def test_prune_retains_recently_stopped_factory_and_reports_deadline(
 
 
 @pytest.mark.parametrize("phase", ["failed", "stopped", "running"])
-@pytest.mark.parametrize("status", ["running", "needs-human"])
 @pytest.mark.parametrize("inside_window", [True, False])
 @pytest.mark.usefixtures("factory_process_ticks")
 def test_prune_dead_nonparked_factory_uses_observation_window(
-    tmp_path: Path, phase: str, status: str, inside_window: bool,
+    tmp_path: Path, phase: str, inside_window: bool,
 ) -> None:
     _write_worklink_yaml(tmp_path, reaper_ttl_s=3600, factory_resumable_retention_s=7200)
     repo = tmp_path / "repo"
@@ -1405,7 +1404,7 @@ def test_prune_dead_nonparked_factory_uses_observation_window(
     os.utime(child, (checkout_time.timestamp(), checkout_time.timestamp()))
     age = timedelta(minutes=30) if inside_window else timedelta(hours=3)
     save_factory_record(tmp_path, _factory_record(
-        sandbox, phase=phase, status=status, process="dead",
+        sandbox, phase=phase, status="running", process="dead",
         observed_at=(datetime.now(UTC) - age).isoformat(),
     ))
 
@@ -1515,8 +1514,11 @@ def test_attempt_is_active_false_for_terminal_or_absent(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("phase", ["parked", "running", "failed", "stopped", "terminal"])
+@pytest.mark.parametrize("observation_age", [None, timedelta(minutes=30), timedelta(hours=25)])
 @pytest.mark.usefixtures("factory_process_ticks")
-def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
+def test_prune_preserves_parked_factory(
+    tmp_path: Path, phase: str, observation_age: timedelta | None,
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     child = tmp_path / ".worklink" / repo.name / "841-1"
@@ -1525,11 +1527,14 @@ def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
     os.utime(child, (0, 0))
     record = _factory_record(
         sandbox, phase=phase, status="needs-human", process="dead",
-        observed_at=datetime.now(UTC).isoformat(),
+        observed_at=(
+            (datetime.now(UTC) - observation_age).isoformat()
+            if observation_age is not None else None
+        ),
     )
     save_factory_record(tmp_path, record)
 
-    assert autonomy._attempt_is_active(child, [record]) is (phase == "parked")
+    assert autonomy._attempt_is_active(child, [record]) is True
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
     assert sandbox.is_dir()
 

@@ -294,7 +294,8 @@ class WorklinkConfig:
             ),
             reaper_ttl_s=reaper_ttl_s,
             factory_resumable_retention_s=defaults_data.get(
-                "factory_resumable_retention_s", default_values.factory_resumable_retention_s
+                "factory_resumable_retention_s",
+                max(default_values.factory_resumable_retention_s, reaper_ttl_s),
             ),
             allow_autonomous_local_subprocess=_coerce_safety_bool(
                 defaults_data.get("allow_autonomous_local_subprocess", False)

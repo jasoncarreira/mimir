@@ -244,7 +244,7 @@ def _attempt_is_active(child: Path, records: Sequence[object] = ()) -> bool:
         if factory_process_is_alive(candidate):
             return True
         status = getattr(candidate, "status", None)
-        if status is not None and status.is_parked and phase == "parked":
+        if status is not None and status.is_parked:
             return True
         if status is not None and status.is_terminal:
             continue
@@ -279,7 +279,7 @@ def _attempt_held_by_factory_observation(
             or status is None
             or status.status is None
             or status.is_terminal
-            or (status.is_parked and phase == "parked")
+            or status.is_parked
             or not factory_process_is_verified_dead(record)
         ):
             continue

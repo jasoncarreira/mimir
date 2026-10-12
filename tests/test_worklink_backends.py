@@ -242,6 +242,28 @@ def test_factory_resumable_retention_defaults_and_override(tmp_path: Path) -> No
     assert WorklinkConfig.load(path).defaults.factory_resumable_retention_s == 7200
 
 
+@pytest.mark.parametrize("settings", [
+    {"reaper_ttl_s": 172800},
+    {"timeout_s": 86400, "reaper_ttl_s": 3600},
+])
+def test_factory_resumable_retention_default_tracks_effective_ttl(
+    tmp_path: Path, settings: dict[str, int],
+) -> None:
+    path = tmp_path / "worklink.yaml"
+    path.write_text(json.dumps({"defaults": settings}), encoding="utf-8")
+    defaults = WorklinkConfig.load(path).defaults
+    assert defaults.reaper_ttl_s == 172800
+    assert defaults.factory_resumable_retention_s == 172800
+
+    # An explicit value remains strict, including against a timeout-clamped TTL.
+    path.write_text(
+        json.dumps({"defaults": {**settings, "factory_resumable_retention_s": 86400}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*reaper_ttl_s"):
+        WorklinkConfig.load(path)
+
+
 @pytest.mark.parametrize("value", [0, -1, 3599, True, 1.5, "7200", None])
 def test_factory_resumable_retention_rejects_invalid_values(tmp_path: Path, value: object) -> None:
     with pytest.raises(ValueError, match="factory_resumable_retention_s.*positive integer.*reaper_ttl_s"):
