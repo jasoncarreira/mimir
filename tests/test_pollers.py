@@ -9818,3 +9818,103 @@ async def test_selected_policy_named_pollers_issue_distinct_manifest_grants(
         )
     assert by_name["poller:missing"].service_authority.capabilities == ()
     assert access_control.get_service_principal("poller", policy=policy) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_manifest_plugin_file_sink_grants_only_named_poller(
+    tmp_path: Path, home: Path, enforce: bool, monkeypatch,
+) -> None:
+    from langchain.agents.middleware import ToolCallRequest
+    from langchain_core.messages import ToolMessage
+    from langchain_core.tools import StructuredTool
+    from langgraph.runtime import Runtime
+    from dataclasses import replace
+
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import InformationFlowLabels, InformationFlowState
+    from mimir.plugins.core import register_core_tools
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.scheduler import Scheduler
+    from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    def deliver(payload: str) -> str:
+        """Deliver to a scoped file."""
+        return payload
+
+    monkeypatch.setenv("MIMIR_HOME", str(home))
+    policy = PolicyRegistry()
+    register_core_tools(policy)
+    plugin = policy.registrar("sample")
+    plugin.register_tool(
+        name="sample_file_sink", factory=lambda: StructuredTool.from_function(
+            deliver, name="sample_file_sink", description="Deliver a file",
+        ),
+        flow="sink", tier="scope-contained", operation_class="admin_required",
+        result_domain=None, result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.FILE, sink_destination="filesystem",
+        sink_target_extractor=lambda _name, args, _ctx: (args.get("payload"),),
+        sink_payload_extractor=None, writes_code_or_state=False,
+        profiles=(), read_backend=False,
+        service_sink_adapter="trigger_service_write_roots",
+    )
+    plugin.register_capability("sample_file_sink")
+    plugin.add_to_profile("heartbeat", "sample_file_sink")
+    policy.freeze()
+
+    skill = tmp_path / "skills" / "sample"
+    _install_script(skill, "emit.py", 'print(\'{"prompt": "deliver"}\')\n')
+    _write_pollers_json(skill, [
+        {"name": name, "command": f"{sys.executable} emit.py", "cron": "* * * * *",
+         "authority": {"profile": "heartbeat", "tier": "scope-contained",
+                       "capabilities": grants, "scoped_roots": ["state"]}}
+        for name, grants in (("granted", ["sample_file_sink"]), ("ungranted", []))
+    ])
+    scheduler = Scheduler(home / "scheduler.yaml", lambda event: None, home=home, policy=policy)
+    scheduler._pollers_dir = skill.parent
+    discovered, _, rejected = scheduler._discover_pollers_io()
+    assert not rejected and {poller.name for poller in discovered} == {"granted", "ungranted"}
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    for poller in discovered:
+        await run_poller(poller, enqueue=enqueue, home=home)
+    by_name = {event.service_principal: event for event in events}
+    assert by_name["poller:granted"].service_authority.sink_policy_for("sample_file_sink") is not None
+    assert by_name["poller:ungranted"].service_authority.sink_policy_for("sample_file_sink") is None
+    for name in ("granted", "ungranted"):
+        event = by_name[f"poller:{name}"]
+        auth = _create_turn_auth_context(
+            event, None, policy_version=None, enforce=enforce,
+            ifc_labels=_initialize_ifc_labels(event, policy=policy), policy=policy,
+        )
+        # Poller output is untrusted active ingest; test the destination grant
+        # independently of the always-on tainted-write veto.
+        auth = replace(auth, ifc_labels=InformationFlowLabels(),
+                       ifc_state=InformationFlowState())
+        target = str(home / "state" / "pollers" / "granted" / "output.md")
+        args = {"payload": target}
+        decision = access_control.ToolRegistry().authorize_tool(
+            "sample_file_sink", auth, enforce=True, target_channel=target,
+            arguments=args, policy=policy,
+        )
+        request = ToolCallRequest(
+            tool_call={"name": "sample_file_sink", "args": args, "id": name, "type": "tool_call"},
+            tool=policy.tools["sample_file_sink"].factory(), state=None,
+            runtime=Runtime(context=auth),
+        )
+        called = []
+        result = BudgetGateMiddleware(policy).wrap_tool_call(
+            request, lambda _: called.append(True) or ToolMessage(content="ok", tool_call_id=name),
+        )
+        if name == "granted":
+            assert decision.allowed and not decision.would_block, (decision.reason, decision.refusal_detail)
+            assert result.status != "error" and called == [True]
+        else:
+            assert not decision.allowed and decision.would_block
+            assert result.status == ("error" if enforce else "success")
+            assert called == ([] if enforce else [True])

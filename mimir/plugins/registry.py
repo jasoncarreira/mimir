@@ -37,6 +37,7 @@ class ToolPolicy:
     readable_domain: str | None = None
     shell_process: bool = False
     memberships: frozenset[str] = frozenset()
+    service_sink_adapter: str | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,7 @@ class PolicyRegistry:
         resource_scope: str | None = None, typed_action: Any | None = None,
         readable_domain: str | None = None,
         shell_process: bool = False, memberships: Iterable[str] = (),
+        service_sink_adapter: str | None = None,
         fetch_authorization: FetchAuthorizationKind | None = None,
         git_operation_result: bool = False, ifc_delegation: bool = False,
         budget_exempt: bool = False, owner: str = "core",
@@ -248,6 +250,15 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{name}: invalid payload extractor")
         if not isinstance(writes_code_or_state, bool) or not isinstance(read_backend, bool):
             raise PolicyRegistrationError(f"{name}: invalid boolean metadata")
+        if owner != "core" and read_backend and (
+            flow not in {"source", "both"}
+            or not result_domain
+            or result_origin & ResultOriginKind.NON_INGESTING
+            or not result_origin & (ResultOriginKind.EXTERNAL | ResultOriginKind.REPOSITORY)
+        ):
+            raise PolicyRegistrationError(f"{owner}: tool {name}: read backend requires a protected ingesting result and source flow")
+        if service_sink_adapter is not None and not isinstance(service_sink_adapter, str):
+            raise PolicyRegistrationError(f"{owner}: tool {name}: invalid service sink adapter")
         if result_domain is not None:
             _name(result_domain, "result domain")
         if readable_domain is not None:
@@ -275,7 +286,7 @@ class PolicyRegistry:
             name, owner, factory, policy_only, flow, tier, operation_class,
             result_domain, descriptor, writes_code_or_state, declared_profiles,
             resource_scope, typed_action, read_backend, readable_domain,
-            shell_process, declared_memberships,
+            shell_process, declared_memberships, service_sink_adapter,
         )
 
     def register_capability(
@@ -377,13 +388,43 @@ class PolicyRegistry:
     def freeze(self) -> PolicyRegistry:
         self._writable()
         from mimir.models import RepoPRAction
-        from mimir.tool_descriptors import validate_tool_descriptors
+        from mimir.tool_descriptors import SinkCategory, validate_tool_descriptors
+
+        service_adapters = {
+            SinkCategory.FILE: "trigger_service_write_roots",
+            SinkCategory.NETWORK: "approved_urls",
+            SinkCategory.HTTP_WEBHOOK: "approved_urls",
+            SinkCategory.NOTIFICATION: "operator_alert",
+            SinkCategory.SHELL_PROCESS: "shell_profile",
+            SinkCategory.SPAWN: "spawn_workspace",
+        }
+        service_destinations = {
+            SinkCategory.FILE: "filesystem",
+            SinkCategory.NETWORK: "network",
+            SinkCategory.HTTP_WEBHOOK: "network",
+            SinkCategory.NOTIFICATION: "notification",
+            SinkCategory.SHELL_PROCESS: "shell_process",
+            SinkCategory.SPAWN: "spawn_process",
+        }
 
         validate_tool_descriptors(self.descriptors)
         for name, companions in self._capability_companions.items():
             if not companions <= self._capabilities.keys():
                 raise PolicyRegistrationError(f"{name}: unknown companion capability")
         for name, tool in self._tools.items():
+            if tool.owner != "core":
+                category = tool.descriptor.sink_category if tool.descriptor else None
+                if tool.profiles and category in {SinkCategory.EXTERNAL_MCP, SinkCategory.PROPOSAL}:
+                    raise PolicyRegistrationError(
+                        f"{tool.owner}: tool {name}: profile sink has no executable service sink adapter"
+                    )
+                expected = service_adapters.get(category)
+                if tool.service_sink_adapter is not None and tool.service_sink_adapter != expected:
+                    raise PolicyRegistrationError(f"{tool.owner}: tool {name}: invalid service sink adapter {tool.service_sink_adapter!r}")
+                if tool.profiles and expected is not None and tool.service_sink_adapter is None:
+                    raise PolicyRegistrationError(f"{tool.owner}: tool {name}: profile sink requires a service sink adapter")
+                if tool.service_sink_adapter is not None and tool.descriptor.sink_destination != service_destinations[category]:
+                    raise PolicyRegistrationError(f"{tool.owner}: tool {name}: invalid service sink destination")
             for profile in tool.profiles:
                 if profile not in self._profiles or name not in self._profiles[profile].capabilities:
                     raise PolicyRegistrationError(f"{name}: missing profile membership {profile}")
