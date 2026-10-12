@@ -32,7 +32,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from ..worklink.planning import render_decompose_prompt
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +51,8 @@ def _template_names() -> list[str]:
 
 def _render_template(name: str, text: str) -> str:
     if name == "decompose.md":
+        from ..worklink.planning import render_decompose_prompt
+
         return render_decompose_prompt(text)
     return text
 

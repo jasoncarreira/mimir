@@ -13,6 +13,13 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .._atomic import atomic_write_json
 from ..access_control import HTTP_EVENT_INGRESS_EXTRA_KEY, authorize_action
+from ..http_ingress import (
+    HTTP_EVENT_INGRESS_EXTRA_VALUE,
+    WORKLINK_HINT_EXTRA_KEYS,
+    stamp_http_event_ingress_extra,
+    strip_http_event_ingress_extra,
+    strip_worklink_hint_extra,
+)
 from ..models import AgentEvent, TurnContext, TurnRecord
 from .run_state import load_run_state, run_state_path
 from .dispatch_failures import is_dispatch_failure_intervention
@@ -21,15 +28,6 @@ CONTINUATION_KIND = "worklink_tool_budget_continuation"
 CONTINUATION_VERSION = 1
 CONTINUATION_PREFIX = "WORKLINK_CONTINUATION "
 
-WORKLINK_HINT_EXTRA_KEYS = frozenset({
-    "issue_id",
-    "pr_url",
-    "worktree",
-    "poller_name",
-    "schedule_name",
-    "run_id",
-})
-HTTP_EVENT_INGRESS_EXTRA_VALUE = "http_event"
 _MAX_RECENT_TURNS = 10
 _MAX_CHANGED_PATHS = 25
 _MAX_EXTERNAL_COMMANDS = 5
@@ -50,53 +48,6 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 Runner = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
-
-
-def strip_worklink_hint_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Drop client-controlled Worklink continuation hint keys from ``extra``.
-
-    Strips recursively so nested objects cannot smuggle authoritative-looking
-    issue / PR / worktree hints through the generic ``POST /event`` ingress.
-    """
-
-    def scrub(value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return {
-                key: scrub(item)
-                for key, item in value.items()
-                if key not in WORKLINK_HINT_EXTRA_KEYS
-            }
-        if isinstance(value, list):
-            return [scrub(item) for item in value]
-        return value
-
-    if not extra:
-        return {}
-    return scrub(extra)
-
-
-def strip_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Drop the server-owned HTTP ingress marker from client ``extra``."""
-
-    if not extra:
-        return {}
-    return {
-        key: value
-        for key, value in extra.items()
-        if key != HTTP_EVENT_INGRESS_EXTRA_KEY
-    }
-
-
-def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Mark generic HTTP ``/event`` ingress as untrusted for admin provenance.
-
-    The marker is server-owned: callers may supply the same key, but the server
-    stamps this after client-controlled stripping and always overwrites it.
-    """
-
-    stamped = strip_http_event_ingress_extra(extra)
-    stamped[HTTP_EVENT_INGRESS_EXTRA_KEY] = HTTP_EVENT_INGRESS_EXTRA_VALUE
-    return stamped
 
 
 @dataclass(frozen=True)

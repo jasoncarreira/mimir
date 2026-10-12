@@ -28,8 +28,8 @@ import yaml
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import ToolException, tool
+from langchain_core.tools.base import create_schema_from_function
 
-from ..forge.github import _MAX_DIFF_FETCH_BYTES
 from ..models import AuthContext, PollerProposalState
 from ..proposals import (
     PROPOSAL_SURFACES,
@@ -48,10 +48,10 @@ from ..proposals import (
 )
 from ..event_logger import log_event
 from .refusals import ToolPolicyRefusal
-from .repo import _bind_injected_runtime
 from .operator_alert import send_social_proposal_ping
 
 _log = logging.getLogger(__name__)
+_MAX_DIFF_FETCH_BYTES = 8_388_608
 
 
 def _social_additions(worktree: Path, scope: PollerProposalScope) -> list[tuple[str, str]]:
@@ -516,7 +516,14 @@ async def abandon_proposal(
 
 
 for _proposal_tool in (open_proposal, proposal_diff, submit_proposal, abandon_proposal):
-    _bind_injected_runtime(_proposal_tool)
+    _callable = _proposal_tool.func or _proposal_tool.coroutine
+    if _callable is None:
+        raise RuntimeError(f"proposal tool {_proposal_tool.name!r} has no callable")
+    _callable.__annotations__["runtime"] = ToolRuntime
+    _proposal_tool.args_schema = create_schema_from_function(
+        _proposal_tool.name, _callable, filter_args=(), include_injected=True,
+    )
+    _proposal_tool.__dict__.pop("_injected_args_keys", None)
 
 
 __all__ = (

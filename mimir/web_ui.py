@@ -57,15 +57,6 @@ from .chainlink_board import (
     build_chainlink_board_payload,
     resolve_worklink_artifact,
 )
-from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
-from .worklink.factory_state import (
-    FactoryRunRecord,
-    FactoryRecordError,
-    archive_factory_record,
-    factory_process_is_verified_dead,
-    list_factory_records,
-    load_factory_record,
-)
 from .live_events import read_live_event_items_since
 from .ops_dashboard import (
     build_dashboard_payload_async,
@@ -107,6 +98,18 @@ from .wiki_backlinks import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def load_factory_record(home: Path, run_id: str):
+    from .worklink.factory_state import load_factory_record as load
+
+    return load(home, run_id)
+
+
+def factory_process_is_verified_dead(record: Any) -> bool:
+    from .worklink.factory_state import factory_process_is_verified_dead as is_dead
+
+    return is_dead(record)
 
 _TURN_VIEWER_HTML: str | None = None
 _WEB_AUTH_JS: str | None = None
@@ -933,6 +936,14 @@ def register_routes(
     ``dashboard_extensions`` is the trusted first-party dashboard registry.
     Enabled manifests drive optional backend namespace hook registration; this
     is not a remote plugin loading mechanism."""
+
+    from .worklink.backends.feature_factory import _RUN_ID as _FACTORY_RUN_ID_RE
+    from .worklink.factory_state import (
+        FactoryRunRecord,
+        FactoryRecordError,
+        archive_factory_record,
+        list_factory_records,
+    )
 
     # Seed the agent-owned UI config on startup so there's a discoverable file
     # for the agent to edit (its name + skin).

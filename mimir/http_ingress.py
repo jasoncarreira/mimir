@@ -5,10 +5,38 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from .chat_skills import strip_chat_skill_extra
-from .worklink.continuation import (
-    strip_http_event_ingress_extra,
-    strip_worklink_hint_extra,
-)
+from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+
+WORKLINK_HINT_EXTRA_KEYS = frozenset({
+    "issue_id", "pr_url", "worktree", "poller_name", "schedule_name", "run_id",
+})
+HTTP_EVENT_INGRESS_EXTRA_VALUE = "http_event"
+
+
+def strip_worklink_hint_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Remove untrusted continuation hints, including hints nested in input."""
+    def scrub(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: scrub(item) for key, item in value.items()
+                    if key not in WORKLINK_HINT_EXTRA_KEYS}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(extra) if extra else {}
+
+
+def strip_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Remove the server-owned HTTP ingress marker from client input."""
+    return {key: value for key, value in (extra or {}).items()
+            if key != HTTP_EVENT_INGRESS_EXTRA_KEY}
+
+
+def stamp_http_event_ingress_extra(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Mark generic HTTP event ingress after stripping client-owned input."""
+    stamped = strip_http_event_ingress_extra(extra)
+    stamped[HTTP_EVENT_INGRESS_EXTRA_KEY] = HTTP_EVENT_INGRESS_EXTRA_VALUE
+    return stamped
 
 
 # These fields affect authorization or durable output visibility and may only

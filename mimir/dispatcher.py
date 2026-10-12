@@ -27,10 +27,8 @@ from .config import Config
 from .event_logger import log_event
 from .models import AgentEvent
 from .scheduler import SCHEDULER_CHANNEL_PREFIX
-from .worklink.continuation import (
-    HTTP_EVENT_INGRESS_EXTRA_KEY,
-    HTTP_EVENT_INGRESS_EXTRA_VALUE,
-)
+from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+from .http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 if TYPE_CHECKING:
     from .bridges.base import SendResult

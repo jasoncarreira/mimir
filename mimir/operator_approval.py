@@ -9,10 +9,8 @@ from typing import TYPE_CHECKING
 
 from . import approval_requests
 
-from .worklink.continuation import (
-    HTTP_EVENT_INGRESS_EXTRA_KEY,
-    HTTP_EVENT_INGRESS_EXTRA_VALUE,
-)
+from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
+from .http_ingress import HTTP_EVENT_INGRESS_EXTRA_VALUE
 
 if TYPE_CHECKING:
     from .identities import IdentityResolver

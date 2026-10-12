@@ -158,13 +158,16 @@ from .turn_logger import (
     slim_turn_record,
     truncate_input,
 )
-from .worklink.continuation import (
-    HTTP_EVENT_INGRESS_EXTRA_KEY,
-    maybe_create_worklink_budget_continuation,
-)
-from .worklink.dispatch_failures import is_dispatch_failure_intervention
+from .access_control import HTTP_EVENT_INGRESS_EXTRA_KEY
 
 log = logging.getLogger(__name__)
+
+
+def maybe_create_worklink_budget_continuation(**kwargs):
+    """Defer Worklink recovery until a turn actually exhausts its budget."""
+    from .worklink.continuation import maybe_create_worklink_budget_continuation as create
+
+    return create(**kwargs)
 
 # Reflection is the sole turn whose session summaries are assembled across
 # channels: its own synthetic scheduler channel has no user sessions.
@@ -3352,6 +3355,8 @@ class Agent:
             # channel couldn't surface its own result — post the mechanical
             # failure notice there. (Mirrored in the outer early-failure guard
             # for crashes before the model loop; disjoint via outcome_emitted.)
+            from .worklink.dispatch_failures import is_dispatch_failure_intervention
+
             if error or is_dispatch_failure_intervention(event):
                 failure_detail = (
                     error
@@ -3611,6 +3616,8 @@ class Agent:
         )
         await self._turn_logger.write(record)
         # Continuation sidecars are server-owned bookkeeping, not model writes.
+        from .worklink.dispatch_failures import is_dispatch_failure_intervention
+
         if ctx.tool_call_budget_exhausted and not is_dispatch_failure_intervention(event):
             continuation_timeout_s = _worklink_continuation_timeout_seconds(self._config)
             try:
