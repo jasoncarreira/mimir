@@ -35,7 +35,7 @@ import pytest
 import yaml
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import ToolException
+from langchain_core.tools import StructuredTool, ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -63,6 +63,9 @@ from mimir.models import (
     TurnContext,
 )
 from mimir.identities import IdentityResolver
+from mimir.plugins.core import register_core_tools
+from mimir.plugins.registry import PolicyRegistry
+from mimir.tool_descriptors import ResultOriginKind
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     OperatorShellPreparationOutcome,
@@ -127,6 +130,113 @@ def _make_request(
         state=None,
         runtime=Runtime(context=auth_context),
     )
+
+
+@pytest.fixture
+def selected_budget_policy():
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("example")
+
+    def run_example() -> str:
+        return "ok"
+
+    for name, exempt, memberships in (
+        ("example_free", True, ()),
+        ("example_counted", False, ("remediation_effect",)),
+        ("example_typed", False, ("typed_error_signal",)),
+    ):
+        registrar.register_tool(
+            name=name,
+            factory=lambda name=name: StructuredTool.from_function(
+                run_example, name=name, description="Example budget tool",
+            ),
+            flow="source", tier="scope-contained", operation_class="open",
+            result_domain="repository", result_origin=ResultOriginKind.NON_INGESTING,
+            sink_category=None, sink_destination=None,
+            sink_target_extractor=None, sink_payload_extractor=None,
+            writes_code_or_state=False, profiles=(), read_backend=False,
+            budget_exempt=exempt, memberships=memberships,
+        )
+    return registry.freeze()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_selected_plugin_budget_exemption_counting_and_denial(
+    selected_budget_policy, asynchronous,
+):
+    auth = _untainted_ifc_auth()
+    turn = _make_ctx(budget=1)
+    turn.auth_context = auth
+    turn.ifc_labels = auth.ifc_labels
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    executed = []
+
+    def handler(request):
+        executed.append(request.tool_call["name"])
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request):
+        return handler(request)
+
+    token = set_current_turn(turn)
+    try:
+        results = []
+        for name in ("example_free", "example_counted", "example_free", "example_counted"):
+            request = _make_request(name, auth_context=auth)
+            results.append(
+                await gate.awrap_tool_call(request, async_handler) if asynchronous
+                else gate.wrap_tool_call(request, handler)
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert [result.status for result in results] == ["success", "success", "success", "error"]
+    assert executed == ["example_free", "example_counted", "example_free"]
+    assert turn.tool_call_count == 1
+    assert turn.tool_call_budget_denied_tools == ["example_counted"]
+    assert turn.remediation_effects == ["example_counted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_selected_plugin_typed_error_signal_and_unknown_denial(
+    selected_budget_policy, asynchronous, monkeypatch,
+):
+    auth = _untainted_ifc_auth()
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    calls = []
+    outcomes = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_tool_call_sync",
+        lambda name, **fields: outcomes.append((name, fields)),
+    )
+
+    def handler(request):
+        calls.append(request.tool_call["name"])
+        return ToolMessage(
+            content=f"{request.tool_call['name']} failed: remote report",
+            tool_call_id=request.tool_call["id"],
+        )
+
+    async def async_handler(request):
+        return handler(request)
+
+    async def invoke(name):
+        request = _make_request(name, auth_context=auth)
+        return (
+            await gate.awrap_tool_call(request, async_handler) if asynchronous
+            else gate.wrap_tool_call(request, handler)
+        )
+
+    assert (await invoke("example_typed")).status == "success"
+    assert (await invoke("example_counted")).status == "success"
+    refused = await invoke("example_unknown")
+    assert refused.status == "error"
+    assert calls == ["example_typed", "example_counted"]
+    assert outcomes[0][0] == "example_typed" and outcomes[0][1]["ok"] is True
+    assert outcomes[1][0] == "example_counted" and outcomes[1][1]["ok"] is False
 
 
 def _service_turn(tmp_path: Path, channel_id: str | None) -> TurnContext:

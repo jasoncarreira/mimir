@@ -414,7 +414,7 @@ def test_plugin_result_domain_comes_from_authorizing_policy(policy):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous):
+async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous, monkeypatch):
     auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
         _state({RepoPRAction.INSPECT.value}),
     )))
@@ -424,6 +424,11 @@ async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous
         }, "id": "plugin-result", "type": "tool_call"},
         tool=policy.tools["example_repo"].factory(), state=None,
         runtime=Runtime(context=auth),
+    )
+    recorded = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate.record_external_ingested_urls",
+        lambda context, text: recorded.append((context, text)),
     )
 
     def handler(_request):
@@ -441,6 +446,7 @@ async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous
     labels = auth.ifc_state.current(auth.ifc_labels)
     assert labels.has_untrusted_active_ingest
     assert any(source.domain == "repository" for source in labels.sources)
+    assert recorded == [(auth, "outside data")]
 
 
 @pytest.mark.parametrize("enforce", [False, True])
