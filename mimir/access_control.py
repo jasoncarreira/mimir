@@ -8098,6 +8098,7 @@ class ChannelResourceAdapter:
         auth_context: "AuthContext | None",
         *,
         enforce: bool = False,
+        registered_plugin: bool = False,
     ) -> ToolAuthorization:
         """Authorize a channel operation against the triggering channel.
 
@@ -8113,7 +8114,7 @@ class ChannelResourceAdapter:
         Returns:
             ToolAuthorization with allowed/reason fields populated
         """
-        if tool_name not in cls._CHANNEL_OPERATIONS:  # Misuse guard; never shadow-emitted.
+        if tool_name not in cls._CHANNEL_OPERATIONS and not registered_plugin:
             return ToolAuthorization(
                 tool_name=tool_name,
                 decision=OperationDecision.UNKNOWN,
@@ -8962,13 +8963,15 @@ def authorize_repo_pr_tool(
     enforce: bool,
     flow_direction: ToolFlowDirection,
     required_actions: tuple[str, ...] | None = None,
+    registered_plugin: bool = False,
 ) -> ToolAuthorization:
     """Make the sole policy decision for one typed PR/repository action."""
-    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS:
+    if tool_name not in _TYPED_REPO_PR_TOOL_ACTIONS and not registered_plugin:
         raise ValueError(f"not a typed pull-request tool: {tool_name}")
     if isinstance(scope, RetainedFactoryScope):
         in_scope = (
-            tool_name in _RETAINED_REPO_TOOLS
+            not registered_plugin
+            and tool_name in _RETAINED_REPO_TOOLS
             and isinstance(service_principal, ServicePrincipal)
             and service_principal.canonical == "poller:worklink-ready-queue"
             and service_principal.trigger == "poller"
@@ -8993,6 +8996,8 @@ def authorize_repo_pr_tool(
             repo_pr_action_scope=scope,
             result_integrity="trusted" if in_scope else "untrusted",
         )
+    if registered_plugin and (required_actions is None or len(required_actions) != 1):
+        raise ValueError("plugin repo/PR tools require one typed action")
     report_required_actions = required_actions is not None
     if required_actions is None:
         required_action = _TYPED_REPO_PR_TOOL_ACTIONS[tool_name]
@@ -9001,8 +9006,10 @@ def authorize_repo_pr_tool(
     missing_actions = tuple(
         action for action in required_actions if action not in granted_actions
     )
+    from .models import RepoPRActionScope
+
     in_scope = (
-        scope is not None
+        (isinstance(scope, RepoPRActionScope) if registered_plugin else scope is not None)
         and not missing_actions
         and (
             not heartbeat_git_authority_enabled(service_principal)
@@ -9313,6 +9320,7 @@ class ToolRegistry:
         tool_call_id: str | None = None,
         client_authorized_host_execution: Any = None,
         request_identity: Any = None,
+        policy: "PolicyRegistry | None" = None,
     ) -> ToolAuthorization:
         """Authorize a tool call using the operation catalog.
 
@@ -9452,8 +9460,42 @@ class ToolRegistry:
             )
             return finish(auth)
 
-        flow_direction = get_tool_flow_direction(tool_name)
-        sink_category = get_sink_category(tool_name)
+        from .plugins.core import core_policy_registry
+
+        policy = policy if policy is not None else core_policy_registry()
+        if not policy.frozen:
+            raise ValueError("authorization requires a frozen policy")
+        tool_policy = policy.tools.get(tool_name)
+        plugin_tool = (
+            tool_policy if tool_policy is not None and tool_policy.owner != "core"
+            else None
+        )
+        plugin_channel_target = None
+        plugin_channel_valid = False
+        if plugin_tool is not None and plugin_tool.resource_scope == "channel":
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                plugin_channel_valid = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                plugin_channel_valid = False
+            if plugin_channel_valid:
+                plugin_channel_target = targets[0]
+                if target_channel is None:
+                    target_channel = sink_target = requested_target = plugin_channel_target
+        flow_direction = (
+            ToolFlowDirection(plugin_tool.flow) if plugin_tool is not None
+            else get_tool_flow_direction(tool_name)
+        )
+        sink_category = (
+            plugin_tool.descriptor.sink_category
+            if plugin_tool is not None and plugin_tool.descriptor is not None
+            else get_sink_category(tool_name)
+        )
         if ifc_labels is None and auth_context is not None:
             ifc_labels = getattr(auth_context, "ifc_labels", None)
         raw_write_target = ((arguments or {}).get("file_path")
@@ -9464,6 +9506,9 @@ class ToolRegistry:
             return finish(_tainted_write_denial(tool_name))
         if tool_name in _SCHEDULE_WRITE_TOOLS and _turn_has_untrusted_active_ingest(auth_context, ifc_labels):
             return finish(_scheduled_write_denial(tool_name))
+        if (plugin_tool is not None and plugin_tool.writes_code_or_state
+                and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
+            return finish(_tainted_write_denial(tool_name))
         if tool_name in {"write_file", "edit_file", "replace_file"}:
             home = os.environ.get("MIMIR_HOME", "").strip()
             raw_path = (arguments or {}).get("file_path") or (arguments or {}).get("path") or target_channel
@@ -9501,7 +9546,10 @@ class ToolRegistry:
             skill_write.flow_direction = flow_direction
             return finish(skill_write)
         catalog = get_operation_catalog()
-        preliminary_decision = catalog.get_decision(tool_name, auth_context)
+        preliminary_decision = (
+            OperationDecision(plugin_tool.operation_class) if plugin_tool is not None
+            else catalog.get_decision(tool_name, auth_context)
+        )
         preliminary_service = (
             get_trusted_service_from_auth_context(auth_context)
             if auth_context is not None
@@ -9555,11 +9603,20 @@ class ToolRegistry:
                         refusal_detail=str(exc),
                     ))
                 repo_pr_action_scope = issue_target
-            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS:
+            elif tool_name in _TYPED_REPO_PR_TOOL_ACTIONS or (
+                plugin_tool is not None and plugin_tool.resource_scope == "repo_pr"
+            ):
                 tool_arguments = arguments or {}
+                plugin_repo_target = (
+                    isinstance(tool_arguments.get("repository"), str)
+                    and bool(tool_arguments["repository"].strip())
+                    and type(tool_arguments.get("pull_request")) is int
+                    and tool_arguments["pull_request"] > 0
+                )
                 retained_scope = getattr(auth_context, "retained_factory_scope", None)
                 retained_matches = (
-                    isinstance(retained_scope, RetainedFactoryScope)
+                    plugin_tool is None
+                    and isinstance(retained_scope, RetainedFactoryScope)
                     and _is_worklink_retained_checkout_service(
                         preliminary_service, auth_context=auth_context,
                     )
@@ -9582,6 +9639,7 @@ class ToolRegistry:
                         if discovered is not None
                         and isinstance(tool_arguments.get("repository"), str)
                         and isinstance(tool_arguments.get("pull_request"), int)
+                        and (plugin_tool is None or plugin_repo_target)
                         else None
                     )
                 if state is None and not retained_matches:
@@ -9592,8 +9650,17 @@ class ToolRegistry:
                             tool_arguments.get("pull_request"),
                         )
                         if registry is not None and hasattr(registry, "resolve")
+                        and (plugin_tool is None or plugin_repo_target)
                         else None
                     )
+                if plugin_tool is not None and state is not None:
+                    from .models import RepoReviewState
+
+                    if not isinstance(state, RepoReviewState) or (
+                        state.repo.lower() != tool_arguments["repository"].lower()
+                        or state.pr_number != tool_arguments["pull_request"]
+                    ):
+                        state = None
                 if not retained_matches:
                     repo_pr_action_scope = (
                         state.action_scope if state is not None else None
@@ -9691,7 +9758,10 @@ class ToolRegistry:
         ):
             sink_target = getattr(auth_context, "channel_id", None)
         if not sink_target:
-            descriptor = get_tool_descriptor(tool_name)
+            descriptor = (
+                plugin_tool.descriptor if plugin_tool is not None
+                else get_tool_descriptor(tool_name)
+            )
             sink_target = descriptor.sink_destination if descriptor else None
         is_ifc_sink = flow_direction in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
@@ -9721,6 +9791,7 @@ class ToolRegistry:
                 requested_cwd=(arguments or {}).get("cwd"),
                 client_authorized_host_execution=client_authorized_host_execution,
                 request_identity=request_identity,
+                sink_category=sink_category,
             )
             sink_check.repo_pr_action_scope = repo_pr_action_scope
             if (not enforce and sink_category is SinkCategory.SHELL_PROCESS
@@ -9777,6 +9848,36 @@ class ToolRegistry:
                 is_shadow = True
                 would_block = True
         elif decision == OperationDecision.RESOURCE_SCOPED:
+            if plugin_tool is not None:
+                scope_kind = plugin_tool.resource_scope
+                if scope_kind == "channel":
+                    if plugin_channel_valid:
+                        channel_auth = ChannelResourceAdapter.authorize_channel_operation(
+                            tool_name, plugin_channel_target, auth_context, enforce=enforce,
+                            registered_plugin=True,
+                        )
+                        channel_auth.flow_direction = flow_direction
+                        return finish(channel_auth)
+                    reason = "channel_target_required"
+                elif scope_kind == "repo_pr" and isinstance(plugin_tool.typed_action, RepoPRAction):
+                    repo_auth = authorize_repo_pr_tool(
+                        tool_name, repo_pr_action_scope,
+                        service_principal=service_principal, enforce=enforce,
+                        flow_direction=flow_direction,
+                        required_actions=(plugin_tool.typed_action.value,),
+                        registered_plugin=True,
+                    )
+                    if shadow_sink is None:
+                        sink_target = requested_target = None
+                    return finish(repo_auth)
+                else:
+                    reason = "resource_scope_unknown"
+                return finish(ToolAuthorization(
+                    tool_name=tool_name, decision=decision, allowed=not enforce,
+                    reason=reason, required_tier=AccessTier.ADMIN,
+                    enforcement_enabled=enforce, is_shadow_decision=not enforce,
+                    would_block=True, flow_direction=flow_direction,
+                ))
             if tool_name == "hands_read":
                 from .tools.client_provider import (
                     MIMIR_HANDS_V1,

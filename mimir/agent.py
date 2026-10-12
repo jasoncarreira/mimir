@@ -1909,7 +1909,7 @@ class Agent:
                     TodoListMiddleware(),
                     IterationGateMiddleware(),
                     ServiceToolSurfaceMiddleware(self._config.plugin_manager.policy),
-                    BudgetGateMiddleware(),
+                    BudgetGateMiddleware(self._config.plugin_manager.policy),
                     FetchedContentReminderMiddleware(self._config.home),
                     SkillMemoryInjectionMiddleware(skill_sources),
                     MidTurnInjectionMiddleware(),

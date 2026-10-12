@@ -133,6 +133,22 @@ def test_core_runtime_surface_materializes_registered_factories() -> None:
     assert all(tool is registry.tools[tool.name].factory() for tool in tools)
 
 
+def test_subagent_budget_gates_share_frozen_parent_policy() -> None:
+    from mimir.plugins.core import core_policy_registry
+    from mimir.subagents import build_mimir_subagents
+    from mimir.tools.budget_gate import BudgetGateMiddleware
+
+    policy = core_policy_registry()
+    parent = BudgetGateMiddleware(policy)
+    children = build_mimir_subagents(policy=policy)
+    assert parent._policy is policy
+    assert len(children) == 2
+    for child in children:
+        gates = [item for item in child["middleware"] if isinstance(item, BudgetGateMiddleware)]
+        assert len(gates) == 1
+        assert gates[0]._policy is policy
+
+
 def test_default_surface_does_not_import_coding_modules() -> None:
     script = """\
 import sys
