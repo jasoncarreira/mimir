@@ -200,6 +200,14 @@ def test_every_core_mimir_name_has_a_reference_entry():
     )
 
 
+def test_plugin_enable_list_reference_contract():
+    assert "MIMIR_PLUGINS" in _scan_core()
+    assert "MIMIR_PLUGINS" in _documented_names()
+    doc = DOC.read_text(encoding="utf-8")
+    assert "Unset or empty `MIMIR_PLUGINS` disables optional plugins only" in doc
+    assert "not\nimported" in doc
+
+
 def test_retired_keys_only_remain_as_startup_warnings():
     assert RETIRED_KEYS <= _scan_core_mimir_names()
     assert RETIRED_KEYS.isdisjoint(_documented_names())
