@@ -17,6 +17,7 @@ import uuid
 
 from ..output_capture import OutputSink, open_output_pair
 from . import identities
+from .compute import LaunchHandle
 
 DEFAULT_EXECUTOR_SOCKET = Path("/run/mimir-worklink/socket/worklink-execd.sock")
 ENABLED_CHECKOUT_ROOT = Path("/var/lib/mimir-worklink/checkouts")
@@ -26,7 +27,7 @@ MAX_PROJECTION_BYTES = 1024 * 1024
 CANCEL_SOCKET_TIMEOUT_S = 20.0
 # Keep this literal independent from worker_exec. The executor runs its image-owned
 # copy, so changing either side of the launch contract requires an image rebuild.
-EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v11-retained-scope"
+EXECUTOR_PROTOCOL_IDENTITY = "worklink-executor-v12-factory-cancel"
 STALE_EXECUTOR_DIAGNOSTIC = (
     "stale root executor image: controller and mimir.worklink.worker_exec protocol "
     "or source identities do not match; rebuild the image and restart the container"
@@ -469,6 +470,38 @@ class WorkerClient:
                 raise RuntimeError("worker executor response identity mismatch")
             if response.get("status") != "cancelled":
                 raise RuntimeError("worker executor returned an invalid cancel response")
+        finally:
+            sock.close()
+
+    async def cancel_factory_handle(self, handle: LaunchHandle) -> None:
+        """Cancel only a recorded factory identity; the executor checks its live job."""
+        _validate_identifier(handle.identifier)
+        if (
+            handle.substrate != "local_subprocess"
+            or type(handle.shim_pid) is not int or handle.shim_pid <= 0
+            or type(handle.process_start_ticks) is not int or handle.process_start_ticks < 0
+        ):
+            raise ValueError("factory cancel requires a verified executor handle")
+        request = {
+            "version": 1, "op": "cancel_factory_handle",
+            "executor_identity": EXECUTOR_PROTOCOL_IDENTITY,
+            "handle": {
+                "substrate": handle.substrate, "identifier": handle.identifier,
+                "process_start_ticks": handle.process_start_ticks,
+                "shim_pid": handle.shim_pid,
+            },
+        }
+        sock = await asyncio.to_thread(self._connect, CANCEL_SOCKET_TIMEOUT_S)
+        try:
+            sock.send(json.dumps(request, separators=(",", ":")).encode())
+            response = json.loads(await asyncio.to_thread(sock.recv, 4096))
+            if "error" in response:
+                error = str(response["error"])
+                if "exact contract" in error or "stale root executor image" in error or "unsupported worker operation" in error:
+                    raise StaleWorkerExecutorError(STALE_EXECUTOR_DIAGNOSTIC)
+                raise RuntimeError(error)
+            if response != {"id": handle.identifier, "status": "exited"}:
+                raise RuntimeError("worker executor returned an invalid factory cancel result")
         finally:
             sock.close()
 

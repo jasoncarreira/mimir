@@ -728,6 +728,13 @@ def render_work_item(issue: IssueContext) -> str:
     )
 
 
+def _bind_work_item_run_id(payload: str, run_id: str) -> str:
+    """Return the rendered work item naming ``run_id``, in the renderer's encoding."""
+    work_item = json.loads(payload)
+    work_item["run_id"] = run_id
+    return json.dumps(work_item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     """Validate the rendered factory payload and return its declared run ID."""
     try:
@@ -2638,6 +2645,7 @@ class WorklinkRunner:
                     base=base,
                     test_cmd=test_cmd,
                     runner=runner,
+                    work_item_json=work_item_json,
                     autonomous=autonomous,
                 )
             else:
@@ -2652,46 +2660,9 @@ class WorklinkRunner:
                     runner=_list_runner(runner),
                     worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
                 )
-                git_name, git_email = _read_checkout_git_identity(lease.path, runner)
-                publishing_identity, publishing_identity_source = (
-                    _read_factory_publishing_identity(self.repo)
-                )
-                github_token, github_env = _resolve_factory_github_credential(os.environ)
-                try:
-                    GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
-                except GitHubIdentityVerificationError as exc:
-                    raise WorklinkError(
-                        f"{exc}; selected identity {publishing_identity} "
-                        f"from {publishing_identity_source}"
-                    ) from exc
-                order = WorkOrder(
-                    issue_id=issue_id,
-                    checkout=lease.path,
-                    prompt=_epic_prompt(issue),
-                    rules=None,
-                    timeout_s=int(_epic_run_timeout_s()),
-                    env={
-                        "MIMIR_HOME": str(self.home),
-                        "MIMIR_WORK_ITEM_JSON": work_item_json,
-                        **github_env,
-                        "GIT_AUTHOR_NAME": git_name,
-                        "GIT_AUTHOR_EMAIL": git_email,
-                        "GIT_COMMITTER_NAME": git_name,
-                        "GIT_COMMITTER_EMAIL": git_email,
-                        # The factory child does the publishing, and 0.8.0+ compares this
-                        # declared identity against ``gh api /user`` at Gate 1.
-                        #
-                        # Two DIFFERENT names are in play: the operator selects the identity
-                        # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
-                        # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
-                        # controller already resolved and verified above, under the child's
-                        # name -- inheritance alone would carry nothing in the local case,
-                        # where the identity comes from .factory.json and no variable is
-                        # exported at all. This also keeps the controller authoritative over
-                        # whatever .factory.json the sandbox happens to hold.
-                        FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
-                    },
-                    transcript_root=self.home / "state" / "worklink" / "transcripts",
+                order, publishing_identity = self._factory_launch_order(
+                    issue=issue, checkout=lease.path,
+                    work_item_json=work_item_json, runner=runner,
                 )
                 spec = selected.work_spec(
                     order,
@@ -2899,6 +2870,60 @@ class WorklinkRunner:
             )
         return result
 
+    def _factory_launch_order(
+        self, *, issue: IssueContext, checkout: Path, work_item_json: str, runner: Runner,
+    ) -> tuple[WorkOrder, str]:
+        """Build the order for a fresh ``/feature`` driver.
+
+        The initial launch and fresh-session recovery both start a new driver
+        that runs intake and later publishes, so both launch from the operator
+        checkout (never the retained sandbox, where intake's absent-feature-ref
+        guard fails) with the work item, Git identity and a verified publishing
+        identity and credential.
+        """
+        git_name, git_email = _read_checkout_git_identity(checkout, runner)
+        publishing_identity, publishing_identity_source = (
+            _read_factory_publishing_identity(self.repo)
+        )
+        github_token, github_env = _resolve_factory_github_credential(os.environ)
+        try:
+            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+        except GitHubIdentityVerificationError as exc:
+            raise WorklinkError(
+                f"{exc}; selected identity {publishing_identity} "
+                f"from {publishing_identity_source}"
+            ) from exc
+        order = WorkOrder(
+            issue_id=issue.issue_id,
+            checkout=checkout,
+            prompt=_epic_prompt(issue),
+            rules=None,
+            timeout_s=int(_epic_run_timeout_s()),
+            env={
+                "MIMIR_HOME": str(self.home),
+                "MIMIR_WORK_ITEM_JSON": work_item_json,
+                **github_env,
+                "GIT_AUTHOR_NAME": git_name,
+                "GIT_AUTHOR_EMAIL": git_email,
+                "GIT_COMMITTER_NAME": git_name,
+                "GIT_COMMITTER_EMAIL": git_email,
+                # The factory child does the publishing, and 0.8.0+ compares this
+                # declared identity against ``gh api /user`` at Gate 1.
+                #
+                # Two DIFFERENT names are in play: the operator selects the identity
+                # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
+                # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
+                # controller already resolved and verified above, under the child's
+                # name -- inheritance alone would carry nothing in the local case,
+                # where the identity comes from .factory.json and no variable is
+                # exported at all. This also keeps the controller authoritative over
+                # whatever .factory.json the sandbox happens to hold.
+                FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
+            },
+            transcript_root=self.home / "state" / "worklink" / "transcripts",
+        )
+        return order, publishing_identity
+
     async def _recover_factory_070(
         self,
         *,
@@ -2913,6 +2938,7 @@ class WorklinkRunner:
         base: str,
         test_cmd: str,
         runner: Runner,
+        work_item_json: str,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
         sandbox = _verify_factory_recovery_binding(
@@ -2964,6 +2990,16 @@ class WorklinkRunner:
             raise WorklinkError("factory recovery refuses a live retained process")
         if not factory_process_is_verified_dead(retained):
             raise WorklinkError("factory recovery cannot verify the retained process is dead")
+        # The sandbox lives at <operator checkout>/.factory-sandboxes/<run id>.
+        operator_checkout = sandbox.parent.parent
+        # Resolve identity before touching the lock, so a refusal leaves the run as found.
+        # Legacy retained runs use the numeric id; bind the work item to the retained
+        # id _verify_factory_recovery_target accepted rather than the canonical render.
+        order, publishing_identity = self._factory_launch_order(
+            issue=issue, checkout=operator_checkout,
+            work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
+            runner=runner,
+        )
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
             backend.lock(
@@ -3013,6 +3049,40 @@ class WorklinkRunner:
         ):
             raise WorklinkError("factory resume did not return an owned running status")
         resumed.require_recovery_next()
+        release_failure = "factory recovery could not verify the retained lock was released"
+        try:
+            backend.lock(
+                retained.run_id, "release", session=session,
+                sandbox=sandbox, launcher=retained.launcher,
+            )
+            released = backend.status(
+                retained.run_id, sandbox=sandbox, launcher=retained.launcher,
+            )
+            _require_factory_status(released, retained)
+            if (
+                released.status != "running"
+                or released.lock != "absent"
+                or released.lock_session is not None
+                or _opaque_json_bytes(released.terminal_result) != historical_result
+            ):
+                raise WorklinkError(release_failure)
+            released.require_recovery_next()
+        except Exception:
+            parked = replace(
+                retained.observed(resumed, datetime.now(UTC).isoformat()),
+                controller_phase="parked",
+                controller_error=_factory_controller_error(release_failure),
+            )
+            save_factory_record(self.home, parked)
+            claims.transition_issue(
+                issue.issue_id, status="blocked", review_ready=False,
+                attempt=claim_record.budget_attempt or claim_record.attempt,
+                reason=f"{release_failure}; retained sandbox: {retained.sandbox}",
+            )
+            return WorklinkRunResult(
+                issue.issue_id, retained.attempt, "needs-human",
+                checkout=sandbox, branch=retained.branch, reason=release_failure,
+            )
         _verify_factory_recovery_binding(
             runner=self,
             issue=issue,
@@ -3023,15 +3093,6 @@ class WorklinkRunner:
             repo_slug=repo_slug,
             base=base,
             command_runner=runner,
-        )
-        order = WorkOrder(
-            issue_id=issue.issue_id,
-            checkout=sandbox,
-            prompt=_epic_prompt(issue),
-            rules=None,
-            timeout_s=int(_epic_run_timeout_s()),
-            env={"MIMIR_HOME": str(self.home)},
-            transcript_root=self.home / "state" / "worklink" / "transcripts",
         )
         recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
         if (
@@ -3045,18 +3106,13 @@ class WorklinkRunner:
             base_ref=retained.base_ref,
             branch=retained.branch,
             test_command=test_cmd,
-            session=session,
             run_id=retained.run_id,
         )
-        if isinstance(compute, LocalSubprocessComputeBackend):
-            # Authorization stays at the original inner checkout; --dir still
-            # selects the retained sandbox validated above. Session data is
-            # attempt-scoped as on the initial launch.
-            spec = replace(spec, local_checkout=sandbox.parent.parent)
+        _require_factory_launch_binding(spec, retained.run_id, publishing_identity)
         spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
         handle = await compute.launch(spec)
         relaunched = replace(
-            retained.observed(resumed, datetime.now(UTC).isoformat()),
+            retained.observed(released, datetime.now(UTC).isoformat()),
             handle=handle,
             controller_phase="running",
             transcript=None,
@@ -3081,7 +3137,8 @@ class WorklinkRunner:
             test_cmd=test_cmd,
             runner=runner,
             started_at=datetime.now(UTC),
-            initial_status=resumed,
+            initial_status=released,
+            recovery_session=session,
             autonomous=autonomous,
         )
 
@@ -3098,6 +3155,7 @@ class WorklinkRunner:
         runner: Runner,
         started_at: datetime,
         initial_status: FactoryStatus | None = None,
+        recovery_session: str | None = None,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
         incident_owner = self._incident_owner or self._begin_incident_invocation(
@@ -3116,8 +3174,13 @@ class WorklinkRunner:
         startup_timeout = _factory_startup_status_timeout_s()
         startup_deadline = min(deadline, loop.time() + startup_timeout)
         stale_after = _epic_stale_heartbeat_s()
+        # Silence during a model generation is not proof that the loop exited.
+        # Keep the short stale diagnostic distinct from the conservative idle
+        # backstop (at least two hours, and eight diagnostic windows).
+        idle_after = max(7200.0, 8 * stale_after)
         last_status: FactoryStatus | None = None
         last_change = loop.time()
+        last_change_at = datetime.now(UTC).isoformat()
         work_snapshot = _factory_work_snapshot(Path(factory_record.sandbox))
         transcript_root = self.home / "state" / "worklink" / "transcripts"
         transcript_snapshot = _factory_transcript_snapshot(
@@ -3179,13 +3242,12 @@ class WorklinkRunner:
             cancel_attempted = True
             await compute.cancel(handle)
 
-        async def park_for_budget(current: FactoryStatus) -> WorklinkRunResult:
+        async def park_for_reason(current: FactoryStatus, reason: str) -> WorklinkRunResult:
             nonlocal factory_record, failed, wait_result
-            reason = _factory_budget_park_reason(current, factory_record)
             await cancel_once()
             wait_result = await _finish_factory_wait_task(wait_task)
             if compute.job_alive(handle):
-                raise WorklinkError("factory driver survived cancellation before budget park")
+                raise WorklinkError("factory driver survived cancellation before park")
             retain_result(wait_result, "needs-human")
             await asyncio.to_thread(
                 backend.terminal,
@@ -3299,7 +3361,11 @@ class WorklinkRunner:
         try:
             while True:
                 if last_status is not None and loop.time() >= park_deadline:
-                    return await park_for_budget(last_status)
+                    return await park_for_reason(
+                        last_status, _factory_budget_park_reason(last_status, factory_record)
+                    )
+                if recovery_session is not None and loop.time() >= startup_deadline:
+                    raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
                 if status is None:
                     remaining = (
                         startup_deadline - loop.time()
@@ -3309,7 +3375,9 @@ class WorklinkRunner:
                     if remaining <= 0:
                         if last_status is None:
                             raise WorklinkError("factory never initialised before startup deadline")
-                        return await park_for_budget(last_status)
+                        return await park_for_reason(
+                            last_status, _factory_budget_park_reason(last_status, factory_record)
+                        )
                     try:
                         status = await asyncio.wait_for(
                             asyncio.to_thread(
@@ -3325,7 +3393,9 @@ class WorklinkRunner:
                             raise WorklinkError(
                                 "factory never initialised before startup deadline"
                             ) from exc
-                        return await park_for_budget(last_status)
+                        return await park_for_reason(
+                            last_status, _factory_budget_park_reason(last_status, factory_record)
+                        )
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
@@ -3336,13 +3406,28 @@ class WorklinkRunner:
                         raise WorklinkError("factory never initialised before startup deadline")
                 else:
                     _require_factory_status(status, factory_record)
+                    handoff_claimed = False
+                    if recovery_session is not None:
+                        if status.lock == "absent" and status.lock_session is None:
+                            if loop.time() >= startup_deadline:
+                                raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                        elif (
+                            status.lock == "fresh"
+                            and not status.dead_lock
+                            and status.lock_session is not None
+                            and status.lock_session != recovery_session
+                        ):
+                            recovery_session = None
+                            handoff_claimed = True
+                        else:
+                            raise WorklinkError("factory recovery lock handoff changed unexpectedly")
                     if status != last_status:
                         status_changed_in_window = last_status is not None
                         last_status = status
                     if factory_record.session is not None and status.lock_session not in {
                         None,
                         factory_record.session,
-                    }:
+                    } and not handoff_claimed:
                         raise WorklinkError("factory lock owner changed")
                     factory_record = factory_record.observed(status, datetime.now(UTC).isoformat())
                     phase = (
@@ -3380,6 +3465,7 @@ class WorklinkRunner:
                             end_stale_episode("liveness_observed")
                             dead_windows = 0
                             last_change = now
+                            last_change_at = datetime.now(UTC).isoformat()
                             work_snapshot = current_work
                             transcript_snapshot = current_transcript
                             status_changed_in_window = False
@@ -3410,7 +3496,19 @@ class WorklinkRunner:
                                     lock=status.lock,
                                     process_alive=compute.job_alive(handle),
                                 )
-                    if stale_failure is None and dead_windows >= 2:
+                            if (
+                                status.status == "running"
+                                and now - last_change >= idle_after
+                                and compute.job_alive(handle)
+                            ):
+                                reason = f"factory driver idle: no progress since {last_change_at}"
+                                end_stale_episode("driver_idle")
+                                return await park_for_reason(status, reason)
+                    if (
+                        stale_failure is None
+                        and dead_windows >= 2
+                        and not compute.job_alive(handle)
+                    ):
                         try:
                             incident = incident_owner.record(
                                 producer="factory_stall",
@@ -3484,6 +3582,11 @@ class WorklinkRunner:
                             sandbox=factory_record.sandbox,
                             reason=detail[:300] or reason,
                         )
+                        _record_factory_milestone(
+                            self.home, kind="factory_needs_human", issue=issue,
+                            run_id=factory_record.run_id, attempt=factory_record.attempt,
+                            factory_record=factory_record,
+                        )
                         failed = False
                         return WorklinkRunResult(
                             issue.issue_id,
@@ -3499,10 +3602,12 @@ class WorklinkRunner:
                     )
                 if loop.time() >= park_deadline:
                     assert last_status is not None
-                    return await park_for_budget(last_status)
+                    return await park_for_reason(
+                        last_status, _factory_budget_park_reason(last_status, factory_record)
+                    )
                 _heartbeat_claim_best_effort(claims, claim_record)
                 poll_delay = max(0.01, float(backend.poll_interval_s))
-                if pre_manifest:
+                if pre_manifest or recovery_session is not None:
                     poll_delay = min(poll_delay, max(0, startup_deadline - loop.time()))
                 else:
                     poll_delay = min(poll_delay, max(0, park_deadline - loop.time()))
@@ -3580,6 +3685,11 @@ class WorklinkRunner:
                 reason=result.reason,
                 sandbox=factory_record.sandbox,
             )
+            _record_factory_milestone(
+                self.home, kind="factory_needs_human", issue=issue,
+                run_id=factory_record.run_id, attempt=factory_record.attempt,
+                factory_record=factory_record,
+            )
             return result
         if status.status in {"blocked", "partial"}:
             claims.transition_issue(
@@ -3607,6 +3717,11 @@ class WorklinkRunner:
                 review_ready=result.review_ready,
                 pr_url=result.pr_url,
                 reason=result.reason,
+            )
+            _record_factory_milestone(
+                self.home, kind=f"factory_{status.status}", issue=issue,
+                run_id=factory_record.run_id, attempt=factory_record.attempt,
+                factory_record=factory_record,
             )
             return result
         evidence_path, pr_url = await _verify_factory_completion(
@@ -5722,20 +5837,51 @@ def _run(
 def _record_factory_milestone(
     home: Path,
     *,
-    kind: Literal["factory_start", "factory_success"],
+    kind: Literal[
+        "factory_start", "factory_success", "factory_needs_human", "factory_blocked", "factory_partial"
+    ],
     issue: IssueContext,
     run_id: str,
     attempt: int,
     pr_url: str | None = None,
+    factory_record: FactoryRunRecord | None = None,
 ) -> None:
     """Informational delivery must not cancel work or replace its result."""
     from .dispatch_failures import dispatch_failure_state_dir, record_factory_transition, terminal_error
 
     try:
+        stop_fields: dict[str, Any] = {}
+        stop_status = {
+            "factory_needs_human": "needs-human",
+            "factory_blocked": "blocked",
+            "factory_partial": "partial",
+        }.get(kind)
+        if stop_status is not None:
+            from .factory_state import factory_record_path
+
+            status = factory_record.status if factory_record is not None else None
+            terminal_result = status.terminal_result if status is not None else None
+            factory_reason = terminal_result.get("reason") if terminal_result else None
+            controller_error = factory_record.controller_error if factory_record is not None else None
+            stop_fields = {
+                # The delivery kind, not an optional/stale factory projection,
+                # defines the receipt validator's status contract.
+                "status": stop_status,
+                "reason": (
+                    factory_reason
+                    if isinstance(factory_reason, str) and factory_reason.strip()
+                    else None
+                ) or controller_error or f"factory status: {stop_status}",
+                "terminal_result": terminal_result,
+                "record_path": str(factory_record_path(home, run_id)),
+                "park_snapshot": status.park_snapshot if status is not None else None,
+                "sandbox": (factory_record.sandbox or "") if factory_record is not None else "",
+            }
         record_factory_transition(
             dispatch_failure_state_dir(home), kind=kind,
             issue_id=issue.issue_id, issue_title=issue.title,
             run_id=run_id, attempt=attempt, pr_url=pr_url,
+            **stop_fields,
         )
     except Exception as exc:
         # The log sink may share the failed/full filesystem with the ledger.

@@ -35,6 +35,7 @@ from mimir.worklink.checkout import CheckoutLease
 from mimir.worklink.detached_dispatch import FactoryRecoveryIdentity
 from mimir.worklink.backends.feature_factory import (
     _FACTORY_PERMISSION,
+    FactoryContractError,
     FeatureFactoryBackend,
     parse_factory_status,
 )
@@ -5230,6 +5231,47 @@ def test_inherited_credential_clears_a_prebound_identity_memo(
         github_module.GitHubForgeClient(token="a-second-token").verify_identity("factory-owner")
 
 
+def _stub_factory_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve the launch identity offline: the recovery tests own the launch, not GitHub."""
+    import mimir.worklink.orchestrator as orchestrator
+
+    class Forge:
+        def __init__(self, *, token: str) -> None:
+            assert token == "factory-token"
+
+        def verify_identity(self, login: str) -> str:
+            assert login == "factory-owner"
+            return login
+
+    monkeypatch.setattr(
+        orchestrator, "_read_checkout_git_identity",
+        lambda checkout, runner: ("Factory Bot", "factory@example.invalid"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_read_factory_publishing_identity",
+        lambda repo: ("factory-owner", ".factory.json"),
+    )
+    monkeypatch.setattr(
+        orchestrator, "_resolve_factory_github_credential",
+        lambda environ: ("factory-token", {"GH_TOKEN": "factory-token"}),
+    )
+    monkeypatch.setattr(orchestrator, "GitHubForgeClient", Forge)
+
+
+def _assert_fresh_driver_launch(spec: WorkSpec, operator_checkout: Path, run_id: str) -> None:
+    """A fresh-session relaunch must look like the initial launch to /feature intake."""
+    from mimir.worklink.backends.feature_factory import FACTORY_PUBLISHING_IDENTITY_ENV
+
+    argv = spec.local_argv
+    assert argv is not None and "--session" not in argv
+    assert argv[argv.index("--dir") + 1] == str(operator_checkout)
+    assert spec.local_checkout == operator_checkout
+    assert json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])["run_id"] == run_id
+    assert spec.env[FACTORY_PUBLISHING_IDENTITY_ENV] == "factory-owner"
+    assert spec.env["GH_TOKEN"] == "factory-token"
+    assert spec.env["GIT_AUTHOR_EMAIL"] == spec.env["GIT_COMMITTER_EMAIL"] == "factory@example.invalid"
+
+
 def _configure_opencode_oauth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5534,9 +5576,11 @@ def test_factory_success_prompt_only_after_success(tmp_path, monkeypatch, autono
     )
     assert result.status == ({"completed": "review_ready", "failure": "failed", "release-failure": "failed"}.get(ending, ending)), result.reason
     entries = list(load_failure_state(dispatch_failure_state_dir(tmp_path)).get("factory_transitions", {}).values())
+    stop_kind = {"blocked": "factory_blocked", "partial": "factory_partial",
+                 "needs-human": "factory_needs_human"}.get(ending)
     assert [entry["kind"] for entry in entries] == (
         ["factory_start", "factory_success"] if autonomous and ending == "completed"
-        else ["factory_start"] if autonomous else []
+        else (["factory_start"] if autonomous else []) + ([stop_kind] if stop_kind else [])
     )
     if autonomous and ending == "completed":
         assert entries[1] == {
@@ -8002,12 +8046,14 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     ("snapshot_published", "cancellation_stops_driver"),
     [(True, True), (False, True), (True, False)],
 )
+@pytest.mark.parametrize("idle", [False, True])
 def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
     snapshot_published: bool,
     cancellation_stops_driver: bool,
+    idle: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -8019,6 +8065,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     lifecycle: list[str] = []
     transitions: list[dict[str, object]] = []
     terminal_reasons: list[str] = []
+    terminal_times: list[float] = []
     parked = False
     parked_status_reads = 0
     snapshot = str(sandbox / ".factory" / ".parked" / "700")
@@ -8101,13 +8148,16 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
             assert stopped.is_set(), "live driver was parked"
             lifecycle.append("terminal")
             terminal_reasons.append(reason)
+            terminal_times.append(factory_clock.now)
             parked = True
 
     async def advance(delay: float) -> None:
         factory_clock.now += delay
         await asyncio.sleep(0)
 
-    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 20.0)
+    monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10000.0 if idle else 20.0)
+    if idle:
+        monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 900.0)
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
     def run() -> WorklinkRunResult:
         return asyncio.run(
@@ -8127,7 +8177,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     if not cancellation_stops_driver:
         with pytest.raises(
             WorklinkError,
-            match="factory driver survived cancellation before budget park",
+            match="factory driver survived cancellation before park",
         ):
             run()
         assert lifecycle == ["cancel", "cleanup"]
@@ -8139,16 +8189,29 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     assert result.status == "needs-human"
     assert lifecycle == ["cancel", "terminal", "cleanup"]
     reason = terminal_reasons[0]
-    assert "budget exhausted at observe-slice:be-retained-recovery-service" in reason
-    assert "9 of 13 slices merged, 1 in review, 3 pending" in reason
-    assert "gates: implementation=passed" in reason
-    assert (
-        f"factory resume 700 --session session-1 --repo {sandbox}" in reason
-    )
+    if idle:
+        assert terminal_times == [7200.0]
+        assert reason.startswith("factory driver idle: no progress since ")
+        assert datetime.fromisoformat(
+            reason.removeprefix("factory driver idle: no progress since ")
+        ).tzinfo == UTC
+    else:
+        assert "budget exhausted at observe-slice:be-retained-recovery-service" in reason
+        assert "9 of 13 slices merged, 1 in review, 3 pending" in reason
+        assert "gates: implementation=passed" in reason
+        assert f"factory resume 700 --session session-1 --repo {sandbox}" in reason
     retained = load_factory_record(tmp_path, "700")
     assert retained is not None and retained.controller_phase == "parked"
+    assert retained.attempt == 1
+    assert retained.controller_error is not None
+    assert retained.controller_error.startswith(reason)
     assert retained.status is not None and retained.status.is_parked
     assert transitions[0]["status"] == "blocked"
+    assert transitions[0]["attempt"] == 1
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
+    assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
+    assert reason in notices[0]["reason"]
     report = str(transitions[0]["reason"])
     if snapshot_published:
         assert retained.status.park_snapshot == snapshot
@@ -8256,6 +8319,9 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def terminal(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("dead process must take the existing failure path")
+
     with pytest.raises(WorklinkError, match="OpenCode process exited"):
         asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
@@ -8273,6 +8339,7 @@ def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
 
     retained = load_factory_record(tmp_path, "700")
     assert retained is not None
+    assert retained.controller_phase == "running"
     assert retained.transcript is not None
     transcript_path = Path(retained.transcript)
     assert transcript_path.parent == tmp_path / "state" / "worklink" / "transcripts"
@@ -8305,7 +8372,7 @@ def _run_factory_progress_case(
     transcript_writes: tuple[tuple[float, str], ...] = (),
     stop_at: float,
     rewrite: tuple[str, str] | None = None,
-) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]]]:
+) -> tuple[dict[str, Any], list[tuple[str, dict[str, Any]]], WorklinkRunResult | None]:
     import mimir.worklink.orchestrator as orchestrator
     from mimir.worklink.dispatch_failures import (
         dispatch_failure_state_dir,
@@ -8333,6 +8400,8 @@ def _run_factory_progress_case(
     transcript.parent.mkdir(parents=True)
     transcript.touch(mode=0o600)
     running = _factory_lifecycle_status(sandbox, status="running")
+    parked = _factory_lifecycle_status(sandbox, status="needs-human", park_snapshot="snapshot")
+    parked_by_controller = False
 
     class CaseFinished(RuntimeError):
         pass
@@ -8357,10 +8426,16 @@ def _run_factory_progress_case(
         def status(self, *args: object, **kwargs: object) -> Any:
             if factory_clock.now >= stop_at:
                 raise CaseFinished
-            return running
+            return parked if parked_by_controller else running
 
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
+
+        def terminal(self, run_id: str, status: str, *, reason: str, **kwargs: object) -> None:
+            nonlocal parked_by_controller
+            assert (run_id, status) == ("700", "needs-human")
+            assert reason.startswith("factory driver idle: no progress since ")
+            parked_by_controller = True
 
     async def advance(delay: float) -> None:
         factory_clock.now += delay
@@ -8385,8 +8460,9 @@ def _run_factory_progress_case(
         orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
     )
 
-    with pytest.raises(CaseFinished):
-        asyncio.run(
+    result = None
+    try:
+        result = asyncio.run(
             WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
@@ -8400,7 +8476,9 @@ def _run_factory_progress_case(
                 autonomous=True,
             )
         )
-    return load_failure_state(dispatch_failure_state_dir(tmp_path)), events
+    except CaseFinished:
+        pass
+    return load_failure_state(dispatch_failure_state_dir(tmp_path)), events, result
 
 
 @pytest.mark.parametrize(
@@ -8438,7 +8516,7 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
         pending_failure_alerts,
     )
 
-    state, _ = _run_factory_progress_case(
+    state, _, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
@@ -8449,10 +8527,36 @@ def test_factory_1783_progress_does_not_create_incident_or_alert(
 
     assert occurrence
     assert state.get("issues", {}).get("700") is None
+    assert result is None
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
-def test_factory_dead_without_any_liveness_signal_escalates_within_two_windows(
+@pytest.mark.parametrize("stale_after", [900.0, 1800.0])
+def test_factory_alive_without_activity_parks_at_separate_idle_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_clock: SimpleNamespace,
+    stale_after: float,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: stale_after)
+    idle_after = max(7200.0, 8 * stale_after)
+    state, events, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=idle_after + 900
+    )
+    assert result is not None and result.status == "needs-human"
+    assert result.reason is not None and result.reason.startswith(
+        "factory driver idle: no progress since "
+    )
+    assert factory_clock.now == idle_after
+    assert state.get("issues", {}).get("700") is None
+    assert [name for name, _ in events if "stale_status" in name] == [
+        "worklink_factory_stale_status", "worklink_factory_stale_status_ended"
+    ]
+
+
+def test_factory_long_silent_generation_is_not_parked_or_reported_as_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8462,16 +8566,17 @@ def test_factory_dead_without_any_liveness_signal_escalates_within_two_windows(
         pending_failure_alerts,
     )
 
-    state, _ = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    state, events, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=3660
     )
-
-    incident = state["issues"]["700"]
-    assert incident["active"] is True
-    assert incident["terminal_error"] == "factory emitted no liveness signals"
-    blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
-    assert blocked == {700}
-    assert len(alerts) == 1
+    # Four diagnostic windows without a transcript write or an exit marker is
+    # still compatible with a healthy long model generation.
+    assert factory_clock.now == 3660
+    assert result is None
+    assert state.get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
+    stale = [name for name, _ in events if "stale_status" in name]
+    assert stale == ["worklink_factory_stale_status", "worklink_factory_stale_status_ended"]
 
 
 def test_factory_logging_without_productivity_runs_to_its_budget(
@@ -8479,7 +8584,7 @@ def test_factory_logging_without_productivity_runs_to_its_budget(
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
 ) -> None:
-    state, _ = _run_factory_progress_case(
+    state, _, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
@@ -8489,9 +8594,10 @@ def test_factory_logging_without_productivity_runs_to_its_budget(
     )
 
     assert state.get("issues", {}).get("700") is None
+    assert result is None
 
 
-def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
+def test_factory_unreadable_work_snapshot_does_not_prevent_idle_park(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8499,13 +8605,11 @@ def test_factory_unreadable_work_snapshot_fails_closed_to_stall(
     import mimir.worklink.orchestrator as orchestrator
 
     monkeypatch.setattr(orchestrator, "_factory_work_snapshot", lambda _sandbox: None)
-    state, _ = _run_factory_progress_case(
-        tmp_path, monkeypatch, factory_clock, stop_at=1860
+    state, _, result = _run_factory_progress_case(
+        tmp_path, monkeypatch, factory_clock, stop_at=8100
     )
-
-    incident = state["issues"]["700"]
-    assert incident["active"] is True
-    assert incident["terminal_error"] == "factory emitted no liveness signals"
+    assert result is not None and result.status == "needs-human"
+    assert state.get("issues", {}).get("700") is None
 
 
 def test_factory_transcript_snapshot_requires_controller_read_access(
@@ -8533,7 +8637,7 @@ def test_factory_transcript_snapshot_requires_controller_read_access(
     assert _factory_transcript_snapshot(root, 701, 1) == {}
 
 
-def test_factory_work_advance_releases_a_stale_incident(
+def test_factory_work_advance_keeps_driver_active(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
@@ -8543,18 +8647,19 @@ def test_factory_work_advance_releases_a_stale_incident(
         pending_failure_alerts,
     )
 
-    state, events = _run_factory_progress_case(
+    state, events, result = _run_factory_progress_case(
         tmp_path,
         monkeypatch,
         factory_clock,
-        writes=((1860, "validation-report.md", "now complete"),),
+        writes=((840, "validation-report.md", "now complete"), (1740, "review.md", "done")),
         stop_at=1920,
     )
 
-    assert state["issues"]["700"]["active"] is False
+    assert state.get("issues", {}).get("700") is None
+    assert result is None
     assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
     ended = [fields for name, fields in events if name.endswith("stale_status_ended")]
-    assert ended[-1]["end_reason"] == "liveness_observed"
+    assert ended == []
 
 
 def test_factory_work_snapshot_does_not_depend_on_private_run_state(
@@ -8667,7 +8772,7 @@ def test_run_worklink_epic_supersedes_stall_with_terminal_failure(
         )
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
-    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 5.0)
     monkeypatch.setattr(
         orchestrator,
         "_epic_run_timeout_s",
@@ -8751,6 +8856,9 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
         def heartbeat(self, *args: object, **kwargs: object) -> None:
             return None
 
+        def terminal(self, *args: object, **kwargs: object) -> None:
+            raise WorklinkError("factory terminal exception")
+
     async def supervise_actual(**kwargs: Any) -> WorklinkRunResult:
         supervisor = kwargs.pop("_supervisor")
         kwargs["backend"] = Backend(kwargs["factory_record"])
@@ -8762,7 +8870,7 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
         raise OSError("disk full")
 
     monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
-    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 1.0)
+    monkeypatch.setattr(orchestrator, "_epic_stale_heartbeat_s", lambda: 5.0)
     monkeypatch.setattr(orchestrator, "_epic_run_timeout_s", lambda: 10.0)
     monkeypatch.setattr(orchestrator, "_record_run_failure", disk_failure)
     monkeypatch.setattr(
@@ -8782,9 +8890,9 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
             release_signals=scans,
         )
 
-    # Two complete quiet windows are required before the incident write.
-    assert status_calls == 3
-    assert writes == ["factory emitted no liveness signals"]
+    # Incident persistence failure retains the claim and run state.
+    assert status_calls == 5
+    assert writes == ["factory terminal exception"]
     assert lifecycle == ["cancel", "cleanup"]
     assert releases == []
     assert scans == []
@@ -8794,12 +8902,10 @@ def test_real_factory_stall_ledger_failure_retains_claim_and_run_state(
     assert Path(retained.transcript).is_file()
 
 
-@pytest.mark.parametrize("ending", ["parked", "newer-incident"])
-def test_factory_stale_status_events_are_bounded_per_episode(
+def test_factory_live_transcript_prevents_idle_park(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     factory_clock: SimpleNamespace,
-    ending: str,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
 
@@ -8813,6 +8919,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     claim_heartbeats: list[ClaimRecord] = []
     running = _factory_lifecycle_status(sandbox, status="running")
     changed = replace(running, next="review")
+    transcript = tmp_path / "state" / "worklink" / "transcripts" / "feature_factory-700-a1-live.stderr.log"
+    transcript.parent.mkdir(parents=True)
 
     class Compute:
         async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -8837,7 +8945,7 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         def status(self, *args: object, **kwargs: object) -> Any:
             self.status_calls += 1
             assert factory_clock.now <= 4000
-            if factory_clock.now == 4000 and ending in {"parked", "newer-incident"}:
+            if factory_clock.now == 4000:
                 return _factory_lifecycle_status(sandbox, status="needs-human")
             return running if factory_clock.now < 2000 else changed
 
@@ -8851,6 +8959,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     async def advance(delay: float) -> None:
         delays.append(delay)
         factory_clock.now += delay
+        with transcript.open("a", encoding="utf-8") as stream:
+            stream.write("driver activity\n")
         await asyncio.sleep(0)
 
     monkeypatch.delenv("MIMIR_FACTORY_STALE_HEARTBEAT_S", raising=False)
@@ -8863,86 +8973,26 @@ def test_factory_stale_status_events_are_bounded_per_episode(
     monkeypatch.setattr(
         orchestrator, "_log_event", lambda name, **fields: events.append((name, fields))
     )
-    if ending == "newer-incident":
-        import mimir.worklink.dispatch_failures as dispatch_failures
-
-        real_resolve = dispatch_failures.resolve_failure_if_current
-        resolve_calls = 0
-
-        def race_newer(
-            state_dir: Path,
-            issue_id: int,
-            signature: str,
-            occurrence_id: str,
-        ) -> bool:
-            nonlocal resolve_calls
-            resolve_calls += 1
-            if resolve_calls == 2:
-                dispatch_failures.record_failure(
-                    state_dir,
-                    issue_id=issue_id,
-                    attempt=2,
-                    exit_status=1,
-                    error="newer terminal factory failure",
-                    log_path="newer.log",
-                )
-            return real_resolve(state_dir, issue_id, signature, occurrence_id)
-
-        monkeypatch.setattr(
-            dispatch_failures, "resolve_failure_if_current", race_newer
-        )
     backend = Backend()
-    with (
-        pytest.raises(WorklinkError, match="factory exceeded run timeout")
-        if ending == "timeout" else nullcontext()
-    ):
-        result = asyncio.run(
-            WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
-                issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
-                claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-                claims=Claims(),
-                backend=backend,
-                compute=Compute(),
-                factory_record=_factory_lifecycle_record(sandbox, handle),
-                test_cmd="pytest -q",
-                runner=lambda args: cp(args),
-                started_at=datetime.now(UTC),
-                autonomous=True,
-            )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=Claims(),
+            backend=backend,
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+            autonomous=True,
         )
-        assert result.status == "needs-human"
+    )
+    assert result.status == "needs-human"
 
     stale_events = [(name, fields) for name, fields in events if "stale_status" in name]
-    # Each episode has over a thousand stale polls, but only entry and end emit.
-    assert [name for name, _ in stale_events] == [
-        "worklink_factory_stale_status",
-        "worklink_factory_stale_status_ended",
-    ] * 2
-    for episode in (1, 2):
-        entry = stale_events[(episode - 1) * 2][1]
-        end = stale_events[(episode - 1) * 2 + 1][1]
-        for fields in (entry, end):
-            assert fields["issue_id"] == 700
-            assert fields["attempt"] == 1
-            assert fields["run_id"] == "700"
-            assert fields["stale_episode"] == episode
-            assert fields["diagnostic_after_s"] == 900
-        assert entry["lock"] == "fresh"
-        assert entry["process_alive"] is True
-        assert entry["unchanged_for_s"] == 900
-        assert entry["stale_duration_s"] == 0
-        assert end["unchanged_for_s"] == 2000
-        assert end["stale_duration_s"] == 1100
-        assert end["stale_started_at"] == entry["stale_started_at"]
-        assert datetime.fromisoformat(entry["stale_started_at"]).tzinfo == UTC
-        assert end["end_reason"] == (
-            "supervision_ended"
-            if episode == 2 and ending == "timeout"
-            else "liveness_observed"
-        )
-    assert backend.status_calls == backend.heartbeat_calls == (
-        4001 if ending in {"parked", "newer-incident"} else 4000
-    )
+    assert stale_events == []
+    assert backend.status_calls == backend.heartbeat_calls == 4001
     assert delays == [1.0] * 4000
     assert len(claim_heartbeats) == 4000
     assert lifecycle == ["cancel", "cleanup"]
@@ -8952,19 +9002,8 @@ def test_factory_stale_status_events_are_bounded_per_episode(
         pending_failure_alerts,
     )
 
-    incident = load_failure_state(dispatch_failure_state_dir(tmp_path))["issues"]["700"]
-    if ending == "parked":
-        assert incident["active"] is False
-        assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
-    elif ending == "newer-incident":
-        assert incident["active"] is True
-        assert incident["terminal_error"] == "newer terminal factory failure"
-        assert incident["attempt"] == 2
-    else:
-        assert incident["active"] is True
-        blocked, alerts = pending_failure_alerts(dispatch_failure_state_dir(tmp_path))
-        assert blocked == {700}
-        assert len(alerts) == 1
+    assert load_failure_state(dispatch_failure_state_dir(tmp_path)).get("issues", {}).get("700") is None
+    assert pending_failure_alerts(dispatch_failure_state_dir(tmp_path)) == (set(), [])
 
 
 @pytest.mark.parametrize("failure", ["status", "heartbeat", "persistence"])
@@ -9115,6 +9154,78 @@ def test_factory_pre_manifest_status_is_bounded_by_startup_deadline(
     assert status_calls >= 2
     assert lifecycle == ["cancel", "cleanup"]
     assert factory_clock.now == 30.0
+
+
+@pytest.mark.parametrize("lock_owner", [None, "session-1"])
+def test_factory_recovery_absent_lock_is_bounded_by_startup_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, factory_clock: SimpleNamespace,
+    lock_owner: str | None,
+) -> None:
+    import mimir.worklink.orchestrator as orchestrator
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    released = _factory_lifecycle_status(
+        sandbox, status="running", lock="absent", session=None,
+    )
+    record = replace(_factory_lifecycle_record(sandbox, handle), session="session-1")
+    status_calls = 0
+    lifecycle: list[str] = []
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            lifecycle.append("cleanup")
+
+    class Backend:
+        poll_interval_s = 1
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            nonlocal status_calls
+            assert factory_clock.now < 3.0
+            status_calls += 1
+            if lock_owner is not None:
+                return _factory_lifecycle_status(
+                    sandbox, status="running", lock="fresh", session=lock_owner,
+                )
+            return released
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("the retired session must not heartbeat")
+
+    async def advance(delay: float) -> None:
+        factory_clock.now += delay
+
+    monkeypatch.setattr(orchestrator.asyncio, "sleep", advance)
+    monkeypatch.setenv("MIMIR_FACTORY_STARTUP_STATUS_TIMEOUT_S", "3")
+    expected = (
+        "factory recovery lock handoff changed unexpectedly"
+        if lock_owner else "did not acquire the run lock before startup deadline"
+    )
+    with pytest.raises(WorklinkError, match=expected):
+        asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=object(), backend=Backend(), compute=Compute(),
+            factory_record=record, test_cmd="pytest -q",
+            runner=lambda args: cp(args), started_at=datetime.now(UTC),
+            initial_status=released, recovery_session="session-1",
+        ))
+    assert status_calls == (1 if lock_owner else 2)
+    assert lifecycle == ["cancel", "cleanup"]
+    assert load_factory_record(tmp_path, "700").session == "session-1"
 
 
 @pytest.mark.parametrize("after_valid", [False, True])
@@ -9680,6 +9791,8 @@ def test_factory_needs_human_transitions_epic_to_parked_tracker_state(
     [("absent", False, "claim"), ("stale", True, "steal"), ("fresh", False, None)],
 )
 @pytest.mark.parametrize("local_compute", [False, True], ids=["fake", "local"])
+@pytest.mark.parametrize("retained_session", ["session-1", "session-2"])
+@pytest.mark.parametrize("idle_park", [False, True], ids=["operator-park", "idle-park"])
 def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9687,7 +9800,10 @@ def test_factory_recovery_uses_run_id_first_lock_resume_and_authoritative_status
     dead_lock: bool,
     action: str | None,
     local_compute: bool,
+    retained_session: str,
+    idle_park: bool,
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     from mimir.worklink.compute import LocalSubprocessComputeBackend
     from mimir.worklink.run_state import process_start_ticks
 
@@ -9724,7 +9840,7 @@ print(json.dumps([str(path) for path in pruned]))
         return json.loads(child.stdout)
     historical = {"reason": "opaque and nonauthoritative"}
 
-    def status(value: str, lock_value: str, next_value: str | None = None):
+    def status(value: str, lock_value: str, next_value: str | None = None, owner: str | None = None):
         payload: dict[str, Any] = {
             "run_id": "700",
             "issue_key": "700",
@@ -9737,7 +9853,7 @@ print(json.dumps([str(path) for path in pruned]))
             "pr_draft": False,
             "lock": lock_value,
             "dead_lock": dead_lock if lock_value == lock else False,
-            "lock_session": None if lock_value == "absent" else "session-1",
+            "lock_session": None if lock_value == "absent" else owner or retained_session,
             "gates": {},
             "steps": [{"agent": "implementation", "status": "running", "attempts": 1}],
             "slices": [{
@@ -9764,7 +9880,9 @@ print(json.dumps([str(path) for path in pruned]))
         statuses.append(status("needs-human", "fresh"))
     statuses.extend([
         status("running", "fresh", "implementation"),
-        status("needs-human", "fresh"),
+        status("running", "absent", "implementation"),
+        status("running", "absent", "implementation"),
+        status("needs-human", "fresh", owner="session-3"),
     ])
     calls: list[tuple[str, ...]] = []
 
@@ -9824,9 +9942,9 @@ print(json.dumps([str(path) for path in pruned]))
                 assert self.process.poll() is None
                 assert sandbox.is_dir()
             assert spec.local_argv is not None
-            session_index = tuple(spec.local_argv).index("--session")
-            assert spec.local_argv[session_index + 1] == "session-1"
-            assert spec.local_argv[-1].split()[-1] == "700"
+            assert "--session" not in spec.local_argv
+            assert spec.local_argv[-1] == " --autonomous --max-retries 5 700"
+            _assert_fresh_driver_launch(spec, sandbox.parent.parent, "700")
             return self.handle
 
         async def wait(self, handle: LaunchHandle, timeout_s: int) -> ComputeResult:
@@ -9887,11 +10005,15 @@ print(json.dumps([str(path) for path in pruned]))
         branch="epic/700",
         launcher="/opt/factory/bin/factory.js",
         sandbox=str(sandbox),
-        session="session-1",
+        session=retained_session,
         handle=LaunchHandle("local_subprocess", "99999999", 456),
         status=status("needs-human", lock),
         observed_at="2026-08-18T12:00:00+00:00",
         controller_phase="parked",
+        controller_error=(
+            "factory driver idle: no progress since 2026-08-18T11:45:00+00:00"
+            if idle_park else None
+        ),
     )
     claim = ClaimRecord(
         700, attempt, "agent", datetime.now(UTC),
@@ -9935,15 +10057,18 @@ print(json.dumps([str(path) for path in pruned]))
     expected = [("status", "700", str(sandbox), retained.launcher)]
     if action is not None:
         expected.extend([
-            ("lock", "700", action, "session-1", str(sandbox)),
+            ("lock", "700", action, retained_session, str(sandbox)),
             ("status", "700", str(sandbox), retained.launcher),
         ])
     expected.extend([
-        ("resume", "700", "session-1", str(sandbox)),
+        ("resume", "700", retained_session, str(sandbox)),
+        ("status", "700", str(sandbox), retained.launcher),
+        ("lock", "700", "release", retained_session, str(sandbox)),
         ("status", "700", str(sandbox), retained.launcher),
     ])
     assert calls[:len(expected)] == expected
-    assert calls[-1] == ("heartbeat", "700", "session-1", str(sandbox))
+    assert calls[-1] == ("heartbeat", "700", "session-3", str(sandbox))
+    assert load_factory_record(tmp_path, "700").session == "session-3"
     assert compute.cancelled and compute.cleaned
     assert compute.launches == 1
     if local_compute:
@@ -9958,7 +10083,8 @@ print(json.dumps([str(path) for path in pruned]))
         assert compute.spec.issue_id == retained.issue_id == 700
         assert compute.spec.attempt == retained.attempt == 3
         argv = tuple(compute.spec.local_argv or ())
-        assert argv[argv.index("--dir") + 1] == str(sandbox)
+        # A fresh driver launches from the operator checkout, as on the initial launch.
+        assert argv[argv.index("--dir") + 1] == str(original_checkout)
 
 
 @pytest.mark.parametrize(
@@ -9969,6 +10095,14 @@ print(json.dumps([str(path) for path in pruned]))
         ("changed_history", ["status", "lock:claim", "status"]),
         ("missing_next", ["status", "resume", "status"]),
         ("live_process", ["status"]),
+        # Identity is resolved before any lock or resume, so a refusal changes nothing.
+        ("identity_refused", ["status"]),
+        ("release_failed", ["status", "resume", "status", "lock:release"]),
+        ("release_held", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_owner", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_history", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_status", ["status", "resume", "status", "lock:release", "status"]),
+        ("release_next", ["status", "resume", "status", "lock:release", "status"]),
     ],
 )
 def test_factory_recovery_rejection_command_matrix(
@@ -9977,7 +10111,18 @@ def test_factory_recovery_rejection_command_matrix(
     case: str,
     expected: list[str],
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.orchestrator as orchestrator
+
+    if case == "identity_refused":
+        class RefusingForge:
+            def __init__(self, *, token: str) -> None:
+                pass
+
+            def verify_identity(self, login: str) -> str:
+                raise orchestrator.GitHubIdentityVerificationError("credential is not factory-owner")
+
+        monkeypatch.setattr(orchestrator, "GitHubForgeClient", RefusingForge)
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -10026,11 +10171,23 @@ def test_factory_recovery_rejection_command_matrix(
                 next_present=False,
             ),
         ]
+    elif case.startswith("release_"):
+        statuses = [
+            status(lock="fresh", owner="session-1"),
+            status(lock="fresh", owner="session-1", current="running"),
+            status(
+                lock="fresh" if case == "release_held" else "absent",
+                owner="session-1" if case == "release_owner" else None,
+                current="needs-human" if case == "release_status" else "running",
+                changed_history=case == "release_history",
+                next_present=case != "release_next",
+            ),
+        ]
     else:
         statuses = [status(lock="fresh", owner="session-1")]
     events: list[str] = []
 
-    class Backend:
+    class Backend(FeatureFactoryBackend):
         poll_interval_s = 0
 
         def status(self, *args: object, **kwargs: object) -> Any:
@@ -10039,6 +10196,8 @@ def test_factory_recovery_rejection_command_matrix(
 
         def lock(self, run_id: str, action: str, **kwargs: object) -> None:
             events.append(f"lock:{action}")
+            if case == "release_failed":
+                raise FactoryContractError("release refused")
 
         def resume(self, run_id: str, **kwargs: object) -> Any:
             events.append("resume")
@@ -10074,13 +10233,25 @@ def test_factory_recovery_rejection_command_matrix(
         "factory_process_is_verified_dead",
         lambda record: case != "live_process",
     )
+    if case.startswith("release_"):
+        _configure_opencode_oauth(tmp_path, monkeypatch)
+        monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kwargs: "https://github.com/owner/repo.git")
+        monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+        monkeypatch.setattr(orchestrator, "_git_credential_settings", lambda repo: ())
 
-    with pytest.raises(Exception):
-        asyncio.run(
-            WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+    class Claims:
+        def transition_issue(self, issue_id: int, **kwargs: object) -> None:
+            assert issue_id == 700
+            assert kwargs == {
+                "status": "blocked", "review_ready": False, "attempt": 1,
+                "reason": f"factory recovery could not verify the retained lock was released; retained sandbox: {sandbox}",
+            }
+
+    async def recover() -> WorklinkRunResult:
+        return await WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
                 issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
                 claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
-                claims=object(),
+                claims=Claims(),
                 backend=Backend(),
                 compute=Compute(),
                 retained=retained,
@@ -10089,8 +10260,17 @@ def test_factory_recovery_rejection_command_matrix(
                 base="main",
                 test_cmd="pytest -q",
                 runner=lambda args: cp(args),
-            )
+                work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
         )
+
+    if case.startswith("release_"):
+        result = asyncio.run(recover())
+        assert result.status == "needs-human"
+        assert result.reason == "factory recovery could not verify the retained lock was released"
+        assert load_factory_record(tmp_path, "700").controller_phase == "parked"
+    else:
+        with pytest.raises(Exception):
+            asyncio.run(recover())
 
     assert events == expected
 
@@ -10113,6 +10293,7 @@ def test_factory_recovery_launch_start(
     existing_start: bool,
     write_failure: str | None,
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.dispatch_failures as failures
     import mimir.worklink.orchestrator as orchestrator
 
@@ -10121,6 +10302,7 @@ def test_factory_recovery_launch_start(
     sandbox.mkdir()
     pre = _factory_lifecycle_status(sandbox, status="needs-human")
     resumed = _factory_lifecycle_status(sandbox, status="running")
+    released = parse_factory_status({**resumed.to_json(), "lock": "absent", "lock_session": None})
     retained = replace(
         _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
         attempt=3,
@@ -10146,15 +10328,20 @@ def test_factory_recovery_launch_start(
 
     class Backend(FeatureFactoryBackend):
         def status(self, *args: object, **kwargs: object) -> Any:
-            return pre
+            return released if "released" in events else pre
 
         def resume(self, *args: object, **kwargs: object) -> Any:
             return resumed
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            assert action == "release" and kwargs["session"] == retained.session
+            events.append("released")
 
     class Compute:
         async def launch(self, spec: WorkSpec) -> LaunchHandle:
             events.append("launch")
             assert spec.attempt == retained.attempt
+            assert "--session" not in (spec.local_argv or ())
             return handle
 
         async def cancel(self, selected: LaunchHandle) -> None:
@@ -10202,23 +10389,102 @@ def test_factory_recovery_launch_start(
         base="main",
         test_cmd="pytest -q",
         runner=lambda args: cp(args),
+        work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
         autonomous=autonomous,
     )
     if write_failure == "record":
         with pytest.raises(OSError, match="recovery persistence failed"):
             asyncio.run(recovery)
-        assert events == ["launch", "cancel", "cleanup"]
+        assert events == ["released", "launch", "cancel", "cleanup"]
         assert not failures.load_failure_state(state_dir).get("factory_transitions")
         saved = load_factory_record(tmp_path, "700")
         assert saved.handle == retained.handle
     else:
         assert asyncio.run(recovery) == "supervised"
-        assert events == ["launch", "supervise"]
+        assert events == ["released", "launch", "supervise"]
+
+
+@pytest.mark.parametrize("run_id", ["chainlink-700", "700"], ids=["canonical", "legacy"])
+def test_factory_recovery_binds_work_item_to_retained_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str,
+) -> None:
+    """The real canonical render must not refuse a legacy retained run after its lock moved."""
+    _stub_factory_launch_identity(monkeypatch)
+    import mimir.worklink.orchestrator as orchestrator
+
+    _configure_opencode_oauth(tmp_path, monkeypatch)
+    operator_checkout = tmp_path / "checkout"
+    sandbox = operator_checkout / ".factory-sandboxes" / run_id
+    sandbox.mkdir(parents=True)
+
+    def lifecycle(status: str, **changes: Any) -> Any:
+        return parse_factory_status({
+            **_factory_lifecycle_status(sandbox, status=status).to_json(), "run_id": run_id, **changes,
+        })
+
+    pre, resumed = lifecycle("needs-human"), lifecycle("running")
+    released = lifecycle("running", lock="absent", lock_session=None)
+    retained = replace(
+        _factory_lifecycle_record(sandbox, LaunchHandle("local_subprocess", "999999999", 1)),
+        run_id=run_id, attempt=3, status=pre, controller_phase="parked",
+    )
+    save_factory_record(tmp_path, retained)
+    launched: list[WorkSpec] = []
+    events: list[str] = []
+
+    class Backend(FeatureFactoryBackend):
+        def status(self, *args: object, **kwargs: object) -> Any:
+            return released if "released" in events else pre
+
+        def resume(self, *args: object, **kwargs: object) -> Any:
+            return resumed
+
+        def lock(self, run_id: str, action: str, **kwargs: object) -> None:
+            assert action == "release"
+            events.append("released")
+
+    class Compute:
+        async def launch(self, spec: WorkSpec) -> LaunchHandle:
+            launched.append(spec)
+            return LaunchHandle("local_subprocess", "999999998", 2)
+
+    async def supervise(self: object, **kwargs: Any) -> str:
+        return "supervised"
+
+    monkeypatch.setattr(orchestrator, "_verify_factory_recovery_binding", lambda **kwargs: sandbox)
+    monkeypatch.setattr(orchestrator, "factory_process_is_alive", lambda record: False)
+    monkeypatch.setattr(orchestrator, "factory_process_is_verified_dead", lambda record: True)
+    monkeypatch.setattr(orchestrator, "_repo_remote_url", lambda *args, **kwargs: "https://github.com/owner/repo.git")
+    monkeypatch.setattr(orchestrator, "_factory_checkout_repository", lambda *args: "owner/repo")
+    monkeypatch.setattr(WorklinkRunner, "_supervise_factory_070", supervise)
+
+    issue = IssueContext(700, "epic", "build", {"worklink:epic"})
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=tmp_path)._recover_factory_070(
+        issue=issue,
+        claim_record=ClaimRecord(700, 3, "agent", datetime.now(UTC)),
+        claims=object(),
+        backend=Backend(entrypoint=retained.launcher),
+        compute=Compute(),
+        retained=retained,
+        launcher=Path(retained.launcher),
+        repo_slug="owner/repo",
+        base="main",
+        test_cmd="pytest -q",
+        runner=lambda args: cp(args),
+        work_item_json=orchestrator.render_work_item(issue),
+    ))
+    assert result == "supervised"
+    [spec] = launched
+    _assert_fresh_driver_launch(spec, operator_checkout, run_id)
+    assert spec.local_argv[-1].split()[-1] == run_id
+    work_item = json.loads(spec.env["MIMIR_WORK_ITEM_JSON"])
+    assert work_item == {"run_id": run_id, "title": "epic", "body": "build"}
 
 
 def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _stub_factory_launch_identity(monkeypatch)
     import mimir.worklink.orchestrator as orchestrator
 
     sandbox = tmp_path / "sandbox"
@@ -10285,6 +10551,7 @@ def test_factory_terminal_recovery_cancels_retained_live_process_without_lock_or
             base="main",
             test_cmd="pytest -q",
             runner=lambda args: cp(args),
+            work_item_json=orchestrator.render_work_item(IssueContext(700, "epic", "build", {"worklink:epic"})),
         )
     )
 
@@ -10505,6 +10772,10 @@ def test_factory_lock_refusal_exit_parks_without_terminal_failure(tmp_path: Path
     assert sandbox.is_dir()
     assert retained is not None and retained.controller_phase == "parked"
     assert transitions[0]["status"] == "blocked"
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path))["factory_transitions"].values())
+    assert len(notices) == 1 and notices[0]["kind"] == "factory_needs_human"
+    assert notices[0]["status"] == "needs-human"
     assert not any("push" in call for call in git_calls)
 
 

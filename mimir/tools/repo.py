@@ -167,7 +167,9 @@ def _publish_attested_lease_result(
     state: RepoReviewState,
 ) -> None:
     """Publish exact-scope provenance when the checkout remains author-attested."""
-    from ..access_control import _attested_pr_checkout_lease
+    from ..access_control import (
+        log_pr_checkout_lease_attestation_refused, pr_checkout_lease_attestation,
+    )
 
     context = getattr(runtime, "context", None) if runtime is not None else None
     if context is None:
@@ -189,7 +191,9 @@ def _publish_attested_lease_result(
         or scope.checkout_ref not in (None, f"refs/pull/{scope.pr_number}/head")
     ):
         return
-    if not _attested_pr_checkout_lease(context, scope, state.checkout_lease):
+    attestation = pr_checkout_lease_attestation(context, scope, state.checkout_lease)
+    if not attestation.ok:
+        log_pr_checkout_lease_attestation_refused(context, scope, attestation.reason)
         return
     _publish_attested_scope_result(runtime, scope, scope.observed_head_sha)
 

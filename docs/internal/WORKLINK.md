@@ -120,9 +120,9 @@ executor together by rebuilding the executor image before enabling this layout.
 - **Controls**: Every control is `node <absolute feature-factory/bin/factory.js>`.
   Worklink admits the launcher only after package/adapter 0.10.14 verification and
   all 16 nonmutating structural command probes. Status is read with `status
-  <run-id> --repo <sandbox> --json`; resume and heartbeat reuse the retained
-  session; lock actions use `lock <run-id> <claim|steal|release> --session
-  <session> --repo <sandbox>`.
+  <run-id> --repo <sandbox> --json`; resume uses the retained session, while
+  heartbeat uses the newly claimed session after recovery; lock actions use
+  `lock <run-id> <claim|steal|release> --session <session> --repo <sandbox>`.
 - **Status contract**: Factory status responses are bounded whole JSON payloads
   with required, typed known fields; additive top-level fields are ignored.
   `issue_key`, `pr_base`, `lock_session`, and `pr_url` are string-or-null;
@@ -159,8 +159,16 @@ executor together by rebuilding the executor image before enabling this layout.
 - **Concurrency and liveness**: Same-issue exclusivity comes only from the atomic
   Worklink claim. `MIMIR_FACTORY_MAX_CONCURRENT` is a separate factory cap with
   default/fallback `1`; leaf concurrency remains `2`. The 12-hour timeout is a
-  process liveness backstop. The 900-second stale threshold emits diagnostics
-  only and never dispatches, steals, cancels, or deletes work.
+  process liveness backstop. The 900-second stale threshold is diagnostic only:
+  a healthy model generation may be silent longer than that. The separate idle
+  backstop is at least two hours (or eight stale windows, whichever is longer).
+  A running manifest with no transition, readable sandbox progress, or live
+  stderr transcript growth for that entire interval is parked if the OpenCode
+  process is still alive. This is a conservative timeout, not proof of an exited
+  agent loop. Worklink cancels and verifies the process group before recording
+  `needs-human`, then retains the same attempt for recovery. A dead process
+  still follows the existing failure path; ongoing transcript writes keep the
+  driver active.
 - **Recovery**: A parked or interrupted run retains its sandbox. The parked report
   includes the `park_snapshot` path when the factory published a complete current
   diagnostic control-plane snapshot at `<operator root>/.factory/.parked/<run-id>`;
@@ -168,10 +176,42 @@ executor together by rebuilding the executor image before enabling this layout.
   The snapshot is not resumable: recovery uses the retained sandbox manifest. Recovery binds
   the retained identities, including resolving a factory clone through its local
   lease checkout, reads status, obtains a run-ID-first lock only when justified,
-  rereads owner/history, and resumes and relaunches OpenCode with one session
-  identity. `terminal_result` is opaque context; its `reason` never selects an
+  rereads owner/history, and resumes with the retained session. It then releases
+  that session's lock, verifies qualified status reports an absent, ownerless
+  lock, and launches OpenCode in a fresh session with the unchanged bare run-ID
+  request. Fresh and recovery launches preserve the bare run-id `/feature`
+  request after the leading option prefix; controller context must not be appended
+  because the adapter uses those bytes for run selection and story content.
+  The adapter claims the lock through Step 0 and continues from `status.next`;
+  Worklink persists the new owner on its first fresh-lock status and heartbeats
+  that session. A failed or unverifiable release parks the run without launching,
+  and an absent lock beyond the startup deadline fails supervision rather than
+  waiting for idle parking. Idleness parks through the same `needs-human`
+  recovery path and does not consume an attempt. `terminal_result` is opaque
+  context; its `reason` never selects an
   action. `needs-human` and lock-refusal exits are parked and resumable, not
   terminal. A relaunch never archives, replaces, or removes a retained run.
+- **Park alerts**: The server checks live `factory-runs/*.json` every five minutes,
+  independently of the optional TTL reaper. A `parked` / `needs-human` record
+  sends a fixed-field notice to `MIMIR_OPERATOR_ALERT_CHANNEL` and, when
+  `NTFY_TOPIC` is set, a priority-4 ntfy push. The notice names the Chainlink
+  issue, run and attempt, and points to its `WORKLINK_BLOCKED` comment or
+  `mimir worklink status <id>` for the decision; it never quotes the factory
+  reason. `<home>/state/worklink/factory-park-alerts.json` remembers delivered
+  sinks per run/attempt/terminal-result identity across server restarts. A new
+  park alerts again; with neither destination configured, the server records
+  one `worklink_factory_park_unrouted` event per park. No agent turn is started.
+- **Agent stop notices**: Factory `needs-human` parks (including budget, idle and
+  lock refusal), `blocked`, and `partial` endings also write durable milestones
+  to the Worklink dispatch ledger. The ready-queue poller delivers each as an
+  acknowledged prompt with the bounded terminal reason, retained factory record,
+  park snapshot, sandbox, and `WORKLINK_BLOCKED` comment pointer. A distinct
+  terminal result for the same attempt gets a new delivery key; a re-scan does
+  not re-prompt. The agent reads the preserved record and requests an operator
+  decision via `operator_alert` when needed; it does not resume the run or edit
+  the issue. Stop notices are recorded for both autonomous and operator-launched
+  runs; unlike `factory_start` and `factory_success`, they are not gated by
+  `autonomous`. These prompts complement the independent operator park alerts.
 - **Completion**: `completed`, `blocked`, and `partial` are terminal, but only
   `completed` can ship. Before `worklink:review`, Worklink runs the configured
   repository test command, requires observed non-skipped exit-zero evidence and
@@ -906,7 +946,7 @@ closed when `WORKLINK_REPO` is absent.
 ### Parking and resuming a factory run by hand
 
 The controller parks a run itself when its budget is nearly spent
-(`park_for_budget`), and that is the path to prefer. `scripts/factory_park.py`
+(`park_for_reason`), and that is the path to prefer. `scripts/factory_park.py`
 and `scripts/factory_resume.py` cover the case where an operator needs to park
 sooner — to preserve an approved spec, an approved decomposition and slice
 reviews that a budget kill would otherwise sweep. Resume recomputes the deadline
@@ -989,7 +1029,11 @@ scripts/factory_resume.py --run-id chainlink-1783 \
 mimir's recovery path performs the whole transition as one operation — it
 requires the retained process to be verifiably dead, steals or claims the
 session lock using the *recorded* session, resumes, verifies the result is owned
-and running, validates the recovery binding, relaunches and enters supervision.
+and running with a recovery `next`, releases the retained lock and verifies it
+is absent and ownerless, validates the recovery binding, relaunches in a fresh
+OpenCode session and enters supervision. The adapter claims through Step 0
+from `status.next`, and supervision persists the new lock owner for subsequent
+heartbeats and recovery.
 Unparking from outside spends the `needs-human` transition that path is gated on,
 after which it refuses the run with `factory resume requires current status
 needs-human` and the attempt is lost. So the script reports which recovery

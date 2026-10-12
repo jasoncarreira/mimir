@@ -1236,7 +1236,7 @@ class RepoReviewState:
     git_expected_head: str | None = field(default=None, init=False, repr=False, compare=False)
     full_tested_head: str | None = field(default=None, init=False, repr=False, compare=False)
     conflict_evidence_head: str | None = field(default=None, init=False, repr=False, compare=False)
-    _author_attestation_verdicts: dict[tuple[str, str], bool] = field(
+    _author_attestation_verdicts: dict[tuple[str, str], tuple[bool, str]] = field(
         default_factory=dict, init=False, repr=False, compare=False,
     )
     _author_attestation_lock: Any = field(
@@ -1293,14 +1293,14 @@ class RepoReviewState:
         with self._author_attestation_lock:
             self._author_attestation_verdicts.clear()
 
-    def author_attestation_verdict(self, head: str, verify: Any) -> bool:
-        """Reuse one author-attestation verdict for an unchanged checkout HEAD."""
+    def author_attestation_verdict(self, head: str, verify: Any) -> tuple[bool, str]:
+        """Reuse the verdict and its content-free reason for an unchanged HEAD."""
         key = (self.action_scope.scope_id, head.lower())
         with self._author_attestation_lock:
             cached = self._author_attestation_verdicts.get(key)
-            if type(cached) is bool:
+            if cached is not None:
                 return cached
-            verdict = bool(verify())
+            verdict = verify()
             self._author_attestation_verdicts[key] = verdict
             return verdict
 

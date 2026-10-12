@@ -281,11 +281,10 @@ def process_is_alive(state: WorklinkRunState) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        pass
     except OSError as exc:
-        if exc.errno == errno.EPERM:
-            return True
-        return False
+        if exc.errno != errno.EPERM:
+            return False
     if process_is_zombie(pid):
         return False
     if state.process_start_ticks is None:
