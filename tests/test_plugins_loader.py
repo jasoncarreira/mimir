@@ -10,6 +10,7 @@ import pytest
 
 from mimir.plugins.discovery import PluginDiscoveryError
 from mimir.plugins.manager import load_plugins
+from mimir.tool_descriptors import ResultOriginKind
 
 
 def test_selected_provider_registers_once_and_freezes(monkeypatch):
@@ -39,6 +40,36 @@ def test_named_load_and_registration_errors(monkeypatch):
     monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: (candidate,))
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: registration failed: import broke"):
         load_plugins(enable="alpha")
+
+
+@pytest.mark.parametrize("registration,cause", [
+    ("profile", "unknown capability missing-capability"),
+    ("action", "repo_pr scope requires typed action"),
+])
+def test_selected_plugin_freeze_failure_names_owner_and_cause(monkeypatch, registration, cause):
+    def register(registrar):
+        if registration == "profile":
+            registrar.register_authority_profile("alpha-profile", capabilities={"missing-capability"})
+        else:
+            registrar.register_tool(
+                name="alpha-repo", factory=lambda: object(), flow="source",
+                tier="scope-contained", operation_class="resource_scoped",
+                resource_scope="repo_pr", result_domain=None,
+                result_origin=ResultOriginKind.NONE, sink_category=None,
+                sink_destination=None, sink_target_extractor=None,
+                sink_payload_extractor=None, writes_code_or_state=False,
+                profiles=(), read_backend=False,
+            )
+
+    candidate = SimpleNamespace(
+        name="alpha", distribution="provider-alpha",
+        entry_point=SimpleNamespace(load=lambda: SimpleNamespace(register=register)),
+    )
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: (candidate,))
+    with pytest.raises(PluginDiscoveryError) as error:
+        load_plugins(enable="alpha")
+    assert "enabled plugin(s) 'alpha':" in str(error.value)
+    assert cause in str(error.value)
 
 
 def test_disabled_provider_is_not_imported_by_loader_in_child_process(tmp_path):

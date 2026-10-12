@@ -65,5 +65,18 @@ def load_plugins(*, enable: str) -> PluginManager:
     try:
         policy.freeze()
     except Exception as exc:
-        raise PluginDiscoveryError(f"plugin policy validation failed: {exc}") from exc
+        subject = str(exc).split(":", 1)[0]
+        tool = policy.tools.get(subject)
+        profile = policy.profiles.get(subject)
+        owner = (tool.owner if tool is not None else
+                 profile.owner if profile is not None else
+                 policy.capabilities.get(subject))
+        if owner is not None and owner != "core":
+            names = (owner,)
+        else:
+            names = tuple(candidate.name for candidate in selected)
+        raise PluginDiscoveryError(
+            f"enabled plugin(s) {', '.join(repr(name) for name in names)}: "
+            f"policy validation failed: {exc}"
+        ) from exc
     return PluginManager(policy, tuple(loaded))
