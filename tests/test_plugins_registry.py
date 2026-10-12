@@ -64,6 +64,29 @@ def test_core_policy_entries_do_not_invent_descriptor_or_flow_rows():
     assert registry.authority_profiles["github"] == {"bash_jobs_list", "pr_review_others"}
 
 
+@pytest.mark.parametrize("tool_first", [True, False])
+def test_capability_tier_cannot_lower_tool_tier_in_either_order(tool_first):
+    registry = PolicyRegistry()
+    tool = tool_fields(name="dangerous", tier="unbounded")
+    if tool_first:
+        registry.register_tool(**tool)
+        with pytest.raises(PolicyRegistrationError, match="core: capability dangerous: tier scope-contained conflicts with tool tier unbounded"):
+            registry.register_capability("dangerous", tier="scope-contained")
+        assert "dangerous" not in registry.capabilities
+    else:
+        registry.register_capability("dangerous", tier="scope-contained")
+        with pytest.raises(PolicyRegistrationError, match="core: tool dangerous: tier unbounded conflicts with capability tier scope-contained"):
+            registry.register_tool(**tool)
+        assert "dangerous" not in registry.tools
+
+
+def test_matching_tool_and_capability_tiers_project_one_value():
+    registry = PolicyRegistry()
+    registry.register_capability("sample", tier="scope-contained")
+    registry.register_tool(**tool_fields())
+    assert registry.freeze().tiers["sample"] == "scope-contained"
+
+
 def test_plugin_cannot_exclude_its_descriptor_or_flow():
     registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match="descriptor exclusion is core-only"):

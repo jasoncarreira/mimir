@@ -203,6 +203,11 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{name}: invalid flow, tier or operation class")
         if owner != "core" and tier is None:
             raise PolicyRegistrationError(f"{name}: plugin tier is required")
+        capability_tier = self._capability_tiers.get(name)
+        if capability_tier is not None and tier is not None and capability_tier != tier:
+            raise PolicyRegistrationError(
+                f"{owner}: tool {name}: tier {tier} conflicts with capability tier {capability_tier}"
+            )
         if resource_scope is not None and resource_scope not in _SCOPES:
             raise PolicyRegistrationError(f"{name}: unknown resource scope {resource_scope!r}")
         if owner != "core" and (operation_class == "resource_scoped") != (resource_scope is not None):
@@ -251,6 +256,11 @@ class PolicyRegistry:
         if tier is not None:
             if tier not in _TIERS or owner != "core":
                 raise PolicyRegistrationError(f"{owner}: capability {name}: invalid core-only tier")
+            tool = self._tools.get(name)
+            if tool is not None and tool.tier is not None and tool.tier != tier:
+                raise PolicyRegistrationError(
+                    f"{owner}: capability {name}: tier {tier} conflicts with tool tier {tool.tier}"
+                )
             self._capability_tiers[name] = tier
         self._capabilities[name] = owner
 
