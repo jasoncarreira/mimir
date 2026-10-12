@@ -69,7 +69,7 @@ from .tool_descriptors import (
     TOOL_DESCRIPTORS,
     get_tool_descriptor,
 )
-from .plugins.core import core_policy_registry
+from .plugins.core import CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry
 
 HTTP_EVENT_INGRESS_EXTRA_KEY = "_mimir_event_ingress"
 POLLER_RECOVERY_REPLAY_EXTRA_KEY = "_mimir_poller_recovery_replay"
@@ -139,15 +139,6 @@ assert set(SinkCategory) == _SINK_CATEGORY_CAPABILITY_ELIGIBLE | {
     SinkCategory.HARNESS_DISPLAY,
     SinkCategory.UNKNOWN,
 }
-
-
-class CapabilityTier(StrEnum):
-    """Blast-radius ceiling for authority declared by autonomous triggers."""
-
-    SCOPE_CONTAINED = "scope-contained"
-    SCOPED_WITH_PROVENANCE = "scoped-with-provenance"
-    CODE_EXECUTION = "code-execution"
-    UNBOUNDED = "unbounded"
 
 
 class ToolFlowDirection(StrEnum):
@@ -230,61 +221,6 @@ from .client_file_resources import (
     client_file_resource_is_canonical,
     client_file_resource_path,
 )
-
-
-@dataclass(frozen=True)
-class ServiceSinkPolicy:
-    """One executable, operation-specific service destination grant."""
-
-    operation: str
-    adapter: str
-    destination: str
-
-
-@dataclass(frozen=True)
-class ServicePrincipal:
-    """Trusted autonomous service principal (chainlink #865).
-
-    Defined by server-owned creation path, trigger, capabilities, readable
-    domains, SAGA read breadth, and sink destinations. Unknown synthetic
-    triggers receive no privilege.
-    """
-    canonical: str
-    trigger: str
-    capabilities: tuple[str, ...] = ()
-    readable_domains: tuple[str, ...] = ()
-    sink_destinations: tuple[str, ...] = ()
-    sink_policies: tuple[ServiceSinkPolicy, ...] = ()
-    filesystem_read_roots: tuple[str, ...] = ()
-    owned_skill_directory: str | None = None
-    channel_memory_directory: str | None = None
-    saga_full_corpus_read: bool = False
-    creation_path: str | None = None
-    authority_profile: str | None = None
-    capability_tier: CapabilityTier | None = None
-    #: Per-job shell grants, additive on top of the profile's allowlist. Declared
-    #: in scheduler.yaml or a poller manifest -- neither of which any service
-    #: principal can write -- and validated into this shape before it lands here.
-    declared_shell_commands: tuple["DeclaredShellCommand", ...] = ()
-    # Exact delivery destination nominated by trusted poller/schedule config.
-    # Prompt assembly uses this carrier instead of client-readable event.extra.
-    configured_delivery_channel: str | None = None
-    proposal_surface: str = "wiki"
-
-    def can_read_domain(self, domain: str) -> bool:
-        return domain in self.readable_domains
-
-    def can_write_sink(self, sink: str) -> bool:
-        return sink in self.sink_destinations
-
-    def has_capability(self, capability: str) -> bool:
-        return capability in self.capabilities
-
-    def sink_policy_for(self, operation: str) -> ServiceSinkPolicy | None:
-        return next(
-            (policy for policy in self.sink_policies if policy.operation == operation),
-            None,
-        )
 
 
 _core_profiles = core_policy_registry()
@@ -11618,171 +11554,8 @@ def get_tool_registry() -> ToolRegistry:
     return _global_tool_registry
 
 
-_TRUSTED_SERVICE_PRINCIPALS: dict[str, ServicePrincipal] = {
-    service.trigger: service
-    for service in (
-        ServicePrincipal(
-            canonical="scheduler",
-            trigger="scheduled_tick",
-            capabilities=(
-                "send_message",
-                "operator_alert",
-                "shell_exec",
-                "bash_async",
-                "bash_jobs_list",
-                "bash_job_output",
-                "spawn_open_code",
-                "task",
-                "saga_forget",
-                "write_file",
-                "edit_file",
-                "replace_file",
-                "open_proposal",
-                "submit_proposal",
-                "abandon_proposal",
-                "worklink_run",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "file_search",
-                "get_turn",
-                "mimir_get_turn",
-                "list_schedules",
-            ),
-            readable_domains=(
-                "configured_inputs",
-                "filesystem",
-                "turn_history",
-                "shell_jobs",
-                "schedule_metadata",
-            ),
-            sink_destinations=(
-                "configured_channel",
-                "message",
-                "notification",
-                "filesystem",
-                "shell_process",
-                "spawn_process",
-                "proposal",
-                "saga",
-                "worklink",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy(
-                    "edit_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy(
-                    "replace_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "maintenance"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "maintenance"),
-                ServiceSinkPolicy("spawn_open_code", "spawn_workspace", "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"),
-                ServiceSinkPolicy("worklink_run", "worklink_repo", "WORKLINK_REPO/MIMIR_WORKLINK_REPO"),
-                ServiceSinkPolicy("operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL"),
-            ),
-            saga_full_corpus_read=True,
-            creation_path="mimir.scheduler.Scheduler._fire_job",
-        ),
-        ServicePrincipal(
-            canonical="synthesis",
-            trigger="saga_session_end",
-            capabilities=tuple(sorted(TRIGGER_AUTHORITY_PROFILES["session-boundary"])),
-            readable_domains=("session", "saga", "turn_history"),
-            sink_destinations=(
-                "filesystem", "session_boundary", "saga",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "static_service_write_roots",
-                    "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS",
-                ),
-            ),
-            saga_full_corpus_read=True,
-            creation_path="mimir.server._on_session_idle",
-            authority_profile="session-boundary",
-            capability_tier=CapabilityTier.SCOPED_WITH_PROVENANCE,
-        ),
-        ServicePrincipal(
-            canonical="system",
-            trigger="upgrade",
-            capabilities=(
-                "shell_exec",
-                "bash_async",
-                "bash_jobs_list",
-                "bash_job_output",
-                "write_file",
-                "edit_file",
-                "replace_file",
-                "open_proposal",
-                "submit_proposal",
-                "abandon_proposal",
-                "proposal_diff",
-                "add_schedule",
-                "set_schedule_priority",
-                "list_schedules",
-                "read_file",
-                "aread",
-                "ls",
-                "als",
-                "glob",
-                "aglob",
-                "grep",
-                "agrep",
-                "send_message",
-            ),
-            readable_domains=(
-                "defaults",
-                "proposal",
-                "filesystem",
-                "schedule_metadata",
-                "shell_jobs",
-            ),
-            sink_destinations=(
-                "operator_alert",
-                "filesystem",
-                "shell_process",
-                "proposal",
-                "scheduler",
-                "message",
-            ),
-            sink_policies=(
-                ServiceSinkPolicy(
-                    "write_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy(
-                    "edit_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy(
-                    "replace_file", "upgrade_proposals",
-                    "MIMIR_HOME/scratch/proposals",
-                ),
-                ServiceSinkPolicy("shell_exec", "shell_profile", "upgrade_workspace"),
-                ServiceSinkPolicy("bash_async", "shell_profile", "upgrade_workspace"),
-            ),
-            creation_path="mimir.defaults_upgrade.enqueue_upgrade_prompt_turns",
-        ),
-    )
-}
-
-
-_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset({
-    "scheduled_tick",
-    "saga_session_end",
-    "upgrade",
-})
+_TRUSTED_SERVICE_PRINCIPALS: Mapping[str, ServicePrincipal] = _core_profiles.service_principals
+_REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(_TRUSTED_SERVICE_PRINCIPALS)
 
 
 # Executable capabilities and information-flow metadata are one policy.

@@ -938,9 +938,9 @@ def test_capability_matrix_rejects_removed_declared_companion(
     import mimir.access_control as access_control
 
     scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "scheduled_tick",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
         replace(
             scheduler,
             capabilities=tuple(
@@ -948,7 +948,7 @@ def test_capability_matrix_rejects_removed_declared_companion(
                 for capability in scheduler.capabilities
                 if capability != "bash_job_output"
             ),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -969,33 +969,33 @@ def test_capability_matrix_preflight_fails_with_incomplete_matrix(
         check_capability_matrix_complete,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
+    import mimir.access_control as access_control
+
     captured: list[tuple[str, dict[str, object]]] = []
     monkeypatch.setattr(
         "mimir.tools.budget_gate._emit_event_sync",
         lambda kind, **fields: captured.append((kind, fields)),
     )
-    try:
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical="scheduler",
             trigger="scheduled_tick",
             capabilities=(),
             readable_domains=(),
             sink_destinations=(),
-        )
+        )},
+    )
 
-        is_complete, errors = check_capability_matrix_complete(fail_closed=True)
-        assert is_complete is False
-        assert len(errors) > 0
-        assert any("no capabilities" in e for e in errors)
-        hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
-        assert hard["tool"] == "startup"
-        assert hard["boundary"] == "capability_matrix_preflight"
-        assert hard["reason"] == "capability_matrix_incomplete"
-        assert any("no capabilities" in error for error in hard["target"])
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    is_complete, errors = check_capability_matrix_complete(fail_closed=True)
+    assert is_complete is False
+    assert len(errors) > 0
+    assert any("no capabilities" in e for e in errors)
+    hard = next(fields for kind, fields in captured if kind == "hard_boundary_denied")
+    assert hard["tool"] == "startup"
+    assert hard["boundary"] == "capability_matrix_preflight"
+    assert hard["reason"] == "capability_matrix_incomplete"
+    assert any("no capabilities" in error for error in hard["target"])
 
 
 def test_capability_matrix_rejects_saga_mutation_without_sink_mapping(
@@ -1079,9 +1079,9 @@ def test_capability_matrix_rejects_service_sink_without_executable_policy(
     from dataclasses import replace
 
     scheduler = access_control._TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "scheduled_tick",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick":
         replace(
             scheduler,
             sink_policies=tuple(
@@ -1089,7 +1089,7 @@ def test_capability_matrix_rejects_service_sink_without_executable_policy(
                 for policy in scheduler.sink_policies
                 if policy.operation != "shell_exec"
             ),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -1108,13 +1108,13 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
     from dataclasses import replace
 
     synthesis = access_control._TRUSTED_SERVICE_PRINCIPALS["saga_session_end"]
-    monkeypatch.setitem(
-        access_control._TRUSTED_SERVICE_PRINCIPALS,
-        "saga_session_end",
+    monkeypatch.setattr(
+        access_control, "_TRUSTED_SERVICE_PRINCIPALS",
+        {**access_control._TRUSTED_SERVICE_PRINCIPALS, "saga_session_end":
         replace(
             synthesis,
             sink_destinations=synthesis.sink_destinations + ("notification",),
-        ),
+        )},
     )
 
     is_complete, errors = access_control.check_capability_matrix_complete()
@@ -1129,34 +1129,31 @@ def test_capability_matrix_rejects_unbacked_sink_category_grant(
 @pytest.mark.parametrize("fail_closed", [True, False])
 def test_capability_matrix_reports_seeded_errors_for_both_modes(
     fail_closed: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import mimir.access_control as access_control
     from mimir.access_control import (
         ServicePrincipal,
         _TRUSTED_SERVICE_PRINCIPALS,
         check_capability_matrix_complete,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
-    try:
-        scheduler = original_principals["scheduled_tick"]
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical=scheduler.canonical,
             trigger=scheduler.trigger,
             capabilities=(),
             readable_domains=scheduler.readable_domains,
             sink_destinations=scheduler.sink_destinations,
             creation_path=scheduler.creation_path,
-        )
+        ),
+    })
 
-        is_complete, errors = check_capability_matrix_complete(
-            fail_closed=fail_closed,
-        )
+    is_complete, errors = check_capability_matrix_complete(fail_closed=fail_closed)
 
-        assert is_complete is False
-        assert any("no capabilities" in error for error in errors)
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    assert is_complete is False
+    assert any("no capabilities" in error for error in errors)
 
 
 @pytest.mark.asyncio
@@ -1200,7 +1197,10 @@ async def test_sink_gate_denial_emits_shadow_decision_when_not_enforced() -> Non
     )
 
 
-def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
+def test_enforcement_enablement_fails_closed_with_incomplete_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mimir.access_control as access_control
     from mimir.access_control import (
         CapabilityMatrixError,
         ServicePrincipal,
@@ -1208,10 +1208,9 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
         resolve_access_control_enforcement,
     )
 
-    original_principals = _TRUSTED_SERVICE_PRINCIPALS.copy()
-    try:
-        scheduler = original_principals["scheduled_tick"]
-        _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"] = ServicePrincipal(
+    scheduler = _TRUSTED_SERVICE_PRINCIPALS["scheduled_tick"]
+    monkeypatch.setattr(access_control, "_TRUSTED_SERVICE_PRINCIPALS", {
+        **_TRUSTED_SERVICE_PRINCIPALS, "scheduled_tick": ServicePrincipal(
             canonical=scheduler.canonical,
             trigger=scheduler.trigger,
             capabilities=scheduler.capabilities,
@@ -1221,14 +1220,12 @@ def test_enforcement_enablement_fails_closed_with_incomplete_matrix() -> None:
             ),
             sink_destinations=scheduler.sink_destinations,
             creation_path=scheduler.creation_path,
-        )
+        ),
+    })
 
-        with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
-            resolve_access_control_enforcement(True)
-        assert resolve_access_control_enforcement(False) is False
-    finally:
-        _TRUSTED_SERVICE_PRINCIPALS.clear()
-        _TRUSTED_SERVICE_PRINCIPALS.update(original_principals)
+    with pytest.raises(CapabilityMatrixError, match="read_file.*filesystem"):
+        resolve_access_control_enforcement(True)
+    assert resolve_access_control_enforcement(False) is False
 
 
 def test_enforcement_enablement_rejects_uncataloged_model_tool(

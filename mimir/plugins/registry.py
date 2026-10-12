@@ -341,10 +341,32 @@ class PolicyRegistry:
 
     def register_service_principal(self, principal: Any, *, owner: str = "core") -> None:
         self._writable()
-        from mimir.access_control import ServicePrincipal
+        from .core import CapabilityTier, ServicePrincipal, ServiceSinkPolicy
 
         if not isinstance(principal, ServicePrincipal):
             raise PolicyRegistrationError(f"{owner}: expected frozen ServicePrincipal")
+        if not isinstance(principal.capabilities, tuple) or not all(
+            isinstance(capability, str) and capability for capability in principal.capabilities
+        ):
+            raise PolicyRegistrationError(f"{owner}: invalid principal capabilities")
+        for field_name in ("readable_domains", "sink_destinations"):
+            values = getattr(principal, field_name)
+            if not isinstance(values, tuple) or not all(isinstance(value, str) and value for value in values):
+                raise PolicyRegistrationError(f"{owner}: invalid principal {field_name}")
+        if not isinstance(principal.sink_policies, tuple) or not all(
+            isinstance(policy, ServiceSinkPolicy)
+            and all(isinstance(value, str) and value for value in (policy.operation, policy.adapter, policy.destination))
+            for policy in principal.sink_policies
+        ):
+            raise PolicyRegistrationError(f"{owner}: invalid principal sink policies")
+        if principal.authority_profile is not None:
+            _name(principal.authority_profile, "principal authority profile")
+        if principal.capability_tier is not None and not isinstance(principal.capability_tier, CapabilityTier):
+            raise PolicyRegistrationError(f"{owner}: invalid principal capability tier")
+        if not isinstance(principal.filesystem_read_roots, tuple) or not all(
+            isinstance(root, str) and root for root in principal.filesystem_read_roots
+        ):
+            raise PolicyRegistrationError(f"{owner}: invalid principal read roots")
         trigger = _name(getattr(principal, "trigger", None), "principal trigger")
         canonical = _name(getattr(principal, "canonical", None), "principal canonical")
         if trigger in self._principals or any(p.canonical == canonical for p in self._principals.values()):
@@ -400,6 +422,10 @@ class PolicyRegistry:
             if self._principal_owners[trigger] != "core":
                 if profile is None or not set(principal.capabilities) <= self._profiles[profile].capabilities:
                     raise PolicyRegistrationError(f"{trigger}: principal capabilities outside profile")
+                if not principal.capabilities or not principal.readable_domains or not principal.sink_destinations:
+                    raise PolicyRegistrationError(f"{trigger}: incomplete service principal")
+                if not principal.creation_path:
+                    raise PolicyRegistrationError(f"{trigger}: missing principal creation path")
         self._frozen = True
         return self
 

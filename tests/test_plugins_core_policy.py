@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
 from mimir import access_control as policy
-from mimir.plugins.core import core_policy_registry, register_core_tools
+from mimir.plugins.core import ServicePrincipal, core_policy_registry, register_core_tools
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir.tool_descriptors import (
     ResultOriginKind,
@@ -152,3 +152,52 @@ def test_operator_shell_profile_registration_is_unique_and_frozen() -> None:
     registry.freeze()
     with pytest.raises(PolicyRegistrationError, match="frozen"):
         registry.register_operator_shell_profile("other")
+
+
+def test_static_service_principals_are_immutable_core_projections() -> None:
+    registry = core_policy_registry()
+    expected = json.loads(
+        (Path(__file__).parent / "fixtures" / "plugin_core_policy_baseline.json").read_text()
+    )["tables"]
+    assert policy._TRUSTED_SERVICE_PRINCIPALS == registry.service_principals
+    assert set(registry.service_principals) == policy._REQUIRED_SERVICE_PRINCIPALS == set(
+        expected["required_service_principals"]
+    )
+    assert set(registry.service_principals) == set(expected["trusted_service_principals"])
+    assert policy.get_service_principal("poller") is None
+    for trigger, principal in registry.service_principals.items():
+        assert policy.get_service_principal(trigger) is principal
+        assert principal.trigger == trigger
+    with pytest.raises(TypeError):
+        policy._TRUSTED_SERVICE_PRINCIPALS["poller"] = registry.service_principals["upgrade"]
+
+
+def test_registered_service_principals_are_typed_and_collision_checked() -> None:
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    scheduler = registry.service_principals["scheduled_tick"]
+    with pytest.raises(PolicyRegistrationError, match="duplicate service principal"):
+        registry.register_service_principal(replace(scheduler, trigger="different"))
+    with pytest.raises(PolicyRegistrationError, match="expected frozen ServicePrincipal"):
+        registry.register_service_principal(object())
+    with pytest.raises(PolicyRegistrationError, match="invalid principal capabilities"):
+        registry.register_service_principal(ServicePrincipal(
+            canonical="new", trigger="new", capabilities=(None,),
+        ))
+    registry.freeze()
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        registry.register_service_principal(ServicePrincipal(canonical="new", trigger="new"))
+
+
+def test_core_service_grants_check_capability_domain_and_destination() -> None:
+    scheduler = policy.get_service_principal("scheduled_tick")
+    assert scheduler is not None
+    assert policy.service_can_invoke_operation(scheduler, "read_file")
+    assert policy.service_can_invoke_operation(scheduler, "shell_exec")
+    assert not policy.service_can_invoke_operation(scheduler, "memory_store")
+    assert not policy.service_can_invoke_operation(
+        replace(scheduler, readable_domains=("configured_inputs",)), "read_file"
+    )
+    assert not policy.service_can_invoke_operation(
+        replace(scheduler, sink_destinations=("message",)), "shell_exec"
+    )
