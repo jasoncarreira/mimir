@@ -12,17 +12,18 @@ from langgraph.runtime import Runtime
 
 from mimir.access_control import (
     HTTP_EVENT_INGRESS_EXTRA_KEY, CapabilityTier, ToolRegistry, build_trigger_service_principal,
-    builtin_trigger_service_principal, get_service_principal,
-    get_trusted_service_from_auth_context, service_can_invoke_operation,
+    builtin_trigger_service_principal, classify_protected_result, get_service_principal,
+    get_trusted_service_from_auth_context, normalize_sink_destination,
+    service_can_invoke_operation,
 )
 from mimir.models import (
     AgentEvent, AuthContext, InformationFlowLabels, InformationFlowState, RepoPRAction,
     RepoPRActionScope, RepoPRScopeRegistry,
-    RepoReviewState, RetainedFactoryScope,
+    RepoReviewState, RetainedFactoryScope, SourceLabel,
 )
 from mimir.plugins.core import ServicePrincipal, register_core_tools
 from mimir.plugins.registry import PolicyRegistrar, PolicyRegistry
-from mimir.tool_descriptors import ResultOriginKind, SinkCategory
+from mimir.tool_descriptors import ResultOriginKind, SinkCategory, get_tool_descriptor
 from mimir.tools.budget_gate import BudgetGateMiddleware, _authorize_tool_call
 
 
@@ -38,6 +39,7 @@ def _plugin_tool(
     channel_id: str | None = None,
     repository: str | None = None,
     pull_request: int | None = None,
+    payload: str | None = None,
 ) -> str:
     """Return a harmless result; middleware tests supply an observable handler."""
     return "result"
@@ -64,7 +66,11 @@ def policy():
             typed_action=action, result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
             sink_category=category if flow == "sink" else None,
             sink_destination="message" if flow == "sink" else None,
-            sink_target_extractor=extractor, sink_payload_extractor=None,
+            sink_target_extractor=extractor,
+            sink_payload_extractor=(
+                lambda _name, args, _context: (args["payload"],)
+                if isinstance(args.get("payload"), str) else ()
+            ) if name == "example_channel" else None,
             writes_code_or_state=writes, profiles=(), read_backend=False,
         )
     return registry.freeze()
@@ -387,6 +393,208 @@ def test_plugin_channel_sink_ifc_and_middleware_policy(policy):
     )
     assert blocked.reason == "missing_ifc_labels" and denial is not None
     assert BudgetGateMiddleware(policy)._policy is policy
+
+
+def test_plugin_result_domain_comes_from_authorizing_policy(policy):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value}),
+    )))
+    args = {"repository": "acme/widget", "pull_request": 7}
+    decision = ToolRegistry().authorize_tool(
+        "example_repo", auth, enforce=True, arguments=args, policy=policy,
+    )
+    assert decision.allowed
+    assert get_tool_descriptor("example_repo", policy=policy) is policy.tools["example_repo"].descriptor
+    labels = classify_protected_result("example_repo", args, auth, decision, result="outside data")
+    assert {source.domain for source in labels.sources} == {"repository"}
+    assert labels.has_untrusted_active_ingest
+    assert all(source.integrity == "untrusted" for source in labels.sources)
+    assert get_tool_descriptor("example_repo") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value}),
+    )))
+    request = ToolCallRequest(
+        tool_call={"name": "example_repo", "args": {
+            "repository": "acme/widget", "pull_request": 7,
+        }, "id": "plugin-result", "type": "tool_call"},
+        tool=policy.tools["example_repo"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+
+    def handler(_request):
+        return ToolMessage(content="outside data", tool_call_id="plugin-result")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(policy)
+    result = (
+        await gate.awrap_tool_call(request, async_handler) if asynchronous
+        else gate.wrap_tool_call(request, handler)
+    )
+    assert result.status != "error"
+    labels = auth.ifc_state.current(auth.ifc_labels)
+    assert labels.has_untrusted_active_ingest
+    assert any(source.domain == "repository" for source in labels.sources)
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_plugin_result_taint_vetoes_subsequent_write(policy, enforce):
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value, RepoPRAction.WRITE.value}),
+    )))
+    args = {"repository": "acme/widget", "pull_request": 7}
+    read = ToolRegistry().authorize_tool(
+        "example_repo", auth, enforce=enforce, arguments=args, policy=policy,
+    )
+    labels = classify_protected_result("example_repo", args, auth, read, result="outside data")
+    auth.ifc_state.merge(labels, fallback=auth.ifc_labels)
+    decision = ToolRegistry().authorize_tool(
+        "example_write", auth, enforce=enforce, arguments=args, policy=policy,
+    )
+    assert not decision.allowed
+    assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_plugin_sink_target_cannot_be_missing_or_spoofed(policy, enforce):
+    auth = _auth()
+    for target, args in ((None, {}), ("scheduler:own", {"channel_id": "scheduler:other"})):
+        decision = ToolRegistry().authorize_tool(
+            "example_channel", auth, enforce=enforce, target_channel=target,
+            arguments=args, policy=policy,
+        )
+        assert decision.would_block and decision.allowed is not enforce
+
+
+@pytest.mark.parametrize("operation_class", ["open", "admin_required"])
+@pytest.mark.parametrize("enforce", [False, True])
+def test_non_channel_plugin_sink_checks_target_and_ifc(operation_class, enforce, monkeypatch):
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+
+    def destinations(_name, arguments, _context):
+        return tuple(arguments.get("destinations", (arguments.get("endpoint"),)))
+
+    def payload(_name, arguments, _context):
+        return (arguments["body"],) if isinstance(arguments.get("body"), str) else ()
+
+    registry.registrar("example").register_tool(
+        name="example_webhook", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_webhook", description="Example outbound tool",
+        ),
+        flow="sink", tier="scope-contained", operation_class=operation_class,
+        result_domain="repository", result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.NETWORK, sink_destination="network",
+        sink_target_extractor=destinations, sink_payload_extractor=payload,
+        writes_code_or_state=False, profiles=(), read_backend=False,
+    )
+    selected = registry.freeze()
+    assert selected.descriptors["example_webhook"].sink_payload_extractor(
+        "example_webhook", {"body": "payload"}, None,
+    ) == ("payload",)
+
+    auth = _auth(roles=("admin",))
+    tools = ToolRegistry()
+    shadows = []
+    monkeypatch.setattr(tools, "_emit_shadow_decision", lambda decision, **_kwargs: shadows.append(decision))
+    endpoint = "https://example.test/hook"
+
+    def decide(arguments, *, context=auth, target=None):
+        return tools.authorize_tool(
+            "example_webhook", context, enforce=enforce, arguments=arguments,
+            target_channel=target, policy=selected,
+        )
+
+    exact = decide({"endpoint": endpoint, "body": "payload"})
+    assert exact.allowed and not exact.would_block
+    assert exact.resolved_sink_target == normalize_sink_destination(SinkCategory.NETWORK, endpoint)
+
+    for arguments, target in (
+        ({"body": "payload"}, None),
+        ({"endpoint": endpoint, "body": "payload"}, "https://other.test/hook"),
+        ({"destinations": (endpoint, "https://other.test/hook"), "body": "payload"}, None),
+    ):
+        denial = decide(arguments, target=target)
+        assert denial.reason == "sink_target_required"
+        assert denial.would_block and denial.allowed is not enforce
+        assert denial.is_shadow_decision is not enforce
+        if not enforce:
+            assert shadows[-1] is denial
+
+    source = SourceLabel(
+        principal="outsider", domain="web", resource_id="https://outside.test/data",
+        bridge_instance="web", sensitivity="internal",
+        source_kind="protected_tool", integrity="untrusted", integrity_effect="active_ingest",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    tainted = replace(auth, ifc_labels=labels, ifc_state=InformationFlowState(labels))
+    refused = decide({"endpoint": endpoint, "body": "payload"}, context=tainted)
+    if enforce:
+        assert refused.reason == "ifc_label_blocked:network"
+        assert refused.would_block and not refused.allowed
+    else:
+        assert refused.allowed
+        assert shadows[-1].reason == "ifc_label_blocked:network"
+        assert shadows[-1].would_block and shadows[-1].is_shadow_decision
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("privacy_enforced", [False, True])
+async def test_plugin_payload_privacy_scans_selected_descriptor(
+    policy, tmp_path, monkeypatch, asynchronous, privacy_enforced,
+):
+    from mimir.tools import budget_gate
+
+    private_term = "42 Maplewood Drive"
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    (tmp_path / "private-terms.txt").write_text(private_term + "\n", encoding="utf-8")
+    monkeypatch.setenv("MIMIR_OUTBOUND_PRIVACY_ENFORCE", "1" if privacy_enforced else "0")
+    events = []
+    monkeypatch.setattr(
+        budget_gate, "_emit_event_sync",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    auth = _auth()
+    request = ToolCallRequest(
+        tool_call={"name": "example_channel", "args": {
+            "channel_id": "scheduler:own", "payload": private_term,
+        }, "id": "plugin-privacy", "type": "tool_call"},
+        tool=policy.tools["example_channel"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    executed = []
+
+    def handler(_request):
+        executed.append(True)
+        return ToolMessage(content="executed", tool_call_id="plugin-privacy")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(policy)
+    assert get_tool_descriptor("example_channel", policy=policy).sink_payload_extractor(
+        "example_channel", request.tool_call["args"], auth,
+    ) == (private_term,)
+    result = (
+        await gate.awrap_tool_call(request, async_handler) if asynchronous
+        else gate.wrap_tool_call(request, handler)
+    )
+    assert result.status == ("error" if privacy_enforced else "success"), events
+    assert executed == ([] if privacy_enforced else [True])
+    event_name = "hard_boundary_denied" if privacy_enforced else "shadow_tool_decision"
+    assert any(
+        event == event_name and fields.get("reason") == "outbound_private_term"
+        for event, fields in events
+    ), events
+    assert private_term not in str(result.content)
+    assert private_term not in str(events)
 
 
 def test_plugin_channel_rejects_ambiguous_extractor_targets(policy):

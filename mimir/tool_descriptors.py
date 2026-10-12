@@ -440,5 +440,11 @@ TOOL_DESCRIPTORS: Mapping[str, ToolDescriptor] = core_policy_registry().descript
 validate_tool_descriptors()
 
 
-def get_tool_descriptor(tool_name: str) -> ToolDescriptor | None:
+def get_tool_descriptor(tool_name: str, *, policy: Any = None) -> ToolDescriptor | None:
+    if policy is not None:
+        if not policy.frozen:
+            raise ValueError("descriptor lookup requires a frozen policy")
+        declared = policy.tools.get(tool_name)
+        if declared is not None:
+            return declared.descriptor
     return TOOL_DESCRIPTORS.get(tool_name)

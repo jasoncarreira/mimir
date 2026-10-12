@@ -8958,6 +8958,7 @@ class ToolAuthorization:
     argument_egress: str = "taint_gated"
     repo_pr_action_scope: Any = field(default=None, repr=False)
     forge_scope_mismatch: dict[str, Any] | None = None
+    policy: Any = field(default=None, repr=False, compare=False)
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return fields for audit logging."""
@@ -9367,6 +9368,8 @@ class ToolRegistry:
         shadow_sink = None
 
         def finish(auth: ToolAuthorization) -> ToolAuthorization:
+            if policy is not None:
+                auth.policy = policy
             # Shadow mode continues past a sink refusal; enforcement would not.
             audit_auth = shadow_sink if shadow_sink is not None else auth
             if not enforce and audit_auth.is_shadow_decision:
@@ -9535,6 +9538,28 @@ class ToolRegistry:
         if (plugin_tool is not None and plugin_tool.writes_code_or_state
                 and _turn_has_untrusted_active_ingest(auth_context, ifc_labels)):
             return finish(_tainted_write_denial(tool_name))
+        if (plugin_tool is not None and plugin_tool.flow in {"sink", "both"}
+                and plugin_tool.resource_scope != "channel"):
+            extractor = plugin_tool.descriptor.sink_target_extractor
+            try:
+                targets = extractor(tool_name, arguments or {}, auth_context) if extractor else ()
+                valid_target = (
+                    len(targets) == 1 and isinstance(targets[0], str)
+                    and bool(targets[0].strip())
+                    and (target_channel is None or target_channel == targets[0])
+                )
+            except (TypeError, ValueError, KeyError, IndexError):
+                valid_target = False
+            if not valid_target:
+                return finish(ToolAuthorization(
+                    tool_name=tool_name,
+                    decision=OperationDecision(plugin_tool.operation_class),
+                    allowed=not enforce, reason="sink_target_required",
+                    required_tier=AccessTier.ADMIN, enforcement_enabled=enforce,
+                    is_shadow_decision=not enforce, would_block=True,
+                    flow_direction=flow_direction,
+                ))
+            sink_target = target_channel = requested_target = targets[0]
         if tool_name in {"write_file", "edit_file", "replace_file"}:
             home = os.environ.get("MIMIR_HOME", "").strip()
             raw_path = (arguments or {}).get("file_path") or (arguments or {}).get("path") or target_channel
@@ -11127,6 +11152,15 @@ def classify_protected_result(
         return acp_error_labels
 
     args = arguments or {}
+    registered = getattr(getattr(authorization, "policy", None), "tools", {}).get(tool_name)
+    if registered is not None and registered.owner != "core":
+        descriptor = registered.descriptor
+        if descriptor is not None and descriptor.result_origin & ResultOriginKind.NON_INGESTING:
+            return None
+        domain = registered.result_domain or "unknown"
+        return _incomplete_protected_result(
+            domain, args, tool_name=tool_name, auth_context=auth_context,
+        )
     retained_scope = getattr(auth_context, "retained_factory_scope", None)
     if (
         tool_name in {"repo_status", "repo_diff", "repo_test", "repo_stage", "repo_commit"}
