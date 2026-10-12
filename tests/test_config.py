@@ -48,6 +48,7 @@ def test_home_dotenv_cannot_grant_plugins_across_loads(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("MIMIR_PLUGINS=alpha\nMIMIR_MODEL_SPEC=openai:test\n")
     monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
     monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    monkeypatch.delenv("MIMIR_MODEL_SPEC", raising=False)
     first = Config.from_env()
     second = Config.from_env()
     assert first.plugin_manager.policy.frozen and second.plugin_manager.policy.frozen
