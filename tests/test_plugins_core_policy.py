@@ -10,7 +10,7 @@ from types import MappingProxyType
 import pytest
 
 from mimir import access_control as policy, read_policy
-from mimir.plugins.core import ServicePrincipal, core_policy_registry, register_core_tools
+from mimir.plugins.core import ServicePrincipal, core_policy_registry, core_runtime_names, register_core_tools
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir.tool_descriptors import (
     ResultOriginKind,
@@ -41,7 +41,7 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
     for name, descriptor in TOOL_DESCRIPTORS.items():
         tool = registry.tools[name]
         assert tool.owner == "core"
-        assert tool.policy_only and tool.factory is None
+        assert tool.policy_only == (tool.factory is None)
         assert tool.descriptor is descriptor
         row = {}
         for field in fields(descriptor):
@@ -54,6 +54,16 @@ def test_all_frozen_core_descriptors_come_from_registrations() -> None:
                 value = int(value)
             row[field.name] = value
         assert row == expected[name], name
+
+
+def test_core_runtime_factories_cover_each_surface_without_loading_coding() -> None:
+    registry = core_policy_registry()
+    surfaces = ("default", "web_search", "fetch_url", "coding")
+    names = [name for surface in surfaces for name in core_runtime_names(surface)]
+    assert len(names) == len(set(names))
+    assert all(registry.tools[name].factory is not None for name in names)
+    assert all(registry.tools[name].policy_only for name in registry.tools if name not in names)
+    assert set(core_runtime_names("coding")) >= {"spawn_open_code", "repo_test", "pr_metadata"}
 
 
 def test_core_flow_registration_includes_native_aliases_and_descriptorless_tools() -> None:
