@@ -5,17 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from mimir.tool_descriptors import (
-    FetchAuthorizationKind,
-    ResultOriginKind,
-    SinkCategory,
-    SinkPayloadExtractor,
-    SinkTargetExtractor,
-    ToolDescriptor,
-    validate_tool_descriptors,
-)
+if TYPE_CHECKING:
+    from mimir.tool_descriptors import (
+        FetchAuthorizationKind, ResultOriginKind, SinkCategory,
+        SinkPayloadExtractor, SinkTargetExtractor, ToolDescriptor,
+    )
 
 
 class PolicyRegistrationError(ValueError):
@@ -180,17 +176,22 @@ class PolicyRegistry:
         operation_class: str | None, result_domain: str | None,
         result_origin: ResultOriginKind, sink_category: SinkCategory | None,
         sink_destination: str | None,
-        sink_target_extractor: SinkTargetExtractor | None,
-        sink_payload_extractor: SinkPayloadExtractor | None,
+        sink_target_extractor: SinkTargetExtractor | None | object,
+        sink_payload_extractor: SinkPayloadExtractor | None | object,
         writes_code_or_state: bool, profiles: Iterable[str], read_backend: bool,
         resource_scope: str | None = None, typed_action: Any | None = None,
         readable_domain: str | None = None,
         shell_process: bool = False, memberships: Iterable[str] = (),
-        fetch_authorization: FetchAuthorizationKind = FetchAuthorizationKind.NONE,
+        fetch_authorization: FetchAuthorizationKind | None = None,
         git_operation_result: bool = False, ifc_delegation: bool = False,
         budget_exempt: bool = False, owner: str = "core",
         descriptor_registered: bool = True,
     ) -> None:
+        from mimir.tool_descriptors import (
+            _PAYLOAD_EXTRACTOR_UNDECLARED, _TARGET_EXTRACTOR_UNDECLARED,
+            FetchAuthorizationKind, ResultOriginKind, SinkCategory, ToolDescriptor,
+        )
+
         self._writable()
         name = _name(name, "tool")
         if name in self._tools:
@@ -214,11 +215,21 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{name}: resource_scoped requires explicit channel or repo_pr scope")
         if not isinstance(result_origin, ResultOriginKind) or not isinstance(sink_category, (SinkCategory, type(None))):
             raise PolicyRegistrationError(f"{name}: invalid origin or sink category")
-        if not isinstance(sink_destination, (str, type(None))) or (sink_category is not None and not sink_destination):
+        if not isinstance(sink_destination, (str, type(None))) or (
+            owner != "core" and sink_category is not None and not sink_destination
+        ):
             raise PolicyRegistrationError(f"{name}: invalid sink destination")
-        if sink_target_extractor is not None and not callable(sink_target_extractor):
+        if (sink_target_extractor is _TARGET_EXTRACTOR_UNDECLARED and owner != "core") or (
+            sink_target_extractor is not None
+            and sink_target_extractor is not _TARGET_EXTRACTOR_UNDECLARED
+            and not callable(sink_target_extractor)
+        ):
             raise PolicyRegistrationError(f"{name}: invalid target extractor")
-        if sink_payload_extractor is not None and not callable(sink_payload_extractor):
+        if (sink_payload_extractor is _PAYLOAD_EXTRACTOR_UNDECLARED and owner != "core") or (
+            sink_payload_extractor is not None
+            and sink_payload_extractor is not _PAYLOAD_EXTRACTOR_UNDECLARED
+            and not callable(sink_payload_extractor)
+        ):
             raise PolicyRegistrationError(f"{name}: invalid payload extractor")
         if not isinstance(writes_code_or_state, bool) or not isinstance(read_backend, bool):
             raise PolicyRegistrationError(f"{name}: invalid boolean metadata")
@@ -237,7 +248,11 @@ class PolicyRegistry:
         descriptor = ToolDescriptor(
             sink_category=sink_category, sink_target_extractor=sink_target_extractor,
             sink_destination=sink_destination, sink_payload_extractor=sink_payload_extractor,
-            fetch_authorization=fetch_authorization, result_origin=result_origin,
+            fetch_authorization=(
+                fetch_authorization if fetch_authorization is not None
+                else FetchAuthorizationKind.NONE
+            ),
+            result_origin=result_origin,
             git_operation_result=git_operation_result, ifc_delegation=ifc_delegation,
             budget_exempt=budget_exempt,
         ) if descriptor_registered else None
@@ -307,6 +322,7 @@ class PolicyRegistry:
     def freeze(self) -> PolicyRegistry:
         self._writable()
         from mimir.models import RepoPRAction
+        from mimir.tool_descriptors import validate_tool_descriptors
 
         validate_tool_descriptors(self.descriptors)
         for name, tool in self._tools.items():
