@@ -60,6 +60,34 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
 
     state_schema = ServiceToolSurfaceState
 
+    def __init__(self, policy: Any = None) -> None:
+        super().__init__()
+        self._policy = policy
+
+    def _plugin_available(self, name: str, service: Any) -> bool:
+        if self._policy is None or service is None:
+            return False
+        declared = self._policy.tools.get(name)
+        if declared is None or declared.owner == "core" or declared.factory is None:
+            return False
+        descriptor = declared.descriptor
+        return bool(
+            service.has_capability(name)
+            and (declared.readable_domain is None
+                 or service.can_read_domain(declared.readable_domain))
+            and descriptor is not None
+            and (descriptor.sink_destination is None
+                 or service.can_write_sink(descriptor.sink_destination))
+        )
+
+    def _available(self, name: str, service: Any, context: Any, catalog: Any) -> bool:
+        if self._policy is not None:
+            declared = self._policy.tools.get(name)
+            if declared is not None and declared.owner != "core":
+                return self._plugin_available(name, service)
+        return (catalog.get_decision(name, context) == OperationDecision.OPEN
+                or service_can_invoke_operation(service, name))
+
     def _filter_request(self, request: ModelRequest) -> ModelRequest:
         context = getattr(request.runtime, "context", None)
         if not _is_service(context):
@@ -76,14 +104,10 @@ class ServiceToolSurfaceMiddleware(AgentMiddleware):
                     _tool_name(tool) == "read_file"
                     or (
                         service.has_capability(_tool_name(tool))
-                        and (
-                            catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
-                            or service_can_invoke_operation(service, _tool_name(tool))
-                        )
+                        and self._available(_tool_name(tool), service, context, catalog)
                     )
                 ) if service.authority_profile == "session-boundary" else (
-                    catalog.get_decision(_tool_name(tool), context) == OperationDecision.OPEN
-                    or service_can_invoke_operation(service, _tool_name(tool))
+                    self._available(_tool_name(tool), service, context, catalog)
                 )
             )
         ]

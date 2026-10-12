@@ -1358,7 +1358,12 @@ def build_app(config: Config) -> web.Application:
     # fails loudly before broader server construction when the runtime is absent.
     from .tools import all_mimir_tools
     requested_coding = getattr(config, "coding_enabled", False)
-    all_mimir_tools(coding_enabled=requested_coding)
+    manager = getattr(config, "plugin_manager", None)
+    if manager is None:
+        all_mimir_tools(coding_enabled=requested_coding)
+    else:
+        all_mimir_tools(coding_enabled=requested_coding, policy=manager.policy,
+                        materialize_plugins=False)
 
     process_session_id = make_process_session_id()
 

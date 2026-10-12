@@ -11642,10 +11642,15 @@ def assert_model_tool_inventory_cataloged(
     *,
     model_spec: str | None = None,
     coding_enabled: bool = False,
+    policy: "PolicyRegistry | None" = None,
 ) -> None:
     """Raise if the assembled model surface lacks authz or IFC metadata."""
     from .tools.registry import all_mimir_tools
+    from .plugins.core import core_policy_registry
 
+    policy = policy if policy is not None else core_policy_registry()
+    if not policy.frozen:
+        raise CapabilityMatrixError("model tool inventory requires a frozen policy")
     catalog = get_operation_catalog()
     mimir_tools = all_mimir_tools(
         model_spec=model_spec,
@@ -11656,16 +11661,32 @@ def assert_model_tool_inventory_cataloged(
         *(tool.name for tool in mimir_tools),
         *_deepagents_builtin_tool_names(),
     }
+    plugin_tools = {
+        name: tool for name, tool in policy.tools.items()
+        if tool.owner != "core" and tool.factory is not None
+    }
+    for name, tool in plugin_tools.items():
+        if name in tool_names:
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} collides with model inventory")
+        if (tool.flow is None or tool.operation_class is None or tool.descriptor is None
+                or (tool.flow in {"sink", "both"} and (
+                    tool.descriptor.sink_category is None
+                    or tool.descriptor.sink_destination is None
+                )) or (tool.result_domain is None and not (
+                    tool.descriptor.result_origin & ResultOriginKind.NON_INGESTING
+                ))):
+            raise CapabilityMatrixError(f"plugin {tool.owner}: tool {name} has incomplete model policy")
+    core_names = tool_names
     unknown_tools = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if catalog.get_decision(tool_name) == OperationDecision.UNKNOWN
     })
     unknown_flows = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if get_tool_flow_direction(tool_name) == ToolFlowDirection.UNKNOWN
     })
     incomplete_sinks = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         if get_tool_flow_direction(tool_name) in {
             ToolFlowDirection.SINK, ToolFlowDirection.BOTH,
         }
@@ -11676,13 +11697,13 @@ def assert_model_tool_inventory_cataloged(
         )
     })
     misclassified_read_backends = sorted({
-        tool_name for tool_name in tool_names & _READ_BACKEND_RESULT_TOOLS
+        tool_name for tool_name in core_names & _READ_BACKEND_RESULT_TOOLS
         if get_tool_flow_direction(tool_name) not in {
             ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH,
         }
     })
     unclassified_results = sorted({
-        tool_name for tool_name in tool_names
+        tool_name for tool_name in core_names
         # MCP has a total result classifier above, including sink/neither calls
         # and unresolved failures. It needs no per-tool native inventory entry;
         # flow direction never exempts its remote response from provenance.
@@ -11733,6 +11754,7 @@ def resolve_access_control_enforcement(
     *,
     model_spec: str | None = None,
     coding_enabled: bool = False,
+    policy: "PolicyRegistry | None" = None,
 ) -> bool:
     """Fail closed at the enforcement enablement boundary."""
     if requested:
@@ -11740,6 +11762,7 @@ def resolve_access_control_enforcement(
         assert_model_tool_inventory_cataloged(
             model_spec=model_spec,
             coding_enabled=coding_enabled,
+            policy=policy,
         )
     return requested
 
