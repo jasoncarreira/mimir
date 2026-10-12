@@ -254,6 +254,18 @@ _CATALOG_ADMIN = _names("""pr_list issue_comment operator_alert
     saga_forget set_poller_overrides download_files adownload_files rebuild_index
     hands_edit hands_shell hands_python hands_request_scope""")
 _PROTECTED_METADATA = _names("list_channels list_schedules bash_jobs_list bash_job_output")
+_FIXED_SERVICE_SINKS = _names("rebuild_index")
+_TAINT_INDEPENDENT_EGRESS = _names("fetch_url web_search")
+_WORKLINK_BUILD_TOOLS = _names("worklink_run worklink_resume")
+_SCHEDULE_WRITES = _names("add_schedule set_schedule_priority remove_schedule set_poller_overrides")
+_REPO_PUBLISH_TOOLS = _names("repo_commit repo_merge repo_rebase repo_revert repo_push")
+_TAINTED_WRITES = _names("""repo_stage repo_commit repo_merge repo_rebase repo_revert
+    repo_push repo_test hands_edit hands_shell hands_python memory_store saga_feedback
+    saga_mark_contributions saga_end_session saga_forget saga_record_skill_learning""")
+_TAINTED_FILE_WRITES = _names("""write_file edit_file replace_file upload
+    awrite_file aedit_file areplace_file aupload write edit replace awrite aedit areplace""")
+_SAGA_MUTATIONS = _names("""memory_store saga_feedback saga_mark_contributions
+    saga_end_session saga_record_skill_learning saga_forget""")
 _CATALOG_ADMIN_BUILTIN = _names(
     "Bash bash bash_exec execute aexecute shell Write Edit Read Glob Grep download_files"
 )
@@ -288,6 +300,14 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("catalog_admin_builtin", _CATALOG_ADMIN_BUILTIN),
             ("read_resource_operations", _READ_RESOURCE_OPERATIONS),
             ("acp_hands_result_tools", _ACP_HANDS_RESULTS),
+            ("fixed_service_sinks", _FIXED_SERVICE_SINKS),
+            ("taint_independent_egress", _TAINT_INDEPENDENT_EGRESS),
+            ("worklink_build_tools", _WORKLINK_BUILD_TOOLS),
+            ("schedule_writes", _SCHEDULE_WRITES),
+            ("repo_publish_tools", _REPO_PUBLISH_TOOLS),
+            ("tainted_writes", _TAINTED_WRITES),
+            ("tainted_file_writes", _TAINTED_FILE_WRITES),
+            ("saga_mutations", _SAGA_MUTATIONS),
         ):
             if name in names:
                 memberships.add(member)
@@ -331,6 +351,18 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             memberships.add("read_resource_operations")
         if name in _ACP_HANDS_RESULTS:
             memberships.add("acp_hands_result_tools")
+        for member, names in (
+            ("fixed_service_sinks", _FIXED_SERVICE_SINKS),
+            ("taint_independent_egress", _TAINT_INDEPENDENT_EGRESS),
+            ("worklink_build_tools", _WORKLINK_BUILD_TOOLS),
+            ("schedule_writes", _SCHEDULE_WRITES),
+            ("repo_publish_tools", _REPO_PUBLISH_TOOLS),
+            ("tainted_writes", _TAINTED_WRITES),
+            ("tainted_file_writes", _TAINTED_FILE_WRITES),
+            ("saga_mutations", _SAGA_MUTATIONS),
+        ):
+            if name in names:
+                memberships.add(member)
         registry.register_tool(
             name=name, policy_only=True, descriptor_registered=False,
             flow=flow_by_name[name], tier=None, operation_class=operation_class,
@@ -340,6 +372,18 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             writes_code_or_state=False, profiles=(), read_backend=name in _READ_BACKEND,
             readable_domain=readable_domains.get(name),
             memberships=memberships,
+        )
+
+    # Native file-write aliases have no core descriptor or flow declaration, but
+    # must still participate in the same target-aware live-ingest veto.
+    for name in sorted(_TAINTED_FILE_WRITES - registry.tools.keys()):
+        registry.register_tool(
+            name=name, policy_only=True, descriptor_registered=False,
+            flow=None, tier=None, operation_class=None, result_domain=None,
+            result_origin=ResultOriginKind.NONE, sink_category=None,
+            sink_destination=None, sink_target_extractor=None,
+            sink_payload_extractor=None, writes_code_or_state=False,
+            profiles=(), read_backend=False, memberships={"tainted_file_writes"},
         )
 
     for tier, names in _TIERS.items():
