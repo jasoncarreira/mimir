@@ -85,7 +85,7 @@ from .safe_git import ControllerGitPublication, _git_credential_settings
 from .backends.feature_factory import (
     FACTORY_PUBLISHING_IDENTITY_ENV,
     FactoryStatus,
-    FactoryStatusContended,
+    FactoryRunLockContended,
     FeatureFactoryBackend,
     epic_run_id,
 )
@@ -3314,7 +3314,7 @@ class WorklinkRunner:
                     snapshot_failure = "factory status reports park_snapshot null"
                     if parked.park_snapshot is not None:
                         break
-                except FactoryStatusContended:
+                except FactoryRunLockContended:
                     snapshot_failure = "factory run state stayed locked"
                 except TimeoutError:
                     snapshot_failure = "factory status verification timed out"
@@ -3397,6 +3397,7 @@ class WorklinkRunner:
                     )
                 if recovery_session is not None and loop.time() >= startup_deadline:
                     raise WorklinkError("factory driver did not acquire the run lock before startup deadline")
+                observed = True
                 if status is None:
                     remaining = (
                         startup_deadline - loop.time()
@@ -3427,7 +3428,7 @@ class WorklinkRunner:
                         return await park_for_reason(
                             last_status, _factory_budget_park_reason(last_status, factory_record)
                         )
-                    except FactoryStatusContended:
+                    except FactoryRunLockContended:
                         # A writer holds run state through a whole transition. That is
                         # no observation: keep the last one so liveness, stall and park
                         # deadlines still govern. A dead holder's lock reads as stale.
@@ -3448,8 +3449,10 @@ class WorklinkRunner:
                             )
                             continue
                         status = last_status
+                        observed = False
                     else:
                         status_contended = False
+                        observed = True
                 pre_manifest = last_status is None and status == FactoryStatus(
                     run_id=factory_record.run_id,
                     valid=False,
@@ -3491,14 +3494,31 @@ class WorklinkRunner:
                     )
                     factory_record = replace(factory_record, controller_phase=phase)
                     save_factory_record(self.home, factory_record)
-                    if status.lock == "fresh" and factory_record.session == status.lock_session:
-                        await asyncio.to_thread(
-                            backend.heartbeat,
-                            factory_record.run_id,
-                            session=factory_record.session,
-                            sandbox=Path(factory_record.sandbox),
-                            launcher=factory_record.launcher,
-                        )
+                    # A reused observation is no evidence the session is current, and
+                    # the refresh takes the same lock; it can also contend after a
+                    # clean read. Neither is a fault: the driver refreshes it too.
+                    if (
+                        observed
+                        and status.lock == "fresh"
+                        and factory_record.session == status.lock_session
+                    ):
+                        try:
+                            await asyncio.to_thread(
+                                backend.heartbeat,
+                                factory_record.run_id,
+                                session=factory_record.session,
+                                sandbox=Path(factory_record.sandbox),
+                                launcher=factory_record.launcher,
+                            )
+                        except FactoryRunLockContended:
+                            if not status_contended:
+                                status_contended = True
+                                _log_event(
+                                    "worklink_factory_status_contended",
+                                    issue_id=issue.issue_id,
+                                    run_id=factory_record.run_id,
+                                    attempt=factory_record.attempt,
+                                )
                     now = loop.time()
                     window_ended = now >= next_work_check
                     if window_ended or stale_failure is not None:

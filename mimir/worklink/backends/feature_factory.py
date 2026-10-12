@@ -113,12 +113,13 @@ class FactoryContractError(RuntimeError):
     pass
 
 
-class FactoryStatusContended(FactoryContractError):
-    """``factory status`` gave up waiting on the held run-state lock.
+class FactoryRunLockContended(FactoryContractError):
+    """A control command gave up waiting on the held run-state lock.
 
     The factory runs every run-scoped command's whole handler under that lock,
     so a live driver can legitimately hold it for minutes (merge/verify), while
-    ``status`` waits only its 1s default. This is no observation, not a fault.
+    ``status`` and ``heartbeat`` (``refreshSessionLock``) wait only its 1s
+    default. That is a missed observation or refresh, not a fault.
     """
 
 
@@ -780,6 +781,16 @@ class FeatureFactoryBackend:
             f" --autonomous --max-retries {retries} {run_id}",
         )
 
+    def _lock_contended_control(
+        self, launcher: str | Path, args: Sequence[str], *, sandbox: Path,
+    ) -> subprocess.CompletedProcess[Any]:
+        try:
+            return self._control(launcher, args, sandbox=sandbox)
+        except FactoryContractError as exc:
+            if _RUN_LOCK_TIMEOUT.search(str(exc)):
+                raise FactoryRunLockContended(str(exc)) from exc
+            raise
+
     def _control(
         self,
         launcher: str | Path,
@@ -811,16 +822,11 @@ class FeatureFactoryBackend:
         return result
 
     def status(self, run_id: str, *, sandbox: Path, launcher: str | Path) -> FactoryStatus:
-        try:
-            result = self._control(
-                launcher,
-                ("status", run_id, "--repo", str(sandbox), "--json"),
-                sandbox=sandbox,
-            )
-        except FactoryContractError as exc:
-            if _RUN_LOCK_TIMEOUT.search(str(exc)):
-                raise FactoryStatusContended(str(exc)) from exc
-            raise
+        result = self._lock_contended_control(
+            launcher,
+            ("status", run_id, "--repo", str(sandbox), "--json"),
+            sandbox=sandbox,
+        )
         stdout = result.stdout if result.stdout is not None else b""
         return parse_factory_status(stdout)
 
@@ -847,7 +853,7 @@ class FeatureFactoryBackend:
         sandbox: Path,
         launcher: str | Path,
     ) -> None:
-        self._control(
+        self._lock_contended_control(
             launcher,
             ("heartbeat", run_id, "--session", session, "--repo", str(sandbox)),
             sandbox=sandbox,

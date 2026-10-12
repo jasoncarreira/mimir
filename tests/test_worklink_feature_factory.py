@@ -1490,23 +1490,29 @@ def test_usable_factory_retry_budget_is_silent(
         ("run.json is malformed", False),
     ],
 )
-def test_status_classifies_only_the_run_lock_timeout_as_contention(
-    monkeypatch, tmp_path: Path, detail: str, contended: bool,
+@pytest.mark.parametrize("command", ["status", "heartbeat"])
+def test_control_classifies_only_the_run_lock_timeout_as_contention(
+    monkeypatch, tmp_path: Path, detail: str, contended: bool, command: str,
 ) -> None:
-    """status waits 1s on a lock a live driver holds for whole transitions."""
+    """status and heartbeat wait 1s on a lock a live driver holds for whole transitions."""
     from mimir.worklink.backends.feature_factory import (
         FactoryContractError,
-        FactoryStatusContended,
+        FactoryRunLockContended,
     )
 
     def refused(self, launcher, args, *, sandbox):
-        assert args[0] == "status"
+        assert args[0] == command
         raise FactoryContractError(detail)
 
     monkeypatch.setattr(FeatureFactoryBackend, "_control", refused)
+    backend = FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js")
     with pytest.raises(FactoryContractError) as raised:
-        FeatureFactoryBackend(entrypoint="/opt/factory/bin/factory.js").status(
-            "chainlink-7", sandbox=tmp_path, launcher="/opt/factory/bin/factory.js",
-        )
-    assert isinstance(raised.value, FactoryStatusContended) is contended
+        if command == "status":
+            backend.status("chainlink-7", sandbox=tmp_path, launcher="/opt/factory/bin/factory.js")
+        else:
+            backend.heartbeat(
+                "chainlink-7", session="s", sandbox=tmp_path,
+                launcher="/opt/factory/bin/factory.js",
+            )
+    assert isinstance(raised.value, FactoryRunLockContended) is contended
     assert str(raised.value) == detail
