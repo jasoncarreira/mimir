@@ -460,13 +460,23 @@ def _extract_sink_target(
 def _extract_sink_targets(
     request: ToolCallRequest,
     auth_context: AuthContext | None = None,
+    policy: Any = None,
 ) -> list[str | None]:
     """Return every independently writable destination in a tool call."""
     tool_name = _tool_name_from_request(request)
     args = (getattr(request, "tool_call", None) or {}).get("args") or {}
-    descriptor = get_tool_descriptor(tool_name)
+    registered = policy.tools.get(tool_name) if policy is not None else None
+    descriptor = (
+        registered.descriptor if registered is not None and registered.owner != "core"
+        else get_tool_descriptor(tool_name)
+    )
     extractor = descriptor.sink_target_extractor if descriptor is not None else None
     if callable(extractor):
+        if registered is not None and registered.owner != "core":
+            try:
+                return list(extractor(tool_name, args, auth_context))
+            except (TypeError, ValueError, KeyError, IndexError):
+                return []
         return list(extractor(tool_name, args, auth_context))
     return [_extract_sink_target(request, auth_context)]
 
@@ -2541,6 +2551,7 @@ def _authorize_tool_call(
     tool_call_id: str | None = None,
     client_authorized_host_execution: ClientAuthorizedHostExecution | None = None,
     request_identity: Any = None,
+    policy: Any = None,
 ) -> tuple[ToolAuthorization, str | None]:
     """Return the exact authorization and any middleware denial text."""
     enforce = (
@@ -2563,6 +2574,7 @@ def _authorize_tool_call(
             "client_authorized_host_execution": client_authorized_host_execution,
             "request_identity": request_identity,
         }
+    policy_parameters = {"policy": policy} if policy is not None else {}
     auth = get_tool_registry().authorize_tool(
         tool_name,
         ctx,
@@ -2571,6 +2583,7 @@ def _authorize_tool_call(
         ifc_labels=ifc_labels,
         mcp_tool=mcp_tool,
         arguments=arguments,
+        **policy_parameters,
         **client_parameters,
         **operator_parameters,
     )
@@ -3429,6 +3442,7 @@ def _prepare_tool_call_execution(
     *,
     include_jev: bool = True,
     jev_candidates: list[str] | None = None,
+    policy: Any = None,
 ) -> _PreparedToolCall | ToolMessage | Command:
     request = call.request
     tool_name = call.tool_name
@@ -3443,7 +3457,9 @@ def _prepare_tool_call_execution(
             call, _argument_validation_refusal(request), arguments=None,
             record_outcome=True,
         )
-    target_channels = _extract_sink_targets(request, auth_context)
+    target_channels = _extract_sink_targets(request, auth_context, policy)
+    if not target_channels:
+        target_channels = [None]
     hands_candidate = _admitted_admin_hands_candidate(
         request, tool_name, auth_context, arguments,
     )
@@ -3472,6 +3488,7 @@ def _prepare_tool_call_execution(
             ifc_labels,
             getattr(request, "tool", None),
             arguments,
+            policy=policy,
             operator_shell_binding=(
                 operator_shell_preparation.binding
                 if operator_shell_preparation is not None
@@ -3954,7 +3971,8 @@ def _finish_tool_result(
 class BudgetGateMiddleware(AgentMiddleware):
     """Intercept model and tool calls at their exact LangGraph boundaries."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy: Any = None) -> None:
+        self._policy = policy
         get_tool_registry().enable_shadow_logging()
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
@@ -3984,7 +4002,7 @@ class BudgetGateMiddleware(AgentMiddleware):
         review_denial = _resolve_standing_review(
             review.tool_name, review.auth_context, review.arguments,
         )
-        call = _prepare_tool_call_execution(review, review_denial)
+        call = _prepare_tool_call_execution(review, review_denial, policy=self._policy)
         if not isinstance(call, _PreparedToolCall):
             return call
         capture = _ToolExecutionCapture()
@@ -4039,6 +4057,7 @@ class BudgetGateMiddleware(AgentMiddleware):
             review_denial,
             include_jev=False,
             jev_candidates=jev_candidates,
+            policy=self._policy,
         )
         if not isinstance(call, _PreparedToolCall):
             return call
