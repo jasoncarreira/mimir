@@ -10047,127 +10047,24 @@ class ToolRegistry:
         return finish(auth)
 
 
-_PROTECTED_RESULT_DOMAINS: dict[str, str] = {
-    "fetch_channel_history": "channel_history",
-    "list_channels": "channel_metadata",
-    "list_schedules": "schedule_metadata",
-    "bash_jobs_list": "shell_jobs",
-    "bash_job_output": "shell_jobs",
-    "read_file": "filesystem",
-    "proposal_diff": "filesystem",
-    "aread": "filesystem",
-    "ls": "filesystem",
-    "als": "filesystem",
-    "glob": "filesystem",
-    "aglob": "filesystem",
-    "grep": "filesystem",
-    "agrep": "filesystem",
-    "download_files": "filesystem",
-    "adownload_files": "filesystem",
-    "Read": "filesystem",
-    "Glob": "filesystem",
-    "Grep": "filesystem",
-    "file_search": "filesystem",
-    "get_turn": "turn_history",
-    "mimir_get_turn": "turn_history",
-    "memory_query": "saga",
-    "memory_get": "saga",
-    "saga_forget": "saga",
-    "commitment_list": "commitments",
-    "shell_exec": "shell",
-    "execute": "shell",
-    "web_search": "web",
-    "worklink_run": "worklink",
-    "worklink_resume": "worklink",
-    "spawn_open_code": "coding_worker",
-    "pr_metadata": "repository",
-    "pr_spec": "repository",
-    "pr_list": "repository",
-    "pr_files": "repository",
-    "pr_diff": "repository",
-    "pr_file_content": "repository",
-    "pr_checks": "repository",
-    "pr_job_log": "repository",
-    "ci_run_jobs": "repository",
-    "ci_run": "repository",
-    "ci_recent_runs": "repository",
-    "pr_reviews": "repository",
-    "pr_comments": "repository",
-    "pr_review_requests": "repository",
-    "repo_checkout": "repository",
-    "repo_fetch": "repository",
-    "repo_status": "repository",
-    "repo_test": "repository",
-    "repo_diff": "repository",
-    "repo_unmerged": "repository",
-    "hands_read": "client_provider",
-    # Bytes returned from the client host are content the agent did not author,
-    # so every Hands result is a protected result in the client_provider domain --
-    # not only the read. main's inventory-completeness check (added while this
-    # branch was diverged) is what surfaces the omission.
-    "hands_edit": "client_provider",
-    "hands_shell": "client_provider",
-    "hands_python": "client_provider",
-    "pr_submit_review": "repository",
-    "pr_inline_review_comment": "repository",
-    "pr_comment": "repository",
-    "pr_edit_body": "repository",
-    "issue_comment": "repository",
-    "repo_commit": "repository",
-    "repo_merge": "repository",
-    "repo_merge_abort": "repository",
-    "repo_rebase": "repository",
-    "repo_rebase_abort": "repository",
-    "repo_revert": "repository",
-    "repo_revert_abort": "repository",
-    "repo_push": "repository",
-}
+_PROTECTED_RESULT_DOMAINS: Mapping[str, str] = MappingProxyType({
+    name: tool.result_domain for name, tool in core_policy_registry().tools.items()
+    if tool.result_domain is not None
+})
 
 _ACP_HANDS_RESULT_SOURCE_KIND = "acp_hands_result"
-_ACP_HANDS_RESULT_TOOLS = frozenset({
-    "hands_read", "hands_edit", "hands_shell", "hands_python"
-})
+_ACP_HANDS_RESULT_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items()
+    if "acp_hands_result_tools" in tool.memberships
+)
 
 # Independent semantic inventory for tools whose results come from a read
 # backend. Startup rejects drift toward SINK/NEITHER before it can suppress
 # result taint. MCP reads have equivalent adapter/resource parity checks in
 # MCPResourceAdapter.authorize_call.
-_READ_BACKEND_RESULT_TOOLS = frozenset({
-    "pr_job_log",
-    "ci_run_jobs",
-    "ci_run",
-    "ci_recent_runs",
-    "Read",
-    "Glob",
-    "Grep",
-    "read_file",
-    "proposal_diff",
-    "aread",
-    "ls",
-    "als",
-    "glob",
-    "aglob",
-    "grep",
-    "agrep",
-    "fetch_url",
-    "pr_metadata",
-    "pr_spec",
-    "pr_list",
-    "pr_files",
-    "pr_diff",
-    "pr_file_content",
-    "pr_checks",
-    "pr_reviews",
-    "pr_comments",
-    "pr_review_requests",
-    "repo_checkout",
-    "repo_fetch",
-    "repo_status",
-    "repo_test",
-    "repo_diff",
-    "repo_unmerged",
-    "hands_read",
-})
+_READ_BACKEND_RESULT_TOOLS = frozenset(
+    name for name, tool in core_policy_registry().tools.items() if tool.read_backend
+)
 
 _SELF_AUTHORED_FILE_ROOTS = frozenset({
     ".mimir_builtin_skills",
@@ -11505,38 +11402,10 @@ _REQUIRED_SERVICE_PRINCIPALS: frozenset[str] = frozenset(_TRUSTED_SERVICE_PRINCI
 
 
 # Executable capabilities and information-flow metadata are one policy.
-_OPERATION_READABLE_DOMAIN: dict[str, str] = {
-    "pr_list": "repository",
-    "list_channels": "channel_metadata",
-    "list_schedules": "schedule_metadata",
-    "bash_jobs_list": "shell_jobs",
-    "bash_job_output": "shell_jobs",
-    "read_file": "filesystem",
-    "proposal_diff": "filesystem",
-    "aread": "filesystem",
-    "ls": "filesystem",
-    "als": "filesystem",
-    "glob": "filesystem",
-    "aglob": "filesystem",
-    "grep": "filesystem",
-    "agrep": "filesystem",
-    "file_search": "filesystem",
-    "get_turn": "turn_history",
-    "mimir_get_turn": "turn_history",
-    "memory_query": "saga",
-    "memory_get": "saga",
-    "ci_run_jobs": "repository",
-    "ci_run": "repository",
-    "ci_recent_runs": "repository",
-    "hands_read": "client_provider",
-    "hands_python": "client_provider",
-    **{
-        operation: "repository"
-        for operation, direction in _TOOL_FLOW_MAP.items()
-        if operation in _TYPED_REPO_PR_TOOL_ACTIONS
-        and direction in {ToolFlowDirection.SOURCE, ToolFlowDirection.BOTH}
-    },
-}
+_OPERATION_READABLE_DOMAIN: Mapping[str, str] = MappingProxyType({
+    name: tool.readable_domain for name, tool in core_policy_registry().tools.items()
+    if tool.readable_domain is not None
+})
 
 _SAGA_MUTATION_OPERATIONS: frozenset[str] = frozenset({
     "memory_store",

@@ -9,7 +9,7 @@ from types import MappingProxyType
 
 import pytest
 
-from mimir import access_control as policy
+from mimir import access_control as policy, read_policy
 from mimir.plugins.core import ServicePrincipal, core_policy_registry, register_core_tools
 from mimir.plugins.registry import PolicyRegistrationError, PolicyRegistry
 from mimir.tool_descriptors import (
@@ -232,3 +232,35 @@ def test_operation_views_are_derived_from_core_registrations() -> None:
         is policy.OperationDecision.RESOURCE_SCOPED
     )
     assert policy.OperationCatalog().get_decision("not_registered") is policy.OperationDecision.UNKNOWN
+
+
+def test_result_and_read_views_are_frozen_core_projections() -> None:
+    tools = core_policy_registry().tools
+    assert policy._PROTECTED_RESULT_DOMAINS == {
+        name: tool.result_domain for name, tool in tools.items()
+        if tool.result_domain is not None
+    }
+    assert policy._OPERATION_READABLE_DOMAIN == {
+        name: tool.readable_domain for name, tool in tools.items()
+        if tool.readable_domain is not None
+    }
+    assert policy._READ_BACKEND_RESULT_TOOLS == frozenset(
+        name for name, tool in tools.items() if tool.read_backend
+    )
+    for membership, view in (
+        ("read_resource_operations", read_policy.READ_RESOURCE_OPERATIONS),
+        ("acp_hands_result_tools", policy._ACP_HANDS_RESULT_TOOLS),
+    ):
+        assert view == frozenset(
+            name for name, tool in tools.items() if membership in tool.memberships
+        )
+    assert policy._PROTECTED_RESULT_DOMAINS["hands_shell"] == "client_provider"
+    assert "hands_read" in policy._READ_BACKEND_RESULT_TOOLS
+    assert "hands_shell" not in policy._READ_BACKEND_RESULT_TOOLS
+    assert policy._OPERATION_READABLE_DOMAIN["hands_python"] == "client_provider"
+    assert "hands_edit" not in policy._OPERATION_READABLE_DOMAIN
+    assert TOOL_DESCRIPTORS["commitment_complete"].result_origin & ResultOriginKind.NON_INGESTING
+    with pytest.raises(TypeError):
+        policy._PROTECTED_RESULT_DOMAINS["other"] = "filesystem"
+    with pytest.raises(TypeError):
+        policy._OPERATION_READABLE_DOMAIN["other"] = "filesystem"
