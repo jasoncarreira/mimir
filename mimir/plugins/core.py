@@ -269,6 +269,15 @@ _SAGA_MUTATIONS = _names("""memory_store saga_feedback saga_mark_contributions
 _CATALOG_ADMIN_BUILTIN = _names(
     "Bash bash bash_exec execute aexecute shell Write Edit Read Glob Grep download_files"
 )
+_STANDING_REVIEW = _names("""pr_metadata pr_spec pr_files pr_diff pr_file_content
+    pr_checks pr_reviews pr_comments pr_review_requests pr_submit_review
+    pr_inline_review_comment pr_comment pr_edit_body pr_rerequest_review
+    repo_checkout repo_cleanup repo_fetch repo_status repo_test repo_diff repo_unmerged""")
+_REMEDIATION_EFFECT = _names("""repo_commit repo_push pr_comment pr_edit_body
+    pr_inline_review_comment pr_rerequest_review write_file edit_file replace_file
+    worklink_resume""")
+_TYPED_ERROR_SIGNAL = _names("""bash_job_output fetch_url get_turn mimir_get_turn
+    shell_exec web_search worklink_run""")
 
 
 def register_core_tools(registry: PolicyRegistry) -> None:
@@ -308,6 +317,9 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("tainted_writes", _TAINTED_WRITES),
             ("tainted_file_writes", _TAINTED_FILE_WRITES),
             ("saga_mutations", _SAGA_MUTATIONS),
+            ("standing_review", _STANDING_REVIEW),
+            ("remediation_effect", _REMEDIATION_EFFECT),
+            ("typed_error_signal", _TYPED_ERROR_SIGNAL),
         ):
             if name in names:
                 memberships.add(member)
@@ -360,6 +372,9 @@ def register_core_tools(registry: PolicyRegistry) -> None:
             ("tainted_writes", _TAINTED_WRITES),
             ("tainted_file_writes", _TAINTED_FILE_WRITES),
             ("saga_mutations", _SAGA_MUTATIONS),
+            ("standing_review", _STANDING_REVIEW),
+            ("remediation_effect", _REMEDIATION_EFFECT),
+            ("typed_error_signal", _TYPED_ERROR_SIGNAL),
         ):
             if name in names:
                 memberships.add(member)

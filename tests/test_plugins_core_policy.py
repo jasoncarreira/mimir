@@ -18,6 +18,7 @@ from mimir.tool_descriptors import (
     _PAYLOAD_EXTRACTOR_UNDECLARED,
     _TARGET_EXTRACTOR_UNDECLARED,
 )
+from mimir.tools import budget_gate
 
 
 def _extractor(value: object, undeclared: object) -> str:
@@ -285,3 +286,19 @@ def test_sink_and_taint_views_are_exact_registry_memberships() -> None:
     assert "upload" not in core_policy_registry().flow
     assert policy._FIXED_SERVICE_SINK_OPERATIONS == {"rebuild_index"}
     assert policy._TAINT_INDEPENDENT_EGRESS_TOOLS == {"fetch_url", "web_search"}
+
+
+def test_budget_policy_views_are_frozen_core_memberships() -> None:
+    tools = core_policy_registry().tools
+    for membership, view in (
+        ("standing_review", budget_gate._STANDING_REVIEW_TOOLS),
+        ("remediation_effect", budget_gate._REMEDIATION_EFFECT_TOOLS),
+        ("typed_error_signal", budget_gate._TYPED_ERROR_SIGNAL_TOOLS),
+    ):
+        assert type(view) is frozenset
+        assert view == frozenset(
+            name for name, tool in tools.items() if membership in tool.memberships
+        ), membership
+    assert "pr_job_log" not in budget_gate._STANDING_REVIEW_TOOLS
+    assert "repo_commit" in budget_gate._REMEDIATION_EFFECT_TOOLS
+    assert "worklink_run" in budget_gate._TYPED_ERROR_SIGNAL_TOOLS
