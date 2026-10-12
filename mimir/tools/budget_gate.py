@@ -61,6 +61,7 @@ import yaml
 from ..env import env_bool
 from ..event_logger import emit_event_background as _emit_event_sync
 from ..models import AuthContext, InformationFlowState
+from ..plugins.core import core_policy_registry
 from ..redaction import redact_text
 from ..tool_descriptors import (
     FetchAuthorizationKind,
@@ -120,13 +121,14 @@ from .prohibited_action_guard import check_prohibited_bash, is_bash_tool
 
 log = logging.getLogger(__name__)
 
-_STANDING_REVIEW_TOOLS = frozenset({
-    "pr_metadata", "pr_spec", "pr_files", "pr_diff", "pr_file_content", "pr_checks", "pr_reviews",
-    "pr_comments", "pr_review_requests", "pr_submit_review",
-    "pr_inline_review_comment", "pr_comment", "pr_edit_body", "pr_rerequest_review",
-    "repo_checkout", "repo_cleanup", "repo_fetch", "repo_status", "repo_test",
-    "repo_diff", "repo_unmerged",
-})
+def _core_membership(name: str) -> frozenset[str]:
+    return frozenset(
+        tool_name for tool_name, tool in core_policy_registry().tools.items()
+        if name in tool.memberships
+    )
+
+
+_STANDING_REVIEW_TOOLS = _core_membership("standing_review")
 _TOOL_EVENT_ARGUMENT_ALLOWLIST = (
     "command",
     "path",
@@ -153,14 +155,8 @@ _SPAWN_OPEN_CODE_ERROR_STATUSES = frozenset({
     "prompt_refused", "containment_unavailable", "timeout", "output_overflow",
     "authentication_required", "failed", "proposal_unavailable",
 })
-_TYPED_ERROR_SIGNAL_TOOLS = frozenset({
-    "bash_job_output", "fetch_url", "get_turn", "mimir_get_turn",
-    "shell_exec", "web_search", "worklink_run",
-})
-_REMEDIATION_EFFECT_TOOLS = frozenset({
-    "repo_commit", "repo_push", "pr_comment", "pr_edit_body", "pr_inline_review_comment",
-    "pr_rerequest_review", "write_file", "edit_file", "replace_file", "worklink_resume",
-})
+_TYPED_ERROR_SIGNAL_TOOLS = _core_membership("typed_error_signal")
+_REMEDIATION_EFFECT_TOOLS = _core_membership("remediation_effect")
 
 
 def _resolve_standing_review(
