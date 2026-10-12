@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -44,14 +45,13 @@ class PluginManager:
         return tuple(tool.factory for tool in self.policy.tools.values()
                      if tool.owner != "core" and tool.factory is not None)
 
-    def hooks(self, name: str) -> tuple[tuple[str, Any], ...]:
-        return tuple((plugin.candidate.name, hook)
-                      for plugin in self.plugins
-                      if (hook := getattr(plugin.contributor, name, None)) is not None)
-
     async def startup_preflight(self, bundle: Any) -> None:
-        for name, hook in self.hooks("startup_preflight"):
+        for plugin in self.plugins:
+            name = plugin.candidate.name
             try:
+                hook = getattr(plugin.contributor, "startup_preflight", None)
+                if hook is None:
+                    continue
                 result = hook(bundle)
                 if inspect.isawaitable(result):
                     await result
@@ -59,8 +59,12 @@ class PluginManager:
                 raise RuntimeError(f"plugin {name!r} startup preflight failed") from exc
 
     async def turn_preflight(self, event: Any, auth_context: Any) -> None:
-        for name, hook in self.hooks("turn_preflight"):
+        for plugin in self.plugins:
+            name = plugin.candidate.name
             try:
+                hook = getattr(plugin.contributor, "turn_preflight", None)
+                if hook is None:
+                    continue
                 result = hook(event, auth_context)
                 if inspect.isawaitable(result):
                     await result
@@ -71,8 +75,12 @@ class PluginManager:
         if self._shutdown_started:
             return
         self._shutdown_started = True
-        for name, hook in self.hooks("shutdown"):
+        for plugin in self.plugins:
+            name = plugin.candidate.name
             try:
+                hook = getattr(plugin.contributor, "shutdown", None)
+                if hook is None:
+                    continue
                 if inspect.iscoroutinefunction(hook):
                     await asyncio.wait_for(hook(), timeout=5)
                 else:
@@ -85,8 +93,12 @@ class PluginManager:
 
     async def health(self) -> dict[str, object]:
         fields: dict[str, object] = {}
-        for name, hook in self.hooks("health"):
+        for plugin in self.plugins:
+            name = plugin.candidate.name
             try:
+                hook = getattr(plugin.contributor, "health", None)
+                if hook is None:
+                    continue
                 if inspect.iscoroutinefunction(hook):
                     value = await asyncio.wait_for(hook(), timeout=5)
                 else:
@@ -99,6 +111,7 @@ class PluginManager:
                     for key, item in value.items()
                 ):
                     raise ValueError("health fields must be named numeric or boolean values")
+                json.dumps(value, allow_nan=False)
                 fields[name] = value
             except Exception:
                 fields[name] = {"error": "health contributor failed"}

@@ -46,6 +46,7 @@ import traceback
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -1965,6 +1966,34 @@ class Agent:
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
+        async def report_early_failure(exc: Exception, ctx: Any, failed_turn_id: str) -> None:
+            if event.trigger == "poller" and not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await log_event(
+                        "turn_failed", channel_id=event.channel_id,
+                        turn_id=failed_turn_id, trigger=event.trigger,
+                        error=f"{type(exc).__name__}: {exc}"[:240],
+                        traceback="".join(traceback.format_exception(
+                            type(exc), exc, exc.__traceback__, limit=12,
+                        ))[-4000:],
+                        phase="pre_model_loop", **_turn_outcome_identity(event),
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase turn_failed emit failed")
+            if not getattr(ctx, "outcome_emitted", False):
+                try:
+                    await self._notify_chat_skill_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx, phase="early_exception",
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase chat-skill failure notice failed")
+                try:
+                    await self._post_deliver_failure(
+                        event, f"{type(exc).__name__}: {exc}", ctx,
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original
+                    log.exception("early-phase deliver notice failed")
+
         explicit_session_binding = session_id is not None and saga_session_id is not None
         def prepare_preflight_context():
             labels = _initialize_ifc_labels(
@@ -1998,9 +2027,31 @@ class Agent:
             return labels, auth
 
         plugin_manager = self._config.plugin_manager
+        preflight_emitter = None
         if plugin_manager.plugins:
             initial_ifc_labels, initial_auth_context = prepare_preflight_context()
-            await plugin_manager.turn_preflight(event, initial_auth_context)
+            turn_id = turn_id or make_turn_id()
+            preflight_emitter = TurnEventEmitter(
+                self._turn_event_bus, turn_id=turn_id,
+                channel_id=event.channel_id, ifc_labels=initial_ifc_labels,
+                auth_context=initial_auth_context,
+            )
+            preflight_emitter.turn_started(event)
+            try:
+                await plugin_manager.turn_preflight(event, initial_auth_context)
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    notice_context = SimpleNamespace(
+                        auth_context=initial_auth_context, ifc_labels=initial_ifc_labels,
+                    )
+                    await report_early_failure(exc, notice_context, turn_id)
+                try:
+                    preflight_emitter.turn_ended(
+                        status="error", error=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:  # noqa: BLE001 — emission must not mask rejection
+                    pass
+                raise
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
@@ -2043,6 +2094,8 @@ class Agent:
                     await self._dispatcher._send_approval_notice(event.channel_id, notice)
                 elif notice and self._channels is not None:
                     await self._channels.send(event.channel_id, notice, final=True)
+                if preflight_emitter is not None:
+                    preflight_emitter.turn_ended(status="ok")
                 return TurnRecord(
                     ts=datetime.now(timezone.utc).isoformat(), turn_id=turn_id or make_turn_id(),
                     session_id=session_id or event.channel_id or "default",
@@ -2061,14 +2114,15 @@ class Agent:
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
-        emitter = TurnEventEmitter(
+        emitter = preflight_emitter or TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,
             channel_id=event.channel_id,
             ifc_labels=initial_ifc_labels,
             auth_context=initial_auth_context,
         )
-        emitter.turn_started(event)
+        if preflight_emitter is None:
+            emitter.turn_started(event)
         _turn_record = None
         _turn_exc = None
         # chainlink #383: arm mid-turn injection before any slow setup work
@@ -2360,48 +2414,13 @@ class Agent:
             # the dispatcher's own error handling is unchanged. Only
             # ``Exception`` (not CancelledError) — a cancelled turn isn't a
             # failure to recover.
-            if event.trigger == "poller" and not getattr(
-                ctx, "outcome_emitted", False
-            ):
-                try:
-                    await log_event(
-                        "turn_failed",
-                        channel_id=event.channel_id,
-                        turn_id=turn_id,
-                        trigger=event.trigger,
-                        error=f"{type(exc).__name__}: {exc}"[:240],
-                        traceback="".join(
-                            traceback.format_exception(
-                                type(exc), exc, exc.__traceback__, limit=12,
-                            )
-                        )[-4000:],
-                        phase="pre_model_loop",
-                        **_turn_outcome_identity(event),
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase turn_failed emit failed")
             # chainlink #508: an early-phase crash (prompt build, agent
             # construction, model resolution) is exactly "the agent couldn't
             # report" — mirror the deliver: failure notice here so a poller OR
             # scheduled-tick job with deliver: set isn't silently lost before
             # the model loop. Gated on outcome_emitted so it never double-posts
             # with the in-body path (which sets that flag after the loop).
-            if not getattr(ctx, "outcome_emitted", False):
-                try:
-                    await self._notify_chat_skill_failure(
-                        event,
-                        f"{type(exc).__name__}: {exc}",
-                        ctx,
-                        phase="early_exception",
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase chat-skill failure notice failed")
-                try:
-                    await self._post_deliver_failure(
-                        event, f"{type(exc).__name__}: {exc}", ctx,
-                    )
-                except Exception:  # noqa: BLE001 — never mask the original
-                    log.exception("early-phase deliver notice failed")
+            await report_early_failure(exc, ctx, turn_id)
             raise
         finally:
             # chainlink #583: close the turn bracket on the live bus. Status
