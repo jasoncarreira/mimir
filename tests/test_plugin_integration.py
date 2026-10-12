@@ -124,8 +124,10 @@ def principal_policy():
         flow="sink", tier="scope-contained", operation_class="admin_required",
         result_domain="repository", result_origin=ResultOriginKind.EXTERNAL,
         sink_category=SinkCategory.FILE, sink_destination="filesystem",
-        sink_target_extractor=None, sink_payload_extractor=None,
+        sink_target_extractor=lambda _name, args, _context: (args.get("payload"),),
+        sink_payload_extractor=None,
         writes_code_or_state=False, profiles=(), read_backend=False,
+        service_sink_adapter="trigger_service_write_roots",
     )
     registrar.register_capability("example_deliver")
     registrar.add_to_profile("heartbeat", "example_deliver")
@@ -264,6 +266,70 @@ async def test_scheduler_fire_uses_selected_profile_grant(principal_policy, tmp_
     assert not service_can_invoke_operation(
         events[0].service_authority, "example_unregistered", policy=principal_policy,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enforce", [False, True])
+async def test_scheduler_sink_grant_reaches_tool_registry_and_middleware(
+    principal_policy, tmp_path, monkeypatch, enforce,
+):
+    from mimir.agent import _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.scheduler import Scheduler, SchedulerJob
+
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    async def record(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr("mimir.scheduler.log_event", record)
+    events = []
+
+    async def enqueue(event):
+        events.append(event)
+        return True
+
+    scheduler = Scheduler(tmp_path / "scheduler.yaml", enqueue, home=tmp_path, policy=principal_policy)
+    await scheduler._fire(job=SchedulerJob(name="heartbeat", prompt="tick", authority_profile="heartbeat"))
+    event = events[0]
+    auth = _create_turn_auth_context(
+        event, None, policy_version=None, enforce=enforce,
+        ifc_labels=_initialize_ifc_labels(event, policy=principal_policy), policy=principal_policy,
+    )
+    service = event.service_authority
+    assert service.sink_policy_for("example_deliver").adapter == "trigger_service_write_roots"
+    assert service_can_invoke_operation(service, "example_deliver", policy=principal_policy)
+    target = str(tmp_path / "state" / "delivered.md")
+    args = {"payload": target}
+    permitted = ToolRegistry().authorize_tool(
+        "example_deliver", auth, enforce=enforce, target_channel=target,
+        arguments=args, policy=principal_policy,
+    )
+    assert permitted.allowed and not permitted.would_block
+    request = ToolCallRequest(
+        tool_call={"name": "example_deliver", "args": args, "id": "deliver", "type": "tool_call"},
+        tool=principal_policy.tools["example_deliver"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    called = []
+    result = BudgetGateMiddleware(principal_policy).wrap_tool_call(
+        request, lambda _: called.append(True) or ToolMessage(content="ok", tool_call_id="deliver"),
+    )
+    assert result.status != "error" and called == [True]
+
+    for denied_target in ("/etc/mimir-denied.md", str(tmp_path / "state" / "credentials.key")):
+        denied = ToolRegistry().authorize_tool(
+            "example_deliver", replace(auth, ifc_labels=InformationFlowLabels(),
+                                       ifc_state=InformationFlowState()),
+            enforce=True, target_channel=denied_target,
+            arguments={"payload": denied_target}, policy=principal_policy,
+        )
+        assert denied.reason == "service_sink_destination_denied", (denied_target, denied.reason)
+        assert denied.would_block and not denied.allowed
+    unselected = replace(auth, service_authority=builtin_trigger_service_principal("heartbeat", tmp_path))
+    denied = ToolRegistry().authorize_tool(
+        "example_deliver", unselected, enforce=True, target_channel=target,
+        arguments=args, policy=principal_policy,
+    )
+    assert denied.would_block and not denied.allowed
 
 
 @pytest.mark.asyncio
@@ -521,6 +587,43 @@ def test_plugin_result_taint_vetoes_subsequent_write(policy, enforce):
     )
     assert not decision.allowed
     assert decision.reason == "write_blocked_by_untrusted_ingest"
+
+
+@pytest.mark.parametrize("enforce", [False, True])
+def test_read_backend_middleware_result_vetoes_live_core_write(tmp_path, monkeypatch, enforce):
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registry.registrar("example").register_tool(
+        name="example_web_read", factory=lambda: StructuredTool.from_function(
+            _plugin_tool, name="example_web_read", description="Read external data",
+        ),
+        flow="source", tier="scope-contained", operation_class="open",
+        result_domain="web", result_origin=ResultOriginKind.EXTERNAL,
+        sink_category=None, sink_destination=None, sink_target_extractor=None,
+        sink_payload_extractor=None, writes_code_or_state=False, profiles=(),
+        read_backend=True,
+    )
+    selected = registry.freeze()
+    auth = _auth(enforcement_enabled=enforce)
+    request = ToolCallRequest(
+        tool_call={"name": "example_web_read", "args": {}, "id": "web-read", "type": "tool_call"},
+        tool=selected.tools["example_web_read"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    result = BudgetGateMiddleware(selected).wrap_tool_call(
+        request, lambda _: ToolMessage(content="outside data", tool_call_id="web-read"),
+    )
+    assert result.status != "error"
+    labels = auth.ifc_state.current(auth.ifc_labels)
+    assert {source.domain for source in labels.sources} == {"web"}
+    assert labels.has_untrusted_active_ingest
+    refusal = ToolRegistry().authorize_tool(
+        "write_file", auth, enforce=enforce,
+        arguments={"file_path": "state/live.md", "content": "untrusted"}, policy=selected,
+    )
+    assert not refusal.allowed
+    assert refusal.reason == "write_blocked_by_untrusted_ingest"
 
 
 @pytest.mark.parametrize("enforce", [False, True])

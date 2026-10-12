@@ -98,6 +98,50 @@ def test_plugin_cannot_exclude_its_descriptor_or_flow():
         registry.registrar("example").register_tool(**tool_fields(flow=None))
 
 
+@pytest.mark.parametrize("fields", [
+    {"result_origin": ResultOriginKind.NON_INGESTING, "result_domain": "web"},
+    {"result_origin": ResultOriginKind.NONE, "result_domain": "web"},
+    {"result_origin": ResultOriginKind.EXTERNAL, "result_domain": None},
+    {"result_origin": ResultOriginKind.EXTERNAL, "result_domain": "web", "flow": "sink"},
+])
+def test_plugin_read_backend_requires_ingesting_source(fields):
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="read backend requires a protected ingesting result"):
+        registry.registrar("example").register_tool(**tool_fields(read_backend=True, **fields))
+    assert not registry.tools
+
+
+def test_profile_sink_requires_bounded_adapter():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_tool(**tool_fields(
+        flow="sink", sink_category=SinkCategory.FILE, sink_destination="filesystem",
+        result_origin=ResultOriginKind.NON_INGESTING,
+        profiles=("worker",),
+    ))
+    plugin.register_capability("sample")
+    plugin.register_authority_profile("worker", capabilities=("sample",))
+    with pytest.raises(PolicyRegistrationError, match="profile sink requires a service sink adapter"):
+        registry.freeze()
+    assert not registry.frozen
+
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="invalid service sink adapter"):
+        registry.registrar("example").register_tool(**tool_fields(
+            sink_category=SinkCategory.FILE, sink_destination="filesystem",
+            service_sink_adapter="approved_urls",
+        ))
+        registry.freeze()
+
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="invalid service sink destination"):
+        registry.registrar("example").register_tool(**tool_fields(
+            sink_category=SinkCategory.FILE, sink_destination="network",
+            service_sink_adapter="trigger_service_write_roots",
+        ))
+        registry.freeze()
+
+
 def test_factory_or_explicit_policy_only_required():
     registry = PolicyRegistry()
     with pytest.raises(PolicyRegistrationError, match="sample.*factory"):

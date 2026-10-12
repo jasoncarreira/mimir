@@ -419,6 +419,21 @@ def build_trigger_service_principal(
                 ]))
             if fetch_policy is not None:
                 policies.append(ServiceSinkPolicy(operation, *fetch_policy))
+        elif tool is not None and tool.owner != "core" and tool.service_sink_adapter is not None:
+            adapter = tool.service_sink_adapter
+            if adapter == "trigger_service_write_roots":
+                bound = json.dumps([str(root) for root in write_roots])
+            elif adapter == "approved_urls":
+                bound = "MIMIR_EGRESS_APPROVED_URLS"
+            elif adapter == "operator_alert":
+                bound = "MIMIR_OPERATOR_ALERT_CHANNEL"
+            elif adapter == "shell_profile":
+                bound = selected.shell_profile_mappings.get(profile, "scheduler_read_only")
+            elif adapter == "spawn_workspace":
+                bound = "MIMIR_HOME/MIMIR_FILE_TOOL_ROOTS"
+            else:
+                raise ValueError(f"unsupported service sink adapter for {operation}: {adapter}")
+            policies.append(ServiceSinkPolicy(operation, adapter, bound))
     if "operator_alert" in capabilities:
         policies.append(ServiceSinkPolicy(
             "operator_alert", "operator_alert", "MIMIR_OPERATOR_ALERT_CHANNEL",
