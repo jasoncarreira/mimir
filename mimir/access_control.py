@@ -8063,11 +8063,10 @@ class ChannelResourceAdapter:
     - Denials are structured and redacted without relying on model-supplied fields
     """
 
-    _CHANNEL_OPERATIONS: frozenset[str] = frozenset({
-        "send_message",
-        "react",
-        "fetch_channel_history",
-    })
+    _CHANNEL_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if "channel_operations" in tool.memberships
+    )
 
     _global_resolver: Any = None
 
@@ -8214,8 +8213,14 @@ class ChannelResourceAdapter:
 class WriteResourceAdapter:
     """Scope write/code operations by the server-authenticated caller axis."""
 
-    _WRITE_OPERATIONS: frozenset[str] = frozenset({"write_file", "edit_file", "replace_file"})
-    _RESOURCE_OPERATIONS: frozenset[str] = _WRITE_OPERATIONS | {"worklink_run", "worklink_resume"}
+    _WRITE_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if "write_operations" in tool.memberships
+    )
+    _RESOURCE_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if "write_resource_operations" in tool.memberships
+    )
     _PROTECTED_NAMES: frozenset[str] = frozenset({
         ".env", ".git", ".mimir", "memory-proposals.jsonl", "compose.env", "rate_limits.json",
         "config", "credentials", "identities", "secrets", "secret",
@@ -8393,91 +8398,32 @@ class OperationCatalog:
     they are denied by default when enforcement is on.
     """
 
-    _OPEN_OPERATIONS: frozenset[str] = frozenset({
-        "commitment_list",
-        "memory_query",
-        "memory_get",
-        # Web research is available to authorized users; calls remain subject
-        # to the NETWORK information-flow sink gate before authorization.
-        "web_search",
-        "fetch_url",
-        "write_todos",
-        "defer_injected_message",
-        "request_operator_approval",
-        "commitment_complete",
-        "commitment_snooze",
-        "commitment_dismiss",
-    })
-
-    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = (
-        READ_RESOURCE_OPERATIONS
-        | WriteResourceAdapter._RESOURCE_OPERATIONS
-        | frozenset(_TYPED_REPO_PR_TOOL_ACTIONS)
-        | frozenset({"hands_read", "ci_run_jobs", "ci_run", "ci_recent_runs"})
+    _OPEN_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if tool.operation_class == "open"
     )
 
-    _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset({
-        "pr_list",
-        "issue_comment",
-        "operator_alert",
-        "approve_declassification",
-        "list_channels",
-        "list_schedules",
-        "add_schedule",
-        "set_schedule_priority",
-        "remove_schedule",
-        "reload_pollers",
-        "open_proposal",
-        "proposal_diff",
-        "submit_proposal",
-        "abandon_proposal",
-        "request_mimir_update",
-        "shell_exec",
-        "bash_async",
-        "bash_jobs_list",
-        "bash_job_output",
-        "spawn_open_code",
-        "task",
-        "memory_store",
-        "memory_propose",
-        "saga_feedback",
-        "saga_mark_contributions",
-        "saga_end_session",
-        "saga_record_skill_learning",
-        "saga_forget",
-        "set_poller_overrides",
-        "download_files",
-        "adownload_files",
-        "rebuild_index",
-        "hands_edit",
-        "hands_shell",
-        "hands_python",
-        "hands_request_scope",
-    })
+    _RESOURCE_SCOPED_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if tool.operation_class == "resource_scoped"
+    )
+
+    _ADMIN_REQUIRED_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if tool.operation_class == "admin_required"
+    )
 
     # Global rows from these operations contain protected identities,
     # configuration, or process metadata and must never become OPEN.
-    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset({
-        "list_channels",
-        "list_schedules",
-        "bash_jobs_list",
-        "bash_job_output",
-    })
+    _PROTECTED_METADATA_OPERATIONS: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if "protected_metadata_operations" in tool.memberships
+    )
 
-    _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
-        "Bash",
-        "bash",
-        "bash_exec",
-        "execute",
-        "aexecute",
-        "shell",
-        "Write",
-        "Edit",
-        "Read",
-        "Glob",
-        "Grep",
-        "download_files",
-    })
+    _ADMIN_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
+        name for name, tool in core_policy_registry().tools.items()
+        if "catalog_admin_builtin" in tool.memberships
+    )
 
     def __init__(self) -> None:
         self._custom_decisions: dict[str, OperationDecision] = {}

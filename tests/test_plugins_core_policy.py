@@ -201,3 +201,34 @@ def test_core_service_grants_check_capability_domain_and_destination() -> None:
     assert not policy.service_can_invoke_operation(
         replace(scheduler, sink_destinations=("message",)), "shell_exec"
     )
+
+
+def test_operation_views_are_derived_from_core_registrations() -> None:
+    tools = core_policy_registry().tools
+    catalog = policy.OperationCatalog
+    for operation_class, view in (
+        ("open", catalog._OPEN_OPERATIONS),
+        ("resource_scoped", catalog._RESOURCE_SCOPED_OPERATIONS),
+        ("admin_required", catalog._ADMIN_REQUIRED_OPERATIONS),
+    ):
+        assert view == frozenset(
+            name for name, tool in tools.items() if tool.operation_class == operation_class
+        )
+    for membership, view in (
+        ("channel_operations", policy.ChannelResourceAdapter._CHANNEL_OPERATIONS),
+        ("write_operations", policy.WriteResourceAdapter._WRITE_OPERATIONS),
+        ("write_resource_operations", policy.WriteResourceAdapter._RESOURCE_OPERATIONS),
+        ("protected_metadata_operations", catalog._PROTECTED_METADATA_OPERATIONS),
+        ("catalog_admin_builtin", catalog._ADMIN_BUILTIN_TOOL_NAMES),
+    ):
+        assert view == frozenset(
+            name for name, tool in tools.items() if membership in tool.memberships
+        )
+    assert catalog._OPEN_OPERATIONS.isdisjoint(catalog._PROTECTED_METADATA_OPERATIONS)
+    assert policy.OperationCatalog().get_decision("memory_query") is policy.OperationDecision.OPEN
+    assert policy.OperationCatalog().get_decision("send_message") is policy.OperationDecision.UNKNOWN
+    assert (
+        policy.get_operation_catalog().get_decision("send_message")
+        is policy.OperationDecision.RESOURCE_SCOPED
+    )
+    assert policy.OperationCatalog().get_decision("not_registered") is policy.OperationDecision.UNKNOWN
