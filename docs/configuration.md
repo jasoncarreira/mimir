@@ -123,6 +123,18 @@ exists — turn it on here first:
 | `MIMIR_CODING_ENABLED` | Single coding runtime/build flag. Requires OpenCode, pinned Git, and an existing runtime-writable PR checkout lease root; see [coding prerequisites](#coding-prerequisites). |
 | `MIMIR_FACTORY_EPICS_ENABLED` | Feature-factory epic dispatch in the chainlink-orchestrator poller (for `worklink:epic` issues). |
 
+Installed Python plugins use a separate operator-owned process-environment enable
+list. They are trusted in-process code, not a sandbox or a remote marketplace.
+Unset or empty `MIMIR_PLUGINS` disables optional plugins only; existing core tools
+remain available. Disabled providers are inspected through package metadata, not
+imported. Set a comma-separated list of manifest names or `all` to enable them.
+Invalid or duplicate disabled providers are diagnosed in the plugin listing;
+selected missing, duplicate, invalid or incompatible providers fail startup.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `MIMIR_PLUGINS` | comma-separated plugin names or `all` | `""` (off) | Operator-owned process enable list for installed `mimir.plugins` providers; does not disable core tools. |
+
 All channel-list flags take a comma-separated prefix allow-list (e.g.
 `discord-,slack-`); `*` means all interactive channels; empty means off.
 
