@@ -28,6 +28,9 @@ MAX_CONSECUTIVE_QUOTA_HOLDS = 4
 _DELIVERY_RECEIPTS_DIR = ".delivery-receipts"
 FACTORY_STOP_KINDS = frozenset({"factory_needs_human", "factory_blocked", "factory_partial"})
 FACTORY_TRANSITION_KINDS = FACTORY_STOP_KINDS | {"factory_start", "factory_success"}
+LEAF_TRANSITION_KINDS = frozenset({
+    "leaf_blocked", "leaf_attempts_exhausted", "leaf_template_invalid", "leaf_claim_reaped",
+})
 _TRANSIENT_CONTENTION_MARKERS = (
     ("unable to create", "index.lock"),
     ("cannot lock ref",),
@@ -608,6 +611,53 @@ def record_factory_transition(
                            park_snapshot=park_snapshot, sandbox=sandbox)
         entry = state.setdefault("factory_transitions", {}).setdefault(delivery_key, payload)
     return entry
+
+
+def record_leaf_transition(
+    state_dir: Path,
+    *,
+    kind: str,
+    issue_id: int,
+    attempt: int,
+    reason: str,
+    issue_title: str = "",
+    evidence_path: str | None = None,
+    transcript_path: str | None = None,
+    checkout: str | None = None,
+    branch: str | None = None,
+    occurrence_id: str = "",
+) -> dict[str, Any]:
+    """Record an ending; producers supply durable identity for repeatable endings."""
+    if kind not in LEAF_TRANSITION_KINDS:
+        raise ValueError(f"invalid leaf transition kind: {kind}")
+    # Keep legacy identities for kinds whose attempt/reason already identify
+    # an occurrence. Reset generations and template demotions need an anchor
+    # independent of their (potentially identical) reason and attempt count.
+    identity = json.dumps([occurrence_id, reason], ensure_ascii=False) if occurrence_id else reason
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    delivery_key = f"worklink-{kind}:{issue_id}:{attempt}:{digest}"
+    payload = {
+        "kind": kind, "issue_id": issue_id, "issue_title": issue_title,
+        "run_id": str(issue_id), "attempt": attempt, "pr_url": None,
+        "occurrence_id": occurrence_id,
+        "reason": reason[:2000] + (" [reason truncated; inspect issue/evidence]" if len(reason) > 2000 else ""),
+        "evidence_path": evidence_path or "", "transcript_path": transcript_path or "",
+        "checkout": checkout or "", "branch": branch or "",
+        "delivery_key": delivery_key, "notified": False,
+    }
+    with failure_state_transaction(state_dir) as state:
+        return state.setdefault("factory_transitions", {}).setdefault(delivery_key, payload)
+
+
+def record_leaf_transition_best_effort(home: Path | None, **fields: Any) -> None:
+    """Milestone IO must never alter a claim, label transition or result."""
+    if home is None:
+        return
+    try:
+        record_leaf_transition(dispatch_failure_state_dir(home), **fields)
+    except Exception:
+        # The ledger and the log may share a failed filesystem.
+        pass
 
 
 def record_failure(

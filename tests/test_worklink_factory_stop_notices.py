@@ -8,11 +8,14 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import inspect
 import hashlib
+import textwrap
 from pathlib import Path
 
 import pytest
 
 from mimir.worklink import orchestrator
+from mimir.worklink import evidence as evidence_module
+from mimir.worklink import claims as claims_module
 from mimir.worklink import dispatch_failures
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.claims import ClaimRecord
@@ -49,6 +52,55 @@ ENDING_NOTICES = {
     "factory_wrapper": "incident",
     "operator_stop": None,  # Explicit operator instruction, not an agent intervention.
 }
+
+# This inventory covers the leaf result statuses AND pre/post-claim endings.
+# A new leaf status or exit needs an explicit delivery mapping or exemption.
+LEAF_ENDING_NOTICES = {
+    "completed": None,  # Completed evidence becomes review_ready; the PR is the notice.
+    "review_ready": None,  # Review is operator-owned.
+    "blocked": "leaf_blocked",
+    "failed": "incident",  # leaf_result and reattach incidents already prompt.
+    "stopped": None,  # Explicit operator stop.
+    "quota_hold": None,  # Scheduled quota retry, no decision needed.
+    "attempts_exhausted": "leaf_attempts_exhausted",
+    "template_invalid": "leaf_template_invalid",
+    "claim_reaped": "leaf_claim_reaped",
+}
+
+
+def test_leaf_ending_inventory_is_closed():
+    from mimir.worklink.dispatch_failures import LEAF_TRANSITION_KINDS
+
+    source = inspect.getsource(WorklinkRunner._finalize)
+    tree = ast.parse(textwrap.dedent(source))
+    returned = {
+        arg.value for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "WorklinkRunResult"
+        for arg in node.args[2:3] if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    }
+    # The evidence validator supplies the dynamic statuses used by _finalize.
+    evidence_tree = ast.parse(inspect.getsource(evidence_module.validate_evidence))
+    evidence_statuses = {
+        item.value for node in ast.walk(evidence_tree) if isinstance(node, ast.Set)
+        for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)
+    }
+    dynamic = {"review_ready" if status == "completed" else status for status in evidence_statuses}
+    final_statuses = returned | dynamic | {
+        node.value.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name) and target.id == "transition_status"
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+    }
+    assert evidence_statuses == {"completed", "blocked", "failed"}
+    assert final_statuses == {"review_ready", "blocked", "failed", "stopped", "quota_hold"}
+    assert set(LEAF_ENDING_NOTICES) == final_statuses | {
+        "completed", "attempts_exhausted", "template_invalid", "claim_reaped",
+    }
+    assert set(LEAF_ENDING_NOTICES.values()) - {None, "incident"} == LEAF_TRANSITION_KINDS
+    assert 'kind="leaf_blocked"' in source
+    assert '"leaf_attempts_exhausted"' in inspect.getsource(claims_module.ChainlinkClaims._attempts_exhausted)
+    assert '"leaf_claim_reaped"' in inspect.getsource(claims_module.ChainlinkClaims.reap_stale_claims)
+    assert 'kind="leaf_template_invalid"' in inspect.getsource(orchestrator._demote_template_invalid_ready_leaf)
 
 
 def test_factory_ending_inventory_is_closed():

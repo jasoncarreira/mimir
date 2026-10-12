@@ -624,7 +624,14 @@ def test_list_issue_ids_falls_back_when_id_is_null() -> None:
     assert claims.issue_ids_with_label("worklink:ready") == [81, 82]
 
 
-def test_claim_issue_blocks_when_attempts_exhausted() -> None:
+@pytest.mark.parametrize("epic", [False, True])
+@pytest.mark.parametrize("ledger_failure", [False, True])
+def test_claim_issue_blocks_when_attempts_exhausted(tmp_path, monkeypatch, epic, ledger_failure) -> None:
+    from mimir.worklink import dispatch_failures
+    if ledger_failure:
+        def fail(*args, **kwargs):
+            raise OSError("ledger unavailable")
+        monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
     calls: list[list[str]] = []
 
     def runner(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -636,9 +643,9 @@ def test_claim_issue_blocks_when_attempts_exhausted() -> None:
         ClaimRecord(7, 2, "a", datetime(2026, 6, 11, tzinfo=UTC)).to_comment(),
         ClaimRecord(7, 3, "a", datetime(2026, 6, 11, tzinfo=UTC)).to_comment(),
     ]
-    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3)
+    claims = ChainlinkClaims(agent_id="mimir-a", runner=runner, max_attempts=3, home_path=tmp_path)
 
-    result = claims.claim_issue(7, old)
+    result = claims.claim_issue(7, old, labels={"worklink:epic"} if epic else set(), issue_title="epic" if epic else "leaf")
 
     assert result.claimed is False
     assert result.attempts_exhausted is True
@@ -648,9 +655,24 @@ def test_claim_issue_blocks_when_attempts_exhausted() -> None:
     assert ["chainlink", "locks", "claim", "7"] in calls
     assert ["chainlink", "locks", "release", "7"] in calls
     assert ["chainlink", "issue", "label", "7", "worklink:blocked"] in calls
+    notices = list(dispatch_failures.load_failure_state(
+        dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    ).get("factory_transitions", {}).values())
+    assert len(notices) == (0 if ledger_failure else 1)
+    if notices:
+        assert notices[0]["kind"] == "leaf_attempts_exhausted"
+        assert notices[0]["issue_title"] == ("epic" if epic else "leaf")
+        assert notices[0]["attempt"] == 3
+        assert "3 of 3" in notices[0]["reason"]
 
 
-def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ledger_failure", [False, True])
+def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path, monkeypatch, ledger_failure) -> None:
+    from mimir.worklink import dispatch_failures
+    if ledger_failure:
+        def fail(*args, **kwargs):
+            raise OSError("ledger unavailable")
+        monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
     calls: list[list[str]] = []
     events: list[tuple[str, dict[str, object]]] = []
 
@@ -721,6 +743,15 @@ def test_reaper_enforces_own_ttl_before_steal(tmp_path: Path) -> None:
             },
         )
     ]
+    notices = list(dispatch_failures.load_failure_state(
+        dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    ).get("factory_transitions", {}).values())
+    assert len(notices) == (0 if ledger_failure else 1)
+    if notices:
+        assert notices[0]["kind"] == "leaf_claim_reaped"
+        assert notices[0]["attempt"] == 1
+        assert "stale" in notices[0]["reason"]
+        assert heartbeat.isoformat() in notices[0]["reason"]
 
 
 def test_reaper_blocks_after_max_attempts() -> None:

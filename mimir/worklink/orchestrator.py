@@ -820,6 +820,7 @@ def validate_leaf(issue: IssueContext) -> None:
 def _demote_template_invalid_ready_leaf(
     issue: IssueContext,
     *,
+    home: Path | None = None,
     reason: str,
     runner: Runner,
     chainlink_bin: str,
@@ -839,10 +840,14 @@ def _demote_template_invalid_ready_leaf(
         return
 
     issue_id = str(issue.issue_id)
+    # Persist the occurrence anchor in the authoritative demotion comment. A
+    # later re-arm can fail with identical text, but is a new demotion.
+    demoted_at = datetime.now(UTC).isoformat()
     comment = (
         "WORKLINK_BLOCKED leaf template validation failed before dispatch; "
         f"{reason}. Re-plan this issue, then remove worklink:blocked and "
-        "re-add worklink:ready when the required checklist is present."
+        "re-add worklink:ready when the required checklist is present. "
+        f"Demoted at: {demoted_at}"
     )
     commands = (
         (chainlink_bin, "issue", "unlabel", issue_id, "worklink:ready"),
@@ -871,6 +876,13 @@ def _demote_template_invalid_ready_leaf(
         "worklink_template_invalid_demoted",
         issue_id=issue.issue_id,
         reason=reason,
+    )
+    from .dispatch_failures import record_leaf_transition_best_effort
+
+    record_leaf_transition_best_effort(
+        home, kind="leaf_template_invalid", issue_id=issue.issue_id,
+        issue_title=issue.title, attempt=0, reason=reason,
+        occurrence_id=f"template-demoted-at:{demoted_at}",
     )
 
 
@@ -954,6 +966,7 @@ class WorklinkRunner:
                         )
                 _demote_template_invalid_ready_leaf(
                     issue,
+                    home=self.home,
                     reason=str(exc),
                     runner=runner,
                     chainlink_bin=self.chainlink_bin,
@@ -1104,6 +1117,7 @@ class WorklinkRunner:
                 issue.issue_id,
                 issue.comments,
                 labels=issue.labels,
+                issue_title=issue.title,
                 max_active_locks=config.defaults.max_concurrent if autonomous else None,
                 exclude_active_label=WORKLINK_EPIC_LABEL,
                 before_claim=record_claiming,
@@ -1885,6 +1899,17 @@ class WorklinkRunner:
                 reason="terminal recovery incomplete: Chainlink lock release failed",
                 incident_recorded=incident_recorded,
             )
+        if transition_status == "blocked":
+            from .dispatch_failures import record_leaf_transition_best_effort
+
+            record_leaf_transition_best_effort(
+                self.home, kind="leaf_blocked", issue_id=issue.issue_id,
+                issue_title=issue.title, attempt=attempt,
+                reason=transition_reason or ", ".join(validation.reasons) or "blocked",
+                evidence_path=str(evidence_path),
+                transcript_path=str(raw.transcript_path) if raw.transcript_path else None,
+                checkout=str(lease.path), branch=lease.branch,
+            )
         cleanup_error = None
         if publication is None:
             cleanup_error = _cleanup_checkout_after_transition(
@@ -2538,6 +2563,7 @@ class WorklinkRunner:
                 issue_id,
                 issue.comments,
                 labels=issue.labels,
+                issue_title=issue.title,
                 max_active_locks=factory_max_concurrent(),
                 active_label=WORKLINK_EPIC_LABEL,
                 before_claim=prepare_factory_claim,

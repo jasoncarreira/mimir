@@ -3592,7 +3592,17 @@ def test_worklink_disabled_base_fetch_fails_before_backend_dispatch(tmp_path: Pa
 
 
 
-def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Path) -> None:
+def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Path, monkeypatch) -> None:
+    from mimir.worklink import dispatch_failures
+
+    attempted = []
+    original = dispatch_failures.record_leaf_transition
+
+    def record(*args, **kwargs):
+        attempted.append(kwargs["kind"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dispatch_failures, "record_leaf_transition", record)
     repo = tmp_path / "repo"
     worktree = repo.parent / ".worklink" / repo.name / "441-1"
     calls, runner = _orchestrator_runner(repo, worktree)
@@ -3634,6 +3644,46 @@ def test_backend_blocked_result_routes_leaf_to_blocked_with_reason(tmp_path: Pat
     )
     assert '"status": "blocked"' in evidence
     assert "planner gave contradictory acceptance criteria" in evidence
+    entries = list(dispatch_failures.load_failure_state(
+        dispatch_failures.dispatch_failure_state_dir(tmp_path)
+    )["factory_transitions"].values())
+    assert attempted == ["leaf_blocked"]
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "leaf_blocked"
+    assert entries[0]["reason"] == "planner gave contradictory acceptance criteria"
+    assert entries[0]["evidence_path"] == str(result.evidence_path)
+    assert entries[0]["transcript_path"]
+    assert entries[0]["checkout"] == str(result.checkout)
+    assert entries[0]["branch"] == result.branch
+
+
+def test_leaf_blocked_ledger_failure_keeps_transition_and_result(tmp_path, monkeypatch):
+    from mimir.worklink import dispatch_failures
+
+    repo = tmp_path / "repo"
+    worktree = repo.parent / ".worklink" / repo.name / "441-1"
+    calls, runner = _orchestrator_runner(repo, worktree)
+
+    class BlockingBackend(FakeBackend):
+        async def interpret(self, order, result):
+            return RawResult(1, order.transcript_root / "fake.json", "blocked", "needs spec repair", "needs spec repair")
+
+    registry = BackendRegistry(WorklinkConfig())
+    registry.register(BlockingBackend(write_change=False))
+    attempts = []
+
+    def fail(*args, **kwargs):
+        attempts.append(kwargs["kind"])
+        raise OSError("ledger unavailable")
+
+    monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
+    result = asyncio.run(WorklinkRunner(home=tmp_path, repo=repo, runner=runner, registry=registry).run(
+        441, backend_name="fake", test_command="echo ok",
+    ))
+    assert attempts == ["leaf_blocked"]
+    assert result.status == "blocked" and result.reason == "needs spec repair"
+    assert ["chainlink", "issue", "label", "441", "worklink:blocked"] in calls
+    assert ["chainlink", "locks", "release", "441"] in calls
 
 
 
@@ -4072,7 +4122,15 @@ INVALID_STRICT_ISSUE_JSON = (
 )
 
 
-def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ledger_failure", [False, True])
+def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(
+    tmp_path: Path, monkeypatch, ledger_failure: bool,
+) -> None:
+    from mimir.worklink import dispatch_failures
+    if ledger_failure:
+        def fail(*args, **kwargs):
+            raise OSError("ledger unavailable")
+        monkeypatch.setattr(dispatch_failures, "record_leaf_transition", fail)
     repo = tmp_path / "repo"
     calls: list[Sequence[str] | str] = []
 
@@ -4112,6 +4170,13 @@ def test_worklink_runner_demotes_template_invalid_ready_leaf_before_claim(tmp_pa
         isinstance(call, list) and call[:3] == ["chainlink", "locks", "claim"]
         for call in calls
     )
+    from mimir.worklink.dispatch_failures import dispatch_failure_state_dir, load_failure_state
+    notices = list(load_failure_state(dispatch_failure_state_dir(tmp_path)).get("factory_transitions", {}).values())
+    if ledger_failure:
+        assert notices == []
+    else:
+        assert len(notices) == 1 and notices[0]["kind"] == "leaf_template_invalid"
+        assert notices[0]["attempt"] == 0 and "acceptance checklist item" in notices[0]["reason"]
 
 
 def test_worklink_runner_does_not_demote_epic_brief_for_leaf_template(tmp_path: Path) -> None:
@@ -7401,6 +7466,7 @@ def test_every_epic_claim_uses_factory_concurrency_cap(
     assert callable(before_claim)
     assert observed == [{
         "labels": {"worklink", "worklink:epic", "worklink:ready"},
+        "issue_title": "epic",
         "max_active_locks": 1,
         "active_label": "worklink:epic",
     }]
