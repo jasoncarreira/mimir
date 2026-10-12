@@ -35,7 +35,7 @@ import pytest
 import yaml
 from langchain.agents.middleware import ToolCallRequest
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import ToolException
+from langchain_core.tools import StructuredTool, ToolException
 from langgraph.runtime import Runtime
 
 from mimir._context import get_current_turn, reset_current_turn, set_current_turn
@@ -63,6 +63,9 @@ from mimir.models import (
     TurnContext,
 )
 from mimir.identities import IdentityResolver
+from mimir.plugins.core import register_core_tools
+from mimir.plugins.registry import PolicyRegistry
+from mimir.tool_descriptors import FetchAuthorizationKind, ResultOriginKind, SinkCategory
 from mimir.tools.budget_gate import (
     BudgetGateMiddleware,
     OperatorShellPreparationOutcome,
@@ -127,6 +130,215 @@ def _make_request(
         state=None,
         runtime=Runtime(context=auth_context),
     )
+
+
+@pytest.fixture
+def selected_budget_policy():
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    registrar = registry.registrar("example")
+
+    def run_example() -> str:
+        return "ok"
+
+    for name, exempt, memberships in (
+        ("example_free", True, ()),
+        ("example_counted", False, ("remediation_effect",)),
+        ("example_typed", False, ("typed_error_signal",)),
+    ):
+        registrar.register_tool(
+            name=name,
+            factory=lambda name=name: StructuredTool.from_function(
+                run_example, name=name, description="Example budget tool",
+            ),
+            flow="source", tier="scope-contained", operation_class="open",
+            result_domain="repository", result_origin=ResultOriginKind.NON_INGESTING,
+            sink_category=None, sink_destination=None,
+            sink_target_extractor=None, sink_payload_extractor=None,
+            writes_code_or_state=False, profiles=(), read_backend=False,
+            budget_exempt=exempt, memberships=memberships,
+        )
+    registrar.register_tool(
+        name="example_fetch",
+        factory=lambda: StructuredTool.from_function(
+            lambda url: url, name="example_fetch", description="Example URL reader",
+        ),
+        flow="source", tier="scope-contained", operation_class="open",
+        result_domain="web", result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.NETWORK, sink_destination="network",
+        sink_target_extractor=lambda _name, args, _auth: (args.get("url"),),
+        sink_payload_extractor=None, writes_code_or_state=False,
+        profiles=(), read_backend=False,
+        fetch_authorization=FetchAuthorizationKind.FETCH_URL,
+    )
+    registrar.register_tool(
+        name="example_search",
+        factory=lambda: StructuredTool.from_function(
+            lambda url: url, name="example_search", description="Example fixed web search",
+        ),
+        flow="source", tier="scope-contained", operation_class="open",
+        result_domain="web", result_origin=ResultOriginKind.NON_INGESTING,
+        sink_category=SinkCategory.NETWORK, sink_destination="network",
+        sink_target_extractor=lambda _name, args, _auth: (args.get("url"),),
+        sink_payload_extractor=None, writes_code_or_state=False,
+        profiles=(), read_backend=False,
+        fetch_authorization=FetchAuthorizationKind.WEB_SEARCH,
+    )
+    return registry.freeze()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_selected_plugin_budget_exemption_counting_and_denial(
+    selected_budget_policy, asynchronous,
+):
+    auth = _untainted_ifc_auth()
+    turn = _make_ctx(budget=1)
+    turn.auth_context = auth
+    turn.ifc_labels = auth.ifc_labels
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    executed = []
+
+    def handler(request):
+        executed.append(request.tool_call["name"])
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request):
+        return handler(request)
+
+    token = set_current_turn(turn)
+    try:
+        results = []
+        for name in ("example_free", "example_counted", "example_free", "example_counted"):
+            request = _make_request(name, auth_context=auth)
+            results.append(
+                await gate.awrap_tool_call(request, async_handler) if asynchronous
+                else gate.wrap_tool_call(request, handler)
+            )
+    finally:
+        reset_current_turn(token)
+
+    assert [result.status for result in results] == ["success", "success", "success", "error"]
+    assert executed == ["example_free", "example_counted", "example_free"]
+    assert turn.tool_call_count == 1
+    assert turn.tool_call_budget_denied_tools == ["example_counted"]
+    assert turn.remediation_effects == ["example_counted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_selected_plugin_typed_error_signal_and_unknown_denial(
+    selected_budget_policy, asynchronous, monkeypatch,
+):
+    auth = _untainted_ifc_auth()
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    calls = []
+    outcomes = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate._emit_tool_call_sync",
+        lambda name, **fields: outcomes.append((name, fields)),
+    )
+
+    def handler(request):
+        calls.append(request.tool_call["name"])
+        return ToolMessage(
+            content=f"{request.tool_call['name']} failed: remote report",
+            tool_call_id=request.tool_call["id"],
+        )
+
+    async def async_handler(request):
+        return handler(request)
+
+    async def invoke(name):
+        request = _make_request(name, auth_context=auth)
+        return (
+            await gate.awrap_tool_call(request, async_handler) if asynchronous
+            else gate.wrap_tool_call(request, handler)
+        )
+
+    assert (await invoke("example_typed")).status == "success"
+    assert (await invoke("example_counted")).status == "success"
+    refused = await invoke("example_unknown")
+    assert refused.status == "error"
+    assert calls == ["example_typed", "example_counted"]
+    assert outcomes[0][0] == "example_typed" and outcomes[0][1]["ok"] is True
+    assert outcomes[1][0] == "example_counted" and outcomes[1][1]["ok"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("approval", ["approved", "denied", "ingested"])
+async def test_selected_plugin_fetch_uses_exact_url_boundary(
+    selected_budget_policy, asynchronous, approval, monkeypatch,
+):
+    from mimir.tools import web
+
+    url = "https://example.test/document"
+    other = "https://example.test/other"
+    monkeypatch.delenv("MIMIR_EGRESS_APPROVED_URLS", raising=False)
+    auth = _untainted_ifc_auth()
+    if approval == "approved":
+        auth.egress_state.approve_url(url)
+    elif approval == "ingested":
+        auth.ingested_url_state.add(url)
+    request = _make_request("example_fetch", auth_context=auth, args={"url": url})
+    request = request.override(tool=selected_budget_policy.tools["example_fetch"].factory())
+    seen = []
+
+    def handler(tool_request):
+        allowed = web._authorized_fetch_urls.get()
+        seen.append(allowed)
+        assert allowed is not None
+        assert other not in allowed
+        return ToolMessage(content="read", tool_call_id=tool_request.tool_call["id"])
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    result = (
+        await gate.awrap_tool_call(request, async_handler) if asynchronous
+        else gate.wrap_tool_call(request, handler)
+    )
+    assert web._authorized_fetch_urls.get() is None
+    if approval == "denied":
+        assert result.status == "error" and seen == []
+    else:
+        assert result.status != "error"
+        assert len(seen) == 1 and url in seen[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_selected_plugin_web_search_requires_fixed_endpoint(
+    selected_budget_policy, asynchronous, monkeypatch,
+):
+    from mimir.tools import web
+
+    fixed = "https://search.example.test/query"
+    monkeypatch.setattr("mimir.access_control._fixed_web_search_url", lambda: fixed)
+    auth = _untainted_ifc_auth()
+    auth.egress_state.approve_url("https://other.example.test/query")
+    gate = BudgetGateMiddleware(selected_budget_policy)
+    seen = []
+
+    def handler(request):
+        seen.append(web._authorized_fetch_urls.get())
+        return ToolMessage(content="results", tool_call_id=request.tool_call["id"])
+
+    async def async_handler(request):
+        return handler(request)
+
+    for url, admitted in ((fixed, True), ("https://other.example.test/query", False)):
+        request = _make_request("example_search", auth_context=auth, args={"url": url})
+        request = request.override(tool=selected_budget_policy.tools["example_search"].factory())
+        result = (
+            await gate.awrap_tool_call(request, async_handler) if asynchronous
+            else gate.wrap_tool_call(request, handler)
+        )
+        assert (result.status != "error") is admitted
+    assert seen == [frozenset({fixed})]
+    assert web._authorized_fetch_urls.get() is None
 
 
 def _service_turn(tmp_path: Path, channel_id: str | None) -> TurnContext:

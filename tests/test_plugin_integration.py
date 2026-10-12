@@ -7,7 +7,7 @@ import pytest
 from langchain.agents.middleware import ToolCallRequest
 from langchain.agents.middleware.types import ModelRequest
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import StructuredTool, ToolException
 from langgraph.runtime import Runtime
 
 from mimir.access_control import (
@@ -55,6 +55,7 @@ def policy():
         ("example_repo", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
         ("example_pr", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.PR_COMMENT, False),
         ("example_write", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.WRITE, True),
+        ("example_review", "repo_pr", _repo_target, SinkCategory.FORGE, "source", RepoPRAction.INSPECT, False),
     ):
         registrar.register_tool(
             name=name,
@@ -72,6 +73,7 @@ def policy():
                 if isinstance(args.get("payload"), str) else ()
             ) if name == "example_channel" else None,
             writes_code_or_state=writes, profiles=(), read_backend=False,
+            memberships=("standing_review",) if name == "example_review" else (),
         )
     return registry.freeze()
 
@@ -414,7 +416,61 @@ def test_plugin_result_domain_comes_from_authorizing_policy(policy):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("asynchronous", [False, True])
-async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous):
+@pytest.mark.parametrize("review_state", ["valid", "missing", "stale", "malformed"])
+async def test_plugin_standing_review_precedes_handler(
+    policy, asynchronous, review_state, monkeypatch,
+):
+    from mimir.tools import forge
+
+    auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
+        _state({RepoPRAction.INSPECT.value}),
+    )))
+    args = {"repository": "acme/widget", "pull_request": 7}
+    if review_state == "missing":
+        auth = replace(auth, repo_pr_scope_registry=None)
+    elif review_state == "malformed":
+        args = {"repository": [], "pull_request": 7}
+    observed = []
+    original = forge.resolve_review_state_for_context
+
+    def resolve(context, repository, pull_request):
+        observed.append((repository, pull_request))
+        if review_state == "stale":
+            raise ToolException("pull-request operation rejected: stale review state")
+        return original(context, repository, pull_request)
+
+    monkeypatch.setattr(forge, "resolve_review_state_for_context", resolve)
+    request = ToolCallRequest(
+        tool_call={"name": "example_review", "args": args, "id": "review", "type": "tool_call"},
+        tool=policy.tools["example_review"].factory(), state=None,
+        runtime=Runtime(context=auth),
+    )
+    executed = []
+
+    def handler(_request):
+        executed.append(True)
+        return ToolMessage(content="reviewed", tool_call_id="review")
+
+    async def async_handler(tool_request):
+        return handler(tool_request)
+
+    result = (
+        await BudgetGateMiddleware(policy).awrap_tool_call(request, async_handler)
+        if asynchronous else BudgetGateMiddleware(policy).wrap_tool_call(request, handler)
+    )
+    if review_state == "valid":
+        assert result.status != "error" and executed == [True]
+        assert observed == [("acme/widget", 7)]
+    else:
+        assert result.status == "error" and executed == []
+        if review_state == "stale":
+            assert "stale review state" in str(result.content)
+        assert observed == ([] if review_state == "malformed" else [("acme/widget", 7)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous, monkeypatch):
     auth = _auth(repo_pr_scope_registry=RepoPRScopeRegistry((
         _state({RepoPRAction.INSPECT.value}),
     )))
@@ -424,6 +480,11 @@ async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous
         }, "id": "plugin-result", "type": "tool_call"},
         tool=policy.tools["example_repo"].factory(), state=None,
         runtime=Runtime(context=auth),
+    )
+    recorded = []
+    monkeypatch.setattr(
+        "mimir.tools.budget_gate.record_external_ingested_urls",
+        lambda context, text: recorded.append((context, text)),
     )
 
     def handler(_request):
@@ -441,6 +502,7 @@ async def test_plugin_result_is_labelled_through_middleware(policy, asynchronous
     labels = auth.ifc_state.current(auth.ifc_labels)
     assert labels.has_untrusted_active_ingest
     assert any(source.domain == "repository" for source in labels.sources)
+    assert recorded == [(auth, "outside data")]
 
 
 @pytest.mark.parametrize("enforce", [False, True])
