@@ -8113,6 +8113,7 @@ def test_factory_supervision_records_and_reports_park_snapshot(
     [(True, True), (False, True), (True, False)],
 )
 @pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("contended", [False, True], ids=["uncontended", "contended"])
 def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8120,8 +8121,10 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     snapshot_published: bool,
     cancellation_stops_driver: bool,
     idle: bool,
+    contended: bool,
 ) -> None:
     import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
 
     sandbox = tmp_path / "sandbox"
     sandbox.mkdir()
@@ -8134,6 +8137,7 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
     terminal_times: list[float] = []
     parked = False
     parked_status_reads = 0
+    running_status_reads = 0
     snapshot = str(sandbox / ".factory" / ".parked" / "700")
     slices = tuple(
         {
@@ -8190,10 +8194,20 @@ def test_factory_budget_expiry_kills_then_parks_and_verifies_snapshot(
         poll_interval_s = 5
 
         def status(self, *args: object, **kwargs: object) -> Any:
-            nonlocal parked_status_reads
+            nonlocal parked_status_reads, running_status_reads
+            # A live driver holds run.json through whole transitions; status
+            # then times out on its 1s lock wait. That must never end the run.
+            lock_timeout = FactoryRunLockContended(
+                f"timed out waiting for run.json lock at {sandbox}/run-json.lock"
+            )
             if not parked:
+                running_status_reads += 1
+                if contended and running_status_reads % 2:
+                    raise lock_timeout
                 return running
             parked_status_reads += 1
+            if contended and parked_status_reads == 1:
+                raise lock_timeout
             return replace(
                 running,
                 status="needs-human",
@@ -8347,6 +8361,159 @@ def test_factory_supervision_waits_for_manifest_then_proceeds(tmp_path: Path) ->
 
     assert result.status == "needs-human"
     assert statuses == []
+
+
+def test_factory_supervision_tolerates_run_lock_contention_before_first_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contended first read is not an observation; supervision waits and proceeds."""
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    events: list[tuple[str, dict[str, object]]] = []
+    contended = FactoryRunLockContended(f"timed out waiting for run.json lock at {sandbox}/run-json.lock")
+    statuses: list[Any] = [
+        contended,
+        contended,
+        _factory_lifecycle_status(sandbox, status="running"),
+        contended,
+        _factory_lifecycle_status(sandbox, status="needs-human"),
+    ]
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            next_status = statuses.pop(0)
+            if isinstance(next_status, Exception):
+                raise next_status
+            return next_status
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        orchestrator, "_log_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=_FactoryLifecycleClaims(),
+            backend=Backend(),
+            compute=Compute(),
+            factory_record=_factory_lifecycle_record(sandbox, handle),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert statuses == []
+    contention = [fields for event, fields in events if event == "worklink_factory_status_contended"]
+    # One event per contention episode, not per poll.
+    assert contention == [
+        {"issue_id": 700, "run_id": "700", "attempt": 1},
+        {"issue_id": 700, "run_id": "700", "attempt": 1},
+    ]
+
+
+def test_factory_supervision_survives_contended_heartbeat_and_skips_it_on_reused_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """refreshSessionLock takes the same run-state lock; contention there is no fault either."""
+    import mimir.worklink.orchestrator as orchestrator
+    from mimir.worklink.backends.feature_factory import FactoryRunLockContended
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    handle = LaunchHandle("local_subprocess", "123", 456)
+    stopped = asyncio.Event()
+    calls: list[str] = []
+    events: list[str] = []
+    lock_timeout = f"timed out waiting for run.json lock at {sandbox}/run-json.lock"
+    running = _factory_lifecycle_status(sandbox, status="running")
+    assert running.lock == "fresh" and running.lock_session == "session-1"
+    statuses: list[Any] = [running, FactoryRunLockContended(lock_timeout), running,
+                           _factory_lifecycle_status(sandbox, status="needs-human")]
+
+    class Compute:
+        async def wait(self, selected: LaunchHandle, timeout_s: int) -> ComputeResult:
+            await stopped.wait()
+            return ComputeResult(-15, "", "cancelled", handle=selected)
+
+        def job_alive(self, selected: LaunchHandle) -> bool:
+            return not stopped.is_set()
+
+        async def cancel(self, selected: LaunchHandle) -> None:
+            calls.append("cancel")
+            stopped.set()
+
+        async def cleanup(self, selected: LaunchHandle) -> None:
+            return None
+
+    class Backend:
+        poll_interval_s = 0
+
+        def status(self, *args: object, **kwargs: object) -> Any:
+            next_status = statuses.pop(0)
+            if isinstance(next_status, Exception):
+                calls.append("status:contended")
+                raise next_status
+            calls.append(f"status:{next_status.status}")
+            return next_status
+
+        def heartbeat(self, *args: object, **kwargs: object) -> None:
+            # The live driver holds the lock through its transition.
+            calls.append("heartbeat:contended")
+            raise FactoryRunLockContended(lock_timeout)
+
+    monkeypatch.setattr(orchestrator, "_log_event", lambda event, **fields: events.append(event))
+    result = asyncio.run(
+        WorklinkRunner(home=tmp_path, repo=tmp_path)._supervise_factory_070(
+            issue=IssueContext(700, "epic", "build", {"worklink:epic"}),
+            claim_record=ClaimRecord(700, 1, "agent", datetime.now(UTC)),
+            claims=_FactoryLifecycleClaims(),
+            backend=Backend(),
+            compute=Compute(),
+            factory_record=replace(_factory_lifecycle_record(sandbox, handle), session="session-1"),
+            test_cmd="pytest -q",
+            runner=lambda args: cp(args),
+            started_at=datetime.now(UTC),
+        )
+    )
+
+    assert result.status == "needs-human"
+    assert statuses == []
+    # No cancellation while the driver held the lock, and no heartbeat on the
+    # reused (contended) observation.
+    assert calls[: calls.index("status:needs-human")] == [
+        "status:running", "heartbeat:contended",
+        "status:contended",
+        "status:running", "heartbeat:contended",
+    ]
+    assert "cancel" not in calls[: calls.index("status:needs-human")]
+    assert "worklink_factory_status_contended" in events
 
 
 def test_factory_executor_exit_retains_scrubbed_tail_and_record_pointer(
