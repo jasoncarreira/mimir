@@ -34,8 +34,42 @@ def test_mandatory_tool_metadata_cannot_be_omitted(missing):
     fields = tool_fields()
     fields.pop(missing)
     registry = PolicyRegistry()
-    with pytest.raises(TypeError):
+    with pytest.raises(PolicyRegistrationError, match=f"example: tool {fields.get('name', '<unnamed>')}: missing required metadata: {missing}"):
         registry.registrar("example").register_tool(**fields)
+
+
+def test_core_policy_entries_do_not_invent_descriptor_or_flow_rows():
+    registry = PolicyRegistry()
+    registry.register_tool(**tool_fields(
+        name="memory_query", factory=None, policy_only=True, tier=None,
+        descriptor_registered=False,
+    ))
+    registry.register_tool(**tool_fields(
+        name="bash_jobs_list", factory=None, policy_only=True,
+        descriptor_registered=False,
+    ))
+    registry.register_capability("bash_jobs_list")
+    registry.register_capability("pr_review_others", tier="scoped-with-provenance")
+    registry.register_authority_profile("github", capabilities={"bash_jobs_list", "pr_review_others"})
+    registry.register_tool(**tool_fields(
+        name="web_turn_events", factory=None, policy_only=True, flow=None, tier=None,
+        operation_class=None,
+    ))
+    registry.freeze()
+    assert set(registry.descriptors) == {"web_turn_events"}
+    assert registry.flow == {"memory_query": "source", "bash_jobs_list": "source"}
+    assert registry.tiers == {
+        "bash_jobs_list": "scope-contained", "pr_review_others": "scoped-with-provenance",
+    }
+    assert registry.authority_profiles["github"] == {"bash_jobs_list", "pr_review_others"}
+
+
+def test_plugin_cannot_exclude_its_descriptor_or_flow():
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="descriptor exclusion is core-only"):
+        registry.registrar("example").register_tool(**tool_fields(descriptor_registered=False))
+    with pytest.raises(PolicyRegistrationError, match="invalid flow"):
+        registry.registrar("example").register_tool(**tool_fields(flow=None))
 
 
 def test_factory_or_explicit_policy_only_required():
@@ -76,6 +110,30 @@ def test_plugin_can_only_add_its_own_tool_to_existing_profile():
     plugin.register_tool(**tool_fields())
     plugin.add_to_profile("research", "sample")
     assert registry.freeze().authority_profiles["research"] == frozenset({"core_tool", "sample"})
+
+
+def test_plugin_profile_membership_must_be_declared_on_both_sides():
+    registry = PolicyRegistry()
+    plugin = registry.registrar("example")
+    plugin.register_capability("sample")
+    plugin.register_tool(**tool_fields(profiles=()))
+    plugin.register_authority_profile("example-profile", capabilities={"sample"})
+    with pytest.raises(PolicyRegistrationError, match="example: tool sample: undeclared profile membership example-profile"):
+        registry.freeze()
+    assert not registry.frozen
+
+
+@pytest.mark.parametrize("membership", ["retained_repo_tools", "fixed_service_sinks", "worklink_build_tools", "catalog_admin_builtin", "repo_publish_tools"])
+def test_core_only_memberships_are_not_plugin_grants(membership):
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match=f"example: tool sample: core-only memberships.*{membership}"):
+        registry.registrar("example").register_tool(**tool_fields(memberships={membership}))
+    assert not registry.tools
+
+
+def test_unknown_membership_is_not_accepted():
+    with pytest.raises(PolicyRegistrationError, match="unknown memberships.*admin_bypass"):
+        PolicyRegistry().registrar("example").register_tool(**tool_fields(memberships={"admin_bypass"}))
 
 
 def test_principal_collisions_and_profile_validation():

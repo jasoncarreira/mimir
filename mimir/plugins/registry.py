@@ -28,11 +28,11 @@ class ToolPolicy:
     owner: str
     factory: Callable[..., Any] | None
     policy_only: bool
-    flow: str
+    flow: str | None
     tier: str | None
-    operation_class: str
+    operation_class: str | None
     result_domain: str | None
-    descriptor: ToolDescriptor
+    descriptor: ToolDescriptor | None
     writes_code_or_state: bool
     profiles: frozenset[str]
     resource_scope: str | None = None
@@ -60,6 +60,24 @@ _FLOW = frozenset({"source", "sink", "both", "neither"})
 _TIERS = frozenset({"scope-contained", "scoped-with-provenance", "code-execution", "unbounded"})
 _OPERATIONS = frozenset({"open", "resource_scoped", "admin_required"})
 _SCOPES = frozenset({"channel", "repo_pr"})
+_REQUIRED_TOOL_FIELDS = frozenset({
+    "name", "flow", "tier", "operation_class", "result_domain", "result_origin",
+    "sink_category", "sink_destination", "sink_target_extractor",
+    "sink_payload_extractor", "writes_code_or_state", "profiles", "read_backend",
+})
+_TOOL_MEMBERSHIPS = frozenset({
+    "forge_actions", "repo_actions", "retained_repo_tools", "read_resource_operations",
+    "acp_hands_result_tools", "channel_operations", "write_operations",
+    "write_resource_operations", "fixed_service_sinks", "taint_independent_egress",
+    "worklink_build_tools", "protected_metadata_operations", "catalog_admin_builtin",
+    "tainted_writes", "tainted_file_writes", "schedule_writes", "saga_mutations",
+    "standing_review", "remediation_effect", "typed_error_signal", "repo_publish_tools",
+})
+_CORE_ONLY_MEMBERSHIPS = frozenset({
+    "retained_repo_tools", "fixed_service_sinks", "worklink_build_tools",
+    "taint_independent_egress", "catalog_admin_builtin", "acp_hands_result_tools",
+    "repo_publish_tools",
+})
 
 
 def _name(value: str, kind: str) -> str:
@@ -84,6 +102,7 @@ class PolicyRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolPolicy] = {}
         self._capabilities: dict[str, str] = {}
+        self._capability_tiers: dict[str, str] = {}
         self._profiles: dict[str, AuthorityProfile] = {}
         self._shell_profiles: dict[str, str] = {}
         self._principals: dict[str, Any] = {}
@@ -124,24 +143,41 @@ class PolicyRegistry:
 
     @property
     def descriptors(self) -> Mapping[str, ToolDescriptor]:
-        return MappingProxyType({name: tool.descriptor for name, tool in self._tools.items()})
+        return MappingProxyType({name: tool.descriptor for name, tool in self._tools.items() if tool.descriptor is not None})
 
     @property
     def flow(self) -> Mapping[str, str]:
-        return MappingProxyType({name: tool.flow for name, tool in self._tools.items()})
+        return MappingProxyType({name: tool.flow for name, tool in self._tools.items() if tool.flow is not None})
 
     @property
     def tiers(self) -> Mapping[str, str]:
-        return MappingProxyType({name: tool.tier for name, tool in self._tools.items() if tool.tier is not None})
+        tiers = {name: tool.tier for name, tool in self._tools.items() if tool.tier is not None}
+        tiers.update(self._capability_tiers)
+        return MappingProxyType(tiers)
 
     @property
     def authority_profiles(self) -> Mapping[str, frozenset[str]]:
         return MappingProxyType({name: profile.capabilities for name, profile in self._profiles.items()})
 
-    def register_tool(
+    def register_tool(self, **kwargs: Any) -> None:
+        """Require explicit metadata even when its declared value is None or False."""
+        self._writable()
+        owner = kwargs.get("owner", "core")
+        name = kwargs.get("name", "<unnamed>")
+        missing = _REQUIRED_TOOL_FIELDS - kwargs.keys()
+        if missing:
+            raise PolicyRegistrationError(
+                f"{owner}: tool {name}: missing required metadata: {', '.join(sorted(missing))}"
+            )
+        try:
+            self._register_tool(**kwargs)
+        except TypeError as exc:
+            raise PolicyRegistrationError(f"{owner}: tool {name}: invalid registration: {exc}") from exc
+
+    def _register_tool(
         self, *, name: str, factory: Callable[..., Any] | None = None,
-        policy_only: bool = False, flow: str, tier: str | None,
-        operation_class: str, result_domain: str | None,
+        policy_only: bool = False, flow: str | None, tier: str | None,
+        operation_class: str | None, result_domain: str | None,
         result_origin: ResultOriginKind, sink_category: SinkCategory | None,
         sink_destination: str | None,
         sink_target_extractor: SinkTargetExtractor | None,
@@ -153,6 +189,7 @@ class PolicyRegistry:
         fetch_authorization: FetchAuthorizationKind = FetchAuthorizationKind.NONE,
         git_operation_result: bool = False, ifc_delegation: bool = False,
         budget_exempt: bool = False, owner: str = "core",
+        descriptor_registered: bool = True,
     ) -> None:
         self._writable()
         name = _name(name, "tool")
@@ -162,7 +199,7 @@ class PolicyRegistry:
             raise PolicyRegistrationError(f"{name}: supply a factory or explicit policy_only=True")
         if factory is not None and not callable(factory):
             raise PolicyRegistrationError(f"{name}: invalid factory")
-        if flow not in _FLOW or operation_class not in _OPERATIONS or tier not in _TIERS | {None}:
+        if flow not in _FLOW | ({None} if owner == "core" else set()) or operation_class not in _OPERATIONS | ({None} if owner == "core" else set()) or tier not in _TIERS | {None}:
             raise PolicyRegistrationError(f"{name}: invalid flow, tier or operation class")
         if owner != "core" and tier is None:
             raise PolicyRegistrationError(f"{name}: plugin tier is required")
@@ -186,13 +223,19 @@ class PolicyRegistry:
             _name(readable_domain, "readable domain")
         declared_profiles = frozenset(_name(profile, "profile") for profile in profiles)
         declared_memberships = frozenset(_name(member, "membership") for member in memberships)
+        if declared_memberships - _TOOL_MEMBERSHIPS:
+            raise PolicyRegistrationError(f"{owner}: tool {name}: unknown memberships {sorted(declared_memberships - _TOOL_MEMBERSHIPS)}")
+        if owner != "core" and declared_memberships & _CORE_ONLY_MEMBERSHIPS:
+            raise PolicyRegistrationError(f"{owner}: tool {name}: core-only memberships {sorted(declared_memberships & _CORE_ONLY_MEMBERSHIPS)}")
+        if not isinstance(descriptor_registered, bool) or owner != "core" and not descriptor_registered:
+            raise PolicyRegistrationError(f"{owner}: tool {name}: descriptor exclusion is core-only")
         descriptor = ToolDescriptor(
             sink_category=sink_category, sink_target_extractor=sink_target_extractor,
             sink_destination=sink_destination, sink_payload_extractor=sink_payload_extractor,
             fetch_authorization=fetch_authorization, result_origin=result_origin,
             git_operation_result=git_operation_result, ifc_delegation=ifc_delegation,
             budget_exempt=budget_exempt,
-        )
+        ) if descriptor_registered else None
         self._tools[name] = ToolPolicy(
             name, owner, factory, policy_only, flow, tier, operation_class,
             result_domain, descriptor, writes_code_or_state, declared_profiles,
@@ -200,11 +243,15 @@ class PolicyRegistry:
             shell_process, declared_memberships,
         )
 
-    def register_capability(self, name: str, *, owner: str = "core") -> None:
+    def register_capability(self, name: str, *, owner: str = "core", tier: str | None = None) -> None:
         self._writable()
         name = _name(name, "capability")
         if name in self._capabilities:
             raise PolicyRegistrationError(f"duplicate capability: {name}")
+        if tier is not None:
+            if tier not in _TIERS or owner != "core":
+                raise PolicyRegistrationError(f"{owner}: capability {name}: invalid core-only tier")
+            self._capability_tiers[name] = tier
         self._capabilities[name] = owner
 
     def register_authority_profile(
@@ -266,6 +313,11 @@ class PolicyRegistry:
                     raise PolicyRegistrationError(f"{name}: unknown capability {capability}")
                 if profile.owner != "core" and self._capabilities[capability] not in {"core", profile.owner}:
                     raise PolicyRegistrationError(f"{name}: foreign capability {capability}")
+                tool = self._tools.get(capability)
+                if tool is not None and tool.owner != "core" and name not in tool.profiles:
+                    raise PolicyRegistrationError(f"{tool.owner}: tool {capability}: undeclared profile membership {name}")
+                if profile.owner != "core" and (tool is None or tool.owner != profile.owner):
+                    raise PolicyRegistrationError(f"{name}: plugin profile cannot add foreign capability {capability}")
             if not profile.bounded_capabilities <= profile.capabilities:
                 raise PolicyRegistrationError(f"{name}: bounded capability outside profile")
             for capability, companions in profile.capability_companions.items():
