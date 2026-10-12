@@ -32,6 +32,7 @@ from mimir.worklink.claims import CLAIM_RESET_PREFIX, ChainlinkClaims, ClaimReco
 from mimir.worklink.backends.registry import WorklinkConfig, WorklinkDefaults
 from mimir.worklink.backends.feature_factory import FactoryStatus
 from mimir.worklink.compute import LaunchHandle
+from mimir.worklink.control import archive_worklink_factory_records
 from mimir.worklink.factory_state import (
     FactoryRunRecord,
     factory_checkout_interlock,
@@ -1109,6 +1110,7 @@ def _write_worklink_yaml(
     priority: str = "normal",
     timeout_s: int = 1800,
     reaper_ttl_s: int = 86400,
+    factory_resumable_retention_s: int = 86400,
 ) -> None:
     home.mkdir(parents=True, exist_ok=True)
     (home / "worklink.yaml").write_text(
@@ -1116,7 +1118,8 @@ def _write_worklink_yaml(
         f"  priority: {priority}\n"
         f"  max_concurrent: {max_concurrent}\n"
         f"  timeout_s: {timeout_s}\n"
-        f"  reaper_ttl_s: {reaper_ttl_s}\n",
+        f"  reaper_ttl_s: {reaper_ttl_s}\n"
+        f"  factory_resumable_retention_s: {factory_resumable_retention_s}\n",
         encoding="utf-8",
     )
 
@@ -1257,6 +1260,7 @@ def _factory_record(
     phase: str = "running",
     status: str | None = "running",
     process: str = "live",
+    observed_at: str | None = None,
 ) -> FactoryRunRecord:
     pid = os.getpid()
     ticks = 100
@@ -1280,10 +1284,13 @@ def _factory_record(
         session=None,
         handle=None if process == "missing-handle" else handle,
         status=(
-            FactoryStatus(run_id=run_id, valid=True, sandbox_path=str(sandbox), status=status)
+            FactoryStatus(
+                run_id=run_id, valid=True, sandbox_path=str(sandbox), status=status,
+                lock="absent",
+            )
             if status is not None else None
         ),
-        observed_at=None,
+        observed_at=observed_at,
         controller_phase=phase,
     )
 
@@ -1332,12 +1339,164 @@ def test_prune_removes_old_attempt_with_verified_dead_unresumed_factory(
     manifest.parent.mkdir(parents=True)
     manifest.write_text("{}", encoding="utf-8")
     os.utime(child, (0, 0))
-    record = _factory_record(sandbox, phase=phase, status=status, process="dead")
+    record = _factory_record(
+        sandbox, phase=phase, status=status, process="dead",
+        observed_at=(
+            (datetime.now(UTC) - timedelta(days=2)).isoformat()
+            if status == "running" else None
+        ),
+    )
     save_factory_record(tmp_path, record)
 
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
     assert not child.exists()
     assert not manifest.exists()
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_retains_recently_stopped_factory_and_reports_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=10800)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    checkout_time = datetime.now(UTC) - timedelta(hours=4)
+    os.utime(child, (checkout_time.timestamp(), checkout_time.timestamp()))
+    observed = datetime.now(UTC) - timedelta(minutes=30)
+    record = _factory_record(
+        sandbox, phase="failed", status="running", process="dead",
+        observed_at=observed.isoformat(),
+    )
+    save_factory_record(tmp_path, record)
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert child.exists()
+    assert events == [("worklink_attempt_checkout_retained", {
+        "issue_id": 841,
+        "run_id": "chainlink-841",
+        "attempt": 1,
+        "phase": "failed",
+        "status": "running",
+        "prunable_after": (observed + timedelta(seconds=86400)).isoformat(),
+    })]
+
+
+@pytest.mark.parametrize("phase", ["failed", "stopped", "running"])
+@pytest.mark.parametrize("status", ["running", "needs-human"])
+@pytest.mark.parametrize("inside_window", [True, False])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_dead_nonparked_factory_uses_observation_window(
+    tmp_path: Path, phase: str, status: str, inside_window: bool,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600, factory_resumable_retention_s=7200)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    checkout_time = datetime.now(UTC) - timedelta(hours=4)
+    os.utime(child, (checkout_time.timestamp(), checkout_time.timestamp()))
+    age = timedelta(minutes=30) if inside_window else timedelta(hours=3)
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase=phase, status=status, process="dead",
+        observed_at=(datetime.now(UTC) - age).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == (
+        [] if inside_window else [child]
+    )
+    assert child.exists() is inside_window
+
+
+@pytest.mark.parametrize("observed_at", [None, "not-a-time", "2026-10-11T23:00:00"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_bad_observation_falls_back_to_checkout_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observed_at: str | None,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", status="running", process="dead", observed_at=observed_at,
+    ))
+    events: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        autonomy, "log_event_sync", lambda name, **fields: events.append((name, fields)),
+    )
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+    assert events == [("worklink_attempt_retention_clock_fallback", {
+        "issue_id": 841, "run_id": "chainlink-841",
+    })]
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_archive_factory_record_releases_checkout_retention(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", process="dead", observed_at=datetime.now(UTC).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
+    assert len(archive_worklink_factory_records(tmp_path, 841)) == 1
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+
+
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_does_not_extend_checkout_for_another_attempt(tmp_path: Path) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    record = replace(
+        _factory_record(
+            sandbox, phase="failed", process="dead", observed_at=datetime.now(UTC).isoformat(),
+        ),
+        attempt=2,
+    )
+    save_factory_record(tmp_path, record)
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
+
+
+@pytest.mark.parametrize("status", ["completed", "blocked", "partial"])
+@pytest.mark.usefixtures("factory_process_ticks")
+def test_prune_terminal_factory_does_not_wait_for_observation(
+    tmp_path: Path, status: str,
+) -> None:
+    _write_worklink_yaml(tmp_path, reaper_ttl_s=3600)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    child = tmp_path / ".worklink" / repo.name / "841-1"
+    sandbox = child / ".factory-sandboxes" / "chainlink-841"
+    sandbox.mkdir(parents=True)
+    os.utime(child, (0, 0))
+    save_factory_record(tmp_path, _factory_record(
+        sandbox, phase="failed", status=status, process="dead",
+        observed_at=datetime.now(UTC).isoformat(),
+    ))
+
+    assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == [child]
 
 
 @pytest.mark.usefixtures("factory_process_ticks")
@@ -1364,10 +1523,13 @@ def test_prune_preserves_parked_factory(tmp_path: Path, phase: str) -> None:
     sandbox = child / ".factory-sandboxes" / "chainlink-841"
     sandbox.mkdir(parents=True)
     os.utime(child, (0, 0))
-    record = _factory_record(sandbox, phase=phase, status="needs-human", process="dead")
+    record = _factory_record(
+        sandbox, phase=phase, status="needs-human", process="dead",
+        observed_at=datetime.now(UTC).isoformat(),
+    )
     save_factory_record(tmp_path, record)
 
-    assert autonomy._attempt_is_active(child, [record]) is True
+    assert autonomy._attempt_is_active(child, [record]) is (phase == "parked")
     assert autonomy.prune_stale_attempt_checkouts_for_home(tmp_path, repo=repo) == []
     assert sandbox.is_dir()
 

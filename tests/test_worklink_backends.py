@@ -232,6 +232,29 @@ def test_reaper_ttl_floor_is_dimensioned_by_leaf_timeout(
     assert WorklinkDefaults(timeout_s=1800, reaper_ttl_s=3600).reaper_ttl_s == 3600
 
 
+def test_factory_resumable_retention_defaults_and_override(tmp_path: Path) -> None:
+    path = tmp_path / "worklink.yaml"
+    assert WorklinkConfig.load(path).defaults.factory_resumable_retention_s == 86400
+    path.write_text(
+        "defaults:\n  reaper_ttl_s: 3600\n  factory_resumable_retention_s: 7200\n",
+        encoding="utf-8",
+    )
+    assert WorklinkConfig.load(path).defaults.factory_resumable_retention_s == 7200
+
+
+@pytest.mark.parametrize("value", [0, -1, 3599, True, 1.5, "7200", None])
+def test_factory_resumable_retention_rejects_invalid_values(tmp_path: Path, value: object) -> None:
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*positive integer.*reaper_ttl_s"):
+        WorklinkDefaults(reaper_ttl_s=3600, factory_resumable_retention_s=value)
+    path = tmp_path / "worklink.yaml"
+    path.write_text(
+        json.dumps({"defaults": {"reaper_ttl_s": 3600, "factory_resumable_retention_s": value}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="factory_resumable_retention_s.*positive integer.*reaper_ttl_s"):
+        WorklinkConfig.load(path)
+
+
 def test_worklink_config_epic_overrides_and_tiered_review_parse(tmp_path: Path) -> None:
     config_path = tmp_path / "worklink.yaml"
     config_path.write_text(

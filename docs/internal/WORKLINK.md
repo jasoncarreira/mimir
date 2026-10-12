@@ -1014,8 +1014,8 @@ stands, and the script exits 3 naming the command to run.
 A park also reconciles mimir's retained record to `controller_phase=parked` with
 an observed `needs-human` status. That is not bookkeeping: `_attempt_is_active`
 reads mimir's last observed status rather than the factory plane, so a record
-left reading `running` behind a dead process is pruned by the next cleanup pass
-even while the factory itself reports a parked run.
+left reading `running` behind a dead process is eligible for cleanup after the
+resumable retention window, even while the factory itself reports a parked run.
 
 Resume is a preflight plus a dispatch, and deliberately does **not** call
 `factory resume`:
@@ -1219,6 +1219,7 @@ defaults:
   priority: normal          # arbiter priority for autonomous dispatch (low|normal|high)
   max_concurrent: 2         # cap on concurrent autonomous claims (poller + tool); CLI uncapped
   reaper_ttl_s: 86400       # >= 2 * timeout_s; backend + gates heartbeat; lower values warn + clamp
+  factory_resumable_retention_s: 86400 # >= reaper_ttl_s; grace since last durable factory observation
   allow_autonomous_local_subprocess: false  # autonomy policy (#460, #832): autonomous dispatch
                             # refuses the unsandboxed local_subprocess substrate unless this
                             # is true. The operator CLI is never gated. See §6.5.
@@ -1280,6 +1281,15 @@ compute_backends:           # ComputeBackend launchers — WHERE it runs (#454).
                             # at config-load time.
   local-subprocess: {}      # the built-in default; accept-the-risk fallback
 ```
+
+`defaults.factory_resumable_retention_s` is a positive integer (default 86400,
+at least `reaper_ttl_s`). A checkout with a verified-dead factory record and a
+non-terminal, non-parked status is pruned only after both the checkout TTL and
+this window since `FactoryRunRecord.observed_at` have elapsed. While held, each
+prune pass emits `worklink_attempt_checkout_retained` with its `prunable_after`
+timestamp. A missing or invalid observation falls back to checkout mtime and
+emits `worklink_attempt_retention_clock_fallback`. Archiving the factory record
+releases the hold; live and parked runs remain protected independently.
 
 Invalid or unknown tool-backend and compute-backend fields fail closed during
 registry construction instead of falling back to another backend. Remove any
