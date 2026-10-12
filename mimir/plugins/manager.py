@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 from .core import register_core_tools
 from .discovery import PluginCandidate, PluginDiscoveryError, enabled_plugins
 from .registry import PolicyRegistry
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,7 @@ class PluginManager:
             raise ValueError("plugin policy must be frozen")
         self.policy = policy
         self.plugins = plugins
+        self._shutdown_started = False
 
     def __repr__(self) -> str:
         return "<plugin runtime policy>"
@@ -40,8 +46,63 @@ class PluginManager:
 
     def hooks(self, name: str) -> tuple[tuple[str, Any], ...]:
         return tuple((plugin.candidate.name, hook)
-                     for plugin in self.plugins
-                     if (hook := getattr(plugin.contributor, name, None)) is not None)
+                      for plugin in self.plugins
+                      if (hook := getattr(plugin.contributor, name, None)) is not None)
+
+    async def startup_preflight(self, bundle: Any) -> None:
+        for name, hook in self.hooks("startup_preflight"):
+            try:
+                result = hook(bundle)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                raise RuntimeError(f"plugin {name!r} startup preflight failed") from exc
+
+    async def turn_preflight(self, event: Any, auth_context: Any) -> None:
+        for name, hook in self.hooks("turn_preflight"):
+            try:
+                result = hook(event, auth_context)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as exc:
+                raise RuntimeError(f"plugin {name!r} turn preflight failed") from exc
+
+    async def shutdown(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        for name, hook in self.hooks("shutdown"):
+            try:
+                if inspect.iscoroutinefunction(hook):
+                    await asyncio.wait_for(hook(), timeout=5)
+                else:
+                    result = await asyncio.wait_for(asyncio.to_thread(hook), timeout=5)
+                    if inspect.isawaitable(result):
+                        await asyncio.wait_for(result, timeout=5)
+            except Exception:
+                # One plugin cannot prevent later hooks or the server's teardown.
+                log.exception("plugin %s shutdown failed", name)
+
+    async def health(self) -> dict[str, object]:
+        fields: dict[str, object] = {}
+        for name, hook in self.hooks("health"):
+            try:
+                if inspect.iscoroutinefunction(hook):
+                    value = await asyncio.wait_for(hook(), timeout=5)
+                else:
+                    value = await asyncio.wait_for(asyncio.to_thread(hook), timeout=5)
+                    if inspect.isawaitable(value):
+                        value = await asyncio.wait_for(value, timeout=5)
+                if not isinstance(value, dict) or any(
+                    not isinstance(key, str) or not key.isidentifier()
+                    or not isinstance(item, (bool, int, float))
+                    for key, item in value.items()
+                ):
+                    raise ValueError("health fields must be named numeric or boolean values")
+                fields[name] = value
+            except Exception:
+                fields[name] = {"error": "health contributor failed"}
+        return fields
 
 
 def load_plugins(*, enable: str) -> PluginManager:

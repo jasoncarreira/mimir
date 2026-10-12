@@ -1965,6 +1965,42 @@ class Agent:
         from .approval_requests import (
             is_non_turn_bound_reply, pending as pending_approvals, resolve as resolve_approval,
         )
+        explicit_session_binding = session_id is not None and saga_session_id is not None
+        def prepare_preflight_context():
+            labels = _initialize_ifc_labels(
+                event, event.attachment_names,
+                resolver=getattr(self, "_identity_resolver", None),
+                policy=self._config.plugin_manager.policy,
+            )
+            if explicit_session_binding:
+                bound = _require_auth_context(event.continuation_auth_context)
+                if not bound.enforcement_enabled:
+                    raise ValueError("bound turns require enforced authorization")
+                acp_state = (bound.ifc_state if bound.origin_trigger == "acp_session" else None)
+                if acp_state is not None:
+                    acp_state.merge(labels)
+                auth = replace(
+                    bound, ifc_labels=labels,
+                    ifc_state=acp_state or InformationFlowState(labels=labels),
+                    ingested_url_state=IngestedURLState(), saga_session_id=saga_session_id,
+                )
+                _seed_trigger_ingested_urls(event, labels, auth)
+            else:
+                auth = _create_turn_auth_context(
+                    event, getattr(self, "_identity_resolver", None),
+                    policy_version=getattr(self._config, "policy_version", None),
+                    enforce=self._config.access_control_enforced,
+                    ifc_labels=labels, audience_provider=self._audience_provider,
+                    cross_platform_pull=self._config.cross_platform_pull,
+                    server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
+                    policy=self._config.plugin_manager.policy,
+                )
+            return labels, auth
+
+        plugin_manager = self._config.plugin_manager
+        if plugin_manager.plugins:
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
+            await plugin_manager.turn_preflight(event, initial_auth_context)
         bare_reply = (event.content or "").strip().lower() in {"approve", "decline"}
         named_reply = is_non_turn_bound_reply(event)
         if _is_authenticated_operator(event, self._identity_resolver, allow_web=named_reply) and (named_reply or bare_reply):
@@ -2019,46 +2055,12 @@ class Agent:
                     ),
                 )
         turn_id = turn_id or make_turn_id()
-        explicit_session_binding = session_id is not None and saga_session_id is not None
         t_total_start = time.monotonic()
+        if not plugin_manager.plugins:
+            initial_ifc_labels, initial_auth_context = prepare_preflight_context()
         # chainlink #583 slice 1: bracket the whole turn on the live event bus
         # (no-op when unwired). turn_started here pairs with turn_ended in the
         # finally so every turn — even an early-phase crash — is bracketed.
-        initial_ifc_labels = _initialize_ifc_labels(
-            event,
-            event.attachment_names,
-            resolver=getattr(self, "_identity_resolver", None),
-            policy=self._config.plugin_manager.policy,
-        )
-        if explicit_session_binding:
-            bound_auth_context = _require_auth_context(event.continuation_auth_context)
-            if not bound_auth_context.enforcement_enabled:
-                raise ValueError("bound turns require enforced authorization")
-            acp_state = (bound_auth_context.ifc_state
-                         if bound_auth_context.origin_trigger == "acp_session" else None)
-            if acp_state is not None:
-                acp_state.merge(initial_ifc_labels)
-            initial_auth_context = replace(
-                bound_auth_context,
-                ifc_labels=initial_ifc_labels,
-                ifc_state=acp_state or InformationFlowState(labels=initial_ifc_labels),
-                ingested_url_state=IngestedURLState(),
-                saga_session_id=saga_session_id,
-            )
-        else:
-            initial_auth_context = _create_turn_auth_context(
-                event,
-                getattr(self, "_identity_resolver", None),
-                policy_version=getattr(self._config, "policy_version", None),
-                enforce=self._config.access_control_enforced,
-                ifc_labels=initial_ifc_labels,
-                audience_provider=self._audience_provider,
-                cross_platform_pull=self._config.cross_platform_pull,
-                server_discovered_pr_scope_store=self._server_discovered_pr_scope_store,
-                policy=self._config.plugin_manager.policy,
-            )
-        if explicit_session_binding:
-            _seed_trigger_ingested_urls(event, initial_ifc_labels, initial_auth_context)
         emitter = TurnEventEmitter(
             self._turn_event_bus,
             turn_id=turn_id,

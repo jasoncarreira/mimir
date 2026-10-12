@@ -495,6 +495,7 @@ class _StartupState:
     scheduler_started: bool = False
     liveness_mark_attempted: bool = False
     compensated: bool = False
+    plugin_preflight_begun: bool = False
 
 
 @dataclass(slots=True)
@@ -1033,6 +1034,9 @@ async def _handle_health(request: web.Request) -> web.Response:
     from .worklink.worker_client import DEFAULT_EXECUTOR_SOCKET, verify_executor_identity
 
     response: dict[str, object] = {"ok": True}
+    manager = request.app.get("plugin_manager")
+    if manager is not None and manager.plugins:
+        response["plugins"] = await manager.health()
     if not request.app.get("check_worker_executor_health"):
         return web.json_response(response)
 
@@ -1623,6 +1627,7 @@ def build_app(config: Config) -> web.Application:
     )
     runtime_slot = _RuntimeSlot()
     startup_state = _StartupState()
+    app["plugin_manager"] = config.plugin_manager
 
     app["config"] = config
     app["dispatcher"] = dispatcher
@@ -1732,6 +1737,9 @@ def build_app(config: Config) -> web.Application:
         bundle = await create_agent_runtime(config, core, runtime_adapters)
         startup_state.bundle = bundle
         _publish_runtime(app, runtime_slot, startup_state, bundle)
+        startup_state.phase = "plugin_startup_preflight"
+        startup_state.plugin_preflight_begun = True
+        await config.plugin_manager.startup_preflight(bundle)
         from .acp.daemon import (
             AcpDaemon,
             _acp_enablement_from_env,
@@ -2593,6 +2601,9 @@ def build_app(config: Config) -> web.Application:
             except BaseException as exc:
                 errors.append(_cleanup_exception(exc))
 
+        if startup_state.plugin_preflight_begun:
+            await attempt(config.plugin_manager.shutdown)
+
         acp_stopped = True
         if startup_state.acp_daemon is not None:
             acp_stopped = await attempt(startup_state.acp_daemon.stop)
@@ -2729,6 +2740,8 @@ def build_app(config: Config) -> web.Application:
                 errors.append(_cleanup_exception(exc))
         else:
             cleanup_started = time.monotonic()
+            if startup_state.plugin_preflight_begun:
+                await attempt(config.plugin_manager.shutdown)
             from .liveness import mark_clean_shutdown
 
             def persist_clean_shutdown() -> bool:
