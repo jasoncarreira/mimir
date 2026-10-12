@@ -9715,3 +9715,28 @@ for number in (1, 2, 3, 4, 5):
         if source.domain == "channel"
     ]
     assert integrities == ["untrusted"] * 5
+@pytest.mark.parametrize("name", ["github-activity", "github-ci-watch", "worklink-ready-queue"])
+def test_named_pollers_have_no_static_service_grant(name: str, tmp_path: Path) -> None:
+    from mimir.pollers import PollerConfig
+
+    config = PollerConfig(
+        name=name, command="true", cron="* * * * *", env={}, skill_dir=tmp_path,
+    )
+    service = config.resolved_authority()
+    assert service.canonical == f"poller:{name}"
+    assert service.trigger == "poller"
+    assert service.capabilities == ()
+    assert access_control.get_service_principal("poller") is None
+    assert not access_control.service_can_invoke_operation(service, "send_message")
+
+
+def test_poller_instance_issues_only_explicit_capabilities(tmp_path: Path) -> None:
+    service = access_control.build_trigger_service_principal(
+        canonical="poller:github-ci-watch", trigger="poller", profile="github",
+        tier=access_control.CapabilityTier.SCOPE_CONTAINED,
+        capabilities=("read_file",), roots=(tmp_path,),
+        creation_path="mimir.pollers.run_poller:manifest",
+    )
+    assert access_control.service_can_invoke_operation(service, "read_file")
+    assert not access_control.service_can_invoke_operation(service, "send_message")
+    assert not access_control.service_can_invoke_operation(service, "shell_exec")
