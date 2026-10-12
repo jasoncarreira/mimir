@@ -728,6 +728,13 @@ def render_work_item(issue: IssueContext) -> str:
     )
 
 
+def _bind_work_item_run_id(payload: str, run_id: str) -> str:
+    """Return the rendered work item naming ``run_id``, in the renderer's encoding."""
+    work_item = json.loads(payload)
+    work_item["run_id"] = run_id
+    return json.dumps(work_item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
 def _validate_epic_work_item(payload: str, issue_id: int) -> str:
     """Validate the rendered factory payload and return its declared run ID."""
     try:
@@ -2638,6 +2645,7 @@ class WorklinkRunner:
                     base=base,
                     test_cmd=test_cmd,
                     runner=runner,
+                    work_item_json=work_item_json,
                     autonomous=autonomous,
                 )
             else:
@@ -2652,46 +2660,9 @@ class WorklinkRunner:
                     runner=_list_runner(runner),
                     worker_eligible=isinstance(compute, LocalSubprocessComputeBackend),
                 )
-                git_name, git_email = _read_checkout_git_identity(lease.path, runner)
-                publishing_identity, publishing_identity_source = (
-                    _read_factory_publishing_identity(self.repo)
-                )
-                github_token, github_env = _resolve_factory_github_credential(os.environ)
-                try:
-                    GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
-                except GitHubIdentityVerificationError as exc:
-                    raise WorklinkError(
-                        f"{exc}; selected identity {publishing_identity} "
-                        f"from {publishing_identity_source}"
-                    ) from exc
-                order = WorkOrder(
-                    issue_id=issue_id,
-                    checkout=lease.path,
-                    prompt=_epic_prompt(issue),
-                    rules=None,
-                    timeout_s=int(_epic_run_timeout_s()),
-                    env={
-                        "MIMIR_HOME": str(self.home),
-                        "MIMIR_WORK_ITEM_JSON": work_item_json,
-                        **github_env,
-                        "GIT_AUTHOR_NAME": git_name,
-                        "GIT_AUTHOR_EMAIL": git_email,
-                        "GIT_COMMITTER_NAME": git_name,
-                        "GIT_COMMITTER_EMAIL": git_email,
-                        # The factory child does the publishing, and 0.8.0+ compares this
-                        # declared identity against ``gh api /user`` at Gate 1.
-                        #
-                        # Two DIFFERENT names are in play: the operator selects the identity
-                        # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
-                        # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
-                        # controller already resolved and verified above, under the child's
-                        # name -- inheritance alone would carry nothing in the local case,
-                        # where the identity comes from .factory.json and no variable is
-                        # exported at all. This also keeps the controller authoritative over
-                        # whatever .factory.json the sandbox happens to hold.
-                        FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
-                    },
-                    transcript_root=self.home / "state" / "worklink" / "transcripts",
+                order, publishing_identity = self._factory_launch_order(
+                    issue=issue, checkout=lease.path,
+                    work_item_json=work_item_json, runner=runner,
                 )
                 spec = selected.work_spec(
                     order,
@@ -2899,6 +2870,60 @@ class WorklinkRunner:
             )
         return result
 
+    def _factory_launch_order(
+        self, *, issue: IssueContext, checkout: Path, work_item_json: str, runner: Runner,
+    ) -> tuple[WorkOrder, str]:
+        """Build the order for a fresh ``/feature`` driver.
+
+        The initial launch and fresh-session recovery both start a new driver
+        that runs intake and later publishes, so both launch from the operator
+        checkout (never the retained sandbox, where intake's absent-feature-ref
+        guard fails) with the work item, Git identity and a verified publishing
+        identity and credential.
+        """
+        git_name, git_email = _read_checkout_git_identity(checkout, runner)
+        publishing_identity, publishing_identity_source = (
+            _read_factory_publishing_identity(self.repo)
+        )
+        github_token, github_env = _resolve_factory_github_credential(os.environ)
+        try:
+            GitHubForgeClient(token=github_token).verify_identity(publishing_identity)
+        except GitHubIdentityVerificationError as exc:
+            raise WorklinkError(
+                f"{exc}; selected identity {publishing_identity} "
+                f"from {publishing_identity_source}"
+            ) from exc
+        order = WorkOrder(
+            issue_id=issue.issue_id,
+            checkout=checkout,
+            prompt=_epic_prompt(issue),
+            rules=None,
+            timeout_s=int(_epic_run_timeout_s()),
+            env={
+                "MIMIR_HOME": str(self.home),
+                "MIMIR_WORK_ITEM_JSON": work_item_json,
+                **github_env,
+                "GIT_AUTHOR_NAME": git_name,
+                "GIT_AUTHOR_EMAIL": git_email,
+                "GIT_COMMITTER_NAME": git_name,
+                "GIT_COMMITTER_EMAIL": git_email,
+                # The factory child does the publishing, and 0.8.0+ compares this
+                # declared identity against ``gh api /user`` at Gate 1.
+                #
+                # Two DIFFERENT names are in play: the operator selects the identity
+                # with MIMIR_FACTORY_PUBLISHING_IDENTITY, the child reads the
+                # factory's own FACTORY_PUBLISHING_IDENTITY. Forward the value the
+                # controller already resolved and verified above, under the child's
+                # name -- inheritance alone would carry nothing in the local case,
+                # where the identity comes from .factory.json and no variable is
+                # exported at all. This also keeps the controller authoritative over
+                # whatever .factory.json the sandbox happens to hold.
+                FACTORY_PUBLISHING_IDENTITY_ENV: publishing_identity,
+            },
+            transcript_root=self.home / "state" / "worklink" / "transcripts",
+        )
+        return order, publishing_identity
+
     async def _recover_factory_070(
         self,
         *,
@@ -2913,6 +2938,7 @@ class WorklinkRunner:
         base: str,
         test_cmd: str,
         runner: Runner,
+        work_item_json: str,
         autonomous: bool = False,
     ) -> WorklinkRunResult:
         sandbox = _verify_factory_recovery_binding(
@@ -2964,6 +2990,16 @@ class WorklinkRunner:
             raise WorklinkError("factory recovery refuses a live retained process")
         if not factory_process_is_verified_dead(retained):
             raise WorklinkError("factory recovery cannot verify the retained process is dead")
+        # The sandbox lives at <operator checkout>/.factory-sandboxes/<run id>.
+        operator_checkout = sandbox.parent.parent
+        # Resolve identity before touching the lock, so a refusal leaves the run as found.
+        # Legacy retained runs use the numeric id; bind the work item to the retained
+        # id _verify_factory_recovery_target accepted rather than the canonical render.
+        order, publishing_identity = self._factory_launch_order(
+            issue=issue, checkout=operator_checkout,
+            work_item_json=_bind_work_item_run_id(work_item_json, retained.run_id),
+            runner=runner,
+        )
         session = retained.session
         if pre.lock == "stale" or pre.dead_lock:
             backend.lock(
@@ -3058,15 +3094,6 @@ class WorklinkRunner:
             base=base,
             command_runner=runner,
         )
-        order = WorkOrder(
-            issue_id=issue.issue_id,
-            checkout=sandbox,
-            prompt=_epic_prompt(issue),
-            rules=None,
-            timeout_s=int(_epic_run_timeout_s()),
-            env={"MIMIR_HOME": str(self.home)},
-            transcript_root=self.home / "state" / "worklink" / "transcripts",
-        )
         recovery_repo_url = _repo_remote_url(sandbox, runner=runner)
         if (
             _factory_checkout_repository(sandbox, runner) or ""
@@ -3081,11 +3108,7 @@ class WorklinkRunner:
             test_command=test_cmd,
             run_id=retained.run_id,
         )
-        if isinstance(compute, LocalSubprocessComputeBackend):
-            # Authorization stays at the original inner checkout; --dir still
-            # selects the retained sandbox validated above. Session data is
-            # attempt-scoped as on the initial launch.
-            spec = replace(spec, local_checkout=sandbox.parent.parent)
+        _require_factory_launch_binding(spec, retained.run_id, publishing_identity)
         spec = replace(spec, factory_credential_settings=_git_credential_settings(self.repo))
         handle = await compute.launch(spec)
         relaunched = replace(
