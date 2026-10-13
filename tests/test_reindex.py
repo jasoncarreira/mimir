@@ -104,13 +104,9 @@ def patch_provider(monkeypatch):
     """Inject a stub provider with a chosen dimension."""
     def _install(dim: int, provider_name: str = "openai"):
         import mimir.saga.embeddings as saga_emb
-        import mimir.saga.calibration as saga_cal
         import mimir.saga._config_io as saga_cfg
         stub = _StubProvider(dim)
         monkeypatch.setattr(saga_emb, "get_provider", lambda: stub)
-        # Calibration captures get_provider at import time. Patch its lookup
-        # too, so prior imports cannot route this test to a real provider.
-        monkeypatch.setattr(saga_cal, "get_provider", lambda: stub)
         # Also patch the config read for provider name
         snap = {"embedding": {"provider": provider_name}}
         monkeypatch.setattr(saga_cfg, "_config", snap)
@@ -348,3 +344,39 @@ def test_file_search_missing_db_returns_empty_report(tmp_path, patch_provider):
 # layer — saga owns its own test coverage. mimir's tests focus on
 # the delegation contract: provider name passed correctly, return
 # shape mapped to ReindexReport, exception isolation.
+
+
+
+def test_dispatch_uses_patched_provider_after_calibration_import(
+    tmp_path, monkeypatch, patch_provider,
+):
+    # calibration once bound get_provider at import time, so a stub installed
+    # after any earlier import (another test on the same xdist worker) was
+    # ignored and the real provider re-embedded. A distinct dimension makes a
+    # stale binding of either kind visible.
+    import mimir.saga.calibration  # noqa: F401
+
+    patch_provider(dim=7)
+    monkeypatch.setenv("MIMIR_HOME", str(tmp_path))
+    monkeypatch.delenv("SAGA_CONFIG", raising=False)
+    (tmp_path / "saga.toml").write_text('[embedding]\nprovider = "openai"\n')
+    db = tmp_path / ".mimir" / "saga.db"
+    db.parent.mkdir(parents=True)
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        "CREATE TABLE atoms (id INTEGER PRIMARY KEY, content TEXT, tombstoned INTEGER);"
+        "CREATE TABLE embeddings (atom_id INTEGER PRIMARY KEY, provider TEXT, model TEXT, "
+        "dim INTEGER, vec BLOB, embedded_at TEXT);"
+        "INSERT INTO atoms VALUES (1, 'real memory', 0);"
+        "INSERT INTO embeddings VALUES (1, 'old', 'old', 1, X'00000000', 'old');"
+    )
+    conn.close()
+    args = argparse.Namespace(home=tmp_path, target="atoms", apply=True, batch_size=50)
+    assert dispatch(args) == 0
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT provider, dim, length(vec) FROM embeddings").fetchone() == (
+            "openai", 7, 28,
+        )
+    finally:
+        conn.close()

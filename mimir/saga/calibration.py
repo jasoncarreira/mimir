@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any
 
 from ._config_io import get_config
-from .embeddings import get_provider
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +98,10 @@ def re_embed(
                 "dry_run": False,
                 "index_rebuild_needed": False,
             }
+
+        # Resolve at call time, like every other caller, so a provider
+        # swapped on ``embeddings`` after this module loaded is honored.
+        from .embeddings import get_provider
 
         provider = get_provider()
         dim = provider.dimensions()
