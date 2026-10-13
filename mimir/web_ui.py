@@ -511,11 +511,13 @@ def available_web_skin_ids(home: Path | None, plugin_skins: tuple[dict[str, Any]
     } | {skin["id"] for skin in plugin_skins}
 
 
-def _plugin_web_resources(manager: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, tuple[Path, frozenset[Path], str]]]:
+def _plugin_web_resources(
+    manager: Any, *, reserved_skin_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, tuple[Path, frozenset[Path], str]]]:
     skins: list[dict[str, Any]] = []
     bundles: list[dict[str, Any]] = []
     roots: dict[str, tuple[Path, frozenset[Path], str]] = {}
-    seen = set(BUILT_IN_WEB_SKIN_IDS)
+    seen = set(BUILT_IN_WEB_SKIN_IDS) | (reserved_skin_ids or set())
     for loaded in manager.plugins:
         candidate = loaded.candidate
         manifest = candidate.manifest
@@ -538,7 +540,7 @@ def _plugin_web_resources(manager: Any) -> tuple[list[dict[str, Any]], list[dict
             if skin["id"] in seen:
                 raise ValueError(f"duplicate web skin: {skin['id']}")
             seen.add(skin["id"])
-            tokens = {re.sub(r"-([a-z])", lambda match: match[1].upper(), key.removeprefix("--mimir-")): value
+            tokens = {re.sub(r"-([a-z0-9])", lambda match: match[1].upper(), key.removeprefix("--mimir-")): value
                       for key, value in skin["tokens"].items()}
             if set(tokens) != SKIN_TOKEN_NAMES:
                 raise ValueError(f"plugin {candidate.name}: incomplete skin tokens")
@@ -1029,12 +1031,17 @@ def register_routes(
         or (Path(configured_react_dist) if configured_react_dist else None)
         or (Path(__file__).parent / "react_app" / "dist")
     )
-    _dashboard_extensions = dashboard_extensions or first_party_dashboard_extensions()
+    _dashboard_extensions = DashboardExtensionRegistry(list(
+        (dashboard_extensions or first_party_dashboard_extensions()).manifests
+    ))
     manager = getattr(app.get("config"), "plugin_manager", None)
+    operator_skin_ids = {skin["id"] for skin in read_operator_skin_manifests(home)}
     plugin_skins, plugin_bundles, plugin_roots = (
-        _plugin_web_resources(manager) if manager is not None else ([], [], {})
+        _plugin_web_resources(manager, reserved_skin_ids=operator_skin_ids)
+        if manager is not None else ([], [], {})
     )
     if manager is not None:
+        used_paths = {entry.route_path for entry in _dashboard_extensions.enabled()}
         for entry_id, (owner, entry) in manager.policy.dashboard_entries.items():
             if owner == "core":
                 continue
@@ -1042,6 +1049,11 @@ def register_routes(
                 continue
             if not isinstance(entry, DashboardExtensionManifest) or entry.id != entry_id:
                 raise ValueError(f"plugin {owner}: invalid dashboard entry {entry_id}")
+            entry.validate()
+            if entry.enabled and entry.route_path in used_paths:
+                raise ValueError(f"plugin {owner}: duplicate dashboard route_path: {entry.route_path}")
+            if entry.enabled:
+                used_paths.add(entry.route_path)
             _dashboard_extensions.manifests.append(entry)
         _dashboard_extensions.__post_init__()
     default_skin = os.environ.get("MIMIR_WEB_DEFAULT_SKIN", "").strip()

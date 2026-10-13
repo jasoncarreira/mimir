@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from tests.timing import HANG_GUARD_SECONDS
@@ -39,6 +40,88 @@ from mimir.web_contracts import (
 )
 from mimir.worklink.backends.feature_factory import epic_run_id, parse_factory_status
 from mimir.worklink.factory_state import FactoryRunRecord, save_factory_record
+
+
+def _selected_web_manager(tmp_path: Path, monkeypatch, *, plugins: tuple[dict, ...], enable: str | None = None):
+    """Discover and load distribution-owned manifests through the real selected path."""
+    from mimir.plugins.manager import load_plugins
+    from mimir.plugins.manifest import _SKIN_TOKENS
+
+    entries = []
+    loaded = []
+    for spec in plugins:
+        name = spec["name"]
+        root = tmp_path / f"package-{name}"
+        root.mkdir()
+        skin = {
+            "id": spec.get("skin_id", f"{name}-skin"), "label": name.title(),
+            "version": "1", "default": spec.get("default", True),
+            "tokens": {token: "#123456" for token in _SKIN_TOKENS},
+            "chrome": {"layout": "sidebar", "density": "compact", "accentPlacement": "side-rule"},
+            "panel": {"surface": "flat", "borderStyle": "solid", "hoverBehavior": "none"},
+            "characterRenderer": {
+                "kind": "static-image", "componentSlot": "agent-character", "variant": "default",
+                "assets": [{"id": "avatar", "type": "image", "href": "avatar.png"}],
+                "stateMap": {"idle": "avatar"}, "fallbackState": "idle",
+                "capabilities": {"supportsExpressions": False, "supportsMotion": False},
+            },
+            "fonts": [{"family": "Local", "src": [{"url": "font.woff2", "format": "woff2"}]}],
+        }
+        (root / "skin.json").write_text(json.dumps(skin))
+        (root / "avatar.png").write_bytes(b"avatar")
+        (root / "font.woff2").write_bytes(b"font")
+        (root / "module.js").write_text("export default true")
+        (root / "bundle.css").write_text(":root { color: red; }")
+        (root / "private.txt").write_text("private")
+        (root / "mimir-plugin.toml").write_text(
+            f'name = "{name}"\nversion = "1.2.3"\nlicense = "MIT"\n'
+            'requires_mimir = ">=0.9,<1"\nthemes = ["skin.json"]\n'
+            '[frontend]\napi_major = 1\nmodule = "module.js"\ncss = "bundle.css"\n'
+            f'[config.MIMIR_PLUGIN_{name.upper()}_LABEL]\ntype = "string"\n'
+            f'[config.MIMIR_PLUGIN_{name.upper()}_TOKEN]\ntype = "string"\nsecret = true\nsecurity = true\n'
+        )
+        paths = [Path(f"package-{name}/{path}") for path in (
+            "mimir-plugin.toml", "skin.json", "avatar.png", "font.woff2",
+            "module.js", "bundle.css", "private.txt",
+        )]
+
+        class Distribution:
+            files = paths
+            metadata = {"Name": f"provider-{name}"}
+
+            def locate_file(self, path):
+                return tmp_path / path
+
+        def register(registrar, spec=spec, name=name):
+            async def respond(_request):
+                return web.json_response({"plugin": name})
+
+            registrar.register_route("GET", f"/api/v1/plugins/{name}/status", respond)
+            registrar.register_route("POST", f"/api/v1/plugins/{name}/admin", respond, role="admin")
+            registrar.register_dashboard_entry(name, DashboardExtensionManifest(
+                id=name, label=name.title(), route_path=spec.get("route_path", f"/{name}"),
+                requires_role="admin",
+            ))
+
+        def load(register=register, name=name):
+            loaded.append(name)
+            return SimpleNamespace(register=register)
+
+        entries.append(SimpleNamespace(name=name, value=f"provider_{name}:register",
+                                       dist=Distribution(), load=load))
+
+    monkeypatch.setattr("mimir.plugins.discovery.metadata.entry_points", lambda *, group: entries)
+    return load_plugins(enable=enable if enable is not None else ",".join(spec["name"] for spec in plugins)), loaded
+
+
+def _operator_skin_from_plugin(path: Path) -> dict:
+    raw = json.loads(path.read_text())
+    raw["name"] = raw.pop("label")
+    raw["tokens"] = {
+        re.sub(r"-([a-z0-9])", lambda match: match[1].upper(), name.removeprefix("--mimir-")): value
+        for name, value in raw["tokens"].items()
+    }
+    return raw
 
 
 @pytest.fixture
@@ -129,35 +212,134 @@ async def test_plugin_routes_are_owner_scoped_and_admin_checked():
         add_plugin_routes(app, policy)
 
 
-async def test_plugin_assets_are_allowlisted_versioned_and_not_escaping(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from mimir.plugins.registry import PolicyRegistry
+async def test_selected_web_host_bootstrap_assets_and_admin_route(tmp_path, monkeypatch):
+    from mimir.server import _make_auth_middleware
 
-    asset = tmp_path / "module.js"
-    asset.write_text("export const ready = true;")
-    (tmp_path / "private.txt").write_text("private")
-    manager = SimpleNamespace(policy=PolicyRegistry(), plugins=())
-    monkeypatch.setattr(web_ui, "_plugin_web_resources", lambda _manager: (
-        [], [{"plugin": "sample", "apiMajor": 1,
-              "moduleUrl": "/plugins/sample/assets/module.js?v=2", "cssUrl": None}],
-        {"sample": (tmp_path, frozenset({asset}), "2")},
-    ))
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "disabled", "default": False},
+    ), enable="alpha")
+    assert loaded == ["alpha"]
+    root = tmp_path / "package-alpha"
+    (root / "escape.js").symlink_to(tmp_path / "outside.js")
+    (tmp_path / "outside.js").write_text("outside")
     app = web.Application()
     app["config"] = SimpleNamespace(plugin_manager=manager)
-    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+    app["api_key"] = "web-key"
+    user_key = issue_web_key(tmp_path, "alice", roles=["user"])
+    resolver = IdentityResolver(tmp_path)
+    resolver.reload()
+    app["identity_resolver"] = resolver
+    app.middlewares.append(_make_auth_middleware("web-key"))
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl", home=tmp_path)
     async with TestClient(TestServer(app)) as client:
-        bootstrap = (await (await client.get("/api/v1/web/bootstrap")).json())["data"]
-        assert bootstrap["plugin_bundles"][0]["moduleUrl"] == "/plugins/sample/assets/module.js?v=2"
-        versioned = await client.get("/plugins/sample/assets/module.js?v=2")
+        assert (await client.get("/api/v1/plugins/alpha/status")).status == 401
+        headers = {"X-API-Key": "web-key"}
+        status = await client.get("/api/v1/plugins/alpha/status", headers=headers)
+        assert (await status.json())["plugin"] == "alpha"
+        assert (await client.get("/api/v1/plugins/alpha/status", headers={"X-API-Key": user_key})).status == 200
+        assert (await client.post("/api/v1/plugins/alpha/admin", headers={"X-API-Key": user_key})).status == 403
+        assert (await client.post("/api/v1/plugins/alpha/admin", headers=headers)).status == 200
+        assert (await client.get("/api/v1/plugins/disabled/status", headers=headers)).status == 404
+        bootstrap = (await (await client.get("/api/v1/web/bootstrap", headers=headers)).json())["data"]
+        assert "alpha" in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert "disabled" not in {entry["id"] for entry in bootstrap["dashboard_extensions"]}
+        assert bootstrap["plugin_bundles"] == [{
+            "plugin": "alpha", "apiMajor": 1,
+            "moduleUrl": "/plugins/alpha/assets/module.js?v=1.2.3",
+            "cssUrl": "/plugins/alpha/assets/bundle.css?v=1.2.3",
+        }]
+        assert bootstrap["ui"]["default_skin"] == "alpha-skin"
+        (skin,) = bootstrap["skins"]["plugins"]
+        assert skin["name"] == "Alpha" and skin["plugin"] == "alpha"
+        assert len(skin["tokens"]) == 66
+        assert set(skin["tokens"]) == web_ui.SKIN_TOKEN_NAMES
+        assert skin["fonts"][0]["src"][0]["url"] == "/plugins/alpha/assets/font.woff2?v=1.2.3"
+        assert skin["characterRenderer"]["assets"][0]["href"] == "/plugins/alpha/assets/avatar.png?v=1.2.3"
+        for path in ("font.woff2", "avatar.png", "module.js", "bundle.css"):
+            assert (await client.get(f"/plugins/alpha/assets/{path}?v=1.2.3", headers=headers)).status == 200
+        versioned = await client.get("/plugins/alpha/assets/module.js?v=1.2.3", headers=headers)
         assert versioned.status == 200
         assert versioned.headers["Cache-Control"] == "public, max-age=31536000, immutable"
-        assert (await client.get("/plugins/sample/assets/module.js")).headers["Cache-Control"].startswith("no-store")
-        assert (await client.get("/plugins/sample/assets/private.txt?v=2")).status == 404
-        assert (await client.get("/plugins/disabled/assets/module.js?v=2")).status == 404
+        for suffix in ("", "?v=other"):
+            assert (await client.get(f"/plugins/alpha/assets/module.js{suffix}", headers=headers)).headers["Cache-Control"].startswith("no-store")
+        for path in ("private.txt", "escape.js", "%2e%2e%2foutside.js"):
+            assert (await client.get(f"/plugins/alpha/assets/{path}?v=1.2.3", headers=headers)).status == 404
+        assert (await client.get("/plugins/disabled/assets/module.js?v=1.2.3", headers=headers)).status == 404
+
+
+@pytest.mark.parametrize("route_paths,expected", [
+    (("/chat",), "/chat"),
+    (("/shared", "/shared"), "/shared"),
+])
+def test_selected_plugin_dashboard_path_collisions_fail_boot(tmp_path, monkeypatch, route_paths, expected):
+    specs = tuple({"name": name, "route_path": path, "default": False}
+                  for name, path in zip(("alpha", "beta"), route_paths))
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=specs)
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match=f"duplicate dashboard route_path: {expected}"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
+
+
+@pytest.mark.parametrize("collision", ["built-in", "operator", "plugin"])
+def test_selected_plugin_skin_id_collisions_fail_boot(tmp_path, monkeypatch, collision):
+    specs = [{"name": "alpha", "default": False,
+              "skin_id": "neon-terminal" if collision == "built-in" else "shared-skin"}]
+    if collision == "plugin":
+        specs.append({"name": "beta", "default": False, "skin_id": "shared-skin"})
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=tuple(specs))
+    if collision == "operator":
+        skins = tmp_path / "skins"
+        skins.mkdir()
+        (skins / "shared.json").write_text(json.dumps(
+            _operator_skin_from_plugin(tmp_path / "package-alpha" / "skin.json")
+        ))
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match="duplicate web skin"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl",
+                               events_log=tmp_path / "events.jsonl", home=tmp_path)
+
+
+@pytest.mark.parametrize("override,plugin_default,expected", [
+    (None, True, "alpha-skin"), (None, False, "neon-terminal"),
+    ("neon-terminal", True, "neon-terminal"),
+    ("operator-skin", True, "operator-skin"),
+])
+async def test_selected_plugin_default_skin_precedence(tmp_path, monkeypatch, override, plugin_default, expected):
+    manager, _loaded = _selected_web_manager(
+        tmp_path, monkeypatch, plugins=({"name": "alpha", "default": plugin_default},)
+    )
+    skins = tmp_path / "skins"
+    skins.mkdir()
+    operator_skin = _operator_skin_from_plugin(tmp_path / "package-alpha" / "skin.json")
+    operator_skin["id"] = "operator-skin"
+    (skins / "operator.json").write_text(json.dumps(operator_skin))
+    if override:
+        monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", override)
+    else:
+        monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl", home=tmp_path)
+    async with TestClient(TestServer(app)) as client:
+        payload = (await (await client.get("/api/v1/web/bootstrap")).json())["data"]
+    assert payload["ui"]["default_skin"] == expected
+
+
+def test_conflicting_selected_plugin_defaults_need_operator_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "neon-terminal")
+    manager, _loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "beta"},
+    ))
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN")
+    app = web.Application()
+    app["config"] = SimpleNamespace(plugin_manager=manager)
+    with pytest.raises(ValueError, match="alpha:alpha-skin, beta:beta-skin"):
+        web_ui.register_routes(app, turns_log=tmp_path / "turns.jsonl", events_log=tmp_path / "events.jsonl")
 
 
 def test_plugin_config_owner_reads_only_declared_keys(monkeypatch):
-    from types import SimpleNamespace
     from mimir.plugins.config_api import plugin_config_rows, validate_plugin_config_write
 
     manifests = {
@@ -175,10 +357,52 @@ def test_plugin_config_owner_reads_only_declared_keys(monkeypatch):
     assert {row["name"] for row in rows} == set(manifests["sample"].config)
     assert next(row for row in rows if row["secret"])["value"] == "[REDACTED]"
     assert next(row for row in rows if not row["secret"])["value"] == "visible"
-    with pytest.raises(ValueError, match="not writable"):
-        validate_plugin_config_write("sample", "MIMIR_PLUGIN_SAMPLE_TOKEN", manifests)
-    with pytest.raises(ValueError, match="not writable"):
-        validate_plugin_config_write("sample", "MIMIR_PLUGIN_OTHER_LABEL", manifests)
+    assert all(row["mutable"] is False for row in rows)
+    validate_plugin_config_write("sample", "MIMIR_PLUGIN_SAMPLE_LABEL", manifests)
+    for owner, name in (
+        ("sample", "MIMIR_PLUGIN_SAMPLE_TOKEN"),
+        ("sample", "MIMIR_PLUGIN_SAMPLE_UNKNOWN"),
+        ("sample", "MIMIR_PLUGIN_OTHER_LABEL"),
+        ("sample", "MIMIR_API_KEY"),
+        ("missing", "MIMIR_PLUGIN_SAMPLE_LABEL"),
+    ):
+        with pytest.raises(ValueError, match="not writable"):
+            validate_plugin_config_write(owner, name, manifests)
+    with pytest.raises(ValueError, match="not enabled"):
+        plugin_config_rows("missing", manifests)
+
+
+def test_admin_config_contains_only_selected_declared_plugin_keys(tmp_path, monkeypatch):
+    from dataclasses import dataclass
+    from mimir.admin_config import build_admin_config_payload
+
+    manager, loaded = _selected_web_manager(tmp_path, monkeypatch, plugins=(
+        {"name": "alpha"}, {"name": "disabled", "default": False},
+    ), enable="alpha")
+    assert loaded == ["alpha"]
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_LABEL", "public value")
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_TOKEN", "private value")
+    monkeypatch.setenv("MIMIR_PLUGIN_ALPHA_UNDECLARED", "should not appear")
+    monkeypatch.setenv("MIMIR_PLUGIN_DISABLED_LABEL", "disabled value")
+    @dataclass
+    class AdminConfigFixture:
+        home: Path
+        plugin_manager: object
+        model_spec: str = ""
+
+    config = AdminConfigFixture(home=tmp_path, plugin_manager=manager)
+    payload = build_admin_config_payload(config=config)
+    plugin_rows = [row for row in payload["env"] if row["name"].startswith("MIMIR_PLUGIN_")]
+    assert {row["name"] for row in plugin_rows} == {
+        "MIMIR_PLUGIN_ALPHA_LABEL", "MIMIR_PLUGIN_ALPHA_TOKEN",
+    }
+    assert {row["name"]: row["value"] for row in plugin_rows} == {
+        "MIMIR_PLUGIN_ALPHA_LABEL": "public value",
+        "MIMIR_PLUGIN_ALPHA_TOKEN": "[REDACTED]",
+    }
+    assert all(row["mutable"] is False for row in plugin_rows)
+    assert payload["mutation_policy"]["mode"] == "read_only_v1"
+    assert payload["mutation_policy"]["mutable_fields"] == []
 
 
 def test_server_builtin_skin_ids_match_frontend_registry():
