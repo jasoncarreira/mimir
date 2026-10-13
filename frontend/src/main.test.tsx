@@ -31,13 +31,23 @@ beforeEach(() => {
   }));
 });
 
-const { routeFailures, whoami, wikiRouteLoads, liveEventsState, reloadSpy } = vi.hoisted(() => ({
+const { routeFailures, whoami, wikiRouteLoads, liveEventsState, reloadSpy, pluginImport } = vi.hoisted(() => ({
   routeFailures: { chat: false },
   whoami: { getWhoami: (..._a: unknown[]): Promise<unknown> => Promise.resolve() },
   wikiRouteLoads: { count: 0 },
   liveEventsState: { status: "idle", lastEvent: null as unknown },
-  reloadSpy: vi.fn()
+  reloadSpy: vi.fn(),
+  pluginImport: { current: null as null | ((url: string) => Promise<unknown>) }
 }));
+
+vi.mock("./dashboardExtensions", async (original) => {
+  const real = await original<typeof import("./dashboardExtensions")>();
+  return {
+    ...real,
+    loadPluginBundles: (...[bundles, manifests, tokens, onChange, signal]: Parameters<typeof real.loadPluginBundles>) =>
+      real.loadPluginBundles(bundles, manifests, tokens, onChange, signal, pluginImport.current ?? undefined)
+  };
+});
 
 vi.mock("./chunkReload", async (original) => {
   const real = await original<typeof import("./chunkReload")>();
@@ -68,6 +78,7 @@ const protectedBootstrap = {
     header: "X-API-Key",
     native_eventsource_supported_when_auth_required: false
   },
+  plugin_bundles: [] as { plugin: string; apiMajor: number; moduleUrl: string; cssUrl: string | null }[],
   dashboard_extensions: [
     {
       id: "chat", route_path: "/chat", label: "Chat", icon: null, nav_position: 0,
@@ -192,8 +203,62 @@ afterEach(() => {
   wikiRouteLoads.count = 0;
   liveEventsState.status = "idle";
   routeFailures.chat = false;
+  pluginImport.current = null;
   vi.clearAllMocks();
   vi.restoreAllMocks();
+});
+
+describe("plugin compatibility notices in the dashboard shell", () => {
+  const incompatible = {
+    plugin: "old-plugin", apiMajor: 2, moduleUrl: "/plugins/old-plugin/assets/main.js", cssUrl: null
+  };
+
+  it("shows a version mismatch to admins without hiding the core dashboard", async () => {
+    bootstrapOverride = { ...protectedBootstrap, plugin_bundles: [incompatible] };
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/chat"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByTestId("plugin-notices").textContent).toContain("unsupported dashboard API version 2"));
+    expect(screen.getByText("chat-stub")).toBeTruthy();
+    expect(screen.getByTestId("nav-chat")).toBeTruthy();
+  });
+
+  it("does not reveal the mismatch notice to non-admin users", async () => {
+    bootstrapOverride = { ...protectedBootstrap, plugin_bundles: [incompatible] };
+    sessionKey = "user-key";
+    vi.mocked(whoami.getWhoami).mockResolvedValueOnce({
+      ok: true, version: "v1", data: { canonical: "user", roles: ["user"], is_admin: false }
+    });
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/chat"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByText("chat-stub")).toBeTruthy());
+    expect(screen.queryByTestId("plugin-notices")).toBeNull();
+  });
+
+  it("mounts registered plugin pages in the same shell as core routes", async () => {
+    bootstrapOverride = {
+      ...protectedBootstrap,
+      plugin_bundles: [{ plugin: "alpha", apiMajor: 1, moduleUrl: "/plugins/alpha/assets/main.js", cssUrl: null }],
+      dashboard_extensions: [
+        ...protectedBootstrap.dashboard_extensions,
+        { id: "alpha", route_path: "/alpha", label: "Alpha", icon: null, nav_position: 10,
+          enabled: true, bundle: "main.js", css: [], api_namespace: "alpha", trusted_first_party: true }
+      ]
+    } as unknown as typeof protectedBootstrap;
+    pluginImport.current = async () => {
+      window.mimirPluginHost!.registerRoute({ plugin: "alpha", id: "alpha", path: "/alpha", component: () => <div>alpha-page</div> });
+      window.mimirPluginHost!.registerNavEntry({ plugin: "alpha", id: "alpha", label: "Alpha plugin" });
+    };
+    sessionKey = "admin-key";
+    useUiState.setState({ apiKeyPresent: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/alpha"]}><AppFrame /></MemoryRouter></QueryClientProvider>);
+    await waitFor(() => expect(screen.getByText("alpha-page")).toBeTruthy());
+    expect(screen.getByTestId("nav-alpha").textContent).toContain("Alpha plugin");
+    expect(screen.getByTestId("nav-chat")).toBeTruthy();
+  });
 });
 
 describe("stale chunk recovery in the dashboard", () => {

@@ -105,3 +105,22 @@ export async function apiFetchEnvelope<TData, TMeta = undefined>(
   }
   return envelope;
 }
+
+export function localPluginUrl(path: string, plugin?: string): string {
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") ||
+      path.includes("\\") || /%2f|%5c|%2e/i.test(path)) {
+    throw new Error("Plugin URL must be a local absolute path");
+  }
+  const url = new URL(path, window.location.origin);
+  if ((plugin && !/^[a-z0-9][a-z0-9_-]*$/.test(plugin)) ||
+      url.origin !== window.location.origin || url.hash ||
+      (plugin && !url.pathname.startsWith(`/plugins/${plugin}/assets/`))) {
+    throw new Error("Plugin URL must be a local plugin asset");
+  }
+  return url.pathname + url.search;
+}
+
+export async function authenticatedPluginFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const { credentials: _credentials, ...request } = options;
+  return fetch(localPluginUrl(path), { ...request, credentials: "same-origin" });
+}
