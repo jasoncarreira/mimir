@@ -89,6 +89,36 @@ assert 'MIMIR_PLUGINS' not in os.environ
     ]
 
 
+def test_disabled_provider_not_imported_for_core_command():
+    script = """
+import importlib.metadata as metadata
+import os
+import sys
+from types import SimpleNamespace
+
+class Entry:
+    name = 'disabled'
+    value = 'poison_provider:register'
+    dist = SimpleNamespace(files=None, metadata={'Name': 'provider-disabled'})
+    def load(self):
+        raise AssertionError('disabled provider loaded')
+
+metadata.entry_points = lambda *, group: [Entry()]
+os.environ.pop('MIMIR_PLUGINS', None)
+from mimir.cli import main
+try:
+    main(['verify-cred', '--help'])
+except SystemExit as exc:
+    assert exc.code == 0
+else:
+    raise AssertionError('expected argparse help exit')
+assert 'poison_provider' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                            text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 def test_plugins_requires_list(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["plugins"])

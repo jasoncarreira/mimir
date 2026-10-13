@@ -27,6 +27,8 @@ class CommandRegistry:
 
     def add_core(self, name: str, parser: argparse.ArgumentParser,
                  dispatch: Callable[[argparse.Namespace], Any]) -> None:
+        if parser.prog != f"mimir {name}":
+            raise PolicyRegistrationError(f"core CLI parser does not match {name!r}")
         self.register(CliCommand("core", name, lambda _sub: parser, dispatch))
 
     def add_selected(self, commands: Mapping[str, CliCommand],

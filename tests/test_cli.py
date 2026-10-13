@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -10,6 +12,53 @@ from unittest.mock import patch
 import pytest
 
 from mimir.cli import _print_setup_report, main, setup_home
+
+
+CORE_COMMANDS = frozenset({
+    "setup", "run", "identities", "reflection", "memory", "worklink",
+    "regenerate-api-key", "stats", "verify-cred", "verify-creds",
+    "viability-report", "verify-index", "rotate", "loops", "update",
+    "predictions", "wiki", "skills", "plugins", "scaffold-docker",
+    "opencode-bootstrap", "commitments", "feedback", "reindex",
+    "migrate-memory", "saga-reembed", "saga-acl-inventory",
+    "saga-enforcement-replay", "saga-migrate-legacy-acl", "watchdog",
+    "notify-restart",
+})
+
+
+def test_closed_core_parser_dispatch_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every core parser has its own handler and no core dispatch chain remains."""
+    from mimir.plugins.cli_registry import CommandRegistry
+
+    source = ast.parse(inspect.getsource(main))
+    registry_nodes = [node for node in ast.walk(source) if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "core_commands"
+                              for target in node.targets)]
+    assert len(registry_nodes) == 1
+    declaration = registry_nodes[0].value
+    assert isinstance(declaration, ast.Dict)
+    assert {ast.literal_eval(key) for key in declaration.keys} == CORE_COMMANDS
+    assert len(declaration.keys) == len(CORE_COMMANDS)
+
+    for node in ast.walk(source):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        comparison = node.test
+        if isinstance(comparison.left, ast.Attribute) and comparison.left.attr == "command":
+            assert not any(isinstance(value, ast.Constant) and isinstance(value.value, str)
+                           for value in comparison.comparators), "legacy core dispatch chain"
+
+    def verify(self, args):
+        commands = self.commands
+        assert set(commands) == CORE_COMMANDS
+        for name, command in commands.items():
+            assert command.owner == "core"
+            assert command.configure(None).prog == f"mimir {name}"
+            assert command.dispatch.__name__ == f"handle_{name.replace('-', '_')}"
+
+    monkeypatch.setattr(CommandRegistry, "dispatch", verify)
+    monkeypatch.delenv("MIMIR_PLUGINS", raising=False)
+    main(["plugins", "list"])
 
 
 @pytest.fixture(autouse=True)
