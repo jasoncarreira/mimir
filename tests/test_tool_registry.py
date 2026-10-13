@@ -1813,6 +1813,47 @@ async def test_injected_runtime_delivered_despite_ifc_labels_regression():
     )
     assert parsed_shell["mimir_direct_argv"] == ["git", "status"]
     assert parsed_shell["runtime"] is runtime
+
+
+def test_typed_plugin_slot_survives_tool_runtime_model_dump_and_injection() -> None:
+    from dataclasses import dataclass
+
+    from langchain.tools import ToolRuntime
+
+    from mimir.access_control import create_auth_context
+    from mimir.plugins.registry import PolicyRegistry
+    from mimir.tools.memory import memory_get
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    source = SourceLabel(
+        principal="alice", domain="channel", resource_id="channel", bridge_instance="test",
+        sensitivity="internal",
+    )
+    labels = InformationFlowLabels().with_source(source)
+    auth = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel", author="alice"),
+        policy=policy, ifc_labels=labels,
+    ).with_plugin_state(registrar, State("private"))
+    runtime = ToolRuntime(
+        state={}, context=auth, config={}, stream_writer=lambda _: None,
+        tool_call_id="slot-runtime", store=None,
+    )
+    fields = memory_get.args_schema.model_validate({"atom_ids": ["a1"], "runtime": runtime})
+    assert isinstance(fields.model_dump(), dict)
+    parsed = memory_get._parse_input({"atom_ids": ["a1"], "runtime": runtime}, "slot-runtime")
+    assert parsed["runtime"] is runtime
+    assert parsed["runtime"].context is auth
+    assert parsed["runtime"].context.plugin_state("example") == State("private")
+    assert auth.ifc_labels.sources == (source,)
+
+
 def test_hands_sink_flow_and_ifc_inventory_is_exact() -> None:
     from mimir import access_control
 

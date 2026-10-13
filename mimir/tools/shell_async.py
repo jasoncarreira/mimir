@@ -24,7 +24,7 @@ from typing import Annotated, Any, Callable, Optional
 from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, ToolException, tool
 
-from ..models import AuthContext, TurnContext
+from ..models import AuthContext
 from ..shell_jobs import (
     SHELL_JOB_OUTPUT_DEFAULT_TAIL_LINES,
     ShellJobRegistry,
@@ -272,7 +272,7 @@ async def bash_async(
     # The runtime auth carrier and dispatcher ContextVar survive the SDK/MCP
     # forked-task path and are server-controlled. get_current_turn() remains the
     # direct-call fallback used by tests and in-process handlers.
-    from .._context import get_current_turn, resolve_active_ctx
+    from .._context import get_current_turn, is_same_turn_auth_carrier, resolve_active_ctx
     from .registry import _current_channel_id_var
     runtime_auth = (
         runtime.context
@@ -312,7 +312,7 @@ async def bash_async(
         )
     if not isinstance(auth_context, AuthContext):
         auth_context = None
-    if isinstance(ctx, TurnContext) and ctx.auth_context is auth_context:
+    if is_same_turn_auth_carrier(ctx, auth_context):
         auth_context = ctx.auth_with_plugin_state()
 
     # Wait-on-pending guard (chainlink #189 / #192): refuse if a same-intent

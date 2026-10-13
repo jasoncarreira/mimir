@@ -167,6 +167,31 @@ def get_current_turn() -> "TurnContext | None":
     return _current_turn.get()
 
 
+def is_same_turn_auth_carrier(turn: "TurnContext | None", carrier: Any) -> bool:
+    """Accept a graph's ingress carrier after a same-turn IFC label replacement.
+
+    The graph retains its original carrier while the live turn receives a
+    ``replace(auth, ifc_labels=...)``. Match the shared IFC cell and every
+    authority-bearing identity field, rather than matching channel or principal
+    alone. A forged/lookalike or another turn's carrier must not select slots.
+    """
+    from dataclasses import replace
+
+    from .models import AuthContext, TurnContext
+
+    if not isinstance(turn, TurnContext) or not isinstance(carrier, AuthContext):
+        return False
+    active = turn.auth_context
+    if active is carrier:
+        return True
+    return (
+        isinstance(active, AuthContext)
+        and active.ifc_state is carrier.ifc_state
+        and active._plugin_slot_policy is carrier._plugin_slot_policy
+        and replace(carrier, ifc_labels=active.ifc_labels) == active
+    )
+
+
 def get_turn_by_session_id(session_id: str | None) -> "TurnContext | None":
     """Look up an active turn by its ``turn_id``. Used by hook callbacks
     where contextvar inheritance is unreliable (the hook task forked at

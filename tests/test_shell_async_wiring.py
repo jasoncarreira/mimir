@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -355,6 +356,87 @@ async def test_bash_async_own_session_keeps_caller_routing_auth_and_labels(
     assert spawned["channel_id"] == "channel-a"
     assert spawned["auth_context"] is auth_a
     assert spawned["job"].ifc_labels == auth_a.ifc_labels
+
+
+@pytest.mark.asyncio
+async def test_live_plugin_slot_survives_shell_spawn_and_completion(
+    fake_registry: ShellJobRegistry, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mimir import agent as agent_module
+    from mimir._context import reset_current_turn, set_current_turn
+    from mimir.access_control import create_auth_context
+    from mimir.agent import Agent, _create_turn_auth_context, _initialize_ifc_labels
+    from mimir.models import AgentEvent, InformationFlowLabels
+    from mimir.plugins.registry import PolicyRegistry
+
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    original = create_auth_context(
+        AgentEvent(trigger="user_message", channel_id="channel-a", author="alice"),
+        policy=policy,
+    )
+    turn = _active_turn("turn-a", "saga-a", original)
+    turn.set_plugin_state(registrar, State("at-spawn"))
+    turn.auth_context = replace(original, ifc_labels=InformationFlowLabels().with_label("internal"))
+    token = set_current_turn(turn)
+    try:
+        result = await shell_async.bash_async.coroutine(
+            command="echo owner", session_id="saga-a",
+            runtime=SimpleNamespace(context=original),
+        )
+    finally:
+        reset_current_turn(token)
+    assert "Spawned job" in result
+    spawned = fake_registry._spawned_log[0]
+    job = spawned["job"]
+    assert spawned["auth_context"].plugin_state("example") == State("at-spawn")
+    assert spawned["auth_context"].ifc_state is original.ifc_state
+    assert original.plugin_state("example") is None
+
+    foreign = replace(original, roles=("admin",))
+    token = set_current_turn(turn)
+    try:
+        await shell_async.bash_async.coroutine(
+            command="echo foreign", session_id="saga-a",
+            runtime=SimpleNamespace(context=foreign),
+        )
+    finally:
+        reset_current_turn(token)
+    assert fake_registry._spawned_log[1]["auth_context"] is foreign
+    assert foreign.plugin_state("example") is None
+
+    captured: list[Any] = []
+
+    async def enqueue(event: Any) -> bool:
+        captured.append(event)
+        return True
+
+    async def log_event(*_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    monkeypatch.setattr(agent_module, "log_event", log_event)
+    agent = SimpleNamespace(
+        _shell_jobs=SimpleNamespace(read_job_output=lambda *_a, **_kw: {}),
+        _dispatcher=SimpleNamespace(enqueue=enqueue),
+    )
+    job.status = "exited_ok"
+    job.exit_code = 0
+    await Agent._on_shell_job_complete(agent, job)
+    [completion] = captured
+    assert completion.trigger == "shell_job_complete"
+    assert completion.continuation_auth_context.plugin_state("example") == State("at-spawn")
+    resumed = _create_turn_auth_context(
+        completion, None, policy_version="test", enforce=True,
+        ifc_labels=_initialize_ifc_labels(completion), policy=policy,
+    )
+    assert resumed.plugin_state("example") == State("at-spawn")
+    assert resumed.ifc_state is not original.ifc_state
 
 
 def test_shell_registry_none_clears_registry_and_callback(tmp_path: Path) -> None:

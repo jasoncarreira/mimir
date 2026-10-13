@@ -14,7 +14,7 @@ from mimir.access_control import create_auth_context, create_local_operator_auth
 from mimir._context import reset_current_turn, set_current_turn
 from mimir._deepagents_subagent_auth import _subagent_auth_context, _wrap_task_tool
 from mimir.commitments import cli as commitments_cli
-from mimir.models import AgentEvent, TurnContext, TurnInteractivity
+from mimir.models import AgentEvent, InformationFlowLabels, TurnContext, TurnInteractivity
 from mimir.plugins.registry import PolicyRegistry
 from mimir.reflection import most_retrieved
 from mimir import scheduler_dashboard
@@ -106,6 +106,41 @@ def test_subagent_task_receives_live_owner_snapshot() -> None:
         reset_current_turn(token)
     assert child.plugin_state("example") == State("live")
     assert auth.plugin_state("example") is None
+    assert _subagent_auth_context.get() is None
+
+
+@pytest.mark.asyncio
+async def test_async_subagent_task_uses_rescoped_live_state_not_foreign_runtime() -> None:
+    @dataclass(frozen=True)
+    class State:
+        value: str
+
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_state_slot(State)
+    policy.freeze()
+    event = AgentEvent(trigger="user_message", channel_id="channel", author="user")
+    ingress = create_auth_context(event, policy=policy)
+    turn = TurnContext("turn", "channel", "user_message", "channel", 0, auth_context=ingress)
+    turn.set_plugin_state(registrar, State("live"))
+    turn.auth_context = replace(ingress, ifc_labels=InformationFlowLabels().with_label("internal"))
+
+    async def child(**_kwargs: Any) -> Any:
+        return _subagent_auth_context.get()
+
+    task = _wrap_task_tool(SimpleNamespace(func=lambda **_kwargs: None, coroutine=child))
+    token = set_current_turn(turn)
+    try:
+        inherited = await task.coroutine(runtime=SimpleNamespace(context=ingress))
+        foreign = create_auth_context(event, policy=policy)
+        refused = await task.coroutine(runtime=SimpleNamespace(context=foreign))
+        lookalike = await task.coroutine(runtime=SimpleNamespace(context=object()))
+    finally:
+        reset_current_turn(token)
+    assert inherited.plugin_state("example") == State("live")
+    assert inherited is not ingress
+    assert refused is foreign and refused.plugin_state("example") is None
+    assert lookalike is None
     assert _subagent_auth_context.get() is None
 
 
