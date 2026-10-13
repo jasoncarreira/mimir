@@ -1875,6 +1875,11 @@ class Scheduler:
         for job in declarations:
             if job.owner == "core":
                 raise ValueError(f"scheduler job {job.name!r} must have a plugin owner")
+            if (
+                job.job_id.startswith((SCHEDULER_CHANNEL_PREFIX, POLLER_CHANNEL_PREFIX))
+                or job.job_id in {_QUOTA_RECOVERY_JOB_ID, _QUOTA_RECHECK_JOB_ID}
+            ):
+                raise ValueError(f"reserved scheduler job ID: {job.job_id!r}")
             if job.name in names:
                 raise ValueError(f"duplicate scheduler callable name: {job.name!r}")
             if job.job_id in job_ids:

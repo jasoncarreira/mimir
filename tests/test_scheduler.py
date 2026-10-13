@@ -1656,6 +1656,39 @@ def test_plugin_callable_collisions_do_not_replace_jobs(tmp_path: Path, collisio
     assert sched.registered_callables() == ["core-job"]
 
 
+@pytest.mark.parametrize("reserved_id", [
+    "scheduler:future", "poller:future",
+    "__quota_recovery__", "__quota_pause_recheck__",
+])
+def test_plugin_callable_cannot_claim_later_scheduler_job_ids(
+    tmp_path: Path, reserved_id: str,
+):
+    path = tmp_path / "scheduler.yaml"
+    sched = Scheduler(scheduler_yaml=path, enqueue=lambda e: asyncio.sleep(0, result=True))
+
+    async def callback():
+        pass
+
+    sched.register_callable("core-job", callback, "0 4 * * *", job_id="core-id")
+    policy = PolicyRegistry()
+    registrar = policy.registrar("example")
+    registrar.register_scheduler_job("valid-job", "valid-id", callback)
+    registrar.register_scheduler_job("reserved-job", reserved_id, callback)
+    policy.freeze()
+    before = {job.id: job for job in sched._scheduler.get_jobs()}
+
+    with pytest.raises(ValueError, match="reserved scheduler job ID"):
+        sched.bind_plugin_jobs(policy.scheduler_jobs.values())
+
+    assert {job.id: job for job in sched._scheduler.get_jobs()} == before
+    assert sched.registered_callables() == ["core-job"]
+    if reserved_id == "scheduler:future":
+        path.write_text("- name: future\n  prompt: tick\n  cron: '0 6 * * *'\n")
+        sched.reload()
+        assert sched._scheduler.get_job(reserved_id) is not None
+        assert sched._scheduler.get_job("core-id").func is callback
+
+
 def test_plugin_callable_disabled_and_no_plugin_compatibility(tmp_path: Path):
     sched = Scheduler(
         scheduler_yaml=tmp_path / "s.yaml",
