@@ -98,6 +98,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 if TYPE_CHECKING:
     from .plugins.registry import PolicyRegistry
 
+from .plugins.core import scoped_policy_call
 from .billing import Priority, normalize_priority
 from .config import trusted_github_bot_logins
 from .access_control import (
@@ -1182,6 +1183,7 @@ def _validate_poller_identity(name: str, manifest_path: Path) -> None:
         )
 
 
+@scoped_policy_call(lambda bound: bound.arguments.get("policy"))
 def _parse_poller_authority(
     raw: object,
     *,

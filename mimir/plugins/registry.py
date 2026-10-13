@@ -113,6 +113,7 @@ class PolicyRegistry:
         self._operator_shell_profile: str | None = None
         self._principals: dict[str, Any] = {}
         self._principal_owners: dict[str, str] = {}
+        self._poller_properties: dict[str, Any] = {}
         self._frozen = False
 
     def registrar(self, plugin: str) -> PolicyRegistrar:
@@ -158,6 +159,27 @@ class PolicyRegistry:
     @property
     def service_principals(self) -> Mapping[str, Any]:
         return MappingProxyType(self._principals)
+
+    @property
+    def poller_properties(self) -> Mapping[str, Any]:
+        return MappingProxyType(self._poller_properties)
+
+    def register_poller_properties(self, canonical: str, properties: Any, *, owner: str = "core") -> None:
+        self._writable()
+        from .core import PollerProperties
+
+        if owner != "core":
+            raise PolicyRegistrationError(f"{owner}: poller properties are core-only")
+        canonical = _name(canonical, "poller canonical")
+        if not canonical.startswith("poller:") or not canonical.removeprefix("poller:"):
+            raise PolicyRegistrationError("poller properties require a poller canonical")
+        if not isinstance(properties, PollerProperties) or any(
+            not isinstance(value, bool) for value in properties.principal_fields().values()
+        ):
+            raise PolicyRegistrationError("invalid poller properties")
+        if canonical in self._poller_properties:
+            raise PolicyRegistrationError(f"duplicate poller properties: {canonical}")
+        self._poller_properties[canonical] = properties
 
     @property
     def descriptors(self) -> Mapping[str, ToolDescriptor]:

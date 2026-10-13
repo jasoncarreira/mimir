@@ -770,3 +770,62 @@ def test_core_tool_can_preserve_reserved_mcp_prefix_without_plugin_privileges():
     registry = PolicyRegistry()
     registry.register_tool(**fields(name="mcp_core_alias"))
     assert registry.freeze().tools["mcp_core_alias"].owner == "core"
+
+
+@pytest.mark.parametrize("canonical,flag", [
+    ("poller:github-activity", "github_activity"),
+    ("poller:worklink-ready-queue", "worklink_retained_checkout"),
+    ("poller:github-ci-watch", "github_ci_watch"),
+])
+def test_poller_builder_uses_registry_properties_not_canonical_literals(canonical, flag):
+    from mimir.access_control import build_trigger_service_principal
+    from mimir.plugins.core import PollerProperties, core_policy_registry
+
+    def build(policy):
+        return build_trigger_service_principal(
+            canonical=canonical, trigger="poller", profile="github",
+            tier=CapabilityTier.SCOPE_CONTAINED, capabilities=(),
+            creation_path="test:poller", policy=policy,
+        )
+
+    assert getattr(build(core_policy_registry()), flag) is True
+    registry = PolicyRegistry()
+    register_core_tools(registry)
+    # Test-only replacement isolates the declaration's effect. A literal-name
+    # fallback would incorrectly keep the property despite the selected policy.
+    registry._poller_properties[canonical] = PollerProperties()
+    selected = registry.freeze()
+    assert getattr(build(selected), flag) is False
+    assert getattr(build(core_policy_registry()), flag) is True
+    with pytest.raises(TypeError):
+        selected.poller_properties[canonical] = PollerProperties()
+    with pytest.raises(PolicyRegistrationError, match="frozen"):
+        selected.register_poller_properties("poller:another", PollerProperties())
+
+
+def test_poller_properties_are_core_only_and_duplicate_safe():
+    from mimir.plugins.core import PollerProperties
+
+    registry = PolicyRegistry()
+    with pytest.raises(PolicyRegistrationError, match="core-only"):
+        registry.register_poller_properties(
+            "poller:example", PollerProperties(github_activity=True), owner="example",
+        )
+    assert not registry.poller_properties
+    assert not hasattr(registry.registrar("example"), "register_poller_properties")
+    properties = PollerProperties(github_activity=True)
+    registry.register_poller_properties("poller:example", properties)
+    with pytest.raises(PolicyRegistrationError, match="duplicate"):
+        registry.register_poller_properties("poller:example", PollerProperties())
+    assert registry.poller_properties["poller:example"] is properties
+
+
+def test_authorization_module_contains_no_reserved_poller_name_literals():
+    import mimir.access_control as module
+
+    tree = ast.parse(Path(module.__file__).read_text())
+    literals = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)}
+    assert not literals.intersection({
+        "poller:github-activity", "poller:worklink-ready-queue", "poller:github-ci-watch",
+    })

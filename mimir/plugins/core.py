@@ -176,14 +176,39 @@ def policy_membership(name: str) -> PolicySetView:
     ))
 
 
-# Reserved historical poller semantics are server declarations, never manifest
-# input; registry validation must reject these flags on plugin principals.
-def core_poller_flags(canonical: str) -> dict[str, bool]:
-    return {
-        "github_activity": canonical == "poller:github-activity",
-        "worklink_retained_checkout": canonical == "poller:worklink-ready-queue",
-        "github_ci_watch": canonical == "poller:github-ci-watch",
-    }
+@dataclass(frozen=True)
+class PollerProperties:
+    """Reserved server semantics for an instance declared by the poller loader."""
+
+    github_activity: bool = False
+    worklink_retained_checkout: bool = False
+    github_ci_watch: bool = False
+
+    def principal_fields(self) -> dict[str, bool]:
+        return {
+            "github_activity": self.github_activity,
+            "worklink_retained_checkout": self.worklink_retained_checkout,
+            "github_ci_watch": self.github_ci_watch,
+        }
+
+
+def poller_properties(canonical: str) -> PollerProperties:
+    return selected_policy_registry().poller_properties.get(canonical, PollerProperties())
+
+
+def register_core_poller_properties(registry: PolicyRegistry) -> None:
+    """Declare historical semantics once; manifests cannot mint these grants."""
+    registry.register_poller_properties(
+        "poller:github-activity", PollerProperties(github_activity=True),
+    )
+    registry.register_poller_properties(
+        "poller:worklink-ready-queue", PollerProperties(worklink_retained_checkout=True),
+    )
+    registry.register_poller_properties(
+        "poller:github-ci-watch", PollerProperties(github_ci_watch=True),
+    )
+
+    # All authorization consumers read properties, never canonical-name lists.
 
 
 def _names(value: str) -> frozenset[str]:
@@ -650,6 +675,7 @@ def register_core_tools(registry: PolicyRegistry) -> None:
         registry.register_shell_profile_mapping(profile, shell)
     registry.register_operator_shell_profile("scheduler_read_only")
     register_core_principals(registry)
+    register_core_poller_properties(registry)
 
 
 def register_core_principals(registry: PolicyRegistry) -> None:

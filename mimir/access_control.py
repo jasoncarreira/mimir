@@ -71,7 +71,7 @@ from .tool_descriptors import (
 )
 from .plugins.core import (
     CapabilityTier, ServicePrincipal, ServiceSinkPolicy, core_policy_registry,
-    core_poller_flags, PolicyMappingView, PolicySetView, policy_membership,
+    poller_properties, PolicyMappingView, PolicySetView, policy_membership,
     scoped_policy_call, selected_policy_registry,
 )
 
@@ -354,7 +354,7 @@ def build_trigger_service_principal(
     home_data_roots = (
         (Path(home) / "state", Path(home) / "memory", artifact_root) if home else ()
     )
-    poller_flags = core_poller_flags(canonical) if trigger == "poller" else {}
+    poller_flags = poller_properties(canonical).principal_fields() if trigger == "poller" else {}
     is_github_activity = poller_flags.get("github_activity", False)
     repo_roots = tuple(root.resolve() for root in _configured_repo_roots())
     fetch_cache_roots = (
