@@ -829,3 +829,29 @@ def test_authorization_module_contains_no_reserved_poller_name_literals():
     assert not literals.intersection({
         "poller:github-activity", "poller:worklink-ready-queue", "poller:github-ci-watch",
     })
+
+
+def test_plugin_poller_hooks_are_owner_bound_and_duplicate_safe():
+    from mimir.poller_hooks import PollerHooks, resolve_poller_hooks
+
+    registry = PolicyRegistry()
+    hooks = PollerHooks(recovery_relevance=lambda _poller: lambda _event: True)
+    registry.registrar("example").register_poller_hook("example-hook", lambda: hooks)
+    with pytest.raises(PolicyRegistrationError, match="duplicate poller hook"):
+        registry.registrar("other").register_poller_hook("example-hook", lambda: hooks)
+    policy = registry.freeze()
+    assert resolve_poller_hooks("example-hook", Path("watcher/pollers.json"),
+                                policy=policy, plugin_owner="example") is hooks
+    with pytest.raises(ValueError, match="foreign"):
+        resolve_poller_hooks("example-hook", Path("watcher/pollers.json"),
+                             policy=policy, plugin_owner="other")
+
+
+def test_poller_hooks_never_execute_skill_path_python():
+    import mimir.poller_hooks as module
+
+    tree = ast.parse(Path(module.__file__).read_text())
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "spec_from_file_location"
+        for node in ast.walk(tree)
+    )

@@ -38,7 +38,7 @@ import yaml
 from mimir import access_control, poller_recovery
 from mimir.event_logger import init_logger
 from mimir.models import AgentEvent
-from mimir.poller_hooks import POLLER_HOOK_PROFILES, PollerHooks
+from mimir.poller_hooks import PollerHooks, resolve_poller_hooks
 from mimir.pollers import (
     POLLER_CIRCUIT_BREAKER_BACKOFF_SECONDS,
     POLLER_CIRCUIT_BREAKER_THRESHOLD,
@@ -66,6 +66,66 @@ from mimir.pollers import (
     run_poller,
     validate_poller_overrides_text,
 )
+
+
+def test_plugin_package_poller_hooks_survive_discovery_and_reload(tmp_path):
+    from mimir.plugins.registry import PolicyRegistry
+
+    root = tmp_path / "provider"
+    skill = root / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    (root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    manifest = skill / "pollers.json"
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": "example-watch", "command": "python3 scripts/watch.py",
+        "cron": "*/10 * * * *", "hooks": "example-recovery",
+    }]}), encoding="utf-8")
+    paths = (root / "mimir-plugin.toml", manifest)
+    dist = SimpleNamespace(files=paths, locate_file=lambda path: path)
+    candidate = SimpleNamespace(enabled=True, name="example", manifest=object(),
+                                entry_point=SimpleNamespace(dist=dist))
+    hooks = PollerHooks(recovery_relevance=lambda _config: lambda _event: True)
+    registry = PolicyRegistry()
+    registry.registrar("example").register_poller_hook("example-recovery", lambda: hooks)
+    policy = registry.freeze()
+
+    for _ in range(2):
+        pollers = discover_pollers(tmp_path / "empty-skills", policy=policy,
+                                   plugin_candidates=(candidate,))
+        assert len(pollers) == 1
+        assert pollers[0].manifest_path == manifest
+        assert pollers[0].hooks is hooks
+        assert pollers[0].resolved_authority().capabilities == ()
+
+    manifest.write_text(json.dumps({"pollers": [{
+        "name": "example-watch", "command": "python3 scripts/watch.py",
+        "cron": "*/10 * * * *", "hooks": "github",
+    }]}), encoding="utf-8")
+    rejected = []
+    assert discover_pollers(tmp_path / "empty-skills", policy=policy,
+                            plugin_candidates=(candidate,), invalid_entries=rejected) == []
+    assert "reserved" in rejected[0][2]
+    assert discover_pollers(tmp_path / "empty-skills", policy=policy,
+                            plugin_candidates=(SimpleNamespace(**{
+                                **vars(candidate), "enabled": False,
+                            }),)) == []
+
+
+def test_plugin_poller_authority_rejects_foreign_profile(tmp_path):
+    from mimir.plugins.registry import PolicyRegistry
+
+    registry = PolicyRegistry()
+    registry.register_authority_profile("foreign")
+    policy = registry.freeze()
+    skill = tmp_path / "skills" / "watcher"
+    skill.mkdir(parents=True)
+    with pytest.raises(ValueError, match="not owned"):
+        _parse_poller_authority(
+            {"profile": "foreign", "tier": "scope-contained",
+             "capabilities": [], "scoped_roots": []}, name="example-watch",
+            persist_dir=skill, state_root=None, manifest_path=skill / "pollers.json",
+            policy=policy, plugin_owner="example",
+        )
 
 
 def test_verified_own_push_drops_stale_framework_trigger_before_scope_binding(
@@ -290,7 +350,7 @@ def test_declared_hooks_are_selected_independently_of_poller_name(
     [poller] = discover_pollers(skills)
 
     assert poller.name == name
-    assert poller.hooks is POLLER_HOOK_PROFILES[profile].hooks
+    assert poller.hooks is resolve_poller_hooks(profile, poller.manifest_path)
 
 
 def test_reserved_poller_without_hooks_is_registered_and_surfaced(
@@ -4179,7 +4239,7 @@ async def test_run_github_poller_logs_stale_recovery_drop(
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
-        hooks=POLLER_HOOK_PROFILES["github"].hooks,
+        hooks=resolve_poller_hooks("github", Path("github-poller/pollers.json")),
     )
     source_id = "poller:github-activity:stale"
     prior = AgentEvent(
@@ -4244,7 +4304,7 @@ print(json.dumps({
         skill_dir=skill_dir,
         persist_dir=persist_dir,
         recover_failed_turns=True,
-        hooks=POLLER_HOOK_PROFILES["github"].hooks,
+        hooks=resolve_poller_hooks("github", Path("github-poller/pollers.json")),
     )
     prior = AgentEvent(
         trigger="poller",
@@ -9514,8 +9574,12 @@ def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
     skills = home / "skills"
     manifest = skills / "github-poller" / "pollers.json"
     names = ["github-activity", "github-ci-watch", "remediation-ready-queue", "default", "typo"]
+    ci_manifest = _write_pollers_json(skills / "github-ci-watch", [
+        {"name": "github-ci-watch", "command": "echo", "cron": "0 * * * *"},
+    ])
     _write_pollers_json(manifest.parent, [
-        {"name": name, "command": "echo", "cron": "0 * * * *"} for name in names
+        {"name": name, "command": "echo", "cron": "0 * * * *"}
+        for name in names if name != "github-ci-watch"
     ])
     path = _write_overrides(home / "pollers-overrides.yaml", json.dumps({
         **{name: {"priority": " High "} for name in names[:3]},
@@ -9528,9 +9592,10 @@ def test_priority_inventory_reports_effective_values_and_sources(home, caplog):
               if r.getMessage().startswith("poller_priorities: ")]
     assert json.loads(line.removeprefix("poller_priorities: ")) == [
         {"name": name, "priority": "high" if name in names[:3] else "normal",
-         "source": "operator_override" if name in names[:3] else "skill_default",
-         "path": str(path if name in names[:3] else manifest)}
-        for name in names
+          "source": "operator_override" if name in names[:3] else "skill_default",
+          "path": str(path if name in names[:3] else
+                      ci_manifest if name == "github-ci-watch" else manifest)}
+        for name in ["github-ci-watch", "github-activity", *names[2:]]
     ]
 
 
