@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import mimir.defaults_upgrade as du
 from mimir.proposals import list_open_proposals
+from mimir.plugins.defaults import plugin_default_files, seed_plugin_defaults
 
 
 def _git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -946,3 +948,413 @@ def test_scheduler_introduction_run_does_not_add(
     assert "scheduler.yaml" not in staged  # introduction run is a no-op for scheduler
     assert "memory-hygiene" not in (wt / "scheduler.yaml").read_text(encoding="utf-8")
     _cleanup_upgrade_proposal(home)
+
+
+def _plugin(tmp_path: Path, version: str = "1.0", *, name: str = "sample"):
+    root = tmp_path / name
+    (root / "skills" / "helper").mkdir(parents=True, exist_ok=True)
+    (root / "prompts").mkdir(exist_ok=True)
+    (root / "jobs.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    (root / "prompts" / "heartbeat.md").write_text("plugin prompt\n", encoding="utf-8")
+    (root / "skills" / "helper" / "SKILL.md").write_text("plugin skill\n", encoding="utf-8")
+    (root / "mimir-plugin.toml").write_text("", encoding="utf-8")
+    class Distribution:
+        files = (Path("mimir-plugin.toml"), Path("jobs.yaml"),
+                 Path("prompts/heartbeat.md"), Path("skills/helper/SKILL.md"))
+
+        def locate_file(self, path):
+            return root / path
+
+    return SimpleNamespace(
+        name=name, entry_point=SimpleNamespace(dist=Distribution()),
+        manifest=SimpleNamespace(defaults={
+            "version": version, "skills": ("skills/helper",),
+            "prompts": ("prompts/heartbeat.md",), "scheduler_jobs": ("jobs.yaml",),
+        }),
+    )
+
+
+def test_plugin_defaults_seed_is_namespaced_and_preserves_edits(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    (home / "prompts").mkdir()
+    (home / "prompts" / "heartbeat.md").write_text("core prompt\n", encoding="utf-8")
+    first = seed_plugin_defaults(home, selected=(plugin,))
+    assert first["skills/sample-helper/SKILL.md"] == "created"
+    assert first["prompts/sample/heartbeat.md"] == "created"
+    assert "sample-heartbeat" in (home / "scheduler.yaml").read_text()
+    target = home / "prompts" / "sample" / "heartbeat.md"
+    target.write_text("operator edit\n", encoding="utf-8")
+    (tmp_path / "sample" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
+    assert seed_plugin_defaults(home, selected=(plugin,))["prompts/sample/heartbeat.md"] == "existing"
+    assert target.read_text() == "operator edit\n"
+    assert (home / "prompts" / "heartbeat.md").read_text() == "core prompt\n"
+    assert (home / "scheduler.yaml").read_text().count("name: sample-heartbeat") == 1
+
+
+def test_plugin_defaults_disabled_does_not_load_package(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("mimir.plugins.defaults.enabled_plugins", lambda: ())
+    assert seed_plugin_defaults(tmp_path) == {}
+    assert not (tmp_path / "skills").exists()
+
+
+def test_new_plugin_version_only_fills_missing_files(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path)
+    home = tmp_path / "home"
+    seed_plugin_defaults(home, selected=(plugin,))
+    skill = home / "skills/sample-helper/SKILL.md"
+    skill.write_text("operator skill\n")
+    plugin.entry_point.dist.files += (Path("skills/helper/README.md"),)
+    (tmp_path / "sample/skills/helper/README.md").write_text("new file\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    result = seed_plugin_defaults(home, selected=(plugin,))
+    assert result["skills/sample-helper/README.md"] == "created"
+    assert skill.read_text() == "operator skill\n"
+
+
+def test_plugin_skill_namespace_collision_fails_before_seeding(tmp_path: Path) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    alpha_beta = _plugin(tmp_path, name="alpha-beta")
+    skill = tmp_path / "alpha/skills/helper/SKILL.md"
+    moved = tmp_path / "alpha/skills/beta-helper"
+    moved.mkdir()
+    (moved / "SKILL.md").write_text(skill.read_text())
+    alpha.manifest.defaults["skills"] = ("skills/beta-helper",)
+    alpha.entry_point.dist.files += (Path("skills/beta-helper/SKILL.md"),)
+    with pytest.raises(ValueError, match="claimed by alpha and alpha-beta"):
+        seed_plugin_defaults(tmp_path / "home", selected=(alpha, alpha_beta))
+    assert not (tmp_path / "home").exists()
+
+
+def test_plugin_defaults_upgrade_proposes_without_touching_live_home(
+    home: Path, tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    seed_plugin_defaults(home, selected=(plugin,))
+    assert (home / "skills/sample-helper/SKILL.md").is_file()
+    assert (home / "prompts/sample/heartbeat.md").is_file()
+    added = _git("add", "-f", "skills/sample-helper/SKILL.md", "prompts/sample/heartbeat.md", "scheduler.yaml", cwd=home, check=False)
+    assert added.returncode == 0, added.stderr
+    _git("commit", "-q", "-m", "plugin seed", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "already_synced"
+    path = home / "prompts" / "sample" / "heartbeat.md"
+    path.write_text("operator edit\n")
+    _git("add", "-f", "prompts/sample/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "operator change", cwd=home)
+    _git("push", "-q", cwd=home)
+    (tmp_path / "sample" / "prompts" / "heartbeat.md").write_text("plugin v2\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "proposal_opened_conflicts"
+    assert result.proposal and result.proposal.worktree
+    assert "operator edit" in (result.proposal.worktree / "prompts/sample/heartbeat.md").read_text()
+    assert "plugin v2" in (result.proposal.worktree / "prompts/sample/heartbeat.md").read_text()
+    assert path.read_text() == "operator edit\n"
+    assert (home / "memory/core/00-identity.md").read_text() == "identity v1\n"
+    _cleanup_upgrade_proposal(home)
+
+
+def test_plugin_defaults_upgrade_keeps_owners_separate_on_shared_upgrade_lane(
+    home: Path, tmp_path: Path,
+) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    beta = _plugin(tmp_path, name="beta")
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    seed_plugin_defaults(home, selected=(alpha, beta))
+    _git("add", "-f", "skills/alpha-helper/SKILL.md", "skills/beta-helper/SKILL.md",
+         "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "seed two plugins", cwd=home)
+    _git("push", "-q", cwd=home)
+
+    first = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert {name: result.action for name, result in first.items()} == {
+        "alpha": "baseline_initialized", "beta": "baseline_initialized",
+    }
+    for owner, other in (("alpha", "beta"), ("beta", "alpha")):
+        files = _git("ls-tree", "-r", "--name-only", f"mimir-plugin-defaults-{owner}", cwd=home).stdout
+        assert f"prompts/{owner}/heartbeat.md" in files
+        assert f"prompts/{other}/heartbeat.md" not in files
+        assert (home / ".mimir/upgrade-plugin-defaults" / owner).read_text() == "1.0\n"
+
+    for owner in ("alpha", "beta"):
+        (home / "prompts" / owner / "heartbeat.md").write_text(f"{owner} operator edit\n")
+        (tmp_path / owner / "prompts/heartbeat.md").write_text(f"{owner} v2\n")
+    _git("add", "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "edit both plugin prompts", cwd=home)
+    _git("push", "-q", cwd=home)
+    alpha.manifest.defaults["version"] = "2.0"
+    beta.manifest.defaults["version"] = "2.0"
+
+    opened = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert opened["alpha"].action == "proposal_opened_conflicts"
+    assert opened["beta"].action == "proposal_exists"
+    assert opened["alpha"].proposal and opened["alpha"].proposal.branch
+    assert "plugin-defaults-alpha-2-0" in opened["alpha"].proposal.branch
+    assert (home / ".mimir/upgrade-plugin-defaults/alpha").read_text() == "2.0\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/beta").read_text() == "1.0\n"
+    assert _git("show", "mimir-plugin-defaults-beta:prompts/beta/heartbeat.md", cwd=home).stdout == "plugin prompt\n"
+    alpha_proposal = opened["alpha"].proposal.worktree
+    assert alpha_proposal is not None
+    assert "alpha v2" in (alpha_proposal / "prompts/alpha/heartbeat.md").read_text()
+    assert "beta v2" not in (alpha_proposal / "prompts/beta/heartbeat.md").read_text()
+    _cleanup_upgrade_proposal(home)
+
+    retried = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert retried["alpha"].action == "already_synced"
+    assert retried["beta"].action == "proposal_opened_conflicts"
+    assert retried["beta"].proposal and retried["beta"].proposal.branch
+    assert "plugin-defaults-beta-2-0" in retried["beta"].proposal.branch
+    beta_proposal = retried["beta"].proposal.worktree
+    assert beta_proposal is not None
+    assert "beta v2" in (beta_proposal / "prompts/beta/heartbeat.md").read_text()
+    assert "alpha v2" not in (beta_proposal / "prompts/alpha/heartbeat.md").read_text()
+    for owner in ("alpha", "beta"):
+        assert (home / "prompts" / owner / "heartbeat.md").read_text() == f"{owner} operator edit\n"
+        assert (home / ".mimir/upgrade-plugin-defaults" / owner).read_text() == "2.0\n"
+    _cleanup_upgrade_proposal(home)
+
+
+def test_new_plugin_scheduler_job_is_proposed_not_seeded_into_live_home(
+    home: Path, tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    (home / "scheduler.yaml").write_text(_HEARTBEAT, encoding="utf-8")
+    seed_plugin_defaults(home, selected=(plugin,))
+    _git("add", "-f", "scheduler.yaml", "prompts/sample/heartbeat.md",
+         "skills/sample-helper/SKILL.md", cwd=home)
+    _git("commit", "-q", "-m", "seed plugin jobs", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+
+    scheduler = home / "scheduler.yaml"
+    edited = scheduler.read_text().replace("cron: 0 * * * *\n  channel_id: null",
+                                            "cron: 30 * * * *\n  channel_id: null")
+    assert edited != scheduler.read_text()
+    scheduler.write_text("# operator schedule\n" + edited)
+    _git("add", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "customize plugin schedule", cwd=home)
+    _git("push", "-q", cwd=home)
+    live = scheduler.read_bytes()
+    plugin.manifest.defaults["version"] = "2.0"
+    (tmp_path / "sample/jobs.yaml").write_text(
+        _HEARTBEAT + "- name: new-tick\n  cron: '0 9 * * *'\n  prompt_file: heartbeat.md\n"
+    )
+
+    seeded = seed_plugin_defaults(home, selected=(plugin,))
+    assert "scheduler.yaml:sample-new-tick" not in seeded
+    assert scheduler.read_bytes() == live
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert result.action == "proposal_opened"
+    assert result.proposal and result.proposal.worktree
+    proposed = (result.proposal.worktree / "scheduler.yaml").read_text()
+    assert "# operator schedule" in proposed
+    assert "cron: 30 * * * *" in proposed
+    assert "name: sample-new-tick" in proposed
+    assert scheduler.read_bytes() == live
+    _cleanup_upgrade_proposal(home)
+
+
+def test_initial_plugin_without_jobs_does_not_seed_jobs_on_later_version(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    plugin.manifest.defaults["scheduler_jobs"] = ()
+    home = tmp_path / "home"
+    home.mkdir()
+    scheduler = home / "scheduler.yaml"
+    scheduler.write_text(_HEARTBEAT)
+    seed_plugin_defaults(home, selected=(plugin,))
+    assert (home / ".mimir/seed-plugin-defaults/sample").read_text() == "1.0\n"
+    plugin.manifest.defaults["version"] = "2.0"
+    plugin.manifest.defaults["scheduler_jobs"] = ("jobs.yaml",)
+    seed_plugin_defaults(home, selected=(plugin,))
+    assert scheduler.read_text() == _HEARTBEAT
+
+
+@pytest.mark.parametrize("scheduler_at_install", [False, True])
+def test_first_plugin_jobs_after_empty_baseline_are_proposed(
+    home: Path, tmp_path: Path, scheduler_at_install: bool,
+) -> None:
+    alpha = _plugin(tmp_path, name="alpha")
+    beta = _plugin(tmp_path, name="beta")
+    alpha.manifest.defaults["scheduler_jobs"] = ()
+    beta.manifest.defaults["scheduler_jobs"] = ()
+    scheduler = home / "scheduler.yaml"
+    if scheduler_at_install:
+        scheduler.write_text(_HEARTBEAT)
+    seed_plugin_defaults(home, selected=(alpha, beta))
+    if scheduler_at_install:
+        assert scheduler.read_text() == _HEARTBEAT
+    else:
+        assert not scheduler.exists()
+    for owner in ("alpha", "beta"):
+        assert (home / ".mimir/seed-plugin-defaults" / owner).read_text() == "1.0\n"
+    _git("add", "-f", "prompts/alpha/heartbeat.md", "prompts/beta/heartbeat.md", cwd=home)
+    if scheduler_at_install:
+        _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "install plugins without jobs", cwd=home)
+    _git("push", "-q", cwd=home)
+    baseline = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert {owner: result.action for owner, result in baseline.items()} == {
+        "alpha": "baseline_initialized", "beta": "baseline_initialized",
+    }
+    assert _git("show", "mimir-plugin-defaults-alpha:plugins/alpha/scheduler.yaml",
+                cwd=home, check=False).returncode != 0
+
+    # The operator may create the missing scheduler later or customize the
+    # existing one; neither action opts into live version-bump writes.
+    scheduler.write_text("# operator schedule\n" + _HEARTBEAT.replace("0 * * * *", "30 * * * *"))
+    _git("add", "-f", "scheduler.yaml", cwd=home)
+    _git("commit", "-q", "-m", "operator schedule", cwd=home)
+    _git("push", "-q", cwd=home)
+    live = scheduler.read_bytes()
+    alpha.manifest.defaults["version"] = "2.0"
+    alpha.manifest.defaults["scheduler_jobs"] = ("jobs.yaml",)
+    seeded = seed_plugin_defaults(home, selected=(alpha, beta))
+    assert "scheduler.yaml:alpha-heartbeat" not in seeded
+    assert scheduler.read_bytes() == live
+
+    results = du.check_and_open_plugin_defaults_upgrade(home, selected=(alpha, beta))
+    assert results["alpha"].action == "proposal_opened"
+    assert results["beta"].action == "already_synced"
+    assert results["alpha"].proposal and results["alpha"].proposal.worktree
+    proposed = results["alpha"].proposal.worktree / "scheduler.yaml"
+    body = proposed.read_text()
+    assert "# operator schedule" in body
+    assert "30 * * * *" in body
+    assert "name: alpha-heartbeat" in body
+    assert "name: beta-heartbeat" not in body
+    assert "scheduler.yaml" in _git("diff", "--cached", "--name-only",
+                                    cwd=results["alpha"].proposal.worktree).stdout.splitlines()
+    assert scheduler.read_bytes() == live
+    assert (home / "prompts/heartbeat.md").read_text() == "heartbeat v1\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/alpha").read_text() == "2.0\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/beta").read_text() == "1.0\n"
+    _cleanup_upgrade_proposal(home)
+
+
+def test_missing_scheduler_at_install_never_follows_later_symlink(
+    tmp_path: Path,
+) -> None:
+    plugin = _plugin(tmp_path)
+    plugin.manifest.defaults["scheduler_jobs"] = ()
+    home = tmp_path / "home"
+    seed_plugin_defaults(home, selected=(plugin,))
+    assert (home / ".mimir/seed-plugin-defaults/sample").read_text() == "1.0\n"
+    assert not (home / "scheduler.yaml").exists()
+
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("outside job\n")
+    (home / "scheduler.yaml").symlink_to(outside)
+    core = home / "prompts/sample/heartbeat.md"
+    core.write_text("operator prompt\n")
+    plugin.manifest.defaults["version"] = "2.0"
+    plugin.manifest.defaults["scheduler_jobs"] = ("jobs.yaml",)
+    with pytest.raises(ValueError, match="symlink"):
+        seed_plugin_defaults(home, selected=(plugin,))
+    assert outside.read_text() == "outside job\n"
+    assert core.read_text() == "operator prompt\n"
+    assert (home / ".mimir/seed-plugin-defaults/sample").read_text() == "1.0\n"
+
+
+@pytest.mark.parametrize("symlink", ["skills", "prompts", "scheduler.yaml"])
+def test_seed_rejects_symlinked_destinations_before_writing(
+    tmp_path: Path, symlink: str,
+) -> None:
+    plugin = _plugin(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text("outside skill\n")
+    (outside / "heartbeat.md").write_text("outside prompt\n")
+    (outside / "scheduler.yaml").write_text(_HEARTBEAT)
+    (home / "prompts").mkdir()
+    core = home / "prompts/heartbeat.md"
+    core.write_text("core prompt\n")
+    if symlink == "scheduler.yaml":
+        (home / symlink).symlink_to(outside / symlink)
+    else:
+        if symlink == "prompts":
+            (home / "prompts/heartbeat.md").unlink()
+            (home / "prompts").rmdir()
+        (home / symlink).symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        seed_plugin_defaults(home, selected=(plugin,))
+    assert (outside / "SKILL.md").read_text() == "outside skill\n"
+    assert (outside / "heartbeat.md").read_text() == "outside prompt\n"
+    assert (outside / "scheduler.yaml").read_text() == _HEARTBEAT
+    if symlink != "prompts":
+        assert core.read_text() == "core prompt\n"
+    assert not (home / ".mimir").exists()
+
+
+def test_plugin_prompt_namespace_cannot_point_into_core(tmp_path: Path) -> None:
+    plugin = _plugin(tmp_path)
+    home = tmp_path / "home"
+    (home / "prompts").mkdir(parents=True)
+    (home / "memory/core").mkdir(parents=True)
+    core_prompt = home / "prompts/heartbeat.md"
+    core_memory = home / "memory/core/heartbeat.md"
+    core_prompt.write_text("core prompt\n")
+    core_memory.write_text("core memory\n")
+    (home / "prompts/sample").symlink_to(core_memory.parent, target_is_directory=True)
+    (home / "scheduler.yaml").write_text(_HEARTBEAT)
+
+    with pytest.raises(ValueError, match="symlink"):
+        seed_plugin_defaults(home, selected=(plugin,))
+    assert core_prompt.read_text() == "core prompt\n"
+    assert core_memory.read_text() == "core memory\n"
+    assert not (home / "skills").exists()
+
+
+@pytest.mark.parametrize("target_kind", ["prompt", "prompt_parent", "scheduler"])
+def test_plugin_proposal_rejects_symlinked_worktree_target(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_kind: str,
+) -> None:
+    plugin = _plugin(tmp_path)
+    (home / "scheduler.yaml").write_text(_HEARTBEAT)
+    seed_plugin_defaults(home, selected=(plugin,))
+    _git("add", "-f", "scheduler.yaml", "prompts/sample/heartbeat.md", cwd=home)
+    _git("commit", "-q", "-m", "plugin baseline", cwd=home)
+    _git("push", "-q", cwd=home)
+    assert du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"].action == "baseline_initialized"
+    plugin.manifest.defaults["version"] = "2.0"
+    (tmp_path / "sample/prompts/heartbeat.md").write_text("new plugin prompt\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "heartbeat.md").write_text("outside text\n")
+    (outside / "scheduler.yaml").write_text("outside schedule\n")
+    original_open = du.open_proposal
+
+    def open_with_symlink(*args, **kwargs):
+        opened = original_open(*args, **kwargs)
+        assert opened.worktree
+        target = opened.worktree / "prompts/sample/heartbeat.md"
+        if target_kind == "scheduler":
+            scheduler = opened.worktree / "scheduler.yaml"
+            scheduler.unlink()
+            scheduler.symlink_to(outside / "scheduler.yaml")
+        else:
+            target.unlink()
+            if target_kind == "prompt_parent":
+                target.parent.rmdir()
+                target.parent.symlink_to(outside, target_is_directory=True)
+            else:
+                target.symlink_to(outside / "heartbeat.md")
+        return opened
+
+    monkeypatch.setattr(du, "open_proposal", open_with_symlink)
+    result = du.check_and_open_plugin_defaults_upgrade(home, selected=(plugin,))["sample"]
+    assert not result.ok and result.action == "error"
+    assert "symlink" in (result.detail or "")
+    assert (outside / "heartbeat.md").read_text() == "outside text\n"
+    assert (outside / "scheduler.yaml").read_text() == "outside schedule\n"
+    assert (home / "prompts/heartbeat.md").read_text() == "heartbeat v1\n"
+    assert (home / ".mimir/upgrade-plugin-defaults/sample").read_text() == "1.0\n"
+    assert list_open_proposals(home, lane="upgrade") == []

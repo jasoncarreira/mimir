@@ -939,6 +939,11 @@ def setup_home(
     from ..skill_defs import migrate_legacy_skills_dir
     migrate_legacy_skills_dir(home)
     seeded_skills = seed_skills(home)
+    from ..plugins.defaults import seed_plugin_defaults
+
+    plugin_defaults = seed_plugin_defaults(home)
+    files_created.extend(path for path, status in plugin_defaults.items()
+                         if status == "created" and not path.startswith("scheduler.yaml:"))
 
     # Reference docs → <home>/docs/ (configuration.md + guides + README +
     # .env.example) so a pip-install operator has them on disk. Seed-if-missing;
@@ -1001,6 +1006,7 @@ def setup_home(
         "files_created": files_created,
         "subagents": seeded_subagents,
         "skills": seeded_skills,
+        "plugin_defaults": plugin_defaults,
         "api_key_action": api_key_action,
         "git_bootstrap": git_bootstrap_status,
         "embedding_preset": embedding,
