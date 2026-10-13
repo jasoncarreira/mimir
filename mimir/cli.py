@@ -112,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .tools._shell_env import disable_process_dumpability
 
     disable_process_dumpability()
+    words = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(
         prog="mimir",
         description="Memory-centric agent harness on the Claude Agent SDK.",
@@ -492,7 +493,42 @@ def main(argv: Sequence[str] | None = None) -> None:
     # Dispatch
     # -----------------------------------------------------------------------
 
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    from .plugins.cli_registry import CommandRegistry
+
+    commands = CommandRegistry()
+    core_parsers = {
+        "setup": setup_p, "run": run_p, "identities": id_p,
+        "reflection": refl_p, "memory": mem_p, "worklink": worklink_p,
+        "regenerate-api-key": regen_p, "stats": stats_p,
+        "verify-cred": verify_cred_p, "verify-creds": verify_creds_p,
+        "viability-report": viability_p, "verify-index": verify_index_p,
+        "rotate": rotate_p, "loops": loops_p, "update": sub.choices["update"],
+        "predictions": pred_p, "wiki": wiki_p, "skills": skills_p,
+        "plugins": plugins_p, "scaffold-docker": scaffold_docker_p,
+        "opencode-bootstrap": opencode_bootstrap_p, "commitments": commitments_p,
+        "feedback": feedback_p, "reindex": reindex_p, "migrate-memory": migrate_p,
+        "saga-reembed": reembed_p, "saga-acl-inventory": acl_inventory_p,
+        "saga-enforcement-replay": enforcement_replay_p,
+        "saga-migrate-legacy-acl": legacy_migration_p,
+        "watchdog": watchdog_p, "notify-restart": notify_restart_p,
+    }
+    for name, core_parser in core_parsers.items():
+        commands.add_core(name, core_parser, lambda _args: None)
+
+    # Listing is intentionally inert: do not construct Config or import even a
+    # selected provider before this metadata-only inspection path is parsed.
+    if words[:2] not in (["plugins", "list"], ["plugins", "dockerfile"]) and os.environ.get("MIMIR_PLUGINS", "").strip():
+        from .plugins.manager import load_plugins
+
+        manager = load_plugins(enable=os.environ["MIMIR_PLUGINS"])
+        commands.add_selected(manager.policy.cli_commands, sub)
+
+    args = parser.parse_args(words)
+    if args.command is not None and args.command not in core_parsers:
+        result = commands.dispatch(args)
+        if result:
+            sys.exit(result)
+        return
 
     if args.command == "setup":
         home = (args.home or Path.cwd()).resolve()

@@ -7,7 +7,10 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 from mimir import cli
+from mimir.plugins.registry import CliCommand, PolicyRegistrationError
 
 
 def _candidate(name: str, *, enabled: bool = False, diagnostic: str | None = None):
@@ -87,9 +90,79 @@ assert 'MIMIR_PLUGINS' not in os.environ
 
 
 def test_plugins_requires_list(capsys):
-    import pytest
-
     with pytest.raises(SystemExit) as exc:
         cli.main(["plugins"])
     assert exc.value.code == 1
     assert "list" in capsys.readouterr().out
+
+
+def test_selected_command_receives_parsed_arguments(monkeypatch, capsys):
+    from mimir.plugins import manager
+
+    def configure(sub):
+        parser = sub.add_parser("example")
+        parser.add_argument("--value", required=True)
+
+    command = CliCommand("example", "example", configure,
+                         lambda args: print(args.value))
+    monkeypatch.setenv("MIMIR_PLUGINS", "example")
+    monkeypatch.setattr(manager, "load_plugins", lambda *, enable: SimpleNamespace(
+        policy=SimpleNamespace(cli_commands={"example": command})))
+    cli.main(["example", "--value", "parsed"])
+    assert capsys.readouterr().out == "parsed\n"
+
+
+@pytest.mark.parametrize("names", [("run",), ("example", "example")])
+def test_command_name_collision_is_fatal(monkeypatch, names):
+    from mimir.plugins import manager
+
+    def configure(sub):
+        sub.add_parser("example")
+
+    commands = {str(index): CliCommand(f"plugin-{index}", name, configure, lambda args: None)
+                for index, name in enumerate(names)}
+    monkeypatch.setenv("MIMIR_PLUGINS", "example")
+    monkeypatch.setattr(manager, "load_plugins", lambda *, enable: SimpleNamespace(
+        policy=SimpleNamespace(cli_commands=commands)))
+    with pytest.raises(PolicyRegistrationError, match="conflicts"):
+        cli.main(["example"])
+
+
+def test_dockerfile_stage_and_selection(monkeypatch, capsys):
+    from mimir import plugin_dockerfile
+
+    seen = []
+    def select_plugins(**kwargs):
+        seen.append(kwargs)
+        return ("alpha", "zeta") if kwargs["all_installed"] else ("alpha",)
+
+    monkeypatch.setattr(plugin_dockerfile, "select_plugins", select_plugins)
+    monkeypatch.setattr(plugin_dockerfile, "render_stage",
+                        lambda candidates, stage: f"{stage}: {','.join(candidates)}")
+    monkeypatch.setenv("MIMIR_PLUGINS", "alpha")
+    cli.main(["plugins", "dockerfile", "--stage", "base"])
+    assert capsys.readouterr().out == "base: alpha\n"
+    cli.main(["plugins", "dockerfile", "--all-installed"])
+    assert capsys.readouterr().out == "\n\n".join(
+        f"{stage}: alpha,zeta" for stage in ("base", "build", "runtime", "services")) + "\n"
+    assert seen == [dict(all_installed=False, enable="alpha"),
+                    dict(all_installed=True, enable="alpha")]
+
+
+def test_dockerfile_uses_inert_sorted_package_metadata(monkeypatch, capsys):
+    from mimir import plugin_dockerfile
+
+    candidates = tuple(SimpleNamespace(
+        name=name, enabled=enabled, diagnostic=None,
+        manifest=SimpleNamespace(dockerfile={"system_packages": [package]}))
+        for name, enabled, package in (("alpha", False, "git"), ("zeta", True, "curl")))
+    monkeypatch.setattr(plugin_dockerfile, "discover_plugins", lambda *, enable: candidates)
+    monkeypatch.setenv("MIMIR_PLUGINS", "zeta")
+    cli.main(["plugins", "dockerfile", "--stage", "base"])
+    assert capsys.readouterr().out == (
+        "# --- plugin zeta ---\nRUN apt-get update && apt-get install -y "
+        "--no-install-recommends curl && rm -rf /var/lib/apt/lists/*\n"
+    )
+    cli.main(["plugins", "dockerfile", "--stage", "base", "--all-installed"])
+    result = capsys.readouterr().out
+    assert result.index("# --- plugin alpha ---") < result.index("# --- plugin zeta ---")
