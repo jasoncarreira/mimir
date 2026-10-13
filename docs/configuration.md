@@ -149,6 +149,9 @@ All channel-list flags take a comma-separated prefix allow-list (e.g.
 | `MIMIR_LLM_RETRY_MAX_ATTEMPTS` | int | `3` | Max attempts in the shared provider-agnostic LLM retry layer (backoff + jitter on transient errors). |
 | `MIMIR_LLM_RETRY_BASE_DELAY` | float | `0.5` | Base backoff (s) for the shared LLM retry layer. |
 | `MIMIR_LLM_RETRY_MAX_DELAY` | float | `30.0` | Max backoff (s) cap for the shared LLM retry layer. |
+| `MIMIR_TURN_TRANSIENT_RETRY_MAX` | int | `5` | Accepted poller-turn replays for transient provider failures before charging the normal content attempt (minimum 0). |
+| `MIMIR_TURN_TRANSIENT_RETRY_BASE_S` | float | `120` | Initial poller-turn provider retry delay in seconds; doubles on subsequent retries with up to 50% jitter. |
+| `MIMIR_TURN_TRANSIENT_RETRY_MAX_S` | float | `1800` | Maximum jittered poller-turn provider delay in seconds; provider Retry-After may extend it. |
 | `MIMIR_CLAUDE_OAUTH_CREDENTIALS` | path | `$MIMIR_HOME/.claude/.credentials.json` | Anthropic OAuth credentials for the usage poller. Empty disables; auto-disabled on a non-Anthropic `ANTHROPIC_BASE_URL`. |
 | `MIMIR_BILLING_MODE` | enum | auto-detected | Override billing mode: `quota` (demotes cost-rate spikes to advisory) or `pay-as-you-go`. |
 
