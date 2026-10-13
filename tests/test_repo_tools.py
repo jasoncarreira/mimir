@@ -410,12 +410,18 @@ def test_github_activity_remediation_turn_attests_large_collaborator_pr(
         )
         observed[tool.name] = added.sources[0].integrity
         auth.ifc_state.merge(added)
+    # Put fixed attestation reasons first: CI's short summary truncates the
+    # integrity map and full event payload before reaching the useful diagnostic.
+    refusal_reasons = [
+        kw["reason"] for name, kw in events
+        if name == "pr_checkout_lease_attestation_refused"
+    ]
     assert observed == {
         "pr_reviews": "trusted", "pr_comments": "trusted",
         "pr_metadata": "untrusted" if case == "head_mismatch" or case == "outsider" else "trusted",
         "pr_spec": "trusted",
         "repo_checkout": "untrusted" if case != "collaborator" else "trusted",
-    }, (observed, events)
+    }, f"lease_refusals={refusal_reasons}; observed={observed}; events={events}"
     assert auth.ifc_state.has_untrusted_active_ingest() is (case != "collaborator")
     # Read actual lease content before exercising the real edit-file gate.
     target = state.checkout_lease.path / "tracked.txt"
