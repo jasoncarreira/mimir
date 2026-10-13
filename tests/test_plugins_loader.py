@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from mimir.plugins.discovery import PluginDiscoveryError
 from mimir.plugins.manager import load_plugins
 from mimir.plugins.core import ServicePrincipal
+from mimir.config import _load_home_dotenv
 from mimir.tool_descriptors import ResultOriginKind
 
 
@@ -41,6 +43,33 @@ def test_named_load_and_registration_errors(monkeypatch):
     monkeypatch.setattr("mimir.plugins.manager.enabled_plugins", lambda *, enable: (candidate,))
     with pytest.raises(PluginDiscoveryError, match="plugin 'alpha' from provider-alpha: registration failed: import broke"):
         load_plugins(enable="alpha")
+
+
+def test_selected_skin_defaults_conflict_only_without_operator_override(monkeypatch):
+    def candidate(name):
+        return SimpleNamespace(
+            name=name, distribution=f"provider-{name}",
+            manifest=SimpleNamespace(skin_defaults=(f"{name}-skin",)),
+            entry_point=SimpleNamespace(load=lambda: SimpleNamespace(register=lambda registrar: None)),
+        )
+
+    monkeypatch.setattr("mimir.plugins.manager.enabled_plugins",
+                        lambda *, enable: (candidate("alpha"), candidate("beta")))
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    with pytest.raises(PluginDiscoveryError, match="alpha:alpha-skin, beta:beta-skin"):
+        load_plugins(enable="alpha,beta")
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "neon-terminal")
+    assert load_plugins(enable="alpha,beta").policy.frozen
+
+
+def test_home_dotenv_cannot_set_operator_skin_override(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("MIMIR_WEB_DEFAULT_SKIN=home-skin\n")
+    monkeypatch.delenv("MIMIR_WEB_DEFAULT_SKIN", raising=False)
+    _load_home_dotenv(tmp_path)
+    assert "MIMIR_WEB_DEFAULT_SKIN" not in os.environ
+    monkeypatch.setenv("MIMIR_WEB_DEFAULT_SKIN", "operator-skin")
+    _load_home_dotenv(tmp_path)
+    assert os.environ["MIMIR_WEB_DEFAULT_SKIN"] == "operator-skin"
 
 
 @pytest.mark.parametrize("registration,cause", [

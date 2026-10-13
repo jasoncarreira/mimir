@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import json
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from mimir.plugins import PluginDiscoveryError, PluginManifestError, discover_plugins, enabled_plugins
-from mimir.plugins.manifest import parse_manifest
+from mimir.plugins.manifest import _SKIN_TOKENS, parse_manifest
 
 
 def _toml(**fields: str) -> bytes:
@@ -80,6 +81,36 @@ def test_config_schema_rejects_foreign_keys():
     assert parse_manifest(data, entry_name="alpha").config["MIMIR_PLUGIN_ALPHA_TOKEN"]["secret"]
     with pytest.raises(PluginManifestError, match="must be under"):
         parse_manifest(data.replace(b"MIMIR_PLUGIN_ALPHA_TOKEN", b"MIMIR_PLUGIN_BETA_TOKEN"), entry_name="alpha")
+
+
+def test_skin_requires_complete_tokens_and_local_assets(tmp_path):
+    root = tmp_path / "pkg"
+    root.mkdir()
+    asset = root / "avatar.png"
+    asset.write_bytes(b"image")
+    skin = {
+        "id": "alpha-skin", "label": "Alpha", "version": "1", "default": True,
+        "tokens": {name: "blue" for name in _SKIN_TOKENS},
+        "chrome": {"layout": "sidebar", "density": "compact", "accentPlacement": "side-rule"},
+        "panel": {"surface": "flat", "borderStyle": "solid", "hoverBehavior": "none"},
+        "characterRenderer": {"kind": "static-image", "componentSlot": "agent-character",
+                              "assets": [{"id": "avatar", "href": "avatar.png"}]},
+    }
+    path = root / "skin.json"
+    inventory = frozenset({asset, path})
+    def parse():
+        path.write_text(json.dumps(skin))
+        return parse_manifest(_toml() + b'themes = ["skin.json"]\n', entry_name="alpha",
+                              resource_root=root, distribution_files=inventory)
+
+    assert parse().skin_defaults == ("alpha-skin",)
+    skin["tokens"].pop("--mimir-color-trigger-poller")
+    with pytest.raises(PluginManifestError, match="complete local"):
+        parse()
+    skin["tokens"]["--mimir-color-trigger-poller"] = "blue"
+    skin["characterRenderer"]["assets"][0]["href"] = "https://example.org/asset.png"
+    with pytest.raises(PluginManifestError, match="package-relative"):
+        parse()
 
 
 def test_discovery_reads_only_the_owning_distribution(tmp_path, monkeypatch):

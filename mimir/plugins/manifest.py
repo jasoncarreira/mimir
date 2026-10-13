@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import json
+import re
 import tomllib
 from dataclasses import dataclass, field
 from importlib import metadata
@@ -84,6 +84,53 @@ def _strings(value: Any, key: str) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
         raise PluginManifestError(f"{key}: expected nonempty strings in an array")
     return tuple(value)
+
+
+def _skin_resource(value: str, *, root: Path | None, files: frozenset[Path] | None) -> None:
+    _resource(value, key="themes asset", root=root, files=files)
+
+
+def _validate_skin(skin: Any, *, path: str, root: Path | None, files: frozenset[Path] | None) -> str | None:
+    if not isinstance(skin, dict) or any(not isinstance(skin.get(key), str) or not skin[key]
+                                             for key in ("id", "label", "version")):
+        raise PluginManifestError(f"themes: id, label and version required: {path}")
+    chrome, panel, renderer = (skin.get(key) for key in ("chrome", "panel", "characterRenderer"))
+    if (not isinstance(chrome, dict) or chrome.get("layout") not in {"top-nav", "sidebar"}
+            or chrome.get("density") not in {"compact", "comfortable"}
+            or chrome.get("accentPlacement") not in {"top-rule", "side-rule", "none"}
+            or not isinstance(panel, dict) or panel.get("surface") not in {"flat", "raised", "inset"}
+            or panel.get("borderStyle") not in {"solid", "double"}
+            or panel.get("hoverBehavior") not in {"border-accent", "lift", "none"}
+            or not isinstance(renderer, dict) or renderer.get("kind") not in {
+                "static-image", "sprite-sheet", "dotlottie", "lottie", "react-placeholder",
+            } or renderer.get("componentSlot") != "agent-character"):
+        raise PluginManifestError(f"themes: invalid chrome, panel or characterRenderer: {path}")
+    tokens = skin.get("tokens")
+    if not isinstance(tokens, dict) or tokens.keys() != _SKIN_TOKENS or any(
+        not isinstance(value, str) or not value or re.search(r"url\s*\(|@import|https?://", value, re.I)
+        for value in tokens.values()
+    ):
+        raise PluginManifestError(f"themes: complete local --mimir-* token set required: {path}")
+    for asset in skin.get("assets", []):
+        _skin_resource(asset, root=root, files=files)
+    for asset in renderer.get("assets", []):
+        if not isinstance(asset, dict) or not isinstance(asset.get("id"), str):
+            raise PluginManifestError(f"themes: invalid character asset: {path}")
+        if asset.get("href") is not None:
+            _skin_resource(asset["href"], root=root, files=files)
+    fonts = skin.get("fonts", [])
+    if not isinstance(fonts, list):
+        raise PluginManifestError(f"themes: invalid fonts: {path}")
+    for font in fonts:
+        if not isinstance(font, dict) or not isinstance(font.get("family"), str) or not isinstance(font.get("src"), list):
+            raise PluginManifestError(f"themes: invalid font: {path}")
+        for source in font["src"]:
+            if not isinstance(source, dict) or source.get("format") not in {"woff2", "woff", "truetype"}:
+                raise PluginManifestError(f"themes: invalid font source: {path}")
+            _skin_resource(source.get("url"), root=root, files=files)
+    if type(skin.get("default", False)) is not bool:
+        raise PluginManifestError("themes: default must be boolean")
+    return skin["id"] if skin.get("default") else None
 
 
 def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None = None,
@@ -171,21 +218,9 @@ def parse_manifest(data: bytes, *, entry_name: str, resource_root: Path | None =
                 skin = json.loads((resource_root / path).read_text())
             except (OSError, ValueError) as exc:
                 raise PluginManifestError(f"themes: invalid JSON: {path}") from exc
-            if not isinstance(skin, dict) or not isinstance(skin.get("id"), str) or not skin["id"] \
-                    or not isinstance(skin.get("label"), str) or not skin["label"]:
-                raise PluginManifestError(f"themes: id and label required: {path}")
-            tokens = skin.get("tokens")
-            if not isinstance(tokens, dict) or tokens.keys() != _SKIN_TOKENS or any(
-                not isinstance(value, str) or not value or re.search(r"url\s*\(|@import|https?://", value, re.I)
-                for value in tokens.values()
-            ):
-                raise PluginManifestError(f"themes: complete local --mimir-* token set required: {path}")
-            for asset in skin.get("assets", []):
-                _resource(asset, key="themes.assets", root=resource_root, files=distribution_files)
-            if skin.get("default", False) is True:
-                skin_defaults.append(skin["id"])
-            elif skin.get("default", False) is not False:
-                raise PluginManifestError("themes: default must be boolean")
+            default_id = _validate_skin(skin, path=path, root=resource_root, files=distribution_files)
+            if default_id:
+                skin_defaults.append(default_id)
     if len(skin_defaults) > 1:
         raise PluginManifestError("themes: only one default skin per plugin")
     frontend = _table(raw, "frontend", {"api_major", "module", "css", "assets"})
